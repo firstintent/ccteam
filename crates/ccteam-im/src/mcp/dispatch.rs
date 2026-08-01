@@ -1583,9 +1583,12 @@ async fn run_session_spawn_at(
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
     let protocol = derive_session_protocol(vendor);
-    // Optional model/effort (composer facets). Grok effort is dropped (its
-    // value set is undocumented — an invalid value would fail the spawn),
-    // mirroring the REST `spawn_tuning_from_form` contract.
+    // Optional model/effort (composer facets), forwarded to EVERY vendor
+    // verbatim — the vendor owns the verdict on its own value set. Grok's
+    // effort used to be zeroed right here, which handed the caller a 201 and
+    // a live sid for a session that quietly ran at the default; a rejected
+    // token is honest feedback, a swallowed one is not. Same contract as the
+    // REST `spawn_tuning_from_form`.
     let model = args
         .get("model")
         .and_then(|v| v.as_str())
@@ -1598,14 +1601,7 @@ async fn run_session_spawn_at(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let tuning = crate::gateway::SpawnTuning {
-        model,
-        effort: if vendor == ccteam_harness::AgentVendor::Grok {
-            None
-        } else {
-            effort
-        },
-    };
+    let tuning = crate::gateway::SpawnTuning { model, effort };
     // Optional `title` — metadata/ledger only, NEVER concatenated into any
     // prompt. Validate ≤80 chars; W1 accepts + echoes it (meta persistence
     // lands with the W2 delegation ledger).
@@ -1649,10 +1645,10 @@ async fn run_session_spawn_at(
     let requested_wait_seconds = requested_inline_wait_seconds(args);
     let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
     let notify = parse_notify_mode("session_spawn", args)?;
-    // Admin/managed-session spawns retain the shared ops pool. A tenant web
-    // bearer uses the same bare web chat-id seed as REST session creation; the
-    // gateway canonicalizes it to the persisted owner `user:<tenant>`.
-    let owner_id = match &caller {
+    // Operator/unowned projects retain the caller-derived pool. Tenant-owned
+    // projects ignore this fallback in the gateway and make every
+    // session_spawn inherit the tenant principal.
+    let fallback_owner_id = match &caller {
         McpCaller::User { user_id } => user_id.clone(),
         McpCaller::Ambient | McpCaller::Admin => "web-api".to_string(),
     };
@@ -1795,7 +1791,7 @@ async fn run_session_spawn_at(
                         vendor,
                         permission_mode,
                         protocol,
-                        owner_id,
+                        fallback_owner_id,
                         tuning,
                         parent,
                         title.clone(),
@@ -1814,7 +1810,7 @@ async fn run_session_spawn_at(
                     vendor,
                     permission_mode,
                     protocol,
-                    owner_id,
+                    fallback_owner_id,
                     tuning,
                     parent,
                     title.clone(),
@@ -3996,6 +3992,7 @@ mod session_tool_tests {
         mark_stub_vendors_installed(&mut gateway);
         gateway.register_project("bob", bob_dir);
         gateway.register_project("admin", admin_dir);
+        gateway.enable_project_creation(paths.clone());
 
         let alice_sid = gateway
             .create_session_api_proto(
@@ -4302,6 +4299,176 @@ mod session_tool_tests {
         .unwrap();
         assert_eq!(meta.owner, "user:ualice");
         assert!(meta.parent_sid.is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_spawn_in_tenant_project_inherits_project_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_spawn",
+                json!({
+                    "project": "alice",
+                    "vendor": "claude",
+                }),
+            ),
+            Some(&gateway),
+            McpCaller::Admin,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let sid = body["sid"].as_str().unwrap();
+        let meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alice"),
+            sid,
+        )
+        .unwrap();
+
+        assert_eq!(meta.owner, "user:ualice");
+        assert!(meta.parent_sid.is_none(), "admin spawn remains a root");
+    }
+
+    #[tokio::test]
+    async fn ambient_child_in_tenant_project_inherits_project_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let response = run_session_spawn_at(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({
+                    "vendor": "claude",
+                }),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let sid = body["sid"].as_str().unwrap();
+        let meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alice"),
+            sid,
+        )
+        .unwrap();
+
+        assert_eq!(meta.owner, "user:ualice");
+        assert_eq!(meta.parent_sid.as_deref(), Some(alice_sid.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_spawn_task_in_tenant_project_never_targets_admin_frontends() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let alice_dir = seed_owned_project(&paths, "alice", "user:ualice");
+        crate::credentials::save(
+            &paths.im_credentials_path(),
+            &crate::credentials::Credentials {
+                telegram: Some(crate::credentials::TelegramCreds {
+                    bot_token: "123:test".into(),
+                    allowed_chat_ids: vec!["admin-chat".into()],
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let stub = StubAdapter {
+            answer: true,
+            ..Default::default()
+        };
+        let stub_for_factory = stub.clone();
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(stub_for_factory.clone())
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gateway = Gateway::new_with_factory(factory, "alice", &alice_dir);
+        mark_stub_vendors_installed(&mut gateway);
+        gateway.enable_project_creation(paths.clone());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        let gateway = std::sync::Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_spawn",
+                json!({
+                    "project": "alice",
+                    "vendor": "claude",
+                    "task": "tenant-only result",
+                }),
+            ),
+            Some(&gateway),
+            McpCaller::Admin,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let sid = body["sid"].as_str().unwrap().to_string();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("gateway event sink remains open");
+                if matches!(event.kind, crate::gateway::GatewayEventKind::Answer) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("spawn task produces an answer");
+        let mut answers = vec![first];
+        for _ in 0..100 {
+            if !gateway.lock().await.session_turn_in_flight(&sid) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event.kind, crate::gateway::GatewayEventKind::Answer) {
+                answers.push(event);
+            }
+        }
+
+        assert!(
+            answers
+                .iter()
+                .any(|event| event.channel == "web" && event.chat_id == "ualice"),
+            "tenant web owns the answer route: {answers:?}"
+        );
+        assert!(
+            answers.iter().all(
+                |event| !(event.channel == "web" && event.chat_id == "web-api"
+                    || event.channel == "telegram" && event.chat_id == "admin-chat")
+            ),
+            "tenant output must never target an admin frontend: {answers:?}"
+        );
     }
 
     #[tokio::test]

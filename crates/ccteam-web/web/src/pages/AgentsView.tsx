@@ -5,9 +5,11 @@
 // stay global above the seg:
 //
 // - 拓扑 topology: a compact, collapsible delegation tree grouped by project,
-//   designed to stay readable with 100+ sessions. Every row (and the detail
-//   panel) links to the real chat route `/chat/s/<sid>` — right/middle-click
-//   open-in-new-tab works because these are real hyperlinks.
+//   designed to stay readable with 100+ sessions. Every row carries what its
+//   session is running right now (模型 · effort, off the graph's live statusline
+//   join) and links to the real chat route `/chat/s/<sid>` — right/middle-click
+//   open-in-new-tab works because these are real hyperlinks. Narrow canvases
+//   fold each row into two wrapped lines (index.css @container agents-canvas).
 // - 分工 charter: per-project routing.md editor + vendor roster (CharterPanel
 //   reuses this view's graph nodes for its aggregation — no refetch; picking
 //   a roster card lands back on the topology filtered to that vendor).
@@ -55,6 +57,16 @@ const chatPath = (sid: string) => `/chat/s/${encodeURIComponent(sid)}`;
 function treeDotClass(node: AgentNode, pulsing: Set<string>): string {
   if (node.status !== "live") return "dot off";
   return pulsing.has(node.sid) ? "dot busy" : "dot on";
+}
+
+/** The 模型 · effort cell — what this session is running RIGHT NOW, off the
+ *  graph's live statusline join. Both halves are the vendor's own strings,
+ *  verbatim in either language (`claude-opus-5 · high`): translating the
+ *  effort would print a word no CLI or statusline ever uses. An idle node
+ *  reports neither (nothing live to read) ⇒ a dash, never a spawn-time
+ *  guess. */
+function modelEffortLabel(node: AgentNode): string {
+  return [node.model?.trim(), node.effort?.trim()].filter(Boolean).join(" · ") || "—";
 }
 
 /** Project-grouped, collapsible delegation tree. Component state contains
@@ -152,14 +164,25 @@ export function AgentsTree({
                 ) : (
                   <span className="agents-tree-toggle-spacer" aria-hidden="true" />
                 )}
-                <VendorChip vendor={n.vendor} />
-                <span className="agents-tree-sid mono">{n.sid}</span>
-                <span className="agents-tree-title">{n.title || n.role || "—"}</span>
-                {showHost ? <span className="agents-tree-host mono">{n.host}</span> : null}
-                <span className={treeDotClass(n, pulsing)} aria-hidden="true" />
-                <span className="agents-tree-active">{relativeTime(lang, n.last_active)}</span>
-                <span className="agents-tree-cost mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
-                <span className="agents-tree-turns mono" title={t("teamColTurns")}>{n.turn_count}t</span>
+                {/* Identity vs. metrics: two groups so a narrow canvas can put
+                    the metrics on their own line under the title. Both are
+                    `display: contents` in table mode — the wide grid sees the
+                    same flat run of cells it always did (index.css). */}
+                <span className="agents-tree-main">
+                  <VendorChip vendor={n.vendor} />
+                  <span className="agents-tree-sid mono">{n.sid}</span>
+                  <span className="agents-tree-title">{n.title || n.role || "—"}</span>
+                </span>
+                <span className="agents-tree-meta">
+                  <span className="agents-tree-model mono" title={t("teamColModel")}>
+                    {modelEffortLabel(n)}
+                  </span>
+                  {showHost ? <span className="agents-tree-host mono">{n.host}</span> : null}
+                  <span className={treeDotClass(n, pulsing)} aria-hidden="true" />
+                  <span className="agents-tree-active">{relativeTime(lang, n.last_active)}</span>
+                  <span className="agents-tree-cost mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
+                  <span className="agents-tree-turns mono" title={t("teamColTurns")}>{n.turn_count}t</span>
+                </span>
                 <Link
                   className="btn ghost mini agents-tree-open"
                   to={chatPath(n.sid)}

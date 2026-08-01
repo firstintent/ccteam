@@ -298,6 +298,7 @@ pub struct HostDetailQuery {
 )]
 pub(crate) async fn handle_host_detail(
     State(app): State<crate::state::AppState>,
+    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<HostDetailQuery>,
 ) -> Response {
@@ -308,6 +309,10 @@ pub(crate) async fn handle_host_detail(
                 cfg.projects
                     .into_iter()
                     .filter(|p| p.host.is_empty() || p.host == LOCAL_HOST)
+                    // Same ownership policy as `GET /api/v1/projects`: this
+                    // surface must not hand a tenant the owner's catalog (slug
+                    // + absolute path) just because it hangs off a host.
+                    .filter(|p| crate::routes::api_v1::can_see_project(&app, &identity, &p.slug))
                     .map(|p| HostProjectView {
                         catalog_slug: Some(p.slug.clone()),
                         slug: p.slug,
@@ -360,7 +365,7 @@ pub(crate) async fn handle_host_detail(
                         .projects
                         .iter()
                         .cloned()
-                        .map(|project| {
+                        .filter_map(|project| {
                             let catalog_slug = catalog
                                 .projects
                                 .iter()
@@ -370,12 +375,27 @@ pub(crate) async fn handle_host_detail(
                                             == Some(project.slug.as_str())
                                 })
                                 .map(|entry| entry.slug.clone());
-                            HostProjectView {
+                            // A CATALOGED project follows its catalog entry's
+                            // ownership — that is the leak this filter closes.
+                            // An un-cataloged one is nobody's yet, and it is
+                            // precisely the candidate list `POST /projects/
+                            // import` works from — a route that deliberately
+                            // lets ANY identity claim one (it stamps the
+                            // caller as owner). Hiding those from tenants
+                            // would break importing from the UI, so they stay
+                            // visible: no owner, nothing to leak.
+                            let visible = match catalog_slug.as_deref() {
+                                Some(slug) => {
+                                    crate::routes::api_v1::can_see_project(&app, &identity, slug)
+                                }
+                                None => true,
+                            };
+                            visible.then(|| HostProjectView {
                                 slug: project.slug,
                                 path: project.path,
                                 cataloged: catalog_slug.is_some(),
                                 catalog_slug,
-                            }
+                            })
                         })
                         .collect(),
                 })
@@ -421,15 +441,22 @@ pub struct RegisterMcpQuery {
     responses(
         (status = 200, description = "Registered; `{registered:[vendor], paths:{vendor:path}}`", body = serde_json::Value),
         (status = 400, description = "Unknown vendor"),
+        (status = 403, description = "Not the admin/owner"),
         (status = 404, description = "Unknown host"),
         (status = 500, description = "Cannot resolve vendor config or MCP credentials"),
     ),
 )]
 pub(crate) async fn handle_register_mcp(
     State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<RegisterMcpQuery>,
 ) -> Response {
+    // Writes the daemon's admin MCP credential into a vendor's GLOBAL config
+    // on this machine — owner-scoped, never a tenant action.
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     if host != LOCAL_HOST {
         return (
             StatusCode::NOT_FOUND,
@@ -475,7 +502,7 @@ pub(crate) async fn handle_register_mcp(
     };
 
     let token_path = app.paths.web_token_path();
-    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&app.paths.root.join("run"));
     let result = tokio::task::spawn_blocking(move || {
         register_mcp_blocking(want.as_deref(), &token_path, &mcp_http_url)
     })
@@ -516,9 +543,9 @@ fn register_mcp_blocking(
     let do_vendor = |v: &str| want.is_none() || want == Some(v);
 
     if do_vendor("claude") {
-        let bin = ccteam_core::current_ccteam_bin()?;
+        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::projects::resolve_claude_json_path()?;
-        ccteam_core::mcp_register::install_mcp_into(&path, &bin)?;
+        ccteam_core::mcp_register::install_mcp_into(&path, mcp_http_url, &admin_token)?;
         written.insert("claude".to_string(), path.display().to_string());
     }
     if do_vendor("codex") {
@@ -574,6 +601,7 @@ pub struct HostRemoveQuery {
     responses(
         (status = 200, description = "Removed; `{host}`", body = serde_json::Value),
         (status = 400, description = "`host` is `local` (the main daemon machine)"),
+        (status = 403, description = "Not the admin/owner"),
         (status = 404, description = "Unknown host"),
         (status = 409, description = "Host is online; retry with `?force=true`"),
         (status = 500, description = "Registry could not be loaded or saved"),
@@ -581,9 +609,15 @@ pub struct HostRemoveQuery {
 )]
 pub(crate) async fn handle_host_remove(
     State(app): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Path(host): Path<String>,
     Query(q): Query<HostRemoveQuery>,
 ) -> Response {
+    // Fleet membership is daemon-global state, not a project resource: only
+    // the owner may drop a satellite (and with it its execution channel).
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     if host == LOCAL_HOST {
         return (
             StatusCode::BAD_REQUEST,
@@ -658,12 +692,19 @@ pub struct MintJoinTokenForm {
     request_body = MintJoinTokenForm,
     responses(
         (status = 201, description = "Minted; `{token, label?, max_uses?, command}`", body = serde_json::Value),
+        (status = 403, description = "Not the admin/owner"),
     ),
 )]
 pub(crate) async fn handle_mint_join_token(
     State(app): State<crate::state::AppState>,
+    Extension(identity): Extension<Identity>,
     Json(form): Json<MintJoinTokenForm>,
 ) -> Response {
+    // A join token attaches a MACHINE to this daemon (and lets it run agent
+    // sessions): a fleet credential, owner-only to mint.
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let path = app.paths.host_join_tokens_path();
     let mut store = match ccteam_core::JoinTokenStore::load(&path) {
         Ok(s) => s,
@@ -706,9 +747,17 @@ pub(crate) async fn handle_mint_join_token(
     tag = "hosts",
     responses(
         (status = 200, description = "Newest valid token or `{token: null}`; `{token, label?, minted_at?, max_uses?, uses, command}`", body = serde_json::Value),
+        (status = 403, description = "Not the admin/owner"),
     ),
 )]
-pub(crate) async fn handle_get_join_token(State(app): State<crate::state::AppState>) -> Response {
+pub(crate) async fn handle_get_join_token(
+    State(app): State<crate::state::AppState>,
+    Extension(identity): Extension<Identity>,
+) -> Response {
+    // Reads the token itself — same credential as minting one, same gate.
+    if let Some(deny) = deny_non_admin(&identity) {
+        return deny;
+    }
     let path = app.paths.host_join_tokens_path();
     let store = match ccteam_core::JoinTokenStore::load(&path) {
         Ok(s) => s,

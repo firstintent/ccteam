@@ -21,7 +21,8 @@ use anyhow::Context as _;
 use crate::latency::now_unix_ms;
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, OutboundFile, OutboundFileKind,
+    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// `getUpdates` long-poll seconds.
@@ -39,13 +40,20 @@ const MAX_MESSAGE_UTF16: usize = 3900;
 pub struct TelegramChannel {
     bot_token: String,
     allowed_chat_ids: Vec<String>,
+    /// What an EMPTY allowlist means for THIS bot.
+    ///
+    /// `true` (the global/owner bot): open — locking a half-configured owner
+    /// out of their own box is the worse failure, and the daemon warns about
+    /// it at startup. `false` (a per-tenant bot, [`Self::fail_closed`]): deny,
+    /// matching Lark. A tenant bot's inbound is stamped with that tenant's
+    /// identity by `Gateway::principal`, so an unbound bot handing a stranger
+    /// the tenant's projects and sessions is not a mode anyone opted into.
+    open_when_unset: bool,
+    /// Shared setup probe + one-shot binding notice for rejected senders.
+    rejected_senders: RejectedSenderNotifier,
     http: reqwest::Client,
     last_offset: Arc<Mutex<i64>>,
     name: String,
-    /// Chats whose non-allowlisted drop was already WARN-logged once —
-    /// the drop is otherwise invisible (DEBUG) while the getUpdates
-    /// offset keeps advancing, which reads as a message black hole.
-    warned_chats: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TelegramChannel {
@@ -56,13 +64,14 @@ impl TelegramChannel {
         Self {
             bot_token,
             allowed_chat_ids,
+            open_when_unset: true,
+            rejected_senders: RejectedSenderNotifier::default(),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(POLL_TIMEOUT_SECS + 10))
                 .build()
                 .expect("reqwest client"),
             last_offset: Arc::new(Mutex::new(0)),
             name: "telegram".to_string(),
-            warned_chats: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -74,16 +83,50 @@ impl TelegramChannel {
         self
     }
 
+    /// Treat an EMPTY allowlist as "answer nobody" instead of "answer
+    /// everybody" — the posture every per-tenant bot takes (see
+    /// [`Self::open_when_unset`]).
+    pub fn fail_closed(mut self) -> Self {
+        self.open_when_unset = false;
+        self
+    }
+
+    /// Record rejected chat ids to `path` so the owner of this bot can
+    /// discover the id to allow from the web UI instead of the daemon log.
+    pub fn with_rejected_sender_probe_path(mut self, path: std::path::PathBuf) -> Self {
+        self.rejected_senders = RejectedSenderNotifier::with_probe_path(path);
+        self
+    }
+
     fn api_url(&self, method: &str) -> String {
         format!("https://api.telegram.org/bot{}/{}", self.bot_token, method)
     }
 
-    /// Whether a chat is permitted (open mode when allowlist empty).
+    /// Whether a chat is permitted. An empty allowlist means whatever this
+    /// bot was built to mean ([`Self::open_when_unset`]) — never an implicit
+    /// "open" for a bot that speaks for one tenant.
     fn chat_allowed(&self, chat_id: &str) -> bool {
         if self.allowed_chat_ids.is_empty() {
-            return true;
+            return self.open_when_unset;
         }
         self.allowed_chat_ids.iter().any(|id| id == chat_id)
+    }
+
+    /// Keep the allowlist fail-closed while making the rejection actionable.
+    /// Telegram's binding id and conversation id are both the chat id.
+    async fn reject_chat(&self, chat_id: &str, message_id: i64, date: i64) {
+        self.rejected_senders
+            .record_and_notify(
+                self,
+                RejectedSenderProbe {
+                    channel: self.name.clone(),
+                    sender_id: chat_id.to_string(),
+                    chat_id: chat_id.to_string(),
+                    message_id: message_id.to_string(),
+                    timestamp: date.max(0) as u64,
+                },
+            )
+            .await;
     }
 
     /// Resolve a `file_id` to its server-side `file_path` via `getFile`.
@@ -180,6 +223,7 @@ impl TelegramChannel {
         };
         let chat_id = msg.chat.id.to_string();
         if !self.chat_allowed(&chat_id) {
+            self.reject_chat(&chat_id, msg.message_id, msg.date).await;
             return;
         }
         let sender = cb
@@ -567,19 +611,7 @@ impl Channel for TelegramChannel {
                 if let Some(m) = upd.message {
                     let chat_id = m.chat.id.to_string();
                     if !self.chat_allowed(&chat_id) {
-                        // WARN once per chat: the update is consumed
-                        // (offset advances) yet never reaches the
-                        // gateway, so a silent DEBUG here reads as the
-                        // bot ignoring the user entirely.
-                        if self.warned_chats.lock().await.insert(chat_id.clone()) {
-                            tracing::warn!(
-                                chat = %chat_id,
-                                allowlist_len = self.allowed_chat_ids.len(),
-                                "telegram: dropping messages from non-allowlisted chat (offset still advances; further drops from this chat log at DEBUG)"
-                            );
-                        } else {
-                            tracing::debug!(chat = %chat_id, "drop msg from non-allowed chat");
-                        }
+                        self.reject_chat(&chat_id, m.message_id, m.date).await;
                         continue;
                     }
                     let sender = m
@@ -891,8 +923,23 @@ mod tests {
 
     #[test]
     fn chat_allowed_open_when_empty() {
+        // The GLOBAL/owner bot keeps the legacy open mode (a half-configured
+        // owner must not be locked out of their own box; the daemon warns).
         let ch = TelegramChannel::new("t".into(), vec![]);
         assert!(ch.chat_allowed("12345"));
+    }
+
+    #[test]
+    fn fail_closed_bot_answers_nobody_until_bound() {
+        // A per-tenant bot takes the opposite default, matching Lark: whatever
+        // arrives here is stamped with that tenant's identity, so an unbound
+        // bot must not hand a stranger their projects and sessions.
+        let ch = TelegramChannel::new("t".into(), vec![]).fail_closed();
+        assert!(!ch.chat_allowed("12345"), "unbound tenant bot denies all");
+
+        let ch = TelegramChannel::new("t".into(), vec!["12345".into()]).fail_closed();
+        assert!(ch.chat_allowed("12345"), "bound chat gets through");
+        assert!(!ch.chat_allowed("99999"), "everyone else still denied");
     }
 
     #[test]

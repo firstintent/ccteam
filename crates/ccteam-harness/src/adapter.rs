@@ -695,40 +695,99 @@ pub struct ChoiceSelection {
     pub free_text: Option<String>,
 }
 
+/// How a [`ContextUsage`] came to be known. Provenance travels WITH the
+/// number so the honesty wording has exactly one home ([`ContextUsage::render`])
+/// instead of one hand-written sentence per vendor adapter.
+///
+/// It deliberately does NOT change how a *known* value renders — a derived
+/// number is no less real than a reported one, and decorating it would only
+/// add noise to every statusline. It exists so the unknown case can be said
+/// out loud, and so the web payload can explain where a number came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSource {
+    /// The vendor pushed occupancy directly (ACP `usage_update{used,size}`,
+    /// Codex app-server token counts).
+    Reported,
+    /// Computed from per-turn token accounting (Claude transcript `usage`,
+    /// grok's `_meta.totalTokens` — whose `inputTokens` carries the whole
+    /// history, so the per-turn total tracks occupancy).
+    Derived,
+    /// Pulled from a status surface the vendor itself advertises (an ACP
+    /// `availableCommands` entry). Used when the vendor has no push channel.
+    Probed,
+    /// No channel carries it. The default: a value nobody vouched for is
+    /// unknown, never zero.
+    #[default]
+    Unknown,
+}
+
 /// Context-window usage for a session, vendor-agnostic. Numerator +
 /// denominator in tokens; the percentage is derived, never stored.
+///
+/// `used_tokens` is an `Option` on purpose: "we have a window but nobody told
+/// us the occupancy" is a real state (a just-resumed ACP session, a vendor
+/// with no usage channel), and it must NOT be flattened to `0` — a zero reads
+/// as "context is empty", which is a lie about a session that may be at 80%.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ContextUsage {
-    pub used_tokens: u64,
+    /// Tokens currently occupying the window; `None` when unknown.
+    #[serde(default)]
+    pub used_tokens: Option<u64>,
+    /// Total window size in tokens; `0` when unknown.
     pub window_tokens: u64,
+    /// Where the numbers came from. Serde-defaulted so an older persisted
+    /// `status.json` still deserializes (as [`ContextSource::Unknown`]).
+    #[serde(default)]
+    pub source: ContextSource,
 }
 
 impl ContextUsage {
-    /// Used/window as a 0–100 percentage; `0.0` when the window is
-    /// unknown (zero) to avoid divide-by-zero.
-    pub fn pct(&self) -> f32 {
-        if self.window_tokens == 0 {
-            0.0
-        } else {
-            (self.used_tokens as f32 / self.window_tokens as f32) * 100.0
+    /// A fully-known usage from a source that vouches for both numbers.
+    pub fn known(used_tokens: u64, window_tokens: u64, source: ContextSource) -> Self {
+        Self {
+            used_tokens: Some(used_tokens),
+            window_tokens,
+            source,
+        }
+    }
+
+    /// A known window whose occupancy nobody reports (yet).
+    pub fn window_only(window_tokens: u64) -> Self {
+        Self {
+            used_tokens: None,
+            window_tokens,
+            source: ContextSource::Unknown,
+        }
+    }
+
+    /// Used/window as a 0–100 percentage. `None` when either half is unknown
+    /// — callers must render "—", never a fabricated `0%`.
+    pub fn pct(&self) -> Option<f32> {
+        match (self.used_tokens, self.window_tokens) {
+            (Some(used), window) if window > 0 => Some((used as f32 / window as f32) * 100.0),
+            _ => None,
         }
     }
 
     /// Render this usage as the canonical absolute-value + percent form
     /// (P3): `"188k / 1M (19%)"`. When the window is unknown (zero), only
-    /// the used count is shown (`"188k (window unknown)"`). This is the
-    /// **single** render point so `/sessions` (gateway) and Codex
-    /// `/status` (adapter) always agree byte-for-byte.
+    /// the used count is shown (`"188k (window unknown)"`); when the
+    /// occupancy is unknown, the window still shows and the numerator is a
+    /// dash (`"— / 500k (usage unknown)"`). This is the **single** render
+    /// point so `/sessions` (gateway) and Codex `/status` (adapter) always
+    /// agree byte-for-byte.
     pub fn render(&self) -> String {
-        if self.window_tokens == 0 {
-            format!("{} (window unknown)", format_tokens(self.used_tokens))
-        } else {
-            format!(
+        match (self.used_tokens, self.window_tokens) {
+            (Some(used), 0) => format!("{} (window unknown)", format_tokens(used)),
+            (Some(used), window) => format!(
                 "{} / {} ({:.0}%)",
-                format_tokens(self.used_tokens),
-                format_tokens(self.window_tokens),
-                self.pct()
-            )
+                format_tokens(used),
+                format_tokens(window),
+                self.pct().unwrap_or(0.0)
+            ),
+            (None, 0) => "—".to_string(),
+            (None, window) => format!("— / {} (usage unknown)", format_tokens(window)),
         }
     }
 }
@@ -958,15 +1017,28 @@ pub struct SpawnCtx {
     /// deterministic per-model pricing; a model absent from the pricing
     /// table prices to `None` (exposed as "—"), never a fallback rate.
     pub model_id: Option<String>,
-    /// v0.8.24 A-U3 — explicit reasoning-effort token for this thread.
-    /// `None` = vendor default (no flag / no override emitted). Wired only
-    /// where the vendor verifiably supports it: Claude stream-json
-    /// (`--effort low|medium|high|xhigh|max`), Codex app-server (the
-    /// `effort` turn/start override, `none|minimal|low|medium|high|xhigh`),
-    /// OpenCode ACP (`session/set_config_option {configId:"effort"}`,
-    /// value = a model variant). Grok's `--reasoning-effort` value set is
-    /// undocumented, so it is NOT wired (an invalid value would fail the
-    /// spawn). Terminal protocol is frozen — never extended with this.
+    /// Explicit reasoning-effort token for this thread. `None` = vendor
+    /// default: nothing is emitted and the vendor's own resolution holds —
+    /// that is what an omitted effort means at every ccteam entry point.
+    ///
+    /// Applied through each vendor's own seam, with the value passed VERBATIM
+    /// (ccteam does not police vendor value sets; the vendor owns that
+    /// verdict, and the ladders a caller is offered come from
+    /// [`crate::model_catalog::supported_efforts`]):
+    /// - Claude stream-json: `--effort` argv;
+    /// - Codex app-server: the sticky `effort` override on the first
+    ///   `turn/start` (codex takes no argv for it);
+    /// - Grok ACP: `--reasoning-effort` argv (its handshake declares the
+    ///   levels in `_meta.reasoningEfforts`);
+    /// - OpenCode / Kimi ACP: `session/set_config_option` on the axis id the
+    ///   vendor declared in its handshake (`effort` / `thinking` — see
+    ///   [`crate::execution::acp::ModelInfo::effort_config_id`]).
+    ///
+    /// A vendor REFUSING an explicit value fails the spawn
+    /// ([`crate::execution::acp::spawn_pick_refused`]) rather than handing
+    /// back a session quietly running on something else. The one surface that
+    /// cannot carry it is the frozen terminal protocol, which refuses the
+    /// spawn with a message naming stream-json instead of ignoring the pick.
     pub effort: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops
@@ -1653,32 +1725,57 @@ mod tests {
 
     #[test]
     fn context_usage_render_absolute_plus_percent() {
-        let u = ContextUsage {
-            used_tokens: 188_000,
-            window_tokens: 1_000_000,
-        };
+        let u = ContextUsage::known(188_000, 1_000_000, ContextSource::Derived);
         assert_eq!(u.render(), "188k / 1M (19%)");
-        let baseline = ContextUsage {
-            used_tokens: 188_000,
-            window_tokens: 200_000,
-        };
+        let baseline = ContextUsage::known(188_000, 200_000, ContextSource::Reported);
         assert_eq!(baseline.render(), "188k / 200k (94%)");
         // Unknown window → no percent.
-        let unknown = ContextUsage {
-            used_tokens: 5_000,
-            window_tokens: 0,
-        };
+        let unknown = ContextUsage::known(5_000, 0, ContextSource::Derived);
         assert_eq!(unknown.render(), "5k (window unknown)");
+    }
+
+    /// Provenance must NOT leak into a known value's rendering — a derived
+    /// number reads exactly like a reported one, so every statusline surface
+    /// keeps agreeing byte-for-byte.
+    #[test]
+    fn context_usage_render_ignores_source_for_known_values() {
+        let rendered: Vec<String> = [
+            ContextSource::Reported,
+            ContextSource::Derived,
+            ContextSource::Probed,
+        ]
+        .into_iter()
+        .map(|src| ContextUsage::known(188_000, 1_000_000, src).render())
+        .collect();
+        assert!(
+            rendered.iter().all(|r| r == "188k / 1M (19%)"),
+            "{rendered:?}"
+        );
+    }
+
+    /// The regression this type exists for: a known window with no reported
+    /// occupancy must never render as `0 (0%)`. A resumed session has an empty
+    /// counter and a full context — claiming 0% there is a lie, not a default.
+    #[test]
+    fn context_usage_unknown_occupancy_never_renders_as_zero() {
+        let u = ContextUsage::window_only(500_000);
+        assert_eq!(u.render(), "— / 500k (usage unknown)");
+        assert_eq!(u.pct(), None);
+        assert_eq!(u.source, ContextSource::Unknown);
+        // Nothing known at all → a bare dash.
+        assert_eq!(ContextUsage::default().render(), "—");
+        assert_eq!(ContextUsage::default().pct(), None);
     }
 
     #[test]
     fn thread_status_suffix_combines_model_and_ctx() {
         let full = ThreadStatus {
             model: Some("claude-opus-4-8[1m]".into()),
-            context: Some(ContextUsage {
-                used_tokens: 188_000,
-                window_tokens: 1_000_000,
-            }),
+            context: Some(ContextUsage::known(
+                188_000,
+                1_000_000,
+                ContextSource::Derived,
+            )),
             effort: None,
             goal: None,
         };

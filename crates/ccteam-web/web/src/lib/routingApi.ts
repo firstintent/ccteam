@@ -7,6 +7,8 @@
 // routing.md` is a read-only fallback here. Auth + error mapping mirror the
 // private-getJson pattern of `agentsApi.ts` (401 → UNAUTHENTICATED).
 
+import { httpError } from "./httpError";
+
 /** `GET .../routing` response (mirrors the Rust `RoutingDoc`). */
 export interface RoutingDoc {
   /** False only when `source === "none"`. */
@@ -52,7 +54,7 @@ async function getJson<T>(url: string): Promise<T> {
     credentials: "same-origin",
   });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }
 
@@ -64,6 +66,6 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
     credentials: "same-origin",
   });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }

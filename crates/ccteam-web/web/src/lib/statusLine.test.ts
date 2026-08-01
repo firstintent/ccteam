@@ -50,6 +50,23 @@ describe("formatContext", () => {
       formatContext({ used_tokens: 100_000, window_tokens: 200_000, pct: 50 }),
     ).toBe("ctx 100k / 200k (50%)");
   });
+
+  // A known window with no reported occupancy (a just-resumed ACP session)
+  // must read as unknown — rendering it as `0 (0%)` claims an empty context.
+  it("renders a dash when occupancy is unknown", () => {
+    expect(
+      formatContext({ used_tokens: null, window_tokens: 500_000, pct: null }),
+    ).toBe("ctx — / 500k (usage unknown)");
+    expect(
+      formatContext({ used_tokens: null, window_tokens: 0, pct: null }),
+    ).toBe("ctx —");
+  });
+
+  it("renders the used count alone when the window is unknown", () => {
+    expect(formatContext({ used_tokens: 5_000, window_tokens: 0, pct: null })).toBe(
+      "ctx 5k (window unknown)",
+    );
+  });
 });
 
 describe("formatStatusLine", () => {

@@ -1,18 +1,19 @@
 //! Curated per-session MCP config for Claude stream-json (v0.8.24 C1 / v0.9-W2).
 //!
 //! Spawn writes `<project>/.ccteam/chat/<sid>/mcp.json` with **only** the
-//! ccteam MCP server (7 tools), then `build_argv` passes
-//! `--mcp-config <path>` alongside `--strict-mcp-config` so ambient user
-//! MCP servers are not inherited (avoids the historical self-referential
-//! init deadlock).
+//! ccteam MCP server, then `build_argv` passes `--mcp-config <path>`. The
+//! stream-json path also passes `--strict-mcp-config` so ambient user MCP
+//! servers are not inherited (avoids the historical self-referential init
+//! deadlock); the terminal path omits it and relies on `--mcp-config` winning
+//! the same-name merge (claude's scope order puts `--mcp-config` above user
+//! scope), keeping the user's other ambient servers.
 //!
-//! Two wire forms:
-//! - **HTTP** (preferred): `type:"http"` against daemon `POST /mcp` with
-//!   session bearer `ccteam-sid:<sid>:<secret>`.
-//! - **stdio** (fallback): `ccteam internal mcp-serve` with secret env.
-//!
-//! Mode selection: `CCTEAM_MCP_CONFIG_MODE=stdio` forces stdio; otherwise
-//! HTTP is used (Claude CLI supports `type:"http"` + headers).
+//! **One wire form: HTTP.** `type:"http"` against daemon `POST /mcp` with the
+//! session bearer `ccteam-sid:<sid>:<secret>`. This is the same transport the
+//! global per-vendor registration uses (`ccteam_core::mcp_register`, admin
+//! bearer); a managed session's config just overrides the same-named entry
+//! with its own principal. Nothing spawns a `ccteam internal mcp-serve` stdio
+//! child any more — that binary stays only as a manually-wired escape hatch.
 
 use std::path::{Path, PathBuf};
 
@@ -34,44 +35,36 @@ pub fn session_mcp_bearer(sid: &str, secret: &str) -> String {
     format!("ccteam-sid:{sid}:{secret}")
 }
 
-/// Default daemon MCP HTTP URL. Override with `CCTEAM_MCP_HTTP_URL`.
-pub fn default_mcp_http_url() -> String {
+/// Last-resort daemon MCP URL, matching `daemon_cli::DEFAULT_WEB_BIND`'s port.
+/// Only correct when the daemon runs on the default bind — prefer
+/// `ccteam_core::mcp_register::resolve_mcp_http_url`, which also honours the
+/// bind the running daemon actually recorded.
+pub const FALLBACK_MCP_HTTP_URL: &str = "http://127.0.0.1:7331/mcp";
+
+/// Explicit operator override of the daemon MCP URL, if any:
+/// `CCTEAM_MCP_HTTP_URL` (full URL) or `CCTEAM_WEB_URL` (base + `/mcp`).
+/// `None` when neither is set — the caller decides what to fall back to.
+pub fn mcp_http_url_from_env() -> Option<String> {
     if let Ok(u) = std::env::var("CCTEAM_MCP_HTTP_URL") {
         let t = u.trim();
         if !t.is_empty() {
-            return t.to_string();
+            return Some(t.to_string());
         }
     }
     if let Ok(base) = std::env::var("CCTEAM_WEB_URL") {
         let b = base.trim().trim_end_matches('/');
         if !b.is_empty() {
-            return format!("{b}/mcp");
+            return Some(format!("{b}/mcp"));
         }
     }
-    "http://127.0.0.1:7331/mcp".to_string()
+    None
 }
 
-/// Which wire form to emit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum McpConfigMode {
-    /// HTTP streamable MCP against the daemon.
-    Http,
-    /// stdio `ccteam internal mcp-serve` child.
-    Stdio,
-}
-
-impl McpConfigMode {
-    /// Env-driven selection (`CCTEAM_MCP_CONFIG_MODE=stdio` → Stdio, else Http).
-    pub fn from_env() -> Self {
-        match std::env::var("CCTEAM_MCP_CONFIG_MODE")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "stdio" | "std-io" | "std" => Self::Stdio,
-            _ => Self::Http,
-        }
-    }
+/// Default daemon MCP HTTP URL: operator override, else the default-bind
+/// fallback. Used where no `CcteamPaths` is in scope (session spawn, whose
+/// config the daemon itself writes).
+pub fn default_mcp_http_url() -> String {
+    mcp_http_url_from_env().unwrap_or_else(|| FALLBACK_MCP_HTTP_URL.to_string())
 }
 
 /// Inputs for a curated session MCP config.
@@ -79,46 +72,28 @@ impl McpConfigMode {
 pub struct CuratedMcpInput<'a> {
     pub sid: &'a str,
     pub secret: &'a str,
-    pub role: &'a str,
-    pub slug: &'a str,
-    /// Absolute path to the ccteam binary (stdio mode).
-    pub ccteam_bin: &'a Path,
-    pub mode: McpConfigMode,
-    /// Full MCP HTTP URL (http mode). Empty → [`default_mcp_http_url`].
+    /// Full MCP HTTP URL. `None` / empty → [`default_mcp_http_url`].
     pub http_url: Option<&'a str>,
 }
 
 /// Build the JSON body for `--mcp-config` (object with `mcpServers`).
 pub fn build_curated_mcp_json(input: &CuratedMcpInput<'_>) -> Value {
-    let server = match input.mode {
-        McpConfigMode::Http => {
-            let url = input
-                .http_url
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .unwrap_or_else(default_mcp_http_url);
-            let bearer = session_mcp_bearer(input.sid, input.secret);
-            json!({
+    let url = input
+        .http_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(default_mcp_http_url);
+    let bearer = session_mcp_bearer(input.sid, input.secret);
+    json!({
+        "mcpServers": {
+            "ccteam": {
                 "type": "http",
                 "url": url,
                 "headers": {
                     "Authorization": format!("Bearer {bearer}"),
                 }
-            })
-        }
-        McpConfigMode::Stdio => {
-            let bin = input.ccteam_bin.to_string_lossy();
-            json!({
-                "command": bin,
-                "args": ["internal", "mcp-serve"],
-                "env": bridge_stdio_env(input.sid, input.secret, input.role, input.slug),
-            })
-        }
-    };
-    json!({
-        "mcpServers": {
-            "ccteam": server
+            }
         }
     })
 }
@@ -209,46 +184,15 @@ pub fn codex_thread_mcp_config_at(sid: &str, secret: &str, http_url: &str) -> Op
     }))
 }
 
-/// Env map for the stdio `ccteam internal mcp-serve` bridge that a vendor
-/// (currently only Claude's explicit stdio-mode `mcp.json`) spawns for a
-/// session. Carries the per-session identity (`CCTEAM_CHAT_*`) AND
-/// **propagates the daemon's `CCTEAM_HOME` / `CCTEAM_PROJECTS_ROOT`** when set:
-/// a vendor may spawn the MCP server with ONLY this map as its environment, so
-/// without these the bridge would resolve
-/// `~/.ccteam/run/mcp.sock` (the DEFAULT home) instead of the daemon's actual
-/// socket — connecting a delegated session to the wrong daemon under any
-/// non-default `CCTEAM_HOME`. Production (default home) is unaffected; this
-/// fixes custom-home / multi-daemon setups (found in v0.9.0 real-machine smoke).
-fn bridge_stdio_env(sid: &str, secret: &str, role: &str, slug: &str) -> Value {
-    let mut env = serde_json::Map::new();
-    env.insert("CCTEAM_CHAT_SID".into(), json!(sid));
-    env.insert("CCTEAM_CHAT_SECRET".into(), json!(secret));
-    env.insert("CCTEAM_CHAT_ROLE".into(), json!(role));
-    env.insert("CCTEAM_CHAT_SLUG".into(), json!(slug));
-    for key in ["CCTEAM_HOME", "CCTEAM_PROJECTS_ROOT"] {
-        if let Ok(v) = std::env::var(key) {
-            if !v.trim().is_empty() {
-                env.insert(key.into(), json!(v));
-            }
-        }
-    }
-    Value::Object(env)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn http_form_has_type_url_and_session_bearer() {
         let v = build_curated_mcp_json(&CuratedMcpInput {
             sid: "s3",
             secret: "sekret",
-            role: "cto",
-            slug: "demo",
-            ccteam_bin: Path::new("/usr/bin/ccteam"),
-            mode: McpConfigMode::Http,
             http_url: Some("http://127.0.0.1:7331/mcp"),
         });
         let srv = &v["mcpServers"]["ccteam"];
@@ -261,23 +205,21 @@ mod tests {
     }
 
     #[test]
-    fn stdio_form_has_command_args_and_secret_env() {
+    fn curated_config_never_emits_a_stdio_child() {
+        // One wire form. A stdio `command`/`args`/`env` entry would re-open the
+        // self-referential init path the HTTP move closed.
         let v = build_curated_mcp_json(&CuratedMcpInput {
             sid: "s1",
             secret: "abc",
-            role: "cto",
-            slug: "demo",
-            ccteam_bin: Path::new("/opt/ccteam"),
-            mode: McpConfigMode::Stdio,
             http_url: None,
         });
         let srv = &v["mcpServers"]["ccteam"];
-        assert_eq!(srv["command"], "/opt/ccteam");
-        assert_eq!(srv["args"][0], "internal");
-        assert_eq!(srv["args"][1], "mcp-serve");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_SECRET"], "abc");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_SID"], "s1");
-        assert_eq!(srv["env"]["CCTEAM_CHAT_ROLE"], "cto");
+        assert_eq!(srv["type"], "http");
+        assert!(srv.get("command").is_none());
+        assert!(srv.get("args").is_none());
+        assert!(srv.get("env").is_none());
+        // Empty/absent url falls back to the daemon default, never to stdio.
+        assert!(srv["url"].as_str().is_some_and(|u| u.ends_with("/mcp")));
     }
 
     #[test]
@@ -288,10 +230,6 @@ mod tests {
             &CuratedMcpInput {
                 sid: "s9",
                 secret: "x",
-                role: "",
-                slug: "p",
-                ccteam_bin: &PathBuf::from("/bin/ccteam"),
-                mode: McpConfigMode::Http,
                 http_url: Some("http://127.0.0.1:9/mcp"),
             },
         )
@@ -299,7 +237,7 @@ mod tests {
         assert!(path.exists());
         assert!(path.ends_with("mcp.json"));
         let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(body["mcpServers"]["ccteam"].is_object());
+        assert_eq!(body["mcpServers"]["ccteam"]["type"], "http");
     }
 
     #[test]

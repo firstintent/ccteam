@@ -88,6 +88,13 @@ pub struct InstallMarker {
     /// RFC3339 install time (informational).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<String>,
+    /// Absolute path of the installed executable, as written by whichever mode
+    /// installed it (`install.sh` or `make install` — both resolve the
+    /// destination through install.sh's one ladder). Recorded so "which ccteam
+    /// is the real one" is a stored fact rather than a PATH race: a second copy
+    /// earlier on PATH is then detectable instead of silently winning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<String>,
 }
 
 /// Resolve `~/.ccteam/install-channel`.
@@ -228,6 +235,7 @@ mod tests {
             channel: InstallChannel::Standalone,
             tag: Some("v0.9.7".to_string()),
             installed_at: Some("2026-07-22T00:00:00Z".to_string()),
+            bin: Some("/home/u/.local/bin/ccteam".to_string()),
         };
         write_marker(&p, &marker).unwrap();
         assert_eq!(read_marker(&p), Some(marker));
@@ -257,6 +265,7 @@ mod tests {
                 channel: InstallChannel::Source,
                 tag: None,
                 installed_at: None,
+                bin: None,
             },
         )
         .unwrap();

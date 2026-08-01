@@ -346,6 +346,79 @@ async fn raw_extras_transport_is_resolved_tag() {
     restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
 }
 
+/// Codex takes no model/effort argv — `codex app-server` is spawned bare and
+/// an explicit spawn-time pick rides the FIRST `turn/start` as a sticky
+/// override. That deferral is easy to break silently (the session looks fine,
+/// it just runs on the wrong model), and until now nothing asserted the
+/// `SpawnCtx` → `turn/start` half of it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn spawn_time_model_and_effort_ride_the_first_turn_start() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("spawn-tuning");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let turn_params: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let seen = Arc::clone(&turn_params);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        let method = req["method"].as_str().unwrap_or("").to_string();
+        if method == "turn/start" {
+            seen.lock().unwrap().push(req["params"].clone());
+        }
+        match method.as_str() {
+            "initialize" => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            "thread/start" => json!({ "result": { "thread": { "thread_id": "t-tuned" } } }),
+            "turn/start" => json!({ "result": { "turn": { "id": "turn-tuned" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "demo".into(),
+            },
+            &SpawnCtx {
+                slug: "tuned".into(),
+                sid: "codex-tuned".into(),
+                cwd: std::env::temp_dir(),
+                project_dir: std::env::temp_dir(),
+                extra_args: vec![],
+                model_id: Some("gpt-5.5-codex".into()),
+                effort: Some("xhigh".into()),
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: String::new(),
+                remote: None,
+            },
+        )
+        .await
+        .unwrap();
+    // The statusline reports the pick immediately — before the first turn even
+    // runs, a caller asking "what is this session running" gets what they asked
+    // for, not a blank.
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("gpt-5.5-codex"));
+    assert_eq!(status.effort.as_deref(), Some("xhigh"));
+
+    adapter
+        .submit_turn(&h, TurnInput::UserText("hi".into()))
+        .await
+        .expect("submit");
+    let params = turn_params.lock().unwrap().clone();
+    let first = params.first().expect("one turn/start");
+    assert_eq!(first["model"], json!("gpt-5.5-codex"), "params={first}");
+    assert_eq!(first["effort"], json!("xhigh"), "params={first}");
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
 /// Deterministic resume-before-turn precondition (the codex "thread not found"
 /// fix): `submit_turn` must `ensure_thread_loaded` first — when the thread is
 /// NOT loaded on the current connection (post-reconnect / restored-session /
@@ -2019,7 +2092,7 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
             a.tracker_snapshot("tid-d2")
                 .await
                 .and_then(|t| t.usage)
-                .map(|u| u.used_tokens == 188000 && u.window_tokens == 1_000_000)
+                .map(|u| u.used_tokens == Some(188000) && u.window_tokens == 1_000_000)
                 .unwrap_or(false)
         }
     })
@@ -2048,7 +2121,8 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
     let status = adapter.thread_status(&h).await.unwrap();
     let ctx = status.context.expect("usage must be present");
     assert_eq!(
-        ctx.used_tokens, 188000,
+        ctx.used_tokens,
+        Some(188000),
         "usage from tokenUsage.last (active context size), not .total (cumulative sum)"
     );
     assert_eq!(ctx.window_tokens, 1_000_000);
@@ -2101,7 +2175,7 @@ async fn tracker_single_dispatcher_not_per_subscribe() {
             a.tracker_snapshot("tid-d2")
                 .await
                 .and_then(|t| t.usage)
-                .map(|u| u.used_tokens == 500)
+                .map(|u| u.used_tokens == Some(500))
                 .unwrap_or(false)
         }
     })
@@ -2129,7 +2203,8 @@ async fn tracker_single_dispatcher_not_per_subscribe() {
         .usage
         .unwrap();
     assert_eq!(
-        usage.used_tokens, 500,
+        usage.used_tokens,
+        Some(500),
         "single dispatcher → no double-count"
     );
 
@@ -2972,6 +3047,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         owner: "user:web-api".into(),
         vendor_uuid: "t-prior".into(),
         model: None,
+        effort: None,
         host: "local".into(),
         created_at: String::new(),
         last_active: String::new(),

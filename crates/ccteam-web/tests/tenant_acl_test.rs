@@ -372,7 +372,7 @@ async fn per_tenant_im_config_self_serve_and_admin() {
     reg.save(&paths.users_dir()).unwrap();
     let alice_tok = alice.web_token.clone();
     let tenants_path = paths.users_dir();
-    let probe_path = paths.im_state_dir().join("lark-open-id-probes.jsonl");
+    let probe_path = paths.im_state_dir().join("rejected-senders.jsonl");
 
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
     let addr = spawn(state).await;
@@ -411,14 +411,14 @@ async fn per_tenant_im_config_self_serve_and_admin() {
             "{}\n{}\n",
             serde_json::json!({
                 "channel": format!("lark@{}", alice.id),
-                "open_id": "ou_captured_alice",
+                "sender_id": "ou_captured_alice",
                 "chat_id": "oc_alice_room",
                 "message_id": "om_alice",
                 "timestamp": 2000_u64
             }),
             serde_json::json!({
                 "channel": format!("lark@{}", bob.id),
-                "open_id": "ou_bob_private",
+                "sender_id": "ou_bob_private",
                 "chat_id": "oc_bob_room",
                 "message_id": "om_bob",
                 "timestamp": 2001_u64
@@ -520,7 +520,11 @@ async fn per_tenant_im_config_self_serve_and_admin() {
         .unwrap();
     assert_eq!(r.status(), 400, "owner uses global /config/im, not /me/im");
 
-    // 5. Replace semantics: alice re-PUTs an empty body → her Lark is cleared.
+    // 5. Per-platform PATCH semantics. This used to be whole-body REPLACE,
+    //    which silently destroyed data: the form never pre-fills a secret, so
+    //    saving a Telegram token submitted no `lark` key and wiped the Lark
+    //    app — unrecoverable without an app secret the UI can never show.
+    //    Absent now means "leave it alone"...
     let r = c
         .put(format!("http://{addr}/api/v1/me/im"))
         .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
@@ -529,10 +533,30 @@ async fn per_tenant_im_config_self_serve_and_admin() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+    let kept = TenantRegistry::load(&tenants_path);
+    assert_eq!(
+        kept.by_id(&alice.id)
+            .unwrap()
+            .lark
+            .as_ref()
+            .expect("an empty PUT must not clear an untouched platform")
+            .app_id,
+        "cli_a",
+    );
+
+    // ...and clearing is still possible, it just has to be said out loud.
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .json(&serde_json::json!({"lark": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
     let cleared = TenantRegistry::load(&tenants_path);
     assert!(
         cleared.by_id(&alice.id).unwrap().lark.is_none(),
-        "an empty PUT clears (replace semantics)",
+        "an explicit null clears the platform",
     );
 }
 
@@ -612,4 +636,244 @@ async fn project_acl_covers_legacy_action_pane_and_pty_routes() {
         404,
         "the owner must still reach its own project's pane snapshot"
     );
+}
+
+/// The FLEET surface is owner-scoped, not "any logged-in user".
+///
+/// Cross-user fix (2026-07-30): the whole `hosts` route file ran with no
+/// identity at all, so a plain tenant could read/mint the satellite join token
+/// (a credential that attaches a MACHINE to this daemon and then runs agent
+/// sessions on it), deregister the owner's satellites, drive the vendor-config
+/// MCP write, and read the owner's entire project catalog — slugs and absolute
+/// paths — off `GET /hosts/{host}` while `GET /api/v1/projects` correctly
+/// showed them nothing. Same病根 as the 2026-07-28 sweep: handing the caller
+/// something it was never authorized for.
+#[tokio::test]
+async fn fleet_surfaces_are_owner_scoped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+
+    let mut reg = TenantRegistry::default();
+    let tenant = reg.add("alice");
+    reg.save(&paths.users_dir()).unwrap();
+    let tenant_tok = tenant.web_token.clone();
+
+    // An admin-owned project, registered in the catalog AND on disk — what the
+    // host page would list for `local`.
+    let mut cfg = ccteam_core::config::CcteamConfig::default();
+    cfg.projects.push(ccteam_core::config::ProjectEntry {
+        slug: "adminproj".into(),
+        path: tmp.path().join("adminproj"),
+        host: "local".into(),
+        remote_slug: None,
+        remote_path: None,
+        team: "dev".into(),
+        installed_at: chrono::Utc::now(),
+    });
+    ccteam_core::config::save(&paths.root, &cfg).unwrap();
+    let admin_state = paths.project_state("adminproj");
+    std::fs::create_dir_all(admin_state.parent().unwrap()).unwrap();
+    let mut st = ccteam_core::ProjectState::initial_for_team("adminproj".into(), "dev".into());
+    st.owner = Some("user:web-api".into());
+    st.save(&admin_state).unwrap();
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    // 1. Join tokens — reading one is as good as minting one: both owner-only.
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant must not read the join token");
+    let r = c
+        .post(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant must not mint a join token");
+
+    // 2. Fleet membership + the vendor-config write.
+    let r = c
+        .delete(format!("http://{addr}/api/v1/hosts/dxa347"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "a tenant must not deregister a host");
+    let r = c
+        .post(format!("http://{addr}/api/v1/hosts/local/register-mcp"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "a tenant must not drive the vendor MCP registration write",
+    );
+
+    // 3. The host page's CATALOGED project list follows the SAME ownership
+    //    policy as `GET /api/v1/projects` — which, for this tenant, is empty.
+    //    (Un-cataloged satellite projects are a different thing: nobody owns
+    //    one yet and `POST /projects/import` lets any identity claim it, so
+    //    they stay visible — hiding them would break importing from the UI.)
+    let detail: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts/local"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["projects"],
+        serde_json::json!([]),
+        "the host page must not leak the owner's catalog to a tenant",
+    );
+
+    // 4. The owner still sees its own fleet: token readable, catalog intact.
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "the owner reads its own join token");
+    let detail: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/hosts/local"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail["projects"][0]["slug"],
+        serde_json::json!("adminproj"),
+        "the owner still sees its own projects on the host page",
+    );
+}
+
+/// A per-tenant Telegram bot is fail-closed, and the tenant can bind its own
+/// chat without ever re-typing the bot token.
+///
+/// The hole this closes (2026-07-30): `apply_tenant_im` always wrote
+/// `allowed_chat_ids: []`, `TelegramChannel` read an empty allowlist as OPEN,
+/// and `Gateway::principal` stamps everything arriving on `telegram@<tenant>`
+/// with that tenant's identity — with no way, anywhere in the product, to
+/// populate the list. Every self-serve Telegram bot was therefore world-open:
+/// whoever found the bot username spoke as that tenant.
+#[tokio::test]
+async fn tenant_telegram_binds_its_own_chat_and_starts_unbound() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let alice = reg.add("alice");
+    let bob = reg.add("bob");
+    // Seed the bot directly: the PUT path would call Telegram's `getMe`.
+    reg.set_telegram(
+        &alice.id,
+        Some(ccteam_core::tenants::TenantTelegram {
+            bot_token: "111:AAA".into(),
+            allowed_chat_ids: Vec::new(),
+        }),
+    );
+    reg.save(&paths.users_dir()).unwrap();
+    let alice_tok = alice.web_token.clone();
+    let tenants_path = paths.users_dir();
+    let probe_path = paths.im_state_dir().join("rejected-senders.jsonl");
+
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    // The daemon records the chats this fail-closed bot dropped; alice sees
+    // hers, and never another tenant's.
+    std::fs::create_dir_all(probe_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &probe_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "channel": format!("telegram@{}", alice.id),
+                "sender_id": "339498819",
+                "chat_id": "339498819",
+                "message_id": "42",
+                "timestamp": 2000_u64
+            }),
+            serde_json::json!({
+                "channel": format!("telegram@{}", bob.id),
+                "sender_id": "777777",
+                "chat_id": "777777",
+                "message_id": "43",
+                "timestamp": 2001_u64
+            }),
+        ),
+    )
+    .unwrap();
+    let candidates: serde_json::Value = c
+        .get(format!(
+            "http://{addr}/api/v1/me/im/telegram/chat-id-candidates?since=1500"
+        ))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates["candidates"][0]["sender_id"],
+        serde_json::json!("339498819"),
+    );
+    assert_eq!(
+        candidates["candidates"].as_array().unwrap().len(),
+        1,
+        "alice must not see another tenant's rejected chats",
+    );
+
+    // Binding takes the chat id alone — the token is write-only, so demanding
+    // it again to bind would be a dead end.
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im/telegram/allowed-chats"))
+        .header("Authorization", format!("Bearer ccteam:{alice_tok}"))
+        .json(&serde_json::json!({"allowed_chat_ids": [" 339498819 ", "339498819"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "alice binds her own chat");
+    let a = TenantRegistry::load(&tenants_path);
+    let tg = a.by_id(&alice.id).unwrap().telegram.clone().unwrap();
+    assert_eq!(tg.allowed_chat_ids, vec!["339498819"], "trimmed + deduped");
+    assert_eq!(tg.bot_token, "111:AAA", "binding never touches the token");
+
+    // The owner's bot is the global one — this surface is not for them.
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im/telegram/allowed-chats"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .json(&serde_json::json!({"allowed_chat_ids": ["1"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "owner uses /config/im");
+
+    // A tenant with no Telegram bot gets a reason, not a silent no-op.
+    let r = c
+        .put(format!("http://{addr}/api/v1/me/im/telegram/allowed-chats"))
+        .header("Authorization", format!("Bearer ccteam:{}", bob.web_token))
+        .json(&serde_json::json!({"allowed_chat_ids": ["1"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "no bot configured → 400 with a reason");
 }

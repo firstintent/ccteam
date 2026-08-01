@@ -12,6 +12,12 @@ use crate::PermissionMode;
 pub struct GrokSpawnInput<'a> {
     pub permission_mode: PermissionMode,
     pub model_id: Option<&'a str>,
+    /// Reasoning effort for the whole session (`grok agent --reasoning-effort`,
+    /// alias `--effort`). Grok declares the levels it takes in its own
+    /// handshake (`availableModels[]._meta.reasoningEfforts` — `low|medium|
+    /// high` on 0.2.118), which is what the spawn surfaces offer; an unknown
+    /// value is grok's to refuse, and it refuses loudly at spawn.
+    pub effort: Option<&'a str>,
 }
 
 /// Resolve the grok binary: `CCTEAM_GROK_BIN` else `"grok"`.
@@ -34,7 +40,8 @@ pub fn build_envs() -> Vec<(String, String)> {
     vec![("GROK_CLAUDE_MCPS_ENABLED".into(), "false".into())]
 }
 
-/// Build argv: `grok agent [--always-approve] [-m MODEL] stdio`.
+/// Build argv: `grok agent [--always-approve] [-m MODEL]
+/// [--reasoning-effort EFFORT] stdio`.
 pub fn build_argv(bin: &str, input: &GrokSpawnInput<'_>) -> Vec<String> {
     let mut argv = vec![bin.to_string(), "agent".into()];
     if !input.permission_mode.is_hitl() {
@@ -44,6 +51,10 @@ pub fn build_argv(bin: &str, input: &GrokSpawnInput<'_>) -> Vec<String> {
     if let Some(model) = input.model_id.map(str::trim).filter(|m| !m.is_empty()) {
         argv.push("-m".into());
         argv.push(model.to_string());
+    }
+    if let Some(effort) = input.effort.map(str::trim).filter(|e| !e.is_empty()) {
+        argv.push("--reasoning-effort".into());
+        argv.push(effort.to_string());
     }
     // Mode last — `grok agent --help` requires options before the mode.
     argv.push("stdio".into());
@@ -61,6 +72,7 @@ mod tests {
             &GrokSpawnInput {
                 permission_mode: PermissionMode::Skip,
                 model_id: None,
+                effort: None,
             },
         );
         assert_eq!(argv, vec!["grok", "agent", "--always-approve", "stdio"]);
@@ -73,6 +85,7 @@ mod tests {
             &GrokSpawnInput {
                 permission_mode: PermissionMode::Hitl,
                 model_id: Some("grok-4.5"),
+                effort: None,
             },
         );
         assert_eq!(argv, vec!["grok", "agent", "-m", "grok-4.5", "stdio"]);
@@ -94,8 +107,54 @@ mod tests {
             &GrokSpawnInput {
                 permission_mode: PermissionMode::Skip,
                 model_id: Some("x"),
+                effort: None,
             },
         );
         assert!(!argv.iter().any(|a| a.contains("system-prompt")));
+    }
+
+    /// Grok's effort was dropped at every spawn surface because its value set
+    /// was called "undocumented" — its own handshake declares it
+    /// (`_meta.reasoningEfforts`), and the CLI takes `--reasoning-effort`
+    /// (alias `--effort`). Omitted still means "grok's own default": no flag.
+    #[test]
+    fn effort_flag_only_when_picked_and_before_the_mode_token() {
+        let argv = build_argv(
+            "grok",
+            &GrokSpawnInput {
+                permission_mode: PermissionMode::Skip,
+                model_id: Some("grok-4.5"),
+                effort: Some("high"),
+            },
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "grok",
+                "agent",
+                "--always-approve",
+                "-m",
+                "grok-4.5",
+                "--reasoning-effort",
+                "high",
+                "stdio"
+            ]
+        );
+
+        // Blank / absent → nothing on the argv at all.
+        for effort in [None, Some(""), Some("   ")] {
+            let argv = build_argv(
+                "grok",
+                &GrokSpawnInput {
+                    permission_mode: PermissionMode::Skip,
+                    model_id: None,
+                    effort,
+                },
+            );
+            assert!(
+                !argv.iter().any(|a| a == "--reasoning-effort"),
+                "effort={effort:?} must not emit the flag"
+            );
+        }
     }
 }

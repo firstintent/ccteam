@@ -9,13 +9,53 @@
 //! - Model switches ride `session/set_model` (`{sessionId, modelId}`; kimi
 //!   also accepts `session/set_config_option` with configId `model`, but the
 //!   dedicated method is the pinned surface). `kimi acp` takes no model argv.
-//! - The effort axis (`session/set_config_option` thinking) is NOT wired in
-//!   this version (PRD non-goal — backlog).
+//! - The effort axis is kimi's `thinking` config option (ACP category
+//!   `thought_level`): a select of the current model's own levels
+//!   (`low|high|max`, plus `off` unless the model is always-thinking).
+//!   Read from the `configOptions` snapshot (handshake + every
+//!   `config_option_update`), written by `session/set_config_option`
+//!   (`/model <id> <effort>`) — same shape the opencode sibling uses under
+//!   its `effort` id. Spawn-time effort is still not wired (backlog): the
+//!   session starts at kimi's own default and `/model` moves it.
 //! - Kimi has no `--agent` persona face → sessions are roleless-only; kimi
 //!   reads the project `AGENTS.md` natively (no prompt injection red line).
 //! - Skip sessions use [`InboundPolicy::AutoAllowPermission`] — kimi's
 //!   `session/request_permission` reverse RPC must never silently block the
 //!   default (skip) posture.
+//!
+//! ## Known vendor limit: kimi hides its own turn failures (kimi 0.29.x)
+//!
+//! Verified on a live binary 2026-07-30. Kimi's ACP layer maps its internal
+//! `turn.ended` reason to a stop reason as
+//! `completed→end_turn`, `cancelled→cancelled`, `blocked→refusal`, and
+//! **`failed→end_turn`** (only `provider.filtered` becomes `refusal`). The
+//! error payload it holds at that moment — e.g.
+//! `{"code":"provider.rate_limit","message":"429 The engine is currently
+//! overloaded"}` after ten internal retries — goes to kimi's own rotating log
+//! files and **never onto the wire or stderr** (its stderr carries node
+//! warnings only). So a kimi turn that failed is indistinguishable, on every
+//! channel ccteam can see, from one that answered: ccteam reports the partial
+//! text as the reply because that is genuinely all the vendor said.
+//!
+//! ccteam's side of the contract is fixed generically — `stopReason` is parsed
+//! and any non-clean reason becomes a real `TurnFailed`
+//! ([`crate::execution::acp::AcpStopReason`]), which covers every ACP vendor
+//! including kimi's `refusal`/`cancelled` paths. Recovering the *collapsed*
+//! `failed` case would mean reading kimi's private session-log layout; that is
+//! deliberately NOT done (unstable non-contract surface). The honest signal a
+//! user gets meanwhile is the gateway's silence watchdog, which now reports the
+//! turn's elapsed time and last observed activity. Fix belongs upstream.
+//!
+//! ## Context usage arrives by pull, not push
+//!
+//! Kimi emits no `usage_update` and its `session/prompt` result carries no
+//! usage at all (verified on a live 0.26.0 binary: the whole response is
+//! `{"stopReason":"end_turn"}`), so there is nothing to fold at a turn
+//! boundary. It does publish `status` in `available_commands_update`, and that
+//! command reports real occupancy locally in ~15 ms — so this adapter carries
+//! [`crate::execution::acp::KIMI_STATUS_PROBE`] and the shared turn runner
+//! pulls after each turn. See that module for why the pull path is fenced the
+//! way it is.
 
 pub mod bridge;
 pub mod protocol;
@@ -33,13 +73,17 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::execution::acp::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};
+use crate::execution::acp::released_thread_status;
+use crate::execution::acp::{
+    route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning, KIMI_STATUS_PROBE,
+};
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
+use crate::execution::session_status::read_status_file;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
+    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use protocol::{
@@ -236,6 +280,16 @@ impl KimiAcpAdapter {
             effort: info.effort,
             ..Default::default()
         }));
+        // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
+        // a session whose context is already full; the handshake reports the
+        // model catalog but never the occupancy. Seed the gaps from the
+        // snapshot so the statusline resumes where it left off instead of
+        // reading as a brand-new session.
+        if let Some(snapshot) = read_status_file(&project_dir, &sid) {
+            if let Ok(mut st) = state.lock() {
+                st.seed_from_snapshot(&snapshot);
+            }
+        }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
         let dispatcher =
             spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
@@ -295,17 +349,7 @@ impl KimiAcpAdapter {
         };
         ThreadStatus {
             model: st.model.clone(),
-            context: match (st.used_tokens, st.window_tokens) {
-                (Some(used), Some(window)) => Some(ContextUsage {
-                    used_tokens: used,
-                    window_tokens: window,
-                }),
-                (None, Some(window)) => Some(ContextUsage {
-                    used_tokens: 0,
-                    window_tokens: window,
-                }),
-                _ => None,
-            },
+            context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
         }
@@ -351,6 +395,11 @@ impl KimiAcpAdapter {
                     state: Arc::clone(&live.state),
                     event_tx: live.event_tx.clone(),
                     session_id: live.session_id.clone(),
+                    project_dir: live.project_dir.clone(),
+                    sid: live.sid.clone(),
+                    // kimi pushes no usage at all — pull it from the status
+                    // command its own ACP layer advertises.
+                    context_probe: Some(KIMI_STATUS_PROBE),
                     tuning: AcpTurnTuning {
                         finalize_barrier: FINALIZE_BARRIER,
                         post_finalize_sleep: None,
@@ -385,7 +434,19 @@ fn spawn_notif_dispatcher(
     event_tx: broadcast::Sender<ThreadEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sub = transport.subscribe();
+        // Take the handshake backlog with the subscription: the vendor's
+        // command catalog and any opening usage arrive before this task exists.
+        let (early, mut sub) = transport.subscribe_with_early();
+        for n in early {
+            let events = if let Ok(mut guard) = state.lock() {
+                apply_notification(&mut guard, &n)
+            } else {
+                Vec::new()
+            };
+            for ev in events {
+                let _ = event_tx.send(ev);
+            }
+        }
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -508,6 +569,9 @@ impl HarnessAdapter for KimiAcpAdapter {
             }
         };
 
+        // The effort axis id kimi just declared (`thinking`), kept before
+        // `info` moves — never hardcoded here, see `ModelInfo`.
+        let effort_config_id = info.effort_config_id.clone();
         let live = self.register_live(
             transport,
             session_id,
@@ -518,19 +582,21 @@ impl HarnessAdapter for KimiAcpAdapter {
             info,
             ctx.permission_mode,
         );
-        // Best-effort spawn-time model via the SAME vendor-native seam the
-        // `/model` directive uses (`session/set_model`; `kimi acp` takes no
-        // model argv). A failure must never fail the spawn — the session
-        // then runs on kimi's own default (honest degrade, warn only). The
-        // effort axis is NOT wired in this version (PRD non-goal).
+        // Spawn-time model + effort through the SAME vendor-native seams the
+        // `/model` directive uses: `session/set_model` for the model (kimi's
+        // pinned method; `kimi acp` takes no model argv) and
+        // `session/set_config_option` for the effort axis it declared.
+        //
+        // A refusal FAILS the spawn (`spawn_pick_refused`): warning and
+        // continuing handed the caller a session running on something other
+        // than what they named, and reported success.
         if let Some(model) = ctx
             .model_id
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
         {
-            match live
-                .transport
+            live.transport
                 .call(
                     "session/set_model",
                     json!({
@@ -539,18 +605,35 @@ impl HarnessAdapter for KimiAcpAdapter {
                     }),
                 )
                 .await
-            {
-                Ok(_) => {
-                    if let Ok(mut st) = live.state.lock() {
-                        st.model = Some(model.to_string());
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    sid = %ctx.sid,
-                    model,
-                    error = %e,
-                    "kimi spawn-time session/set_model failed; continuing with vendor default"
-                ),
+                .map_err(|e| crate::execution::acp::spawn_pick_refused("model", model, e))?;
+            if let Ok(mut st) = live.state.lock() {
+                st.model = Some(model.to_string());
+            }
+        }
+        if let Some(effort) = ctx
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            // The id kimi just declared wins; `thinking` is only the cold
+            // fallback for a snapshot that omitted the axis (a model with no
+            // thinking knob). Either way the vendor gets the call and owns the
+            // verdict — same shape as the opencode sibling.
+            let config_id = effort_config_id.as_deref().unwrap_or("thinking");
+            live.transport
+                .call(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": live.session_id,
+                        "configId": config_id,
+                        "value": effort,
+                    }),
+                )
+                .await
+                .map_err(|e| crate::execution::acp::spawn_pick_refused("effort", effort, e))?;
+            if let Ok(mut st) = live.state.lock() {
+                st.effort = Some(effort.to_string());
             }
         }
         let mut handle = Self::make_handle(&live);
@@ -637,6 +720,11 @@ impl HarnessAdapter for KimiAcpAdapter {
                 } else {
                     ThreadStatus::default()
                 };
+                // No kimi-specific wording here any more: occupancy now comes
+                // from the vendor's own `/status` command, and when it cannot
+                // (a session that has not completed a turn yet), the shared
+                // render point says "usage unknown" in the same words every
+                // vendor uses.
                 let receipt = status
                     .status_suffix()
                     .unwrap_or_else(|| "kimi · acp".into());
@@ -719,10 +807,33 @@ impl HarnessAdapter for KimiAcpAdapter {
                             }
                         }
                         let mut receipt = format!("已切换 model → {model_id}（live）");
-                        if effort.is_some() {
-                            // Effort axis (kimi thinking) is not wired in this
-                            // version (PRD non-goal) — say so, never silently drop.
-                            receipt.push_str("；effort 轴本版未接，已忽略");
+                        if let Some(ref e) = effort {
+                            // Kimi's effort ladder is the `thought_level` config
+                            // option (`low|high|max`, plus `off` when the model
+                            // allows it) — the same `set_config_option` call the
+                            // opencode sibling makes under its own `effort` id.
+                            match live
+                                .transport
+                                .call(
+                                    "session/set_config_option",
+                                    json!({
+                                        "sessionId": live.session_id,
+                                        "configId": "thinking",
+                                        "value": e,
+                                    }),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    if let Ok(mut st) = live.state.lock() {
+                                        st.effort = Some(e.clone());
+                                    }
+                                    receipt.push_str(&format!("；effort → {e}"));
+                                }
+                                Err(err) => {
+                                    receipt.push_str(&format!("；effort 切换失败: {err}"));
+                                }
+                            }
                         }
                         Ok(DirectiveOutcome::Done { receipt })
                     }
@@ -739,7 +850,9 @@ impl HarnessAdapter for KimiAcpAdapter {
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(ThreadStatus::default());
+            // Released / restarted: answer from the persisted snapshot rather
+            // than going silent.
+            return Ok(released_thread_status(h));
         };
         Ok(self.thread_status_inner(&live))
     }

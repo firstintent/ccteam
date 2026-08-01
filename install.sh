@@ -31,7 +31,100 @@
 set -eu
 
 REPO="${CCTEAM_REPO:-firstintent/ccteam}"
-INSTALL_DIR="${CCTEAM_INSTALL_DIR:-$HOME/.local/bin}"
+
+# ---- install location: ONE ladder, shared by every install mode ----
+#
+# The failure this prevents: two install modes that each pick their own
+# destination leave two ccteam binaries, and whichever sorts first on PATH wins
+# — so "I rebuilt and it still misbehaves" becomes unfalsifiable (a real
+# incident: a repo build, a stale `cargo/bin` copy, and a dangling symlink, all
+# named ccteam).
+#
+# Ladder: explicit override → wherever ccteam ALREADY lives (if we can write
+# there) → the default. Landing on the existing copy is what keeps an upgrade
+# from ever creating a second one.
+#
+# `make install` calls `install.sh --print-install-dir` instead of
+# reimplementing this — a second copy of the ladder is the same class of bug.
+
+# Absolute, symlink-resolved path of $1 — so a link and its target are
+# recognised as the SAME binary rather than two rival installs.
+canonical_bin() {
+    _p="$1"
+    [ -n "$_p" ] || return 1
+    if [ -L "$_p" ]; then
+        _link="$(readlink "$_p" 2>/dev/null || true)"
+        case "$_link" in
+            /*) _p="$_link" ;;
+            ?*) _p="$(dirname "$_p")/$_link" ;;
+        esac
+    fi
+    _d="$(cd "$(dirname "$_p")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s\n' "$_d" "$(basename "$_p")"
+}
+
+resolve_install_dir() {
+    if [ -n "${CCTEAM_INSTALL_DIR:-}" ]; then
+        printf '%s\n' "$CCTEAM_INSTALL_DIR"
+        return 0
+    fi
+    _existing="$(command -v ccteam 2>/dev/null || true)"
+    if [ -n "$_existing" ]; then
+        _resolved="$(canonical_bin "$_existing" || true)"
+        _dir="${_resolved%/*}"
+        # A build-tree binary is not an install location — `cargo clean` or a
+        # redirected CARGO_TARGET_DIR would take the daemon's binary with it.
+        case "$_dir" in
+            */target/release|*/target/debug) _dir="" ;;
+        esac
+        if [ -n "$_dir" ] && [ -w "$_dir" ]; then
+            printf '%s\n' "$_dir"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+# Name any OTHER ccteam on PATH after installing.
+#
+# This is the failure that cost real debugging time: a second copy earlier on
+# PATH keeps winning, so an upgrade looks like it did nothing and "I rebuilt and
+# it still misbehaves" becomes unfalsifiable. We only REPORT — deleting a binary
+# the user never asked us to touch would be worse than the confusion.
+warn_shadow_copies() {
+    _installed="$(canonical_bin "$1" || printf '%s' "$1")"
+    _shadows=""
+    _oldifs="$IFS"
+    IFS=:
+    for _dir in $PATH; do
+        [ -n "$_dir" ] || _dir="."
+        [ -x "$_dir/ccteam" ] || continue
+        _cand="$(canonical_bin "$_dir/ccteam" || true)"
+        [ -n "$_cand" ] || continue
+        [ "$_cand" = "$_installed" ] && continue
+        case ":$_shadows:" in
+            *":$_cand:"*) continue ;;
+        esac
+        _shadows="${_shadows:+$_shadows:}$_cand"
+    done
+    IFS="$_oldifs"
+    [ -n "$_shadows" ] || return 0
+
+    warn "Other ccteam binaries are on your PATH:"
+    _oldifs="$IFS"
+    IFS=:
+    for _s in $_shadows; do
+        printf '        %s\n' "$_s"
+    done
+    IFS="$_oldifs"
+    printf '    Whichever comes first on PATH is the one you actually run, so an\n'
+    printf '    upgrade can look like it did nothing. Remove the stale ones, or\n'
+    printf '    reinstall over the one you keep:\n\n'
+    printf '      CCTEAM_INSTALL_DIR=<dir> sh install.sh\n\n'
+    printf '    Confirm which one wins with:  command -v ccteam\n'
+}
+
+INSTALL_DIR="${CCTEAM_INSTALL_DIR:-$(resolve_install_dir)}"
 
 # ---- pretty output helpers (no color when not a TTY) ----
 if [ -t 1 ]; then
@@ -221,8 +314,8 @@ write_install_marker() {
     _home="${CCTEAM_HOME:-$HOME/.ccteam}"
     _now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
     mkdir -p "$_home" 2>/dev/null || return 0
-    printf '{\n  "channel": "standalone",\n  "tag": "%s",\n  "installed_at": "%s"\n}\n' \
-        "$_tag" "$_now" > "$_home/install-channel" 2>/dev/null || true
+    printf '{\n  "channel": "standalone",\n  "tag": "%s",\n  "bin": "%s",\n  "installed_at": "%s"\n}\n' \
+        "$_tag" "$INSTALL_DIR/ccteam" "$_now" > "$_home/install-channel" 2>/dev/null || true
 }
 
 # Print the fresh-install next step without launching (装包 ≠ 启服).
@@ -308,6 +401,9 @@ do_uninstall() {
 # ---- main install ----
 main() {
     case "${1:-}" in
+        # Location query used by `make install` so both modes resolve the
+        # destination through this one ladder. Prints the dir and exits.
+        --print-install-dir) printf '%s\n' "$INSTALL_DIR"; exit 0 ;;
         --uninstall|uninstall) do_uninstall ;;
     esac
     if [ -n "${CCTEAM_UNINSTALL:-}" ]; then do_uninstall; fi
@@ -399,6 +495,17 @@ main() {
     chmod +x "$INSTALL_DIR/ccteam"
     write_install_marker "$TAG"
     info "${GREEN}Installed:${RESET} $INSTALL_DIR/ccteam ($TAG)"
+
+    # Say WHY this directory, when it isn't the documented default and the user
+    # didn't ask for it: landing on an existing install is what keeps a second
+    # binary from appearing, but silently writing somewhere unexpected is its own
+    # kind of surprise.
+    if [ -z "${CCTEAM_INSTALL_DIR:-}" ] && [ "$INSTALL_DIR" != "$HOME/.local/bin" ]; then
+        info "Updated your existing install in place (not the $HOME/.local/bin default)."
+        printf '    Install elsewhere with:  CCTEAM_INSTALL_DIR=<dir> sh install.sh\n'
+    fi
+
+    warn_shadow_copies "$INSTALL_DIR/ccteam"
 
     # ---- PATH hint ----
     case ":$PATH:" in

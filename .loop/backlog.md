@@ -46,6 +46,25 @@
 - **规格**:① 测试期望 path 改按 canonicalized root 构造(生产 canonicalize 行为不动);② 测试 UDS socket 落短路径(如 `/tmp/<短随机>`,测试自清理),不动生产 socket 布局。
 - **DoD**:两族在默认 shell TMPDIR(`/var/folders/…`)下全绿;`make test-baseline` 本机默认 shell 全绿;不动任何生产逻辑;writeback 绿。
 
+### ACP-LEDGER-1 失败/截断 turn 的 usage 不入账本(跨 vendor 同形洞)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im(gateway 事件泵记账段)` · **建议入口**:dev 会话
+- **背景**:`410647d` 修 ACP 结局契约时暴露的**既有**洞(非该 commit 引入):成本/token 账本行只在 `ThreadEvent::TurnCompleted` 分支写(`gateway.rs` 事件泵 `!protocol.is_terminal()` 段 → `ccteam_cost::estimate_cost`),而 `TurnFailed` 是终态事件、后面不跟 `TurnCompleted`(claude `is_failure` 早退、codex terminal error、现在 ACP 非 clean `stopReason` 三条路一致)。所以**失败 turn 烧掉的 token 全部不入账**;`max_tokens` 尤其刺眼——它定义上烧完了整个输出窗口,却在账本里消失。红线「成本全入账本」与之冲突。
+- **规格**:让终态失败也落账 —— 倾向让 `TurnFailed` 携带 usage(`ThreadEvent` 加字段属 additive,但 `CanonicalEvent`/progress schema 语义须零变,schema 权威 = `harness/progress_bridge`),或事件泵在 `TurnFailed` 分支复用同一 `estimate_cost` 路径取本 turn 已知 usage。**跨 vendor 一次修**(claude/codex/acp 同形),不做 per-vendor 补丁;若要改 `ThreadEvent` 公共形状先核全 caller(AGENTS §六)。
+- **DoD**:新定向测试先造缺陷态红(失败 turn 后账本零行)后修绿;三 vendor 路径各一断言;`make test` 基线只增;writeback 绿。
+
+### KIMI-UPSTREAM-1 kimi vendor 缺陷 watch(failed→end_turn 折叠 + 无 ctx 面)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness(kimi_acp)` · **建议入口**:dev 会话
+- **取活条件**:**watch 卡,平时不动** —— 仅在 kimi 升级后(或上游宣布修复)复核;无升级则本卡保持待排,不占并行位。
+- **背景**:kimi 0.29.x 两处 ACP 面缺陷,已在 `410647d` 的适配器头注释中实证记录、**有意不 workaround**(owner「不要硬修」+ 不耦合 vendor 私有布局,见 state 教训行):① `turn.ended reason=failed` → `stopReason:end_turn`(仅 `provider.filtered` → refusal),error 载荷(如 10 次退避后的 `429 engine overloaded`)只进它自己的日志文件,不上线也不进 stderr → **kimi 的 turn 失败对 ccteam 全通道不可见**;② ACP 面不 push context window / token(`usage_update`/`session_info_update` 在其 schema 内但从不构造)。**②已于 v0.9.12 `80e12f6e` 按契约面解决、不再是本卡余量**:kimi 不 push 但**答** —— `status` 是它自己 `available_commands_update` 公告的命令(已公告 = 契约面,与私有日志的界线正在于此),runner 自排 turn 拉真占用,解析失败保持原值。本卡余量 = ①(仍无任何契约面信号)。诊断入口(仅人工排障用,**不得**进产品代码路径):`~/.kimi-code/sessions/wd_<slug>_<hash>/session_<vendor_uuid>/logs/kimi-code.log` + 同目录 `agents/main/wire.jsonl`。
+- **规格**:每次 kimi 升级(或收到上游修复)复核 ① `stopReason` 是否透传 failed 类结局;顺带核 `usage_update` 是否终于出现(出现则 `80e12f6e` 的 probe 按其头注释「排在所有 push 通道之下」自然让位、可删)。修了则删适配器头注释对应段 + 接上共享路(`AcpStopReason` 已就位);未修则只更新版本号。**禁**:任何形式的私有 log/文件布局解析。
+- **DoD**:复核结论落卡面验证段(含实测 kimi 版本号);若上游已修则新增定向测试证透传;不改红线;writeback 绿。
+
+### DEPLOY-DRIFT-1 daemon build 漂移外显(doctor/status 比对运行中 daemon 与磁盘 binary)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli(doctor/status) + crates/ccteam-core(daemon lock/version 面)` · **建议入口**:dev 会话
+- **背景**:2026-07-31 实锤(state 教训「构建成功 ≠ 已部署」):tenant IM `/status` 无 👥 直接子会话的 ACL 修复(48bd3c81/e6fbef72)「修过两次仍复现」,实为运行中 daemon 仍是 Jul-29 旧映像(efce019)—— 修复 binary 建出来了但从未接管:部署软链指向 `repo/target/release`(被 `CARGO_TARGET_DIR` 重定向架空)+ daemon 未重启 + PATH 另有旧拷贝遮蔽。真实用户走 install.sh/`ccteam update` 升级后同样会踩「binary 换了、daemon 还旧」,且现状无任何面外显这个漂移(`daemon.lock` 的 `version` 字段甚至比 binary `--version` 落后一版,见背景复盘)。
+- **规格**:① daemon 启动把自身 `version + build sha`(即 `--version` 同源常量)写进 lock/状态面(`daemon.lock.version` 修正为同源即可,additive 加 sha 字段);② `ccteam doctor`(可含 `status`)比对运行中 daemon 的 build 与当前 CLI binary 的 build,漂移 → 可读告警「binary 已更新,daemon 仍旧,ccteam stop && ccteam start」;③ REST 版本面外显同字段。比对认 sha 不认 mtime;单 daemon 语义与红线零碰。
+- **DoD**:定向测试(漂移态告警 / 对齐态静默 / lock version 与 binary 同源);`make test` 基线只增;writeback 绿。
+
 ### P1-2 session_collect 游标去重
 - **状态**:待排 · **冲突域**:`crates/ccteam-im(session_collect MCP)` · **建议入口**:dev 会话
 - **背景**:collect 会重复返回已读段(v0.9.2 遗留 P1)。坐标开工时核现值。
@@ -98,4 +117,4 @@
 
 ## 历史波指针
 
-- **v0.9.11**(团队页驾驶舱重设计:TEAM-1 `33545de5` 拓扑独占+真链接+chips+ticker / TEAM-2 `9609eb37` routing REST+宪章编辑器+名册 / TEAM-3 `670e335f` playbooks 6 编队 / TEAM-4 `e6704daf` live model join / wave 修复 `b20e1e96` sessions_api 封口 / TEAM-5 `4c45ed01` host 反注册 REST+CLI / TEAM-6 `61692685` 名册按主机分组+在线离线+移除 / TEAM-7 `8ec9cf2e` 名册卡点击过滤拓扑 / TEAM-8 `ee32b6cd` 离线时长+stale 建议 / TEAM-9 `3621e871` HostsView 收敛动作面 / TEAM-10 `36c5793a` npm 可更新提示迁名册;明细 → `docs-local/versions/v0-9-11/`)· **v0.9.10**(MCP 工具面治理 + doctor 重排与自动注册 + web IA 改版 + IM 下一步提示 + 活跃消息 vendor 注入 + web ACL 收敛;完成卡明细 → `docs-local/versions/v0-9-10/`)· v0.9.9(全局 skill 库 + wait 240 诚实 pending + 烂测清理;明细 → `docs-local/versions/v0-9-9/README.md`)· v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)
+- **v0.9.12**(累积周期,全程 owner 直驱**无卡** —— 本节只作坐标:spawn 调参轴 `4d223cf5`/`02c6d1b5`/`a0b714f9`/`13d9ace7`/`daef69b0` · 上下文口径 `b6634b26`/`0dcce1da`/`80e12f6e` · 团队拓扑强度列 `18a79f04`/`00b622ab` · MCP 传输统一 HTTP `1ce65b86`/`379cd2b2` · install 落点阶梯 `08aa865e`/`53074ff8`/`ffc86515` · ACP 结局契约 `410647d5` · 租户面五修 `d66cb75a`/`5a62ae0f`/`53a06a09`/`89cc7a40`/`48bd3c81`+`e6fbef72`;一行史 → `.loop/history.md`)· **v0.9.11**(团队页驾驶舱重设计:TEAM-1 `33545de5` 拓扑独占+真链接+chips+ticker / TEAM-2 `9609eb37` routing REST+宪章编辑器+名册 / TEAM-3 `670e335f` playbooks 6 编队 / TEAM-4 `e6704daf` live model join / wave 修复 `b20e1e96` sessions_api 封口 / TEAM-5 `4c45ed01` host 反注册 REST+CLI / TEAM-6 `61692685` 名册按主机分组+在线离线+移除 / TEAM-7 `8ec9cf2e` 名册卡点击过滤拓扑 / TEAM-8 `ee32b6cd` 离线时长+stale 建议 / TEAM-9 `3621e871` HostsView 收敛动作面 / TEAM-10 `36c5793a` npm 可更新提示迁名册;明细 → `docs-local/versions/v0-9-11/`)· **v0.9.10**(MCP 工具面治理 + doctor 重排与自动注册 + web IA 改版 + IM 下一步提示 + 活跃消息 vendor 注入 + web ACL 收敛;完成卡明细 → `docs-local/versions/v0-9-10/`)· v0.9.9(全局 skill 库 + wait 240 诚实 pending + 烂测清理;明细 → `docs-local/versions/v0-9-9/README.md`)· v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)

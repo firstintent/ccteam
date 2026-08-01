@@ -294,10 +294,16 @@ fn bare_doctor_fails_when_claude_version_probe_exits_nonzero() {
 fn bare_doctor_exits_zero_when_claude_binary_and_mcp_are_both_ok() {
     let sb = sandbox();
     // Pre-register MCP and provide auth so the consolidated Claude row PASSes.
+    // Readiness requires the CURRENT (HTTP + admin bearer) shape — a legacy
+    // stdio `mcp-serve` entry reads as not-registered so it gets repaired.
     std::fs::write(
         &sb.claude_json,
-        json!({"mcpServers": {"ccteam": {"command": "/usr/bin/true", "args": [], "env": {}}}})
-            .to_string(),
+        json!({"mcpServers": {"ccteam": {
+            "type": "http",
+            "url": "http://127.0.0.1:7331/mcp",
+            "headers": {"Authorization": "Bearer ccteam:tok"},
+        }}})
+        .to_string(),
     )
     .unwrap();
     std::fs::write(sb.claude_config_home.join("credentials.json"), "{}").unwrap();

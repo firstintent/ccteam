@@ -49,6 +49,7 @@ use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
+use crate::execution::session_status::{read_status_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome,
@@ -260,10 +261,11 @@ fn spawn_status_tap(
                                     s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
                                 }
                                 if let Some((used, window)) = fresh_ctx {
-                                    s.context = Some(crate::ContextUsage {
-                                        used_tokens: used,
-                                        window_tokens: window,
-                                    });
+                                    s.context = Some(crate::ContextUsage::known(
+                                        used,
+                                        window,
+                                        crate::ContextSource::Derived,
+                                    ));
                                     // Tag the 1M model id when the real window is
                                     // 1M (same rule the TurnResult path applies).
                                     if window >= 1_000_000 {
@@ -310,9 +312,12 @@ fn spawn_status_tap(
                                 s.effort = Some(e);
                             }
                             // ONLY claude's own number; otherwise no context at all.
-                            s.context = real.map(|(used, window)| crate::ContextUsage {
-                                used_tokens: used,
-                                window_tokens: window,
+                            s.context = real.map(|(used, window)| {
+                                crate::ContextUsage::known(
+                                    used,
+                                    window,
+                                    crate::ContextSource::Derived,
+                                )
                             });
                             // Show the FULL model id (…[1m]) when the real window
                             // is 1M — both statusline surfaces tag the 1M id the
@@ -691,47 +696,6 @@ async fn apply_flag_settings_live(
 /// permissions, hooks, or the MCP surface.)
 const SET_PROTECTED_KEYS: &[&str] = &["permissions", "hooks", "mcpServers"];
 
-/// Persisted per-session status snapshot path, next to the turns mirror:
-/// `<project_dir>/.ccteam/chat/<sid>/status.json`. ccteam-owned (no
-/// Anthropic-internal dependency). Unlike the TUI adapter — which re-derives
-/// status from the on-disk transcript every call — a stream-json session's
-/// status lives only in the in-memory `LiveSession`, so it would vanish on
-/// idle-release / daemon restart (spawn-on-demand resume). Persisting it here
-/// lets [`HarnessAdapter::thread_status`] answer for a released/resumed
-/// session, giving the statusline the same durability the TUI gets for free.
-fn status_json_path(project_dir: &Path, sid: &str) -> PathBuf {
-    project_dir
-        .join(".ccteam")
-        .join("chat")
-        .join(sid)
-        .join("status.json")
-}
-
-/// Persist the latest status atomically (tmp + rename). Best-effort: a write
-/// failure only means a released session can't show its statusline until its
-/// next turn — never worth failing anything over.
-fn write_status_file(project_dir: &Path, sid: &str, status: &ThreadStatus) {
-    let path = status_json_path(project_dir, sid);
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let Ok(body) = serde_json::to_string(status) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
-/// Read the persisted status snapshot, or `None` if absent / unreadable.
-fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
-    let body = std::fs::read_to_string(status_json_path(project_dir, sid)).ok()?;
-    serde_json::from_str(&body).ok()
-}
-
 /// Whether `m` is claude's OWN model-picker placeholder (`SystemMsg::
 /// from_initialize`'s `models[0].value`, typically the literal string
 /// `"default"` — labeled "Default"/"recommended" in the picker) rather than a
@@ -980,7 +944,6 @@ impl ClaudeStreamJsonAdapter {
     /// has to guess its own LAN-reachable address).
     fn build_exec_spec(
         ctx: &SpawnCtx,
-        spec: &AgentSpecBrief,
         argv: Vec<String>,
         env: &[(String, String)],
         ship_mcp: bool,
@@ -1009,11 +972,6 @@ impl ClaudeStreamJsonAdapter {
             let input = crate::execution::mcp_config::CuratedMcpInput {
                 sid: &ctx.sid,
                 secret: &ctx.secret,
-                role: &spec.role,
-                slug: &ctx.slug,
-                // Unused in Http mode (no stdio command to resolve).
-                ccteam_bin: Path::new("ccteam"),
-                mode: crate::execution::mcp_config::McpConfigMode::Http,
                 http_url: Some(&daemon_url_mcp),
             };
             let body = crate::execution::mcp_config::build_curated_mcp_json(&input);
@@ -1121,7 +1079,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // identical for both.
         let (transport, init) = if let Some(remote) = ctx.remote.as_ref() {
             let build_spec = |resume: bool| {
-                Self::build_exec_spec(ctx, spec, make_argv(resume), &env, ship_mcp, &mcp_relpath)
+                Self::build_exec_spec(ctx, make_argv(resume), &env, ship_mcp, &mcp_relpath)
             };
             match Self::spawn_and_init_remote(remote, build_spec(resume)).await {
                 Ok(ok) => ok,

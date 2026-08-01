@@ -39,8 +39,32 @@ const CACHE_NO_CACHE: &str = "no-cache";
 #[folder = "web/dist/"]
 struct SpaAssets;
 
+/// Root-served PWA files. A web app manifest and its icons are fetched by the
+/// BROWSER, not by app code: the URL comes from `index.html` / the manifest
+/// itself, and the fetch is anonymous (no cookie, no Bearer). They were only
+/// mounted under `/app/`, so on a phone every one of them 404'd and the PWA
+/// install lost its name, icon, `start_url` and standalone display — a failure
+/// desktop never sees, because nothing on desktop asks for them.
+pub const ROOT_PWA_FILES: &[&str] = &[
+    "manifest.json",
+    "sw.js",
+    "icon-192.png",
+    "icon-512.png",
+    "logo.svg",
+];
+
+/// Whether `path` is one of the anonymous root PWA files (leading slash form).
+pub fn is_root_pwa_file(path: &str) -> bool {
+    path.strip_prefix('/')
+        .is_some_and(|name| ROOT_PWA_FILES.contains(&name))
+}
+
 pub fn router() -> Router<AppState> {
-    Router::new()
+    let mut router = Router::new();
+    for name in ROOT_PWA_FILES {
+        router = router.route(&format!("/{name}"), get(handle_root_pwa_file));
+    }
+    router
         // SPA hashed bundle. Vite emits paths like `assets/<n>-<hash>.js`
         // inside `dist/` when `base: "/app/"` is set, so the embedded
         // lookup key is the suffix after `/assets/spa/`.
@@ -54,6 +78,17 @@ pub fn router() -> Router<AppState> {
         // `/app/` and any deeper path — direct lookup first, then
         // react-router fallback to index.html.
         .route("/app/{*path}", get(handle_spa_path))
+}
+
+/// Serve a root PWA file from the embedded bundle. `no-cache` (not immutable):
+/// these names are unhashed, so a stale manifest or icon would otherwise
+/// outlive an upgrade.
+async fn handle_root_pwa_file(uri: axum::http::Uri) -> impl IntoResponse {
+    let name = uri.path().trim_start_matches('/').to_string();
+    match SpaAssets::get(&name) {
+        Some(file) => serve_embedded(&name, file, CACHE_NO_CACHE),
+        None => (StatusCode::NOT_FOUND, "asset not found").into_response(),
+    }
 }
 
 async fn handle_spa_bundle_asset(Path(path): Path<String>) -> impl IntoResponse {

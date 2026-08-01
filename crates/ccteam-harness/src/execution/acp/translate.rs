@@ -15,11 +15,14 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use super::protocol::{
-    content_text, cost_from_usage_update, is_replay, is_turn_boundary, usage_from_prompt_result,
-    AvailableCommand,
+    content_text, cost_from_usage_update, is_replay, is_turn_boundary,
+    stop_reason_from_prompt_result, usage_from_prompt_result, AvailableCommand,
 };
 use super::transport::{AcpWriteBarrier, Notification};
-use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
+use crate::{
+    ContextSource, ContextUsage, ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails,
+    ThreadStatus, UnifiedTokenUsage,
+};
 
 /// Min gap between liveness `ThreadEvent`s for message/thought chunks.
 /// Chunks arrive many times per second; the watchdog only needs a periodic
@@ -153,6 +156,10 @@ pub struct SessionTranslateState {
     pub model: Option<String>,
     pub window_tokens: Option<u64>,
     pub used_tokens: Option<u64>,
+    /// Which channel filled [`Self::used_tokens`]. Kept next to the number so
+    /// [`Self::context_usage`] can hand provenance to the single render point
+    /// instead of every vendor adapter re-deciding it.
+    pub used_source: ContextSource,
     pub effort: Option<String>,
     /// Session-cumulative USD from the latest non-zero `usage_update.cost`.
     pub session_cost_usd: Option<f64>,
@@ -167,6 +174,76 @@ pub struct SessionTranslateState {
 }
 
 impl SessionTranslateState {
+    /// Resolve this session's context usage — the ONE place every ACP vendor
+    /// answers `thread_status`'s context question from.
+    ///
+    /// A known window with no reported occupancy yields `used_tokens: None`
+    /// (rendered `"— / 500k (usage unknown)"`), **never** `0`: a freshly
+    /// resumed session has an empty in-memory counter and a full context, and
+    /// claiming `0%` there is a lie, not a placeholder. Both halves unknown
+    /// yields `None` so the statusline omits the fragment entirely.
+    pub fn context_usage(&self) -> Option<ContextUsage> {
+        match (self.used_tokens, self.window_tokens) {
+            (None, None) => None,
+            (used, window) => Some(ContextUsage {
+                used_tokens: used,
+                window_tokens: window.unwrap_or(0),
+                source: if used.is_some() {
+                    self.used_source
+                } else {
+                    ContextSource::Unknown
+                },
+            }),
+        }
+    }
+
+    /// Record occupancy together with the channel that produced it.
+    pub fn set_used_tokens(&mut self, used: u64, source: ContextSource) {
+        self.used_tokens = Some(used);
+        self.used_source = source;
+    }
+
+    /// The session's queryable status. Every ACP vendor answers
+    /// `thread_status` with exactly this — the shape is protocol-level, not
+    /// vendor-level, and duplicating it per adapter is how the three copies
+    /// of the occupancy bug got in.
+    pub fn thread_status(&self) -> ThreadStatus {
+        ThreadStatus {
+            model: self.model.clone(),
+            context: self.context_usage(),
+            effort: self.effort.clone(),
+            goal: None,
+        }
+    }
+
+    /// Seed a freshly (re)connected session from its persisted snapshot.
+    ///
+    /// The handshake is authoritative for what it actually reports — model,
+    /// effort and window come from the vendor's live catalog — so this only
+    /// fills what the handshake left empty. Occupancy is always taken from
+    /// the snapshot because ACP has no way to ask for it at connect time; it
+    /// was true at the session's last turn boundary and nothing has run
+    /// since, so it is the honest starting value, carried with the
+    /// provenance it was recorded under (never upgraded).
+    pub fn seed_from_snapshot(&mut self, snapshot: &ThreadStatus) {
+        if self.model.is_none() {
+            self.model.clone_from(&snapshot.model);
+        }
+        if self.effort.is_none() {
+            self.effort.clone_from(&snapshot.effort);
+        }
+        let Some(ctx) = snapshot.context else {
+            return;
+        };
+        if self.window_tokens.is_none() && ctx.window_tokens > 0 {
+            self.window_tokens = Some(ctx.window_tokens);
+        }
+        if let (None, Some(used)) = (self.used_tokens, ctx.used_tokens) {
+            self.used_tokens = Some(used);
+            self.used_source = ctx.source;
+        }
+    }
+
     pub fn begin_turn(&mut self, turn_id: impl Into<String>, done: Arc<Notify>) {
         self.begin_turn_with_prompt_barrier(turn_id, done, None);
     }
@@ -214,7 +291,7 @@ impl SessionTranslateState {
     }
 
     /// Signal (once) that the turn boundary was reached.
-    fn signal_turn_done(&mut self) {
+    pub fn signal_turn_done(&mut self) {
         if let Some(done) = self.turn_done.take() {
             done.notify_one();
         }
@@ -420,7 +497,8 @@ fn apply_session_update(
         // OpenCode: context occupancy + session-cumulative USD.
         "usage_update" => {
             if let Some(used) = update.get("used").and_then(|v| v.as_u64()) {
-                state.used_tokens = Some(used);
+                // Authoritative: the vendor states occupancy outright.
+                state.set_used_tokens(used, ContextSource::Reported);
             }
             if let Some(size) = update.get("size").and_then(|v| v.as_u64()) {
                 state.window_tokens = Some(size);
@@ -436,9 +514,23 @@ fn apply_session_update(
             apply_model_changed(state, params);
             Vec::new()
         }
-        "plan" | "current_mode_update" | "config_option_update" | "session_info_update" => {
+        // Kimi (and any configOptions vendor) republishes the WHOLE snapshot
+        // whenever model / thinking / mode changes — from our own
+        // `session/set_config_option` or from the user's own TUI. Re-plucking it
+        // is what keeps the statusline's model · effort honest mid-session;
+        // dropping the frame is why a switched effort used to read as the
+        // handshake value forever.
+        "config_option_update" => {
+            let info = super::protocol::pluck_model_info(&update);
+            if let Some(model) = info.model {
+                state.model = Some(model);
+            }
+            // An absent axis means the current model has none — report nothing
+            // rather than a stale level from the previous model.
+            state.effort = info.effort;
             Vec::new()
         }
+        "plan" | "current_mode_update" | "session_info_update" => Vec::new(),
         _ => {
             if !kind.is_empty() && state.warned_methods.insert(format!("update:{kind}")) {
                 tracing::warn!(kind, "acp: skipping unknown sessionUpdate kind (warn-once)");
@@ -527,6 +619,13 @@ fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<Thread
 }
 
 /// Finalize a turn from the `session/prompt` response (authoritative).
+///
+/// The response's `stopReason` decides whether this is an ANSWER or a
+/// FAILURE. Both shapes still deliver whatever the vendor managed to produce
+/// (never drop paid-for output), but a non-clean reason ends the turn with
+/// [`ThreadEvent::TurnFailed`] so the failure reaches the user, `turns.jsonl`
+/// (`outcome:"failed"`) and the delegation parent instead of masquerading as
+/// the final reply.
 pub fn finalize_from_prompt_result(
     state: &mut SessionTranslateState,
     result: &Value,
@@ -548,12 +647,18 @@ pub fn finalize_from_prompt_result(
     if let Some(m) = model.clone() {
         state.model = Some(m);
     }
+    // Per-turn token total ≈ occupancy, because a vendor reporting it here
+    // counts the WHOLE prompt (system + history) as this turn's input (grok,
+    // verified on the wire). A `0` is never occupancy — it is what a turn that
+    // made no model call reports (a vendor-local slash command, an aborted
+    // turn), and folding it in would blank a session that is really at 80%.
     if let Some(total) = result
         .pointer("/_meta/totalTokens")
         .or_else(|| result.pointer("/usage/totalTokens"))
         .and_then(|v| v.as_u64())
+        .filter(|t| *t > 0)
     {
-        state.used_tokens = Some(total);
+        state.set_used_tokens(total, ContextSource::Derived);
     }
     // Signal barrier if turn_completed never arrived (OpenCode has no such notif).
     state.signal_turn_done();
@@ -563,7 +668,31 @@ pub fn finalize_from_prompt_result(
         .map(|b| b.turn_id.clone())
         .unwrap_or_else(|| "unknown".into());
     let text = buf.map(|b| b.text).unwrap_or_default();
+    let stop = stop_reason_from_prompt_result(result);
     let mut out = Vec::new();
+    if let Some(message) = stop.failure_message() {
+        // Partial output first — it was produced and paid for, and it is often
+        // the only clue about how far the turn got. Empty text is dropped
+        // downstream, so an unconditional push stays correct.
+        out.push(ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: format!("{turn_id}-msg"),
+                details: ThreadItemDetails::AgentMessage(text),
+            },
+        });
+        // TurnFailed is the terminal event (same convention as
+        // claude_stream_json's `is_failure` path): it clears the gateway's
+        // in-flight marker, flushes the delegation boundary with
+        // `vendor_error`, and no TurnCompleted follows.
+        out.push(ThreadEvent::TurnFailed {
+            turn_id,
+            err: ThreadErrorEvent {
+                kind: format!("stop_reason:{}", stop.wire()),
+                message,
+            },
+        });
+        return out;
+    }
     out.push(ThreadEvent::ItemCompleted {
         item: ThreadItem {
             id: format!("{turn_id}-msg"),
@@ -607,6 +736,140 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use serde_json::json;
+
+    /// A resumed ACP session knows its window (from the vendor's model
+    /// catalog) but not its occupancy (an in-memory counter that restarts
+    /// empty). It must say "unknown", not "0%" — a grok session sitting at
+    /// 80% used to render `0 / 500k (0%)` after every daemon restart.
+    #[test]
+    fn window_without_occupancy_is_unknown_not_zero() {
+        let st = SessionTranslateState {
+            window_tokens: Some(500_000),
+            ..Default::default()
+        };
+        let ctx = st
+            .context_usage()
+            .expect("window alone is still reportable");
+        assert_eq!(ctx.used_tokens, None);
+        assert_eq!(ctx.window_tokens, 500_000);
+        assert_eq!(ctx.source, ContextSource::Unknown);
+        assert_eq!(ctx.render(), "— / 500k (usage unknown)");
+
+        // Nothing at all → no fragment on the statusline.
+        assert!(SessionTranslateState::default().context_usage().is_none());
+    }
+
+    /// `config_option_update` is how a configOptions vendor (kimi) announces
+    /// every model / thinking change — from our own `set_config_option` or
+    /// from the user's own TUI picker. Dropping the frame (what ccteam did)
+    /// froze the statusline at the handshake values for the rest of the
+    /// session.
+    #[test]
+    fn config_option_update_refreshes_model_and_effort() {
+        let mut st = SessionTranslateState {
+            model: Some("kimi-code/k3".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {"id":"model","category":"model","currentValue":"kimi-code/k3-256k",
+                             "options":[{"value":"kimi-code/k3-256k","name":"K3-256k"}]},
+                            {"id":"thinking","category":"thought_level","currentValue":"max",
+                             "options":[{"value":"low"},{"value":"high"},{"value":"max"}]}
+                        ]
+                    }
+                }),
+            },
+        );
+        assert_eq!(st.model.as_deref(), Some("kimi-code/k3-256k"));
+        assert_eq!(st.effort.as_deref(), Some("max"));
+
+        // Switching to a model with no thinking axis drops the option from the
+        // snapshot — report nothing, not the previous model's level.
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [
+                            {"id":"model","category":"model","currentValue":"kimi-code/plain",
+                             "options":[{"value":"kimi-code/plain","name":"Plain"}]},
+                            {"id":"mode","category":"mode","currentValue":"default",
+                             "options":[{"value":"default"}]}
+                        ]
+                    }
+                }),
+            },
+        );
+        assert_eq!(st.model.as_deref(), Some("kimi-code/plain"));
+        assert_eq!(st.effort, None);
+    }
+
+    /// `usage_update` is the vendor stating occupancy; the prompt result's
+    /// per-turn total is our own inference. Both fill the same slot, so the
+    /// slot has to remember which one spoke.
+    #[test]
+    fn occupancy_carries_the_channel_that_reported_it() {
+        let mut st = SessionTranslateState::default();
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {"sessionUpdate": "usage_update", "used": 4_000, "size": 128_000}
+                }),
+            },
+        );
+        let ctx = st.context_usage().unwrap();
+        assert_eq!(ctx.used_tokens, Some(4_000));
+        assert_eq!(ctx.source, ContextSource::Reported);
+
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t1", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 17_580}}),
+        );
+        assert_eq!(st.context_usage().unwrap().source, ContextSource::Derived);
+    }
+
+    /// A turn that made no model call reports `totalTokens: 0` (verified on a
+    /// live grok binary: a vendor-local slash command answers in 3ms with a
+    /// zero total). Folding that in would blank a session that is really at
+    /// 80% — the last real measurement must survive.
+    #[test]
+    fn zero_total_tokens_never_overwrites_real_occupancy() {
+        let mut st = SessionTranslateState {
+            window_tokens: Some(500_000),
+            ..Default::default()
+        };
+        st.begin_turn("t1", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 17_580}}),
+        );
+        assert_eq!(st.context_usage().unwrap().used_tokens, Some(17_580));
+
+        st.begin_turn("t2", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 0}}),
+        );
+        assert_eq!(
+            st.context_usage().unwrap().used_tokens,
+            Some(17_580),
+            "a no-model-call turn must not blank the last real measurement"
+        );
+    }
 
     #[test]
     fn buffers_message_not_thought_and_finalizes_once() {
@@ -691,6 +954,87 @@ mod tests {
             ThreadEvent::TurnCompleted { usage, .. } => *usage,
             _ => unreachable!(),
         };
+    }
+
+    /// Buffer some partial text, then finalize with `reason`.
+    fn finalize_with_stop_reason(reason: &str) -> Vec<ThreadEvent> {
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t-stop", Arc::new(Notify::new()));
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type":"text","text":"先读 state"}
+                    }
+                }),
+            },
+        );
+        let events = finalize_from_prompt_result(&mut st, &json!({ "stopReason": reason }));
+        assert!(
+            st.buffer.is_none(),
+            "the turn buffer must be released whatever the outcome"
+        );
+        events
+    }
+
+    #[test]
+    fn non_clean_stop_reason_delivers_partial_text_then_fails_the_turn() {
+        // The s172 shape: a vendor ends a turn abnormally after emitting a
+        // mid-turn preamble. Pre-fix this finalized as TurnCompleted and the
+        // preamble was delivered as if it were the final answer.
+        for (reason, want_kind) in [
+            ("refusal", "stop_reason:refusal"),
+            ("max_tokens", "stop_reason:max_tokens"),
+            ("max_turn_requests", "stop_reason:max_turn_requests"),
+            ("something_new", "stop_reason:something_new"),
+        ] {
+            let events = finalize_with_stop_reason(reason);
+            assert_eq!(events.len(), 2, "{reason}: partial text + failure");
+            match &events[0] {
+                ThreadEvent::ItemCompleted { item } => match &item.details {
+                    // Never drop output the user already paid for.
+                    ThreadItemDetails::AgentMessage(t) => assert_eq!(t, "先读 state"),
+                    other => panic!("{reason}: unexpected {other:?}"),
+                },
+                other => panic!("{reason}: unexpected {other:?}"),
+            }
+            match &events[1] {
+                ThreadEvent::TurnFailed { turn_id, err } => {
+                    assert_eq!(turn_id, "t-stop");
+                    assert_eq!(err.kind, want_kind);
+                    assert!(err.message.contains(reason), "{reason}: {}", err.message);
+                }
+                other => panic!("{reason}: must be TurnFailed, got {other:?}"),
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ThreadEvent::TurnCompleted { .. })),
+                "{reason}: a failed turn must not also report completion"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_stop_reasons_still_complete_normally() {
+        // end_turn, cancelled and an absent field must all keep the answer
+        // path — a `/stop` is not a defect and an omitted field is not either.
+        for reason in ["end_turn", "cancelled"] {
+            let events = finalize_with_stop_reason(reason);
+            assert_eq!(events.len(), 2, "{reason}");
+            assert!(
+                matches!(&events[1], ThreadEvent::TurnCompleted { .. }),
+                "{reason}: must complete, got {:?}",
+                events[1]
+            );
+        }
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t-bare", Arc::new(Notify::new()));
+        let events = finalize_from_prompt_result(&mut st, &json!({}));
+        assert!(matches!(&events[1], ThreadEvent::TurnCompleted { .. }));
     }
 
     #[test]

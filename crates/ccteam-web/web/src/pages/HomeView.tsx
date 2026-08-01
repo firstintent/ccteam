@@ -22,16 +22,17 @@ import { useEffect, useRef, useState } from "react";
 import { Folder, GitBranch, Globe } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { ChatComposer } from "../components/ChatComposer";
+import { useVendorCatalog } from "../hooks/useVendorCatalog";
 import type { TurnAttachment } from "../lib/attachmentsApi";
 import { VendorChip } from "../components/VendorChip";
 import { toastBus } from "../lib/toastBus";
 import { makeT, tRemoteProjectPath, type Lang } from "../lib/i18n";
 import {
   defaultDraft,
+  effortSwitchFor,
   modelSwitchFor,
   normalizeDraft,
   slugFromPath,
-  wireEffort,
   wireProtocol,
   type ComposerDraft,
 } from "../lib/vendors";
@@ -52,10 +53,16 @@ export interface ProjectHostIdentity {
 
 const MODEL_DRAFT_KEY = "ccteam.home.model.v1";
 
+/** The persisted draft is deliberately NOT normalized here: the live vendor
+ *  catalog (`GET /api/v1/models`) has not loaded at mount, so a static-only
+ *  normalize would wipe a perfectly good `kimi-code/k3` for looking unknown.
+ *  Render-time normalization below — which sees the catalog — is the single
+ *  validity gate (it also drops the retired `effortKey` of an older SPA's
+ *  draft, degrading it to the vendor default rather than crashing). */
 function loadModelDraft(): ComposerDraft {
   try {
     const raw = localStorage.getItem(MODEL_DRAFT_KEY);
-    if (raw) return normalizeDraft({ ...defaultDraft(), ...JSON.parse(raw) });
+    if (raw) return { ...defaultDraft(), ...(JSON.parse(raw) as Partial<ComposerDraft>) };
   } catch {
     /* fall through */
   }
@@ -205,6 +212,9 @@ export default function HomeView({
   const [hostDetails, setHostDetails] = useState<Record<string, HostDetail | null>>({});
   const [host, setHost] = useState<string>("local");
   const [draft, setDraft] = useState<ComposerDraft>(() => loadModelDraft());
+  // What each installed vendor actually declares (models + effort tokens);
+  // `{}` until it loads / on an older daemon → the static registry answers.
+  const catalog = useVendorCatalog();
   const [pending, setPending] = useState(false);
   // 快速开始 template pick → composer draft text (bump-nonce channel).
   const [prefill, setPrefill] = useState({ text: "", nonce: 0 });
@@ -219,7 +229,7 @@ export default function HomeView({
     const patch = applyPlaybook(id, lang);
     if (!patch) return;
     setPrefill((cur) => ({ text: patch.text, nonce: cur.nonce + 1 }));
-    setDraft((cur) => normalizeDraft({ ...cur, vendor: patch.vendor }));
+    setDraft((cur) => normalizeDraft({ ...cur, vendor: patch.vendor }, catalog));
   };
 
   // Team page 起手 CTA lands `{ state: { playbook: id } }` on `/`: apply it
@@ -315,11 +325,15 @@ export default function HomeView({
   // 主机绑定 vendor: the composer only offers harnesses installed on the
   // effective host (null = unknown → don't filter); a pick the host can't
   // run is normalized to the host's first installed vendor, derived too.
+  // Normalizing on EVERY render (not just on a host-forced vendor swap) is
+  // what lets the persisted draft stay raw until the catalog lands.
   const hostVendors = allowedVendorsFor(hostDetails[effectiveHost]);
-  const effectiveDraft =
+  const effectiveDraft = normalizeDraft(
     hostVendors && !hostVendors.includes(draft.vendor)
-      ? normalizeDraft({ ...draft, vendor: hostVendors[0]! })
-      : draft;
+      ? { ...draft, vendor: hostVendors[0]! }
+      : draft,
+    catalog,
+  );
 
   const openNewProject = () => {
     setHost("local");
@@ -359,14 +373,16 @@ export default function HomeView({
       }
       // v0.8.24 A-U3 — an explicit model/effort pick rides the create form
       // (vendor-native spawn seam), replacing the old post-spawn `/model`
-      // control turn.
+      // control turn. Both are the vendor's OWN tokens and both go out for
+      // EVERY vendor (omitted only on the default row): dropping grok's /
+      // kimi's / opencode's effort client-side is what made the menu lie.
       const { sid } = await apiCreateSession(slug, {
         role,
         vendor: effectiveDraft.vendor,
         permission_mode: effectiveDraft.hitl ? "hitl" : "skip",
         protocol: wireProtocol(effectiveDraft),
-        model: modelSwitchFor(effectiveDraft) ?? undefined,
-        effort: wireEffort(effectiveDraft) ?? undefined,
+        model: modelSwitchFor(effectiveDraft, catalog) ?? undefined,
+        effort: effortSwitchFor(effectiveDraft, catalog) ?? undefined,
       });
       await submitTurn(sid, text, attachments);
       return sid;
@@ -555,6 +571,7 @@ export default function HomeView({
             disabled={pending}
             draft={effectiveDraft}
             onDraftChange={setDraft}
+            catalog={catalog}
             allowedVendors={hostVendors ?? undefined}
             onSend={launch}
             sendTestId="home-send"

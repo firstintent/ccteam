@@ -133,26 +133,243 @@ pub fn tenant_of_bot_channel(channel: &str) -> Option<&str> {
     channel.split_once('@').map(|(_platform, tid)| tid)
 }
 
-/// Lark/Feishu setup helper event: an inbound message whose sender was parsed
-/// successfully but rejected by the provider-level `allowed_user_ids` gate.
+/// Setup-helper event: an inbound message whose sender was parsed successfully
+/// but rejected by the provider-level allowlist gate.
 ///
 /// The daemon records these to a small JSONL file so the web Settings flow can
-/// show the user their own `ou_...` open_id without asking them to inspect
-/// server logs. The message is still denied and never reaches the gateway.
+/// show a user the id to allow — their own Lark `ou_...` open_id, or their
+/// Telegram `chat_id` — without asking them to read server logs. The message is
+/// still denied and never reaches the gateway.
+///
+/// One shape for every platform on purpose: the discovery flow is identical, so
+/// a second struct would be the same fact living in two homes. [`Self::channel`]
+/// says which bot saw it and therefore how to read [`Self::sender_id`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LarkOpenIdProbe {
-    /// Channel key that saw the event: `"lark"` for the global/admin bot or
-    /// `"lark@<tenant_id>"` for a per-user bot.
+pub struct RejectedSenderProbe {
+    /// Channel key that saw the event: `"lark"` / `"telegram"` for the
+    /// global/admin bot, or `"<platform>@<tenant_id>"` for a per-user bot.
     pub channel: String,
-    /// Sender `open_id` (`ou_...`) to place in `allowed_user_ids`.
-    pub open_id: String,
-    /// Conversation id (`oc_...`), kept for diagnostics and masked by the web
-    /// API.
+    /// The id to place in the allowlist — a Lark sender `open_id` (`ou_...`),
+    /// or a Telegram `chat_id`.
+    pub sender_id: String,
+    /// Conversation id (Lark `oc_...`; for Telegram the same value as
+    /// [`Self::sender_id`]), kept for diagnostics and masked by the web API.
     pub chat_id: String,
-    /// Raw Lark/Feishu message id (`om_...`).
+    /// Raw provider message id (Lark `om_...`; Telegram the numeric id).
     pub message_id: String,
-    /// Event time in Unix seconds, copied from the Lark message when present.
+    /// Event time in Unix seconds, copied from the message when present.
     pub timestamp: u64,
+}
+
+impl RejectedSenderProbe {
+    /// Append this probe to `path` as one JSONL line, creating the parent dir.
+    ///
+    /// Best effort by construction: a discovery aid must never interfere with
+    /// message handling, so every failure logs a WARN and returns. Lives here
+    /// rather than in a provider so both Lark and Telegram write the one
+    /// format the web setup flow reads.
+    pub async fn append_to(&self, path: &std::path::Path) {
+        use tokio::io::AsyncWriteExt;
+        let line = match serde_json::to_string(self) {
+            Ok(line) => format!("{line}\n"),
+            Err(err) => {
+                tracing::warn!(error = %err, "rejected-sender probe encode failed");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!(
+                    path = %parent.display(), error = %err,
+                    "rejected-sender probe dir create failed"
+                );
+                return;
+            }
+        }
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(line.as_bytes()).await {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "rejected-sender probe append failed"
+                    );
+                } else if let Err(err) = file.flush().await {
+                    tracing::warn!(
+                        path = %path.display(), error = %err,
+                        "rejected-sender probe flush failed"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(), error = %err,
+                    "rejected-sender probe open failed"
+                );
+            }
+        }
+    }
+}
+
+/// Shared provider-edge handling for an inbound sender rejected by an IM
+/// allowlist.
+///
+/// Rejection stays fail-closed: this helper has no inbound sender and cannot
+/// forward the rejected payload to the gateway. It only preserves the setup
+/// probe and sends one static, actionable notice per sender for this channel
+/// listener's lifetime. Keeping both actions here prevents Telegram, Lark, and
+/// future providers from drifting back to a silent message black hole.
+#[derive(Debug, Default)]
+pub(crate) struct RejectedSenderNotifier {
+    probe_path: Option<std::path::PathBuf>,
+    notice_state: tokio::sync::Mutex<RejectedSenderNoticeState>,
+}
+
+/// A rejected-sender flood must not grow daemon memory or bot replies without
+/// bound. Normal personal bots have one or a handful of candidates; reaching
+/// this ceiling means the listener is under abuse, so it stays fail-closed and
+/// keeps writing setup probes but stops notifying new identities until reload.
+const MAX_REJECTED_SENDERS_PER_LISTENER: usize = 1024;
+const MAX_REJECTED_NOTICES_PER_MINUTE: usize = 20;
+const REJECTED_NOTICE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct RejectedSenderNoticeState {
+    notified_senders: std::collections::HashSet<String>,
+    notice_times: std::collections::VecDeque<std::time::Instant>,
+    capacity_warning_emitted: bool,
+    rate_warning_emitted: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RejectedSenderNoticeDecision {
+    Notify,
+    AlreadyNotified,
+    AtCapacity { emit_warning: bool },
+    RateLimited { emit_warning: bool },
+}
+
+impl RejectedSenderNoticeState {
+    fn admit(&mut self, sender_id: &str, now: std::time::Instant) -> RejectedSenderNoticeDecision {
+        if self.notified_senders.contains(sender_id) {
+            return RejectedSenderNoticeDecision::AlreadyNotified;
+        }
+        if self.notified_senders.len() >= MAX_REJECTED_SENDERS_PER_LISTENER {
+            let emit_warning = !self.capacity_warning_emitted;
+            self.capacity_warning_emitted = true;
+            return RejectedSenderNoticeDecision::AtCapacity { emit_warning };
+        }
+
+        self.notice_times
+            .retain(|sent_at| now.duration_since(*sent_at) < REJECTED_NOTICE_WINDOW);
+        if self.notice_times.len() >= MAX_REJECTED_NOTICES_PER_MINUTE {
+            let emit_warning = !self.rate_warning_emitted;
+            self.rate_warning_emitted = true;
+            return RejectedSenderNoticeDecision::RateLimited { emit_warning };
+        }
+
+        self.rate_warning_emitted = false;
+        self.notified_senders.insert(sender_id.to_string());
+        self.notice_times.push_back(now);
+        RejectedSenderNoticeDecision::Notify
+    }
+}
+
+impl RejectedSenderNotifier {
+    pub(crate) fn with_probe_path(path: std::path::PathBuf) -> Self {
+        Self {
+            probe_path: Some(path),
+            notice_state: tokio::sync::Mutex::new(RejectedSenderNoticeState::default()),
+        }
+    }
+
+    /// Record every rejected event for the web binding flow, then notify the
+    /// sender at most once. Both operations are best effort and never weaken
+    /// the allowlist decision made by the caller.
+    pub(crate) async fn record_and_notify<C>(&self, channel: &C, probe: RejectedSenderProbe)
+    where
+        C: Channel + ?Sized,
+    {
+        if let Some(path) = self.probe_path.as_ref() {
+            probe.append_to(path).await;
+        }
+
+        let decision = {
+            self.notice_state
+                .lock()
+                .await
+                .admit(&probe.sender_id, std::time::Instant::now())
+        };
+        match decision {
+            RejectedSenderNoticeDecision::Notify => {}
+            RejectedSenderNoticeDecision::AlreadyNotified => {
+                tracing::debug!(
+                    channel = %probe.channel,
+                    sender_id = %probe.sender_id,
+                    "dropping another event from rejected IM sender"
+                );
+                return;
+            }
+            RejectedSenderNoticeDecision::AtCapacity { emit_warning } => {
+                if emit_warning {
+                    tracing::warn!(
+                        channel = %probe.channel,
+                        max_senders = MAX_REJECTED_SENDERS_PER_LISTENER,
+                        "rejected-sender notice capacity reached; suppressing notices for new identities until listener reload"
+                    );
+                }
+                tracing::debug!(
+                    channel = %probe.channel,
+                    sender_id = %probe.sender_id,
+                    "rejected-sender binding notice suppressed at capacity"
+                );
+                return;
+            }
+            RejectedSenderNoticeDecision::RateLimited { emit_warning } => {
+                if emit_warning {
+                    tracing::warn!(
+                        channel = %probe.channel,
+                        max_notices = MAX_REJECTED_NOTICES_PER_MINUTE,
+                        "rejected-sender notice rate limit reached; suppressing this burst"
+                    );
+                }
+                tracing::debug!(
+                    channel = %probe.channel,
+                    sender_id = %probe.sender_id,
+                    "rejected-sender binding notice suppressed by rate limit"
+                );
+                return;
+            }
+        }
+
+        tracing::warn!(
+            channel = %probe.channel,
+            sender_id = %probe.sender_id,
+            "dropping event from rejected IM sender; sending one binding notice"
+        );
+        let notice = rejected_sender_notice(&probe.sender_id);
+        if let Err(err) = channel
+            .send(&SendMessage::new(notice, probe.chat_id.clone()))
+            .await
+        {
+            tracing::warn!(
+                channel = %probe.channel,
+                sender_id = %probe.sender_id,
+                error = %err,
+                "rejected-sender binding notice send failed"
+            );
+        }
+    }
+}
+
+fn rejected_sender_notice(sender_id: &str) -> String {
+    format!(
+        "此 IM 身份尚未绑定，消息未交给任何 agent。\n绑定 ID: {sender_id}\n请用此 bot 所属的 ccteam 账号打开「设置 → 接入」，绑定该 ID 后重试。"
+    )
 }
 
 /// How an [`OutboundFile`] should be sent (V0.8.4 P2b).
@@ -423,6 +640,7 @@ pub fn sanitize_attachment_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::providers::mock::MockChannel;
 
     /// v0.8.20 F2 — the platform prefix is what platform-keyed logic (ACL,
     /// menus) uses; the `@`-suffixed full name is the per-bot routing key.
@@ -448,5 +666,104 @@ mod tests {
         // Quotes/angle brackets would break the `image_path="…"` attr.
         assert_eq!(sanitize_attachment_name("foo\"bar.pdf"), "foobar.pdf");
         assert_eq!(sanitize_attachment_name("a<b>c.png"), "abc.png");
+    }
+
+    #[tokio::test]
+    async fn rejected_sender_is_probed_each_time_but_notified_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let probe_path = tmp.path().join("rejected-senders.jsonl");
+        let notifier = RejectedSenderNotifier::with_probe_path(probe_path.clone());
+        let channel = MockChannel::new().with_name("telegram@u123");
+        let first = RejectedSenderProbe {
+            channel: "telegram@u123".into(),
+            sender_id: "339498819".into(),
+            chat_id: "339498819".into(),
+            message_id: "1".into(),
+            timestamp: 10,
+        };
+        let mut second = first.clone();
+        second.message_id = "2".into();
+        second.timestamp = 11;
+
+        notifier.record_and_notify(&channel, first.clone()).await;
+        notifier.record_and_notify(&channel, second.clone()).await;
+
+        let outbox = channel.outbox().await;
+        assert_eq!(outbox.len(), 1, "repeat rejects must not spam the sender");
+        assert_eq!(outbox[0].recipient, "339498819");
+        assert_eq!(
+            outbox[0].content,
+            "此 IM 身份尚未绑定，消息未交给任何 agent。\n绑定 ID: 339498819\n请用此 bot 所属的 ccteam 账号打开「设置 → 接入」，绑定该 ID 后重试。"
+        );
+
+        let lines = tokio::fs::read_to_string(&probe_path).await.unwrap();
+        let probes = lines
+            .lines()
+            .map(|line| serde_json::from_str::<RejectedSenderProbe>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            probes,
+            vec![first, second],
+            "every reject remains discoverable"
+        );
+
+        // The helper can only send outbound. It cannot inject the rejected
+        // payload (or its notice) into the gateway-facing inbound stream.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        channel.listen(tx).await.unwrap();
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn rejected_sender_notice_state_is_rate_and_memory_bounded() {
+        let mut state = RejectedSenderNoticeState::default();
+        let now = std::time::Instant::now();
+
+        for index in 0..MAX_REJECTED_NOTICES_PER_MINUTE {
+            assert_eq!(
+                state.admit(&format!("ou_{index}"), now),
+                RejectedSenderNoticeDecision::Notify
+            );
+        }
+        assert_eq!(
+            state.admit("ou_burst", now),
+            RejectedSenderNoticeDecision::RateLimited { emit_warning: true }
+        );
+        assert_eq!(
+            state.admit("ou_burst", now),
+            RejectedSenderNoticeDecision::RateLimited {
+                emit_warning: false
+            },
+            "one burst must only emit one warning"
+        );
+
+        let after_window = now + REJECTED_NOTICE_WINDOW + std::time::Duration::from_secs(1);
+        assert_eq!(
+            state.admit("ou_burst", after_window),
+            RejectedSenderNoticeDecision::Notify,
+            "a legitimate sender may retry after the burst window"
+        );
+
+        for index in state.notified_senders.len()..MAX_REJECTED_SENDERS_PER_LISTENER {
+            state.notified_senders.insert(format!("fill_{index}"));
+        }
+        assert_eq!(
+            state.notified_senders.len(),
+            MAX_REJECTED_SENDERS_PER_LISTENER
+        );
+        assert_eq!(
+            state.admit("ou_over_capacity", after_window),
+            RejectedSenderNoticeDecision::AtCapacity { emit_warning: true }
+        );
+        assert_eq!(
+            state.admit("ou_over_capacity", after_window),
+            RejectedSenderNoticeDecision::AtCapacity {
+                emit_warning: false
+            }
+        );
+        assert_eq!(
+            state.notified_senders.len(),
+            MAX_REJECTED_SENDERS_PER_LISTENER
+        );
     }
 }

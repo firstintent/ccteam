@@ -12,6 +12,20 @@
 //! `_into` seams take an explicit path so they are unit-testable against a
 //! temp dir without touching the real `~/.claude.json` / `~/.codex`.
 //!
+//! **One transport for all five vendors: Streamable HTTP against the daemon's
+//! `POST /mcp`, authenticated with the admin web token.** No global
+//! registration spawns a `ccteam internal mcp-serve` stdio child any more —
+//! the shapes differ only in each vendor's config dialect (Claude/Kimi
+//! `mcpServers` JSON, Codex/Grok `[mcp_servers]` TOML, OpenCode `mcp` JSON)
+//! and in the header key (`headers` vs Codex's `http_headers`). A global entry
+//! serves a **plain main session** with Admin semantics; ccteam-managed
+//! sessions override the same-named entry with their per-session
+//! `ccteam-sid:<sid>:<secret>` principal (see
+//! `ccteam_harness::execution::mcp_config`).
+//!
+//! Every config written here embeds the admin bearer, so every writer chmods
+//! its file to 0600.
+//!
 //! v0.8.18 柱1 — moved here from `ccteam-cli::mcp_serve` (which now
 //! re-exports) so the web host page can register MCP without depending on
 //! the CLI binary crate.
@@ -22,16 +36,84 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-/// Register the ccteam MCP server in Claude's `~/.claude.json`.
+/// Filename under `~/.ccteam/run/` where a starting daemon records the MCP URL
+/// its own web bind resolves to.
+const DAEMON_MCP_URL_FILE: &str = "mcp-url";
+
+/// Record the MCP URL implied by the daemon's actual web bind, so registration
+/// paths that run OUT OF BAND (`ccteam config mcp`, doctor) target the port the
+/// daemon really listens on instead of guessing the default.
 ///
-/// Strategy: read the file, ensure `mcpServers.ccteam` points at the
-/// running binary's absolute path, write back atomically. A junk /
+/// Called at daemon start, before auto-registration. Best-effort by contract:
+/// the caller logs and continues, since a stale/missing record only costs the
+/// default guess. A non-parsing bind is `Ok(())` with nothing written — the
+/// startup path reports that error properly a few lines later.
+pub fn record_daemon_mcp_url(run_dir: &Path, web_bind: &str) -> Result<()> {
+    let Some(url) = mcp_url_from_bind(web_bind) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    atomic_write(&run_dir.join(DAEMON_MCP_URL_FILE), url.as_bytes())
+}
+
+/// Resolve the MCP URL to register: explicit operator override
+/// (`CCTEAM_MCP_HTTP_URL` / `CCTEAM_WEB_URL`) → the running daemon's recorded
+/// bind → the default-bind fallback.
+///
+/// This is what makes an HTTP registration correct on a non-default
+/// `--web-bind`. The old stdio entry was port-agnostic (the child dialled the
+/// unix socket), so without this the move to HTTP would break exactly the users
+/// who bind somewhere else.
+pub fn resolve_mcp_http_url(run_dir: &Path) -> String {
+    if let Some(url) = ccteam_harness::execution::mcp_config::mcp_http_url_from_env() {
+        return url;
+    }
+    if let Ok(body) = std::fs::read_to_string(run_dir.join(DAEMON_MCP_URL_FILE)) {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    ccteam_harness::execution::mcp_config::FALLBACK_MCP_HTTP_URL.to_string()
+}
+
+/// `<bind>` → the loopback URL a vendor on this host should dial. A wildcard
+/// bind (`0.0.0.0` / `[::]`) is not a destination, so it maps to loopback on the
+/// same port; a concrete address is kept as-is. `None` when unparseable.
+fn mcp_url_from_bind(web_bind: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = web_bind.trim().parse().ok()?;
+    let port = addr.port();
+    if addr.ip().is_unspecified() {
+        return Some(format!("http://127.0.0.1:{port}/mcp"));
+    }
+    Some(match addr.ip() {
+        std::net::IpAddr::V4(v4) => format!("http://{v4}:{port}/mcp"),
+        std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{port}/mcp"),
+    })
+}
+
+/// Register the ccteam MCP server in Claude's `~/.claude.json` as an
+/// `mcpServers.ccteam` Streamable HTTP entry (`type` + `url` + `headers` —
+/// the shape `claude mcp add --transport http` writes, and the same one the
+/// per-session `--mcp-config` file uses).
+///
+/// MERGE, never clobber + idempotent: every other top-level key and every
+/// other `mcpServers.*` entry survives; only `ccteam` is set. A junk /
 /// non-object root is tolerated (treated as "start fresh") rather than
 /// failing the install.
-pub fn install_mcp_into(claude_json: &Path, ccteam_bin: &Path) -> Result<()> {
-    let bin = ccteam_bin
-        .to_str()
-        .ok_or_else(|| anyhow!("ccteam binary path not valid UTF-8"))?;
+///
+/// The whole `ccteam` table is REPLACED so a legacy stdio `command` / `args` /
+/// `env` cannot survive alongside `url` — Claude's config schema validates
+/// per transport, and a mixed entry fails the server outright.
+pub fn install_mcp_into(claude_json: &Path, mcp_http_url: &str, admin_token: &str) -> Result<()> {
+    let url = mcp_http_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
+    }
+    let token = admin_token.trim();
+    if token.is_empty() {
+        anyhow::bail!("ccteam admin web token must not be empty");
+    }
     let mut root = if claude_json.exists() {
         let bytes = std::fs::read(claude_json)
             .with_context(|| format!("read {}", claude_json.display()))?;
@@ -59,14 +141,21 @@ pub fn install_mcp_into(claude_json: &Path, ccteam_bin: &Path) -> Result<()> {
     map.insert(
         crate::CCTEAM_MCP_SERVER_KEY.into(),
         json!({
-            "command": bin,
-            "args": crate::CCTEAM_MCP_SERVE_ARGS.to_vec(),
-            "env": {},
+            "type": "http",
+            "url": url,
+            "headers": { "Authorization": format!("Bearer ccteam:{token}") },
         }),
     );
 
     let body = serde_json::to_string_pretty(&Value::Object(root))?;
-    atomic_write(claude_json, body.as_bytes())
+    atomic_write(claude_json, body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(claude_json, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", claude_json.display()))?;
+    }
+    Ok(())
 }
 
 /// Register the ccteam MCP server in Codex's `config.toml` as a
@@ -475,9 +564,12 @@ pub fn resolve_opencode_config_path() -> Result<PathBuf> {
     Ok(base.join("opencode").join("opencode.json"))
 }
 
-/// Whether `~/.claude.json` already carries the ccteam MCP server entry.
-/// Best-effort: a missing / unreadable / junk file reads as `false` (not
-/// registered). Read-only — never writes.
+/// Whether `~/.claude.json` carries the current HTTP form of
+/// `mcpServers.ccteam`. A legacy stdio entry deliberately reads as `false` so
+/// doctor / host readiness asks the operator to rerun `ccteam config mcp` and
+/// the daemon's auto-registration replaces the old shape, instead of declaring
+/// a `mcp-serve`-child entry ready. Best-effort: a missing / unreadable / junk
+/// file reads as `false`. Read-only — never writes.
 pub fn claude_mcp_registered(claude_json: &Path) -> bool {
     let Ok(bytes) = std::fs::read(claude_json) else {
         return false;
@@ -485,10 +577,22 @@ pub fn claude_mcp_registered(claude_json: &Path) -> bool {
     let Ok(Value::Object(root)) = serde_json::from_slice::<Value>(&bytes) else {
         return false;
     };
-    root.get("mcpServers")
+    let Some(entry) = root
+        .get("mcpServers")
         .and_then(Value::as_object)
-        .map(|m| m.contains_key(crate::CCTEAM_MCP_SERVER_KEY))
-        .unwrap_or(false)
+        .and_then(|m| m.get(crate::CCTEAM_MCP_SERVER_KEY))
+    else {
+        return false;
+    };
+    entry
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|u| !u.trim().is_empty())
+        && entry
+            .pointer("/headers/Authorization")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.starts_with("Bearer ccteam:"))
+        && entry.get("command").is_none()
 }
 
 /// Whether Codex's `config.toml` carries the current HTTP form of
@@ -564,15 +668,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_mcp_into_writes_command_args_env_for_ccteam_server() {
+    fn mcp_url_from_bind_maps_wildcard_to_loopback_and_keeps_concrete() {
+        // A wildcard bind is not a destination — a vendor on this host must
+        // dial loopback on the SAME port (the whole point: non-default ports).
+        assert_eq!(
+            mcp_url_from_bind("0.0.0.0:8080").as_deref(),
+            Some("http://127.0.0.1:8080/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("[::]:9000").as_deref(),
+            Some("http://127.0.0.1:9000/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("127.0.0.1:7331").as_deref(),
+            Some("http://127.0.0.1:7331/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("192.168.1.5:7331").as_deref(),
+            Some("http://192.168.1.5:7331/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("[::1]:7331").as_deref(),
+            Some("http://[::1]:7331/mcp")
+        );
+        // Unparseable → None, so startup writes nothing and reports the bind
+        // error through its own path.
+        assert!(mcp_url_from_bind("not-an-addr").is_none());
+        assert!(mcp_url_from_bind("").is_none());
+    }
+
+    #[test]
+    fn resolve_mcp_http_url_prefers_recorded_bind_over_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        // Nothing recorded yet → default-bind fallback.
+        assert_eq!(
+            resolve_mcp_http_url(&run_dir),
+            ccteam_harness::execution::mcp_config::FALLBACK_MCP_HTTP_URL
+        );
+        // A daemon on a custom port records it; registration follows.
+        record_daemon_mcp_url(&run_dir, "0.0.0.0:8080").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:8080/mcp");
+        // Re-record on restart (idempotent, last write wins).
+        record_daemon_mcp_url(&run_dir, "0.0.0.0:9100").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
+        // An unparseable bind leaves the previous record intact.
+        record_daemon_mcp_url(&run_dir, "bogus").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
+    }
+
+    #[test]
+    fn install_mcp_into_writes_http_url_and_admin_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        install_mcp_into(&claude_json, &PathBuf::from("/usr/local/bin/ccteam")).unwrap();
+        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", "admin-secret").unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
         let entry = &v["mcpServers"]["ccteam"];
-        assert_eq!(entry["command"], "/usr/local/bin/ccteam");
-        assert!(entry["args"].is_array());
-        assert!(entry["env"].is_object());
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            "Bearer ccteam:admin-secret"
+        );
+        // No stdio child: the global entry never spawns `internal mcp-serve`.
+        assert!(entry.get("command").is_none());
+        assert!(entry.get("args").is_none());
     }
 
     #[test]
@@ -584,11 +744,37 @@ mod tests {
             r#"{"projects":{"a":1},"mcpServers":{"other":{"command":"x"}}}"#,
         )
         .unwrap();
-        install_mcp_into(&claude_json, &PathBuf::from("/x/ccteam")).unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "tok").unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
         assert_eq!(v["projects"]["a"], 1);
         assert_eq!(v["mcpServers"]["other"]["command"], "x");
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/ccteam");
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["url"],
+            "http://localhost:7331/mcp"
+        );
+    }
+
+    #[test]
+    fn install_mcp_into_replaces_legacy_stdio_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_json = tmp.path().join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            r#"{"mcpServers":{"ccteam":{"command":"/old/ccteam","args":["internal","mcp-serve"],"env":{"CCTEAM_CHAT_SID":"stale"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !claude_mcp_registered(&claude_json),
+            "legacy stdio shape must read as NOT registered so it gets repaired"
+        );
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "fresh").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
+        let entry = &v["mcpServers"]["ccteam"];
+        assert_eq!(entry["url"], "http://localhost:7331/mcp");
+        assert!(entry.get("command").is_none());
+        assert!(entry.get("args").is_none());
+        assert!(entry.get("env").is_none());
+        assert!(claude_mcp_registered(&claude_json));
     }
 
     #[test]
@@ -598,8 +784,46 @@ mod tests {
         assert!(!claude_mcp_registered(&claude_json), "missing file → false");
         std::fs::write(&claude_json, r#"{"mcpServers":{"other":{}}}"#).unwrap();
         assert!(!claude_mcp_registered(&claude_json), "no ccteam → false");
-        install_mcp_into(&claude_json, &PathBuf::from("/x/ccteam")).unwrap();
+        install_mcp_into(&claude_json, "http://localhost/mcp", "t").unwrap();
         assert!(claude_mcp_registered(&claude_json), "after install → true");
+    }
+
+    #[test]
+    fn install_mcp_into_is_idempotent_and_rejects_missing_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_json = tmp.path().join("nested").join(".claude.json");
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "a").unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7444/mcp", "b").unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["url"],
+            "http://localhost:7444/mcp"
+        );
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["headers"]["Authorization"],
+            "Bearer ccteam:b"
+        );
+        let absent = tmp.path().join("absent.json");
+        assert!(install_mcp_into(&absent, "", "t").is_err());
+        assert!(install_mcp_into(&absent, "http://x/mcp", " ").is_err());
+        assert!(!absent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_install_makes_token_bearing_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_json = tmp.path().join(".claude.json");
+        install_mcp_into(&claude_json, "http://localhost/mcp", "s").unwrap();
+        assert_eq!(
+            std::fs::metadata(&claude_json)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

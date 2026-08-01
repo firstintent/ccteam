@@ -665,20 +665,18 @@ async fn reload_im_channels(
     // registrations; per-tenant bots come from tenants.json.
     let bots = list_bots().unwrap_or_default();
     let mut rebuilt: ChannelMap = HashMap::new();
-    let lark_probe_path = lark_open_id_probe_path_for(args);
+    let probe_path = rejected_sender_probe_path_for(args);
     if creds_changed {
         // The allowlist IS the operator roster — re-seed it with the channels.
         bind_operator_rosters(&mut *gateway.lock().await, &new_creds);
         for (name, builder) in CHANNEL_BUILDERS {
-            if let Some(ch) = builder(&new_creds, &bots, Some(lark_probe_path.as_path())) {
+            if let Some(ch) = builder(&new_creds, &bots, Some(probe_path.as_path())) {
                 rebuilt.insert((*name).to_string(), ch);
             }
         }
     }
     if tenants_changed {
-        for (name, ch) in
-            build_tenant_channels(&daemon_tenants(args), Some(lark_probe_path.as_path()))
-        {
+        for (name, ch) in build_tenant_channels(&daemon_tenants(args), Some(probe_path.as_path())) {
             rebuilt.insert(name, ch);
         }
     }
@@ -778,9 +776,9 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
         return ch; // test MockChannel injection still wins, unchanged
     }
     let mut out: ChannelMap = HashMap::new();
-    let lark_probe_path = lark_open_id_probe_path_for(args);
+    let probe_path = rejected_sender_probe_path_for(args);
     for (name, builder) in CHANNEL_BUILDERS {
-        if let Some(ch) = builder(creds, bots, Some(lark_probe_path.as_path())) {
+        if let Some(ch) = builder(creds, bots, Some(probe_path.as_path())) {
             out.insert((*name).to_string(), ch);
             tracing::info!(channel = %name, "imd: provider channel built from credentials");
         }
@@ -788,8 +786,7 @@ fn build_channels(args: &DaemonArgs, creds: &Credentials, bots: &[BotRegistratio
     // v0.8.20 F2 — one listener per tenant bot (tenants.json), additive to the
     // global/admin bot above. Keyed "<platform>@<tenant_id>" so reply routing
     // and the inbound→tenant binding work without colliding on the platform.
-    for (name, ch) in build_tenant_channels(&daemon_tenants(args), Some(lark_probe_path.as_path()))
-    {
+    for (name, ch) in build_tenant_channels(&daemon_tenants(args), Some(probe_path.as_path())) {
         tracing::info!(channel = %name, "imd: per-tenant bot channel built");
         out.insert(name, ch);
     }
@@ -827,7 +824,7 @@ fn telegram_effective_allowlist(user_allowed: &[String], bots: &[BotRegistration
 fn build_telegram_channel(
     creds: &Credentials,
     bots: &[BotRegistration],
-    _lark_probe_path: Option<&Path>,
+    _probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let tg = creds.telegram.as_ref()?;
     Some(Arc::new(TelegramChannel::new(
@@ -843,7 +840,7 @@ fn build_telegram_channel(
 fn build_slack_channel(
     creds: &Credentials,
     _bots: &[BotRegistration],
-    _lark_probe_path: Option<&Path>,
+    _probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let slack = creds.slack.as_ref()?;
     Some(Arc::new(
@@ -861,7 +858,7 @@ fn build_slack_channel(
 fn build_discord_channel(
     creds: &Credentials,
     _bots: &[BotRegistration],
-    _lark_probe_path: Option<&Path>,
+    _probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let discord = creds.discord.as_ref()?;
     Some(Arc::new(
@@ -886,7 +883,7 @@ fn build_discord_channel(
 fn build_lark_channel(
     creds: &Credentials,
     bots: &[BotRegistration],
-    lark_probe_path: Option<&Path>,
+    probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let lark = creds.lark.as_ref()?;
     let mut allowed = lark.allowed_user_ids.clone();
@@ -901,36 +898,33 @@ fn build_lark_channel(
         allowed,
         lark.use_feishu,
     );
-    if let Some(path) = lark_probe_path {
+    if let Some(path) = probe_path {
         ch = ch.with_open_id_probe_path(path.to_path_buf());
     }
     Some(Arc::new(ch))
 }
 
-/// JSONL file where Lark channels record unauthorized sender `open_id`s for
-/// the web self-serve setup flow. When tests override the credentials path,
-/// derive the matching fake `~/.ccteam` root from that path instead of touching
-/// the real home.
-fn lark_open_id_probe_path_for(args: &DaemonArgs) -> PathBuf {
+/// JSONL file where per-tenant channels record the senders they rejected, so
+/// the web self-serve setup flow can offer them (Lark `open_id`s, Telegram
+/// `chat_id`s). When tests override the credentials path, derive the matching
+/// fake `~/.ccteam` root from that path instead of touching the real home.
+fn rejected_sender_probe_path_for(args: &DaemonArgs) -> PathBuf {
     if let Some(creds) = &args.credentials {
         if let Some(secrets) = creds.parent() {
             if let Some(root) = secrets.parent() {
-                return root
-                    .join("state")
-                    .join("im")
-                    .join("lark-open-id-probes.jsonl");
+                return root.join("state").join("im").join("rejected-senders.jsonl");
             }
         }
     }
     ccteam_core::CcteamPaths::from_env()
-        .map(|p| p.im_state_dir().join("lark-open-id-probes.jsonl"))
+        .map(|p| p.im_state_dir().join("rejected-senders.jsonl"))
         .unwrap_or_else(|_| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/"))
                 .join(".ccteam")
                 .join("state")
                 .join("im")
-                .join("lark-open-id-probes.jsonl")
+                .join("rejected-senders.jsonl")
         })
 }
 
@@ -976,7 +970,7 @@ fn tenants_fingerprint(args: &DaemonArgs) -> String {
 /// tenants WITH IM creds get a channel.
 fn build_tenant_channels(
     reg: &ccteam_core::tenants::TenantRegistry,
-    lark_probe_path: Option<&Path>,
+    probe_path: Option<&Path>,
 ) -> Vec<(String, Arc<dyn Channel + Send + Sync>)> {
     let mut out: Vec<(String, Arc<dyn Channel + Send + Sync>)> = Vec::new();
     for t in reg.list() {
@@ -984,8 +978,17 @@ fn build_tenant_channels(
         {
             if let Some(tg) = &t.telegram {
                 let name = format!("telegram@{}", t.id);
-                let ch = TelegramChannel::new(tg.bot_token.clone(), tg.allowed_chat_ids.clone())
-                    .with_name(name.clone());
+                // Per-tenant bots are fail-closed: everything arriving here is
+                // stamped with THIS tenant's identity, so an empty allowlist
+                // must mean "nobody yet", not "anybody". The rejected chat ids
+                // land in the probe file the tenant's own setup page reads.
+                let mut ch =
+                    TelegramChannel::new(tg.bot_token.clone(), tg.allowed_chat_ids.clone())
+                        .fail_closed()
+                        .with_name(name.clone());
+                if let Some(path) = probe_path {
+                    ch = ch.with_rejected_sender_probe_path(path.to_path_buf());
+                }
                 out.push((name, Arc::new(ch)));
             }
         }
@@ -999,7 +1002,7 @@ fn build_tenant_channels(
                     lk.allowed_user_ids.clone(),
                     lk.use_feishu,
                 );
-                if let Some(path) = lark_probe_path {
+                if let Some(path) = probe_path {
                     ch = ch.with_open_id_probe_path(path.to_path_buf());
                 }
                 let ch = ch.with_name(name.clone());

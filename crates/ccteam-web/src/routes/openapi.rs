@@ -121,6 +121,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
     ),
     tags(
         (name = "capabilities", description = "Harness vendor probe"),
+        (name = "models", description = "Spawn-tuning discovery: per-vendor observed model ids + reasoning-effort ladders (advisory affordance, never a spawn allowlist)"),
         (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join; reverse control channel + exec dial-back ride WS at /hosts/channel and /hosts/exec/{nonce}; register-mcp)"),
         (name = "users", description = "档1 per-user web tenant management (admin-gated; web-first, no CLI — mint personal links, list, delete)"),
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
@@ -145,6 +146,9 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         // capabilities
         .routes(routes!(super::capabilities::handle_capabilities))
+        // spawn-tuning discovery — the affordance side of `POST .../sessions`
+        // taking `model` + `effort` (no project named, so no project ACL).
+        .routes(routes!(super::models::handle_models))
         // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp)
         .routes(routes!(super::hosts::handle_hosts))
         .routes(routes!(super::hosts::handle_host_detail))
@@ -173,6 +177,14 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(
             super::users::handle_get_me_lark_open_id_candidates,
             super::users::handle_put_me_lark_allowed_users
+        ))
+        // Telegram twin of the Lark discovery pair — a per-tenant bot is
+        // fail-closed, so the tenant needs a way to bind its own chat.
+        .routes(routes!(
+            super::users::handle_get_me_telegram_chat_id_candidates
+        ))
+        .routes(routes!(
+            super::users::handle_put_me_telegram_allowed_chats
         ))
         .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)

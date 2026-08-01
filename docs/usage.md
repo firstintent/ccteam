@@ -63,6 +63,8 @@ kimi --version     # optional; only needed for Kimi Code sessions (`kimi login` 
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
 
+**Where it lands.** One ladder decides the destination for every install mode — the script, `make install`, and `ccteam update` all use it, so you never end up with two `ccteam` binaries disagreeing: an explicit `CCTEAM_INSTALL_DIR` wins, otherwise the directory where `ccteam` already lives (an upgrade replaces the copy you are running, symlinks resolved), otherwise `~/.local/bin`. After installing, the script names any *other* `ccteam` still on your PATH — it only reports, never deletes — because a copy earlier on PATH is what makes an upgrade look like it did nothing.
+
 ### 2. The Daemon
 
 `make install` (and the one-click script, when it detects an upgrade) already started the daemon with **`ccteam daemon start`**: one resident process (web console + IM gateway + standard resource API + MCP socket), detached with `setsid` so it survives your shell closing and SSH disconnects. This is the single supervision mechanism on Linux, macOS, and WSL — **there is no systemd or launchd unit anymore** (retired in v0.9.7). Manage it the same way on every platform:
@@ -106,7 +108,7 @@ In the new-session dialog, choose **+ New project...**, enter a slug and directo
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode and Kimi), optional effort, and HITL at spawn time. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode and Kimi), the model and reasoning effort, and HITL at spawn time. Both menus are built per vendor from what that vendor declared at its last handshake (`GET /api/v1/models`), so you pick from its own ids and its own levels — a vendor that has no effort axis shows no effort menu, and leaving either on **default** sends nothing and lets the vendor decide. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
 - **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
@@ -156,7 +158,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 The console is built on a token-authenticated HTTP API you can use directly:
 
 - Interactive docs: `http://<host>:7331/api/docs` (Scalar). Machine-readable spec: `/api/v1/openapi.json`.
-- Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop,scheduled}`, `/marketplace`, `/status`, `/hosts`, and `/capabilities`.
+- Resources include `/api/v1/projects`, `.../projects/{slug}/sessions`, `/sessions/{sid}/{turn,events,stop,scheduled}`, `/marketplace`, `/status`, `/hosts`, `/capabilities`, and `/models` (per vendor: the models it declared at its last handshake with an `observed_at`, plus its reasoning-effort ladder — advisory discovery for filling in `model` / `effort` on a spawn, never an allowlist).
 - Auth uses the same web token. Session endpoints require the daemon to be online.
 
 ### External agents over MCP (`POST /mcp`)
@@ -226,11 +228,15 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 /newproject <slug> <path>  Create and register a project, then switch to it.
 
 # Sessions
-/new [vendor] [role] [hitl]  Create a session and return handle s<N>.
+/new [vendor] [role] [hitl] [model=<id>] [effort=<level>]
+                             Create a session and return handle s<N>.
                              vendor = claude (default) | codex | grok | opencode | kimi
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
                              grok/opencode/kimi = roleless ACP session (role arg ignored)
                              add hitl = approve tools in IM; default skip runs directly
+                             model= / effort= (or m= / e=) go to the vendor verbatim, in any
+                             order; omit them to ride the vendor's own default. Ladders differ
+                             per vendor — `/status` lists what each one declared.
 /use <id>                  Switch to session s<N>; stopped sessions cold-resume from disk.
 /role <role>               Change the current session role in place; handle stays the same.
 /interrupt [id]            Interrupt an in-flight turn; keep the session. Omit id for current.
@@ -238,7 +244,10 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.
-/status                    Team health: idle / working / stuck plus model and context.
+/status                    Team health: idle / working / stuck plus model, effort and context
+                           usage. Context occupancy is only shown when it was actually
+                           measured — a session whose vendor has not reported yet reads as
+                           unknown rather than 0%, and survives daemon restarts.
 /help                      List gateway commands.
 
 # Delayed send (one-shot user turns)

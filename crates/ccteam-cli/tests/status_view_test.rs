@@ -87,6 +87,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
             owner: "telegram:c1".to_string(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".to_string(),
             created_at: now.clone(),
             last_active: now,

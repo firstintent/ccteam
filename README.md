@@ -31,7 +31,7 @@ Paste a bot token once (Settings → Access) and the chat becomes a full console
 
 ```text
 /cd demo                        # pick a project; your next message talks to it
-/new codex                      # more sessions: /new [vendor] [role]
+/new codex effort=high          # more sessions: /new [vendor] [role] [model=…] [effort=…]
 @s2 run the test suite          # address any session directly
 /status  /sessions  /stop s3    # health · fleet · cost · stop
 /inbox +30m remind me …         # schedule a one-shot user turn; /inbox lists · cancel dN
@@ -43,7 +43,7 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
 - a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
-- a Team page: the live delegation topology — vendor, live model and cost per session, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place
+- a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place
 - a cost pill with daily budget caps
 - marketplace and settings
 
@@ -92,7 +92,7 @@ Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ```
 
-One static binary into `~/.local/bin`, no sudo.
+One static binary into `~/.local/bin`, no sudo. Every install mode — the script, `make install`, and `ccteam update` — resolves the destination through the same ladder (`CCTEAM_INSTALL_DIR` → wherever `ccteam` already lives → `~/.local/bin`), so an upgrade replaces the copy you are actually running instead of leaving a second one to shadow it.
 
 **2 · Let an agent do it** — paste into any agent you already have:
 
@@ -142,7 +142,9 @@ Async by default: the completion notification lands in the parent's chat like a 
 - **Grind + probe** — codex holds the long job while grok answers the quick question before codex finishes a step.
 - **Bulk on a budget** — fan the repetitive 80% out to kimi; keep the judgment calls on claude.
 
-Who gets what starts from facts, not guesses: one `status` call is the roster — vendors installed, authenticated, and in-budget on the project's host, an advisory model catalog, and your routing notes (`<project>/.ccteam/routing.md` over the global fallback). Omit `model` and each spawn rides the vendor's default.
+Who gets what starts from facts, not guesses: one `status` call is the roster — vendors installed, authenticated, and in-budget on the project's host, each one's models and reasoning-effort levels as it last declared them, and your routing notes (`<project>/.ccteam/routing.md` over the global fallback).
+
+Every spawn surface takes `model` and `effort` for every vendor and forwards both verbatim — the vendor owns the verdict on its own values, so a level it refuses comes back as a real error instead of a session quietly running at the default. Omit them and the vendor's own defaults hold. The ladders differ (claude `low…max`, codex `low…xhigh`, grok `low|medium|high`, kimi `low|high|max`), so ask rather than guess: `status` for agents, `GET /api/v1/models` for programs, and the web composer's menus render from the same source.
 
 ## Project context
 
@@ -165,6 +167,7 @@ It stays deliberately underneath:
 
 - **No prompt injection** — personas load through the vendor's native mechanism; task text is forwarded verbatim.
 - **No terminal scraping** — state comes from transcripts and structured events.
+- **Measurements, never placeholders** — a context reading you see was really reported by that vendor and survives restarts; one it has not reported yet reads as unknown, not `0%`.
 - **Local first** — `~/.ccteam` and your repos; no cloud in the loop.
 - **Budgets guard, never kill** — daily per-vendor caps are the only automatic brake.
 

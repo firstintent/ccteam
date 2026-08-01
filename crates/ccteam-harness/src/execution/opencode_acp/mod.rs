@@ -19,6 +19,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::execution::acp::released_thread_status;
 use crate::execution::acp::{
     acp_model_picker_options, apply_notification, known_efforts, pluck_model_info,
     pluck_session_id, route_acp_turn, split_trailing_effort, AcpModelOption, AcpTransport,
@@ -26,10 +27,11 @@ use crate::execution::acp::{
 };
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
+use crate::execution::session_status::read_status_file;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
+    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use spawn_spec::{build_argv, opencode_bin, OpencodeSpawnInput};
@@ -223,6 +225,16 @@ impl OpencodeAcpAdapter {
             effort: info.effort,
             ..Default::default()
         }));
+        // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
+        // a session whose context is already full; the handshake reports the
+        // model catalog but never the occupancy. Seed the gaps from the
+        // snapshot so the statusline resumes where it left off instead of
+        // reading as a brand-new session.
+        if let Some(snapshot) = read_status_file(&project_dir, &sid) {
+            if let Ok(mut st) = state.lock() {
+                st.seed_from_snapshot(&snapshot);
+            }
+        }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
         let dispatcher =
             spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
@@ -281,17 +293,7 @@ impl OpencodeAcpAdapter {
         };
         ThreadStatus {
             model: st.model.clone(),
-            context: match (st.used_tokens, st.window_tokens) {
-                (Some(used), Some(window)) => Some(ContextUsage {
-                    used_tokens: used,
-                    window_tokens: window,
-                }),
-                (None, Some(window)) => Some(ContextUsage {
-                    used_tokens: 0,
-                    window_tokens: window,
-                }),
-                _ => None,
-            },
+            context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
         }
@@ -337,6 +339,10 @@ impl OpencodeAcpAdapter {
                     state: Arc::clone(&live.state),
                     event_tx: live.event_tx.clone(),
                     session_id: live.session_id.clone(),
+                    project_dir: live.project_dir.clone(),
+                    sid: live.sid.clone(),
+                    // opencode pushes `usage_update{used,size}`.
+                    context_probe: None,
                     tuning: AcpTurnTuning {
                         finalize_barrier: FINALIZE_BARRIER,
                         post_finalize_sleep: Some(std::time::Duration::from_millis(50)),
@@ -371,7 +377,19 @@ fn spawn_notif_dispatcher(
     event_tx: broadcast::Sender<ThreadEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sub = transport.subscribe();
+        // Take the handshake backlog with the subscription: the vendor's
+        // command catalog and any opening usage arrive before this task exists.
+        let (early, mut sub) = transport.subscribe_with_early();
+        for n in early {
+            let events = if let Ok(mut guard) = state.lock() {
+                apply_notification(&mut guard, &n)
+            } else {
+                Vec::new()
+            };
+            for ev in events {
+                let _ = event_tx.send(ev);
+            }
+        }
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -492,6 +510,8 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             }
         };
 
+        // The axis id the vendor just declared, kept before `info` moves.
+        let effort_config_id = info.effort_config_id.clone();
         let live = self.register_live(
             transport,
             session_id,
@@ -502,48 +522,49 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             info,
             ctx.permission_mode,
         );
-        // v0.8.24 A-U3 — best-effort spawn-time model/effort via the SAME
-        // vendor-native seam the `/model` directive uses
-        // (`session/set_config_option`; opencode's `session/new` takes no
-        // model). A failure must never fail the spawn — the session then
-        // runs on opencode's self-selected default (honest degrade, warn
-        // only). Model value shape is opencode's `provider/model[/variant]`;
-        // effort must be one of the model's variants.
-        for (config_id, value) in [
-            ("model", ctx.model_id.as_deref()),
-            ("effort", ctx.effort.as_deref()),
+        // Spawn-time model/effort via the SAME vendor-native seam the `/model`
+        // directive uses (`session/set_config_option`; opencode's
+        // `session/new` takes no model). Model value shape is opencode's
+        // `provider/model[/variant]`; the effort axis is whatever id opencode
+        // declared in the handshake (`effort` today) — read from the snapshot,
+        // never hardcoded, so a vendor that renames it keeps working.
+        //
+        // A refusal FAILS the spawn (see `spawn_pick_refused`): this used to
+        // warn-and-continue, which handed the caller a session running on
+        // something other than what they asked for and told them it worked.
+        let effort_axis = effort_config_id.as_deref().unwrap_or("effort");
+        for axis in [
+            crate::execution::acp::SpawnAxis {
+                what: "model",
+                config_id: "model",
+                value: ctx.model_id.as_deref().unwrap_or_default().trim(),
+            },
+            crate::execution::acp::SpawnAxis {
+                what: "effort",
+                config_id: effort_axis,
+                value: ctx.effort.as_deref().unwrap_or_default().trim(),
+            },
         ] {
-            let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            if axis.value.is_empty() {
                 continue;
-            };
-            match live
-                .transport
+            }
+            live.transport
                 .call(
                     "session/set_config_option",
                     json!({
                         "sessionId": live.session_id,
-                        "configId": config_id,
-                        "value": value,
+                        "configId": axis.config_id,
+                        "value": axis.value,
                     }),
                 )
                 .await
-            {
-                Ok(_) => {
-                    if let Ok(mut st) = live.state.lock() {
-                        if config_id == "model" {
-                            st.model = Some(value.to_string());
-                        } else {
-                            st.effort = Some(value.to_string());
-                        }
-                    }
+                .map_err(|e| crate::execution::acp::spawn_pick_refused(axis.what, axis.value, e))?;
+            if let Ok(mut st) = live.state.lock() {
+                if axis.what == "model" {
+                    st.model = Some(axis.value.to_string());
+                } else {
+                    st.effort = Some(axis.value.to_string());
                 }
-                Err(e) => tracing::warn!(
-                    sid = %ctx.sid,
-                    config_id,
-                    value,
-                    error = %e,
-                    "opencode spawn-time set_config_option failed; continuing with vendor default"
-                ),
             }
         }
         let mut handle = Self::make_handle(&live);
@@ -747,7 +768,9 @@ impl HarnessAdapter for OpencodeAcpAdapter {
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(ThreadStatus::default());
+            // Released / restarted: answer from the persisted snapshot rather
+            // than going silent.
+            return Ok(released_thread_status(h));
         };
         Ok(self.thread_status_inner(&live))
     }

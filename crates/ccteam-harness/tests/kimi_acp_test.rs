@@ -169,6 +169,78 @@ async fn handshake_prompt_final_only_on_fake() {
     clear_fake();
 }
 
+/// An ACP `session/prompt` result is a *successful* JSON-RPC response even when
+/// the turn produced no answer, so ignoring `stopReason` reports every vendor
+/// outcome as a clean reply — the partial text lands in `turns.jsonl` as the
+/// final answer and a delegation parent is told the task completed. Any
+/// non-clean reason must reach the event stream as `TurnFailed`, still carrying
+/// whatever partial output the vendor produced.
+#[tokio::test]
+#[serial]
+async fn abnormal_stop_reason_surfaces_as_turn_failed_with_partial_text() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-stop"),
+        ),
+    )
+    .await
+    .expect("start timeout")
+    .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut partial = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        partial.push(t);
+                    }
+                }
+                ThreadEvent::TurnFailed { err, .. } => return (partial, Some(err)),
+                ThreadEvent::TurnCompleted { .. } => return (partial, None),
+                _ => {}
+            }
+        }
+        (partial, None)
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("STOP:refusal go".into()))
+        .await
+        .expect("submit");
+
+    let (partial, failure) = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    let err = failure.expect("a refused turn must not report completion");
+    assert_eq!(err.kind, "stop_reason:refusal");
+    assert!(
+        err.message.contains("refusal"),
+        "the failure must name the wire reason: {}",
+        err.message
+    );
+    assert_eq!(
+        partial.len(),
+        1,
+        "output the vendor did produce is still delivered"
+    );
+    assert!(partial[0].contains("STOP:refusal"));
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 /// The application requests Inject by default, but Kimi's public ACP adapter
 /// does not expose its internal `turn.steer`. The adapter must degrade without
 /// loss to two FIFO turns rather than cancel or reject the second message.
@@ -255,6 +327,7 @@ async fn resume_prefers_session_resume_no_replay() {
         owner: "user:test".into(),
         vendor_uuid: "01JYQX7A9D2E3F4G5H6J7K8M9N".into(),
         model: None,
+        effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         last_active: chrono::Utc::now().to_rfc3339(),
@@ -344,6 +417,7 @@ async fn resume_carries_mcp_servers() {
         owner: "user:test".into(),
         vendor_uuid: "01JYQX7A9D2E3F4G5H6J7K8M9N".into(),
         model: None,
+        effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         last_active: chrono::Utc::now().to_rfc3339(),
@@ -533,13 +607,15 @@ async fn model_directive_lists_and_sets() {
         ccteam_harness::DirectiveOutcome::NeedsChoice(p) => p,
         other => panic!("expected NeedsChoice, got {other:?}"),
     };
+    // Rows are model×effort while the vendor declares a thought_level axis
+    // (kimi 0.31.1 does) — the id is exactly the `/model <id> [effort]` form.
     let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
     assert!(
-        ids.contains(&"kimi-k2-0905-preview"),
+        ids.iter().any(|id| id.starts_with("kimi-k2-0905-preview")),
         "picker must include kimi-k2-0905-preview from vendor options, got {ids:?}"
     );
     assert!(
-        ids.contains(&"kimi-k2-thinking"),
+        ids.iter().any(|id| id.starts_with("kimi-k2-thinking")),
         "picker must include kimi-k2-thinking from vendor options, got {ids:?}"
     );
 
@@ -614,6 +690,226 @@ async fn model_directive_lists_and_sets() {
     clear_fake();
 }
 
+/// Kimi's effort ladder is the ACP `thought_level` config option, id
+/// `thinking` — NOT opencode's `effort` id. Reading only the latter is why a
+/// kimi session that was plainly running at `high` reported no effort at all
+/// (verified on kimi 0.31.1: `session/new` answers
+/// `{"id":"thinking","category":"thought_level","currentValue":"high",
+/// "options":[low,high,max]}`).
+///
+/// The whole round trip: the handshake value reaches the statusline, the
+/// picker offers the vendor's own model×effort rows, `/model <id> <effort>`
+/// sets it through `session/set_config_option`, and the vendor's
+/// `config_option_update` — the frame ccteam used to drop — keeps the
+/// statusline honest afterwards.
+#[tokio::test]
+#[serial]
+async fn effort_reads_and_writes_kimis_thought_level_option() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-effort"),
+        )
+        .await
+        .unwrap();
+
+    // 1. Handshake: the current level rides the statusline.
+    let status = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(
+        status.effort.as_deref(),
+        Some("high"),
+        "handshake thought_level must reach the statusline"
+    );
+
+    // 2. Picker: the vendor's own levels, never a ccteam-invented ladder.
+    let bare = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    let prompt = match bare {
+        ccteam_harness::DirectiveOutcome::NeedsChoice(p) => p,
+        other => panic!("expected NeedsChoice, got {other:?}"),
+    };
+    let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
+    assert!(
+        ids.contains(&"kimi-k2-thinking max"),
+        "picker must expand model×effort from the vendor levels, got {ids:?}"
+    );
+
+    // 3. Write: `/model <id> <effort>` lands the level and says so.
+    let set = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "kimi-k2-thinking max".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match set {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(receipt.contains("effort → max"), "receipt={receipt}");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let after = adapter.thread_status(&handle).await.unwrap();
+    assert_eq!(after.model.as_deref(), Some("kimi-k2-thinking"));
+    assert_eq!(after.effort.as_deref(), Some("max"));
+
+    // 4. A level the vendor doesn't declare is rejected by the vendor, and the
+    //    receipt says the model moved but the effort did not (never silent).
+    let bad = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "model".into(),
+                args: "kimi-k2-0905-preview low".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match bad {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(receipt.contains("effort → low"), "receipt={receipt}");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert_eq!(
+        adapter
+            .thread_status(&handle)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("low")
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// Kimi pushes no context usage at all — no `usage_update`, and a
+/// `session/prompt` response that is literally `{"stopReason":"end_turn"}`.
+/// What it DOES do is advertise `status` in `available_commands_update`, and
+/// answer that command locally with a real occupancy report.
+///
+/// So the runner pulls after each turn: before any turn there is nothing to
+/// report (and the statusline says so rather than showing a zero); after one,
+/// `/status` carries a real percentage sourced from the vendor itself.
+#[tokio::test]
+#[serial]
+async fn context_is_pulled_from_the_status_command_kimi_advertises() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-ctx"),
+        )
+        .await
+        .expect("start ok");
+
+    // Nothing has run: no occupancy to claim, and we do not invent one.
+    let before = adapter.thread_status(&handle).await.unwrap();
+    assert!(
+        before.context.is_none_or(|c| c.used_tokens.is_none()),
+        "occupancy before the first turn must be unknown, not zero: {before:?}"
+    );
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut finals = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        finals.push(t);
+                    }
+                }
+                ThreadEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        finals
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("hello".into()))
+        .await
+        .expect("submit");
+    let finals = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    // The probe rides its own turn slot and publishes nothing: the user sees
+    // exactly their own answer, and no `/status` text reaches the transcript.
+    assert_eq!(finals, vec!["echo:hello".to_string()]);
+
+    // The probe runs after the turn boundary; give the runner a moment.
+    let mut ctx = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = adapter.thread_status(&handle).await.unwrap();
+        if let Some(c) = status.context.filter(|c| c.used_tokens.is_some()) {
+            ctx = Some(c);
+            break;
+        }
+    }
+    let ctx = ctx.expect("occupancy pulled from the vendor's status command");
+    assert_eq!(ctx.used_tokens, Some(12_345));
+    assert_eq!(ctx.window_tokens, 1_048_576);
+    assert_eq!(
+        ctx.source,
+        ccteam_harness::ContextSource::Probed,
+        "a pulled number must not pass for a reported one"
+    );
+
+    // `/status` now renders the real reading — no vendor-specific apology.
+    let outcome = adapter
+        .handle_directive(
+            &handle,
+            ccteam_harness::Directive {
+                name: "context".into(),
+                args: String::new(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match outcome {
+        ccteam_harness::DirectiveOutcome::Done { receipt } => {
+            assert!(
+                receipt.contains("ctx 12.3k / 1.0M (1%)"),
+                "receipt={receipt}"
+            );
+            assert!(!receipt.contains("不可用"), "receipt={receipt}");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 /// An explicit spawn-time model choice rides `session/set_model`
 /// post-handshake (the fake acks it) and is reflected in `thread_status`. A
 /// missing choice keeps kimi's own default (covered by
@@ -638,6 +934,103 @@ async fn spawn_time_model_set_via_set_model() {
     let status = adapter.thread_status(&handle).await.unwrap();
     assert_eq!(status.model.as_deref(), Some("kimi-k2-thinking"));
     adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// Spawn-time effort lands through the axis id KIMI declared (`thinking`,
+/// category `thought_level`) — not opencode's `effort` id, and not a value
+/// ccteam guessed. Omitted ⇒ nothing sent ⇒ kimi's own default (`high` in the
+/// fake, matching the live 0.31.1 handshake).
+#[tokio::test]
+#[serial]
+async fn spawn_time_effort_lands_on_the_declared_axis() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+
+    let mut ctx = spawn_ctx(&tmp, "s-tune-effort");
+    ctx.effort = Some("max".into());
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("start ok");
+    assert_eq!(
+        adapter
+            .thread_status(&handle)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("max")
+    );
+    adapter.close_thread(&handle).await.unwrap();
+
+    // Nothing asked → the vendor's own default, untouched.
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-tune-default"),
+        )
+        .await
+        .expect("start ok");
+    assert_eq!(
+        adapter
+            .thread_status(&handle)
+            .await
+            .unwrap()
+            .effort
+            .as_deref(),
+        Some("high"),
+        "an omitted effort must leave the vendor default alone"
+    );
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// A vendor refusal of an EXPLICIT pick fails the spawn instead of handing
+/// back a session quietly running on something else (the old behaviour was a
+/// `tracing::warn!` and a success).
+#[tokio::test]
+#[serial]
+async fn a_refused_spawn_pick_fails_the_spawn() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = KimiAcpAdapter::new();
+
+    let mut ctx = spawn_ctx(&tmp, "s-refused-effort");
+    ctx.effort = Some("ludicrous".into());
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("vendor refuses an undeclared level");
+    let msg = err.to_string();
+    assert!(msg.contains("effort"), "err={msg}");
+    assert!(msg.contains("ludicrous"), "err={msg}");
+
+    let mut ctx = spawn_ctx(&tmp, "s-refused-model");
+    ctx.model_id = Some("made-up-model".into());
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("vendor refuses an unknown model");
+    assert!(err.to_string().contains("made-up-model"), "err={err}");
     clear_fake();
 }
 

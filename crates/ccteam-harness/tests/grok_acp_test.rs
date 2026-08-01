@@ -74,6 +74,7 @@ fn spawn_spec_always_approve_before_stdio() {
         &GrokSpawnInput {
             permission_mode: PermissionMode::Skip,
             model_id: Some("grok-4.5"),
+            effort: None,
         },
     );
     assert_eq!(
@@ -451,6 +452,7 @@ async fn load_resume_filters_is_replay() {
         owner: "user:test".into(),
         vendor_uuid: "019f4547-0000-7000-8000-00000000cafe".into(),
         model: None,
+        effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         last_active: chrono::Utc::now().to_rfc3339(),
@@ -737,6 +739,7 @@ async fn session_new_and_load_carry_mcp_servers() {
         owner: "user:test".into(),
         vendor_uuid: "019f4547-0000-7000-8000-00000000cafe".into(),
         model: None,
+        effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
         last_active: chrono::Utc::now().to_rfc3339(),
@@ -860,5 +863,75 @@ async fn spawn_disables_claude_mcp_compat_scan() {
         Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_ENV_DUMP", v) },
         None => unsafe { std::env::remove_var("CCTEAM_ACP_ENV_DUMP") },
     }
+    clear_fake();
+}
+
+/// An ACP session's status lives in the adapter's live map, so a released or
+/// daemon-restarted session used to report a blank statusline — and, because
+/// the window still came back from the handshake while the occupancy counter
+/// restarted empty, a long-running session would render `0 / 500k (0%)`.
+///
+/// After a completed turn the status is snapshotted at the turn boundary; a
+/// brand-new adapter (nothing live — exactly what a daemon restart looks like)
+/// must answer from that snapshot, occupancy included.
+#[tokio::test]
+#[serial]
+async fn context_survives_release_via_the_turn_boundary_snapshot() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s1"),
+        ),
+    )
+    .await
+    .expect("start timeout")
+    .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, ThreadEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("hello".into()))
+        .await
+        .expect("submit");
+    tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    let live = adapter.thread_status(&handle).await.unwrap();
+    let live_ctx = live.context.expect("live session reports context");
+    assert_eq!(live_ctx.used_tokens, Some(110), "grok per-turn total");
+    assert!(live_ctx.window_tokens > 0, "window from the model catalog");
+
+    // Snapshot lands where the turns mirror lives — same dir, ccteam-owned.
+    assert!(tmp.path().join(".ccteam/chat/s1/status.json").is_file());
+
+    // A fresh adapter has an empty live map: the daemon-restart shape.
+    let restarted = GrokAcpAdapter::new();
+    let after = restarted.thread_status(&handle).await.unwrap();
+    let ctx = after
+        .context
+        .expect("released session still reports context");
+    assert_eq!(
+        ctx.used_tokens, live_ctx.used_tokens,
+        "occupancy survives the release — never silently reset to 0"
+    );
+    assert_eq!(ctx.window_tokens, live_ctx.window_tokens);
+    assert_eq!(after.model, live.model);
+
+    adapter.close_thread(&handle).await.unwrap();
     clear_fake();
 }

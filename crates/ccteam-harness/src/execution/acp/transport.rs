@@ -126,6 +126,12 @@ pub struct AcpTransport {
     next_id: AtomicI64,
     pending: Arc<StdMutex<Pending>>,
     notifications: broadcast::Sender<Notification>,
+    /// Notifications that arrived before anyone subscribed. A broadcast
+    /// channel drops those, and the ACP handshake is exactly when they come:
+    /// `session/new` answers, then the vendor immediately pushes its command
+    /// catalog / initial usage — all before the adapter has a session to hang
+    /// a dispatcher on. Held here and handed to the first subscriber.
+    early: Arc<StdMutex<Vec<Notification>>>,
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
     child: StdMutex<Option<Child>>,
@@ -221,6 +227,7 @@ impl AcpTransport {
     {
         let pending: Arc<StdMutex<Pending>> = Arc::new(StdMutex::new(HashMap::new()));
         let (notif_tx, _) = broadcast::channel(NOTIFICATION_BUFFER);
+        let early: Arc<StdMutex<Vec<Notification>>> = Arc::new(StdMutex::new(Vec::new()));
         let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(WRITER_BUFFER);
         let closed = Arc::new(tokio::sync::Notify::new());
 
@@ -229,6 +236,7 @@ impl AcpTransport {
             reader,
             Arc::clone(&pending),
             notif_tx.clone(),
+            Arc::clone(&early),
             out_tx.clone(),
             Arc::clone(&closed),
             inbound,
@@ -239,6 +247,7 @@ impl AcpTransport {
             next_id: AtomicI64::new(1),
             pending,
             notifications: notif_tx,
+            early,
             _writer_task: writer_task,
             _reader_task: reader_task,
             child: StdMutex::new(child),
@@ -344,6 +353,21 @@ impl AcpTransport {
         self.notifications.subscribe()
     }
 
+    /// Subscribe AND take everything that arrived before this call.
+    ///
+    /// The adapter can only build its dispatcher after the handshake returns a
+    /// session, so plain `subscribe` silently loses whatever the vendor pushed
+    /// during it — for kimi that is its entire `available_commands_update`,
+    /// sent once and never repeated. Callers that need the full stream from
+    /// byte zero use this instead.
+    pub fn subscribe_with_early(&self) -> (Vec<Notification>, broadcast::Receiver<Notification>) {
+        let mut early = self.early.lock().unwrap_or_else(|e| e.into_inner());
+        // Created under the lock: any dispatch after this sees a receiver and
+        // broadcasts instead of buffering.
+        let rx = self.notifications.subscribe();
+        (std::mem::take(&mut *early), rx)
+    }
+
     pub async fn wait_closed(&self) {
         self.closed.notified().await;
     }
@@ -405,6 +429,7 @@ async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
     reader: R,
     pending: Arc<StdMutex<Pending>>,
     notifications: broadcast::Sender<Notification>,
+    early: Arc<StdMutex<Vec<Notification>>>,
     out: mpsc::Sender<Vec<u8>>,
     closed: Arc<tokio::sync::Notify>,
     inbound: InboundPolicy,
@@ -419,7 +444,7 @@ async fn run_reader_loop<R: AsyncRead + Unpin + Send>(
                     continue;
                 }
                 match serde_json::from_str::<Value>(trimmed) {
-                    Ok(v) => dispatch(v, &pending, &notifications, &out, inbound).await,
+                    Ok(v) => dispatch(v, &pending, &notifications, &early, &out, inbound).await,
                     Err(err) => {
                         tracing::warn!(error = %err, line = %trimmed, "acp: parse failure");
                     }
@@ -458,6 +483,7 @@ async fn dispatch(
     v: Value,
     pending: &Arc<StdMutex<Pending>>,
     notifications: &broadcast::Sender<Notification>,
+    early: &Arc<StdMutex<Vec<Notification>>>,
     out: &mpsc::Sender<Vec<u8>>,
     inbound: InboundPolicy,
 ) {
@@ -519,10 +545,28 @@ async fn dispatch(
     // Notification: method, typically no id (or ignore id for push).
     if let Some(method) = method {
         let params = v.get("params").cloned().unwrap_or(Value::Null);
-        let _ = notifications.send(Notification {
+        let n = Notification {
             method: method.to_string(),
             params,
-        });
+        };
+        // Buffer-or-broadcast decided under the same lock `subscribe_with_early`
+        // takes, so a notification is delivered exactly once: never dropped for
+        // want of a subscriber, never replayed to one that already saw it.
+        {
+            let mut early = early.lock().unwrap_or_else(|e| e.into_inner());
+            if notifications.receiver_count() == 0 {
+                if early.len() < NOTIFICATION_BUFFER {
+                    early.push(n);
+                } else {
+                    tracing::warn!(
+                        method,
+                        "acp: dropping pre-subscription notification (backlog full)"
+                    );
+                }
+                return;
+            }
+        }
+        let _ = notifications.send(n);
         return;
     }
 
@@ -664,6 +708,63 @@ mod tests {
                 .is_empty(),
             "cancelled caller must not leak a pending request id"
         );
+    }
+
+    /// A vendor pushes its command catalog during the handshake, before the
+    /// adapter has a session to hang a dispatcher on. A plain broadcast drops
+    /// that (kimi sends `available_commands_update` exactly once), so the
+    /// transport holds pre-subscription notifications — and hands each one over
+    /// exactly once: nothing lost before the subscriber, nothing replayed after.
+    #[tokio::test]
+    async fn pre_subscription_notifications_are_delivered_exactly_once() {
+        let (client_rw, mut peer_rw) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_rw);
+        let client = AcpTransport::from_halves(client_r, client_w, None);
+
+        let push = |v: Value| {
+            let mut line = serde_json::to_vec(&v).unwrap();
+            line.push(b'\n');
+            line
+        };
+        {
+            use tokio::io::AsyncWriteExt;
+            peer_rw
+                .write_all(&push(json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"update": {"sessionUpdate": "available_commands_update"}}
+                })))
+                .await
+                .unwrap();
+            peer_rw.flush().await.unwrap();
+        }
+        // Let the reader loop take it while nobody is listening.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (early, mut sub) = client.subscribe_with_early();
+        assert_eq!(early.len(), 1, "handshake notification must be retained");
+        assert_eq!(early[0].method, "session/update");
+
+        // A second subscriber must NOT see it again — the backlog is consumed.
+        let (early_again, _) = client.subscribe_with_early();
+        assert!(early_again.is_empty(), "backlog must not be replayed");
+
+        // With a live subscriber, delivery goes back to the broadcast path.
+        {
+            use tokio::io::AsyncWriteExt;
+            peer_rw
+                .write_all(&push(json!({
+                    "jsonrpc": "2.0", "method": "session/update", "params": {"n": 2}
+                })))
+                .await
+                .unwrap();
+            peer_rw.flush().await.unwrap();
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("notification must arrive")
+            .expect("channel open");
+        assert_eq!(next.params["n"], 2);
     }
 
     #[tokio::test]

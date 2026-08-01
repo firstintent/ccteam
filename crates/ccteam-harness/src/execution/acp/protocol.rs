@@ -16,6 +16,113 @@ pub struct AvailableCommand {
     pub input: Option<Value>,
 }
 
+/// The `stopReason` an ACP vendor reports on its `session/prompt` result —
+/// the ONLY place the protocol says how a turn ended.
+///
+/// A `session/prompt` result is a *successful* JSON-RPC response even when the
+/// turn did not produce an answer (refused, truncated, cancelled), so a client
+/// that ignores this field reports every vendor outcome as a clean answer:
+/// half-finished text lands in `turns.jsonl` as the final reply and a
+/// delegation parent is told the task completed. Parsing it here (shared by
+/// every ACP vendor, present and future) is what keeps the completion contract
+/// honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpStopReason {
+    /// The vendor finished normally. Also the verdict for an **absent** field:
+    /// not every build emits one, and treating silence as failure would break
+    /// working vendors.
+    EndTurn,
+    /// `session/cancel` took effect — an explicit stop, not a defect. Whatever
+    /// the vendor produced first is still the answer.
+    Cancelled,
+    /// Output window exhausted → the answer is truncated, not complete.
+    MaxTokens,
+    /// Vendor-side turn-request budget exhausted mid-task.
+    MaxTurnRequests,
+    /// The vendor declined to answer (also where kimi maps its own
+    /// `blocked` / content-filtered turns).
+    Refusal,
+    /// A reason this ccteam does not know, kept verbatim. Reported as a
+    /// failure on purpose: an unrecognized terminal state must never be
+    /// laundered into "answered".
+    Other(String),
+}
+
+impl AcpStopReason {
+    /// The wire spelling, for error kinds and logs.
+    pub fn wire(&self) -> &str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::Cancelled => "cancelled",
+            Self::MaxTokens => "max_tokens",
+            Self::MaxTurnRequests => "max_turn_requests",
+            Self::Refusal => "refusal",
+            Self::Other(raw) => raw.as_str(),
+        }
+    }
+
+    /// Whether the turn may be finalized as an ordinary completed answer.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::EndTurn | Self::Cancelled)
+    }
+
+    /// The honest sentence for a non-clean outcome (`None` when clean). Goes
+    /// to the user verbatim and into `turns.jsonl`'s `error`, so it names the
+    /// wire reason rather than paraphrasing it.
+    pub fn failure_message(&self) -> Option<String> {
+        match self {
+            Self::EndTurn | Self::Cancelled => None,
+            Self::MaxTokens => Some(
+                "⚠️ vendor ended the turn at its output limit (stopReason=max_tokens) — \
+                 the reply above is truncated, not a finished answer."
+                    .into(),
+            ),
+            Self::MaxTurnRequests => Some(
+                "⚠️ vendor ended the turn at its request budget \
+                 (stopReason=max_turn_requests) — the task did not finish."
+                    .into(),
+            ),
+            Self::Refusal => Some(
+                "⚠️ vendor refused this turn (stopReason=refusal) — no answer was produced.".into(),
+            ),
+            Self::Other(raw) => Some(format!(
+                "⚠️ vendor ended the turn with an unrecognized stopReason={raw} — \
+                 treating it as a failure rather than an answer."
+            )),
+        }
+    }
+}
+
+/// Read `stopReason` off a `session/prompt` result.
+///
+/// Tolerant by design: top-level or `_meta`, and case/separator-insensitive
+/// (`end_turn` / `endTurn` / `END-TURN` all land on [`AcpStopReason::EndTurn`])
+/// because ACP implementations differ on spelling. Absent or blank → `EndTurn`.
+pub fn stop_reason_from_prompt_result(result: &Value) -> AcpStopReason {
+    let raw = result
+        .get("stopReason")
+        .or_else(|| result.pointer("/_meta/stopReason"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw.is_empty() {
+        return AcpStopReason::EndTurn;
+    }
+    let normalized: String = raw
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    match normalized.as_str() {
+        "endturn" => AcpStopReason::EndTurn,
+        "cancelled" | "canceled" => AcpStopReason::Cancelled,
+        "maxtokens" => AcpStopReason::MaxTokens,
+        "maxturnrequests" => AcpStopReason::MaxTurnRequests,
+        "refusal" | "refused" => AcpStopReason::Refusal,
+        _ => AcpStopReason::Other(raw.to_string()),
+    }
+}
+
 /// Map `session/prompt` result → usage.
 ///
 /// - **Grok**: fields live under `_meta` (`inputTokens`, `cachedReadTokens`, …).
@@ -118,11 +225,19 @@ pub struct ModelInfo {
     pub model: Option<String>,
     pub window: Option<u64>,
     pub effort: Option<String>,
+    /// `configOptions[].id` of the effort axis the vendor declared — the value
+    /// to send back as `session/set_config_option.configId` when SETTING an
+    /// effort. Vendors disagree on the id (`effort` for OpenCode, `thinking`
+    /// for Kimi) and agree on nothing but the category, so the id has to
+    /// travel with the value instead of being hardcoded at each call site.
+    /// `None` for a vendor that declares no axis (or reports effort through
+    /// grok's `_meta` instead of `configOptions`).
+    pub effort_config_id: Option<String>,
     /// Vendor-supplied catalog for the bare-`/model` picker.
     ///
     /// - **Grok**: `models.availableModels[]` (live, changes with CLI upgrades).
-    /// - **OpenCode**: `configOptions[id=model].options[]` (+ shared effort
-    ///   levels from `configOptions[id=effort].options[]`).
+    /// - **OpenCode / Kimi**: `configOptions[id=model].options[]` (+ the effort
+    ///   levels off the `thought_level` axis — see [`effort_config_entry`]).
     ///
     /// Never a ccteam-hardcoded name list.
     pub available: Vec<AcpModelOption>,
@@ -191,19 +306,41 @@ pub fn split_trailing_effort(arg: &str, known_efforts: &[String]) -> (String, Op
     (arg.to_string(), None)
 }
 
-/// Pull model info from a `session/new` / `session/load` / `session/resume` result.
+/// The reasoning-effort axis of a `configOptions[]` snapshot.
+///
+/// Matched by the ACP spec CATEGORY (`thought_level` — the reserved bucket for
+/// reasoning knobs) first, and only then by the ids vendors happen to ship
+/// (`effort` — OpenCode; `thinking` — Kimi). Keying on one vendor's id is what
+/// made ccteam report "no effort" for a Kimi session that was plainly running
+/// at `high`: the value was on the wire the whole time, under an id our reader
+/// didn't know. Category-first means the next spec-conforming vendor is read
+/// with no new branch.
+fn effort_config_entry(opts: &[Value]) -> Option<&Value> {
+    let by = |pred: &dyn Fn(&Value) -> bool| opts.iter().find(|o| pred(o));
+    by(&|o| o.get("category").and_then(|v| v.as_str()) == Some("thought_level")).or_else(|| {
+        by(&|o| {
+            matches!(
+                o.get("id").and_then(|v| v.as_str()),
+                Some("effort") | Some("thinking")
+            )
+        })
+    })
+}
+
+/// Pull model info from a `session/new` / `session/load` / `session/resume`
+/// result — or from a `config_option_update` payload, which carries the same
+/// `configOptions[]` snapshot.
 ///
 /// - **Grok**: `models.currentModelId` + full `availableModels` (+ `_meta`).
-/// - **OpenCode**: `configOptions` with `id=model|effort` (current + options).
+/// - **OpenCode / Kimi**: `configOptions` with `id=model` + the
+///   [`effort_config_entry`] axis (current value + selectable levels).
 pub fn pluck_model_info(result: &Value) -> ModelInfo {
-    // OpenCode path first: configOptions present without models block.
+    // configOptions path first (OpenCode / Kimi): present without a models block.
     if let Some(opts) = result.get("configOptions").and_then(|v| v.as_array()) {
         let model_entry = opts
             .iter()
             .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("model"));
-        let effort_entry = opts
-            .iter()
-            .find(|o| o.get("id").and_then(|v| v.as_str()) == Some("effort"));
+        let effort_entry = effort_config_entry(opts);
         let model = model_entry
             .and_then(|o| o.get("currentValue"))
             .and_then(|v| v.as_str())
@@ -212,7 +349,11 @@ pub fn pluck_model_info(result: &Value) -> ModelInfo {
             .and_then(|o| o.get("currentValue"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        // Shared effort axis (OpenCode models share one effort select).
+        // One effort select for the snapshot: OpenCode shares it across models,
+        // Kimi scopes it to the currently-selected model (and omits it entirely
+        // for a model with no thinking axis — then `effort_levels` is empty and
+        // no model×effort picker rows are minted). Either way the levels are
+        // the vendor's own, refreshed by every `config_option_update`.
         let effort_levels = effort_entry
             .and_then(|o| o.get("options"))
             .and_then(|a| a.as_array())
@@ -228,6 +369,10 @@ pub fn pluck_model_info(result: &Value) -> ModelInfo {
                 model,
                 window: None,
                 effort,
+                effort_config_id: effort_entry
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 available,
             };
         }
@@ -265,6 +410,10 @@ pub fn pluck_model_info(result: &Value) -> ModelInfo {
         model,
         window,
         effort,
+        // Grok reports its effort through `_meta`, not a `configOptions`
+        // select — there is no configId to set it back with (its spawn-time
+        // axis is the `--reasoning-effort` argv flag instead).
+        effort_config_id: None,
         available,
     }
 }
@@ -415,6 +564,83 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn stop_reason_maps_every_spec_value_and_tolerates_spelling() {
+        for (raw, want) in [
+            ("end_turn", AcpStopReason::EndTurn),
+            ("endTurn", AcpStopReason::EndTurn),
+            ("END-TURN", AcpStopReason::EndTurn),
+            ("cancelled", AcpStopReason::Cancelled),
+            ("canceled", AcpStopReason::Cancelled),
+            ("max_tokens", AcpStopReason::MaxTokens),
+            ("maxTokens", AcpStopReason::MaxTokens),
+            ("max_turn_requests", AcpStopReason::MaxTurnRequests),
+            ("refusal", AcpStopReason::Refusal),
+        ] {
+            assert_eq!(
+                stop_reason_from_prompt_result(&json!({ "stopReason": raw })),
+                want,
+                "stopReason {raw} must map to {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_blank_stop_reason_stays_clean() {
+        // Not every ACP build emits one; treating silence as failure would
+        // break working vendors (grok/opencode omit it on some paths).
+        for result in [
+            json!({}),
+            json!({ "stopReason": "  " }),
+            json!({"usage":{}}),
+        ] {
+            let stop = stop_reason_from_prompt_result(&result);
+            assert_eq!(stop, AcpStopReason::EndTurn);
+            assert!(stop.is_clean());
+            assert!(stop.failure_message().is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_stop_reason_fails_loud_and_keeps_the_raw_value() {
+        let stop = stop_reason_from_prompt_result(&json!({ "stopReason": "exploded" }));
+        assert_eq!(stop, AcpStopReason::Other("exploded".into()));
+        assert!(
+            !stop.is_clean(),
+            "an unknown terminal state is not an answer"
+        );
+        assert_eq!(stop.wire(), "exploded");
+        assert!(stop
+            .failure_message()
+            .expect("unknown reason must report")
+            .contains("exploded"));
+    }
+
+    #[test]
+    fn cancelled_is_clean_but_truncating_reasons_are_not() {
+        assert!(AcpStopReason::Cancelled.is_clean(), "/stop is not a defect");
+        for stop in [
+            AcpStopReason::MaxTokens,
+            AcpStopReason::MaxTurnRequests,
+            AcpStopReason::Refusal,
+        ] {
+            assert!(!stop.is_clean());
+            let msg = stop.failure_message().expect("must carry a message");
+            assert!(
+                msg.contains(stop.wire()),
+                "the message must name the wire reason: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_reason_also_reads_from_meta() {
+        assert_eq!(
+            stop_reason_from_prompt_result(&json!({ "_meta": { "stopReason": "refusal" } })),
+            AcpStopReason::Refusal
+        );
+    }
+
+    #[test]
     fn usage_maps_section11_fields() {
         let result = json!({
             "stopReason": "end_turn",
@@ -493,6 +719,72 @@ mod tests {
         let opts = acp_model_picker_options(&info.available);
         assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].id, "tokenopen/gpt-5.5 low");
+    }
+
+    /// Kimi ships the effort axis under id `thinking` with the ACP spec
+    /// category `thought_level` (verified on 0.31.1). Matching opencode's
+    /// `effort` id alone reported "no effort" for a session running at `high`.
+    #[test]
+    fn model_info_reads_kimis_thought_level_axis() {
+        let result = json!({
+            "sessionId": "session_abc",
+            "configOptions": [
+                {
+                    "type":"select","id":"model","name":"Model","category":"model",
+                    "currentValue":"kimi-code/k3",
+                    "options": [
+                        {"value":"kimi-code/k3","name":"K3"},
+                        {"value":"kimi-code/kimi-for-coding","name":"K2.7 Coding"}
+                    ]
+                },
+                {
+                    "type":"select","id":"thinking","name":"Thinking","category":"thought_level",
+                    "currentValue":"high",
+                    "options": [
+                        {"value":"low","name":"Low"},
+                        {"value":"high","name":"High"},
+                        {"value":"max","name":"Max"}
+                    ]
+                },
+                {
+                    "type":"select","id":"mode","name":"Mode","category":"mode",
+                    "currentValue":"default",
+                    "options": [{"value":"default","name":"Default"}]
+                }
+            ]
+        });
+        let info = pluck_model_info(&result);
+        assert_eq!(info.model.as_deref(), Some("kimi-code/k3"));
+        assert_eq!(info.effort.as_deref(), Some("high"));
+        assert_eq!(info.available[0].efforts, vec!["low", "high", "max"]);
+        // `mode` is a select too — only the thought_level axis may be read as
+        // effort, or a session would report `default` as its reasoning level.
+        assert_ne!(info.effort.as_deref(), Some("default"));
+    }
+
+    /// A model with no thinking axis ships no `thought_level` option at all
+    /// (kimi omits it) — that is honestly "no effort", and no model×effort
+    /// picker rows are minted.
+    #[test]
+    fn model_info_has_no_effort_when_the_axis_is_absent() {
+        let result = json!({
+            "configOptions": [
+                {
+                    "type":"select","id":"model","category":"model",
+                    "currentValue":"kimi-code/plain",
+                    "options": [{"value":"kimi-code/plain","name":"Plain"}]
+                },
+                {
+                    "type":"select","id":"mode","category":"mode",
+                    "currentValue":"default",
+                    "options": [{"value":"default","name":"Default"}]
+                }
+            ]
+        });
+        let info = pluck_model_info(&result);
+        assert_eq!(info.effort, None);
+        assert!(info.available[0].efforts.is_empty());
+        assert_eq!(acp_model_picker_options(&info.available).len(), 1);
     }
 
     #[test]

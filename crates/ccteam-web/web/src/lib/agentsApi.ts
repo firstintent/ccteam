@@ -3,6 +3,8 @@
 // parent→child delegation edges). Mirrors the `getJson` pattern every other
 // `lib/*Api.ts` module keeps its own private copy of (see `workflowApi.ts`).
 
+import { httpError } from "./httpError";
+
 /** One session node in the team graph (mirrors the Rust `AgentNode`). */
 export interface AgentNode {
   sid: string;
@@ -10,6 +12,10 @@ export interface AgentNode {
   role: string;
   vendor: string;
   model?: string | null;
+  /** Reasoning-effort token off the same live statusline join as `model`
+   *  (`low`/`medium`/`high`/`xhigh`/`max`); absent on idle nodes and on
+   *  vendors with no effort axis. */
+  effort?: string | null;
   host: string;
   /** `"live"` (gateway-tracked) or `"idle"` (persisted, not tracked). */
   status: string;
@@ -44,7 +50,7 @@ async function getJson<T>(url: string): Promise<T> {
     credentials: "same-origin",
   });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }
 

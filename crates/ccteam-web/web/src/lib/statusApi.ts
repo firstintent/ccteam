@@ -8,6 +8,8 @@
 //   401 → throw Error("UNAUTHENTICATED")  (global TokenEntryGate kicks in)
 //   other non-2xx → throw Error("HTTP <status>")
 
+import { httpError } from "./httpError";
+
 /** v0.8.18 柱1 — one live session's fleet-view row (`SessionCostRow`). The
  *  loop-ops console skeleton: per-session cost today, oracle/gate columns
  *  next version. `cost_usd` is priced deterministically per-turn by each
@@ -56,6 +58,6 @@ async function getJson<T>(url: string): Promise<T> {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);
   }
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }

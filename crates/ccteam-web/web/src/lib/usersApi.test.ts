@@ -6,6 +6,8 @@ import {
   createUser,
   deleteUser,
   getMyLarkOpenIdCandidates,
+  getMyTelegramChatIdCandidates,
+  putMyTelegramAllowedChats,
   listUsers,
   putMyIm,
   putMyLarkAllowedUsers,
@@ -143,5 +145,56 @@ describe("usersApi", () => {
     await expect(listUsers()).rejects.toThrow("FORBIDDEN");
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(500, {}));
     await expect(listUsers()).rejects.toThrow("HTTP 500");
+  });
+});
+
+describe("per-user Telegram binding (the fail-closed bot's way in)", () => {
+  it("getMyTelegramChatIdCandidates GETs the discovery endpoint with `since`", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              sender_id: "339498819",
+              open_id: "339498819",
+              seen_at: 1700,
+              message_id: "42",
+              chat_id_last4: "8819",
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const got = await getMyTelegramChatIdCandidates(1500);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/me/im/telegram/chat-id-candidates?since=1500",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(got.candidates[0].sender_id).toBe("339498819");
+  });
+
+  it("putMyTelegramAllowedChats PUTs the ids alone — never the bot token", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, allowed_chat_id_count: 1 }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await putMyTelegramAllowedChats(["339498819"]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/me/im/telegram/allowed-chats");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ allowed_chat_ids: ["339498819"] });
+    expect(init.body).not.toContain("token");
+  });
+
+  it("surfaces the server's reason instead of a bare status", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "no Telegram bot configured" }), { status: 400 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(putMyTelegramAllowedChats(["1"])).rejects.toThrow(
+      "HTTP 400: no Telegram bot configured",
+    );
   });
 });

@@ -78,9 +78,17 @@ export interface SessionHistory {
  *  float 0–100. `null` on the parent when a brand-new session hasn't completed
  *  a turn yet (no context numbers to report). */
 export interface SessionContext {
-  used_tokens: number;
+  /** Tokens occupying the window; `null` when no channel reports occupancy
+   *  (a just-resumed ACP session, a vendor with no usage surface). Never
+   *  render a null as `0` — an empty context is a different claim. */
+  used_tokens: number | null;
   window_tokens: number;
-  pct: number;
+  /** `null` whenever either half is unknown. */
+  pct: number | null;
+  /** How the numbers were obtained: `reported` (vendor stated occupancy) /
+   *  `derived` (computed from per-turn tokens) / `probed` (pulled from the
+   *  vendor's own status command) / `unknown`. */
+  source?: "reported" | "derived" | "probed" | "unknown";
 }
 
 /** Per-session statusline payload from `GET /api/v1/sessions/{sid}/status`
@@ -387,9 +395,10 @@ export interface CreateSessionOpts {
   /** v0.8.24 A-U3 — explicit model id (overrides the role's `model:`
    *  frontmatter); omit for the vendor default. */
   model?: string;
-  /** v0.8.24 A-U3 — explicit reasoning-effort token (vendor value set; see
-   *  `wireEffort`); omit for the vendor default. Ignored server-side for
-   *  grok. */
+  /** v0.8.24 A-U3 — explicit reasoning-effort token, the VENDOR's own value
+   *  verbatim (there is no shared ladder: kimi has no `medium`, grok has no
+   *  `max` — see `lib/vendors.ts` / `GET /api/v1/models`); omit for the
+   *  vendor default. */
   effort?: string;
 }
 

@@ -204,7 +204,95 @@ describe("model button label", () => {
       draft: { ...defaultDraft(), vendor: "kimi", model: "", protocol: "acp" },
     });
     expect(html).toContain("<span>Kimi · kimi-code/k3</span>");
-    expect(html).toContain('<span class="eff">默认</span>');
+    // Effort renders as the vendor's own token, never a translated word —
+    // identical in zh and en. Nothing reported ⇒ `default`.
+    expect(html).toContain('<span class="eff">default</span>');
+  });
+
+  it("conversation: the live effort token prints VERBATIM (display prop, not draft)", () => {
+    // The pill must echo what the session reports, even a token this vendor's
+    // menu never offers — `max` for kimi, `xhigh` for codex, both raw.
+    expect(
+      renderBtn({
+        modelLabel: "kimi-code/k3",
+        effortLabel: "max",
+        draft: { ...defaultDraft(), vendor: "kimi", model: "", protocol: "acp" },
+      }),
+    ).toContain('<span class="eff">max</span>');
+    const en = renderBtn({
+      lang: "en",
+      modelLabel: "gpt-5.5-codex",
+      effortLabel: "xhigh",
+      draft: { ...defaultDraft(), vendor: "codex", model: "", protocol: "app-server" },
+    });
+    expect(en).toContain('<span class="eff">xhigh</span>');
+  });
+});
+
+// ── vendor-driven model + effort menus ────────────────────────────────────────
+
+describe("model menu (rows come from the vendor, never from a ccteam ladder)", () => {
+  const renderMenu = (over: Partial<Parameters<typeof ChatComposer>[0]> = {}) =>
+    renderToString(
+      <ChatComposer
+        draftKey="test"
+        lang="zh"
+        draft={defaultDraft()}
+        onDraftChange={() => {}}
+        onSend={() => {}}
+        {...over}
+      />,
+    );
+
+  it("with no catalog (404 daemon) claude keeps its static alias list + its own effort set", () => {
+    const html = renderMenu();
+    for (const alias of ["默认", "fable", "opus", "sonnet", "haiku"]) {
+      expect(html).toContain(alias);
+    }
+    expect(html).toContain('data-testid="effort-group"');
+    // claude's verified `--effort` levels, and no ccteam-invented rung.
+    for (const eff of ["default", "low", "medium", "high", "xhigh", "max"]) {
+      expect(html).toContain(`>${eff}<`);
+    }
+  });
+
+  it("the effort section names the selected vendor and shows only ITS tokens", () => {
+    const kimi = renderMenu({
+      draft: { ...defaultDraft(), vendor: "kimi", protocol: "acp" },
+    });
+    expect(kimi).toContain("effort(Kimi)");
+    expect(kimi).toContain(">max<");
+    // kimi has no `medium` — the old shared ladder offered one anyway.
+    expect(kimi).not.toContain(">medium<");
+    const grok = renderMenu({ draft: { ...defaultDraft(), vendor: "grok", protocol: "acp" } });
+    expect(grok).toContain(">medium<");
+    // …and grok has no `max`.
+    expect(grok).not.toContain(">max<");
+  });
+
+  it("a vendor with no effort axis (opencode) gets NO effort section at all", () => {
+    const html = renderMenu({
+      draft: { ...defaultDraft(), vendor: "opencode", protocol: "acp" },
+    });
+    expect(html).not.toContain('data-testid="effort-group"');
+    // …while the rest of the menu still renders (only effort is missing).
+    expect(html).toContain('data-testid="model-menu"');
+    expect(html).toContain("JSON-RPC stdio");
+  });
+
+  it("a live catalog supersedes the static rows for models AND efforts", () => {
+    const html = renderMenu({
+      draft: { ...defaultDraft(), vendor: "kimi", protocol: "acp" },
+      catalog: {
+        kimi: { models: ["kimi-code/k3", "kimi-code/k3-256k"], efforts: ["low", "max"] },
+        opencode: { models: ["openai/gpt-5.5"], efforts: [] },
+      },
+    });
+    expect(html).toContain("kimi-code/k3-256k");
+    expect(html).toContain("openai/gpt-5.5");
+    // The catalog said low|max — `high` (static) is gone.
+    expect(html).toContain(">low<");
+    expect(html).not.toContain(">high<");
   });
 });
 

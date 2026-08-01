@@ -56,11 +56,13 @@ import {
   createUser,
   deleteUser,
   getMyLarkOpenIdCandidates,
+  getMyTelegramChatIdCandidates,
   getUserLink,
   listUsers,
   putMyIm,
   putMyLarkAllowedUsers,
-  type LarkOpenIdCandidate,
+  putMyTelegramAllowedChats,
+  type SenderCandidate,
   type PutMyImForm,
   type TenantView,
 } from "../lib/usersApi";
@@ -681,7 +683,13 @@ export function MyImSection() {
   const [larkUsersRaw, setLarkUsersRaw] = useState("");
   const [useFeishu, setUseFeishu] = useState(true);
   const [larkCaptureSince, setLarkCaptureSince] = useState<number | null>(null);
-  const [larkCandidates, setLarkCandidates] = useState<LarkOpenIdCandidate[]>([]);
+  const [larkCandidates, setLarkCandidates] = useState<SenderCandidate[]>([]);
+  // Telegram twin of the Lark capture: a per-tenant bot answers nobody until a
+  // chat is bound, so every DM it drops is recorded and offered here.
+  const [tgCaptureSince, setTgCaptureSince] = useState<number | null>(null);
+  const [tgCandidates, setTgCandidates] = useState<SenderCandidate[]>([]);
+  const [tgAllowed, setTgAllowed] = useState<string[]>([]);
+  const tgCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pending, setPending] = useState(false);
   const [saved, setSaved] = useState(false);
   const larkCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -715,6 +723,61 @@ export function MyImSection() {
       }
     };
   }, [larkCaptureSince]);
+
+  useEffect(() => {
+    if (tgCaptureSince === null) return;
+    let cancelled = false;
+
+    const tick = () => {
+      getMyTelegramChatIdCandidates(tgCaptureSince)
+        .then((res) => {
+          if (cancelled) return;
+          setTgCandidates(res.candidates);
+          tgCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          if (!(err instanceof Error) || err.message !== "UNAUTHENTICATED") {
+            toastBus.handler?.error(err instanceof Error ? err.message : "chat_id capture failed");
+          }
+          tgCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
+        });
+    };
+    tgCaptureTimerRef.current = setTimeout(tick, 300);
+    return () => {
+      cancelled = true;
+      if (tgCaptureTimerRef.current) {
+        clearTimeout(tgCaptureTimerRef.current);
+        tgCaptureTimerRef.current = null;
+      }
+    };
+  }, [tgCaptureSince]);
+
+  function onStartTelegramCapture() {
+    setTgCandidates([]);
+    // eslint-disable-next-line react-hooks/purity -- user-action timestamp, never called during render
+    setTgCaptureSince(Math.floor(Date.now() / 1000) - 2);
+    toastBus.handler?.info("现在私聊你的 Telegram bot,这里会出现你的 chat_id");
+  }
+
+  async function saveTelegramAllowlist(ids: string[]) {
+    if (pending) return;
+    const normalized = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).sort();
+    setPending(true);
+    try {
+      const res = await putMyTelegramAllowedChats(normalized);
+      setTgAllowed(normalized);
+      setTgCaptureSince(null);
+      setTgCandidates([]);
+      setSaved(true);
+      toastBus.handler?.info(res.note || "chat_id 已保存,bot 现在只回你");
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
 
   function onStartLarkCapture() {
     setLarkCandidates([]);
@@ -754,7 +817,7 @@ export function MyImSection() {
       };
     }
     try {
-      await putMyIm(form);
+      const res = await putMyIm(form);
       setSaved(true);
       setTelegram("");
       setLarkAppId("");
@@ -762,7 +825,15 @@ export function MyImSection() {
       if (larkOpen && larkUserIds.length === 0) {
         onStartLarkCapture();
       }
-      toastBus.handler?.info("已保存 / Saved");
+      // A saved-but-unbound Telegram bot answers NOBODY (fail-closed, like
+      // Lark). Say so and open the capture instead of leaving the tenant to
+      // discover it as silence.
+      if (tok && res.telegram_unbound) {
+        onStartTelegramCapture();
+        toastBus.handler?.info("已保存 —— 现在私聊 bot 绑定你的 chat,绑定前它不回任何人");
+      } else {
+        toastBus.handler?.info("已保存 / Saved");
+      }
     } catch (err) {
       if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
       toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
@@ -805,7 +876,8 @@ export function MyImSection() {
         </div>
         <p className="text-[11px] text-text-muted leading-relaxed">
           配置你自己的 Telegram / Lark 机器人 —— 它只驱动你自己的 session(不再共用管理员的全局 bot)。
-          保存会<b className="text-text-secondary">替换</b>当前配置;留空即清除。下次该 bot 监听重启后生效。
+          只保存你<b className="text-text-secondary">填了的那一项</b>,另一项原样保留(留空 = 不动它)。
+          两边都<b className="text-text-secondary">只回被你允许的人</b>,绑定前谁也不回。保存后即时生效。
         </p>
       </div>
 
@@ -827,6 +899,62 @@ export function MyImSection() {
             <p className="text-[10px] text-text-dim">
               从 @BotFather 拿一个新 bot 的 token(每个 bot 的 token 唯一,保存前会校验)。
             </p>
+
+            <div
+              className="flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2"
+              data-testid="my-im-telegram-bind"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-text-secondary">
+                  绑定你的 chat
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  data-testid="my-im-telegram-capture"
+                  onClick={onStartTelegramCapture}
+                  disabled={pending}
+                >
+                  开始
+                </Button>
+              </div>
+              <p className="text-[10px] text-status-error">
+                你的 bot 只回被绑定的 chat。绑定前它不回任何人 —— 否则任何找到 bot
+                的人都会以你的身份驱动你的 session。
+              </p>
+              {tgAllowed.length > 0 ? (
+                <p className="text-[10px] font-mono text-status-running">
+                  已绑定 {tgAllowed.length} 个 chat:{tgAllowed.join(", ")}
+                </p>
+              ) : null}
+              {tgCaptureSince !== null ? (
+                <p className="text-[10px] text-text-dim">
+                  现在私聊这个 bot 发一条消息;消息会被拒绝,只用于显示你的 chat_id。
+                </p>
+              ) : null}
+              {tgCandidates.length > 0 ? (
+                <div className="flex flex-col gap-1">
+                  {tgCandidates.map((candidate) => (
+                    <button
+                      key={`${candidate.sender_id}:${candidate.message_id}`}
+                      type="button"
+                      data-testid={`my-im-telegram-candidate-${candidate.sender_id}`}
+                      onClick={() =>
+                        void saveTelegramAllowlist([...tgAllowed, candidate.sender_id])
+                      }
+                      disabled={pending}
+                      className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
+                    >
+                      <span>{candidate.sender_id}</span>
+                      <span className="text-[10px] text-text-dim">绑定并保存</span>
+                    </button>
+                  ))}
+                </div>
+              ) : tgCaptureSince !== null ? (
+                <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
+              ) : null}
+            </div>
           </div>
 
           <button

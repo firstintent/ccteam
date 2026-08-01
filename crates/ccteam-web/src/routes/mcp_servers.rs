@@ -2,9 +2,10 @@
 //!
 //! The workflow → MCP Servers page: list what the project's `.mcp.json`
 //! declares (vendor-native config Claude Code reads on next start) and
-//! register a new server by **idempotently writing that config** — the
-//! same seam `ccteam init` uses for ccteam's own entry
-//! (`ccteam_core::merge_named_mcp_server` / `merge_project_mcp_json`).
+//! register a new server by **idempotently writing that config**
+//! (`ccteam_core::merge_named_mcp_server`). ccteam's own entry is never
+//! written here — it is registered globally per vendor over HTTP
+//! (`ccteam_core::mcp_register`) and overridden per session at spawn.
 //!
 //! **Red line**: this surface writes configuration ONLY. ccteam never
 //! fetches, installs, or executes a third-party server — Claude Code

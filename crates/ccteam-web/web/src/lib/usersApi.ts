@@ -8,6 +8,8 @@
 //   403 → throw Error("FORBIDDEN")        (caller is a tenant, not the admin)
 //   other non-2xx → throw Error("HTTP <status>")
 
+import { httpError } from "./httpError";
+
 /** One tenant as `GET /api/v1/users` returns it — never carries the token. */
 export interface TenantView {
   id: string;
@@ -57,45 +59,89 @@ export function getUserLink(id: string): Promise<UserLinkResponse> {
   return getJson<UserLinkResponse>(`/api/v1/users/${encodeURIComponent(id)}/link`);
 }
 
-/** `PUT /api/v1/me/im` body — v0.8.20 F2. REPLACE semantics: the full desired
- *  per-user IM config; a platform omitted/empty is cleared. */
+/** `PUT /api/v1/me/im` body — per-platform PATCH semantics: an OMITTED
+ *  platform is left alone, an explicit `null` clears it. (It used to be
+ *  whole-body replace, so saving a Telegram token wiped the Lark app the form
+ *  could never re-fill.) */
 export interface PutMyImForm {
-  /** The tenant's own Telegram bot token. Omit/empty → no Telegram bot. */
-  telegram_bot_token?: string;
-  /** The tenant's own Lark/Feishu app. Omit → no Lark bot. */
+  /** Omit → unchanged; `null`/empty → no Telegram bot. */
+  telegram_bot_token?: string | null;
+  /** Omit → unchanged; `null` → no Lark bot. */
   lark?: {
     app_id: string;
     app_secret: string;
     allowed_user_ids?: string[];
     use_feishu?: boolean;
-  };
+  } | null;
 }
 
 /** `PUT /api/v1/me/im` — the caller sets its OWN per-user IM bot (self-serve).
- *  The Telegram token is `getMe`-validated server-side before it is stored. */
-export function putMyIm(form: PutMyImForm): Promise<{ ok: boolean }> {
-  return sendJson<{ ok: boolean }>("/api/v1/me/im", "PUT", form);
+ *  The Telegram token is `getMe`-validated server-side before it is stored.
+ *  `telegram_unbound` reports the fail-closed state a fresh bot lands in: saved,
+ *  but answering nobody until a chat id is allowlisted. */
+export function putMyIm(form: PutMyImForm): Promise<PutMyImResult> {
+  return sendJson<PutMyImResult>("/api/v1/me/im", "PUT", form);
 }
 
-export interface LarkOpenIdCandidate {
+export interface PutMyImResult {
+  ok: boolean;
+  telegram: boolean;
+  lark: boolean;
+  /** A Telegram bot is configured but has an empty chat allowlist → it will
+   *  answer no one until `putMyTelegramAllowedChats` binds a chat. */
+  telegram_unbound: boolean;
+  reloaded?: boolean;
+  note?: string;
+}
+
+/** One id a tenant's own bot saw and rejected — the thing to allowlist. Shared
+ *  by both discovery endpoints: `sender_id` is a Lark `open_id` (`ou_...`) or a
+ *  Telegram `chat_id`, depending on which one you asked. */
+export interface SenderCandidate {
+  sender_id: string;
+  /** Legacy alias of `sender_id` on the Lark endpoint. */
   open_id: string;
   seen_at: number;
   message_id: string;
   chat_id_last4: string;
 }
 
-export interface LarkOpenIdCandidatesResponse {
-  candidates: LarkOpenIdCandidate[];
+export interface SenderCandidatesResponse {
+  candidates: SenderCandidate[];
 }
 
 /** Poll rejected Lark/Feishu sender open_ids for the caller's own per-user bot.
  *  These messages were denied by the allowlist and never routed to an agent. */
 export function getMyLarkOpenIdCandidates(
   since?: number,
-): Promise<LarkOpenIdCandidatesResponse> {
+): Promise<SenderCandidatesResponse> {
   const qs = since ? `?since=${encodeURIComponent(String(since))}` : "";
-  return getJson<LarkOpenIdCandidatesResponse>(
+  return getJson<SenderCandidatesResponse>(
     `/api/v1/me/im/lark/open-id-candidates${qs}`,
+  );
+}
+
+/** Poll the chat ids the caller's OWN Telegram bot rejected. A per-tenant bot
+ *  is fail-closed, so until a chat is bound every message is dropped and shows
+ *  up here — the tenant DMs their bot, sees their own chat id, allows it. */
+export function getMyTelegramChatIdCandidates(
+  since?: number,
+): Promise<SenderCandidatesResponse> {
+  const qs = since ? `?since=${encodeURIComponent(String(since))}` : "";
+  return getJson<SenderCandidatesResponse>(
+    `/api/v1/me/im/telegram/chat-id-candidates${qs}`,
+  );
+}
+
+/** Bind the caller's own Telegram chats. Takes chat ids alone: the bot token is
+ *  write-only, so demanding it again just to allow a chat would be a dead end. */
+export function putMyTelegramAllowedChats(
+  allowed_chat_ids: string[],
+): Promise<{ ok: boolean; allowed_chat_id_count: number; note?: string }> {
+  return sendJson<{ ok: boolean; allowed_chat_id_count: number; note?: string }>(
+    "/api/v1/me/im/telegram/allowed-chats",
+    "PUT",
+    { allowed_chat_ids },
   );
 }
 
@@ -148,6 +194,6 @@ async function sendJson<T>(
 async function handleResponse<T>(res: Response): Promise<T> {
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (res.status === 403) throw new Error("FORBIDDEN");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await httpError(res);
   return (await res.json()) as T;
 }

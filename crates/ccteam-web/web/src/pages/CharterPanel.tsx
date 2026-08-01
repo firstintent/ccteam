@@ -49,6 +49,7 @@ import { makeT, tRosterOfflineFor, tRosterUpdateAvailable, type Lang } from "../
 import { VENDORS } from "../lib/vendors";
 import { PLAYBOOKS } from "../lib/playbooks";
 import { toastBus } from "../lib/toastBus";
+import { useMe } from "../hooks/useMe";
 import { VendorChip } from "../components/VendorChip";
 import { Markdown } from "../components/Markdown";
 
@@ -108,6 +109,7 @@ export function VendorRosterCards({
   onToggleCollapse = () => {},
   confirmingHost = null,
   onRemoveClick = () => {},
+  canRemove = true,
   onVendorPick,
   nowMs,
   latests,
@@ -121,6 +123,10 @@ export function VendorRosterCards({
   /** Host id currently armed for a second-click remove confirmation. */
   confirmingHost?: string | null;
   onRemoveClick?: (host: string, online: boolean) => void;
+  /** Whether to offer the remove button at all. Fleet membership is owner-
+   *  scoped (`DELETE /hosts/{id}` is admin-gated), so a tenant would only get
+   *  a 403 — don't show them a button that can only fail. UX, not the gate. */
+  canRemove?: boolean;
   /** Present = cards are clickable "show me this vendor's sessions". */
   onVendorPick?: (vendor: string) => void;
   /** Clock the offline age is measured against (ms). Owned by the caller —
@@ -187,7 +193,7 @@ export function VendorRosterCards({
                     {t("rosterStaleHint")}
                   </span>
                 ) : null}
-                {!isLocal ? (
+                {!isLocal && canRemove ? (
                   <button
                     type="button"
                     className={
@@ -467,6 +473,7 @@ export default function CharterPanel({
 }) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
+  const { isAdmin } = useMe();
   const [projects, setProjects] = useState<DashboardRow[] | null>(null);
   const [slug, setSlug] = useState<string | null>(null);
   const [roster, setRoster] = useState<RosterHost[]>([]);
@@ -638,6 +645,7 @@ export default function CharterPanel({
         onToggleCollapse={toggleRosterCollapsed}
         confirmingHost={confirmingHost}
         onRemoveClick={onRosterRemoveClick}
+        canRemove={isAdmin}
         onVendorPick={onVendorPick}
         nowMs={nowMs ?? undefined}
         latests={latests}

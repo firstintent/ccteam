@@ -3,15 +3,18 @@
 
 Speaks JSON-RPC 2.0 over stdin/stdout. Supports:
   initialize → notifications/initialized → session/new|resume|load →
-  session/prompt → session/set_model → session/cancel
+  session/prompt → session/set_model → session/set_config_option →
+  session/cancel
   inbound session/request_permission (client auto-allows on skip)
 
 Kimi wire traits mirrored from `references/kimi-code` (protocol reference
 only — never vendored):
   - initialize reply carries agentInfo {name: "Kimi Code CLI", version}
   - session id is a ULID
-  - model catalog arrives as `configOptions` (select id "model"); a
-    `thought_level` "thinking" toggle rides along for thinking models
+  - model catalog arrives as `configOptions` (select id "model"); the
+    effort ladder rides along as the `thought_level` "thinking" select
+    (`low|high|max`, verified on kimi 0.31.1), set via
+    session/set_config_option and republished as config_option_update
   - session/resume does NOT replay history; session/load does
   - the prompt stream emits agent_thought_chunk + agent_message_chunk and
     the response carries ONLY stopReason — no usage/cost on the ACP wire
@@ -29,6 +32,10 @@ KNOWN_MODELS = {
     "kimi-k2-thinking": "Kimi K2 Thinking",
 }
 MODEL = "kimi-k2-0905-preview"
+# The current model's own effort ladder (kimi 0.31.1 ships low/high/max for
+# thinking models; `off` only when the model is not always-thinking).
+THINKING_LEVELS = ["low", "high", "max"]
+THINKING = "high"
 
 
 def emit(obj: dict) -> None:
@@ -48,8 +55,9 @@ def err(req_id, code: int, message: str) -> None:
     emit({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
-def config_options(current_model=None):
+def config_options(current_model=None, thinking=None):
     current_model = current_model or MODEL
+    thinking = thinking or THINKING
     return [
         {
             "type": "select",
@@ -66,10 +74,9 @@ def config_options(current_model=None):
             "id": "thinking",
             "name": "Thinking",
             "category": "thought_level",
-            "currentValue": "off",
+            "currentValue": thinking,
             "options": [
-                {"value": "off", "name": "off"},
-                {"value": "on", "name": "on"},
+                {"value": level, "name": level.capitalize()} for level in THINKING_LEVELS
             ],
         },
         {
@@ -93,7 +100,39 @@ def available_commands_notif(session_id: str) -> None:
                 "availableCommands": [
                     {"name": "compact", "description": "Compact context"},
                     {"name": "model", "description": "Switch model"},
+                    {"name": "status", "description": "Show current session status"},
+                    {"name": "usage", "description": "Show session token usage"},
                 ],
+            },
+        },
+    )
+
+
+# Occupancy the fake reports, in the shape kimi's `formatStatusReport` emits.
+CONTEXT_WINDOW = 1048576
+TOKENS_PER_TURN = 12345
+
+
+def emit_status_report(session_id: str, model: str, context_tokens: int) -> None:
+    pct = (context_tokens / CONTEXT_WINDOW) * 100
+    report = "\n".join(
+        [
+            "Session status:",
+            f"- Model: {model}",
+            "- Thinking: max",
+            "- Permission: manual",
+            "- Plan mode: off",
+            f"- Context: {context_tokens:,} / {CONTEXT_WINDOW:,} ({pct:.1f}%)",
+        ]
+    )
+    notif(
+        "session/update",
+        {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": f"msg_{uuid.uuid4().hex[:12]}",
+                "content": {"type": "text", "text": report},
             },
         },
     )
@@ -107,7 +146,9 @@ def main() -> None:
 
     session_id = SESSION_ID
     current_model = MODEL
+    current_thinking = THINKING
     request_perm_once = True
+    context_tokens = 0
 
     for line in sys.stdin:
         line = line.strip()
@@ -170,7 +211,7 @@ def main() -> None:
                 req_id,
                 {
                     "sessionId": session_id,
-                    "configOptions": config_options(current_model),
+                    "configOptions": config_options(current_model, current_thinking),
                 },
             )
             available_commands_notif(session_id)
@@ -179,7 +220,7 @@ def main() -> None:
         if method == "session/resume":
             sid = params.get("sessionId") or SESSION_ID
             session_id = sid
-            reply(req_id, {"configOptions": config_options(current_model)})
+            reply(req_id, {"configOptions": config_options(current_model, current_thinking)})
             available_commands_notif(session_id)
             # No history replay on resume.
             continue
@@ -198,7 +239,7 @@ def main() -> None:
                     },
                 },
             )
-            reply(req_id, {"configOptions": config_options(current_model)})
+            reply(req_id, {"configOptions": config_options(current_model, current_thinking)})
             available_commands_notif(session_id)
             continue
 
@@ -227,7 +268,39 @@ def main() -> None:
                     "sessionId": session_id,
                     "update": {
                         "sessionUpdate": "config_option_update",
-                        "configOptions": config_options(current_model),
+                        "configOptions": config_options(current_model, current_thinking),
+                    },
+                },
+            )
+            continue
+
+        if method == "session/set_config_option":
+            config_id = (params.get("configId") or "").strip()
+            value = (params.get("value") or "").strip()
+            if config_id == "thinking":
+                if value not in THINKING_LEVELS:
+                    err(req_id, -32602, f"unknown thinking level: {value}")
+                    continue
+                current_thinking = value
+            elif config_id == "model":
+                if value not in KNOWN_MODELS:
+                    err(req_id, -32602, f"unknown model: {value}")
+                    continue
+                current_model = value
+            else:
+                err(req_id, -32602, f"unknown configId: {config_id}")
+                continue
+            # Live kimi 0.31.1: the reply carries the refreshed snapshot AND the
+            # same snapshot is pushed as config_option_update.
+            snapshot = config_options(current_model, current_thinking)
+            reply(req_id, {"configOptions": snapshot})
+            notif(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": snapshot,
                     },
                 },
             )
@@ -239,6 +312,16 @@ def main() -> None:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text += block.get("text") or ""
             answer = f"echo:{text}" if text else "echo:"
+
+            # `/status` is handled locally by kimi's ACP layer: no model call,
+            # no usage on the response, just a rendered report on the message
+            # channel. Occupancy grows with the turns actually taken so a test
+            # can watch it track. Format copied from a live 0.26.0 binary.
+            if text.strip() == "/status":
+                emit_status_report(session_id, current_model, context_tokens)
+                reply(req_id, {"stopReason": "end_turn"})
+                continue
+            context_tokens += TOKENS_PER_TURN
 
             # One inbound permission request on the first prompt; the client
             # (skip → auto-allow, hitl → decline) replies asynchronously.
@@ -308,7 +391,17 @@ def main() -> None:
                 },
             )
             # Kimi's ACP wire carries NO usage/cost — stopReason only.
-            reply(req_id, {"stopReason": "end_turn"})
+            #
+            # A prompt containing `STOP:<reason>` makes this fake end the turn
+            # with that stopReason instead of `end_turn`, so tests can drive the
+            # abnormal-outcome path (refusal / max_tokens / an unknown value)
+            # over the real adapter. Live kimi reaches these through its own
+            # `blocked` / content-filter mapping.
+            stop_reason = "end_turn"
+            marker = "STOP:"
+            if marker in text:
+                stop_reason = text.split(marker, 1)[1].split()[0].strip()
+            reply(req_id, {"stopReason": stop_reason})
             continue
 
         if method == "session/cancel":

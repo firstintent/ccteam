@@ -281,36 +281,37 @@ pub struct CreateSessionForm {
     /// `session/set_model` (both best-effort).
     #[serde(default)]
     pub model: Option<String>,
-    /// v0.8.24 A-U3 — explicit reasoning-effort token. Vendor value sets:
-    /// claude `low|medium|high|xhigh|max`; codex
-    /// `none|minimal|low|medium|high|xhigh`; opencode = a model variant
-    /// (best-effort). Grok is NOT wired (its `--reasoning-effort` value set
-    /// is undocumented; an invalid value would fail the spawn) — the field
-    /// is ignored for grok. Kimi's effort axis (thinking) is likewise NOT
-    /// wired — the field is ignored for kimi.
+    /// Explicit reasoning-effort token, forwarded to EVERY vendor verbatim.
+    /// The value set is vendor-specific (claude `low|medium|high|xhigh|max`;
+    /// codex `low|medium|high|xhigh`; grok `low|medium|high`; kimi
+    /// `low|high|max`; opencode declares no effort axis today) and the VENDOR
+    /// owns the verdict on its own values — ccteam never silently drops a
+    /// caller's pick, because a dropped effort looks like a working spawn that
+    /// quietly ran at the default. Omitted/empty → vendor default. Discover
+    /// the live ladders with `GET /api/v1/models`.
     #[serde(default)]
     pub effort: Option<String>,
 }
 
-/// v0.8.24 A-U3 — map the create form's model/effort into a [`SpawnTuning`].
-/// Grok effort is dropped (see [`CreateSessionForm::effort`]): the flag
-/// exists but its value set is undocumented, so passing one through could
-/// fail the spawn; model still rides `-m`. Kimi effort is likewise dropped
-/// (thinking axis not wired this version). Empty strings normalize to `None`
-/// downstream (`SpawnTuning::normalized`).
+/// Map the create form's model/effort into a [`SpawnTuning`] — the ONE place
+/// this entry point decides what reaches the vendor, and it decides nothing:
+/// both facets ride through untouched for all five vendors.
+///
+/// `_vendor` stays in the signature deliberately. It used to gate the effort
+/// facet (grok/kimi were zeroed here on the theory that ccteam knew their
+/// value sets better than they did), which turned an explicit caller choice
+/// into a silent default — the exact failure this contract now forbids. The
+/// param keeps the question "does the vendor change what we forward?" visible
+/// with its permanent answer: no. Empty strings normalize to `None`
+/// downstream (`SpawnTuning::normalized`); an unsupported token comes back as
+/// the vendor's own spawn error, which is honest feedback the caller can act
+/// on.
 fn spawn_tuning_from_form(
-    vendor: AgentVendor,
+    _vendor: AgentVendor,
     model: Option<String>,
     effort: Option<String>,
 ) -> ccteam_im::gateway::SpawnTuning {
-    ccteam_im::gateway::SpawnTuning {
-        model,
-        effort: if matches!(vendor, AgentVendor::Grok | AgentVendor::Kimi) {
-            None
-        } else {
-            effort
-        },
-    }
+    ccteam_im::gateway::SpawnTuning { model, effort }
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -675,9 +676,12 @@ pub(crate) async fn handle_session_status(
     let status = resolved_thread_status(adapter, thread, &sid).await;
     let context = status.context.map(|c| {
         json!({
+            // `used_tokens` / `pct` are null when no channel reports occupancy
+            // — the SPA renders a dash; a zero would claim an empty context.
             "used_tokens": c.used_tokens,
             "window_tokens": c.window_tokens,
             "pct": c.pct(),
+            "source": c.source,
         })
     });
     Json(json!({
@@ -2948,39 +2952,36 @@ mod tests {
         assert!(entries.is_empty());
     }
 
-    /// v0.8.24 A-U3 — the form → SpawnTuning map: model/effort pass through
-    /// for claude/codex/opencode; grok drops effort (undocumented value set,
-    /// an invalid value would fail the spawn) but keeps model.
+    /// The form → SpawnTuning contract: BOTH facets reach every vendor
+    /// verbatim. Grok and kimi are the regression anchors — this entry point
+    /// used to zero their effort, so an explicit `effort` looked accepted
+    /// (201 + a live sid) while the session actually ran at the vendor
+    /// default. The per-vendor loop keeps a future "just this one vendor"
+    /// exception from being re-added quietly.
     #[test]
-    fn spawn_tuning_from_form_drops_grok_effort_only() {
-        let t = spawn_tuning_from_form(
-            AgentVendor::Claude,
-            Some("opus-4.8".into()),
-            Some("max".into()),
-        );
-        assert_eq!(t.model.as_deref(), Some("opus-4.8"));
-        assert_eq!(t.effort.as_deref(), Some("max"));
+    fn spawn_tuning_from_form_passes_model_and_effort_through_for_every_vendor() {
+        for (vendor, model, effort) in [
+            (AgentVendor::Claude, "opus-4.8", "max"),
+            (AgentVendor::Codex, "gpt-5.2-codex", "xhigh"),
+            (AgentVendor::Grok, "grok-code", "high"),
+            (AgentVendor::Opencode, "anthropic/claude-opus-4-5", "high"),
+            (AgentVendor::Kimi, "kimi-code/k3", "max"),
+        ] {
+            let t = spawn_tuning_from_form(vendor, Some(model.into()), Some(effort.into()));
+            assert_eq!(t.model.as_deref(), Some(model), "{vendor:?} dropped model");
+            assert_eq!(
+                t.effort.as_deref(),
+                Some(effort),
+                "{vendor:?} dropped the caller's explicit effort — the vendor owns \
+                 that verdict, ccteam must not pre-empt it"
+            );
+        }
 
-        let t = spawn_tuning_from_form(AgentVendor::Codex, None, Some("xhigh".into()));
-        assert_eq!(t.effort.as_deref(), Some("xhigh"));
-
-        let t = spawn_tuning_from_form(
-            AgentVendor::Grok,
-            Some("grok-code".into()),
-            Some("high".into()),
-        );
-        assert_eq!(t.model.as_deref(), Some("grok-code"), "grok keeps -m");
-        assert_eq!(t.effort, None, "grok effort must be dropped");
-        let t = spawn_tuning_from_form(AgentVendor::Opencode, None, Some("high".into()));
-        assert_eq!(t.effort.as_deref(), Some("high"));
-
-        let t = spawn_tuning_from_form(
-            AgentVendor::Kimi,
-            Some("kimi-k2".into()),
-            Some("high".into()),
-        );
-        assert_eq!(t.model.as_deref(), Some("kimi-k2"), "kimi keeps set_model");
-        assert_eq!(t.effort, None, "kimi effort must be dropped");
+        // Omitted stays omitted: absence is how a caller asks for the vendor
+        // default, and it must never be back-filled here either.
+        let t = spawn_tuning_from_form(AgentVendor::Grok, None, None);
+        assert_eq!(t.model, None);
+        assert_eq!(t.effort, None);
     }
 }
 

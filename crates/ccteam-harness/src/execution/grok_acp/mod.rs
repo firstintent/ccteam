@@ -22,16 +22,18 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
-    TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
+    HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId,
+    TurnInput, TurnRouting, TurnSubmission,
 };
 
+use crate::execution::acp::released_thread_status;
 use crate::execution::acp::{
     route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning, JsonRpcError,
 };
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
+use crate::execution::session_status::read_status_file;
 use protocol::{
     acp_model_picker_options, known_efforts, pluck_model_info, pluck_session_id,
     split_trailing_effort, AcpModelOption, ModelInfo,
@@ -233,6 +235,16 @@ impl GrokAcpAdapter {
             capture_vendor_started_turns: true,
             ..Default::default()
         }));
+        // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
+        // a session whose context is already full; the handshake reports the
+        // model catalog but never the occupancy. Seed the gaps from the
+        // snapshot so the statusline resumes where it left off instead of
+        // reading as a brand-new session.
+        if let Some(snapshot) = read_status_file(&project_dir, &sid) {
+            if let Ok(mut st) = state.lock() {
+                st.seed_from_snapshot(&snapshot);
+            }
+        }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
         let dispatcher =
             spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
@@ -288,17 +300,7 @@ impl GrokAcpAdapter {
         };
         ThreadStatus {
             model: st.model.clone(),
-            context: match (st.used_tokens, st.window_tokens) {
-                (Some(used), Some(window)) => Some(ContextUsage {
-                    used_tokens: used,
-                    window_tokens: window,
-                }),
-                (None, Some(window)) => Some(ContextUsage {
-                    used_tokens: 0,
-                    window_tokens: window,
-                }),
-                _ => None,
-            },
+            context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
         }
@@ -342,6 +344,10 @@ impl GrokAcpAdapter {
                     state: Arc::clone(&live.state),
                     event_tx: live.event_tx.clone(),
                     session_id: live.session_id.clone(),
+                    project_dir: live.project_dir.clone(),
+                    sid: live.sid.clone(),
+                    // grok derives occupancy from its prompt-result `_meta`.
+                    context_probe: None,
                     tuning: AcpTurnTuning {
                         finalize_barrier: FINALIZE_BARRIER,
                         post_finalize_sleep: None,
@@ -456,7 +462,19 @@ fn spawn_notif_dispatcher(
     event_tx: broadcast::Sender<ThreadEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sub = transport.subscribe();
+        // Take the handshake backlog with the subscription: the vendor's
+        // command catalog and any opening usage arrive before this task exists.
+        let (early, mut sub) = transport.subscribe_with_early();
+        for n in early {
+            let events = if let Ok(mut guard) = state.lock() {
+                apply_notification(&mut guard, &n)
+            } else {
+                Vec::new()
+            };
+            for ev in events {
+                let _ = event_tx.send(ev);
+            }
+        }
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -510,6 +528,7 @@ impl HarnessAdapter for GrokAcpAdapter {
             &GrokSpawnInput {
                 permission_mode: ctx.permission_mode,
                 model_id: ctx.model_id.as_deref(),
+                effort: ctx.effort.as_deref(),
             },
         );
         let program = argv[0].clone();
@@ -801,7 +820,9 @@ impl HarnessAdapter for GrokAcpAdapter {
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(ThreadStatus::default());
+            // Released / restarted: answer from the persisted snapshot rather
+            // than going silent.
+            return Ok(released_thread_status(h));
         };
         Ok(self.thread_status_inner(&live))
     }

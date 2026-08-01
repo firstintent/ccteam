@@ -303,8 +303,18 @@ async fn join_registers_host_and_heartbeat_online_offline() {
         .is_some());
 }
 
+/// Fleet credentials are owner-scoped; host DISCOVERY stays shared.
+///
+/// This case used to assert the opposite for join tokens ("shared operational
+/// surface"): a tenant could mint one and read it back. That made the very next
+/// assertion — "tenant must be 403 on join" — unenforceable, because
+/// `resolve_host_token` turns a valid join token into the `host-join` identity
+/// that `POST /hosts/join` accepts. Reproduced end-to-end on 2026-07-30: a
+/// plain tenant minted a token, presented it as its own Bearer, and registered
+/// a machine into the owner's fleet (201 + agent token). Minting the credential
+/// IS joining, one hop later, so both now take the owner gate.
 #[tokio::test]
-async fn tenant_can_manage_hosts_tokens_but_cannot_join_as_a_host() {
+async fn tenant_reads_host_list_but_fleet_credentials_are_owner_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     std::fs::create_dir_all(&paths.root).unwrap();
@@ -320,39 +330,33 @@ async fn tenant_can_manage_hosts_tokens_but_cannot_join_as_a_host() {
     let c = client();
     let tauth = format!("Bearer ccteam:{tenant_tok}");
 
-    // Host discovery + join-token management are shared operational surfaces.
-    for path in ["/api/v1/hosts", "/api/v1/hosts/join-token"] {
-        let r = if path.ends_with("join-token") {
-            c.post(format!("http://{addr}{path}"))
-                .header("Authorization", &tauth)
-                .json(&serde_json::json!({"label": "x"}))
-                .send()
-                .await
-                .unwrap()
-        } else {
-            c.get(format!("http://{addr}{path}"))
-                .header("Authorization", &tauth)
-                .send()
-                .await
-                .unwrap()
-        };
-        let expected = if path.ends_with("join-token") {
-            201
-        } else {
-            200
-        };
-        assert_eq!(r.status(), expected, "tenant reaches {path}");
-    }
-    // The token just minted is readable by the same tenant.
+    // Host discovery stays shared — the Team page roster renders for everyone.
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts"))
+        .header("Authorization", &tauth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "tenant still reaches the host list");
+
+    // Minting / reading a join token is the owner's alone.
+    let r = c
+        .post(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", &tauth)
+        .json(&serde_json::json!({"label": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403, "tenant must not mint a join token");
     let r = c
         .get(format!("http://{addr}/api/v1/hosts/join-token"))
         .header("Authorization", &tauth)
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 200, "tenant reaches GET join-token");
-    // Join: tenant is neither admin nor join-token identity → 403 (after a
-    // well-formed body so the extractor does not 422 first).
+    assert_eq!(r.status(), 403, "tenant must not read the join token");
+
+    // And it still cannot join directly.
     let r = c
         .post(format!("http://{addr}/api/v1/hosts/join"))
         .header("Authorization", &tauth)
@@ -367,6 +371,24 @@ async fn tenant_can_manage_hosts_tokens_but_cannot_join_as_a_host() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403, "tenant must be 403 on join");
+
+    // The owner keeps the whole flow: mint, then read it back.
+    let aauth = format!("Bearer ccteam:{ADMIN_HEX}");
+    let r = c
+        .post(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", &aauth)
+        .json(&serde_json::json!({"label": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "owner mints");
+    let r = c
+        .get(format!("http://{addr}/api/v1/hosts/join-token"))
+        .header("Authorization", &aauth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "owner reads it back");
 }
 
 #[tokio::test]

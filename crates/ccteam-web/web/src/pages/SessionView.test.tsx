@@ -24,7 +24,7 @@ vi.hoisted(() => {
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 
-import SessionView, { effortKeyOf } from "./SessionView";
+import SessionView from "./SessionView";
 import { rowsKeyFor } from "./chatTranscript";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 
@@ -122,28 +122,20 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(codex).not.toContain('data-testid="terminal-tab"');
   });
 
+  it("composer effort pill reads `default` until the session reports a token", () => {
+    // The conversation composer is LOCKED: its pill echoes what the session
+    // reports (`GET /sessions/{sid}/status` → the `effortLabel` prop, printed
+    // verbatim in zh and en). Nothing reported yet ⇒ `default`, never a
+    // made-up rung — and never a ccteam-invented ladder word.
+    expect(render()).toContain('<span class="eff">default</span>');
+  });
+
   it("shows the @host chip only for a remote session", () => {
     const strip = (h: string) => h.replace(/<!-- -->/g, "");
     const local = render({ ...SESSION, host: "local" });
     expect(strip(local)).not.toContain("@ local");
     const remote = render({ ...SESSION, host: "dev04" });
     expect(strip(remote)).toContain("@ dev04");
-  });
-});
-
-describe("effortKeyOf (backend effort token → dictionary key)", () => {
-  it("maps the four levels", () => {
-    expect(effortKeyOf("low")).toBe("effLow");
-    expect(effortKeyOf("medium")).toBe("effMid");
-    expect(effortKeyOf("high")).toBe("effHigh");
-    expect(effortKeyOf("max")).toBe("effMax");
-    expect(effortKeyOf("xhigh")).toBe("effMax");
-  });
-
-  it("returns null (hide, never fake) for unknown/absent", () => {
-    expect(effortKeyOf(null)).toBeNull();
-    expect(effortKeyOf(undefined)).toBeNull();
-    expect(effortKeyOf("weird")).toBeNull();
   });
 });
 

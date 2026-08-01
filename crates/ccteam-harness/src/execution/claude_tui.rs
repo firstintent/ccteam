@@ -434,7 +434,29 @@ fn claude_spawn_argv_base(input: ClaudeTuiSpecInput<'_>) -> Vec<String> {
     push_agent_arg(&mut argv, input.role);
     push_model_arg(&mut argv, input.model_id, false);
     argv.extend(permission_args(input.permission_mode));
+    push_mcp_config_arg(&mut argv, input.cwd, input.sid);
     argv
+}
+
+/// Attach the curated per-session `--mcp-config` (HTTP + this session's
+/// `ccteam-sid:<sid>:<secret>` bearer) the gateway wrote before spawn.
+///
+/// Why the terminal path needs it: the global `~/.claude.json` entry is HTTP
+/// with the *admin* bearer, so a pane that inherited only that would call
+/// `session_*` as admin and lose its own principal — no delegation parent edge.
+/// `--mcp-config` is claude's highest-precedence manual scope, so the
+/// same-named `ccteam` entry here overrides the global one.
+///
+/// Deliberately NOT paired with `--strict-mcp-config` (unlike stream-json): a
+/// terminal session is a human-facing TUI and must keep the user's other
+/// ambient MCP servers. Absent file ⇒ no flag (claude errors on a missing
+/// config path), which is also the pre-spawn / secret-less case.
+fn push_mcp_config_arg(argv: &mut Vec<String>, cwd: &Path, sid: &str) {
+    let path = crate::execution::mcp_config::session_mcp_config_path(cwd, sid);
+    if path.exists() {
+        argv.push("--mcp-config".to_string());
+        argv.push(path.to_string_lossy().into_owned());
+    }
 }
 
 fn spec_for_resume(input: ClaudeTuiSpecInput<'_>) -> MuxSessionSpec {
@@ -587,6 +609,21 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        // The terminal protocol is frozen (maintenance-only, 规划淘汰), so it
+        // does not carry the effort axis the stream-json path does. Say that
+        // instead of ignoring the pick: every other vendor/protocol now either
+        // applies an explicit effort or fails loudly, and a silent drop here
+        // would be the one surface that still lies about it.
+        if let Some(effort) = ctx
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            return Err(HarnessError::SpawnFailed(format!(
+                "claude terminal 协议不接 effort(`{effort}`);用默认 stream-json 协议,或省略 effort"
+            )));
+        }
         // v0.8.8 F2 — roleless session 合法:空 role → spawn 不加 `--agent`
         // (vendor 原生裸 claude 自读项目 CLAUDE.md)。这是红线允许的(红线只禁
         // 注入 system prompt,不禁省略 `--agent`),故移除原先的非空 role 硬挡。
@@ -1758,6 +1795,51 @@ mod tests {
         session_id_name: &'a str,
     ) -> ClaudeTuiSpecInput<'a> {
         ClaudeTuiSpecInput::new(role, slug, sid, cwd, session_id_name)
+    }
+
+    /// The terminal pane must carry its OWN principal, not the global admin
+    /// bearer: when the gateway wrote `chat/<sid>/mcp.json`, both spawn shapes
+    /// attach it via `--mcp-config`. No `--strict-mcp-config` here — a human
+    /// TUI keeps the user's other ambient MCP servers (stream-json, which is
+    /// headless, is the one that strips them).
+    #[test]
+    fn terminal_argv_attaches_session_mcp_config_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let path = crate::execution::mcp_config::write_session_mcp_config(
+            cwd,
+            &crate::execution::mcp_config::CuratedMcpInput {
+                sid: "s7",
+                secret: "sek",
+                http_url: Some("http://127.0.0.1:7331/mcp"),
+            },
+        )
+        .unwrap();
+
+        for spec in [
+            spec_for_new(test_spec_input("dev", "slug", "s7", cwd, "sid-1")),
+            spec_for_resume(test_spec_input("dev", "slug", "s7", cwd, "sid-1")),
+        ] {
+            let at = spec
+                .argv
+                .iter()
+                .position(|a| a == "--mcp-config")
+                .expect("--mcp-config present when the session config exists");
+            assert_eq!(
+                spec.argv.get(at + 1).map(String::as_str),
+                Some(path.to_string_lossy().as_ref())
+            );
+            assert!(!spec.argv.iter().any(|a| a == "--strict-mcp-config"));
+        }
+    }
+
+    /// Absent config ⇒ no flag: claude errors on a missing `--mcp-config` path,
+    /// and this is the secret-less / pre-write case.
+    #[test]
+    fn terminal_argv_omits_mcp_config_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = spec_for_new(test_spec_input("dev", "slug", "s8", tmp.path(), "sid-1"));
+        assert!(!spec.argv.iter().any(|a| a == "--mcp-config"));
     }
 
     #[test]

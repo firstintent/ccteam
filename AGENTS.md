@@ -25,8 +25,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 
 | 项 | 值 |
 |---|---|
-| Workspace version | `0.9.11`(**dev 已收口** 2026-07-29,PR #171 待 owner merge;**tag/发布 HELD** 待 owner 显式发话;最近发布 = v0.9.10 2026-07-26 `/releases/latest`) |
-| 本版 headline | 团队页驾驶舱重设计(owner 直驱 PRD 全默认拍板):拓扑独占(roster/timeline 两 tab 删)+ 会话真超链接(右键新 tab 对照父子)+ per-vendor KPI chips + 委派 ticker + live 节点 model join + 分工 charter tab(REST `GET/PUT /projects/{slug}/routing` 项目宪章编辑器(全局只读)+ vendor 名册按主机分组(在线/离线区分 + 移除主机))+ host 反注册(REST `DELETE /hosts/{id}` + CLI `host rm`,owner 实机截图追问「vendor 重复」驱动实锤根因 = 离线卫星残留撞 hostname)+ 名册收敛四连(卡点击过滤拓扑 / 离线时长+7 天建议清理 / 设置 HostsView 收敛为动作面(观察面归团队页)/ npm「可更新」提示迁名册)+ 编队起手(`lib/playbooks.ts` 6 编队唯一家,Home+团队双消费;文档编队目录 9 式双语)+ 周期同车 ACL 病根三修(具名 principal / 项目解析不越界 / session 单一归属策略)+ session rename 全链 + SSE 401 自愈 + 委派 vendor 失败外显 |
+| Workspace version | `0.9.12`(ship gate 已过,dev→main PR 待合并 + tag;发布回填见 `.loop/state.md`;下版 tag 仍需 owner 显式发话) |
+| 本版 headline | **spawn 调参轴打通**(model + effort,五 vendor × 四入口一致):每 vendor 走自己的通道下发(claude/grok argv · codex sticky first-turn override · ACP `session/set_config_option` 按 spec category `thought_level` 取轴、不再钉某家 id)+ **显式选择被拒即报错**(不再静默吃 vendor 默认)+ `meta.json` 持久化 `effort` 让 resume/`/role`/重建都续用 + 发现面 `GET /api/v1/models`(vendor 自报目录 + 强度梯,advisory **永非白名单**)+ MCP `status` spawn 配方内联两轴 + IM `/new … model= effort=`(order-free k=v)+ web composer 按 vendor 渲染真菜单(全局梯删除)+ 团队拓扑「模型·强度」列 + 响应式树;**上下文口径修正**(`used_tokens: Option<u64>` + `ContextSource` provenance —— 未知不再谎报 0%,ACP status 快照落盘让 resume/挤停/重启不丢占用,kimi 经其自报 `status` 命令拉真占用)+ **ACP turn 结局契约**(`stopReason` 不再把失败洗成答案);**MCP 注册全 vendor 全路径统一 HTTP**(旧 stdio 条目升级自愈 + 认 daemon 真实端口)+ **install 单一落点阶梯**(install.sh / `make install` 同址 + 影子副本外显 + channel marker,治「三个 binary 三个真相」)+ IM/web 租户面五修(live session 继承 tenant project owner · 每租户 bot fail-closed · PWA 根路径匿名 · 未编目卫星项目可见 · fleet 面 owner 门) |
 | 焦点 / 基线 / 队列 | 唯一家:焦点·基线数字·人工门 = `.loop/state.md`;基线口径与 env-flake 族 = `.loop/verify/README.md`(**只增不减**);任务队列 = `.loop/backlog.md`;逐版蒸馏 = `.loop/history.md` |
 
 > 开发一律落 `dev` 分支 + dev→main PR 攒版本,main 不直推(§五「分支与推送」);主分支 HEAD 以 `git rev-parse origin/main` 为准。
@@ -115,6 +115,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
    - **用户面**:root `README.md`(**英文**,始终反映当前能力,不含版本进展/时间轴/baseline/shipped 日期)+ `docs/usage.md` ── 把本版新能力融入**当前能力描述**,不写"V0.X.Y 新增"措辞(README 规则的唯一家 = 本条,原 §三行已迁出)
    - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
 8. **beta-gating(仅 UI 层,v0.8.20 起;2026-07-28 owner 令收窄至「几乎不用」)** — **功能面默认对全体登录用户开放**,能不能碰由后端「身份 × 项目归属」判,不靠藏菜单;SPA 唯一 admin-only 面 = 设置→**管理员**(用户管理),`visibleSettingsItems` 有一行不变量测试锁死。新/不稳定功能确需只对 admin 展示时可临时按 `useMe().isAdmin` 藏,但**必须是临时的**,且**非安全/权限边界**(真权限仍走 `deny_non_admin`/`can_see_project`);毕业即移除。历史例(已退役):terminal/rmux 协议与角色选择曾 admin-only,现全员。
+
+9. **日耗上限 15 USD / 自然日,自主连跑不问**(owner 令 2026-08-01)— 预算内**不为「要不要继续/花钱」请示**,持续推进取活;逼近上限时**减小规模**(缩 wave / 少派 subagent / 降模型档),**不停工**。上限是硬约束不是目标:省下的额度不换质量,`§五.6` 测试门与基线红线照旧。与产品面 `budgets.*.max_cost_usd_per_24h`(触顶 auto-disable,§三)是两件事 —— 本条约束**开发会话自身**的花法。
 
 ### 角色与写权(治理骨架;执法 = 声明 + 复核,**不做脚本硬防护**)
 

@@ -544,7 +544,7 @@ pub(crate) fn render_section(
     format!(
         "{}{}\n\n{}\n\n{}",
         render_panel(&header, &rows),
-        render_recipes(&rows),
+        render_recipes(&rows, &runtime, &paths.root),
         render_catalog(&runtime, hub),
         render_routing_notes(notes.as_ref()),
     )
@@ -552,11 +552,16 @@ pub(crate) fn render_section(
 
 /// MCP-BEACON-1 — one `session_spawn` recipe line per INSTALLED vendor, so
 /// discovery → execution is a single hop (the external-agent complaint: the
-/// panel said grok exists but not how to call it). Static text assembled
-/// from the probe rows — no model, no routing opinion beyond what the spawn
-/// tool description already states. Empty when nothing is installed (the
-/// panel rows already say so).
-fn render_recipes(rows: &[PanelRow]) -> String {
+/// panel said grok exists but not how to call it). Each recipe now carries
+/// that vendor's tuning axes ([`render_tuning_axes`]) because knowing a
+/// vendor exists is not enough to spawn it *well*: an agent that cannot see
+/// the effort ladder either omits it forever or guesses a token from another
+/// vendor. Empty when nothing is installed (the panel rows already say so).
+fn render_recipes(
+    rows: &[PanelRow],
+    runtime: &ccteam_core::model_catalog::ModelCatalog,
+    root: &Path,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
     for row in rows.iter().filter(|r| r.installed) {
         let recipe = match row.vendor.as_str() {
@@ -572,14 +577,64 @@ fn render_recipes(rows: &[PanelRow]) -> String {
             _ => continue,
         };
         lines.push(format!("  {recipe}"));
+        if let Some(axes) = render_tuning_axes(&row.vendor, runtime, root) {
+            lines.push(format!("    {axes}"));
+        }
     }
     if lines.is_empty() {
         return String::new();
     }
     format!(
-        "\nrecipes (installed vendors):\n{}\n  then: session_collect{{sid, tail:true}} reads the final answer · session_dispatch{{sid, task}} sends follow-ups",
+        "\nrecipes (installed vendors):\n{}\n  then: session_collect{{sid, tail:true}} reads the final answer · session_dispatch{{sid, task}} sends follow-ups\n  model/effort are advisory affordances, NEVER an allowlist: any value rides to the vendor verbatim and the vendor validates it; omit either one for its default",
         lines.join("\n")
     )
+}
+
+/// One vendor's spawn-tuning axes: the model ids its last handshake reported
+/// plus the reasoning-effort ladder from
+/// [`ccteam_core::model_catalog::supported_efforts_in`] (vendor-declared
+/// first, CLI-verified fallback otherwise). Provenance rides along — an agent
+/// deciding whether to trust a list needs to know whether it came from the
+/// vendor's own handshake or from ccteam's cold-start guess.
+///
+/// `None` only when neither axis has anything to say (a vendor with no
+/// observation and no known effort axis, e.g. OpenCode before its first
+/// session): a bare "model=[] effort=[]" teaches nothing.
+fn render_tuning_axes(
+    vendor: &str,
+    runtime: &ccteam_core::model_catalog::ModelCatalog,
+    root: &Path,
+) -> Option<String> {
+    let entry = runtime.0.get(vendor);
+    let ids: Vec<String> = entry
+        .map(|e| e.models.iter().map(|m| m.id.clone()).collect())
+        .unwrap_or_default();
+    let efforts = ccteam_core::model_catalog::supported_efforts_in(root, vendor);
+    if ids.is_empty() && efforts.is_empty() {
+        return None;
+    }
+    let mut segs: Vec<String> = Vec::new();
+    if !ids.is_empty() {
+        segs.push(format!(
+            "model=[{}]",
+            compact_list(&ids, CATALOG_IDS_PER_VENDOR)
+        ));
+    }
+    if !efforts.is_empty() {
+        segs.push(format!("effort=[{}]", efforts.join("|")));
+    }
+    // Provenance: an observation is dated (so staleness is the reader's call);
+    // no observation says so outright rather than passing a pinned guess off
+    // as a vendor fact.
+    let provenance = match entry.filter(|e| !e.models.is_empty()) {
+        Some(e) => format!(
+            "observed {} via {}",
+            compact_timestamp(&e.observed_at),
+            compact_token(&e.source)
+        ),
+        None => "no handshake observed yet — ccteam's CLI-verified fallback".to_string(),
+    };
+    Some(format!("{} ({provenance})", segs.join(" ")))
 }
 
 /// Panel for a resolved project: local vs satellite by its catalog host
@@ -756,24 +811,30 @@ mod tests {
         );
     }
 
-    /// MCP-BEACON-1 — recipes list INSTALLED vendors only (one spawn
-    /// one-liner each + the collect/dispatch footer); nothing installed →
-    /// empty string (no dangling header).
-    #[test]
-    fn recipes_render_installed_vendors_only() {
-        let row = |vendor: &str, installed: bool| PanelRow {
+    fn panel_row(vendor: &str, installed: bool) -> PanelRow {
+        PanelRow {
             vendor: vendor.to_string(),
             installed,
             version: None,
             last_session_ok: None,
             budget: BudgetState::NotConfigured,
-        };
-        let out = render_recipes(&[
-            row("claude", true),
-            row("codex", false),
-            row("grok", true),
-            row("kimi", false),
-            row("opencode", false),
+        }
+    }
+
+    /// MCP-BEACON-1 — recipes list INSTALLED vendors only (one spawn
+    /// one-liner each + the collect/dispatch footer); nothing installed →
+    /// empty string (no dangling header).
+    #[test]
+    fn recipes_render_installed_vendors_only() {
+        let empty = tempfile::tempdir().unwrap();
+        let runtime = ccteam_core::model_catalog::ModelCatalog::default();
+        let render = |rows: &[PanelRow]| render_recipes(rows, &runtime, empty.path());
+        let out = render(&[
+            panel_row("claude", true),
+            panel_row("codex", false),
+            panel_row("grok", true),
+            panel_row("kimi", false),
+            panel_row("opencode", false),
         ]);
         assert!(out.contains("recipes (installed vendors):"), "{out}");
         assert!(
@@ -785,8 +846,61 @@ mod tests {
         assert!(!out.contains("vendor:\"kimi\""), "{out}");
         assert!(out.contains("session_collect{sid, tail:true}"), "{out}");
 
-        assert_eq!(render_recipes(&[row("claude", false)]), "");
-        assert_eq!(render_recipes(&[]), "");
+        assert_eq!(render(&[panel_row("claude", false)]), "");
+        assert_eq!(render(&[]), "");
+    }
+
+    /// Discovery: each installed vendor's recipe carries its model ids +
+    /// effort ladder with provenance. An observed handshake is dated and
+    /// attributed; an unobserved vendor says so instead of passing ccteam's
+    /// pinned fallback off as a vendor fact. The footer states the axes are
+    /// affordances, never an allowlist — that is what keeps an agent from
+    /// reading this list as "anything else will be rejected by ccteam".
+    #[test]
+    fn recipes_carry_model_and_effort_axes_with_provenance() {
+        let empty = tempfile::tempdir().unwrap();
+        let runtime = ccteam_core::model_catalog::ModelCatalog(BTreeMap::from([(
+            "kimi".to_string(),
+            ccteam_core::model_catalog::VendorModelCatalog {
+                observed_at: "2026-08-01T11:33:50Z".to_string(),
+                source: "ACP session availableModels".to_string(),
+                models: vec![ccteam_core::model_catalog::CatalogModel {
+                    id: "kimi-code/k3".to_string(),
+                    display_name: Some("K3".to_string()),
+                    efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                }],
+            },
+        )]));
+        let out = render_recipes(
+            &[panel_row("kimi", true), panel_row("claude", true)],
+            &runtime,
+            empty.path(),
+        );
+        assert!(out.contains("model=[kimi-code/k3]"), "{out}");
+        assert!(out.contains("effort=[low|high|max]"), "{out}");
+        assert!(out.contains("observed 2026-08-01T11:33Z"), "{out}");
+        assert!(out.contains("ACP session availableModels"), "{out}");
+        // claude has no observation here: the pinned ladder still shows, but
+        // labelled as ccteam's fallback, and with no invented model ids.
+        assert!(out.contains("effort=[low|medium|high|xhigh|max]"), "{out}");
+        assert!(out.contains("no handshake observed yet"), "{out}");
+        assert!(!out.contains("model=[]"), "{out}");
+        assert!(out.contains("NEVER an allowlist"), "{out}");
+    }
+
+    /// OpenCode declares no effort axis and (before its first session) no
+    /// models: rather than print two empty brackets, the recipe stays bare.
+    #[test]
+    fn tuning_axes_absent_when_the_vendor_has_declared_nothing() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            render_tuning_axes(
+                "opencode",
+                &ccteam_core::model_catalog::ModelCatalog::default(),
+                empty.path()
+            ),
+            None
+        );
     }
 
     #[test]

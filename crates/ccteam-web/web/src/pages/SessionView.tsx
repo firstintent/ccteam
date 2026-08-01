@@ -27,11 +27,7 @@ import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
-import {
-  defaultDraft,
-  normalizeDraft,
-  type ComposerDraft,
-} from "../lib/vendors";
+import { defaultDraft, normalizeDraft, type ComposerDraft } from "../lib/vendors";
 import {
   getHistory,
   getDaemonTimezone,
@@ -55,25 +51,6 @@ import {
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
-
-/** Map the backend effort token to the dictionary key (unknown → null hides
- *  the label — never a fake value). */
-// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
-export function effortKeyOf(effort: string | null | undefined): ComposerDraft["effortKey"] | null {
-  switch ((effort ?? "").toLowerCase()) {
-    case "low":
-      return "effLow";
-    case "medium":
-      return "effMid";
-    case "high":
-      return "effHigh";
-    case "max":
-    case "xhigh":
-      return "effMax";
-    default:
-      return null;
-  }
-}
 
 export default function SessionView({
   sid,
@@ -364,7 +341,11 @@ export default function SessionView({
   const who = `${vendor} · ${sid}${statusModel ? ` · ${statusModel}` : ""}`;
 
   // The conversation composer reflects this session's FIXED spawn parameters
-  // (locked: picking toasts; /model via the input still works).
+  // (locked: picking toasts; /model via the input still works). What the live
+  // session REPORTS rides the display props (`modelLabel` / `effortLabel`)
+  // rather than the draft, because the draft is menu state — normalizeDraft
+  // holds it to rows the menu offers, while the pill must print the session's
+  // own tokens verbatim (unreported ⇒ 默认 / `default`, never a made-up 中).
   const lockedDraft: ComposerDraft = useMemo(
     () =>
       normalizeDraft({
@@ -374,8 +355,7 @@ export default function SessionView({
           : "claude") as ComposerDraft["vendor"],
         model: statusModel ?? "",
         hitl: session?.permission_mode === "hitl",
-        // Unknown/unreported effort reads 默认 (honest), not a made-up 中.
-        effortKey: effortKeyOf(statusEffort) ?? "effDefault",
+        effort: statusEffort ?? "",
       }),
     [vendor, statusModel, statusEffort, session?.permission_mode],
   );
@@ -607,6 +587,7 @@ export default function SessionView({
                 onDraftChange={() => {}}
                 locked
                 modelLabel={statusModel ?? ""}
+                effortLabel={statusEffort ?? ""}
                 uploadSlug={session?.project}
                 onSchedule={scheduleText}
                 scheduleTimezone={daemonTimezone}

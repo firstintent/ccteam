@@ -55,6 +55,8 @@ async fn spawn(state: AppState) -> SocketAddr {
 fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
     [
         ("GET", "/api/v1/capabilities"),
+        // Spawn-tuning discovery: per-vendor model ids + effort ladders.
+        ("GET", "/api/v1/models"),
         // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp).
         ("GET", "/api/v1/hosts"),
         ("GET", "/api/v1/hosts/{host}"),
@@ -78,6 +80,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("PUT", "/api/v1/me/im"),
         ("GET", "/api/v1/me/im/lark/open-id-candidates"),
         ("PUT", "/api/v1/me/im/lark/allowed-users"),
+        // Telegram twin — a per-tenant bot is fail-closed, so the tenant needs
+        // a way to discover and bind its own chat id.
+        ("GET", "/api/v1/me/im/telegram/chat-id-candidates"),
+        ("PUT", "/api/v1/me/im/telegram/allowed-chats"),
         ("PUT", "/api/v1/users/{id}/im"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),

@@ -76,6 +76,14 @@ impl ChatKey {
     }
 }
 
+/// `slug -> tenant project principal` resolved once per ACL pass (`None` =
+/// operator-owned / unowned, i.e. no principal to inherit). The session gate
+/// runs per LIVE session, and each resolution is a `state.json` read, so the
+/// filters that walk the whole fleet thread one of these through instead of
+/// re-reading the same project N times. See
+/// [`Gateway::memoized_tenant_project_owner`] for why it never becomes a field.
+type ProjectPrincipalMemo = std::collections::HashMap<String, Option<String>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
     User,
@@ -166,10 +174,13 @@ struct GatewaySession {
     /// to `None` on `TurnCompleted`. `/status` appends it on the 🔵 working line.
     latest_activity: Arc<std::sync::Mutex<Option<String>>>,
     /// v0.8.x (concurrency review §4.1 P1) — the in-flight turn's watchdog
-    /// arm: `Some((turn_id, start_visible_events))` from the moment
-    /// `after_turn_submitted` submits a turn until the session's own event
-    /// pump either sees it answer (`visible_events` moves past
-    /// `start_visible_events`) or fires the one-shot stall warning for it.
+    /// arm: `Some((turn_id, start_visible_events))` from the moment the turn is
+    /// known to be RUNNING (`after_turn_submitted` for a `Started`/`Injected`
+    /// submission; the pump's canonical `TurnStarted` for one that was queued
+    /// behind a predecessor) until the session's own event pump either sees it
+    /// answer (`visible_events` moves past `start_visible_events`) or fires the
+    /// one-shot stall warning for it. A queued turn is never armed — it is not
+    /// silent, it is waiting.
     /// Folds the old detached per-turn `spawn_turn_timeout_watchdog` task into
     /// the pump's own `tokio::select!` loop (one fewer task per turn); kept
     /// separate from `turn_started_at` (directive-driven turns intentionally
@@ -822,18 +833,26 @@ pub struct StartOutcome {
     pub permission_mode: PermissionMode,
 }
 
-/// v0.8.24 A-U3 — optional explicit model / reasoning-effort chosen at
-/// spawn (the composer's three-way menu). `None` fields keep the existing
-/// defaults (role frontmatter `model:` for the model, vendor default for
-/// effort). Passed by value through `create_session_api_on_host` →
-/// `start_session` → `plan_new_session`; IM paths pass
-/// `SpawnTuning::default()`.
+/// The one carriage for an explicit model / reasoning-effort choice made at
+/// spawn time. `None` fields keep the existing defaults (role frontmatter
+/// `model:` for the model, vendor default for effort). Passed by value
+/// through `create_session_api_on_host` → `start_session` →
+/// `plan_new_session`, and filled by every entry point: REST
+/// (`spawn_tuning_from_form`), MCP `session_spawn`, IM `/new model= effort=`.
+///
+/// **No entry point may second-guess it.** Both facets ride to the vendor
+/// verbatim for every vendor; ccteam does not filter them against any cached
+/// capability table, because a dropped facet reaches the caller as a
+/// successful spawn that quietly ran at the default, while an unsupported
+/// token reaches them as the vendor's own error — the second is the honest
+/// one. Discovery affordances (`GET /api/v1/models`, the MCP `status` panel)
+/// exist so a caller can pick well; they are never a gate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnTuning {
     /// Explicit model id; overrides the role's `model:` frontmatter.
     pub model: Option<String>,
-    /// Explicit reasoning-effort token (vendor-specific value set; only
-    /// wired where the vendor verifiably supports it — see `SpawnCtx::effort`).
+    /// Explicit reasoning-effort token (vendor-specific value set — the
+    /// vendor validates it; see `SpawnCtx::effort`).
     pub effort: Option<String>,
 }
 
@@ -1017,6 +1036,8 @@ struct MetaRebuildPlan {
     /// @mention handle = role, else sid for a roleless session.
     handle: String,
     model_id: Option<String>,
+    /// Replayed from `meta.effort`, exactly like `model_id` above.
+    effort: Option<String>,
     secret: String,
     cwd: PathBuf,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -1043,7 +1064,10 @@ struct MetaRebuildPlan {
 /// lock-dropping callers.
 struct NewSessionPlan {
     id: String,
+    /// Canonical resource owner used by session ACL and persisted meta.
     owner: ChatKey,
+    /// Concrete frontend route used for async answer delivery.
+    reply_to: ChatKey,
     project: String,
     vendor: AgentVendor,
     role: String,
@@ -1057,9 +1081,9 @@ struct NewSessionPlan {
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
-    /// v0.8.24 A-U3 — explicit reasoning effort (spawn-time only; not
-    /// persisted in meta, so a daemon-restart rebuild reverts to vendor
-    /// default — same lifetime as an explicit web model choice).
+    /// Explicit reasoning effort. Persisted in `meta.effort` alongside
+    /// `meta.model`, so a resume / role switch / rebuild replays the pick
+    /// instead of quietly reverting one axis to the vendor default.
     effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// v0.9.0 W2 (F2) — delegation parent sid (the spawning principal). `None`
@@ -1104,6 +1128,8 @@ struct ResumeDeadPlan {
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
+    /// Replayed from `meta.effort`, exactly like `model_id` above.
+    effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// Race marker: `format!("{identity}@{started_at}")` of the thread that
     /// was live when we planned. Apply aborts if the map's thread no longer
@@ -1242,8 +1268,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[vendor] [role] [hitl]"),
-        help: "start a new session (trailing `hitl` = approve tools in IM)",
+        arg_hint: Some("[vendor] [role] [hitl] [model=<id>] [effort=<level>]"),
+        help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -1594,7 +1620,10 @@ impl Gateway {
             .model
             .clone()
             .or_else(|| role_model_id(role_detail.as_ref()));
-        let owner = ChatKey::from_identity(&meta.owner).unwrap_or_else(|| reply_to.clone());
+        let owner = self
+            .tenant_project_owner(slug)
+            .or_else(|| ChatKey::from_identity(&meta.owner))
+            .unwrap_or_else(|| canonical_owner(reply_to));
         // Empty role ⇒ roleless: fall back to sid so @handle addressing stays
         // unique + non-empty (mirrors start_session / switch_current_role).
         let handle = if meta.role.is_empty() {
@@ -1616,6 +1645,7 @@ impl Gateway {
             owner,
             handle,
             model_id,
+            effort: meta.effort.clone(),
             secret: ccteam_core::session_secret::mint(),
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
@@ -1645,26 +1675,18 @@ impl Gateway {
         .await
         .map_err(|e| HarnessError::SpawnFailed(format!("remote host re-gate: {e:#}")))?;
         // v0.9.0 W5 (real-machine smoke fix) — RE-WRITE the curated Claude
-        // stream-json mcp.json with the FRESHLY-MINTED secret. Secrets are
-        // in-memory and re-minted on every rebuild (`plan.secret`), but the
-        // file-based mcp.json is only written on FRESH spawn — so without this a
-        // session that cold-resumes after a daemon restart would keep the stale
-        // bearer and LOSE all ccteam MCP tools (it could no longer delegate).
+        // mcp.json with the FRESHLY-MINTED secret. Secrets are in-memory and
+        // re-minted on every rebuild (`plan.secret`), but the file-based
+        // mcp.json is only written on FRESH spawn — so without this a session
+        // that cold-resumes after a daemon restart would keep the stale bearer
+        // and LOSE all ccteam MCP tools (it could no longer delegate).
         // ACP/codex pass mcpServers inline with the current secret each resume,
         // so this file rewrite is the one gap. Best-effort (mirrors fresh path).
-        if plan.vendor == AgentVendor::Claude
-            && plan.protocol == SessionProtocol::StreamJson
-            && !plan.secret.is_empty()
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
         {
-            let bin = ccteam_core::current_ccteam_bin()
-                .unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
             let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
                 sid: &plan.sid,
                 secret: &plan.secret,
-                role: &plan.role,
-                slug: &plan.slug,
-                ccteam_bin: &bin,
-                mode: ccteam_harness::execution::mcp_config::McpConfigMode::from_env(),
                 http_url: None,
             };
             if let Err(e) =
@@ -1673,7 +1695,7 @@ impl Gateway {
                 tracing::warn!(
                     sid = %plan.sid,
                     error = %e,
-                    "curated mcp.json rewrite on resume failed; stream-json continues without MCP"
+                    "curated mcp.json rewrite on resume failed; session continues without MCP"
                 );
             }
         }
@@ -1689,7 +1711,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
-                    effort: None,
+                    effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -1762,15 +1784,16 @@ impl Gateway {
         Ok(())
     }
 
-    /// Drop `current_session` routes pointing at a sid no longer in the live
-    /// map (e.g. a session that failed to rebuild after restart, or a state
-    /// file edited out-of-band). Interior-mutates the shared route table.
+    /// Drop `current_session` routes pointing at a missing or foreign session.
+    /// The ownership check also scrubs routes persisted by an older buggy
+    /// session_spawn that bound a tenant project's sid to the admin web chat.
     fn drop_dead_session_routes(&self) {
-        let live: std::collections::HashSet<String> = self.sessions.keys().cloned().collect();
-        self.current_session
-            .write()
-            .unwrap()
-            .retain(|_, sid| live.contains(sid));
+        let mut memo = ProjectPrincipalMemo::new();
+        self.current_session.write().unwrap().retain(|chat, sid| {
+            self.sessions
+                .get(sid)
+                .is_some_and(|session| self.chat_can_access_with(chat, session, &mut memo))
+        });
     }
 
     /// v0.8.21 Wave-2 — cold-start rebuild the sessions that were live at last
@@ -1792,8 +1815,12 @@ impl Gateway {
                 tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
                 continue;
             };
-            let reply_to = ChatKey::from_identity(&meta.owner)
-                .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+            let reply_to = self
+                .tenant_project_owner_reply_target(&slug)
+                .or_else(|| {
+                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
+                })
+                .unwrap_or_else(web_api_chat);
             if let Err(err) = self
                 .rebuild_session_from_meta(&slug, cwd, &meta, reply_to)
                 .await
@@ -1830,8 +1857,13 @@ impl Gateway {
                 } else {
                     match g.find_meta_for_sid(&sid) {
                         Ok((slug, cwd, meta)) => {
-                            let reply_to = ChatKey::from_identity(&meta.owner)
-                                .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+                            let reply_to = g
+                                .tenant_project_owner_reply_target(&slug)
+                                .or_else(|| {
+                                    ChatKey::from_identity(&meta.owner)
+                                        .map(|owner| reply_target_for_owner(&owner))
+                                })
+                                .unwrap_or_else(web_api_chat);
                             match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
                                 Ok(plan) => Some((plan, reply_to)),
                                 Err(err) => {
@@ -2338,46 +2370,14 @@ impl Gateway {
         match cmd {
             "/inbox" => Ok(Some(self.handle_inbox_command(chat, trimmed)?)),
             "/new" => {
-                let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
-                // v0.8.18 (owner) — NO role token ⇒ **roleless** (bare claude that
-                // self-reads the project `CLAUDE.md`); no explicit `-` needed. The
-                // first NON-flag token is the role; `hitl`/`skip`/`terminal`/… are
-                // order-independent flags, so `/new claude` AND `/new claude hitl`
-                // are both roleless, while `/new claude reviewer hitl` is role
-                // `reviewer` + hitl. Defaults = skip + stream-json.
-                // Grok always uses ACP (v0.8.23) — ignore protocol flags for grok.
-                let mut role = String::new();
-                let mut role_set = false;
-                let mut permission_mode = PermissionMode::Skip;
-                let mut protocol = SessionProtocol::StreamJson;
-                for tok in parts {
-                    match tok {
-                        "hitl" | "skip" => {
-                            permission_mode =
-                                PermissionMode::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
-                        }
-                        "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json"
-                        | "acp" => {
-                            protocol =
-                                SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
-                        }
-                        other if !role_set => {
-                            role = other.to_string();
-                            role_set = true;
-                        }
-                        other => {
-                            return Err(anyhow!(
-                                "/new: unexpected token `{other}` (give one role + optional hitl / terminal / acp)"
-                            ));
-                        }
-                    }
-                }
-                if matches!(
+                let args: Vec<&str> = parts.collect();
+                let NewSessionArgs {
                     vendor,
-                    AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
-                ) {
-                    protocol = SessionProtocol::Acp;
-                }
+                    role,
+                    permission_mode,
+                    protocol,
+                    tuning,
+                } = parse_new_command_args(&args)?;
                 let project = self.require_current_project(chat)?;
                 let handle = role.clone();
                 let outcome = self
@@ -2389,7 +2389,7 @@ impl Gateway {
                         handle,
                         permission_mode,
                         protocol,
-                        SpawnTuning::default(),
+                        tuning,
                     )
                     .await?;
                 Ok(Some(Self::new_session_receipt(&outcome)))
@@ -2725,7 +2725,7 @@ impl Gateway {
             return self.chat_can_access(chat, session);
         }
         read_session_meta(&entry.project_dir, &entry.item.sid)
-            .map(|meta| self.owner_identity_visible(chat, &meta.owner))
+            .map(|meta| self.project_session_owner_visible(chat, &meta.slug, &meta.owner))
             .unwrap_or(false)
     }
 
@@ -2779,7 +2779,7 @@ impl Gateway {
             let acl_ok = self
                 .find_meta_for_sid(id)
                 .ok()
-                .map(|(_, _, meta)| self.owner_identity_visible(chat, &meta.owner))
+                .map(|(slug, _, meta)| self.project_session_owner_visible(chat, &slug, &meta.owner))
                 .unwrap_or(false);
             if !acl_ok {
                 return Ok(format!("unknown session for this chat: {id}"));
@@ -2906,6 +2906,22 @@ impl Gateway {
             .and_then(|state| state.owner)
     }
 
+    /// Canonical tenant principal inherited by every session in a tenant-owned
+    /// project. Operator-owned projects deliberately return `None`: separate
+    /// admin IM chats keep their own session identities.
+    fn tenant_project_owner(&self, slug: &str) -> Option<ChatKey> {
+        let owner = self.project_owner(slug)?;
+        ccteam_core::identity::is_tenant_owned(Some(&owner))
+            .then(|| ChatKey::from_identity(&owner))
+            .flatten()
+    }
+
+    /// Concrete web delivery route for a tenant project's principal.
+    fn tenant_project_owner_reply_target(&self, slug: &str) -> Option<ChatKey> {
+        self.tenant_project_owner(slug)
+            .map(|owner| reply_target_for_owner(&owner))
+    }
+
     /// One "switch project" button per project (`nav:cd:<slug>`), the current
     /// one marked `✓`. Payloads over Telegram's 64-byte `callback_data` cap are
     /// dropped (a pathologically long slug still shows in the text list).
@@ -2942,10 +2958,11 @@ impl Gateway {
     /// (history) sessions switch only via their text `→ /use <sid>` hint.
     fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat).unwrap_or_default();
+        let mut memo = ProjectPrincipalMemo::new();
         let mut visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .filter(|s| all || s.project == cur)
             .collect();
         visible.sort_by(|a, b| {
@@ -3349,7 +3366,7 @@ impl Gateway {
     #[allow(clippy::too_many_arguments)]
     fn plan_new_session(
         &mut self,
-        owner: ChatKey,
+        reply_to: ChatKey,
         project: String,
         vendor: AgentVendor,
         role: String,
@@ -3418,9 +3435,24 @@ impl Gateway {
         let (host, wire_slug) = self.project_host_binding(&project)?;
         let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor, protocol);
+        // Ownership is decided HERE, the one sync core every fresh spawn funnels
+        // through (IM `/new` → `start_session`, REST `POST …/sessions` →
+        // `create_session_api_tuned`, MCP `session_spawn` →
+        // `create_delegated_session`), so a future entry inherits it for free
+        // instead of needing its own patch. project 是归属单元, session 继承: a
+        // tenant-owned project stamps its own principal even when a fleet-wide
+        // admin or an ambient agent does the spawning; operator-owned and
+        // unowned projects have no principal, so the caller's canonical identity
+        // still owns (keeping separate admin IM chats apart). `reply_to` is NOT
+        // touched — owner is the resource identity, reply_to the concrete
+        // delivery frontend, and a tenant's own bot must keep its IM route.
+        let owner = self
+            .tenant_project_owner(&project)
+            .unwrap_or_else(|| canonical_owner(&reply_to));
         Ok(NewSessionPlan {
             id,
             owner,
+            reply_to,
             project,
             vendor,
             role,
@@ -3463,23 +3495,15 @@ impl Gateway {
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("remote host gate: {e:#}")))?
         };
-        // v0.8.24 C1 — curated per-session MCP for Claude stream-json only.
-        // File path is well-known (chat/<sid>/mcp.json); the adapter attaches
-        // --mcp-config when the file exists. Best-effort: spawn still proceeds
-        // if write fails (session runs without in-agent ccteam tools).
-        if plan.vendor == AgentVendor::Claude
-            && plan.protocol == SessionProtocol::StreamJson
-            && !plan.secret.is_empty()
+        // v0.8.24 C1 — curated per-session MCP for Claude sessions. File path is
+        // well-known (chat/<sid>/mcp.json); the adapter attaches --mcp-config
+        // when the file exists. Best-effort: spawn still proceeds if write fails
+        // (session runs without in-agent ccteam tools).
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
         {
-            let bin = ccteam_core::current_ccteam_bin()
-                .unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
             let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
                 sid: &plan.id,
                 secret: &plan.secret,
-                role: &plan.role,
-                slug: &plan.project,
-                ccteam_bin: &bin,
-                mode: ccteam_harness::execution::mcp_config::McpConfigMode::from_env(),
                 http_url: None,
             };
             if let Err(e) =
@@ -3488,7 +3512,7 @@ impl Gateway {
                 tracing::warn!(
                     sid = %plan.id,
                     error = %e,
-                    "curated mcp.json write failed; stream-json continues without MCP"
+                    "curated mcp.json write failed; session continues without MCP"
                 );
             }
         }
@@ -3525,6 +3549,7 @@ impl Gateway {
         let NewSessionPlan {
             id,
             owner,
+            reply_to,
             project,
             vendor,
             role,
@@ -3536,7 +3561,7 @@ impl Gateway {
             secret,
             cwd: _,
             model_id,
-            effort: _,
+            effort: effort_meta,
             adapter,
             parent_sid,
             spawned_by_role,
@@ -3555,20 +3580,16 @@ impl Gateway {
             .to_string();
         let meta_project = project.clone();
         let meta_role = role.clone();
-        let owner_channel = owner.channel.clone();
-        let owner_for_reply = owner.clone();
+        let owner_channel = reply_to.channel.clone();
         let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
         self.ensure_live_capacity(&excluded).await;
         self.sessions.insert(
             id.clone(),
             GatewaySession {
                 id: id.clone(),
-                // v0.8.20 web↔IM convergence — the OWNER is the canonical identity
-                // (`user:<tenant>` for a per-tenant bot; the chat itself otherwise),
-                // so a tenant's web console + their own IM bot share ONE owner and
-                // see the SAME sessions. `reply_to` below stays the actual frontend
-                // chat (delivery target), so reply routing is unchanged.
-                owner: canonical_owner(&owner),
+                // v0.8.20 web↔IM convergence — owner is the canonical resource
+                // identity while reply_to remains the concrete frontend route.
+                owner,
                 project,
                 role,
                 vendor,
@@ -3581,7 +3602,7 @@ impl Gateway {
                 adapter,
                 visible_events: Arc::new(AtomicU64::new(0)),
                 activity_events: Arc::new(AtomicU64::new(0)),
-                reply_to: Arc::new(std::sync::Mutex::new(owner_for_reply)),
+                reply_to: Arc::new(std::sync::Mutex::new(reply_to.clone())),
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
@@ -3596,7 +3617,7 @@ impl Gateway {
         self.current_session
             .write()
             .unwrap()
-            .insert(owner, id.clone());
+            .insert(reply_to, id.clone());
         self.persist_routing()?;
         // Write per-session meta.json for history list + resume after stop.
         {
@@ -3604,7 +3625,7 @@ impl Gateway {
             let owner_tag = self
                 .sessions
                 .get(&id)
-                .map(|s| canonical_owner(&s.owner).identity())
+                .map(|s| s.owner.identity())
                 .unwrap_or_default();
             // v0.9 T5 — snapshot role/skill fingerprints at spawn (not rehashed
             // mid-session).
@@ -3640,6 +3661,7 @@ impl Gateway {
                 owner: owner_tag,
                 vendor_uuid: meta_vendor_uuid,
                 model: model_id,
+                effort: effort_meta,
                 host: host.clone(),
                 created_at: now.clone(),
                 last_active: now,
@@ -3781,6 +3803,12 @@ impl Gateway {
         // Wave-2: a restart rebuilds from meta, so the role change must persist).
         let meta_dir = cwd.clone();
         let meta_role = role.clone();
+        // `/role` re-derives the MODEL from the new role's frontmatter, but the
+        // effort belongs to the session, not the role — replay it so a switch
+        // doesn't silently drop the level the session was spawned with.
+        let effort = read_session_meta(&meta_dir, &sid)
+            .ok()
+            .and_then(|meta| meta.effort);
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -3790,6 +3818,7 @@ impl Gateway {
                 &sid,
                 cwd,
                 model_id.clone(),
+                effort.clone(),
                 permission_mode,
                 secret.clone(),
                 &host,
@@ -3840,6 +3869,7 @@ impl Gateway {
         if let Ok(mut meta) = read_session_meta(&meta_dir, &sid) {
             meta.role = meta_role.clone();
             meta.model = model_id;
+            meta.effort = effort;
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
@@ -4078,10 +4108,34 @@ impl Gateway {
                         // previous TurnCompleted already cleared it. Native
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
-                        if matches!(&evt, ThreadEvent::TurnStarted { .. }) {
+                        if let ThreadEvent::TurnStarted { turn_id } = &evt {
                             if let Ok(mut started) = session.turn_started_at.lock() {
                                 if started.is_none() {
                                     *started = Some(Instant::now());
+                                }
+                            }
+                            // …and the silence watchdog follows the same
+                            // authority. The submit path arms only the turns it
+                            // knows are running (`Started` / `Injected`), so a
+                            // turn that was QUEUED behind a predecessor is armed
+                            // here, the moment it actually begins — with a fresh
+                            // `visible_events` baseline. Re-arming on a
+                            // different id also drops a stale arm left by a turn
+                            // that already answered but whose tick has not run
+                            // yet; without that, every queued turn would go
+                            // unwatched.
+                            if !watch_timeout.is_zero() {
+                                if let Ok(mut watch) = session.watched_turn.lock() {
+                                    let stale = watch
+                                        .as_ref()
+                                        .map(|(armed, _)| armed != turn_id)
+                                        .unwrap_or(true);
+                                    if stale {
+                                        *watch = Some((
+                                            turn_id.clone(),
+                                            session.visible_events.load(Ordering::SeqCst),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -5474,10 +5528,15 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
         let role_detail = ensure_role_exists(&cwd, &role)?;
-        let model_id = read_session_meta(&cwd, session_id)
-            .ok()
-            .and_then(|meta| meta.model)
+        // One read for both axes: `model` falls back to the role's frontmatter
+        // (a role may pin a model), `effort` has no such fallback — the vendor
+        // default is the honest answer when the session never named one.
+        let meta = read_session_meta(&cwd, session_id).ok();
+        let model_id = meta
+            .as_ref()
+            .and_then(|m| m.model.clone())
             .or_else(|| role_model_id(role_detail.as_ref()));
+        let effort = meta.and_then(|m| m.effort);
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
@@ -5495,6 +5554,7 @@ impl Gateway {
             secret,
             cwd,
             model_id,
+            effort,
             adapter,
             generation,
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
@@ -5529,7 +5589,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
-                    effort: None,
+                    effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -5560,6 +5620,7 @@ impl Gateway {
             secret: _,
             cwd: _,
             model_id: _,
+            effort: _,
             adapter,
             generation,
             ccteam_root: _,
@@ -5630,6 +5691,9 @@ impl Gateway {
         sid: &str,
         cwd: PathBuf,
         model_id: Option<String>,
+        // Replayed from `meta.effort` — a re-spawn must not reset the axis the
+        // caller picked (`/role` swaps the ROLE, not the reasoning level).
+        effort: Option<String>,
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
@@ -5663,10 +5727,7 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id,
-                    // Explicit effort is spawn-time only (not persisted in
-                    // meta) — a role-switch / dead-child re-spawn reverts to
-                    // the vendor default, same lifetime as a web model pick.
-                    effort: None,
+                    effort,
                     permission_mode,
                     secret,
                     remote,
@@ -5979,7 +6040,12 @@ impl Gateway {
         // origin and transcript bookkeeping are visible.
         submitted.release_completion();
         let drained = self
-            .after_turn_submitted(session, start_visible_events, &turn_id.0)
+            .after_turn_submitted(
+                session,
+                start_visible_events,
+                &turn_id.0,
+                submitted.disposition,
+            )
             .await?;
         Ok(SubmitResult::Turn {
             id: turn_id.0,
@@ -6019,8 +6085,16 @@ impl Gateway {
                 if let Ok(mut origins) = session.turn_origins.lock() {
                     origins.insert(turn_id.0.clone(), origin);
                 }
-                self.after_turn_submitted(session, start_visible_events, &turn_id.0)
-                    .await
+                // A directive that resolves to a turn was submitted by the
+                // adapter itself (`/model` re-prompt, grok steer): it is
+                // running, not queued.
+                self.after_turn_submitted(
+                    session,
+                    start_visible_events,
+                    &turn_id.0,
+                    TurnDisposition::Started,
+                )
+                .await
             }
             DirectiveOutcome::Done { receipt } => Ok(vec![receipt]),
             DirectiveOutcome::Rejected { reason } => Ok(vec![reason]),
@@ -6039,6 +6113,7 @@ impl Gateway {
         session: &GatewaySession,
         start_visible_events: u64,
         turn_id: &str,
+        disposition: TurnDisposition,
     ) -> Result<Vec<String>> {
         if self.event_sink.is_some() {
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog
@@ -6051,7 +6126,17 @@ impl Gateway {
             // (`emit_turn_stall_warning`) that `spawn_turn_timeout_watchdog`
             // used to do standalone. Skip arming entirely when the window is
             // disabled (`0` = off) — matches the old early return.
-            if !gateway_turn_timeout_duration().is_zero() {
+            //
+            // A QUEUED submission is NOT in flight: an adapter without a native
+            // interjection channel (kimi / opencode ACP) parks it behind the
+            // active vendor turn, and it may legitimately sit there for as long
+            // as that turn runs. Arming here would blame the queued turn for
+            // its predecessor's silence and tell the user a turn "went silent"
+            // when it has not started — the same reason `turn_started_at` is
+            // only stamped for `Started`. The pump arms it instead when its
+            // canonical `TurnStarted` proves it really began.
+            if !gateway_turn_timeout_duration().is_zero() && disposition != TurnDisposition::Queued
+            {
                 if let Ok(mut watch) = session.watched_turn.lock() {
                     *watch = Some((turn_id.to_string(), start_visible_events));
                 }
@@ -6308,8 +6393,31 @@ impl Gateway {
     /// sessions (and every tenant's console every other tenant's). It now routes
     /// through [`ccteam_core::identity::can_see_session_owner`], the session twin
     /// of the project ACL — one policy, both frontends.
+    ///
+    /// Project inheritance (2026-07-30) — the LIVE gate reads the same rule as
+    /// its stopped twin ([`Self::chat_can_access_sid`]) via
+    /// [`Self::project_owner_visible_with`]: project 是归属单元, session 继承,
+    /// so a tenant-owned project's principal decides regardless of the owner
+    /// stamped on the session. It used to read `session.owner` raw, so a tenant
+    /// whose children carried the caller's admin pool saw them when they were
+    /// STOPPED and not when they were LIVE — while its web team page (gated at
+    /// project level) showed them either way. Two frontends, two answers.
     fn chat_can_access(&self, chat: &ChatKey, session: &GatewaySession) -> bool {
-        self.chat_owner_visible(chat, &session.owner)
+        self.chat_can_access_with(chat, session, &mut ProjectPrincipalMemo::new())
+    }
+
+    /// [`Self::chat_can_access`] with a caller-supplied per-pass memo, for the
+    /// filters that run it over EVERY live session (`/status`, `/sessions`, the
+    /// switch pickers, the route scrub). Resolving the project principal costs
+    /// a `state.json` read, so a 30-session fleet would otherwise pay 30
+    /// identical reads per render; the memo makes it one per DISTINCT slug.
+    fn chat_can_access_with(
+        &self,
+        chat: &ChatKey,
+        session: &GatewaySession,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> bool {
+        self.project_owner_visible_with(chat, &session.project, &session.owner.identity(), memo)
     }
 
     /// [`Self::chat_can_access`] for a BARE sid, live or stopped: the live map
@@ -6323,34 +6431,17 @@ impl Gateway {
             return self.chat_can_access(chat, session);
         }
         self.find_meta_for_sid(sid)
-            .map(|(_slug, _dir, meta)| self.owner_identity_visible(chat, &meta.owner))
+            .map(|(slug, _dir, meta)| self.project_session_owner_visible(chat, &slug, &meta.owner))
             .unwrap_or(false)
     }
 
-    /// v0.8.20 F2 — the pure visibility rule, extracted so it is unit-testable
-    /// without a full [`GatewaySession`]. A chat sees a session owned by `owner`
-    /// iff (a) it owns it, or (b) the session sits in the WEB-CONSOLE pool of
-    /// the SAME identity (the admin's `user:web-api`, or a tenant's
-    /// `user:<tenant>`). Another identity's console — and any other IM chat —
-    /// stays hidden.
-    fn chat_owner_visible(&self, chat: &ChatKey, owner: &ChatKey) -> bool {
-        // v0.8.21 Wave-2 — delegate to the identity-string rule. A session
-        // rebuilt from `meta.json` (daemon restart) or cold-resumed carries an
-        // owner round-tripped through `from_identity`, which forces
-        // `user_id = chat_id`; a raw `ChatKey ==` own-check would then wrongly
-        // DENY the legitimate owner. Ownership is chat-level by design
-        // (`identity()` drops `user_id` — "owned by the CHAT, not a member"), so
-        // comparing canonical identity strings is the correct, round-trip-safe
-        // invariant. This unifies the live-map ACL with the cold-resume ACL onto
-        // one rule; chat_id isolation is preserved (different chat_id ⇒ different
-        // identity ⇒ not visible). The convergence + isolation cases are
-        // unchanged (tenant/web/admin identities have `user_id == chat_id`).
-        self.owner_identity_visible(chat, &owner.identity())
-    }
-
-    /// Identity-string form of [`chat_owner_visible`] for the cold-resume path,
-    /// where the owner is a persisted `meta.owner` canonical identity string
-    /// (`"channel:chat_id"`) rather than a live [`GatewaySession`]'s `ChatKey`.
+    /// v0.8.20 F2 — the pure visibility rule, expressed on the canonical owner
+    /// IDENTITY string so it is unit-testable without a full
+    /// [`GatewaySession`], and identical for a live session and a persisted
+    /// `meta.owner`. A chat sees a session owned by `owner_identity` iff (a) it
+    /// owns it, or (b) the session sits in the WEB-CONSOLE pool of the SAME
+    /// identity (the admin's `user:web-api`, or a tenant's `user:<tenant>`).
+    /// Another identity's console — and any other IM chat — stays hidden.
     ///
     /// We MUST compare on the identity string, not by reconstructing a `ChatKey`
     /// via `from_identity` and using `==`: `ChatKey` equality includes `user_id`,
@@ -6358,7 +6449,11 @@ impl Gateway {
     /// so a round-trip loses the real `user_id`. For a non-tenant IM bot (whose
     /// `canonical_owner` keeps the sender's `user_id`), that round-trip would
     /// wrongly deny the legitimate owner. Comparing the user_id-free identity
-    /// strings sidesteps the lossy round-trip entirely.
+    /// strings sidesteps the lossy round-trip entirely — which is also why a
+    /// session rebuilt from `meta.json` after a restart still reaches its owner.
+    /// Ownership is chat-level by design ("owned by the CHAT, not a member"),
+    /// and chat_id isolation is preserved (different chat_id ⇒ different
+    /// identity ⇒ not visible).
     fn owner_identity_visible(&self, chat: &ChatKey, owner_identity: &str) -> bool {
         // ONE policy for both frontends: own ⊕ the web-console pool this
         // identity may see (`ccteam_core::identity::can_see_session_owner` —
@@ -6375,6 +6470,56 @@ impl Gateway {
             is_admin,
             owner_identity,
         )
+    }
+
+    /// Session ownership inherits the project principal. The stored owner is
+    /// only a fallback for unowned legacy projects; this keeps stopped-session
+    /// ACL checks safe even when old metadata was persisted with the caller's
+    /// admin identity instead of the tenant project's identity.
+    fn project_session_owner_visible(
+        &self,
+        chat: &ChatKey,
+        slug: &str,
+        stored_owner: &str,
+    ) -> bool {
+        self.project_owner_visible_with(chat, slug, stored_owner, &mut ProjectPrincipalMemo::new())
+    }
+
+    /// The ONE session-ownership rule, shared by the live gate
+    /// ([`Self::chat_can_access_with`]) and the stopped/meta gate
+    /// ([`Self::project_session_owner_visible`]): a tenant-owned project's
+    /// principal decides; operator-owned and unowned projects have none, so the
+    /// owner stamped on the session decides instead (that fallback is what
+    /// keeps two admin IM chats isolated from each other).
+    fn project_owner_visible_with(
+        &self,
+        chat: &ChatKey,
+        slug: &str,
+        stored_owner: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> bool {
+        match self.memoized_tenant_project_owner(memo, slug) {
+            Some(project_owner) => self.owner_identity_visible(chat, project_owner),
+            None => self.owner_identity_visible(chat, stored_owner),
+        }
+    }
+
+    /// [`Self::tenant_project_owner`] behind a per-pass memo. Deliberately a
+    /// LOCAL value threaded through one pass rather than a field on `Gateway`:
+    /// an ACL cache that outlives the pass can serve stale visibility after an
+    /// ownership change, and a stale ACL is worse than a `state.json` read.
+    fn memoized_tenant_project_owner<'a>(
+        &self,
+        memo: &'a mut ProjectPrincipalMemo,
+        slug: &str,
+    ) -> Option<&'a str> {
+        if !memo.contains_key(slug) {
+            memo.insert(
+                slug.to_string(),
+                self.tenant_project_owner(slug).map(|o| o.identity()),
+            );
+        }
+        memo.get(slug).and_then(Option::as_deref)
     }
 
     /// Resolve a frontend chat to the principal it speaks for — the ONE place
@@ -6541,16 +6686,17 @@ impl Gateway {
     /// An unmatched role returns a usage error listing the roles that ARE
     /// available to this chat, so the user can immediately retry.
     fn resolve_use_role_shorthand(&self, chat: &ChatKey, role: &str) -> Result<String> {
+        let mut memo = ProjectPrincipalMemo::new();
         let mut candidates: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s) && s.role == role)
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && s.role == role)
             .collect();
         if candidates.is_empty() {
             let mut available: Vec<&str> = self
                 .sessions
                 .values()
-                .filter(|s| self.chat_can_access(chat, s) && !s.role.is_empty())
+                .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && !s.role.is_empty())
                 .map(|s| s.role.as_str())
                 .collect();
             available.sort_unstable();
@@ -6590,10 +6736,11 @@ impl Gateway {
     async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
         // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
+        let mut memo = ProjectPrincipalMemo::new();
         let accessible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         // Web has its own GUI chrome (project picker, session list, Status page)
         // AND the chat bridge parses this reply into a structured frame, so the
@@ -6707,11 +6854,14 @@ impl Gateway {
                     row.push_str(&format!(".{e}"));
                 }
                 if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
-                    row.push_str(&format!(
-                        ".{}({:.0}%)",
-                        format_tokens(ctx.window_tokens),
-                        ctx.pct()
-                    ));
+                    // Window known but occupancy not (a just-resumed ACP
+                    // session, a vendor with no usage channel) renders `—`,
+                    // never `0%` — the row must not claim an empty context.
+                    let pct = match ctx.pct() {
+                        Some(p) => format!("{p:.0}%"),
+                        None => "—".to_string(),
+                    };
+                    row.push_str(&format!(".{}({pct})", format_tokens(ctx.window_tokens)));
                 }
             }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
@@ -6901,10 +7051,11 @@ impl Gateway {
     /// When the watchdog window is disabled (`CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS
     /// == 0`), fall back to a fixed 300s stuck threshold so 🔴 still works.
     async fn render_status(&self, chat: &ChatKey) -> String {
+        let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
             .sessions
             .values()
-            .filter(|s| self.chat_can_access(chat, s))
+            .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
         if visible.is_empty() {
             return "no sessions — start one with /new".to_string();
@@ -7030,9 +7181,13 @@ impl Gateway {
             .and_then(|st| st.effort.as_deref())
             .filter(|e| !e.is_empty())
             .unwrap_or("—");
-        let ctx = match status.as_ref().and_then(|st| st.context.as_ref()) {
-            Some(c) if c.window_tokens > 0 => format!("ctx {:.0}%", c.pct()),
-            _ => "ctx —".to_string(),
+        let ctx = match status
+            .as_ref()
+            .and_then(|st| st.context.as_ref())
+            .and_then(|c| c.pct())
+        {
+            Some(pct) => format!("ctx {pct:.0}%"),
+            None => "ctx —".to_string(),
         };
         // The REAL `--resume` id (Anthropic session uuid), shown in full so it
         // can be matched against `tmux ls` / `claude --resume`; `—` for a
@@ -7359,8 +7514,8 @@ impl Gateway {
         // without this guard a tenant authorised for project A could resume a
         // session belonging to project B by passing B's sid under A's slug.
         // Bind the resolved project to the caller's authorised slug. (The IM
-        // path passes `None` — it owner-checks via `chat_owner_visible` before
-        // calling, which is the IM equivalent of this project gate.)
+        // path passes `None` — it owner-checks via `project_session_owner_visible`
+        // before calling, which is the IM equivalent of this project gate.)
         if let Some(exp) = expected_slug {
             if exp != slug {
                 anyhow::bail!("session {sid} does not belong to project {exp}");
@@ -7437,6 +7592,7 @@ impl Gateway {
             owner: owner_tag,
             vendor_uuid: vendor_uuid.to_string(),
             model: None,
+            effort: None,
             host: "local".to_string(),
             created_at: now.clone(),
             last_active: now,
@@ -8113,10 +8269,16 @@ impl Gateway {
         )
         .await?;
         let host = host_target.host.clone();
-        let owner = ChatKey::new("web", &owner_id, &owner_id);
+        // DELIVERY only — ownership comes from `plan_new_session` (the project
+        // principal). A delegated spawn has no frontend of its own (its caller
+        // is an agent, not a human chat), so a tenant project's answers must
+        // land in THAT tenant's web console rather than the caller's.
+        let reply_to = self
+            .tenant_project_owner_reply_target(&project)
+            .unwrap_or_else(|| ChatKey::new("web", &owner_id, &owner_id));
         let handle = role.clone();
         let mut plan = self.plan_new_session(
-            owner,
+            reply_to,
             project.clone(),
             vendor,
             role,
@@ -8521,12 +8683,11 @@ impl Gateway {
     }
 
     /// Submit a user-text turn to a session addressed by `sid` (W5b).
-    /// Looks the session up by id (not by current-chat routing), points its
-    /// `reply_to` at the web console so the async answer/progress events
-    /// route back to a web SSE subscriber, then submits via the owning
-    /// adapter. The lock is held only across the (fast) `submit_turn`
-    /// send-keys / RPC; the long turn streams asynchronously through the
-    /// event pump. Returns the submitted [`TurnId`]'s inner string.
+    /// Looks the session up by id (not by current-chat routing), resolves its
+    /// project owner's concrete frontend as `reply_to`, then submits via the
+    /// owning adapter. The lock is held only across the (fast) `submit_turn`
+    /// send-keys / RPC; the long turn streams asynchronously through the event
+    /// pump. Returns the submitted [`TurnId`]'s inner string.
     pub async fn submit_to_sid(&mut self, sid: &str, text: String) -> Result<String> {
         self.submit_to_sid_with_origin(sid, text, TurnOrigin::Internal)
             .await
@@ -8540,12 +8701,22 @@ impl Gateway {
     ) -> Result<String> {
         // Same core as the IM `submit_to_current` path (parity by construction):
         // a single-line `/command` is a session directive, everything else a
-        // turn. The synthetic web `reply_to` routes async answers / progress
-        // back to the per-`sid` SSE subscriber. An empty `message_id` (the web
-        // has no inbound IM message) + the `web` channel both suppress the 👀
-        // ack reaction — web has its own UI.
+        // turn. Project ownership selects the concrete reply frontend; an empty
+        // `message_id` and a web target suppress the IM-only 👀 ack reaction.
+        let reply_to = if let Some(session) = self.sessions.get(sid) {
+            self.tenant_project_owner_reply_target(&session.project)
+                .unwrap_or_else(|| reply_target_for_owner(&session.owner))
+        } else if let Ok((slug, _, meta)) = self.find_meta_for_sid(sid) {
+            self.tenant_project_owner_reply_target(&slug)
+                .or_else(|| {
+                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
+                })
+                .unwrap_or_else(web_api_chat)
+        } else {
+            web_api_chat()
+        };
         match self
-            .submit_resolved(&web_api_chat(), sid, "", text, origin, false)
+            .submit_resolved(&reply_to, sid, "", text, origin, false)
             .await?
         {
             // A turn's answer streams over the pump → SSE; hand back the turn id
@@ -8863,6 +9034,24 @@ fn vendor_str(v: AgentVendor) -> &'static str {
     }
 }
 
+/// Whether a session gets the curated per-session `mcp.json` (HTTP + its own
+/// `ccteam-sid:<sid>:<secret>` bearer) that both Claude spawn paths attach with
+/// `--mcp-config`.
+///
+/// Claude only: codex and the ACP vendors pass their MCP server inline on every
+/// `thread/start` / `session/new`, so they need no file. BOTH Claude protocols
+/// qualify — the global `~/.claude.json` entry is HTTP with the *admin* bearer,
+/// so without this file a managed session would authenticate as admin and lose
+/// its own principal (no delegation parent edge). The single fresh-spawn and
+/// single rebuild call site share this predicate so the two can't drift.
+fn claude_session_mcp_config_applies(vendor: AgentVendor, protocol: SessionProtocol) -> bool {
+    vendor == AgentVendor::Claude
+        && matches!(
+            protocol,
+            SessionProtocol::StreamJson | SessionProtocol::Terminal
+        )
+}
+
 /// Model ids commonly repeat the vendor name as their own prefix
 /// (`claude-opus-4-8`, `grok-4.5`) — since the compact `/sessions` row
 /// ALREADY leads with the vendor (`sid vendor.model…`), showing the model
@@ -9035,11 +9224,7 @@ fn session_cost_and_tokens(
     )
 }
 
-/// The synthetic chat key used by the network resource API (W5b) as the
-/// `owner` / `reply_to` for sessions it creates or drives. `channel ==
-/// "web"` so it matches the web console's existing cross-entry sharing
-/// rules (e.g. global `/sessions`, `/use` any session), and the
-/// per-`sid` SSE filter keys on `chat_id == sid` via [`pump_target`].
+/// Admin-web fallback for an unowned legacy resource or an unknown sid.
 fn web_api_chat() -> ChatKey {
     ChatKey::new("web", "web-api", "web-api")
 }
@@ -9064,6 +9249,17 @@ fn canonical_owner(chat: &ChatKey) -> ChatKey {
     } else {
         // The admin/global IM bot, etc. — owns by the chat itself.
         chat.clone()
+    }
+}
+
+/// Map a canonical resource owner back to a concrete delivery frontend.
+/// Synthetic `user:<id>` identities use that user's web channel; real IM
+/// owners already name their delivery channel directly.
+fn reply_target_for_owner(owner: &ChatKey) -> ChatKey {
+    if owner.channel == "user" {
+        ChatKey::new("web", &owner.chat_id, &owner.chat_id)
+    } else {
+        owner.clone()
     }
 }
 
@@ -9274,11 +9470,33 @@ fn emit_turn_stall_warning(
         Ok(target) => (target.channel.clone(), target.chat_id.clone()),
         Err(_) => (session.owner.channel.clone(), session.owner.chat_id.clone()),
     };
+    // Carry the two facts ccteam actually owns about the silence: how long the
+    // turn has been running and what the last thing it did was. Without them
+    // the warning cannot be told apart from a legitimately quiet build — and a
+    // vendor hung in its own internal retry loop (kimi's 429 backoff reports
+    // nothing on the ACP wire) reads as "last seen: a tool call 16m ago", which
+    // is diagnosable.
+    let elapsed = session
+        .turn_started_at
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|start| format!(" (running {})", humanize_dur(start.elapsed())))
+        .unwrap_or_default();
+    let last_seen = session
+        .latest_activity
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| format!(" Last observed activity: {a}."))
+        .unwrap_or_else(|| " No activity was ever observed for this turn.".into());
     let content = format!(
-        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id} (no tokens, tool \
-         calls or progress). Heads-up only — the watchdog does NOT interrupt it (a long \
-         command like a benchmark legitimately emits no events). If it is truly stuck, \
-         `/stop` the session; tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
+        "⏱️ turn {turn_id} went silent for {timeout:?} for {session_id}{elapsed} — no tokens, \
+         tool calls or progress.{last_seen} Heads-up only — the watchdog does NOT interrupt it \
+         (a long command like a benchmark legitimately emits no events, and a vendor stuck in \
+         its own retry loop reports nothing either). If it is truly stuck, `/stop` the session; \
+         tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
     );
     let _ = tx.send(GatewayEvent {
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
@@ -9457,6 +9675,13 @@ fn mirror_internal_web_answer(
     if origin != TurnOrigin::Internal || reply_to.channel != "web" || session.parent_sid.is_some() {
         return;
     }
+    // `session.owner` is authoritative: ownership is settled once at spawn
+    // (`plan_new_session` inherits the project principal) and repaired at
+    // rebuild (`plan_session_rebuild` re-reads it from the project SoT), so
+    // there is no live session left whose owner could point at the wrong
+    // mailbox. Re-deriving it from `ProjectState` here would be a compat shim
+    // for metadata this repo explicitly does not migrate (§五.3/§五.4) — and a
+    // second home for the ownership rule, on the delivery hot path.
     let Some((channel, chat_id)) = paths.and_then(|p| web_owner_im_target(p, &session.owner))
     else {
         return;
@@ -10124,6 +10349,102 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
     }
 }
 
+/// Everything `/new` resolves before it touches the session spine.
+#[derive(Debug, PartialEq, Eq)]
+struct NewSessionArgs {
+    vendor: AgentVendor,
+    role: String,
+    permission_mode: PermissionMode,
+    protocol: SessionProtocol,
+    tuning: SpawnTuning,
+}
+
+/// The one-line `/new` syntax, echoed by every parse error so a chat user
+/// never has to leave the conversation to find the shape.
+const NEW_COMMAND_SYNTAX: &str =
+    "/new [vendor] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>]";
+
+/// Parse the tokens after `/new`.
+///
+/// Token grammar (all order-free after the leading vendor):
+/// - **vendor** — the FIRST token when it names a harness; omitted ⇒ claude.
+/// - **`key=value`** — the spawn-tuning facets `model=` / `effort=`
+///   (`m=` / `e=` short forms). Matched BEFORE the bare-token arms so a
+///   mistyped key (`modle=opus`) surfaces as an error instead of quietly
+///   becoming the session's role name.
+/// - **flags** — `hitl`/`skip`, `terminal`/`acp`/`stream-json`.
+/// - **the first remaining bare token** — the role. v0.8.18 (owner): NO role
+///   token ⇒ **roleless** (bare vendor self-reads the project `CLAUDE.md`);
+///   no explicit `-` needed. So `/new claude` and `/new claude hitl` are both
+///   roleless, while `/new claude reviewer hitl` is role `reviewer` + hitl.
+///
+/// `model` / `effort` are carried into [`SpawnTuning`] untouched: the vendor
+/// owns the verdict on its own value set, and a bad token must come back as
+/// the vendor's own spawn error rather than as a session that silently ran at
+/// the default. Defaults = skip + stream-json; the ACP-only vendors override
+/// the protocol axis last (a `terminal` flag there is a no-op, not an error).
+fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
+    let mut rest = args.iter().copied();
+    let vendor = parse_vendor(rest.next().unwrap_or("claude"))?;
+    let mut role = String::new();
+    let mut role_set = false;
+    let mut permission_mode = PermissionMode::Skip;
+    let mut protocol = SessionProtocol::StreamJson;
+    let mut tuning = SpawnTuning::default();
+    for tok in rest {
+        if let Some((key, value)) = tok.split_once('=') {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "/new: `{tok}` has no value — write `{key}=<value>`\nsyntax: {NEW_COMMAND_SYNTAX}"
+                ));
+            }
+            match key {
+                "model" | "m" => tuning.model = Some(value.to_string()),
+                "effort" | "e" => tuning.effort = Some(value.to_string()),
+                other => {
+                    return Err(anyhow!(
+                        "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                    ));
+                }
+            }
+            continue;
+        }
+        match tok {
+            "hitl" | "skip" => {
+                permission_mode = PermissionMode::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
+            }
+            "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json" | "acp" => {
+                protocol = SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
+            }
+            other if !role_set => {
+                role = other.to_string();
+                role_set = true;
+            }
+            other => {
+                return Err(anyhow!(
+                    "/new: unexpected token `{other}` (role `{role}` was already given)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                ));
+            }
+        }
+    }
+    // Grok/OpenCode/Kimi always speak ACP (v0.8.23) — settled after the loop
+    // so token order never changes the outcome.
+    if matches!(
+        vendor,
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
+    ) {
+        protocol = SessionProtocol::Acp;
+    }
+    Ok(NewSessionArgs {
+        vendor,
+        role,
+        permission_mode,
+        protocol,
+        tuning,
+    })
+}
+
 /// Resolve a chat-supplied project path: expand a leading `~`, then
 /// require the result to be absolute (the daemon's cwd is not a
 /// meaningful base for a path typed into a chat / web form).
@@ -10174,7 +10495,8 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
 mod tests {
     use super::*;
     use ccteam_harness::{
-        ChoiceOption, ContextUsage, ExecutionMode, HarnessError, ThreadItem, ThreadStatus, TurnId,
+        ChoiceOption, ContextSource, ContextUsage, ExecutionMode, HarnessError, ThreadItem,
+        ThreadStatus, TurnId,
     };
     use futures::stream::BoxStream;
     use std::collections::VecDeque;
@@ -10210,6 +10532,104 @@ mod tests {
     /// string (the property `select_live_capacity_eviction` relies on).
     fn capacity_ts(secs_ago: i64) -> String {
         (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339()
+    }
+
+    fn parse_new(args: &str) -> Result<NewSessionArgs> {
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        parse_new_command_args(&tokens)
+    }
+
+    /// The historical `/new` shapes must keep parsing byte-identically after
+    /// the `key=value` facets were added — the tuning tokens are additive, not
+    /// a new grammar.
+    #[test]
+    fn new_command_keeps_its_vendor_role_flag_grammar() {
+        let bare = parse_new("").unwrap();
+        assert_eq!(bare.vendor, AgentVendor::Claude);
+        assert_eq!(bare.role, "", "no role token ⇒ roleless");
+        assert_eq!(bare.permission_mode, PermissionMode::Skip);
+        assert_eq!(bare.protocol, SessionProtocol::StreamJson);
+        assert_eq!(bare.tuning, SpawnTuning::default());
+
+        let roled = parse_new("claude reviewer hitl").unwrap();
+        assert_eq!(roled.role, "reviewer");
+        assert_eq!(roled.permission_mode, PermissionMode::Hitl);
+
+        // ACP vendors settle the protocol axis last, whatever was typed.
+        assert_eq!(
+            parse_new("grok terminal").unwrap().protocol,
+            SessionProtocol::Acp
+        );
+    }
+
+    /// `model=` / `effort=` are order-free and reach [`SpawnTuning`] verbatim
+    /// — no vendor filtering, no normalization of the vendor's own token
+    /// vocabulary. The short forms exist because these are typed on a phone.
+    #[test]
+    fn new_command_parses_order_free_model_and_effort_tokens() {
+        for args in [
+            "kimi effort=max model=kimi-code/k3 reviewer",
+            "kimi reviewer model=kimi-code/k3 effort=max",
+            "kimi model=kimi-code/k3 reviewer effort=max",
+            "kimi e=max reviewer m=kimi-code/k3",
+        ] {
+            let parsed = parse_new(args).unwrap();
+            assert_eq!(parsed.role, "reviewer", "{args}");
+            assert_eq!(parsed.vendor, AgentVendor::Kimi, "{args}");
+            assert_eq!(
+                parsed.tuning,
+                SpawnTuning {
+                    model: Some("kimi-code/k3".to_string()),
+                    effort: Some("max".to_string()),
+                },
+                "{args}"
+            );
+        }
+
+        // A token ccteam has never heard of still rides through: the vendor
+        // owns the verdict on its own value set.
+        assert_eq!(
+            parse_new("grok effort=ludicrous").unwrap().tuning.effort,
+            Some("ludicrous".to_string())
+        );
+    }
+
+    /// A mistyped key must NOT fall through to the role arm: `/new modle=opus`
+    /// silently becoming role `modle=opus` is the same class of failure as a
+    /// silently dropped effort — the user asked for something and got
+    /// something else without being told.
+    #[test]
+    fn new_command_rejects_unknown_keys_with_an_honest_syntax_line() {
+        let err = parse_new("claude modle=opus").unwrap_err().to_string();
+        assert!(err.contains("unknown option `modle=`"), "{err}");
+        assert!(err.contains("model=<id>"), "{err}");
+        assert!(err.contains("effort=<level>"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+
+        let err = parse_new("claude model=").unwrap_err().to_string();
+        assert!(err.contains("has no value"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+
+        // A second bare token is still the pre-existing "one role" error, now
+        // carrying the same syntax line.
+        let err = parse_new("claude reviewer auditor")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unexpected token `auditor`"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+    }
+
+    /// The menu/help entry must teach the tuning tokens: a facet nobody can
+    /// discover is a facet nobody uses.
+    #[test]
+    fn new_command_help_advertises_model_and_effort() {
+        let spec = GATEWAY_COMMANDS
+            .iter()
+            .find(|c| c.name == "/new")
+            .expect("/new is a gateway command");
+        let hint = spec.arg_hint.expect("/new takes args");
+        assert!(hint.contains("model=<id>"), "{hint}");
+        assert!(hint.contains("effort=<level>"), "{hint}");
     }
 
     #[test]
@@ -10682,6 +11102,57 @@ mod tests {
                 (Some("sonnet".into()), None),
                 (Some("sonnet".into()), None),
             ]
+        );
+    }
+
+    /// A spawn-time pick must survive the session, not just its first process.
+    /// `meta.json` persisted `model` but not `effort`, so every re-spawn path
+    /// (resume a dead session, `/role` switch, daemon-restart rebuild) restored
+    /// the model and reset the effort to the vendor default — one axis of the
+    /// same explicit choice silently evaporating, with a live sid to suggest
+    /// nothing had happened.
+    #[tokio::test]
+    async fn an_explicit_effort_survives_a_respawn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    model: Some("opus".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Both axes are on disk — meta.json is the session SoT every re-spawn
+        // path rebuilds from.
+        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
+        assert_eq!(meta.model.as_deref(), Some("opus"));
+        assert_eq!(meta.effort.as_deref(), Some("xhigh"));
+
+        // Stop it, then resume by sid — the rebuild-from-meta path a daemon
+        // restart, a capacity eviction and a web resume all share. The re-spawn
+        // must carry BOTH axes, not just the model.
+        gateway.stop_session("s1").await.ok();
+        gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await
+            .expect("resume");
+        let last = fake.spawn_tunings.lock().await.last().cloned();
+        assert_eq!(
+            last,
+            Some((Some("opus".into()), Some("xhigh".into()))),
+            "a resumed session re-spawns with the effort it was created with"
         );
     }
 
@@ -11395,6 +11866,83 @@ mod tests {
         })
         .await
         .expect("event pump stamps queued TurnStarted");
+    }
+
+    /// A QUEUED submission is waiting, not silent. Arming the silence watchdog
+    /// on it produces a "turn went silent — /stop the session" warning for a
+    /// turn that never started, blaming it for its predecessor's silence (the
+    /// s172 shape: kimi ACP parks a mid-turn message in FIFO, and the queued
+    /// turn got a stall warning 5m later while the real turn was still running).
+    /// The pump's canonical `TurnStarted` is the authority instead.
+    #[tokio::test]
+    async fn queued_submission_never_arms_the_watchdog_but_its_turn_start_does() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default().with_inject_degraded_to_queue());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Kimi,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let identity = gateway.sessions[&sid].thread.identity.clone();
+
+        // A running turn IS armed — that is the watchdog's real job.
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        assert!(
+            gateway.sessions[&sid]
+                .watched_turn
+                .lock()
+                .unwrap()
+                .is_some(),
+            "a Started submission must be watched"
+        );
+
+        // Clear the arm the way the watchdog does once it has warned, then let
+        // a second message degrade to FIFO behind the active turn.
+        *gateway.sessions[&sid].watched_turn.lock().unwrap() = None;
+        gateway.submit_to_sid(&sid, "queued".into()).await.unwrap();
+        assert_eq!(
+            fake.routings.lock().await.len(),
+            2,
+            "both messages reached the adapter"
+        );
+        assert!(
+            gateway.sessions[&sid]
+                .watched_turn
+                .lock()
+                .unwrap()
+                .is_none(),
+            "a queued turn has not started and must not be watched for silence"
+        );
+
+        // …and when it really starts, the pump arms it by its own turn id.
+        fake.events.lock().await.push_back((
+            identity,
+            ThreadEvent::TurnStarted {
+                turn_id: "queued-2".into(),
+            },
+        ));
+        fake.events_notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let armed = gateway.sessions[&sid].watched_turn.lock().unwrap().clone();
+                if let Some((turn_id, _)) = armed {
+                    assert_eq!(turn_id, "queued-2");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canonical TurnStarted arms the watchdog for the turn that began");
     }
 
     /// V0.8.6 W5b — the resource-API spine: create a session via
@@ -13125,6 +13673,338 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poisoned_admin_owner_uses_project_owner_for_delivery_and_rebuild() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        seed_global_telegram(&paths, vec!["admin-chat".into()]);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // The write path now stamps the project principal, so poison the
+        // PERSISTED metadata by hand — that is the state this test is about:
+        // a `meta.json` written before ownership inherited the project (the
+        // operator's on-disk fleet), which no migration will ever rewrite.
+        let mut meta = read_session_meta(&project_dir, &sid).unwrap();
+        assert_eq!(
+            meta.owner, "user:ualice",
+            "the spawn path stamps the tenant project's principal"
+        );
+        meta.owner = "user:web-api".to_string();
+        write_session_meta(&project_dir, &meta).unwrap();
+
+        let rebuild = gateway
+            .plan_session_rebuild("alpha", project_dir, &meta, &web_api_chat())
+            .unwrap();
+        assert_eq!(
+            rebuild.owner.identity(),
+            "user:ualice",
+            "restart repairs the effective owner from the project SoT"
+        );
+
+        gateway
+            .submit_to_sid(&sid, "tenant-only result".into())
+            .await
+            .unwrap();
+        let answers = recv_sink_answers(&mut events, 1).await;
+        wait_for_turn_idle(&gateway, &sid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(answers[0].channel, "web");
+        assert_eq!(answers[0].chat_id, "ualice");
+        assert!(
+            events.try_recv().is_err(),
+            "poisoned metadata must not mirror tenant output to admin Telegram"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_project_keeps_delegated_session_caller_pool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("telegram:project-owner"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths);
+
+        let sid = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let meta = read_session_meta(&project_dir, &sid).unwrap();
+        assert_eq!(
+            meta.owner, "user:web-api",
+            "operator projects preserve the caller's session pool"
+        );
+    }
+
+    /// THE REPORTED BUG (2026-07-30, real machine) — a tenant's IM `/status`
+    /// rendered NO `👥 直接子会话` block and under-counted "本项目其他 N 个会话"
+    /// while that tenant's WEB team page listed the very same children. The
+    /// children (`s22..s30`) had been spawned by an ambient `session_spawn`, so
+    /// they carried the admin pool's owner (`user:web-api`); the LIVE gate read
+    /// that stored owner verbatim while its STOPPED twin (`chat_can_access_sid`)
+    /// already inherited the project principal — same chat, same project, same
+    /// session, visible when stopped and invisible when live. The web surface
+    /// gates at PROJECT level only, so the two frontends disagreed, which is
+    /// exactly what the §三 red line forbids ("ACL = 一个身份解析器 + 一套归属
+    /// 策略,两个前端共用"). project 是归属单元,session 继承 — including live.
+    #[tokio::test]
+    async fn tenant_status_lists_live_children_owned_by_the_admin_pool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+
+        // The tenant drives its own project from its per-tenant bot; `/new`
+        // focuses the chat on s1, the parent of the delegation tree.
+        let tenant = ChatKey::new("telegram@ualice", "111", "alice");
+        gateway
+            .handle_text("telegram@ualice", "111", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let child = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "researcher".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "s1".into(),
+                    depth: 0,
+                    role: "reviewer".into(),
+                }),
+                Some("delegated investigation".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+        // Reproduce the operator's LIVE fleet: children whose owner is the
+        // caller's admin pool, not the project's tenant. Reachable whenever a
+        // session predates its project's ownership (spawned before the
+        // inheritance rule, or spawned in a project a tenant claimed later) —
+        // the ownership decision belongs to the project, so the gate must
+        // resolve it at read time rather than trust the stamped owner.
+        gateway.sessions.get_mut(&child).unwrap().owner =
+            ChatKey::new("user", "web-api", "web-api");
+
+        assert!(
+            gateway.chat_can_access(&tenant, gateway.sessions.get(&child).unwrap()),
+            "a LIVE session in a tenant-owned project belongs to that tenant"
+        );
+        let status = gateway.render_status(&tenant).await;
+        assert!(
+            status.contains(&format!("👥 直接子会话:\n      · {child} · claude")),
+            "the tenant's /status must list its project's delegated children: {status}"
+        );
+    }
+
+    /// The fallback leg must stay untouched: an operator-owned (or unowned)
+    /// project has NO tenant principal to inherit, so the stored owner still
+    /// decides and two admin IM chats on one bot stay isolated from each other
+    /// ("IM chat 之间互相隔离" — the 档0 rule the v0.8.13 same-project sharing
+    /// was reverted for; do not let project inheritance quietly re-add it).
+    #[tokio::test]
+    async fn operator_and_unowned_projects_keep_per_im_chat_isolation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, _project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "ops", Some("user:web-api")); // operator pool
+        seed_owned_project(&paths, "legacy", None); // legacy `ccteam init`
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "ops", paths.projects_root.join("ops"));
+        // Both chats are NAMED in the allowlist ⇒ both are the operator.
+        gateway.bind_operator_allowlist("telegram", ["111".to_string(), "222".to_string()]);
+        gateway.enable_project_creation(paths);
+
+        let rob = ChatKey::new("telegram", "111", "rob");
+        let eve = ChatKey::new("telegram", "222", "eve");
+        for slug in ["ops", "legacy"] {
+            gateway.change_project(&rob, slug).unwrap();
+            gateway.change_project(&eve, slug).unwrap();
+            gateway
+                .handle_text("telegram", "111", "rob", "/new claude reviewer")
+                .await
+                .unwrap();
+            gateway
+                .handle_text("telegram", "222", "eve", "/new claude reviewer")
+                .await
+                .unwrap();
+            let focused = |chat: &ChatKey| {
+                gateway
+                    .current_session
+                    .read()
+                    .unwrap()
+                    .get(chat)
+                    .cloned()
+                    .expect("/new focuses the chat")
+            };
+            let (mine, theirs) = (focused(&rob), focused(&eve));
+            assert!(
+                gateway.chat_can_access(&rob, gateway.sessions.get(&mine).unwrap()),
+                "{slug}: a chat sees its own session"
+            );
+            assert!(
+                !gateway.chat_can_access(&rob, gateway.sessions.get(&theirs).unwrap()),
+                "{slug}: an admin chat must NOT see another admin chat's session"
+            );
+            assert!(
+                !gateway.chat_can_access(&eve, gateway.sessions.get(&mine).unwrap()),
+                "{slug}: isolation is symmetric"
+            );
+        }
+    }
+
+    /// Live and stopped must answer identically for the SAME (chat, session):
+    /// the divergence IS the bug (a `/status` that hides what `/rename` reaches).
+    #[tokio::test]
+    async fn live_and_stopped_session_gates_agree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        // Stamp the pre-inheritance owner on BOTH rungs of the ladder (live map
+        // + on-disk meta), so the two gates read the same poisoned input.
+        gateway.sessions.get_mut(&sid).unwrap().owner = ChatKey::new("user", "web-api", "web-api");
+        let mut meta = read_session_meta(&project_dir, &sid).unwrap();
+        meta.owner = "user:web-api".to_string();
+        write_session_meta(&project_dir, &meta).unwrap();
+
+        let tenant = ChatKey::new("telegram@ualice", "111", "alice");
+        let live = gateway.chat_can_access(&tenant, gateway.sessions.get(&sid).unwrap());
+        gateway.sessions.remove(&sid); // the session stops; meta.json stays
+        let stopped = gateway.chat_can_access_sid(&tenant, &sid);
+        assert_eq!(
+            live, stopped,
+            "one ownership policy: live and stopped cannot disagree"
+        );
+        assert!(live, "the tenant owns everything in its own project");
+    }
+
+    /// The WRITE path decides ownership once, in `plan_new_session`, so every
+    /// spawn entry (IM `/new`, REST `POST …/sessions`, MCP `session_spawn`) is
+    /// covered without its own patch (§五 总纲 判据②). The persisted
+    /// `meta.owner` is what `ccteam-web` serves verbatim, so getting it right
+    /// here is what keeps the two frontends telling one story.
+    #[tokio::test]
+    async fn fresh_session_meta_owner_follows_project_ownership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, _project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "tenant-proj", Some("user:ualice"));
+        seed_owned_project(&paths, "ops", Some("user:web-api"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "ops", paths.projects_root.join("ops"));
+        gateway.enable_project_creation(paths.clone());
+
+        let tenant_sid = gateway
+            .create_session_api_tuned(
+                "tenant-proj".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(
+            read_session_meta(&paths.projects_root.join("tenant-proj"), &tenant_sid)
+                .unwrap()
+                .owner,
+            "user:ualice",
+            "a tenant project stamps its own principal on every fresh session"
+        );
+
+        let ops_sid = gateway
+            .create_session_api(
+                "ops".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(
+            read_session_meta(&paths.projects_root.join("ops"), &ops_sid)
+                .unwrap()
+                .owner,
+            "user:web-api",
+            "an operator project still stamps the caller-derived owner"
+        );
+    }
+
+    /// `owner` is the resource identity; `reply_to` is the concrete delivery
+    /// frontend — inheriting the first must never rewrite the second. A tenant
+    /// bot creating a session in its own project keeps its TELEGRAM route;
+    /// pinning `reply_to` to `web:<tenant>` would silently kill IM delivery.
+    #[tokio::test]
+    async fn tenant_bot_spawn_keeps_its_im_reply_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        seed_owned_project(&paths, "alpha", Some("user:ualice"));
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_project_creation(paths);
+
+        gateway
+            .handle_text("telegram@ualice", "111", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let session = gateway.sessions.get("s1").expect("session s1");
+        assert_eq!(session.owner.identity(), "user:ualice");
+        let reply_to = session.reply_to.lock().unwrap().clone();
+        assert_eq!(reply_to.channel, "telegram@ualice", "IM delivery survives");
+        assert_eq!(reply_to.chat_id, "111");
+        assert_eq!(
+            read_session_meta(&project_dir, "s1").unwrap().owner,
+            "user:ualice"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn internal_delegated_child_web_turn_does_not_mirror_to_admin_telegram() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, project_dir) = mirror_test_paths(&tmp);
@@ -14685,10 +15565,11 @@ mod tests {
         // slug, no absolute USED count.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8[1m]".into()),
-            context: Some(ContextUsage {
-                used_tokens: 188_000,
-                window_tokens: 1_000_000,
-            }),
+            context: Some(ContextUsage::known(
+                188_000,
+                1_000_000,
+                ContextSource::Derived,
+            )),
             effort: Some("max".into()),
             goal: None,
         })
@@ -14705,11 +15586,12 @@ mod tests {
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
             model: Some("claude-sonnet-4-5".into()),
-            context: Some(ContextUsage {
-                used_tokens: 188_000,
-                window_tokens: 200_000,
-            }),
             effort: None,
+            context: Some(ContextUsage::known(
+                188_000,
+                200_000,
+                ContextSource::Derived,
+            )),
             goal: None,
         })
         .await;
@@ -14865,10 +15747,11 @@ mod tests {
         // A model + effort + context so the model·effort·ctx tail is exercised.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8".into()),
-            context: Some(ContextUsage {
-                used_tokens: 410_000,
-                window_tokens: 1_000_000,
-            }),
+            context: Some(ContextUsage::known(
+                410_000,
+                1_000_000,
+                ContextSource::Derived,
+            )),
             effort: Some("max".into()),
             goal: None,
         })
@@ -15291,13 +16174,13 @@ mod tests {
     /// still sees NOTHING of other tenants or the admin pool. The admin/global
     /// bot keeps the operator "own + all web" view.
     #[test]
-    fn chat_owner_visible_converges_tenant_web_and_im() {
+    fn session_owner_visibility_converges_tenant_web_and_im() {
         let gw = acl_gateway();
         // A web-created session's OWNER is the canonical user identity
         // (`user:<id>`), derived by `canonical_owner` from the web frontend chat.
-        let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")); // user:uaaa
-        let web_b = canonical_owner(&ChatKey::new("web", "ubbb", "ubbb")); // user:ubbb
-        let web_admin = canonical_owner(&ChatKey::new("web", "web-api", "web-api")); // user:web-api
+        let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")).identity(); // user:uaaa
+        let web_b = canonical_owner(&ChatKey::new("web", "ubbb", "ubbb")).identity(); // user:ubbb
+        let web_admin = canonical_owner(&ChatKey::new("web", "web-api", "web-api")).identity();
         let admin_tg = ChatKey::new("telegram", "339", "rob");
         let bot_a = ChatKey::new("telegram@uaaa", "111", "alice"); // uaaa's IM bot
         let bot_b = ChatKey::new("telegram@ubbb", "222", "bob");
@@ -15305,15 +16188,24 @@ mod tests {
         // CONVERGENCE: uaaa's bot canonicalizes to user:uaaa → it sees uaaa's
         // web-created sessions (owner user:uaaa).
         assert!(
-            gw.chat_owner_visible(&bot_a, &web_a),
+            gw.owner_identity_visible(&bot_a, &web_a),
             "a tenant bot sees its tenant's web-created sessions (convergence)"
         );
         // ISOLATION: not the admin pool, not another tenant, not the admin IM.
-        assert!(!gw.chat_owner_visible(&bot_a, &web_admin), "no admin pool");
-        assert!(!gw.chat_owner_visible(&bot_a, &web_b), "no other tenant");
-        assert!(!gw.chat_owner_visible(&bot_a, &admin_tg), "no admin IM");
         assert!(
-            !gw.chat_owner_visible(&bot_b, &web_a),
+            !gw.owner_identity_visible(&bot_a, &web_admin),
+            "no admin pool"
+        );
+        assert!(
+            !gw.owner_identity_visible(&bot_a, &web_b),
+            "no other tenant"
+        );
+        assert!(
+            !gw.owner_identity_visible(&bot_a, &admin_tg.identity()),
+            "no admin IM"
+        );
+        assert!(
+            !gw.owner_identity_visible(&bot_b, &web_a),
             "ubbb's bot doesn't see uaaa's sessions"
         );
 
@@ -15322,19 +16214,19 @@ mod tests {
         // pushed tenants' sessions into the owner's IM bot, where a `/use` on a
         // listed sid then re-pointed that session's `reply_to` at the admin
         // chat — "IM receives another user's session messages".)
-        assert!(gw.chat_owner_visible(&admin_tg, &admin_tg));
-        assert!(gw.chat_owner_visible(&admin_tg, &web_admin));
+        assert!(gw.owner_identity_visible(&admin_tg, &admin_tg.identity()));
+        assert!(gw.owner_identity_visible(&admin_tg, &web_admin));
         assert!(
-            !gw.chat_owner_visible(&admin_tg, &web_a),
+            !gw.owner_identity_visible(&admin_tg, &web_a),
             "the admin/global bot must NOT see a tenant's web sessions"
         );
         // ... and symmetrically, a tenant's WEB console (channel "web", not a
         // bot channel) sees neither the admin pool nor another tenant.
         let web_console_a = ChatKey::new("web", "uaaa", "uaaa");
-        assert!(gw.chat_owner_visible(&web_console_a, &web_a));
-        assert!(!gw.chat_owner_visible(&web_console_a, &web_b));
-        assert!(!gw.chat_owner_visible(&web_console_a, &web_admin));
-        assert!(!gw.chat_owner_visible(&web_console_a, &admin_tg));
+        assert!(gw.owner_identity_visible(&web_console_a, &web_a));
+        assert!(!gw.owner_identity_visible(&web_console_a, &web_b));
+        assert!(!gw.owner_identity_visible(&web_console_a, &web_admin));
+        assert!(!gw.owner_identity_visible(&web_console_a, &admin_tg.identity()));
     }
 
     /// PRIVILEGE IS A NAME (2026-07-28 owner report, part 2). Reaching a bot
@@ -15447,9 +16339,9 @@ mod tests {
         );
     }
 
-    /// v0.8.21 cold-resume ACL — `owner_identity_visible` (the identity-string
-    /// form used when resuming a STOPPED session from `meta.owner`) must agree
-    /// with the live `chat_owner_visible` rule. The regression it guards: the
+    /// v0.8.21 cold-resume ACL — `owner_identity_visible` reads a persisted
+    /// `meta.owner` when resuming a STOPPED session, and must agree with the
+    /// live gate (`chat_can_access`). The regression it guards: the
     /// earlier cold path reconstructed a `ChatKey` via `from_identity` and
     /// compared with `==`, but `ChatKey` equality includes `user_id` while
     /// `identity()` drops it — so an admin IM bot (whose `canonical_owner` keeps
@@ -15506,8 +16398,8 @@ mod tests {
     /// MCP list (`visible_user_projects`), since all three now authorize off the
     /// same `ProjectState.owner` through the same core policy
     /// (`ccteam_core::identity::can_see_owner`). Pure-predicate twin of
-    /// `chat_owner_visible_converges_tenant_web_and_im` (the session rule),
-    /// keyed on PROJECT owners instead of session owners.
+    /// `session_owner_visibility_converges_tenant_web_and_im` (the session
+    /// rule), keyed on PROJECT owners instead of session owners.
     #[test]
     fn project_acl_isolates_tenants_from_admin_and_each_other() {
         let gw = acl_gateway();
@@ -15676,6 +16568,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),
@@ -15748,6 +16641,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),

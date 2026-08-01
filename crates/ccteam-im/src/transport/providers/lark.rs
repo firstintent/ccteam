@@ -38,14 +38,13 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, LarkOpenIdProbe, MessageOption, OutboundFile, OutboundFileKind,
-    SendMessage,
+    ChannelMessage, ChoiceReply, MessageOption, OutboundFile, OutboundFileKind,
+    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -477,10 +476,8 @@ pub struct LarkChannel {
     /// Dedup set: WS `message_id`s seen in the last ~30 min to prevent
     /// double-dispatch.
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
-    /// Optional setup-helper JSONL path. Unauthorized sender `open_id`s are
-    /// appended here so the web Settings page can surface them without asking
-    /// users to inspect daemon logs. This does NOT authorize the message.
-    open_id_probe_path: Option<PathBuf>,
+    /// Shared setup probe + one-shot binding notice for rejected senders.
+    rejected_senders: RejectedSenderNotifier,
     name: String,
 }
 
@@ -504,7 +501,7 @@ impl LarkChannel {
                 .expect("reqwest client"),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
-            open_id_probe_path: None,
+            rejected_senders: RejectedSenderNotifier::default(),
             name: "lark".to_string(),
         }
     }
@@ -520,7 +517,7 @@ impl LarkChannel {
     /// sets this for real channels; tests and standalone providers may leave
     /// it unset.
     pub fn with_open_id_probe_path(mut self, path: PathBuf) -> Self {
-        self.open_id_probe_path = Some(path);
+        self.rejected_senders = RejectedSenderNotifier::with_probe_path(path);
         self
     }
 
@@ -764,7 +761,12 @@ impl LarkChannel {
                     if msg_type == "card" || (msg_type == "event" && payload_is_card_action(&payload)) {
                         let Some(action) = decode_card_action(&payload) else { continue };
                         if !self.is_user_allowed(&action.open_id) {
-                            tracing::warn!("Lark WS: ignoring card action from {} (not allowed)", action.open_id);
+                            self.reject_sender(
+                                &action.open_id,
+                                &action.chat_id,
+                                &action.message_id,
+                                now_secs(),
+                            ).await;
                             continue;
                         }
                         // Dedup on the WS-frame message_id (Feishu reuses it on
@@ -806,8 +808,12 @@ impl LarkChannel {
                     let Some(decoded) = self.decode_event(&payload) else { continue };
 
                     if !self.is_user_allowed(&decoded.open_id) {
-                        self.record_open_id_probe(&decoded).await;
-                        tracing::warn!("Lark WS: ignoring {} (not in allowed_users)", decoded.open_id);
+                        self.reject_sender(
+                            &decoded.open_id,
+                            &decoded.chat_id,
+                            &decoded.message_id,
+                            decoded.timestamp,
+                        ).await;
                         continue;
                     }
 
@@ -870,57 +876,25 @@ impl LarkChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == open_id)
     }
 
-    async fn record_open_id_probe(&self, decoded: &DecodedMessage) {
-        let Some(path) = self.open_id_probe_path.as_ref() else {
-            return;
-        };
-        let probe = LarkOpenIdProbe {
-            channel: self.name.clone(),
-            open_id: decoded.open_id.clone(),
-            chat_id: decoded.chat_id.clone(),
-            message_id: decoded.message_id.clone(),
-            timestamp: decoded.timestamp,
-        };
-        let line = match serde_json::to_string(&probe) {
-            Ok(line) => format!("{line}\n"),
-            Err(err) => {
-                tracing::warn!(error = %err, "Lark open_id probe encode failed");
-                return;
-            }
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = tokio::fs::create_dir_all(parent).await {
-                tracing::warn!(
-                    path = %parent.display(),
-                    error = %err,
-                    "Lark open_id probe dir create failed"
-                );
-                return;
-            }
-        }
-        match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-        {
-            Ok(mut file) => {
-                if let Err(err) = file.write_all(line.as_bytes()).await {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "Lark open_id probe append failed"
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "Lark open_id probe open failed"
-                );
-            }
-        }
+    async fn reject_sender(
+        &self,
+        sender_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        timestamp: u64,
+    ) {
+        self.rejected_senders
+            .record_and_notify(
+                self,
+                RejectedSenderProbe {
+                    channel: self.name.clone(),
+                    sender_id: sender_id.to_string(),
+                    chat_id: chat_id.to_string(),
+                    message_id: message_id.to_string(),
+                    timestamp,
+                },
+            )
+            .await;
     }
 
     /// Get or refresh the tenant access token (cached).
