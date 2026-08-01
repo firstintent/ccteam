@@ -204,7 +204,9 @@ describe("model button label", () => {
       draft: { ...defaultDraft(), vendor: "kimi", model: "", protocol: "acp" },
     });
     expect(html).toContain("<span>Kimi · kimi-code/k3</span>");
-    expect(html).toContain('<span class="eff">默认</span>');
+    // Effort renders as the vendor's own token, never a translated word —
+    // identical in zh and en (see `effortLabel`).
+    expect(html).toContain('<span class="eff">default</span>');
   });
 });
 

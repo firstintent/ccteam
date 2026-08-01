@@ -1123,11 +1123,11 @@ select:focus-visible,
 .agents-tree-toggle { padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--text-faint); cursor: pointer; font-size: 17px; line-height: 1; }
 .agents-tree-toggle:hover { color: var(--text); background: var(--bg-soft); }
 /* The chip is an icon (VendorChip), so it only needs icon width — the space
-   it used to reserve for a text label goes to 模型 · 强度. */
+   it used to reserve for a text label goes to 模型 · effort. */
 .agents-tree-row .chip { justify-self: start; width: 34px; padding-inline: 5px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
 .agents-tree-sid { color: var(--text-faint); }
 .agents-tree-title { color: var(--text); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* 模型 · 强度 — what the session runs right now (live statusline join). */
+/* 模型 · effort — what the session runs right now (live statusline join). */
 .agents-tree-model { color: var(--text-faint); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .agents-tree-active { white-space: nowrap; text-align: right; }
 .agents-tree-cost, .agents-tree-turns { color: var(--text-muted); text-align: right; font-variant-numeric: tabular-nums; }
@@ -1177,7 +1177,7 @@ select:focus-visible,
 }
 /* Card mode — the row stops being one wide table line and becomes two:
      [guide][toggle] vendor · sid · title …………………………… 打开 ↗
-     [guide][toggle] 模型 · 强度 · host ● 2分钟前 $0.42 12t
+     [guide][toggle] claude-opus-5 · high · host ● 2分钟前 $0.42 12t
    The tree guide + toggle span both lines (so depth stays readable) and the
    metrics line starts under the title, not at the card edge. Nothing scrolls
    horizontally at any width. */

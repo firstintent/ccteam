@@ -189,7 +189,7 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
     expect(html).toContain("打开 ↗");
   });
 
-  it("每行展示 模型 · 强度 — localized effort, raw model, dash when nothing live", () => {
+  it("每行展示 模型 · effort — vendor tokens verbatim, dash when nothing live", () => {
     const rows = [
       fixtureNode({ sid: "s0", model: "claude-opus-5", effort: "high" }),
       fixtureNode({ sid: "s1", model: "gpt-5.5-codex", effort: "xhigh" }),
@@ -203,40 +203,29 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
         <AgentsTree nodes={rows} edges={[]} selected={null} pulsing={new Set()} onSelect={() => {}} />
       </MemoryRouter>,
     ).replace(/<!-- -->/g, "");
-    expect(html).toContain("claude-opus-5 · 高");
-    expect(html).toContain("gpt-5.5-codex · 极高");
+    expect(html).toContain("claude-opus-5 · high");
+    expect(html).toContain("gpt-5.5-codex · xhigh");
     expect(html).toContain("kimi-code/k3");
     expect(html).not.toContain("kimi-code/k3 ·");
     expect(html).toMatch(/agents-tree-model[^>]*>—</);
-
-    const en = renderToString(
-      <MemoryRouter>
-        <AgentsTree
-          nodes={[rows[0]!]}
-          edges={[]}
-          selected={null}
-          pulsing={new Set()}
-          lang="en"
-          onSelect={() => {}}
-        />
-      </MemoryRouter>,
-    ).replace(/<!-- -->/g, "");
-    expect(en).toContain("claude-opus-5 · High");
   });
 
-  it("an effort token with no label renders verbatim (honest, never faked)", () => {
-    const html = renderToString(
-      <MemoryRouter>
-        <AgentsTree
-          nodes={[fixtureNode({ model: "some-model", effort: "ludicrous" })]}
-          edges={[]}
-          selected={null}
-          pulsing={new Set()}
-          onSelect={() => {}}
-        />
-      </MemoryRouter>,
-    ).replace(/<!-- -->/g, "");
-    expect(html).toContain("some-model · ludicrous");
+  it("the effort token never translates — zh and en render the same cell", () => {
+    const render = (lang: "zh" | "en") =>
+      renderToString(
+        <MemoryRouter>
+          <AgentsTree
+            nodes={[fixtureNode({ model: "claude-opus-5", effort: "high" })]}
+            edges={[]}
+            selected={null}
+            pulsing={new Set()}
+            lang={lang}
+            onSelect={() => {}}
+          />
+        </MemoryRouter>,
+      ).replace(/<!-- -->/g, "");
+    expect(render("zh")).toContain("claude-opus-5 · high");
+    expect(render("en")).toContain("claude-opus-5 · high");
   });
 
   it("host badge renders only when the graph spans more than one host", () => {

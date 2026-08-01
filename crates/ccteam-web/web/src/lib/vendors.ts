@@ -124,11 +124,34 @@ export function wireEffort(draft: Pick<ComposerDraft, "vendor" | "effortKey">): 
   }
 }
 
+/** How an effort level is SHOWN, everywhere (composer pill + menu, team
+ *  topology): the vendor's own token — `low` / `medium` / `high` / `max` |
+ *  `xhigh`, and `default` for "wire nothing". Never translated: 高 / 极高
+ *  read as ccteam vocabulary while the thing the CLI takes (and the
+ *  statusline reports back) is `high` / `xhigh`, so the menu, the pill and
+ *  the topology column all showed different words for one value. The label
+ *  is identical in zh and en by design.
+ *
+ *  Vendors whose effort ccteam never wires (grok / opencode / kimi — see
+ *  {@link wireEffort}) fall back to the generic ladder, since there is no
+ *  vendor token to name. */
+export function effortLabel(key: EffortKey, vendor?: string): string {
+  if (key === "effDefault") return "default";
+  const generic: Record<Exclude<EffortKey, "effDefault">, string> = {
+    effLow: "low",
+    effMid: "medium",
+    effHigh: "high",
+    effMax: "max",
+  };
+  return wireEffort({ vendor: (vendor ?? "claude") as VendorId, effortKey: key }) ?? generic[key];
+}
+
 /** The inverse of {@link wireEffort}: a backend effort token (from the live
- *  statusline — `GET /sessions/{sid}/status`, `agents/graph` nodes) → the
- *  dictionary key that labels it. Vendor-agnostic (`xhigh` and `max` are the
- *  same top rung across codex/claude). Unknown/absent → `null`, so a caller
- *  renders the raw token or nothing — never a fake level. */
+ *  statusline — `GET /sessions/{sid}/status`) → the ladder key, so a live
+ *  session's reported effort can select the composer's menu row.
+ *  Vendor-agnostic (`xhigh` and `max` are the same top rung across
+ *  codex/claude). Unknown/absent → `null` (the composer then reads
+ *  `default`) — never a fake level. */
 export function effortKeyOf(effort: string | null | undefined): EffortKey | null {
   switch ((effort ?? "").toLowerCase()) {
     case "low":

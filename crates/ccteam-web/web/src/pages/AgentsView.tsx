@@ -6,7 +6,7 @@
 //
 // - 拓扑 topology: a compact, collapsible delegation tree grouped by project,
 //   designed to stay readable with 100+ sessions. Every row carries what its
-//   session is running right now (模型 · 强度, off the graph's live statusline
+//   session is running right now (模型 · effort, off the graph's live statusline
 //   join) and links to the real chat route `/chat/s/<sid>` — right/middle-click
 //   open-in-new-tab works because these are real hyperlinks. Narrow canvases
 //   fold each row into two wrapped lines (index.css @container agents-canvas).
@@ -39,7 +39,7 @@ import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { VendorChip } from "../components/VendorChip";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
-import { effortKeyOf, vendorDotClass } from "../lib/vendors";
+import { vendorDotClass } from "../lib/vendors";
 import { makeT, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
@@ -59,14 +59,14 @@ function treeDotClass(node: AgentNode, pulsing: Set<string>): string {
   return pulsing.has(node.sid) ? "dot busy" : "dot on";
 }
 
-/** The 模型 · 强度 cell — what this session is running RIGHT NOW, off the
- *  graph's live statusline join. An idle node reports neither (nothing live
- *  to read) ⇒ a dash, never a spawn-time guess; an effort token we have no
- *  label for renders verbatim (honest over pretty). */
-function modelEffortLabel(node: AgentNode, t: (key: string) => string): string {
-  const key = effortKeyOf(node.effort);
-  const effort = key ? t(key) : node.effort?.trim();
-  return [node.model?.trim(), effort].filter(Boolean).join(" · ") || "—";
+/** The 模型 · effort cell — what this session is running RIGHT NOW, off the
+ *  graph's live statusline join. Both halves are the vendor's own strings,
+ *  verbatim in either language (`claude-opus-5 · high`): translating the
+ *  effort would print a word no CLI or statusline ever uses. An idle node
+ *  reports neither (nothing live to read) ⇒ a dash, never a spawn-time
+ *  guess. */
+function modelEffortLabel(node: AgentNode): string {
+  return [node.model?.trim(), node.effort?.trim()].filter(Boolean).join(" · ") || "—";
 }
 
 /** Project-grouped, collapsible delegation tree. Component state contains
@@ -175,7 +175,7 @@ export function AgentsTree({
                 </span>
                 <span className="agents-tree-meta">
                   <span className="agents-tree-model mono" title={t("teamColModel")}>
-                    {modelEffortLabel(n, t)}
+                    {modelEffortLabel(n)}
                   </span>
                   {showHost ? <span className="agents-tree-host mono">{n.host}</span> : null}
                   <span className={treeDotClass(n, pulsing)} aria-hidden="true" />

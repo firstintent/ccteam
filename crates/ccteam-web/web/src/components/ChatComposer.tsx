@@ -43,6 +43,7 @@ import {
 } from "../lib/attachmentsApi";
 import {
   EFFORT_KEYS,
+  effortLabel,
   normalizeDraft,
   vendorSpec,
   visibleProtocols,
@@ -985,7 +986,7 @@ export function ChatComposer({
             >
               <span className={`dot ${spec.id}`} />
               <span>{modelText ? `${spec.label} · ${modelText}` : spec.label}</span>
-              <span className="eff">{t(draft.effortKey)}</span>
+              <span className="eff">{effortLabel(draft.effortKey, draft.vendor)}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
               {(allowedVendors
@@ -1016,7 +1017,7 @@ export function ChatComposer({
                   className={`sel-item ${draft.effortKey === k ? "selected" : ""}`}
                   onClick={() => pickEffort(k)}
                 >
-                  {t(k)}
+                  {effortLabel(k, draft.vendor)}
                   <span className="check">✓</span>
                 </button>
               ))}

@@ -3,9 +3,11 @@
 
 import { describe, expect, it } from "vitest";
 
+import { I18N } from "./i18n";
 import {
   defaultDraft,
   effortKeyOf,
+  effortLabel,
   modelSwitchFor,
   wireEffort,
   normalizeDraft,
@@ -125,7 +127,7 @@ describe("wireEffort (A-U3 create-form effort field)", () => {
     expect(wireEffort({ vendor: "claude", effortKey: "effMax" })).toBe("max");
   });
 
-  it("maps codex 极高 to xhigh (its ReasoningEffort set has no max)", () => {
+  it("maps codex's top rung to xhigh (its ReasoningEffort set has no max)", () => {
     expect(wireEffort({ vendor: "codex", effortKey: "effMax" })).toBe("xhigh");
     expect(wireEffort({ vendor: "codex", effortKey: "effLow" })).toBe("low");
   });
@@ -142,7 +144,30 @@ describe("wireEffort (A-U3 create-form effort field)", () => {
   });
 });
 
-describe("effortKeyOf (backend effort token → dictionary key)", () => {
+describe("effortLabel (display = the vendor's own token, never translated)", () => {
+  it("names claude's ladder and codex's xhigh top rung", () => {
+    expect(effortLabel("effDefault")).toBe("default");
+    expect(effortLabel("effLow", "claude")).toBe("low");
+    expect(effortLabel("effMid", "claude")).toBe("medium");
+    expect(effortLabel("effHigh", "claude")).toBe("high");
+    expect(effortLabel("effMax", "claude")).toBe("max");
+    expect(effortLabel("effMax", "codex")).toBe("xhigh");
+  });
+
+  it("falls back to the generic ladder for vendors whose effort is never wired", () => {
+    for (const vendor of ["grok", "opencode", "kimi"] as const) {
+      expect(effortLabel("effMax", vendor)).toBe("max");
+      expect(effortLabel("effMid", vendor)).toBe("medium");
+    }
+  });
+
+  it("is language-independent by construction (no dictionary lookup)", () => {
+    expect(I18N.zh.effLow).toBeUndefined();
+    expect(I18N.en.effMax).toBeUndefined();
+  });
+});
+
+describe("effortKeyOf (backend effort token → ladder key)", () => {
   it("maps the four levels", () => {
     expect(effortKeyOf("low")).toBe("effLow");
     expect(effortKeyOf("medium")).toBe("effMid");
