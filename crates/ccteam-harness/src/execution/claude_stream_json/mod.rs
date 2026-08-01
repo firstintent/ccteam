@@ -49,6 +49,7 @@ use crate::execution::claude_common;
 use crate::execution::progress_bridge::{
     append_event, build_chat_session_reset_event_with_reason, progress_jsonl_from_env,
 };
+use crate::execution::session_status::{read_status_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome,
@@ -694,47 +695,6 @@ async fn apply_flag_settings_live(
 /// escape hatch is fenced to keep a chat command from silently weakening
 /// permissions, hooks, or the MCP surface.)
 const SET_PROTECTED_KEYS: &[&str] = &["permissions", "hooks", "mcpServers"];
-
-/// Persisted per-session status snapshot path, next to the turns mirror:
-/// `<project_dir>/.ccteam/chat/<sid>/status.json`. ccteam-owned (no
-/// Anthropic-internal dependency). Unlike the TUI adapter — which re-derives
-/// status from the on-disk transcript every call — a stream-json session's
-/// status lives only in the in-memory `LiveSession`, so it would vanish on
-/// idle-release / daemon restart (spawn-on-demand resume). Persisting it here
-/// lets [`HarnessAdapter::thread_status`] answer for a released/resumed
-/// session, giving the statusline the same durability the TUI gets for free.
-fn status_json_path(project_dir: &Path, sid: &str) -> PathBuf {
-    project_dir
-        .join(".ccteam")
-        .join("chat")
-        .join(sid)
-        .join("status.json")
-}
-
-/// Persist the latest status atomically (tmp + rename). Best-effort: a write
-/// failure only means a released session can't show its statusline until its
-/// next turn — never worth failing anything over.
-fn write_status_file(project_dir: &Path, sid: &str, status: &ThreadStatus) {
-    let path = status_json_path(project_dir, sid);
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let Ok(body) = serde_json::to_string(status) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
-/// Read the persisted status snapshot, or `None` if absent / unreadable.
-fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
-    let body = std::fs::read_to_string(status_json_path(project_dir, sid)).ok()?;
-    serde_json::from_str(&body).ok()
-}
 
 /// Whether `m` is claude's OWN model-picker placeholder (`SystemMsg::
 /// from_initialize`'s `models[0].value`, typically the literal string

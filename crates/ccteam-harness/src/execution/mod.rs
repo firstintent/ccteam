@@ -23,6 +23,7 @@ pub mod remote_exec;
 pub mod satellite_exec;
 pub mod session_meta;
 pub mod session_recovery;
+pub mod session_status;
 pub mod transcript_tail;
 pub mod turns_mirror;
 pub mod typed_events;

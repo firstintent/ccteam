@@ -21,7 +21,7 @@ use super::protocol::{
 use super::transport::{AcpWriteBarrier, Notification};
 use crate::{
     ContextSource, ContextUsage, ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails,
-    UnifiedTokenUsage,
+    ThreadStatus, UnifiedTokenUsage,
 };
 
 /// Min gap between liveness `ThreadEvent`s for message/thought chunks.
@@ -201,6 +201,47 @@ impl SessionTranslateState {
     pub fn set_used_tokens(&mut self, used: u64, source: ContextSource) {
         self.used_tokens = Some(used);
         self.used_source = source;
+    }
+
+    /// The session's queryable status. Every ACP vendor answers
+    /// `thread_status` with exactly this — the shape is protocol-level, not
+    /// vendor-level, and duplicating it per adapter is how the three copies
+    /// of the occupancy bug got in.
+    pub fn thread_status(&self) -> ThreadStatus {
+        ThreadStatus {
+            model: self.model.clone(),
+            context: self.context_usage(),
+            effort: self.effort.clone(),
+            goal: None,
+        }
+    }
+
+    /// Seed a freshly (re)connected session from its persisted snapshot.
+    ///
+    /// The handshake is authoritative for what it actually reports — model,
+    /// effort and window come from the vendor's live catalog — so this only
+    /// fills what the handshake left empty. Occupancy is always taken from
+    /// the snapshot because ACP has no way to ask for it at connect time; it
+    /// was true at the session's last turn boundary and nothing has run
+    /// since, so it is the honest starting value, carried with the
+    /// provenance it was recorded under (never upgraded).
+    pub fn seed_from_snapshot(&mut self, snapshot: &ThreadStatus) {
+        if self.model.is_none() {
+            self.model.clone_from(&snapshot.model);
+        }
+        if self.effort.is_none() {
+            self.effort.clone_from(&snapshot.effort);
+        }
+        let Some(ctx) = snapshot.context else {
+            return;
+        };
+        if self.window_tokens.is_none() && ctx.window_tokens > 0 {
+            self.window_tokens = Some(ctx.window_tokens);
+        }
+        if let (None, Some(used)) = (self.used_tokens, ctx.used_tokens) {
+            self.used_tokens = Some(used);
+            self.used_source = ctx.source;
+        }
     }
 
     pub fn begin_turn(&mut self, turn_id: impl Into<String>, done: Arc<Notify>) {

@@ -13,6 +13,7 @@
 //!
 //! [`buffer`]: SessionTranslateState::buffer
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -24,6 +25,7 @@ use super::translate::{
     fail_turn, finalize_from_prompt_result, AcpInjectionReservation, SessionTranslateState,
 };
 use super::transport::{AcpTransport, AcpWriteBarrier};
+use crate::execution::session_status::write_status_file;
 use crate::{ThreadEvent, TurnRouting};
 
 /// Monotonic suffix so ids stay unique even for turns steered in the same ms.
@@ -60,6 +62,10 @@ pub struct AcpTurnRunner {
     pub state: Arc<StdMutex<SessionTranslateState>>,
     pub event_tx: broadcast::Sender<ThreadEvent>,
     pub session_id: String,
+    /// Where to persist the status snapshot: the ccteam project dir + sid that
+    /// own `<project>/.ccteam/chat/<sid>/status.json`.
+    pub project_dir: PathBuf,
+    pub sid: String,
     pub tuning: AcpTurnTuning,
 }
 
@@ -147,6 +153,8 @@ impl AcpTurnRunner {
             state,
             event_tx,
             session_id,
+            project_dir,
+            sid,
             tuning,
         } = self;
         tokio::spawn(async move {
@@ -194,12 +202,16 @@ impl AcpTurnRunner {
                 // in one critical section: `buffer` must never observably drop
                 // to None while work is queued, else a concurrent `submit_turn`
                 // would see an idle session and spawn a second runner.
+                let mut boundary_status = None;
                 let next = match state.lock() {
                     Ok(mut st) => {
                         let events = match &result {
                             Ok(r) => finalize_from_prompt_result(&mut st, r),
                             Err(e) => fail_turn(&mut st, &e.to_string()),
                         };
+                        // The turn boundary is the only moment context usage
+                        // changes, so it is the only moment worth persisting.
+                        boundary_status = Some(st.thread_status());
                         let next = match st.pending.pop_front() {
                             Some((tid, txt)) => {
                                 let done = Arc::new(Notify::new());
@@ -229,6 +241,11 @@ impl AcpTurnRunner {
                         None
                     }
                 };
+                // Outside the lock: the write is best-effort file I/O and must
+                // never hold up the next queued turn.
+                if let Some(status) = boundary_status {
+                    write_status_file(&project_dir, &sid, &status);
+                }
                 match next {
                     Some((tid, txt, done, sent)) => {
                         turn_id = tid;

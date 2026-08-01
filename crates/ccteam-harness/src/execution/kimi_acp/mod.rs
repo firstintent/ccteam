@@ -56,9 +56,11 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
+use crate::execution::acp::released_thread_status;
 use crate::execution::acp::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
+use crate::execution::session_status::read_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
     HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
@@ -259,6 +261,16 @@ impl KimiAcpAdapter {
             effort: info.effort,
             ..Default::default()
         }));
+        // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
+        // a session whose context is already full; the handshake reports the
+        // model catalog but never the occupancy. Seed the gaps from the
+        // snapshot so the statusline resumes where it left off instead of
+        // reading as a brand-new session.
+        if let Some(snapshot) = read_status_file(&project_dir, &sid) {
+            if let Ok(mut st) = state.lock() {
+                st.seed_from_snapshot(&snapshot);
+            }
+        }
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
         let dispatcher =
             spawn_notif_dispatcher(Arc::clone(&transport), Arc::clone(&state), event_tx.clone());
@@ -364,6 +376,8 @@ impl KimiAcpAdapter {
                     state: Arc::clone(&live.state),
                     event_tx: live.event_tx.clone(),
                     session_id: live.session_id.clone(),
+                    project_dir: live.project_dir.clone(),
+                    sid: live.sid.clone(),
                     tuning: AcpTurnTuning {
                         finalize_barrier: FINALIZE_BARRIER,
                         post_finalize_sleep: None,
@@ -765,7 +779,9 @@ impl HarnessAdapter for KimiAcpAdapter {
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         let Some(live) = self.get_live(&h.identity) else {
-            return Ok(ThreadStatus::default());
+            // Released / restarted: answer from the persisted snapshot rather
+            // than going silent.
+            return Ok(released_thread_status(h));
         };
         Ok(self.thread_status_inner(&live))
     }
