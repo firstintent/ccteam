@@ -4,8 +4,10 @@
 //   - IME composition guard (the owner's #1 bug: a CJK candidate Enter must
 //     never send a half-typed message) + per-key draft persistence
 //   - HITL 胶囊 toggle (black-on when armed) with a permission-mode toast
-//   - the 3-section model menu: models grouped by vendor · effort · protocol
-//     (per-vendor; claude `terminal` admin-only)
+//   - the 3-section model menu: models grouped by vendor · effort · protocol,
+//     all of it driven by what the vendor itself declares (`GET
+//     /api/v1/models`, cached once per page load) — never a ccteam-invented
+//     ladder, and the picked token rides the spawn verbatim
 //   - Send morphs into a red Stop while a turn is in flight with an empty
 //     draft (interrupt keeps the session — never a kill).
 //   - attach menu (＋): upload files/photos + attach skills in TWO sections —
@@ -41,9 +43,12 @@ import {
   type SkillSummary,
   type TurnAttachment,
 } from "../lib/attachmentsApi";
+import { useVendorCatalog } from "../hooks/useVendorCatalog";
+import type { VendorCatalog } from "../lib/modelsApi";
 import {
-  EFFORT_KEYS,
-  effortLabel,
+  effortRowLabel,
+  effortRowsFor,
+  modelRowsFor,
   normalizeDraft,
   vendorSpec,
   visibleProtocols,
@@ -327,8 +332,10 @@ export function ChatComposer({
   draft,
   onDraftChange,
   modelLabel,
+  effortLabel,
   locked,
   allowedVendors,
+  catalog: catalogOverride,
   topSlot,
   sendTestId = "composer-send",
   uploadSlug,
@@ -355,11 +362,22 @@ export function ChatComposer({
    *  model). The vendor name always prefixes it; an empty/omitted model
    *  segment leaves the vendor name standing alone. */
   modelLabel?: string;
+  /** Conversation override for the button's effort segment — the token the
+   *  live session REPORTS (`GET /sessions/{sid}/status`), printed verbatim.
+   *  It is a display override rather than a draft field because the draft is
+   *  menu state (`normalizeDraft` holds it to what the menu offers) while the
+   *  pill must show whatever the session is really running. `""` reads
+   *  `default`. (A prop — the old `effortLabel()` ladder helper is gone.) */
+  effortLabel?: string;
   /** Conversation: spawn parameters are fixed → picking toasts instead. */
   locked?: boolean;
   /** Vendors installed on the target host (Home 主机绑定 vendor) — the menu
    *  only offers these. Omit to offer the full registry. */
   allowedVendors?: VendorId[];
+  /** Pre-resolved vendor catalog. Omit to use the shared once-per-page fetch;
+   *  pass one when the parent already holds it (Home normalizes the draft
+   *  against the same data) or to render deterministically in tests. */
+  catalog?: VendorCatalog;
   /** Home's inline new-project row renders inside the composer card. */
   topSlot?: React.ReactNode;
   sendTestId?: string;
@@ -375,6 +393,8 @@ export function ChatComposer({
   scheduleTimezone?: string;
 }) {
   const t = makeT(lang);
+  const fetchedCatalog = useVendorCatalog();
+  const catalog = catalogOverride ?? fetchedCatalog;
   const [text, setText] = useState(() => loadDraft(draftKey));
   const [menuOpen, setMenuOpen] = useState(false);
   const [attachOpen, setAttachOpen] = useState(false);
@@ -675,23 +695,30 @@ export function ChatComposer({
       return;
     }
     const spec = vendorSpec(vendor);
+    // Switching vendor drops an effort/protocol the new vendor doesn't offer
+    // (kimi has no `medium`, opencode has no effort axis at all) —
+    // `normalizeDraft` is the one gate that decides that, catalog in hand.
     onDraftChange(
-      normalizeDraft({
-        ...draft,
-        vendor: spec.id,
-        model,
-        protocol: draft.vendor === spec.id ? draft.protocol : spec.protocols[0]!.id,
-      }),
+      normalizeDraft(
+        {
+          ...draft,
+          vendor: spec.id,
+          model,
+          protocol: draft.vendor === spec.id ? draft.protocol : spec.protocols[0]!.id,
+        },
+        catalog,
+      ),
     );
     setMenuOpen(false);
   };
 
-  const pickEffort = (key: ComposerDraft["effortKey"]) => {
+  /** `effort` is the vendor's own token, verbatim; `""` = vendor default. */
+  const pickEffort = (effort: string) => {
     if (locked) {
       setMenuOpen(false);
       return;
     }
-    onDraftChange({ ...draft, effortKey: key });
+    onDraftChange({ ...draft, effort });
     setMenuOpen(false);
   };
 
@@ -709,8 +736,13 @@ export function ChatComposer({
   // Vendor is ALWAYS spelled out next to the model — a bare "默认"/"opus"
   // plus a colored dot left the harness unreadable (owner feedback).
   const modelText = modelLabel ?? draft.model;
+  const effortText = effortRowLabel(effortLabel ?? draft.effort);
   const showStop = !!busy && !scheduleMode && !text.trim() && !!onStop;
   const protocols = visibleProtocols(draft.vendor);
+  // Effort rows for the SELECTED vendor. Only the default row ⇒ this vendor
+  // declares no effort axis ⇒ no section at all: a menu whose every entry
+  // wires nothing is exactly the lie this replaced.
+  const efforts = effortRowsFor(draft.vendor, catalog);
   const sendable = scheduleMode
     ? !!text.trim() && !!resolvedScheduleWhen
     : !!text.trim() || attachments.length > 0;
@@ -986,7 +1018,7 @@ export function ChatComposer({
             >
               <span className={`dot ${spec.id}`} />
               <span>{modelText ? `${spec.label} · ${modelText}` : spec.label}</span>
-              <span className="eff">{effortLabel(draft.effortKey, draft.vendor)}</span>
+              <span className="eff">{effortText}</span>
             </button>
             <div className="sel-menu drop-up align-right" style={{ minWidth: 280 }} data-testid="model-menu">
               {(allowedVendors
@@ -995,7 +1027,7 @@ export function ChatComposer({
               ).map((v) => (
                 <div key={v.id}>
                   <div className="sel-group">{v.label}</div>
-                  {v.models.map((m) => (
+                  {modelRowsFor(v.id, catalog).map((m) => (
                     <button
                       key={`${v.id}-${m}`}
                       type="button"
@@ -1009,18 +1041,26 @@ export function ChatComposer({
                   ))}
                 </div>
               ))}
-              <div className="sel-group">{t("effort")}</div>
-              {EFFORT_KEYS.map((k) => (
-                <button
-                  key={k}
-                  type="button"
-                  className={`sel-item ${draft.effortKey === k ? "selected" : ""}`}
-                  onClick={() => pickEffort(k)}
-                >
-                  {effortLabel(k, draft.vendor)}
-                  <span className="check">✓</span>
-                </button>
-              ))}
+              {efforts.length > 1 ? (
+                <>
+                  {/* One interpolated string, not adjacent children: the
+                      section is per-vendor now, so say WHOSE ladder this is. */}
+                  <div className="sel-group" data-testid="effort-group">
+                    {`${t("effort")}(${spec.label})`}
+                  </div>
+                  {efforts.map((e) => (
+                    <button
+                      key={`eff-${e || "default"}`}
+                      type="button"
+                      className={`sel-item ${draft.effort === e ? "selected" : ""}`}
+                      onClick={() => pickEffort(e)}
+                    >
+                      {effortRowLabel(e)}
+                      <span className="check">✓</span>
+                    </button>
+                  ))}
+                </>
+              ) : null}
               <div className="sel-group">
                 {t("protocol")}({spec.label})
               </div>

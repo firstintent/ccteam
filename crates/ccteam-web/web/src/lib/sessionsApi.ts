@@ -395,9 +395,10 @@ export interface CreateSessionOpts {
   /** v0.8.24 A-U3 — explicit model id (overrides the role's `model:`
    *  frontmatter); omit for the vendor default. */
   model?: string;
-  /** v0.8.24 A-U3 — explicit reasoning-effort token (vendor value set; see
-   *  `wireEffort`); omit for the vendor default. Ignored server-side for
-   *  grok. */
+  /** v0.8.24 A-U3 — explicit reasoning-effort token, the VENDOR's own value
+   *  verbatim (there is no shared ladder: kimi has no `medium`, grok has no
+   *  `max` — see `lib/vendors.ts` / `GET /api/v1/models`); omit for the
+   *  vendor default. */
   effort?: string;
 }
 
