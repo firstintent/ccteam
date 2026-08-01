@@ -31,7 +31,53 @@
 set -eu
 
 REPO="${CCTEAM_REPO:-firstintent/ccteam}"
-INSTALL_DIR="${CCTEAM_INSTALL_DIR:-$HOME/.local/bin}"
+
+# ---- install location: ONE ladder, shared by every install mode ----
+#
+# The failure this prevents: two install modes that each pick their own
+# destination leave two ccteam binaries, and whichever sorts first on PATH wins
+# — so "I rebuilt and it still misbehaves" becomes unfalsifiable (a real
+# incident: a repo build, a stale `cargo/bin` copy, and a dangling symlink, all
+# named ccteam).
+#
+# Ladder: explicit override → wherever ccteam ALREADY lives (if we can write
+# there) → the default. Landing on the existing copy is what keeps an upgrade
+# from ever creating a second one.
+#
+# `make install` calls `install.sh --print-install-dir` instead of
+# reimplementing this — a second copy of the ladder is the same class of bug.
+resolve_install_dir() {
+    if [ -n "${CCTEAM_INSTALL_DIR:-}" ]; then
+        printf '%s\n' "$CCTEAM_INSTALL_DIR"
+        return 0
+    fi
+    _existing="$(command -v ccteam 2>/dev/null || true)"
+    if [ -n "$_existing" ]; then
+        # Resolve symlinks so we replace the real file, not a link into a build
+        # tree that a `cargo clean` can vaporize.
+        _resolved="$(cd "$(dirname "$_existing")" 2>/dev/null && pwd -P)/$(basename "$_existing")"
+        if [ -L "$_existing" ]; then
+            _link="$(readlink "$_existing" 2>/dev/null || true)"
+            case "$_link" in
+                /*) _resolved="$_link" ;;
+                ?*) _resolved="$(cd "$(dirname "$_existing")" 2>/dev/null && pwd -P)/$_link" ;;
+            esac
+        fi
+        _dir="$(dirname "$_resolved")"
+        # A build-tree binary is not an install location — `cargo clean` or a
+        # redirected CARGO_TARGET_DIR would take the daemon's binary with it.
+        case "$_dir" in
+            */target/release|*/target/debug) _dir="" ;;
+        esac
+        if [ -n "$_dir" ] && [ -w "$_dir" ]; then
+            printf '%s\n' "$_dir"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+INSTALL_DIR="${CCTEAM_INSTALL_DIR:-$(resolve_install_dir)}"
 
 # ---- pretty output helpers (no color when not a TTY) ----
 if [ -t 1 ]; then
@@ -221,8 +267,8 @@ write_install_marker() {
     _home="${CCTEAM_HOME:-$HOME/.ccteam}"
     _now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')"
     mkdir -p "$_home" 2>/dev/null || return 0
-    printf '{\n  "channel": "standalone",\n  "tag": "%s",\n  "installed_at": "%s"\n}\n' \
-        "$_tag" "$_now" > "$_home/install-channel" 2>/dev/null || true
+    printf '{\n  "channel": "standalone",\n  "tag": "%s",\n  "bin": "%s",\n  "installed_at": "%s"\n}\n' \
+        "$_tag" "$INSTALL_DIR/ccteam" "$_now" > "$_home/install-channel" 2>/dev/null || true
 }
 
 # Print the fresh-install next step without launching (装包 ≠ 启服).
@@ -308,6 +354,9 @@ do_uninstall() {
 # ---- main install ----
 main() {
     case "${1:-}" in
+        # Location query used by `make install` so both modes resolve the
+        # destination through this one ladder. Prints the dir and exits.
+        --print-install-dir) printf '%s\n' "$INSTALL_DIR"; exit 0 ;;
         --uninstall|uninstall) do_uninstall ;;
     esac
     if [ -n "${CCTEAM_UNINSTALL:-}" ]; then do_uninstall; fi

@@ -30,6 +30,65 @@ if command -v shellcheck >/dev/null 2>&1; then
     echo "PASS  shellcheck"
 fi
 
+# ---- install-location ladder (--print-install-dir) ----
+# `make install` resolves BIN_DIR by calling this, so the two install modes
+# cannot drift onto two different binaries. Needs no network/server.
+ladder_tmp="$(mktemp -d)"
+mkdir -p "$ladder_tmp/target/release" "$ladder_tmp/realbin" "$ladder_tmp/linkdir" "$ladder_tmp/ro"
+printf '#!/bin/sh\n' >"$ladder_tmp/target/release/ccteam"
+printf '#!/bin/sh\n' >"$ladder_tmp/realbin/ccteam"
+chmod +x "$ladder_tmp/target/release/ccteam" "$ladder_tmp/realbin/ccteam"
+ln -sf "$ladder_tmp/target/release/ccteam" "$ladder_tmp/linkdir/ccteam"
+cp "$ladder_tmp/realbin/ccteam" "$ladder_tmp/ro/ccteam"
+
+expect_dir() {
+    _want="$1"; _got="$2"; _label="$3"
+    if [ "$_got" != "$_want" ]; then
+        echo "FAIL  $_label: want '$_want', got '$_got'" >&2
+        exit 1
+    fi
+    echo "PASS  $_label"
+}
+
+# Explicit override always wins (CI / packagers pin it).
+expect_dir "/opt/ccteam-bin" \
+    "$(CCTEAM_INSTALL_DIR=/opt/ccteam-bin HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
+    "ladder: explicit CCTEAM_INSTALL_DIR wins"
+
+# An already-installed ccteam is where the upgrade must land — that is what
+# stops a second binary from appearing.
+expect_dir "$ladder_tmp/realbin" \
+    "$(PATH="$ladder_tmp/realbin:/usr/bin:/bin" HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
+    "ladder: lands on the existing install"
+
+# A build tree is NOT an install location: `cargo clean` or a redirected
+# CARGO_TARGET_DIR would otherwise take the daemon's binary with it.
+expect_dir "$ladder_tmp/.local/bin" \
+    "$(PATH="$ladder_tmp/target/release:/usr/bin:/bin" HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
+    "ladder: skips target/release"
+
+# Same when PATH holds a symlink INTO a build tree (the dangling-symlink
+# incident: the link outlived the file it pointed at).
+expect_dir "$ladder_tmp/.local/bin" \
+    "$(PATH="$ladder_tmp/linkdir:/usr/bin:/bin" HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
+    "ladder: resolves symlinks before judging"
+
+# Existing copy somewhere unwritable (root-owned /usr/local/bin) → fall back
+# rather than fail: install.sh is a no-sudo installer.
+chmod 555 "$ladder_tmp/ro"
+expect_dir "$ladder_tmp/.local/bin" \
+    "$(PATH="$ladder_tmp/ro:/usr/bin:/bin" HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
+    "ladder: unwritable existing dir falls back"
+chmod 755 "$ladder_tmp/ro"
+
+# Nothing installed yet → the documented default.
+expect_dir "$ladder_tmp/.local/bin" \
+    "$(PATH="/usr/bin:/bin" HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
+    "ladder: default when nothing is installed"
+# Removed explicitly, not via `trap`: the end-to-end section below installs its
+# own EXIT trap, which would replace ours and leak this dir.
+rm -rf "$ladder_tmp"
+
 if ! command -v python3 >/dev/null 2>&1; then
     echo "SKIP  end-to-end (python3 not installed)"
     exit 0

@@ -458,6 +458,20 @@ fn run_installer(json: bool) -> Result<ExitStatus> {
         .arg(install_channel::STANDALONE_INSTALL_PIPELINE)
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
+    // Pin the installer to the binary we are REPLACING. install.sh's own ladder
+    // would infer the destination from `command -v ccteam`, which answers a
+    // different question — "what does a shell find first" — and would install
+    // beside a shadowing copy instead of over this one, leaving two binaries and
+    // an update that appears to do nothing. The running process knows where it
+    // lives; that is the authoritative answer, so pass it explicitly.
+    if let Some(dir) = ccteam_core::current_ccteam_bin()
+        .ok()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        cmd.env("CCTEAM_INSTALL_DIR", dir);
+    }
     if json {
         cmd.stdout(stderr_stdio());
     } else {

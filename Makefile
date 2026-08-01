@@ -7,13 +7,26 @@
 #   make start           # run the daemon in the FOREGROUND (dev / one-off)
 #   make wipe            # reset runtime state (keeps secrets + config + routing)
 #
-# Override locations:  make BIN_DIR=/usr/local/bin install
+# Override locations:  make BIN_DIR=/usr/local/bin install     # this run only
+#                       CCTEAM_INSTALL_DIR=/usr/local/bin ...   # both install modes
 #                       make WEB_PORT=8080 start
 #                       make CCTEAM_HOME=~/.ccteam2 wipe
+#
+# `make install` and `install.sh` install the SAME file: BIN_DIR is resolved by
+# calling `install.sh --print-install-dir`, so prefer CCTEAM_INSTALL_DIR — it is
+# the knob both modes read.
 
 # --- Configuration -----------------------------------------------------------
 
-BIN_DIR      ?= $(HOME)/.local/bin
+# Install destination. `make install` and `install.sh` MUST land on the same
+# file, or a machine ends up with two ccteam binaries and whichever sorts first
+# on PATH silently wins ("I rebuilt and it still misbehaves").
+#
+# So the ladder lives in exactly one place — install.sh — and this asks it:
+# explicit CCTEAM_INSTALL_DIR/BIN_DIR → wherever ccteam already lives (skipping
+# build trees) → $(HOME)/.local/bin. Reimplementing it here would recreate the
+# very drift it prevents. The fallback covers a checkout without install.sh.
+BIN_DIR      ?= $(shell sh $(CURDIR)/install.sh --print-install-dir 2>/dev/null || echo $(HOME)/.local/bin)
 BIN_NAME     := ccteam
 BIN_LINK     := $(BIN_DIR)/$(BIN_NAME)
 # Cargo may redirect its target directory through CARGO_TARGET_DIR or
@@ -188,6 +201,14 @@ gate: fmt-check clippy test test-web web-check
 # cleanup or a redirected CARGO_TARGET_DIR must never break the live daemon.
 # `daemon restart` runs the one-time legacy-unit takeover, so a dev box that
 # used to run the old systemd/launchd service migrates cleanly on this install.
+#
+# It also stamps ~/.ccteam/install-channel as `source`. That matters BECAUSE the
+# destination is now shared with install.sh: `ccteam update` can no longer tell
+# the two apart by path, and without this marker it classifies a locally built
+# binary as `standalone` (the ~/.local/bin heuristic) and replaces it with the
+# latest published release — silently discarding the build under test. The
+# schema is owned by `ccteam_core::install_channel::InstallMarker`; unknown
+# fields are ignored, and `tag` is absent here on purpose (no release tag).
 
 install-binary: release
 	@set -eu; \
@@ -202,7 +223,12 @@ install-binary: release
 	install -m 755 "$$_release_bin" "$$_tmp"; \
 	mv -f "$$_tmp" "$(BIN_LINK)"; \
 	trap - EXIT HUP INT TERM; \
-	printf 'installed: %s (copied from %s)\n' '$(BIN_LINK)' "$$_release_bin"
+	printf 'installed: %s (copied from %s)\n' '$(BIN_LINK)' "$$_release_bin"; \
+	_marker="$(CCTEAM_HOME)/install-channel"; \
+	mkdir -p "$(CCTEAM_HOME)" 2>/dev/null || true; \
+	printf '{\n  "channel": "source",\n  "bin": "%s",\n  "installed_at": "%s"\n}\n' \
+	    '$(BIN_LINK)' "$$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
+	    > "$$_marker" 2>/dev/null || true
 
 install: install-binary
 	@case ":$$PATH:" in \
