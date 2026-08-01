@@ -833,18 +833,26 @@ pub struct StartOutcome {
     pub permission_mode: PermissionMode,
 }
 
-/// v0.8.24 A-U3 — optional explicit model / reasoning-effort chosen at
-/// spawn (the composer's three-way menu). `None` fields keep the existing
-/// defaults (role frontmatter `model:` for the model, vendor default for
-/// effort). Passed by value through `create_session_api_on_host` →
-/// `start_session` → `plan_new_session`; IM paths pass
-/// `SpawnTuning::default()`.
+/// The one carriage for an explicit model / reasoning-effort choice made at
+/// spawn time. `None` fields keep the existing defaults (role frontmatter
+/// `model:` for the model, vendor default for effort). Passed by value
+/// through `create_session_api_on_host` → `start_session` →
+/// `plan_new_session`, and filled by every entry point: REST
+/// (`spawn_tuning_from_form`), MCP `session_spawn`, IM `/new model= effort=`.
+///
+/// **No entry point may second-guess it.** Both facets ride to the vendor
+/// verbatim for every vendor; ccteam does not filter them against any cached
+/// capability table, because a dropped facet reaches the caller as a
+/// successful spawn that quietly ran at the default, while an unsupported
+/// token reaches them as the vendor's own error — the second is the honest
+/// one. Discovery affordances (`GET /api/v1/models`, the MCP `status` panel)
+/// exist so a caller can pick well; they are never a gate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpawnTuning {
     /// Explicit model id; overrides the role's `model:` frontmatter.
     pub model: Option<String>,
-    /// Explicit reasoning-effort token (vendor-specific value set; only
-    /// wired where the vendor verifiably supports it — see `SpawnCtx::effort`).
+    /// Explicit reasoning-effort token (vendor-specific value set — the
+    /// vendor validates it; see `SpawnCtx::effort`).
     pub effort: Option<String>,
 }
 
@@ -1256,8 +1264,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[vendor] [role] [hitl]"),
-        help: "start a new session (trailing `hitl` = approve tools in IM)",
+        arg_hint: Some("[vendor] [role] [hitl] [model=<id>] [effort=<level>]"),
+        help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
         in_menu: true,
     },
     GatewayCommandSpec {
@@ -1698,6 +1706,11 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
+                    // KNOWN ASYMMETRY, not a policy: `meta.json` persists
+                    // `model` (restored just above) but has no `effort` field,
+                    // so a rebuild reverts effort to the vendor default while
+                    // the model survives. Closing it = an `effort` field on
+                    // `ccteam_harness::execution::session_meta::SessionMeta`.
                     effort: None,
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
@@ -2357,46 +2370,14 @@ impl Gateway {
         match cmd {
             "/inbox" => Ok(Some(self.handle_inbox_command(chat, trimmed)?)),
             "/new" => {
-                let vendor = parse_vendor(parts.next().unwrap_or("claude"))?;
-                // v0.8.18 (owner) — NO role token ⇒ **roleless** (bare claude that
-                // self-reads the project `CLAUDE.md`); no explicit `-` needed. The
-                // first NON-flag token is the role; `hitl`/`skip`/`terminal`/… are
-                // order-independent flags, so `/new claude` AND `/new claude hitl`
-                // are both roleless, while `/new claude reviewer hitl` is role
-                // `reviewer` + hitl. Defaults = skip + stream-json.
-                // Grok always uses ACP (v0.8.23) — ignore protocol flags for grok.
-                let mut role = String::new();
-                let mut role_set = false;
-                let mut permission_mode = PermissionMode::Skip;
-                let mut protocol = SessionProtocol::StreamJson;
-                for tok in parts {
-                    match tok {
-                        "hitl" | "skip" => {
-                            permission_mode =
-                                PermissionMode::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
-                        }
-                        "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json"
-                        | "acp" => {
-                            protocol =
-                                SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
-                        }
-                        other if !role_set => {
-                            role = other.to_string();
-                            role_set = true;
-                        }
-                        other => {
-                            return Err(anyhow!(
-                                "/new: unexpected token `{other}` (give one role + optional hitl / terminal / acp)"
-                            ));
-                        }
-                    }
-                }
-                if matches!(
+                let args: Vec<&str> = parts.collect();
+                let NewSessionArgs {
                     vendor,
-                    AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
-                ) {
-                    protocol = SessionProtocol::Acp;
-                }
+                    role,
+                    permission_mode,
+                    protocol,
+                    tuning,
+                } = parse_new_command_args(&args)?;
                 let project = self.require_current_project(chat)?;
                 let handle = role.clone();
                 let outcome = self
@@ -2408,7 +2389,7 @@ impl Gateway {
                         handle,
                         permission_mode,
                         protocol,
-                        SpawnTuning::default(),
+                        tuning,
                     )
                     .await?;
                 Ok(Some(Self::new_session_receipt(&outcome)))
@@ -5593,6 +5574,11 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
+                    // KNOWN ASYMMETRY, not a policy: `plan_resume_dead_session`
+                    // restores `model` from `meta.json`, which has no `effort`
+                    // field to restore — so a resumed session reverts to the
+                    // vendor default effort. Closing it = an `effort` field on
+                    // `ccteam_harness::execution::session_meta::SessionMeta`.
                     effort: None,
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
@@ -5727,9 +5713,12 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id,
-                    // Explicit effort is spawn-time only (not persisted in
-                    // meta) — a role-switch / dead-child re-spawn reverts to
-                    // the vendor default, same lifetime as a web model pick.
+                    // KNOWN ASYMMETRY, not a policy: `model_id` above is
+                    // restored (role frontmatter / `meta.json`), but `meta.json`
+                    // has no `effort` field, so a role-switch / dead-child
+                    // re-spawn reverts effort to the vendor default. Closing it
+                    // = an `effort` field on
+                    // `ccteam_harness::execution::session_meta::SessionMeta`.
                     effort: None,
                     permission_mode,
                     secret,
@@ -10351,6 +10340,102 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
     }
 }
 
+/// Everything `/new` resolves before it touches the session spine.
+#[derive(Debug, PartialEq, Eq)]
+struct NewSessionArgs {
+    vendor: AgentVendor,
+    role: String,
+    permission_mode: PermissionMode,
+    protocol: SessionProtocol,
+    tuning: SpawnTuning,
+}
+
+/// The one-line `/new` syntax, echoed by every parse error so a chat user
+/// never has to leave the conversation to find the shape.
+const NEW_COMMAND_SYNTAX: &str =
+    "/new [vendor] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>]";
+
+/// Parse the tokens after `/new`.
+///
+/// Token grammar (all order-free after the leading vendor):
+/// - **vendor** — the FIRST token when it names a harness; omitted ⇒ claude.
+/// - **`key=value`** — the spawn-tuning facets `model=` / `effort=`
+///   (`m=` / `e=` short forms). Matched BEFORE the bare-token arms so a
+///   mistyped key (`modle=opus`) surfaces as an error instead of quietly
+///   becoming the session's role name.
+/// - **flags** — `hitl`/`skip`, `terminal`/`acp`/`stream-json`.
+/// - **the first remaining bare token** — the role. v0.8.18 (owner): NO role
+///   token ⇒ **roleless** (bare vendor self-reads the project `CLAUDE.md`);
+///   no explicit `-` needed. So `/new claude` and `/new claude hitl` are both
+///   roleless, while `/new claude reviewer hitl` is role `reviewer` + hitl.
+///
+/// `model` / `effort` are carried into [`SpawnTuning`] untouched: the vendor
+/// owns the verdict on its own value set, and a bad token must come back as
+/// the vendor's own spawn error rather than as a session that silently ran at
+/// the default. Defaults = skip + stream-json; the ACP-only vendors override
+/// the protocol axis last (a `terminal` flag there is a no-op, not an error).
+fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
+    let mut rest = args.iter().copied();
+    let vendor = parse_vendor(rest.next().unwrap_or("claude"))?;
+    let mut role = String::new();
+    let mut role_set = false;
+    let mut permission_mode = PermissionMode::Skip;
+    let mut protocol = SessionProtocol::StreamJson;
+    let mut tuning = SpawnTuning::default();
+    for tok in rest {
+        if let Some((key, value)) = tok.split_once('=') {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!(
+                    "/new: `{tok}` has no value — write `{key}=<value>`\nsyntax: {NEW_COMMAND_SYNTAX}"
+                ));
+            }
+            match key {
+                "model" | "m" => tuning.model = Some(value.to_string()),
+                "effort" | "e" => tuning.effort = Some(value.to_string()),
+                other => {
+                    return Err(anyhow!(
+                        "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                    ));
+                }
+            }
+            continue;
+        }
+        match tok {
+            "hitl" | "skip" => {
+                permission_mode = PermissionMode::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
+            }
+            "terminal" | "tmux" | "stream-json" | "streamjson" | "stream_json" | "acp" => {
+                protocol = SessionProtocol::parse_opt(Some(tok)).map_err(|e| anyhow!(e))?;
+            }
+            other if !role_set => {
+                role = other.to_string();
+                role_set = true;
+            }
+            other => {
+                return Err(anyhow!(
+                    "/new: unexpected token `{other}` (role `{role}` was already given)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                ));
+            }
+        }
+    }
+    // Grok/OpenCode/Kimi always speak ACP (v0.8.23) — settled after the loop
+    // so token order never changes the outcome.
+    if matches!(
+        vendor,
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
+    ) {
+        protocol = SessionProtocol::Acp;
+    }
+    Ok(NewSessionArgs {
+        vendor,
+        role,
+        permission_mode,
+        protocol,
+        tuning,
+    })
+}
+
 /// Resolve a chat-supplied project path: expand a leading `~`, then
 /// require the result to be absolute (the daemon's cwd is not a
 /// meaningful base for a path typed into a chat / web form).
@@ -10438,6 +10523,104 @@ mod tests {
     /// string (the property `select_live_capacity_eviction` relies on).
     fn capacity_ts(secs_ago: i64) -> String {
         (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339()
+    }
+
+    fn parse_new(args: &str) -> Result<NewSessionArgs> {
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        parse_new_command_args(&tokens)
+    }
+
+    /// The historical `/new` shapes must keep parsing byte-identically after
+    /// the `key=value` facets were added — the tuning tokens are additive, not
+    /// a new grammar.
+    #[test]
+    fn new_command_keeps_its_vendor_role_flag_grammar() {
+        let bare = parse_new("").unwrap();
+        assert_eq!(bare.vendor, AgentVendor::Claude);
+        assert_eq!(bare.role, "", "no role token ⇒ roleless");
+        assert_eq!(bare.permission_mode, PermissionMode::Skip);
+        assert_eq!(bare.protocol, SessionProtocol::StreamJson);
+        assert_eq!(bare.tuning, SpawnTuning::default());
+
+        let roled = parse_new("claude reviewer hitl").unwrap();
+        assert_eq!(roled.role, "reviewer");
+        assert_eq!(roled.permission_mode, PermissionMode::Hitl);
+
+        // ACP vendors settle the protocol axis last, whatever was typed.
+        assert_eq!(
+            parse_new("grok terminal").unwrap().protocol,
+            SessionProtocol::Acp
+        );
+    }
+
+    /// `model=` / `effort=` are order-free and reach [`SpawnTuning`] verbatim
+    /// — no vendor filtering, no normalization of the vendor's own token
+    /// vocabulary. The short forms exist because these are typed on a phone.
+    #[test]
+    fn new_command_parses_order_free_model_and_effort_tokens() {
+        for args in [
+            "kimi effort=max model=kimi-code/k3 reviewer",
+            "kimi reviewer model=kimi-code/k3 effort=max",
+            "kimi model=kimi-code/k3 reviewer effort=max",
+            "kimi e=max reviewer m=kimi-code/k3",
+        ] {
+            let parsed = parse_new(args).unwrap();
+            assert_eq!(parsed.role, "reviewer", "{args}");
+            assert_eq!(parsed.vendor, AgentVendor::Kimi, "{args}");
+            assert_eq!(
+                parsed.tuning,
+                SpawnTuning {
+                    model: Some("kimi-code/k3".to_string()),
+                    effort: Some("max".to_string()),
+                },
+                "{args}"
+            );
+        }
+
+        // A token ccteam has never heard of still rides through: the vendor
+        // owns the verdict on its own value set.
+        assert_eq!(
+            parse_new("grok effort=ludicrous").unwrap().tuning.effort,
+            Some("ludicrous".to_string())
+        );
+    }
+
+    /// A mistyped key must NOT fall through to the role arm: `/new modle=opus`
+    /// silently becoming role `modle=opus` is the same class of failure as a
+    /// silently dropped effort — the user asked for something and got
+    /// something else without being told.
+    #[test]
+    fn new_command_rejects_unknown_keys_with_an_honest_syntax_line() {
+        let err = parse_new("claude modle=opus").unwrap_err().to_string();
+        assert!(err.contains("unknown option `modle=`"), "{err}");
+        assert!(err.contains("model=<id>"), "{err}");
+        assert!(err.contains("effort=<level>"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+
+        let err = parse_new("claude model=").unwrap_err().to_string();
+        assert!(err.contains("has no value"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+
+        // A second bare token is still the pre-existing "one role" error, now
+        // carrying the same syntax line.
+        let err = parse_new("claude reviewer auditor")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unexpected token `auditor`"), "{err}");
+        assert!(err.contains(NEW_COMMAND_SYNTAX), "{err}");
+    }
+
+    /// The menu/help entry must teach the tuning tokens: a facet nobody can
+    /// discover is a facet nobody uses.
+    #[test]
+    fn new_command_help_advertises_model_and_effort() {
+        let spec = GATEWAY_COMMANDS
+            .iter()
+            .find(|c| c.name == "/new")
+            .expect("/new is a gateway command");
+        let hint = spec.arg_hint.expect("/new takes args");
+        assert!(hint.contains("model=<id>"), "{hint}");
+        assert!(hint.contains("effort=<level>"), "{hint}");
     }
 
     #[test]

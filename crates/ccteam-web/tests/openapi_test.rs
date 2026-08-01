@@ -55,6 +55,8 @@ async fn spawn(state: AppState) -> SocketAddr {
 fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
     [
         ("GET", "/api/v1/capabilities"),
+        // Spawn-tuning discovery: per-vendor model ids + effort ladders.
+        ("GET", "/api/v1/models"),
         // v0.8.18 柱1 — host-keyed agent report (list / detail / register-mcp).
         ("GET", "/api/v1/hosts"),
         ("GET", "/api/v1/hosts/{host}"),

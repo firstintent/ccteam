@@ -43,6 +43,10 @@ pub mod internal_hook;
 // per-project catalog, body preview, install). The network face of
 // `ccteam_im::hub`; merged into the `/api/v1` OpenApiRouter (auto auth-gated).
 pub mod marketplace;
+// Spawn-tuning discovery (`GET /api/v1/models`): per-vendor observed model
+// ids + reasoning-effort ladders, so a caller of `POST .../sessions` can see
+// what `model` / `effort` a vendor takes. Advisory, never a spawn gate.
+pub mod models;
 // v0.8.7 W5 (Item E) — OpenAPI auto-docs. Aggregates every `/api/v1`
 // handler into one `OpenApiRouter` (single source with the route table)
 // + serves the spec (`/api/v1/openapi.json`) and Scalar UI (`/api/docs`).

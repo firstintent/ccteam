@@ -205,8 +205,8 @@ pub fn session_tool_definitions() -> Vec<Value> {
                         "enum": ["claude", "codex", "grok", "opencode", "kimi"],
                         "description": "Harness vendor (lowercase). Default claude."
                     },
-                    "model": { "type": "string", "description": "Optional explicit model id; overrides the role's `model:` frontmatter. Omitted/empty → vendor default." },
-                    "effort": { "type": "string", "description": "Optional reasoning-effort token (vendor-specific value set). Ignored for grok (undocumented value set)." },
+                    "model": { "type": "string", "description": "Optional explicit model id, passed to the vendor verbatim; overrides the role's `model:` frontmatter. Omitted → vendor default. `status` lists each installed vendor's observed ids." },
+                    "effort": { "type": "string", "description": "Optional reasoning-effort token, passed to the vendor verbatim for EVERY vendor — the value set is vendor-specific and the vendor validates it (a bad token fails the spawn with its own error, it is never silently ignored). Omitted → vendor default. `status` lists each installed vendor's effort ladder." },
                     "project": { "type": "string", "description": "Target project slug — honored only for admin / local main-session callers (a session-principal caller always spawns into its OWN project). Omitted: your working directory's project, else the sole registered project; `status` lists every slug." },
                     "permission_mode": {
                         "type": "string",

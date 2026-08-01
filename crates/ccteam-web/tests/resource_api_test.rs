@@ -288,6 +288,77 @@ async fn get_capabilities_lists_both_vendors() {
     }
 }
 
+// ------------------------------ models ------------------------------
+
+/// `GET /api/v1/models` is the affordance side of `POST .../sessions`
+/// accepting `model` + `effort`. Two properties matter to a client building
+/// a spawn composer: an OBSERVED vendor reports its own ids with dated
+/// provenance, and an UNOBSERVED vendor still gets a row — otherwise the
+/// picker silently loses vendors that simply have not run yet.
+#[tokio::test]
+async fn get_models_reports_every_vendor_with_observed_and_fallback_rows() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    ccteam_core::model_catalog::record_vendor_models_in(
+        &paths.root,
+        "kimi",
+        "ACP session availableModels",
+        vec![ccteam_core::model_catalog::CatalogModel {
+            id: "kimi-code/k3".to_string(),
+            display_name: Some("K3".to_string()),
+            efforts: vec!["low".to_string(), "high".to_string(), "max".to_string()],
+        }],
+    )
+    .unwrap();
+    let addr = spawn(AppState::new(paths)).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/v1/models"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let vendors = v["vendors"].as_array().expect("vendors array");
+    let names: Vec<&str> = vendors
+        .iter()
+        .map(|e| e["vendor"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["claude", "codex", "grok", "opencode", "kimi"]);
+
+    let kimi = vendors.iter().find(|e| e["vendor"] == "kimi").unwrap();
+    assert_eq!(kimi["source"], "ACP session availableModels");
+    assert!(
+        kimi["observed_at"].as_str().unwrap().starts_with("20"),
+        "observed row carries an RFC3339 capture time: {kimi}"
+    );
+    assert_eq!(kimi["models"][0]["id"], "kimi-code/k3");
+    assert_eq!(kimi["models"][0]["display_name"], "K3");
+    assert_eq!(
+        kimi["models"][0]["efforts"],
+        serde_json::json!(["low", "high", "max"])
+    );
+    assert_eq!(
+        kimi["efforts"],
+        serde_json::json!(["low", "high", "max"]),
+        "vendor-level ladder is the union its own handshake declared"
+    );
+
+    // Never observed: an honest empty model list + null provenance, but the
+    // CLI-verified effort ladder is still offered so the axis is discoverable
+    // before the vendor's first session.
+    let claude = vendors.iter().find(|e| e["vendor"] == "claude").unwrap();
+    assert_eq!(claude["models"], serde_json::json!([]));
+    assert!(claude["observed_at"].is_null(), "{claude}");
+    assert!(claude["source"].is_null(), "{claude}");
+    assert_eq!(
+        claude["efforts"],
+        serde_json::json!(["low", "medium", "high", "xhigh", "max"])
+    );
+
+    // OpenCode declares no effort axis: an empty ladder, never an invented one.
+    let opencode = vendors.iter().find(|e| e["vendor"] == "opencode").unwrap();
+    assert_eq!(opencode["efforts"], serde_json::json!([]));
+}
+
 // ----------------------------- projects -----------------------------
 
 #[tokio::test]

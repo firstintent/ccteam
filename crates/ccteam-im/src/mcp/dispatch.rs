@@ -1583,9 +1583,12 @@ async fn run_session_spawn_at(
     )
     .map_err(|e| format!("session_spawn: {e}"))?;
     let protocol = derive_session_protocol(vendor);
-    // Optional model/effort (composer facets). Grok effort is dropped (its
-    // value set is undocumented — an invalid value would fail the spawn),
-    // mirroring the REST `spawn_tuning_from_form` contract.
+    // Optional model/effort (composer facets), forwarded to EVERY vendor
+    // verbatim — the vendor owns the verdict on its own value set. Grok's
+    // effort used to be zeroed right here, which handed the caller a 201 and
+    // a live sid for a session that quietly ran at the default; a rejected
+    // token is honest feedback, a swallowed one is not. Same contract as the
+    // REST `spawn_tuning_from_form`.
     let model = args
         .get("model")
         .and_then(|v| v.as_str())
@@ -1598,14 +1601,7 @@ async fn run_session_spawn_at(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let tuning = crate::gateway::SpawnTuning {
-        model,
-        effort: if vendor == ccteam_harness::AgentVendor::Grok {
-            None
-        } else {
-            effort
-        },
-    };
+    let tuning = crate::gateway::SpawnTuning { model, effort };
     // Optional `title` — metadata/ledger only, NEVER concatenated into any
     // prompt. Validate ≤80 chars; W1 accepts + echoes it (meta persistence
     // lands with the W2 delegation ledger).
