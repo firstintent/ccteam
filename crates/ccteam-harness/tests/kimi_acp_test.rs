@@ -686,15 +686,17 @@ async fn model_directive_lists_and_sets() {
     clear_fake();
 }
 
-/// Kimi's ACP wire reports neither a context window nor token counts (verified
-/// against the 0.29.x binary: `usage_update` / `session_info_update` exist in
-/// its ACP schema but are never emitted, and its internal
-/// `event.session.usage_updated` is not bridged). So `ctx —` is the truth, and
-/// `/status` must SAY that rather than leave a bare dash the user reads as a
-/// ccteam defect. Grok and OpenCode do report and keep their percentage.
+/// Kimi pushes no context usage at all — no `usage_update`, and a
+/// `session/prompt` response that is literally `{"stopReason":"end_turn"}`.
+/// What it DOES do is advertise `status` in `available_commands_update`, and
+/// answer that command locally with a real occupancy report.
+///
+/// So the runner pulls after each turn: before any turn there is nothing to
+/// report (and the statusline says so rather than showing a zero); after one,
+/// `/status` carries a real percentage sourced from the vendor itself.
 #[tokio::test]
 #[serial]
-async fn status_directive_explains_why_kimi_has_no_context_reading() {
+async fn context_is_pulled_from_the_status_command_kimi_advertises() {
     install_fake();
     let tmp = TempDir::new().unwrap();
     let adapter = KimiAcpAdapter::new();
@@ -708,13 +710,63 @@ async fn status_directive_explains_why_kimi_has_no_context_reading() {
         .await
         .expect("start ok");
 
-    // No context on the wire → none in the status.
-    let status = adapter.thread_status(&handle).await.unwrap();
+    // Nothing has run: no occupancy to claim, and we do not invent one.
+    let before = adapter.thread_status(&handle).await.unwrap();
     assert!(
-        status.context.is_none(),
-        "kimi reports no context; inventing one would be fabricated data"
+        before.context.is_none_or(|c| c.used_tokens.is_none()),
+        "occupancy before the first turn must be unknown, not zero: {before:?}"
     );
 
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        let mut finals = Vec::new();
+        while let Some(ev) = stream.next().await {
+            match ev {
+                ThreadEvent::ItemCompleted { item } => {
+                    if let ThreadItemDetails::AgentMessage(t) = item.details {
+                        finals.push(t);
+                    }
+                }
+                ThreadEvent::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        finals
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("hello".into()))
+        .await
+        .expect("submit");
+    let finals = tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    // The probe rides its own turn slot and publishes nothing: the user sees
+    // exactly their own answer, and no `/status` text reaches the transcript.
+    assert_eq!(finals, vec!["echo:hello".to_string()]);
+
+    // The probe runs after the turn boundary; give the runner a moment.
+    let mut ctx = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = adapter.thread_status(&handle).await.unwrap();
+        if let Some(c) = status.context.filter(|c| c.used_tokens.is_some()) {
+            ctx = Some(c);
+            break;
+        }
+    }
+    let ctx = ctx.expect("occupancy pulled from the vendor's status command");
+    assert_eq!(ctx.used_tokens, Some(12_345));
+    assert_eq!(ctx.window_tokens, 1_048_576);
+    assert_eq!(
+        ctx.source,
+        ccteam_harness::ContextSource::Probed,
+        "a pulled number must not pass for a reported one"
+    );
+
+    // `/status` now renders the real reading — no vendor-specific apology.
     let outcome = adapter
         .handle_directive(
             &handle,
@@ -728,16 +780,11 @@ async fn status_directive_explains_why_kimi_has_no_context_reading() {
         .unwrap();
     match outcome {
         ccteam_harness::DirectiveOutcome::Done { receipt } => {
-            assert!(receipt.contains("ctx 不可用"), "receipt={receipt}");
             assert!(
-                receipt.contains("vendor"),
-                "the reason must name the vendor limit: {receipt}"
-            );
-            // The model it DOES know still leads the receipt.
-            assert!(
-                receipt.contains("kimi-k2-0905-preview"),
+                receipt.contains("ctx 12.3k / 1.0M (1%)"),
                 "receipt={receipt}"
             );
+            assert!(!receipt.contains("不可用"), "receipt={receipt}");
         }
         other => panic!("expected Done, got {other:?}"),
     }

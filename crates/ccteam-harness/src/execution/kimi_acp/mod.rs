@@ -39,6 +39,17 @@
 //! deliberately NOT done (unstable non-contract surface). The honest signal a
 //! user gets meanwhile is the gateway's silence watchdog, which now reports the
 //! turn's elapsed time and last observed activity. Fix belongs upstream.
+//!
+//! ## Context usage arrives by pull, not push
+//!
+//! Kimi emits no `usage_update` and its `session/prompt` result carries no
+//! usage at all (verified on a live 0.26.0 binary: the whole response is
+//! `{"stopReason":"end_turn"}`), so there is nothing to fold at a turn
+//! boundary. It does publish `status` in `available_commands_update`, and that
+//! command reports real occupancy locally in ~15 ms — so this adapter carries
+//! [`crate::execution::acp::KIMI_STATUS_PROBE`] and the shared turn runner
+//! pulls after each turn. See that module for why the pull path is fenced the
+//! way it is.
 
 pub mod bridge;
 pub mod protocol;
@@ -57,7 +68,9 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::execution::acp::released_thread_status;
-use crate::execution::acp::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};
+use crate::execution::acp::{
+    route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning, KIMI_STATUS_PROBE,
+};
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use crate::execution::session_status::read_status_file;
@@ -378,6 +391,9 @@ impl KimiAcpAdapter {
                     session_id: live.session_id.clone(),
                     project_dir: live.project_dir.clone(),
                     sid: live.sid.clone(),
+                    // kimi pushes no usage at all — pull it from the status
+                    // command its own ACP layer advertises.
+                    context_probe: Some(KIMI_STATUS_PROBE),
                     tuning: AcpTurnTuning {
                         finalize_barrier: FINALIZE_BARRIER,
                         post_finalize_sleep: None,
@@ -412,7 +428,19 @@ fn spawn_notif_dispatcher(
     event_tx: broadcast::Sender<ThreadEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sub = transport.subscribe();
+        // Take the handshake backlog with the subscription: the vendor's
+        // command catalog and any opening usage arrive before this task exists.
+        let (early, mut sub) = transport.subscribe_with_early();
+        for n in early {
+            let events = if let Ok(mut guard) = state.lock() {
+                apply_notification(&mut guard, &n)
+            } else {
+                Vec::new()
+            };
+            for ev in events {
+                let _ = event_tx.send(ev);
+            }
+        }
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -664,22 +692,14 @@ impl HarnessAdapter for KimiAcpAdapter {
                 } else {
                     ThreadStatus::default()
                 };
-                let mut receipt = status
+                // No kimi-specific wording here any more: occupancy now comes
+                // from the vendor's own `/status` command, and when it cannot
+                // (a session that has not completed a turn yet), the shared
+                // render point says "usage unknown" in the same words every
+                // vendor uses.
+                let receipt = status
                     .status_suffix()
                     .unwrap_or_else(|| "kimi · acp".into());
-                // `ctx —` on the status line is the TRUTH for kimi, not a
-                // defect: its ACP wire carries neither a context window nor a
-                // token count (see the module header). Say so where the user
-                // asks, instead of leaving a bare dash that reads as broken.
-                // Grok (`_meta.totalContextTokens` + `totalTokens`) and
-                // OpenCode (`usage_update{used,size}`) do report, so their
-                // sessions show a real percentage.
-                if status.context.is_none() {
-                    receipt.push_str(
-                        "；ctx 不可用 —— kimi 的 ACP 面不上报 context window / token 用量\
-                         (vendor 限制,非 ccteam 缺失)",
-                    );
-                }
                 Ok(DirectiveOutcome::Done { receipt })
             }
             "compact" => Ok(DirectiveOutcome::Rejected {

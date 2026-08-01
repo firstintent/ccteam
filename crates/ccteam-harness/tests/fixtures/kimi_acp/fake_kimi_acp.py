@@ -93,7 +93,39 @@ def available_commands_notif(session_id: str) -> None:
                 "availableCommands": [
                     {"name": "compact", "description": "Compact context"},
                     {"name": "model", "description": "Switch model"},
+                    {"name": "status", "description": "Show current session status"},
+                    {"name": "usage", "description": "Show session token usage"},
                 ],
+            },
+        },
+    )
+
+
+# Occupancy the fake reports, in the shape kimi's `formatStatusReport` emits.
+CONTEXT_WINDOW = 1048576
+TOKENS_PER_TURN = 12345
+
+
+def emit_status_report(session_id: str, model: str, context_tokens: int) -> None:
+    pct = (context_tokens / CONTEXT_WINDOW) * 100
+    report = "\n".join(
+        [
+            "Session status:",
+            f"- Model: {model}",
+            "- Thinking: max",
+            "- Permission: manual",
+            "- Plan mode: off",
+            f"- Context: {context_tokens:,} / {CONTEXT_WINDOW:,} ({pct:.1f}%)",
+        ]
+    )
+    notif(
+        "session/update",
+        {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": f"msg_{uuid.uuid4().hex[:12]}",
+                "content": {"type": "text", "text": report},
             },
         },
     )
@@ -108,6 +140,7 @@ def main() -> None:
     session_id = SESSION_ID
     current_model = MODEL
     request_perm_once = True
+    context_tokens = 0
 
     for line in sys.stdin:
         line = line.strip()
@@ -239,6 +272,16 @@ def main() -> None:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text += block.get("text") or ""
             answer = f"echo:{text}" if text else "echo:"
+
+            # `/status` is handled locally by kimi's ACP layer: no model call,
+            # no usage on the response, just a rendered report on the message
+            # channel. Occupancy grows with the turns actually taken so a test
+            # can watch it track. Format copied from a live 0.26.0 binary.
+            if text.strip() == "/status":
+                emit_status_report(session_id, current_model, context_tokens)
+                reply(req_id, {"stopReason": "end_turn"})
+                continue
+            context_tokens += TOKENS_PER_TURN
 
             # One inbound permission request on the first prompt; the client
             # (skip → auto-allow, hitl → decline) replies asynchronously.

@@ -5,11 +5,13 @@
 //! - [`crate::execution::grok_acp`]
 //! - [`crate::execution::opencode_acp`]
 
+pub mod context_probe;
 pub mod protocol;
 pub mod translate;
 pub mod transport;
 pub mod turn_runner;
 
+pub use context_probe::{AcpContextProbe, KIMI_STATUS_PROBE};
 pub use protocol::{
     acp_model_picker_options, content_text, cost_from_usage_update, is_replay, is_turn_boundary,
     known_efforts, pluck_model_info, pluck_session_id, split_trailing_effort,

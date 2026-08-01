@@ -346,6 +346,8 @@ impl GrokAcpAdapter {
                     session_id: live.session_id.clone(),
                     project_dir: live.project_dir.clone(),
                     sid: live.sid.clone(),
+                    // grok derives occupancy from its prompt-result `_meta`.
+                    context_probe: None,
                     tuning: AcpTurnTuning {
                         finalize_barrier: FINALIZE_BARRIER,
                         post_finalize_sleep: None,
@@ -460,7 +462,19 @@ fn spawn_notif_dispatcher(
     event_tx: broadcast::Sender<ThreadEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut sub = transport.subscribe();
+        // Take the handshake backlog with the subscription: the vendor's
+        // command catalog and any opening usage arrive before this task exists.
+        let (early, mut sub) = transport.subscribe_with_early();
+        for n in early {
+            let events = if let Ok(mut guard) = state.lock() {
+                apply_notification(&mut guard, &n)
+            } else {
+                Vec::new()
+            };
+            for ev in events {
+                let _ = event_tx.send(ev);
+            }
+        }
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,

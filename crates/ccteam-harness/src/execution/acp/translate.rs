@@ -291,7 +291,7 @@ impl SessionTranslateState {
     }
 
     /// Signal (once) that the turn boundary was reached.
-    fn signal_turn_done(&mut self) {
+    pub fn signal_turn_done(&mut self) {
         if let Some(done) = self.turn_done.take() {
             done.notify_one();
         }

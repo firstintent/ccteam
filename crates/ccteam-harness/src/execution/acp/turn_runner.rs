@@ -21,15 +21,22 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::{broadcast, Notify};
 
+use super::context_probe::AcpContextProbe;
 use super::translate::{
     fail_turn, finalize_from_prompt_result, AcpInjectionReservation, SessionTranslateState,
 };
 use super::transport::{AcpTransport, AcpWriteBarrier};
 use crate::execution::session_status::write_status_file;
-use crate::{ThreadEvent, TurnRouting};
+use crate::{ContextSource, ThreadEvent, TurnRouting};
 
 /// Monotonic suffix so ids stay unique even for turns steered in the same ms.
 static ACP_TURN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How long a context probe waits for its reply to reach the translate buffer
+/// after the `session/prompt` response lands. The vendor answers a probe
+/// locally with no model call, so this covers only the gap between the
+/// response task and the notification dispatcher — not the vendor's work.
+const PROBE_DISPATCH_GRACE: Duration = Duration::from_millis(200);
 
 /// A unique per-process turn id (`t-<millis>-<seq>`). Used as the ACP adapter's
 /// turn correlation id — must be unique so queued turns and the experience log
@@ -66,7 +73,54 @@ pub struct AcpTurnRunner {
     /// own `<project>/.ccteam/chat/<sid>/status.json`.
     pub project_dir: PathBuf,
     pub sid: String,
+    /// Pull-mode context surface for a vendor that pushes no usage at all.
+    /// `None` for vendors that report it (grok, opencode) — asking them would
+    /// be pure cost.
+    pub context_probe: Option<AcpContextProbe>,
     pub tuning: AcpTurnTuning,
+}
+
+/// What the runner does next, decided under the state lock so the turn slot is
+/// never observably free while more work is scheduled.
+enum NextTurn {
+    /// A user turn (the first one, or one queued while another ran).
+    User {
+        turn_id: String,
+        text: String,
+        done: Arc<Notify>,
+        sent: Arc<AcpWriteBarrier>,
+    },
+    /// The runner's own context probe. Occupies the turn slot exactly like a
+    /// user turn — a concurrent `submit_turn` queues behind it instead of
+    /// racing for the buffer — but publishes no events, so it never reaches
+    /// `turns.jsonl`, the IM reply path, or a delegation parent.
+    Probe {
+        probe: AcpContextProbe,
+        done: Arc<Notify>,
+        sent: Arc<AcpWriteBarrier>,
+    },
+    Stop,
+}
+
+/// Whether this session still owes us an occupancy reading.
+///
+/// True only when no push/derive channel has spoken: `Unknown` (nobody ever
+/// did) or `Probed` (last value came from us, and occupancy has moved since).
+/// A vendor that reports `Reported`/`Derived` is never probed — the pull path
+/// is strictly the fallback for vendors with no push channel.
+fn probe_is_due(state: &SessionTranslateState, probe: &AcpContextProbe) -> bool {
+    if !matches!(
+        state.used_source,
+        ContextSource::Unknown | ContextSource::Probed
+    ) {
+        return false;
+    }
+    // Only ask for what the vendor itself advertises — if the command is gone
+    // from its catalog, stop asking rather than prompt blindly.
+    state
+        .available_commands
+        .iter()
+        .any(|c| c.name == probe.command)
 }
 
 /// Decision made under the per-session translate-state lock. Every ACP vendor
@@ -155,6 +209,7 @@ impl AcpTurnRunner {
             session_id,
             project_dir,
             sid,
+            context_probe,
             tuning,
         } = self;
         tokio::spawn(async move {
@@ -162,10 +217,15 @@ impl AcpTurnRunner {
             let mut turn_done = first_turn_done;
             let mut prompt_sent = first_prompt_sent;
             let mut text = first_text;
+            // `None` for a user turn; `Some(probe)` while the runner is asking
+            // the vendor for its own context reading.
+            let mut probing: Option<AcpContextProbe> = None;
             loop {
-                let _ = event_tx.send(ThreadEvent::TurnStarted {
-                    turn_id: turn_id.clone(),
-                });
+                if probing.is_none() {
+                    let _ = event_tx.send(ThreadEvent::TurnStarted {
+                        turn_id: turn_id.clone(),
+                    });
+                }
                 let result = transport
                     .call_with_write_barrier(
                         "session/prompt",
@@ -192,8 +252,20 @@ impl AcpTurnRunner {
                     // Wait until the dispatcher drained through the turn boundary
                     // so finalize sees every chunk. A stored permit returns
                     // instantly when the boundary already arrived (common case).
-                    let _ =
-                        tokio::time::timeout(tuning.finalize_barrier, turn_done.notified()).await;
+                    //
+                    // A probe waits far less: its whole reply precedes the
+                    // response on the wire, so the only thing to cover is the
+                    // dispatcher-vs-response task race, not vendor think time.
+                    // Charging it the full barrier would hold the turn slot —
+                    // and delay a user's next message — for nothing. Coming up
+                    // short is safe by construction: an unparseable reply
+                    // leaves the previous reading in place.
+                    let barrier = if probing.is_some() {
+                        PROBE_DISPATCH_GRACE.min(tuning.finalize_barrier)
+                    } else {
+                        tuning.finalize_barrier
+                    };
+                    let _ = tokio::time::timeout(barrier, turn_done.notified()).await;
                     if let Some(sleep) = tuning.post_finalize_sleep {
                         tokio::time::sleep(sleep).await;
                     }
@@ -203,27 +275,80 @@ impl AcpTurnRunner {
                 // to None while work is queued, else a concurrent `submit_turn`
                 // would see an idle session and spawn a second runner.
                 let mut boundary_status = None;
+                let finished_probe = probing.take();
                 let next = match state.lock() {
                     Ok(mut st) => {
-                        let events = match &result {
-                            Ok(r) => finalize_from_prompt_result(&mut st, r),
-                            Err(e) => fail_turn(&mut st, &e.to_string()),
-                        };
+                        let mut events = Vec::new();
+                        match (&finished_probe, &result) {
+                            // A probe's reply is data, not conversation: read
+                            // it out of the buffer and publish nothing. A
+                            // failed probe leaves occupancy exactly as it was.
+                            (Some(probe), Ok(_)) => {
+                                st.signal_turn_done();
+                                let reply = st.take_buffer().map(|b| b.text).unwrap_or_default();
+                                if let Some(ctx) = (probe.parse)(&reply) {
+                                    if let Some(used) = ctx.used_tokens {
+                                        st.set_used_tokens(used, ctx.source);
+                                    }
+                                    st.window_tokens = Some(ctx.window_tokens);
+                                } else {
+                                    tracing::debug!(
+                                        vendor = tuning.label,
+                                        command = probe.command,
+                                        "acp context probe: unrecognised reply, occupancy stays unknown"
+                                    );
+                                }
+                            }
+                            (Some(probe), Err(e)) => {
+                                st.signal_turn_done();
+                                let _ = st.take_buffer();
+                                tracing::debug!(
+                                    vendor = tuning.label,
+                                    command = probe.command,
+                                    error = %e,
+                                    "acp context probe failed"
+                                );
+                            }
+                            (None, Ok(r)) => events = finalize_from_prompt_result(&mut st, r),
+                            (None, Err(e)) => events = fail_turn(&mut st, &e.to_string()),
+                        }
                         // The turn boundary is the only moment context usage
                         // changes, so it is the only moment worth persisting.
                         boundary_status = Some(st.thread_status());
-                        let next = match st.pending.pop_front() {
-                            Some((tid, txt)) => {
-                                let done = Arc::new(Notify::new());
-                                let sent = Arc::new(AcpWriteBarrier::default());
-                                st.begin_turn_with_prompt_barrier(
-                                    tid.clone(),
-                                    Arc::clone(&done),
-                                    Some(Arc::clone(&sent)),
-                                );
-                                Some((tid, txt, done, sent))
+                        // Decide the successor while still holding the slot:
+                        // `buffer` must never observably drop to None while
+                        // work remains, else a concurrent `submit_turn` would
+                        // see an idle session and spawn a second runner.
+                        let next = if let Some((tid, txt)) = st.pending.pop_front() {
+                            let done = Arc::new(Notify::new());
+                            let sent = Arc::new(AcpWriteBarrier::default());
+                            st.begin_turn_with_prompt_barrier(
+                                tid.clone(),
+                                Arc::clone(&done),
+                                Some(Arc::clone(&sent)),
+                            );
+                            NextTurn::User {
+                                turn_id: tid,
+                                text: txt,
+                                done,
+                                sent,
                             }
-                            None => None,
+                        } else if let Some(probe) = context_probe
+                            .filter(|_| finished_probe.is_none())
+                            .filter(|p| probe_is_due(&st, p))
+                        {
+                            // Only ever scheduled after a USER turn, so a probe
+                            // can never schedule another probe.
+                            let done = Arc::new(Notify::new());
+                            let sent = Arc::new(AcpWriteBarrier::default());
+                            st.begin_turn_with_prompt_barrier(
+                                format!("probe-{}", next_acp_turn_id()),
+                                Arc::clone(&done),
+                                Some(Arc::clone(&sent)),
+                            );
+                            NextTurn::Probe { probe, done, sent }
+                        } else {
+                            NextTurn::Stop
                         };
                         // Publish the old boundary before another submit can
                         // observe idle, and before this loop publishes the next
@@ -238,7 +363,7 @@ impl AcpTurnRunner {
                             vendor = tuning.label,
                             "acp turn runner: state lock poisoned"
                         );
-                        None
+                        NextTurn::Stop
                     }
                 };
                 // Outside the lock: the write is best-effort file I/O and must
@@ -247,13 +372,24 @@ impl AcpTurnRunner {
                     write_status_file(&project_dir, &sid, &status);
                 }
                 match next {
-                    Some((tid, txt, done, sent)) => {
+                    NextTurn::User {
+                        turn_id: tid,
+                        text: txt,
+                        done,
+                        sent,
+                    } => {
                         turn_id = tid;
                         text = txt;
                         turn_done = done;
                         prompt_sent = sent;
                     }
-                    None => break,
+                    NextTurn::Probe { probe, done, sent } => {
+                        text = format!("/{}", probe.command);
+                        turn_done = done;
+                        prompt_sent = sent;
+                        probing = Some(probe);
+                    }
+                    NextTurn::Stop => break,
                 }
             }
         });
