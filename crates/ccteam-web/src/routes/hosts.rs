@@ -543,9 +543,9 @@ fn register_mcp_blocking(
     let do_vendor = |v: &str| want.is_none() || want == Some(v);
 
     if do_vendor("claude") {
-        let bin = ccteam_core::current_ccteam_bin()?;
+        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::projects::resolve_claude_json_path()?;
-        ccteam_core::mcp_register::install_mcp_into(&path, &bin)?;
+        ccteam_core::mcp_register::install_mcp_into(&path, mcp_http_url, &admin_token)?;
         written.insert("claude".to_string(), path.display().to_string());
     }
     if do_vendor("codex") {

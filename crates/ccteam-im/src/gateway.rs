@@ -1662,26 +1662,18 @@ impl Gateway {
         .await
         .map_err(|e| HarnessError::SpawnFailed(format!("remote host re-gate: {e:#}")))?;
         // v0.9.0 W5 (real-machine smoke fix) — RE-WRITE the curated Claude
-        // stream-json mcp.json with the FRESHLY-MINTED secret. Secrets are
-        // in-memory and re-minted on every rebuild (`plan.secret`), but the
-        // file-based mcp.json is only written on FRESH spawn — so without this a
-        // session that cold-resumes after a daemon restart would keep the stale
-        // bearer and LOSE all ccteam MCP tools (it could no longer delegate).
+        // mcp.json with the FRESHLY-MINTED secret. Secrets are in-memory and
+        // re-minted on every rebuild (`plan.secret`), but the file-based
+        // mcp.json is only written on FRESH spawn — so without this a session
+        // that cold-resumes after a daemon restart would keep the stale bearer
+        // and LOSE all ccteam MCP tools (it could no longer delegate).
         // ACP/codex pass mcpServers inline with the current secret each resume,
         // so this file rewrite is the one gap. Best-effort (mirrors fresh path).
-        if plan.vendor == AgentVendor::Claude
-            && plan.protocol == SessionProtocol::StreamJson
-            && !plan.secret.is_empty()
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
         {
-            let bin = ccteam_core::current_ccteam_bin()
-                .unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
             let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
                 sid: &plan.sid,
                 secret: &plan.secret,
-                role: &plan.role,
-                slug: &plan.slug,
-                ccteam_bin: &bin,
-                mode: ccteam_harness::execution::mcp_config::McpConfigMode::from_env(),
                 http_url: None,
             };
             if let Err(e) =
@@ -1690,7 +1682,7 @@ impl Gateway {
                 tracing::warn!(
                     sid = %plan.sid,
                     error = %e,
-                    "curated mcp.json rewrite on resume failed; stream-json continues without MCP"
+                    "curated mcp.json rewrite on resume failed; session continues without MCP"
                 );
             }
         }
@@ -3522,23 +3514,15 @@ impl Gateway {
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("remote host gate: {e:#}")))?
         };
-        // v0.8.24 C1 — curated per-session MCP for Claude stream-json only.
-        // File path is well-known (chat/<sid>/mcp.json); the adapter attaches
-        // --mcp-config when the file exists. Best-effort: spawn still proceeds
-        // if write fails (session runs without in-agent ccteam tools).
-        if plan.vendor == AgentVendor::Claude
-            && plan.protocol == SessionProtocol::StreamJson
-            && !plan.secret.is_empty()
+        // v0.8.24 C1 — curated per-session MCP for Claude sessions. File path is
+        // well-known (chat/<sid>/mcp.json); the adapter attaches --mcp-config
+        // when the file exists. Best-effort: spawn still proceeds if write fails
+        // (session runs without in-agent ccteam tools).
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
         {
-            let bin = ccteam_core::current_ccteam_bin()
-                .unwrap_or_else(|_| std::path::PathBuf::from("ccteam"));
             let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
                 sid: &plan.id,
                 secret: &plan.secret,
-                role: &plan.role,
-                slug: &plan.project,
-                ccteam_bin: &bin,
-                mode: ccteam_harness::execution::mcp_config::McpConfigMode::from_env(),
                 http_url: None,
             };
             if let Err(e) =
@@ -3547,7 +3531,7 @@ impl Gateway {
                 tracing::warn!(
                     sid = %plan.id,
                     error = %e,
-                    "curated mcp.json write failed; stream-json continues without MCP"
+                    "curated mcp.json write failed; session continues without MCP"
                 );
             }
         }
@@ -9043,6 +9027,24 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
     }
+}
+
+/// Whether a session gets the curated per-session `mcp.json` (HTTP + its own
+/// `ccteam-sid:<sid>:<secret>` bearer) that both Claude spawn paths attach with
+/// `--mcp-config`.
+///
+/// Claude only: codex and the ACP vendors pass their MCP server inline on every
+/// `thread/start` / `session/new`, so they need no file. BOTH Claude protocols
+/// qualify — the global `~/.claude.json` entry is HTTP with the *admin* bearer,
+/// so without this file a managed session would authenticate as admin and lose
+/// its own principal (no delegation parent edge). The single fresh-spawn and
+/// single rebuild call site share this predicate so the two can't drift.
+fn claude_session_mcp_config_applies(vendor: AgentVendor, protocol: SessionProtocol) -> bool {
+    vendor == AgentVendor::Claude
+        && matches!(
+            protocol,
+            SessionProtocol::StreamJson | SessionProtocol::Terminal
+        )
 }
 
 /// Model ids commonly repeat the vendor name as their own prefix

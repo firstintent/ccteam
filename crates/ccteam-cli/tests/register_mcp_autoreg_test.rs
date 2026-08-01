@@ -183,10 +183,12 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
     let claude: Value =
         serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
     assert_eq!(claude["mcpServers"]["sibling"]["command"], "sibling");
-    assert_eq!(
-        claude["mcpServers"]["ccteam"]["args"],
-        serde_json::json!(["internal", "mcp-serve"])
-    );
+    // One transport for all five vendors: HTTP + admin bearer, no stdio child.
+    assert_eq!(claude["mcpServers"]["ccteam"]["type"], "http");
+    assert!(claude["mcpServers"]["ccteam"]["url"].is_string());
+    assert!(claude["mcpServers"]["ccteam"]
+        .get("command")
+        .is_none_or(Value::is_null));
 
     let codex: toml::Table =
         toml::from_str(&std::fs::read_to_string(sb.codex_home.join("config.toml")).unwrap())

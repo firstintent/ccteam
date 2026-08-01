@@ -980,7 +980,6 @@ impl ClaudeStreamJsonAdapter {
     /// has to guess its own LAN-reachable address).
     fn build_exec_spec(
         ctx: &SpawnCtx,
-        spec: &AgentSpecBrief,
         argv: Vec<String>,
         env: &[(String, String)],
         ship_mcp: bool,
@@ -1009,11 +1008,6 @@ impl ClaudeStreamJsonAdapter {
             let input = crate::execution::mcp_config::CuratedMcpInput {
                 sid: &ctx.sid,
                 secret: &ctx.secret,
-                role: &spec.role,
-                slug: &ctx.slug,
-                // Unused in Http mode (no stdio command to resolve).
-                ccteam_bin: Path::new("ccteam"),
-                mode: crate::execution::mcp_config::McpConfigMode::Http,
                 http_url: Some(&daemon_url_mcp),
             };
             let body = crate::execution::mcp_config::build_curated_mcp_json(&input);
@@ -1121,7 +1115,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // identical for both.
         let (transport, init) = if let Some(remote) = ctx.remote.as_ref() {
             let build_spec = |resume: bool| {
-                Self::build_exec_spec(ctx, spec, make_argv(resume), &env, ship_mcp, &mcp_relpath)
+                Self::build_exec_spec(ctx, make_argv(resume), &env, ship_mcp, &mcp_relpath)
             };
             match Self::spawn_and_init_remote(remote, build_spec(resume)).await {
                 Ok(ok) => ok,

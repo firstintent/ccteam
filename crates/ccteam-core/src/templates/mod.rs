@@ -21,11 +21,11 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
-// V0.6.0 F111 — per-project `.mcp.json` template + merge helper.
+// Per-project `.mcp.json` merge helper for third-party servers (ccteam's own
+// entry is global-only + HTTP — see `crate::mcp_register`).
 pub mod project_mcp_json;
 pub use project_mcp_json::{
-    merge_named_mcp_server, merge_project_mcp_json, render_project_mcp_json,
-    validate_mcp_server_name, CCTEAM_MCP_SERVER_KEY, CCTEAM_MCP_SERVE_ARGS,
+    merge_named_mcp_server, validate_mcp_server_name, CCTEAM_MCP_SERVER_KEY,
 };
 
 // V0.6.0 Wave 2 F114 — `ccteam-creator` preset workflow.yaml templates.

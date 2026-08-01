@@ -360,15 +360,25 @@ async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> Result<()
 }
 
 /// `ccteam config` — register the ccteam MCP server in `~/.claude.json`.
-pub fn install_mcp_into(claude_json: &std::path::Path, ccteam_bin: &std::path::Path) -> Result<()> {
-    ccteam_core::mcp_register::install_mcp_into(claude_json, ccteam_bin)
+pub fn install_mcp_into(
+    claude_json: &std::path::Path,
+    mcp_http_url: &str,
+    admin_token: &str,
+) -> Result<()> {
+    ccteam_core::mcp_register::install_mcp_into(claude_json, mcp_http_url, admin_token)
 }
 
-/// Production path: locate `~/.claude.json` and the running binary.
+/// Production path for Claude MCP install: like every other vendor, the global
+/// `~/.claude.json` entry points at the daemon's HTTP `/mcp` endpoint and
+/// authenticates with the admin web token, so a plain `claude` main session can
+/// orchestrate. ccteam-managed Claude sessions override the same-named entry via
+/// `--mcp-config` with their per-session bearer.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
-    let bin = ccteam_core::current_ccteam_bin()?;
-    install_mcp_into(&claude_json, &bin)?;
+    let paths = CcteamPaths::from_env()?;
+    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let mcp_http_url = ccteam_harness::execution::mcp_config::default_mcp_http_url();
+    install_mcp_into(&claude_json, &mcp_http_url, &admin_token)?;
     Ok(claude_json)
 }
 
@@ -548,27 +558,22 @@ mod tests {
     }
 
     #[test]
-    fn install_mcp_into_writes_command_args_env_for_ccteam_server() {
+    fn install_mcp_into_writes_http_url_and_admin_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        let ccteam_bin = std::path::PathBuf::from("/usr/local/bin/ccteam");
-        install_mcp_into(&claude_json, &ccteam_bin).unwrap();
+        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", "admin-token").unwrap();
         let body = std::fs::read_to_string(&claude_json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
+        let entry = &v["mcpServers"]["ccteam"];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
         assert_eq!(
-            v["mcpServers"]["ccteam"]["command"],
-            "/usr/local/bin/ccteam"
+            entry["headers"]["Authorization"],
+            "Bearer ccteam:admin-token"
         );
-        assert_eq!(
-            v["mcpServers"]["ccteam"]["args"],
-            serde_json::json!(["internal", "mcp-serve"])
-        );
-        let shared: Vec<&str> = ccteam_core::CCTEAM_MCP_SERVE_ARGS.to_vec();
-        assert_eq!(
-            v["mcpServers"]["ccteam"]["args"],
-            serde_json::json!(shared),
-            "Claude install args must equal ccteam_core::CCTEAM_MCP_SERVE_ARGS"
-        );
+        // Vendor symmetry: no global registration spawns an `mcp-serve` child.
+        assert!(entry.get("command").is_none());
+        assert!(entry.get("args").is_none());
     }
 
     #[test]
@@ -580,12 +585,15 @@ mod tests {
             r#"{"userID": "rob", "mcpServers": {"playwright": {"command": "npx"}}}"#,
         )
         .unwrap();
-        install_mcp_into(&claude_json, &std::path::PathBuf::from("/x/ccteam")).unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "tok").unwrap();
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(v["userID"], "rob");
         assert_eq!(v["mcpServers"]["playwright"]["command"], "npx");
-        assert_eq!(v["mcpServers"]["ccteam"]["command"], "/x/ccteam");
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["url"],
+            "http://localhost:7331/mcp"
+        );
     }
 
     #[test]
