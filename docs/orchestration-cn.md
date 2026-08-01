@@ -76,7 +76,7 @@
 挑谁干活靠三层,刻意分开:
 
 - **事实,探测出来。** 一次 `status` 调用返回**厂商面板**——按你项目绑定的主机出:各 vendor 装没装、版本,诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录,`unknown` 也绝不拦 spawn),预算态,主机在线还是快照已过期。远程主机经卫星通道上报;主机离线时给你最后一份快照并标 `stale`,绝不拿本机能力顶替。
-- **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。
+- **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。每个 vendor 的 spawn 配方旁边还挂着它自己的**思考强度梯**——它自报的档位,没自报就是 ccteam 用 CLI 实测钉死的那套。各家的梯**真不一样**(claude `low…max`、codex `low…xhigh`、grok `low|medium|high`、kimi `low|high|max`,opencode 干脆不公告共享梯),所以别拿另一家的拼写去猜,读一眼就是了。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。但它也**绝不吞掉你的选择**:点名了 vendor 拒绝的模型或强度,spawn 直接报错,而不是悄悄按默认档跑起来。
 - **观点,你的文本。** 全局分工写在 `~/.ccteam/routing.md`(缺失时由统一 home 初始化生成中立模板,绝不覆盖),可选的项目级覆盖写在 `<project>/.ccteam/routing.md`。项目文件存在时完整取代全局文件,二者不合并。它们都是 dumb markdown,无 schema。`status` 把选中的一份原文带给任何开口问的会话(注明来源/sha/是否截断)——任何 vendor、任何主机上的规划者拿到同一份——ccteam 永不解析、不执行。
 
 远程项目的 routing 仍是主 daemon 控制面配置:`<project>` 指 catalog 中的 daemon-side project data home;ccteam 不会偷偷同步或读取卫星工作树文件。
