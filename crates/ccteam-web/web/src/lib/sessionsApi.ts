@@ -78,9 +78,17 @@ export interface SessionHistory {
  *  float 0–100. `null` on the parent when a brand-new session hasn't completed
  *  a turn yet (no context numbers to report). */
 export interface SessionContext {
-  used_tokens: number;
+  /** Tokens occupying the window; `null` when no channel reports occupancy
+   *  (a just-resumed ACP session, a vendor with no usage surface). Never
+   *  render a null as `0` — an empty context is a different claim. */
+  used_tokens: number | null;
   window_tokens: number;
-  pct: number;
+  /** `null` whenever either half is unknown. */
+  pct: number | null;
+  /** How the numbers were obtained: `reported` (vendor stated occupancy) /
+   *  `derived` (computed from per-turn tokens) / `probed` (pulled from the
+   *  vendor's own status command) / `unknown`. */
+  source?: "reported" | "derived" | "probed" | "unknown";
 }
 
 /** Per-session statusline payload from `GET /api/v1/sessions/{sid}/status`

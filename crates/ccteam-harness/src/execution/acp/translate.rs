@@ -19,7 +19,10 @@ use super::protocol::{
     stop_reason_from_prompt_result, usage_from_prompt_result, AvailableCommand,
 };
 use super::transport::{AcpWriteBarrier, Notification};
-use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
+use crate::{
+    ContextSource, ContextUsage, ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails,
+    UnifiedTokenUsage,
+};
 
 /// Min gap between liveness `ThreadEvent`s for message/thought chunks.
 /// Chunks arrive many times per second; the watchdog only needs a periodic
@@ -153,6 +156,10 @@ pub struct SessionTranslateState {
     pub model: Option<String>,
     pub window_tokens: Option<u64>,
     pub used_tokens: Option<u64>,
+    /// Which channel filled [`Self::used_tokens`]. Kept next to the number so
+    /// [`Self::context_usage`] can hand provenance to the single render point
+    /// instead of every vendor adapter re-deciding it.
+    pub used_source: ContextSource,
     pub effort: Option<String>,
     /// Session-cumulative USD from the latest non-zero `usage_update.cost`.
     pub session_cost_usd: Option<f64>,
@@ -167,6 +174,35 @@ pub struct SessionTranslateState {
 }
 
 impl SessionTranslateState {
+    /// Resolve this session's context usage — the ONE place every ACP vendor
+    /// answers `thread_status`'s context question from.
+    ///
+    /// A known window with no reported occupancy yields `used_tokens: None`
+    /// (rendered `"— / 500k (usage unknown)"`), **never** `0`: a freshly
+    /// resumed session has an empty in-memory counter and a full context, and
+    /// claiming `0%` there is a lie, not a placeholder. Both halves unknown
+    /// yields `None` so the statusline omits the fragment entirely.
+    pub fn context_usage(&self) -> Option<ContextUsage> {
+        match (self.used_tokens, self.window_tokens) {
+            (None, None) => None,
+            (used, window) => Some(ContextUsage {
+                used_tokens: used,
+                window_tokens: window.unwrap_or(0),
+                source: if used.is_some() {
+                    self.used_source
+                } else {
+                    ContextSource::Unknown
+                },
+            }),
+        }
+    }
+
+    /// Record occupancy together with the channel that produced it.
+    pub fn set_used_tokens(&mut self, used: u64, source: ContextSource) {
+        self.used_tokens = Some(used);
+        self.used_source = source;
+    }
+
     pub fn begin_turn(&mut self, turn_id: impl Into<String>, done: Arc<Notify>) {
         self.begin_turn_with_prompt_barrier(turn_id, done, None);
     }
@@ -420,7 +456,8 @@ fn apply_session_update(
         // OpenCode: context occupancy + session-cumulative USD.
         "usage_update" => {
             if let Some(used) = update.get("used").and_then(|v| v.as_u64()) {
-                state.used_tokens = Some(used);
+                // Authoritative: the vendor states occupancy outright.
+                state.set_used_tokens(used, ContextSource::Reported);
             }
             if let Some(size) = update.get("size").and_then(|v| v.as_u64()) {
                 state.window_tokens = Some(size);
@@ -555,12 +592,18 @@ pub fn finalize_from_prompt_result(
     if let Some(m) = model.clone() {
         state.model = Some(m);
     }
+    // Per-turn token total ≈ occupancy, because a vendor reporting it here
+    // counts the WHOLE prompt (system + history) as this turn's input (grok,
+    // verified on the wire). A `0` is never occupancy — it is what a turn that
+    // made no model call reports (a vendor-local slash command, an aborted
+    // turn), and folding it in would blank a session that is really at 80%.
     if let Some(total) = result
         .pointer("/_meta/totalTokens")
         .or_else(|| result.pointer("/usage/totalTokens"))
         .and_then(|v| v.as_u64())
+        .filter(|t| *t > 0)
     {
-        state.used_tokens = Some(total);
+        state.set_used_tokens(total, ContextSource::Derived);
     }
     // Signal barrier if turn_completed never arrived (OpenCode has no such notif).
     state.signal_turn_done();
@@ -638,6 +681,83 @@ mod tests {
     use super::*;
     use futures::FutureExt;
     use serde_json::json;
+
+    /// A resumed ACP session knows its window (from the vendor's model
+    /// catalog) but not its occupancy (an in-memory counter that restarts
+    /// empty). It must say "unknown", not "0%" — a grok session sitting at
+    /// 80% used to render `0 / 500k (0%)` after every daemon restart.
+    #[test]
+    fn window_without_occupancy_is_unknown_not_zero() {
+        let st = SessionTranslateState {
+            window_tokens: Some(500_000),
+            ..Default::default()
+        };
+        let ctx = st
+            .context_usage()
+            .expect("window alone is still reportable");
+        assert_eq!(ctx.used_tokens, None);
+        assert_eq!(ctx.window_tokens, 500_000);
+        assert_eq!(ctx.source, ContextSource::Unknown);
+        assert_eq!(ctx.render(), "— / 500k (usage unknown)");
+
+        // Nothing at all → no fragment on the statusline.
+        assert!(SessionTranslateState::default().context_usage().is_none());
+    }
+
+    /// `usage_update` is the vendor stating occupancy; the prompt result's
+    /// per-turn total is our own inference. Both fill the same slot, so the
+    /// slot has to remember which one spoke.
+    #[test]
+    fn occupancy_carries_the_channel_that_reported_it() {
+        let mut st = SessionTranslateState::default();
+        apply_notification(
+            &mut st,
+            &Notification {
+                method: "session/update".into(),
+                params: json!({
+                    "update": {"sessionUpdate": "usage_update", "used": 4_000, "size": 128_000}
+                }),
+            },
+        );
+        let ctx = st.context_usage().unwrap();
+        assert_eq!(ctx.used_tokens, Some(4_000));
+        assert_eq!(ctx.source, ContextSource::Reported);
+
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t1", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 17_580}}),
+        );
+        assert_eq!(st.context_usage().unwrap().source, ContextSource::Derived);
+    }
+
+    /// A turn that made no model call reports `totalTokens: 0` (verified on a
+    /// live grok binary: a vendor-local slash command answers in 3ms with a
+    /// zero total). Folding that in would blank a session that is really at
+    /// 80% — the last real measurement must survive.
+    #[test]
+    fn zero_total_tokens_never_overwrites_real_occupancy() {
+        let mut st = SessionTranslateState::default();
+        st.window_tokens = Some(500_000);
+        st.begin_turn("t1", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 17_580}}),
+        );
+        assert_eq!(st.context_usage().unwrap().used_tokens, Some(17_580));
+
+        st.begin_turn("t2", Arc::new(Notify::new()));
+        finalize_from_prompt_result(
+            &mut st,
+            &json!({"stopReason": "end_turn", "_meta": {"totalTokens": 0}}),
+        );
+        assert_eq!(
+            st.context_usage().unwrap().used_tokens,
+            Some(17_580),
+            "a no-model-call turn must not blank the last real measurement"
+        );
+    }
 
     #[test]
     fn buffers_message_not_thought_and_finalizes_once() {

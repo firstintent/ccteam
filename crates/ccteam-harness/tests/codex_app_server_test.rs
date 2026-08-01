@@ -2019,7 +2019,7 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
             a.tracker_snapshot("tid-d2")
                 .await
                 .and_then(|t| t.usage)
-                .map(|u| u.used_tokens == 188000 && u.window_tokens == 1_000_000)
+                .map(|u| u.used_tokens == Some(188000) && u.window_tokens == 1_000_000)
                 .unwrap_or(false)
         }
     })
@@ -2048,7 +2048,8 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
     let status = adapter.thread_status(&h).await.unwrap();
     let ctx = status.context.expect("usage must be present");
     assert_eq!(
-        ctx.used_tokens, 188000,
+        ctx.used_tokens,
+        Some(188000),
         "usage from tokenUsage.last (active context size), not .total (cumulative sum)"
     );
     assert_eq!(ctx.window_tokens, 1_000_000);
@@ -2101,7 +2102,7 @@ async fn tracker_single_dispatcher_not_per_subscribe() {
             a.tracker_snapshot("tid-d2")
                 .await
                 .and_then(|t| t.usage)
-                .map(|u| u.used_tokens == 500)
+                .map(|u| u.used_tokens == Some(500))
                 .unwrap_or(false)
         }
     })
@@ -2129,7 +2130,8 @@ async fn tracker_single_dispatcher_not_per_subscribe() {
         .usage
         .unwrap();
     assert_eq!(
-        usage.used_tokens, 500,
+        usage.used_tokens,
+        Some(500),
         "single dispatcher → no double-count"
     );
 

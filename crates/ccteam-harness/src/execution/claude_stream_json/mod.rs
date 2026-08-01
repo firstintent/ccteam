@@ -260,10 +260,11 @@ fn spawn_status_tap(
                                     s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
                                 }
                                 if let Some((used, window)) = fresh_ctx {
-                                    s.context = Some(crate::ContextUsage {
-                                        used_tokens: used,
-                                        window_tokens: window,
-                                    });
+                                    s.context = Some(crate::ContextUsage::known(
+                                        used,
+                                        window,
+                                        crate::ContextSource::Derived,
+                                    ));
                                     // Tag the 1M model id when the real window is
                                     // 1M (same rule the TurnResult path applies).
                                     if window >= 1_000_000 {
@@ -310,9 +311,12 @@ fn spawn_status_tap(
                                 s.effort = Some(e);
                             }
                             // ONLY claude's own number; otherwise no context at all.
-                            s.context = real.map(|(used, window)| crate::ContextUsage {
-                                used_tokens: used,
-                                window_tokens: window,
+                            s.context = real.map(|(used, window)| {
+                                crate::ContextUsage::known(
+                                    used,
+                                    window,
+                                    crate::ContextSource::Derived,
+                                )
                             });
                             // Show the FULL model id (…[1m]) when the real window
                             // is 1M — both statusline surfaces tag the 1M id the

@@ -535,7 +535,11 @@ async fn thread_status_reports_model_and_context_after_turn() {
     // Numbers come from the vendor's `get_context_usage` (totalTokens 12345,
     // maxTokens 1000000) — NOT the result.usage sum (7); the bare "fake-model"
     // heuristic would give 200k, so a 1M window can only come from get_context_usage.
-    assert_eq!(c.used_tokens, 12_345, "totalTokens from get_context_usage");
+    assert_eq!(
+        c.used_tokens,
+        Some(12_345),
+        "totalTokens from get_context_usage"
+    );
     assert_eq!(
         c.window_tokens, 1_000_000,
         "maxTokens from get_context_usage (real window, not the heuristic)"
@@ -592,7 +596,8 @@ async fn thread_status_refreshes_context_mid_turn_before_result() {
     }
     let c = got.expect("context populated mid-turn (no result was emitted)");
     assert_eq!(
-        c.used_tokens, 12_345,
+        c.used_tokens,
+        Some(12_345),
         "totalTokens from get_context_usage mid-turn"
     );
     assert_eq!(
@@ -649,7 +654,7 @@ async fn stream_json_status_survives_release_via_persisted_file() {
     let c = after
         .context
         .expect("persisted context survives session release");
-    assert_eq!(c.used_tokens, 12_345);
+    assert_eq!(c.used_tokens, Some(12_345));
     assert_eq!(c.window_tokens, 1_000_000);
 }
 

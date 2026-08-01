@@ -23,12 +23,22 @@ export function humanizeTokens(n: number): string {
 }
 
 /** Build the `ctx <used> / <window> (<pct>%)` fragment from structured
- *  context numbers, mirroring the backend's `status_suffix()` rendering. */
+ *  context numbers, mirroring the backend's `ContextUsage::render()`.
+ *  A null `used_tokens` means nobody reports occupancy — render the dash
+ *  form (`ctx — / 500k (usage unknown)`) rather than a fabricated `0 (0%)`. */
 export function formatContext(context: SessionContext): string {
-  const pct = Number.isFinite(context.pct) ? Math.round(context.pct) : 0;
-  return `ctx ${humanizeTokens(context.used_tokens)} / ${humanizeTokens(
-    context.window_tokens,
-  )} (${pct}%)`;
+  const window = humanizeTokens(context.window_tokens);
+  if (typeof context.used_tokens !== "number") {
+    return context.window_tokens > 0
+      ? `ctx — / ${window} (usage unknown)`
+      : "ctx —";
+  }
+  const used = humanizeTokens(context.used_tokens);
+  if (context.window_tokens <= 0) return `ctx ${used} (window unknown)`;
+  const pct = Number.isFinite(context.pct as number)
+    ? Math.round(context.pct as number)
+    : 0;
+  return `ctx ${used} / ${window} (${pct}%)`;
 }
 
 /** The display line for a session's statusline bar, or `null` to render

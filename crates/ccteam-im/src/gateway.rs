@@ -6857,11 +6857,14 @@ impl Gateway {
                     row.push_str(&format!(".{e}"));
                 }
                 if let Some(ctx) = st.context.as_ref().filter(|c| c.window_tokens > 0) {
-                    row.push_str(&format!(
-                        ".{}({:.0}%)",
-                        format_tokens(ctx.window_tokens),
-                        ctx.pct()
-                    ));
+                    // Window known but occupancy not (a just-resumed ACP
+                    // session, a vendor with no usage channel) renders `—`,
+                    // never `0%` — the row must not claim an empty context.
+                    let pct = match ctx.pct() {
+                        Some(p) => format!("{p:.0}%"),
+                        None => "—".to_string(),
+                    };
+                    row.push_str(&format!(".{}({pct})", format_tokens(ctx.window_tokens)));
                 }
             }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
@@ -7181,9 +7184,13 @@ impl Gateway {
             .and_then(|st| st.effort.as_deref())
             .filter(|e| !e.is_empty())
             .unwrap_or("—");
-        let ctx = match status.as_ref().and_then(|st| st.context.as_ref()) {
-            Some(c) if c.window_tokens > 0 => format!("ctx {:.0}%", c.pct()),
-            _ => "ctx —".to_string(),
+        let ctx = match status
+            .as_ref()
+            .and_then(|st| st.context.as_ref())
+            .and_then(|c| c.pct())
+        {
+            Some(pct) => format!("ctx {pct:.0}%"),
+            None => "ctx —".to_string(),
         };
         // The REAL `--resume` id (Anthropic session uuid), shown in full so it
         // can be matched against `tmux ls` / `claude --resume`; `—` for a
@@ -10394,7 +10401,8 @@ fn event_text(evt: &ThreadEvent) -> Option<String> {
 mod tests {
     use super::*;
     use ccteam_harness::{
-        ChoiceOption, ContextUsage, ExecutionMode, HarnessError, ThreadItem, ThreadStatus, TurnId,
+        ChoiceOption, ContextSource, ContextUsage, ExecutionMode, HarnessError, ThreadItem,
+        ThreadStatus, TurnId,
     };
     use futures::stream::BoxStream;
     use std::collections::VecDeque;
@@ -15314,10 +15322,11 @@ mod tests {
         // slug, no absolute USED count.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8[1m]".into()),
-            context: Some(ContextUsage {
-                used_tokens: 188_000,
-                window_tokens: 1_000_000,
-            }),
+            context: Some(ContextUsage::known(
+                188_000,
+                1_000_000,
+                ContextSource::Derived,
+            )),
             effort: Some("max".into()),
             goal: None,
         })
@@ -15334,10 +15343,11 @@ mod tests {
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
             model: Some("claude-sonnet-4-5".into()),
-            context: Some(ContextUsage {
-                used_tokens: 188_000,
-                window_tokens: 200_000,
-            }),
+            context: Some(ContextUsage::known(
+                188_000,
+                200_000,
+                ContextSource::Derived,
+            )),
             effort: None,
             goal: None,
         })
@@ -15494,10 +15504,11 @@ mod tests {
         // A model + effort + context so the model·effort·ctx tail is exercised.
         fake.set_status(ThreadStatus {
             model: Some("claude-opus-4-8".into()),
-            context: Some(ContextUsage {
-                used_tokens: 410_000,
-                window_tokens: 1_000_000,
-            }),
+            context: Some(ContextUsage::known(
+                410_000,
+                1_000_000,
+                ContextSource::Derived,
+            )),
             effort: Some("max".into()),
             goal: None,
         })

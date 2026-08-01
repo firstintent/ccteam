@@ -60,9 +60,9 @@ use crate::execution::acp::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurn
 use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ContextUsage, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
-    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
+    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
+    ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use protocol::{
@@ -318,17 +318,7 @@ impl KimiAcpAdapter {
         };
         ThreadStatus {
             model: st.model.clone(),
-            context: match (st.used_tokens, st.window_tokens) {
-                (Some(used), Some(window)) => Some(ContextUsage {
-                    used_tokens: used,
-                    window_tokens: window,
-                }),
-                (None, Some(window)) => Some(ContextUsage {
-                    used_tokens: 0,
-                    window_tokens: window,
-                }),
-                _ => None,
-            },
+            context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
         }

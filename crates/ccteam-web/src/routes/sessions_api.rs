@@ -675,9 +675,12 @@ pub(crate) async fn handle_session_status(
     let status = resolved_thread_status(adapter, thread, &sid).await;
     let context = status.context.map(|c| {
         json!({
+            // `used_tokens` / `pct` are null when no channel reports occupancy
+            // — the SPA renders a dash; a zero would claim an empty context.
             "used_tokens": c.used_tokens,
             "window_tokens": c.window_tokens,
             "pct": c.pct(),
+            "source": c.source,
         })
     });
     Json(json!({

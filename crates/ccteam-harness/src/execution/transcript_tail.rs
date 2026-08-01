@@ -739,10 +739,7 @@ pub fn context_usage_from_usage(usage: &Value, model: Option<&str>) -> crate::Co
     let window = model
         .map(context_window_for_model)
         .unwrap_or(CLAUDE_CONTEXT_WINDOW_BASELINE);
-    crate::ContextUsage {
-        used_tokens: used,
-        window_tokens: window,
-    }
+    crate::ContextUsage::known(used, window, crate::ContextSource::Derived)
 }
 
 /// Pull `(model, ContextUsage)` from one transcript row, if it carries a
@@ -1306,7 +1303,11 @@ mod tests {
         f.flush().unwrap();
         let (model, ctx) = read_status_tail(&path).await.unwrap();
         assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(ctx.unwrap().used_tokens, 50_000, "must take the LAST usage");
+        assert_eq!(
+            ctx.unwrap().used_tokens,
+            Some(50_000),
+            "must take the LAST usage"
+        );
     }
 
     /// (v0.8.5 S3) On a transcript larger than the tail window whose
@@ -1351,7 +1352,7 @@ mod tests {
         let (model, ctx) = read_status_tail(&path).await.unwrap();
         assert_eq!(model.as_deref(), Some("claude-sonnet-4-6"));
         let ctx = ctx.expect("last usage line parsed despite the boundary split");
-        assert_eq!(ctx.used_tokens, 188_000);
+        assert_eq!(ctx.used_tokens, Some(188_000));
         assert_eq!(ctx.window_tokens, 200_000);
     }
 
@@ -1394,12 +1395,12 @@ mod tests {
             "output_tokens": 42,
         });
         let one_m = context_usage_from_usage(&usage, Some("claude-opus-4-8[1m]"));
-        assert_eq!(one_m.used_tokens, 188_000);
+        assert_eq!(one_m.used_tokens, Some(188_000));
         assert_eq!(one_m.window_tokens, CLAUDE_CONTEXT_WINDOW_1M);
 
         // No model → 200k baseline; missing usage fields default to 0.
         let baseline = context_usage_from_usage(&serde_json::json!({ "input_tokens": 50 }), None);
-        assert_eq!(baseline.used_tokens, 50);
+        assert_eq!(baseline.used_tokens, Some(50));
         assert_eq!(baseline.window_tokens, CLAUDE_CONTEXT_WINDOW_BASELINE);
     }
 

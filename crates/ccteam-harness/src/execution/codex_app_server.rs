@@ -68,8 +68,8 @@ use crate::{
     TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
 };
 use crate::{
-    ChoiceOption, ChoicePrompt, ChoiceSelection, ContextUsage, Directive, DirectiveOutcome,
-    ThreadStatus,
+    ChoiceOption, ChoicePrompt, ChoiceSelection, ContextSource, ContextUsage, Directive,
+    DirectiveOutcome, ThreadStatus,
 };
 
 /// Env override for the UDS path the adapter dials. Setting it is the
@@ -3555,10 +3555,8 @@ async fn apply_notification_to_tracker(
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0)
                 .max(0) as u64;
-            tracker.lock().await.entry(&tid).usage = Some(ContextUsage {
-                used_tokens: used,
-                window_tokens: window,
-            });
+            tracker.lock().await.entry(&tid).usage =
+                Some(ContextUsage::known(used, window, ContextSource::Reported));
         }
         _ => {}
     }
