@@ -131,6 +131,17 @@ pub struct SessionMeta {
     /// always passed back to the vendor verbatim on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort requested when the session was spawned, same contract
+    /// as [`Self::model`]: opaque, `None` = vendor default, replayed verbatim
+    /// on every re-spawn.
+    ///
+    /// It exists BECAUSE `model` did and this did not: a resume, a role
+    /// switch, or a rebuild restored the model and silently reset the effort
+    /// to the vendor default — an explicit pick surviving one axis but not the
+    /// other, invisibly, which is the same failure the spawn surfaces just
+    /// stopped committing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub host: String,
     pub created_at: String,
     /// Updated only on turn completion — not on every event.
@@ -449,6 +460,7 @@ mod title_tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),

@@ -31,7 +31,7 @@ Paste a bot token once (Settings → Access) and the chat becomes a full console
 
 ```text
 /cd demo                        # pick a project; your next message talks to it
-/new codex                      # more sessions: /new [vendor] [role]
+/new codex effort=high          # more sessions: /new [vendor] [role] [model=…] [effort=…]
 @s2 run the test suite          # address any session directly
 /status  /sessions  /stop s3    # health · fleet · cost · stop
 /inbox +30m remind me …         # schedule a one-shot user turn; /inbox lists · cancel dN
@@ -142,7 +142,9 @@ Async by default: the completion notification lands in the parent's chat like a 
 - **Grind + probe** — codex holds the long job while grok answers the quick question before codex finishes a step.
 - **Bulk on a budget** — fan the repetitive 80% out to kimi; keep the judgment calls on claude.
 
-Who gets what starts from facts, not guesses: one `status` call is the roster — vendors installed, authenticated, and in-budget on the project's host, an advisory model catalog, and your routing notes (`<project>/.ccteam/routing.md` over the global fallback). Omit `model` and each spawn rides the vendor's default.
+Who gets what starts from facts, not guesses: one `status` call is the roster — vendors installed, authenticated, and in-budget on the project's host, each one's models and reasoning-effort levels as it last declared them, and your routing notes (`<project>/.ccteam/routing.md` over the global fallback).
+
+Every spawn surface takes `model` and `effort` for every vendor and forwards both verbatim — the vendor owns the verdict on its own values, so a level it refuses comes back as a real error instead of a session quietly running at the default. Omit them and the vendor's own defaults hold. The ladders differ (claude `low…max`, codex `low…xhigh`, grok `low|medium|high`, kimi `low|high|max`), so ask rather than guess: `status` for agents, `GET /api/v1/models` for programs, and the web composer's menus render from the same source.
 
 ## Project context
 

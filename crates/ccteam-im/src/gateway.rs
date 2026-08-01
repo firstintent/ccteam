@@ -1036,6 +1036,8 @@ struct MetaRebuildPlan {
     /// @mention handle = role, else sid for a roleless session.
     handle: String,
     model_id: Option<String>,
+    /// Replayed from `meta.effort`, exactly like `model_id` above.
+    effort: Option<String>,
     secret: String,
     cwd: PathBuf,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -1079,9 +1081,9 @@ struct NewSessionPlan {
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
-    /// v0.8.24 A-U3 — explicit reasoning effort (spawn-time only; not
-    /// persisted in meta, so a daemon-restart rebuild reverts to vendor
-    /// default — same lifetime as an explicit web model choice).
+    /// Explicit reasoning effort. Persisted in `meta.effort` alongside
+    /// `meta.model`, so a resume / role switch / rebuild replays the pick
+    /// instead of quietly reverting one axis to the vendor default.
     effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// v0.9.0 W2 (F2) — delegation parent sid (the spawning principal). `None`
@@ -1126,6 +1128,8 @@ struct ResumeDeadPlan {
     secret: String,
     cwd: PathBuf,
     model_id: Option<String>,
+    /// Replayed from `meta.effort`, exactly like `model_id` above.
+    effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// Race marker: `format!("{identity}@{started_at}")` of the thread that
     /// was live when we planned. Apply aborts if the map's thread no longer
@@ -1641,6 +1645,7 @@ impl Gateway {
             owner,
             handle,
             model_id,
+            effort: meta.effort.clone(),
             secret: ccteam_core::session_secret::mint(),
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
@@ -1706,12 +1711,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
-                    // KNOWN ASYMMETRY, not a policy: `meta.json` persists
-                    // `model` (restored just above) but has no `effort` field,
-                    // so a rebuild reverts effort to the vendor default while
-                    // the model survives. Closing it = an `effort` field on
-                    // `ccteam_harness::execution::session_meta::SessionMeta`.
-                    effort: None,
+                    effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -3561,7 +3561,7 @@ impl Gateway {
             secret,
             cwd: _,
             model_id,
-            effort: _,
+            effort: effort_meta,
             adapter,
             parent_sid,
             spawned_by_role,
@@ -3661,6 +3661,7 @@ impl Gateway {
                 owner: owner_tag,
                 vendor_uuid: meta_vendor_uuid,
                 model: model_id,
+                effort: effort_meta,
                 host: host.clone(),
                 created_at: now.clone(),
                 last_active: now,
@@ -3802,6 +3803,12 @@ impl Gateway {
         // Wave-2: a restart rebuilds from meta, so the role change must persist).
         let meta_dir = cwd.clone();
         let meta_role = role.clone();
+        // `/role` re-derives the MODEL from the new role's frontmatter, but the
+        // effort belongs to the session, not the role — replay it so a switch
+        // doesn't silently drop the level the session was spawned with.
+        let effort = read_session_meta(&meta_dir, &sid)
+            .ok()
+            .and_then(|meta| meta.effort);
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -3811,6 +3818,7 @@ impl Gateway {
                 &sid,
                 cwd,
                 model_id.clone(),
+                effort.clone(),
                 permission_mode,
                 secret.clone(),
                 &host,
@@ -3861,6 +3869,7 @@ impl Gateway {
         if let Ok(mut meta) = read_session_meta(&meta_dir, &sid) {
             meta.role = meta_role.clone();
             meta.model = model_id;
+            meta.effort = effort;
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
@@ -5519,10 +5528,15 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
         let role_detail = ensure_role_exists(&cwd, &role)?;
-        let model_id = read_session_meta(&cwd, session_id)
-            .ok()
-            .and_then(|meta| meta.model)
+        // One read for both axes: `model` falls back to the role's frontmatter
+        // (a role may pin a model), `effort` has no such fallback — the vendor
+        // default is the honest answer when the session never named one.
+        let meta = read_session_meta(&cwd, session_id).ok();
+        let model_id = meta
+            .as_ref()
+            .and_then(|m| m.model.clone())
             .or_else(|| role_model_id(role_detail.as_ref()));
+        let effort = meta.and_then(|m| m.effort);
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
@@ -5540,6 +5554,7 @@ impl Gateway {
             secret,
             cwd,
             model_id,
+            effort,
             adapter,
             generation,
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
@@ -5574,12 +5589,7 @@ impl Gateway {
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
-                    // KNOWN ASYMMETRY, not a policy: `plan_resume_dead_session`
-                    // restores `model` from `meta.json`, which has no `effort`
-                    // field to restore — so a resumed session reverts to the
-                    // vendor default effort. Closing it = an `effort` field on
-                    // `ccteam_harness::execution::session_meta::SessionMeta`.
-                    effort: None,
+                    effort: plan.effort.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -5610,6 +5620,7 @@ impl Gateway {
             secret: _,
             cwd: _,
             model_id: _,
+            effort: _,
             adapter,
             generation,
             ccteam_root: _,
@@ -5680,6 +5691,9 @@ impl Gateway {
         sid: &str,
         cwd: PathBuf,
         model_id: Option<String>,
+        // Replayed from `meta.effort` — a re-spawn must not reset the axis the
+        // caller picked (`/role` swaps the ROLE, not the reasoning level).
+        effort: Option<String>,
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
@@ -5713,13 +5727,7 @@ impl Gateway {
                     project_dir: cwd,
                     extra_args: vec![],
                     model_id,
-                    // KNOWN ASYMMETRY, not a policy: `model_id` above is
-                    // restored (role frontmatter / `meta.json`), but `meta.json`
-                    // has no `effort` field, so a role-switch / dead-child
-                    // re-spawn reverts effort to the vendor default. Closing it
-                    // = an `effort` field on
-                    // `ccteam_harness::execution::session_meta::SessionMeta`.
-                    effort: None,
+                    effort,
                     permission_mode,
                     secret,
                     remote,
@@ -7584,6 +7592,7 @@ impl Gateway {
             owner: owner_tag,
             vendor_uuid: vendor_uuid.to_string(),
             model: None,
+            effort: None,
             host: "local".to_string(),
             created_at: now.clone(),
             last_active: now,
@@ -11093,6 +11102,57 @@ mod tests {
                 (Some("sonnet".into()), None),
                 (Some("sonnet".into()), None),
             ]
+        );
+    }
+
+    /// A spawn-time pick must survive the session, not just its first process.
+    /// `meta.json` persisted `model` but not `effort`, so every re-spawn path
+    /// (resume a dead session, `/role` switch, daemon-restart rebuild) restored
+    /// the model and reset the effort to the vendor default — one axis of the
+    /// same explicit choice silently evaporating, with a live sid to suggest
+    /// nothing had happened.
+    #[tokio::test]
+    async fn an_explicit_effort_survives_a_respawn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    model: Some("opus".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Both axes are on disk — meta.json is the session SoT every re-spawn
+        // path rebuilds from.
+        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
+        assert_eq!(meta.model.as_deref(), Some("opus"));
+        assert_eq!(meta.effort.as_deref(), Some("xhigh"));
+
+        // Stop it, then resume by sid — the rebuild-from-meta path a daemon
+        // restart, a capacity eviction and a web resume all share. The re-spawn
+        // must carry BOTH axes, not just the model.
+        gateway.stop_session("s1").await.ok();
+        gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await
+            .expect("resume");
+        let last = fake.spawn_tunings.lock().await.last().cloned();
+        assert_eq!(
+            last,
+            Some((Some("opus".into()), Some("xhigh".into()))),
+            "a resumed session re-spawns with the effort it was created with"
         );
     }
 
@@ -15526,12 +15586,12 @@ mod tests {
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
             model: Some("claude-sonnet-4-5".into()),
+            effort: None,
             context: Some(ContextUsage::known(
                 188_000,
                 200_000,
                 ContextSource::Derived,
             )),
-            effort: None,
             goal: None,
         })
         .await;
@@ -16508,6 +16568,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),
@@ -16580,6 +16641,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_active: "2026-01-01T00:00:00Z".into(),

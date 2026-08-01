@@ -437,6 +437,7 @@ mod tests {
             owner: "user:web".to_string(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_active: "2026-01-01T00:00:00Z".to_string(),

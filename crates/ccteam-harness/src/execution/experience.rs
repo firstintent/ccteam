@@ -593,6 +593,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            effort: None,
             host: "local".into(),
             created_at: now.to_rfc3339(),
             last_active: now.to_rfc3339(),

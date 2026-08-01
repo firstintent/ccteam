@@ -200,6 +200,7 @@ fn idle_meta(project_dir: &std::path::Path, sid: &str, model: Option<&str>) {
         owner: "user:web".to_string(),
         vendor_uuid: String::new(),
         model: model.map(str::to_string),
+        effort: None,
         host: String::new(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
         last_active: "2026-01-01T00:00:00Z".to_string(),
