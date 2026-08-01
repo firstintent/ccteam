@@ -46,6 +46,23 @@ REPO="${CCTEAM_REPO:-firstintent/ccteam}"
 #
 # `make install` calls `install.sh --print-install-dir` instead of
 # reimplementing this — a second copy of the ladder is the same class of bug.
+
+# Absolute, symlink-resolved path of $1 — so a link and its target are
+# recognised as the SAME binary rather than two rival installs.
+canonical_bin() {
+    _p="$1"
+    [ -n "$_p" ] || return 1
+    if [ -L "$_p" ]; then
+        _link="$(readlink "$_p" 2>/dev/null || true)"
+        case "$_link" in
+            /*) _p="$_link" ;;
+            ?*) _p="$(dirname "$_p")/$_link" ;;
+        esac
+    fi
+    _d="$(cd "$(dirname "$_p")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s\n' "$_d" "$(basename "$_p")"
+}
+
 resolve_install_dir() {
     if [ -n "${CCTEAM_INSTALL_DIR:-}" ]; then
         printf '%s\n' "$CCTEAM_INSTALL_DIR"
@@ -53,17 +70,8 @@ resolve_install_dir() {
     fi
     _existing="$(command -v ccteam 2>/dev/null || true)"
     if [ -n "$_existing" ]; then
-        # Resolve symlinks so we replace the real file, not a link into a build
-        # tree that a `cargo clean` can vaporize.
-        _resolved="$(cd "$(dirname "$_existing")" 2>/dev/null && pwd -P)/$(basename "$_existing")"
-        if [ -L "$_existing" ]; then
-            _link="$(readlink "$_existing" 2>/dev/null || true)"
-            case "$_link" in
-                /*) _resolved="$_link" ;;
-                ?*) _resolved="$(cd "$(dirname "$_existing")" 2>/dev/null && pwd -P)/$_link" ;;
-            esac
-        fi
-        _dir="$(dirname "$_resolved")"
+        _resolved="$(canonical_bin "$_existing" || true)"
+        _dir="${_resolved%/*}"
         # A build-tree binary is not an install location — `cargo clean` or a
         # redirected CARGO_TARGET_DIR would take the daemon's binary with it.
         case "$_dir" in
@@ -75,6 +83,45 @@ resolve_install_dir() {
         fi
     fi
     printf '%s\n' "$HOME/.local/bin"
+}
+
+# Name any OTHER ccteam on PATH after installing.
+#
+# This is the failure that cost real debugging time: a second copy earlier on
+# PATH keeps winning, so an upgrade looks like it did nothing and "I rebuilt and
+# it still misbehaves" becomes unfalsifiable. We only REPORT — deleting a binary
+# the user never asked us to touch would be worse than the confusion.
+warn_shadow_copies() {
+    _installed="$(canonical_bin "$1" || printf '%s' "$1")"
+    _shadows=""
+    _oldifs="$IFS"
+    IFS=:
+    for _dir in $PATH; do
+        [ -n "$_dir" ] || _dir="."
+        [ -x "$_dir/ccteam" ] || continue
+        _cand="$(canonical_bin "$_dir/ccteam" || true)"
+        [ -n "$_cand" ] || continue
+        [ "$_cand" = "$_installed" ] && continue
+        case ":$_shadows:" in
+            *":$_cand:"*) continue ;;
+        esac
+        _shadows="${_shadows:+$_shadows:}$_cand"
+    done
+    IFS="$_oldifs"
+    [ -n "$_shadows" ] || return 0
+
+    warn "Other ccteam binaries are on your PATH:"
+    _oldifs="$IFS"
+    IFS=:
+    for _s in $_shadows; do
+        printf '        %s\n' "$_s"
+    done
+    IFS="$_oldifs"
+    printf '    Whichever comes first on PATH is the one you actually run, so an\n'
+    printf '    upgrade can look like it did nothing. Remove the stale ones, or\n'
+    printf '    reinstall over the one you keep:\n\n'
+    printf '      CCTEAM_INSTALL_DIR=<dir> sh install.sh\n\n'
+    printf '    Confirm which one wins with:  command -v ccteam\n'
 }
 
 INSTALL_DIR="${CCTEAM_INSTALL_DIR:-$(resolve_install_dir)}"
@@ -448,6 +495,17 @@ main() {
     chmod +x "$INSTALL_DIR/ccteam"
     write_install_marker "$TAG"
     info "${GREEN}Installed:${RESET} $INSTALL_DIR/ccteam ($TAG)"
+
+    # Say WHY this directory, when it isn't the documented default and the user
+    # didn't ask for it: landing on an existing install is what keeps a second
+    # binary from appearing, but silently writing somewhere unexpected is its own
+    # kind of surprise.
+    if [ -z "${CCTEAM_INSTALL_DIR:-}" ] && [ "$INSTALL_DIR" != "$HOME/.local/bin" ]; then
+        info "Updated your existing install in place (not the $HOME/.local/bin default)."
+        printf '    Install elsewhere with:  CCTEAM_INSTALL_DIR=<dir> sh install.sh\n'
+    fi
+
+    warn_shadow_copies "$INSTALL_DIR/ccteam"
 
     # ---- PATH hint ----
     case ":$PATH:" in

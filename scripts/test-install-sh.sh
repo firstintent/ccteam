@@ -85,6 +85,48 @@ chmod 755 "$ladder_tmp/ro"
 expect_dir "$ladder_tmp/.local/bin" \
     "$(PATH="/usr/bin:/bin" HOME="$ladder_tmp" sh "$INSTALL" --print-install-dir)" \
     "ladder: default when nothing is installed"
+
+# ---- shadow-copy warning ----
+# A second ccteam earlier on PATH silently wins, so an upgrade looks like it did
+# nothing. install.sh reports (never deletes) the others. Source just the two
+# helpers so this needs no network.
+sed -n '/^canonical_bin()/,/^}/p;/^warn_shadow_copies()/,/^}/p' "$INSTALL" >"$ladder_tmp/fns.sh"
+ln -sf "$ladder_tmp/realbin/ccteam" "$ladder_tmp/linkdir/alias-ccteam"
+mkdir -p "$ladder_tmp/samefile" && ln -sf "$ladder_tmp/realbin/ccteam" "$ladder_tmp/samefile/ccteam"
+
+shadow_report() {
+    PATH="$1" sh -c '
+        warn() { printf "WARN %s\n" "$1"; }
+        . "$1"
+        warn_shadow_copies "$2"
+    ' _ "$ladder_tmp/fns.sh" "$2"
+}
+
+# `ro/ccteam` is a genuine second copy → reported.
+_out="$(shadow_report "$ladder_tmp/realbin:$ladder_tmp/ro:/usr/bin:/bin" "$ladder_tmp/realbin/ccteam")"
+case "$_out" in
+    *"$ladder_tmp/ro/ccteam"*) echo "PASS  shadow: reports a rival copy" ;;
+    *) echo "FAIL  shadow: rival copy not reported. got: $_out" >&2; exit 1 ;;
+esac
+
+# `samefile/ccteam` is a SYMLINK to the installed binary — the same file, not a
+# rival. Reporting it would be a false alarm on every symlinked install.
+_out="$(shadow_report "$ladder_tmp/realbin:$ladder_tmp/samefile:/usr/bin:/bin" "$ladder_tmp/realbin/ccteam")"
+if [ -z "$_out" ]; then
+    echo "PASS  shadow: symlink to the same binary is not a rival"
+else
+    echo "FAIL  shadow: false positive on a symlink. got: $_out" >&2
+    exit 1
+fi
+
+# Nothing else on PATH → silent.
+_out="$(shadow_report "$ladder_tmp/realbin:/usr/bin:/bin" "$ladder_tmp/realbin/ccteam")"
+if [ -z "$_out" ]; then
+    echo "PASS  shadow: silent when the install is the only copy"
+else
+    echo "FAIL  shadow: spurious warning. got: $_out" >&2
+    exit 1
+fi
 # Removed explicitly, not via `trap`: the end-to-end section below installs its
 # own EXIT trap, which would replace ours and leak this dir.
 rm -rf "$ladder_tmp"
