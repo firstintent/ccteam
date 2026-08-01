@@ -116,6 +116,8 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
    - **版本归档**:`docs-local/versions/v0-X-Y/README.md` + handoff doc 落地(**留在 gitignored `docs-local/`,不入库不推送**)
 8. **beta-gating(仅 UI 层,v0.8.20 起;2026-07-28 owner 令收窄至「几乎不用」)** — **功能面默认对全体登录用户开放**,能不能碰由后端「身份 × 项目归属」判,不靠藏菜单;SPA 唯一 admin-only 面 = 设置→**管理员**(用户管理),`visibleSettingsItems` 有一行不变量测试锁死。新/不稳定功能确需只对 admin 展示时可临时按 `useMe().isAdmin` 藏,但**必须是临时的**,且**非安全/权限边界**(真权限仍走 `deny_non_admin`/`can_see_project`);毕业即移除。历史例(已退役):terminal/rmux 协议与角色选择曾 admin-only,现全员。
 
+9. **日耗上限 15 USD / 自然日,自主连跑不问**(owner 令 2026-08-01)— 预算内**不为「要不要继续/花钱」请示**,持续推进取活;逼近上限时**减小规模**(缩 wave / 少派 subagent / 降模型档),**不停工**。上限是硬约束不是目标:省下的额度不换质量,`§五.6` 测试门与基线红线照旧。与产品面 `budgets.*.max_cost_usd_per_24h`(触顶 auto-disable,§三)是两件事 —— 本条约束**开发会话自身**的花法。
+
 ### 角色与写权(治理骨架;执法 = 声明 + 复核,**不做脚本硬防护**)
 
 | 角色 | 写权 |
