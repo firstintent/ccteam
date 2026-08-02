@@ -123,9 +123,9 @@ impl Channel for WebChatChannel {
 }
 
 /// Convert the daemon-internal outbound file to the reference-only browser
-/// shape. The project upload handle is mandatory on the web channel; the
-/// arbitrary source path is used only to derive display metadata and never
-/// crosses the wire.
+/// shape. The project upload handle is mandatory on the web channel; display
+/// name and staged size conversion is pure, and the arbitrary source path
+/// never crosses the wire or gets re-opened here.
 fn web_attachment_ref(file: &ccteam_im::transport::OutboundFile) -> anyhow::Result<AttachmentRef> {
     file.attachment_ref().map_err(|err| {
         anyhow::anyhow!(
@@ -269,14 +269,17 @@ mod tests {
         let message = SendMessage::new("chart attached", "web-api").with_attachments(vec![
             ccteam_im::transport::OutboundFile {
                 id: "1780000000000-chart.png".into(),
+                size: 3,
                 path: source.to_string_lossy().into_owned(),
                 caption: None,
                 kind: ccteam_im::transport::OutboundFileKind::Photo,
             },
         ]);
+        std::fs::remove_file(&source).unwrap();
 
         bridge.channel.send(&message).await.unwrap();
         let sent = outbound.recv().await.unwrap();
+        assert_eq!(sent.content, "chart attached");
         assert_eq!(sent.attachments.len(), 1);
         assert_eq!(sent.attachments[0].id, "1780000000000-chart.png");
         assert_eq!(sent.attachments[0].name, "chart.png");

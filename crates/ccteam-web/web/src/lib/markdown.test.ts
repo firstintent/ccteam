@@ -23,8 +23,29 @@ describe("chat markdown URI sanitizer", () => {
   it("keeps the configured URI allowlist closed to data/blob/script schemes", () => {
     expect(CHAT_ALLOWED_URI_REGEXP.test("/api/v1/projects/demo/uploads/chart.png")).toBe(true);
     expect(CHAT_ALLOWED_URI_REGEXP.test("https://example.test/chart.png")).toBe(true);
+    expect(CHAT_ALLOWED_URI_REGEXP.test("docs/readme.md")).toBe(true);
+    expect(CHAT_ALLOWED_URI_REGEXP.test("foo/bar")).toBe(true);
+    expect(CHAT_ALLOWED_URI_REGEXP.test("abc123")).toBe(true);
     expect(CHAT_ALLOWED_URI_REGEXP.test("data:image/png;base64,AAAA")).toBe(false);
     expect(CHAT_ALLOWED_URI_REGEXP.test("blob:https://example.test/id")).toBe(false);
     expect(CHAT_ALLOWED_URI_REGEXP.test("javascript:alert(1)")).toBe(false);
+  });
+
+  it("preserves relative links while the sanitizer hook removes unsafe schemes", () => {
+    const rendered = renderMarkdown(
+      [
+        "[docs](docs/readme.md)",
+        "[nested](foo/bar)",
+        "[slug](abc123)",
+        "[blob](blob:https://example.test/id)",
+        "[script](javascript:alert(1))",
+      ].join("\n\n"),
+    );
+
+    expect(rendered).toContain('href="docs/readme.md"');
+    expect(rendered).toContain('href="foo/bar"');
+    expect(rendered).toContain('href="abc123"');
+    expect(rendered).not.toContain('href="blob:');
+    expect(rendered).not.toContain('href="javascript:');
   });
 });

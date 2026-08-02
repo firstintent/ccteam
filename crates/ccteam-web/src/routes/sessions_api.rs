@@ -2272,6 +2272,7 @@ mod tests {
         event.content.clear();
         event.attachments.push(ccteam_im::transport::OutboundFile {
             id: "1780000000000-chart.png".into(),
+            size: 3,
             path: source.to_string_lossy().into_owned(),
             caption: None,
             kind: ccteam_im::transport::OutboundFileKind::Photo,

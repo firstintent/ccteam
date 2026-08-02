@@ -393,6 +393,11 @@ pub struct OutboundFile {
     /// providers continue reading `path` directly.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
+    /// Byte length of the project-owned staged copy. Captured once when web
+    /// staging commits the file; zero for IM-only delivery (and valid for an
+    /// empty staged file, distinguished by its non-empty `id`).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub size: u64,
     /// Absolute path to the file on disk.
     pub path: String,
     /// Optional caption (placed on the first attachment).
@@ -403,17 +408,15 @@ pub struct OutboundFile {
 }
 
 impl OutboundFile {
-    /// Build the reference-only browser/transcript shape. The returned type
-    /// cannot carry source paths or bytes; callers may serialize it directly.
+    /// Purely convert staged metadata to the reference-only browser/transcript
+    /// shape. The returned type cannot carry source paths or bytes; callers
+    /// may serialize it directly. A project upload handle remains mandatory.
     pub fn attachment_ref(
         &self,
-    ) -> std::io::Result<ccteam_harness::execution::turns_mirror::AttachmentRef> {
+    ) -> Result<ccteam_harness::execution::turns_mirror::AttachmentRef, &'static str> {
         use ccteam_harness::execution::turns_mirror::{AttachmentRef, AttachmentRefKind};
         if self.id.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "outbound attachment has no project upload id",
-            ));
+            return Err("outbound attachment has no project upload id");
         }
         let source = std::path::Path::new(&self.path);
         let name = source
@@ -421,7 +424,6 @@ impl OutboundFile {
             .and_then(|name| name.to_str())
             .map(sanitize_attachment_name)
             .unwrap_or_else(|| "file".to_string());
-        let size = std::fs::metadata(source)?.len();
         let kind = match self.kind {
             OutboundFileKind::Photo => AttachmentRefKind::Image,
             OutboundFileKind::Document => AttachmentRefKind::File,
@@ -430,9 +432,13 @@ impl OutboundFile {
             id: self.id.clone(),
             name,
             kind,
-            size,
+            size: self.size,
         })
     }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A single selectable option rendered on an outbound [`SendMessage`]
@@ -743,6 +749,32 @@ mod tests {
         std::fs::write(&first, b"one").unwrap();
         let (second, _) = next_project_upload_path(tmp.path(), "chart.png", 42);
         assert_eq!(second.file_name().unwrap(), "42-1-chart.png");
+    }
+
+    #[test]
+    fn attachment_ref_uses_staged_size_without_reading_source_and_requires_id() {
+        let mut file = OutboundFile {
+            id: "42-chart.png".into(),
+            size: 17,
+            path: "/definitely/missing/chart.png".into(),
+            caption: None,
+            kind: OutboundFileKind::Photo,
+        };
+
+        let reference = file.attachment_ref().unwrap();
+        assert_eq!(reference.id, "42-chart.png");
+        assert_eq!(reference.name, "chart.png");
+        assert_eq!(reference.size, 17);
+        assert_eq!(
+            reference.kind,
+            ccteam_harness::execution::turns_mirror::AttachmentRefKind::Image
+        );
+
+        file.id.clear();
+        assert_eq!(
+            file.attachment_ref().unwrap_err(),
+            "outbound attachment has no project upload id"
+        );
     }
 
     #[tokio::test]

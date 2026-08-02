@@ -2491,6 +2491,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
         kind: GatewayEventKind::Answer,
         attachments: vec![OutboundFile {
             id: String::new(),
+            size: 0,
             path: "/tmp/ccteam-out/chart.png".into(),
             caption: Some("the chart".into()),
             kind: OutboundFileKind::Photo,

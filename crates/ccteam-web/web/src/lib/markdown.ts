@@ -14,7 +14,7 @@ import type { UponSanitizeAttributeHook } from "dompurify";
 /** Chat links may use ordinary relative URLs or a small set of explicit
  * schemes. `data:`/`blob:` and script-like schemes never qualify. */
 export const CHAT_ALLOWED_URI_REGEXP =
-  /^(?!data:)(?:(?:(?:f|ht)tps?|mailto|tel):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$))/i;
+  /^(?!data:)(?:(?:(?:f|ht)tps?|mailto|tel):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i;
 
 const URI_ATTRIBUTES = new Set([
   "href",

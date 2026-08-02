@@ -632,9 +632,7 @@ fn stage_web_outbound_file(
     paths: &CcteamPaths,
     seq: u64,
 ) -> std::result::Result<(), String> {
-    use ccteam_harness::execution::turns_mirror::{
-        append_turn, AttachmentRef, AttachmentRefKind, TurnRecord,
-    };
+    use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
 
     let host = project_host(paths, &session.project);
     if host != ccteam_core::LOCAL_HOST {
@@ -657,7 +655,7 @@ fn stage_web_outbound_file(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("file");
-        let (staged, name) =
+        let (staged, _) =
             crate::transport::next_project_upload_path(&session.project_dir, original_name, millis);
         let staged_name = staged
             .file_name()
@@ -697,16 +695,12 @@ fn stage_web_outbound_file(
         }
 
         attachment.id = staged_name.clone();
-        let kind = match attachment.kind {
-            crate::transport::OutboundFileKind::Photo => AttachmentRefKind::Image,
-            crate::transport::OutboundFileKind::Document => AttachmentRefKind::File,
-        };
-        references.push(AttachmentRef {
-            id: staged_name,
-            name,
-            kind,
-            size: copied,
-        });
+        attachment.size = copied;
+        references.push(
+            attachment.attachment_ref().map_err(|err| {
+                format!("chat_send_file: build staged attachment reference: {err}")
+            })?,
+        );
         staged_paths.push(staged);
     }
 
@@ -805,6 +799,7 @@ fn build_send_file_event(
         kind: crate::gateway::GatewayEventKind::Answer,
         attachments: vec![crate::transport::OutboundFile {
             id: String::new(),
+            size: 0,
             path: path.to_string(),
             caption,
             kind,
@@ -3678,12 +3673,17 @@ mod chat_send_file_tests {
         assert_eq!(event.slug.as_deref(), Some("dev-foo"));
         assert_eq!(event.content, "the chart");
         assert_eq!(event.attachments[0].path, source.to_string_lossy());
+        assert_eq!(event.attachments[0].size, 11);
         let id = event.attachments[0].id.clone();
         assert!(id.ends_with("-chart.png"), "got {id}");
         assert_eq!(
             std::fs::read(crate::transport::project_uploads_dir(&project_dir).join(&id)).unwrap(),
             b"chart-bytes"
         );
+        std::fs::remove_file(&source).unwrap();
+        let live_reference = event.attachments[0].attachment_ref().unwrap();
+        assert_eq!(live_reference.name, "chart.png");
+        assert_eq!(live_reference.size, 11);
 
         let turns =
             ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, "s7").unwrap();
