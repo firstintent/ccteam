@@ -12,7 +12,7 @@
 
 **R-code 速查**(简写 ↔ CLAUDE.md §三):
 
-- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(`--agent` 让 vendor **自读** role.md = 这条的**兑现**,不是违反;roleless = 省略 `--agent` 的合法形态)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid;§三已并入「session = 独立一等实体」行)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目 slug = `slugify(目录名)` + 撞名数字累加,`ccteam init` 可就地初始化 · `R11` root README.md 英文且不含版本进展(家已迁 = CLAUDE.md §五.7 ship gate,不再是 §三行)
+- `R1` 文件系统是状态面(非 chat 命令面)· `R2` `progress.jsonl` 是 state SoT(+ `turns.jsonl` 对话原文,**按 sid**)· `R3` No prompt injection(ccteam 不注入 system prompt;让 vendor **自读自己的文件** = 这条的**兑现**,不是违反)· `R4` 会话 = resume-by-session-id(粒度 = 持久 sid;§三已并入「session = 独立一等实体」行)· `R5` 永不**主动** kill 长 session(例外:`project stop` / `rm --force` 是用户**显式**命令)· `R6` 不解析终端输出(不 scrape pane)· `R7` `ccteam-core` 零 team 名字面量 · `R8` 跨项目记忆走 vendor 原生接口 · `R9` crate 拓扑 `core → harness → cost` · `R10` 新建项目 slug = `slugify(目录名)` + 撞名数字累加,`ccteam init` 可就地初始化 · `R11` root README.md 英文且不含版本进展(家已迁 = CLAUDE.md §五.7 ship gate,不再是 §三行)
 
 > 已退役概念的一行清单在 CLAUDE.md §〇 尾注(本文档不再重复);R-code 与 §三行名的全量对齐校对 = TD-SYNC-1 卡。
 
@@ -469,7 +469,7 @@ model: claude-opus-4-5
 You are a reviewer agent. ...
 ```
 
-`ccteam init` 种默认 `cto.md`(管家 role,3 职责见 §2.1);work-role 由用户自建 / 从 **ccteam-hub 插件市场**装(§6.8),落同一目录。**这是 ccteam 唯一管理的"指令面"** —— 与「No prompt injection」红线不冲突:ccteam 不向 pane / app-server 注入 system prompt,而是让 vendor 用原生 `--agent` 机制自读 role.md(R3 兑现)。**roleless session 省略 `--agent`**(空 role 短路 `ensure_role_exists`),裸 claude 读项目知识层当 brain —— 同样不违反红线(不注入 ≠ 必须有 role)。`session persona` / API `PUT /roles/{role}` 改写 role.md body(保留 frontmatter),下次该 session fresh start 生效。
+`ccteam init` **不种任何 role**(默认 roleless);role 由用户自建 / 从 **ccteam-hub 插件市场**装(§6.8),落 `.claude/agents/`。**role 不是红线概念**(owner 令 2026-08-03,§三已整体移出)—— 它是一个普通产品特性,只受「No prompt injection」约束:ccteam 不向 pane / app-server 注入 system prompt,而是让 vendor 用原生 `--agent` 机制自读 role.md(R3 兑现)。**roleless session 省略 `--agent`**(空 role 短路 `ensure_role_exists`),裸 claude 读项目知识层当 brain。`session persona` / API `PUT /roles/{role}` 改写 role.md body(保留 frontmatter),下次该 session fresh start 生效。
 
 ### 6.3 Hooks 配置
 
@@ -579,7 +579,7 @@ MCP 工具共 **8**(v0.9-T1 cull 15→8:删 advise 2 / admin_change_persona+add_
 
 > 以下是**推后**的自动编排能力,住在独立 crate `ccteam-flow`,**当前未接进运行中的 gateway daemon**。这里只记其存在与红线,供编排层落地时不退基线;**不要**把它当成当前 daemon 的运行方式。当前运行态由用户在 IM / web / API 里**手动**驱动多个 session(§2)。
 
-`ccteam-flow` 设计目标是一个文件系统驱动的 thin orchestrator(声明式 `workflow.yaml` 拓扑 + trigger:`manual` / `schedule` / `gate` / `watch:<path>`;bg-job 形态 Claude `claude --bg --agent`、Codex `codex exec --json`)。`workflow.yaml` 红线:**不许**出现 `prompt:` / `system_prompt:` / `messages:` 字段(R3);agent 行为住 `.claude/agents/<role>.md`。该层的**编排级 HITL 批准**(`workflow.yaml` mode-as-state-SoT)、self-healing fix-loop、squad 跨 session 路由、5 类编排模式均随它一并推后;`ApprovalIR` 是该编排层的类型占位。
+`ccteam-flow` 设计目标是一个文件系统驱动的 thin orchestrator(声明式 `workflow.yaml` 拓扑 + trigger:`manual` / `schedule` / `gate` / `watch:<path>`;bg-job 形态 Claude `claude --bg --agent`、Codex `codex exec --json`)。`workflow.yaml` 红线:**不许**出现 `prompt:` / `system_prompt:` / `messages:` 字段(R3)。该层的**编排级 HITL 批准**(`workflow.yaml` mode-as-state-SoT)、self-healing fix-loop、squad 跨 session 路由、5 类编排模式均随它一并推后;`ApprovalIR` 是该编排层的类型占位。
 
 > 注:**per-session 交互式批准已 v0.8.7 落地**(§6.5 的 `PermissionMode::Hitl` + `PermissionRequest` hook,走 IM 弹窗),与此处推后的「编排层 workflow.yaml 批准 state SoT」是两件事 —— 前者是 hitl session 单工具放行/拒绝,后者是声明式编排的审批节点。非 hitl session 仍 `--dangerously-skip-permissions`。
 
