@@ -125,6 +125,13 @@ pub(crate) struct AgentsGraphQuery {
     slug: Option<String>,
 }
 
+/// How long ONE live session gets to report its statusline before the graph
+/// gives up on it and reports the node without `model`/`effort`. The snapshot
+/// is a fleet overview, not a per-session probe: a node's model is a nicety,
+/// while a stalled response blocks the whole team view. Per-session (not
+/// global) so one slow vendor never costs the others their model.
+const LIVE_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Project slugs `identity` may see (mirrors `api_v1::build_projects`'s
 /// per-tenant filter). Best-effort: a `collect_projects` failure degrades to
 /// "no projects visible" rather than 500ing the whole graph.
@@ -280,15 +287,43 @@ pub(crate) async fn handle_agents_graph(
             .collect();
         (live, armed, handles)
     };
-    // The live-statusline join (model + effort): N per-live-sid reads per
-    // snapshot (the SPA refreshes at 15s), through the SAME helper `GET
-    // /sessions/{sid}/status` serves — one source of truth for what a
-    // session is running.
-    let mut live_status: HashMap<String, ThreadStatus> = HashMap::new();
-    for (sid, adapter, thread) in live_handles {
-        let status = super::sessions_api::resolved_thread_status(adapter, thread, &sid).await;
-        live_status.insert(sid, status);
-    }
+    // The live-statusline join (model + effort): one per-live-sid read per
+    // snapshot, through the SAME helper `GET /sessions/{sid}/status` serves —
+    // one source of truth for what a session is running.
+    //
+    // BOUNDED BY CONSTRUCTION (2026-08-02). This used to be a sequential loop
+    // with no deadline, so the endpoint's latency was the SUM over live
+    // sessions of whatever each vendor took to answer — unbounded, and one
+    // stuck adapter held the whole team view hostage. Now the reads run
+    // concurrently and each carries its own deadline: a session that cannot
+    // answer in time is simply reported without `model`/`effort` (already a
+    // valid, honest response — an idle node reports the same). Worst-case
+    // latency is therefore one deadline regardless of fleet size, and any
+    // FUTURE adapter is covered without touching this code.
+    let live_status: HashMap<String, ThreadStatus> =
+        futures::future::join_all(live_handles.into_iter().map(
+            |(sid, adapter, thread)| async move {
+                match tokio::time::timeout(
+                    LIVE_STATUS_DEADLINE,
+                    super::sessions_api::resolved_thread_status(adapter, thread, &sid),
+                )
+                .await
+                {
+                    Ok(status) => Some((sid, status)),
+                    Err(_) => {
+                        tracing::warn!(
+                            %sid,
+                            "thread_status exceeded the graph deadline; reporting no model"
+                        );
+                        None
+                    }
+                }
+            },
+        ))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     let paths = app.paths.clone();
     let graph = build_agents_graph(
         |slug| paths.project_dir(slug),

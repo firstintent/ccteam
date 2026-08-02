@@ -44,10 +44,11 @@ export interface AgentsGraphResponse {
   hosts: string[];
 }
 
-async function getJson<T>(url: string): Promise<T> {
+async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, {
     headers: { Accept: "application/json" },
     credentials: "same-origin",
+    signal,
   });
   if (res.status === 401) throw new Error("UNAUTHENTICATED");
   if (!res.ok) throw await httpError(res);
@@ -60,6 +61,13 @@ export function agentsGraphUrl(slug?: string): string {
   return slug ? `/api/v1/agents/graph?slug=${encodeURIComponent(slug)}` : "/api/v1/agents/graph";
 }
 
-export function fetchAgentsGraph(slug?: string): Promise<AgentsGraphResponse> {
-  return getJson<AgentsGraphResponse>(agentsGraphUrl(slug));
+/** Fetch one graph snapshot. `signal` lets the caller ABORT an in-flight
+ *  request (unmount, or a poll superseded by a manual refresh) — without it a
+ *  slow link leaves the socket held after the view is gone, and the browser's
+ *  6-connections-per-origin cap starves every other request on the page. */
+export function fetchAgentsGraph(
+  slug?: string,
+  signal?: AbortSignal,
+): Promise<AgentsGraphResponse> {
+  return getJson<AgentsGraphResponse>(agentsGraphUrl(slug), signal);
 }

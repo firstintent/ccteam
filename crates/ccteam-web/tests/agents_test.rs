@@ -103,9 +103,18 @@ impl HarnessAdapter for FakeAdapter {
         Ok(DirectiveOutcome::Done { receipt: d.name })
     }
 
-    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
-        // Every LIVE session's statusline reports this model + effort — the
-        // graph's statusline join (TEAM-4) reads it through the same source
+    async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        // A session in the `stall` project models an adapter that cannot answer
+        // (a wedged vendor transport / a huge blocking transcript read). The
+        // graph must NOT wait on it — see
+        // `agents_graph_survives_a_stalled_adapter`. Keyed off the handle
+        // identity (`{slug}-{sid}`) so it needs no shared mutable state and
+        // stays correct under parallel tests.
+        if h.identity.starts_with("stall-") {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+        // Every other LIVE session's statusline reports this model + effort —
+        // the graph's statusline join (TEAM-4) reads it through the same source
         // as `GET /sessions/{sid}/status`.
         Ok(ThreadStatus {
             model: Some("agents-test-model".to_string()),
@@ -163,10 +172,20 @@ fn register_project(paths: &CcteamPaths, slug: &str, owner: Option<&str>) -> std
 /// twin (unconditional — see `Gateway::emit_delegation_progress`).
 /// Returns `(gateway, child_sid)`.
 async fn spawn_delegated_child(project_dir: std::path::PathBuf) -> (Gateway, String) {
-    let mut gateway = Gateway::new_with_factory(factory(), "demo", project_dir);
+    spawn_delegated_child_in("demo", project_dir).await
+}
+
+/// [`spawn_delegated_child`] for an arbitrary slug (the slug reaches the
+/// `FakeAdapter` through the handle identity, which is how the stalled-adapter
+/// test selects its behaviour).
+async fn spawn_delegated_child_in(
+    slug: &str,
+    project_dir: std::path::PathBuf,
+) -> (Gateway, String) {
+    let mut gateway = Gateway::new_with_factory(factory(), slug, project_dir);
     let outcome = gateway
         .create_delegated_session(
-            "demo".to_string(),
+            slug.to_string(),
             "worker".to_string(),
             AgentVendor::Claude,
             PermissionMode::Skip,
@@ -421,6 +440,65 @@ async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
     assert!(
         idle["effort"].is_null(),
         "idle node has no live effort to report: {body}"
+    );
+}
+
+/// 2026-08-02 — ONE stuck adapter must not cost the whole team view.
+///
+/// The statusline join used to be a sequential loop with no deadline, so the
+/// endpoint's latency was the SUM over live sessions of however long each
+/// vendor took — unbounded. A single wedged transport (or a live session whose
+/// transcript read blocked) held the entire graph, the SPA's poller stacked up
+/// behind it, and the browser's per-origin connection budget filled with stuck
+/// requests until nothing on the page could load.
+///
+/// The graph must now answer within its per-session deadline and report the
+/// unresponsive node honestly (`model`/`effort` absent — exactly what an idle
+/// node reports), not hang. `stall-*` sessions sleep 30s in `thread_status`, so
+/// under the old sequential-and-unbounded shape this test would take 30s and
+/// blow the assertion below.
+#[tokio::test]
+async fn agents_graph_survives_a_stalled_adapter() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = register_project(&paths, "stall", None);
+
+    let (gateway, child_sid) = spawn_delegated_child_in("stall", project_dir.clone()).await;
+
+    let gw = Arc::new(tokio::sync::Mutex::new(gateway));
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into())).with_gateway(gw);
+    let addr = spawn(state).await;
+
+    let started = std::time::Instant::now();
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/agents/graph"))
+        .header("Authorization", bearer(ADMIN_HEX))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let elapsed = started.elapsed();
+    let body: Value = resp.json().await.unwrap();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the graph must not wait on a stalled adapter (took {elapsed:?})"
+    );
+    let node = body["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["sid"] == child_sid.as_str())
+        .unwrap_or_else(|| panic!("expected node {child_sid} in {body}"));
+    // Still reported, still honestly LIVE — only its statusline is missing.
+    assert_eq!(node["status"], Value::String("live".to_string()));
+    assert!(
+        node["model"].is_null(),
+        "a session that missed the deadline reports no model: {body}"
+    );
+    assert!(
+        node["effort"].is_null(),
+        "a session that missed the deadline reports no effort: {body}"
     );
 }
 

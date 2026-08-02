@@ -4,6 +4,18 @@
 // controlled backoff 1s→30s cap 7 retries; `reconnect_hint` → close+reopen);
 // reuses its exported, sid-agnostic `shouldAcceptEventSeq` so the two hooks'
 // reconnect-dedup logic can never drift apart.
+//
+// ONE CONNECTION, MANY CONSUMERS (2026-08-02). This endpoint is GLOBAL — every
+// consumer asks for the same feed — but the hook used to open its own stream
+// per call site, so `AgentsView` + `ChatConsole` mounted together held TWO
+// sockets and downloaded the identical frames twice. A browser opens only ~6
+// HTTP/1.1 connections per origin, so duplicate streams spend a scarce,
+// permanently-held resource for nothing and bring socket exhaustion (every
+// other request on the page stuck pending) that much closer. The stream now
+// lives in a module-level broker that refcounts its subscribers: N consumers
+// share one connection and one reconnect watermark, and any FUTURE consumer is
+// covered automatically. Each subscriber still keeps its own filtered ring, so
+// the hook's contract is unchanged.
 
 import { useEffect, useRef, useState } from "react";
 import { createAuthedEventSource } from "../lib/authedEventSource";
@@ -106,6 +118,175 @@ export function appendAgentsEvent(prev: AgentsEvent[], event: AgentsEvent): Agen
   return [...prev, event];
 }
 
+/** Connection health, broadcast to every subscriber of the shared stream. */
+export interface AgentsStreamStatus {
+  connected: boolean;
+  lastError: string | null;
+  gatewayUnavailable: boolean;
+}
+
+/** What a subscriber hands the broker: one callback per frame, one for health. */
+export interface AgentsStreamSubscriber {
+  onFrame(event: AgentsEvent): void;
+  onStatus(status: AgentsStreamStatus): void;
+}
+
+/** The bits of `AuthedEventSource` the broker needs — injectable so the
+ *  sharing/refcount invariants are testable without a real network. */
+export interface AgentsEventSourceLike {
+  addEventListener(type: string, listener: EventListener): void;
+  close(): void;
+}
+
+export interface AgentsStreamEnvironment {
+  createEventSource(url: string): AgentsEventSourceLike;
+  setTimer(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
+  clearTimer(timer: ReturnType<typeof setTimeout>): void;
+}
+
+const defaultEnv: AgentsStreamEnvironment = {
+  // fetch-backed (Bearer + cookie), same as useSessionEvents — native
+  // EventSource is cookie-only and 401s when localStorage Bearer is the
+  // only live auth path.
+  createEventSource: (url) => createAuthedEventSource(url),
+  setTimer: (callback, delay) => setTimeout(callback, delay),
+  clearTimer: (timer) => clearTimeout(timer),
+};
+
+/** The single shared stream. `lastSeenSeq` survives the last unsubscribe so a
+ *  remount resumes from its watermark instead of replaying the whole ring. */
+const broker = {
+  subscribers: new Set<AgentsStreamSubscriber>(),
+  source: null as AgentsEventSourceLike | null,
+  retryTimer: null as ReturnType<typeof setTimeout> | null,
+  retryCount: 0,
+  lastSeenSeq: 0,
+  status: {
+    connected: false,
+    lastError: null,
+    gatewayUnavailable: false,
+  } as AgentsStreamStatus,
+  env: defaultEnv,
+};
+
+function publishStatus(patch: Partial<AgentsStreamStatus>): void {
+  broker.status = { ...broker.status, ...patch };
+  for (const sub of broker.subscribers) sub.onStatus(broker.status);
+}
+
+function connectBroker(): void {
+  if (broker.subscribers.size === 0) return;
+  const es = broker.env.createEventSource(agentsEventsUrl(broker.lastSeenSeq));
+  broker.source = es;
+  // Ignore a stream we have already replaced or closed (a late frame from an
+  // aborted fetch must not advance the shared watermark).
+  const current = () => broker.source === es;
+
+  const onFrame = (ev: Event) => {
+    if (!current()) return;
+    const msgEvent = ev as MessageEvent;
+    const decision = shouldAcceptEventSeq(msgEvent.lastEventId, broker.lastSeenSeq);
+    broker.lastSeenSeq = decision.nextHighest;
+    if (!decision.accept) return;
+    const parsed = parseAgentsEvent(msgEvent.data);
+    if (!parsed) return;
+    for (const sub of broker.subscribers) sub.onFrame(parsed);
+  };
+
+  es.addEventListener("open", () => {
+    if (!current()) return;
+    broker.retryCount = 0;
+    publishStatus({ connected: true, lastError: null });
+  });
+
+  // The named event types the server emits (see
+  // `crate::routes::agents::agents_event`) — all carry the SAME JSON shape,
+  // just a different SSE `event:` name.
+  es.addEventListener("progress", onFrame);
+  es.addEventListener("delegation", onFrame);
+  es.addEventListener("session_lifecycle", onFrame);
+
+  es.addEventListener("gateway_unavailable", () => {
+    if (!current()) return;
+    publishStatus({ gatewayUnavailable: true });
+  });
+
+  es.addEventListener("reconnect_hint", () => {
+    if (!current()) return;
+    es.close();
+    broker.source = null;
+    scheduleBrokerReconnect("server requested reconnect");
+  });
+
+  es.addEventListener("error", () => {
+    if (!current()) return;
+    es.close();
+    broker.source = null;
+    scheduleBrokerReconnect("connection lost");
+  });
+}
+
+function scheduleBrokerReconnect(reason: string): void {
+  publishStatus({ connected: false });
+  if (broker.subscribers.size === 0) return;
+  if (broker.retryCount >= MAX_RETRIES) {
+    publishStatus({ lastError: `SSE max retries reached (${reason})` });
+    return;
+  }
+  broker.retryCount += 1;
+  const delay = retryDelayMs(broker.retryCount);
+  broker.retryTimer = broker.env.setTimer(() => {
+    broker.retryTimer = null;
+    connectBroker();
+  }, delay);
+}
+
+function teardownBroker(): void {
+  if (broker.retryTimer !== null) {
+    broker.env.clearTimer(broker.retryTimer);
+    broker.retryTimer = null;
+  }
+  broker.source?.close();
+  broker.source = null;
+  broker.retryCount = 0;
+  broker.status = { connected: false, lastError: null, gatewayUnavailable: false };
+}
+
+/** Join the shared global stream; returns the unsubscribe. The connection opens
+ *  on the FIRST subscriber and closes after the LAST one leaves. */
+export function subscribeAgentsStream(
+  subscriber: AgentsStreamSubscriber,
+  env?: AgentsStreamEnvironment,
+): () => void {
+  if (env) broker.env = env;
+  const first = broker.subscribers.size === 0;
+  broker.subscribers.add(subscriber);
+  if (first) {
+    connectBroker();
+  } else {
+    // Late joiner: hand it the current health immediately rather than leave it
+    // showing "disconnected" until the next transition.
+    subscriber.onStatus(broker.status);
+  }
+  return () => {
+    broker.subscribers.delete(subscriber);
+    if (broker.subscribers.size === 0) teardownBroker();
+  };
+}
+
+/** Test-only: drop every subscriber and close the shared stream. */
+export function resetAgentsStreamForTests(): void {
+  broker.subscribers.clear();
+  teardownBroker();
+  broker.lastSeenSeq = 0;
+  broker.env = defaultEnv;
+}
+
+/** Test-only: how many consumers share the stream, and whether it is open. */
+export function agentsStreamDebugState(): { subscribers: number; open: boolean } {
+  return { subscribers: broker.subscribers.size, open: broker.source !== null };
+}
+
 export function useAgentsEvents(
   enabled: boolean = true,
   filter: "all" | "session_lifecycle" = "all",
@@ -114,23 +295,16 @@ export function useAgentsEvents(
   const [connected, setConnected] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [gatewayUnavailable, setGatewayUnavailable] = useState(false);
-  const lastSeenSeqRef = useRef(0);
-  // fetch-backed (Bearer + cookie), same as useSessionEvents — native
-  // EventSource is cookie-only and 401s when localStorage Bearer is the
-  // only live auth path.
-  const esRef = useRef<ReturnType<typeof createAuthedEventSource> | null>(null);
-  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const retryCountRef = useRef(0);
+  // Read the filter through a ref so switching it never re-subscribes (which
+  // would churn the shared connection for every consumer). Refreshed in an
+  // effect declared BEFORE the subscribe effect, never during render.
+  const filterRef = useRef(filter);
+  useEffect(() => {
+    filterRef.current = filter;
+  }, [filter]);
 
   useEffect(() => {
     if (!enabled) {
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
-      esRef.current?.close();
-      esRef.current = null;
-      retryCountRef.current = 0;
       let cancelled = false;
       queueMicrotask(() => {
         if (cancelled) return;
@@ -142,85 +316,18 @@ export function useAgentsEvents(
         cancelled = true;
       };
     }
-
-    let cancelled = false;
-
-    const onFrame = (ev: Event) => {
-      if (cancelled) return;
-      const msgEvent = ev as MessageEvent;
-      const decision = shouldAcceptEventSeq(msgEvent.lastEventId, lastSeenSeqRef.current);
-      lastSeenSeqRef.current = decision.nextHighest;
-      if (!decision.accept) return;
-      const parsed = parseAgentsEvent(msgEvent.data);
-      if (parsed && (filter === "all" || parsed.kind === "session_lifecycle")) {
-        setEvents((prev) => appendAgentsEvent(prev, parsed));
-      }
-    };
-
-    const connect = () => {
-      if (cancelled) return;
-      const es = createAuthedEventSource(agentsEventsUrl(lastSeenSeqRef.current));
-      esRef.current = es;
-
-      es.addEventListener("open", () => {
-        if (cancelled) return;
-        retryCountRef.current = 0;
-        setConnected(true);
-        setLastError(null);
-      });
-
-      // The two named event types the server emits (see
-      // `crate::routes::agents::agents_event`) — both carry the SAME JSON
-      // shape, just a different SSE `event:` name.
-      es.addEventListener("progress", onFrame);
-      es.addEventListener("delegation", onFrame);
-      es.addEventListener("session_lifecycle", onFrame);
-
-      es.addEventListener("gateway_unavailable", () => {
-        if (cancelled) return;
-        setGatewayUnavailable(true);
-      });
-
-      es.addEventListener("reconnect_hint", () => {
-        if (cancelled) return;
-        es.close();
-        scheduleReconnect("server requested reconnect");
-      });
-
-      es.addEventListener("error", () => {
-        if (cancelled) return;
-        es.close();
-        scheduleReconnect("connection lost");
-      });
-    };
-
-    const scheduleReconnect = (reason: string) => {
-      setConnected(false);
-      if (retryCountRef.current >= MAX_RETRIES) {
-        setLastError(`SSE max retries reached (${reason})`);
-        return;
-      }
-      retryCountRef.current += 1;
-      const delay = retryDelayMs(retryCountRef.current);
-      retryTimerRef.current = setTimeout(() => {
-        retryTimerRef.current = null;
-        connect();
-      }, delay);
-    };
-
-    connect();
-
-    return () => {
-      cancelled = true;
-      if (retryTimerRef.current) {
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = null;
-      }
-      esRef.current?.close();
-      esRef.current = null;
-      retryCountRef.current = 0;
-    };
-  }, [enabled, filter]);
+    return subscribeAgentsStream({
+      onFrame: (event) => {
+        if (filterRef.current !== "all" && event.kind !== filterRef.current) return;
+        setEvents((prev) => appendAgentsEvent(prev, event));
+      },
+      onStatus: (status) => {
+        setConnected(status.connected);
+        setLastError(status.lastError);
+        setGatewayUnavailable(status.gatewayUnavailable);
+      },
+    });
+  }, [enabled]);
 
   return { events, connected, lastError, gatewayUnavailable };
 }

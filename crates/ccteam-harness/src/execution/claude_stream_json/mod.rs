@@ -760,9 +760,21 @@ fn read_latest_goal_status(cwd: &Path, uuid: &str) -> Option<crate::GoalStatus> 
 /// Scan transcript jsonl lines for the LAST `goal_status` attachment. A later
 /// `/goal clear` (or an empty condition) resets it to `None`. Pure (no fs) so
 /// it is unit-testable; `read_latest_goal_status` wraps it with the file read.
+///
+/// COST DISCIPLINE (2026-08-02): the tail handed here is up to 8 MB and this
+/// runs on every statusline read — per live session on the team graph, so a
+/// naive full parse is tens of millions of JSON parses per page refresh. Two
+/// properties keep it cheap without changing the answer:
+/// - scan from the END and return the first hit (the LAST record — identical
+///   result, but an active goal is found within a few lines);
+/// - `contains` pre-filter before `serde_json` (a goal record is rare, and
+///   substring scanning is orders of magnitude cheaper than parsing).
 fn parse_latest_goal_status(body: &str) -> Option<crate::GoalStatus> {
-    let mut latest: Option<crate::GoalStatus> = None;
-    for line in body.lines() {
+    for line in body.lines().rev() {
+        // Cheap reject: only lines that literally mention the marker can match.
+        if !line.contains("goal_status") {
+            continue;
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -778,14 +790,16 @@ fn parse_latest_goal_status(body: &str) -> Option<crate::GoalStatus> {
             .unwrap_or("")
             .to_string();
         let met = att.get("met").and_then(|m| m.as_bool()).unwrap_or(false);
-        // A cleared goal carries an empty condition → no active goal.
-        latest = if condition.trim().is_empty() {
+        // A cleared goal carries an empty condition → no active goal. This is
+        // the LAST record, so it decides on its own — nothing earlier can
+        // revive a cleared goal.
+        return if condition.trim().is_empty() {
             None
         } else {
             Some(crate::GoalStatus { condition, met })
         };
     }
-    latest
+    None
 }
 
 /// Translate one outbound message and forward its events to the stream's
@@ -1665,12 +1679,22 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let mut status = if live_ready {
             live.unwrap()
         } else {
-            let persisted = h
+            // `read_status_file` is sync fs — off the runtime (see the goal read
+            // below for why this matters on this code path).
+            let persisted = match h
                 .raw_extras
                 .get("project_dir")
                 .and_then(|v| v.as_str())
                 .zip(h.raw_extras.get("sid").and_then(|v| v.as_str()))
-                .and_then(|(pd, sid)| read_status_file(Path::new(pd), sid));
+            {
+                Some((pd, sid)) => {
+                    let (pd, sid) = (PathBuf::from(pd), sid.to_string());
+                    tokio::task::spawn_blocking(move || read_status_file(&pd, &sid))
+                        .await
+                        .unwrap_or(None)
+                }
+                None => None,
+            };
             match (live, persisted) {
                 // Live (model from init, no turn yet) + persisted context → show
                 // the live model with the last-known context.
@@ -1688,8 +1712,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // The `/goal` is NOT on the stream-json stream and has no control_request
         // (probed) — read the current one from the transcript (cwd + the vendor
         // uuid name the file). Overrides any goal from a persisted snapshot.
+        //
+        // OFF THE RUNTIME (2026-08-02): this is SYNC fs — it seeks and reads up
+        // to 8 MB, then scans it. Doing that inside an `async fn` parks a Tokio
+        // worker thread, and this call is fanned out per live session by the
+        // team graph, so enough live sessions starve the runtime and EVERY
+        // endpoint the daemon serves (plus every vendor event pump) stalls
+        // behind it. `spawn_blocking` keeps the cost on the blocking pool where
+        // it belongs.
         if let Some(cwd) = h.raw_extras.get("cwd").and_then(|v| v.as_str()) {
-            status.goal = read_latest_goal_status(Path::new(cwd), &h.identity);
+            let (cwd, uuid) = (PathBuf::from(cwd), h.identity.clone());
+            status.goal = tokio::task::spawn_blocking(move || read_latest_goal_status(&cwd, &uuid))
+                .await
+                .unwrap_or(None);
         }
         Ok(status)
     }

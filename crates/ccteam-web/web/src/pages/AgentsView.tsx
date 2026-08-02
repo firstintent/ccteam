@@ -29,13 +29,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { fetchAgentsGraph, type AgentEdge, type AgentNode, type AgentsGraphResponse } from "../lib/agentsApi";
 import {
-  applyDelegationEvent,
   delegationToast,
+  reduceDelegationEvents,
   sidsActiveWithin,
   type TimestampedAgentsEvent,
 } from "../lib/agentsReducer";
 import { groupDelegationTrees } from "../lib/agentsTree";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
+import { usePolledSnapshot } from "../hooks/usePolledSnapshot";
 import { VendorChip } from "../components/VendorChip";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
@@ -46,7 +47,12 @@ import { toastBus } from "../lib/toastBus";
 import CharterPanel from "./CharterPanel";
 
 const PULSE_WINDOW_MS = 60_000;
+/** Quiet gap between snapshot refreshes (NOT a fixed rate — see
+ *  `usePolledSnapshot`: the next request starts this long after the previous
+ *  one finishes, so requests can never overlap). */
 const GRAPH_REFRESH_MS = 15_000;
+/** Stable empty snapshot so the poller's initial value never changes identity. */
+const EMPTY_GRAPH: AgentsGraphResponse = { nodes: [], edges: [], hosts: [] };
 const EVENT_LOG_CAP = 500;
 const TICKER_SIZE = 5;
 
@@ -405,11 +411,8 @@ export default function AgentsView({
   const t = makeT(lang);
 
   const [tab, setTab] = useState<"topology" | "charter">(initialTab ?? "topology");
-  const [graph, setGraph] = useState<AgentsGraphResponse>({ nodes: [], edges: [], hosts: [] });
-  const [edges, setEdges] = useState<AgentEdge[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [vendorFilter, setVendorFilter] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [historyBySid, setHistoryBySid] = useState<Record<string, SessionHistoryEvent[]>>({});
   const [now, setNow] = useState(() => Date.now());
   const [timestamped, setTimestamped] = useState<TimestampedAgentsEvent[]>([]);
@@ -418,30 +421,25 @@ export default function AgentsView({
   const seenCountRef = useRef(0);
 
   // ---- snapshot: initial load + periodic refresh (catches anything the
-  // event-log reducer alone can't derive, e.g. a brand-new root session) ----
-  useEffect(() => {
-    let cancelled = false;
-    const load = () => {
-      fetchAgentsGraph()
-        .then((g) => {
-          if (cancelled) return;
-          setGraph(g);
-          setEdges(g.edges);
-        })
-        .catch(() => {
-          /* best-effort: the page just keeps showing the last good snapshot */
-        })
-        .finally(() => {
-          if (!cancelled) setLoading(false);
-        });
-    };
-    load();
-    const id = window.setInterval(load, GRAPH_REFRESH_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, []);
+  // event-log reducer alone can't derive, e.g. a brand-new root session).
+  // `usePolledSnapshot` keeps at most ONE request in flight and schedules the
+  // next from the previous one's completion, so a slow link degrades to a
+  // lower refresh rate instead of a growing pile of stuck requests that
+  // exhausts the browser's per-origin connection budget. ----
+  const { data: graph, loading } = usePolledSnapshot<AgentsGraphResponse>(
+    (signal) => fetchAgentsGraph(undefined, signal),
+    EMPTY_GRAPH,
+    { intervalMs: GRAPH_REFRESH_MS },
+  );
+
+  // Edges are DERIVED, not stored: the snapshot's server-seeded `active` flags
+  // with the live delegation log folded on top. Deriving (rather than copying
+  // the snapshot into state and mutating it) means a refresh can never drop a
+  // live correction, and there is no snapshot→setState cascade.
+  const edges = useMemo(
+    () => reduceDelegationEvents(graph.edges, timestamped),
+    [graph.edges, timestamped],
+  );
 
   // ---- fold fresh SSE frames: edge active state + denial toasts + the
   // timestamped log the pulse/activity/ticker all read from ----
@@ -454,7 +452,6 @@ export default function AgentsView({
       const merged = [...prev, ...fresh.map((e) => ({ ...e, receivedAt: at }))];
       return merged.length > EVENT_LOG_CAP ? merged.slice(merged.length - EVENT_LOG_CAP) : merged;
     });
-    setEdges((prev) => fresh.reduce(applyDelegationEvent, prev));
     for (const ev of fresh) {
       const msg = delegationToast(ev);
       if (msg) toastBus.handler?.error(msg);
