@@ -8,6 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+use ccteam_harness::execution::turns_mirror::AttachmentRef;
 use ccteam_im::transport::{Channel, ChannelMessage, ChoiceReply, SendMessage};
 use ccteam_web::chat_protocol::{WebChannelMessage, WebMessageOption, WebSendMessage};
 use ccteam_web::{ChatConns, CHAT_BACKLOG_CAP};
@@ -56,11 +57,17 @@ impl Channel for WebChatChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let attachments = message
+            .attachments
+            .iter()
+            .map(web_attachment_ref)
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let message = WebSendMessage {
             content: message.content.clone(),
             recipient: message.recipient.clone(),
             subject: message.subject.clone(),
             thread_ts: message.thread_ts.clone(),
+            attachments,
             // v0.8.5 D3: carry choice options through to the browser chips.
             options: message
                 .options
@@ -113,6 +120,19 @@ impl Channel for WebChatChannel {
     async fn health_check(&self) -> bool {
         true
     }
+}
+
+/// Convert the daemon-internal outbound file to the reference-only browser
+/// shape. The project upload handle is mandatory on the web channel; the
+/// arbitrary source path is used only to derive display metadata and never
+/// crosses the wire.
+fn web_attachment_ref(file: &ccteam_im::transport::OutboundFile) -> anyhow::Result<AttachmentRef> {
+    file.attachment_ref().map_err(|err| {
+        anyhow::anyhow!(
+            "build web reference for outbound attachment {}: {err}",
+            file.path
+        )
+    })
 }
 
 fn to_im_message(message: WebChannelMessage) -> ChannelMessage {
@@ -237,6 +257,33 @@ mod tests {
         });
         assert_eq!(plain.selection, None);
         assert_eq!(plain.content, "hi");
+    }
+
+    #[tokio::test]
+    async fn bridge_carries_reference_only_outbound_attachments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("chart.png");
+        std::fs::write(&source, b"png").unwrap();
+        let bridge = build();
+        let mut outbound = bridge.outbound_tx.subscribe();
+        let message = SendMessage::new("chart attached", "web-api").with_attachments(vec![
+            ccteam_im::transport::OutboundFile {
+                id: "1780000000000-chart.png".into(),
+                path: source.to_string_lossy().into_owned(),
+                caption: None,
+                kind: ccteam_im::transport::OutboundFileKind::Photo,
+            },
+        ]);
+
+        bridge.channel.send(&message).await.unwrap();
+        let sent = outbound.recv().await.unwrap();
+        assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].id, "1780000000000-chart.png");
+        assert_eq!(sent.attachments[0].name, "chart.png");
+        assert_eq!(sent.attachments[0].size, 3);
+        let wire = serde_json::to_string(&sent).unwrap();
+        assert!(!wire.contains(source.to_string_lossy().as_ref()));
+        assert!(!wire.contains("base64"));
     }
 
     #[derive(Default)]
@@ -572,7 +619,7 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "timed out waiting for reply containing {needle:?}"
             );
-            if let ServerChatFrame::Reply { content } = recv_frame(socket, needle).await {
+            if let ServerChatFrame::Reply { content, .. } = recv_frame(socket, needle).await {
                 if content.contains(needle) {
                     return;
                 }
@@ -591,7 +638,7 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "timed out waiting for replies containing {needles:?}"
             );
-            if let ServerChatFrame::Reply { content } = recv_frame(socket, "reply set").await {
+            if let ServerChatFrame::Reply { content, .. } = recv_frame(socket, "reply set").await {
                 for (idx, needle) in needles.iter().enumerate() {
                     if content.contains(needle) {
                         seen[idx] = true;

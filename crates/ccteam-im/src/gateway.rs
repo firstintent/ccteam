@@ -612,8 +612,9 @@ pub struct GatewayEvent {
     /// tracked session's event pump / turn watchdog (V0.8.6 W5b). This is
     /// the **SSE filter key**: a per-session web SSE handler keeps only the
     /// events whose `sid` matches the session it is streaming. `None` for
-    /// events not tied to a session (e.g. the `chat_send_file` MCP path and
-    /// the D6 `interaction/ask` hook prompt, which have no gateway session).
+    /// events not tied to a session (e.g. the D6 `interaction/ask` hook
+    /// prompt). A web-bound `chat_send_file` is server-resolved to its caller
+    /// sid; IM-only file delivery keeps this unset.
     /// The IM delivery path ignores `sid` entirely — it routes by `channel`
     /// + `chat_id` as before — so this is additive.
     pub sid: Option<String>,
@@ -1536,6 +1537,13 @@ impl Gateway {
     /// existing broadcast `Sender` and registers a new `Receiver`.
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<GatewayEvent> {
         self.events_broadcast.subscribe()
+    }
+
+    /// Publish an event that entered through the daemon-side MCP dispatcher
+    /// rather than a harness event pump. Delivery still uses the dispatcher's
+    /// shared mpsc exactly once; this adds only the per-session SSE twin.
+    pub fn broadcast_external_event(&self, event: GatewayEvent) {
+        let _ = self.events_broadcast.send(event);
     }
 
     /// Inject the shared pending-interaction registry (v0.8.5). The daemon
@@ -4453,6 +4461,7 @@ impl Gateway {
                                     assistant: text.clone(),
                                     usage: serde_json::Value::Null,
                                     tool_calls: Vec::new(),
+                                    attachments: Vec::new(),
                                     outcome: failure.map(|_| "failed".to_string()),
                                     error_kind: failure.map(|err| err.kind.clone()),
                                     error: failure.map(|err| err.message.clone()),
@@ -5381,6 +5390,7 @@ impl Gateway {
             assistant: String::new(),
             usage: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            attachments: Vec::new(),
             outcome: None,
             error_kind: None,
             error: None,
@@ -13167,6 +13177,7 @@ mod tests {
             assistant: who.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            attachments: vec![],
             outcome: None,
             error_kind: None,
             error: None,
@@ -15174,6 +15185,7 @@ mod tests {
                 assistant: "LGTM, two nits inline.".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                attachments: vec![],
                 outcome: None,
                 error_kind: None,
                 error: None,
@@ -20185,6 +20197,7 @@ mod tests {
                 assistant: "the research is done".into(),
                 usage: serde_json::Value::Null,
                 tool_calls: vec![],
+                attachments: vec![],
                 outcome: None,
                 error_kind: None,
                 error: None,
@@ -20275,6 +20288,7 @@ mod tests {
                     assistant: format!("checkpoint {n}"),
                     usage: serde_json::Value::Null,
                     tool_calls: vec![],
+                    attachments: vec![],
                     outcome: None,
                     error_kind: None,
                     error: None,

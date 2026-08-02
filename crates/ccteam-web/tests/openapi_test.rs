@@ -119,6 +119,7 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("PUT", "/api/v1/projects/{slug}/routing"),
         // composer attachments — project uploads + installed-skill picker
         ("POST", "/api/v1/projects/{slug}/uploads"),
+        ("GET", "/api/v1/projects/{slug}/uploads/{name}"),
         ("GET", "/api/v1/projects/{slug}/skills"),
         ("GET", "/api/v1/skills"),
         // sessions (gateway spine)

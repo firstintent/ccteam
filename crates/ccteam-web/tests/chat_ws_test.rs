@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ccteam_core::CcteamPaths;
+use ccteam_harness::execution::turns_mirror::{AttachmentRef, AttachmentRefKind};
 use ccteam_web::chat_protocol::{ClientChatFrame, ServerChatFrame, WebSendMessage, SUBPROTOCOL};
 use ccteam_web::{router_with_state, AppState, AuthState};
 use futures_util::{SinkExt, StreamExt};
@@ -141,14 +142,26 @@ async fn chat_ws_forwards_text_to_inbound_and_renders_outbound_reply() {
     assert_eq!(inbound.channel, "web");
     assert_eq!(inbound.content, "hello");
 
-    let outbound = WebSendMessage::new("hi from gateway", "chat-1");
+    let mut outbound = WebSendMessage::new("hi from gateway", "chat-1");
+    outbound.attachments.push(AttachmentRef {
+        id: "1780000000000-chart.png".into(),
+        name: "chart.png".into(),
+        kind: AttachmentRefKind::Image,
+        size: 42,
+    });
     backlog.lock().await.push(outbound.clone());
     out_tx.send(outbound).unwrap();
     let reply = recv_server_frame(&mut ws).await;
     assert_eq!(
         reply,
         ServerChatFrame::Reply {
-            content: "hi from gateway".into()
+            content: "hi from gateway".into(),
+            attachments: vec![AttachmentRef {
+                id: "1780000000000-chart.png".into(),
+                name: "chart.png".into(),
+                kind: AttachmentRefKind::Image,
+                size: 42,
+            }],
         }
     );
     let _ = ws.close(None).await;
@@ -227,7 +240,8 @@ async fn chat_ws_outbound_replies_are_scoped_by_chat_id() {
     assert_eq!(
         reply,
         ServerChatFrame::Reply {
-            content: "only chat two".into()
+            content: "only chat two".into(),
+            attachments: Vec::new(),
         }
     );
 

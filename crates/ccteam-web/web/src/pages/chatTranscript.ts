@@ -14,7 +14,7 @@ import type {
   SessionEvent,
   SessionEventOption,
 } from "../hooks/useSessionEvents";
-import type { SessionHistoryEvent } from "../lib/sessionsApi";
+import type { OutboundAttachmentRef, SessionHistoryEvent } from "../lib/sessionsApi";
 
 export type RowKind = "user" | "assistant" | "tool" | "system" | "approval" | "activity";
 
@@ -28,6 +28,9 @@ export interface TranscriptRow {
   id: string;
   kind: RowKind;
   content: string;
+  /** Project asset references only; rendering constructs a fixed same-origin
+   * URL from `id` and never accepts a URL or byte payload from this state. */
+  attachments?: OutboundAttachmentRef[];
   /** Approval-only: the options to render as buttons (`{label, id}`). */
   options?: SessionEventOption[];
   /** Approval-only: the pending-resolution token the resolve POST carries
@@ -100,8 +103,13 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
     };
   }
   if (ev.kind === "answer") {
-    if (!ev.content) return null;
-    return { id: ev.id ?? nextRowId("assistant"), kind: "assistant", content: ev.content };
+    if (!ev.content && (!ev.attachments || ev.attachments.length === 0)) return null;
+    return {
+      id: ev.id ?? nextRowId("assistant"),
+      kind: "assistant",
+      content: ev.content,
+      attachments: ev.attachments,
+    };
   }
   // progress — only surface a finalizing edit with text (status churn is noise).
   if (ev.done && ev.content) {
@@ -261,8 +269,13 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
     if (ev.user) {
       rows.push({ id: `${ev.turn_id}-u`, kind: "user", content: ev.user });
     }
-    if (ev.assistant) {
-      rows.push({ id: `${ev.turn_id}-a`, kind: "assistant", content: ev.assistant });
+    if (ev.assistant || (ev.attachments && ev.attachments.length > 0)) {
+      rows.push({
+        id: `${ev.turn_id}-a`,
+        kind: "assistant",
+        content: ev.assistant,
+        attachments: ev.attachments,
+      });
     }
   }
   return rows;

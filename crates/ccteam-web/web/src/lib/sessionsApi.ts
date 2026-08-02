@@ -61,17 +61,34 @@ export interface SessionView {
 /** One history event from `GET /api/v1/sessions/{sid}` — a mirrored turn
  *  (`crates/ccteam-web/src/routes/sessions_api.rs::turn_to_event`). Used to
  *  seed a reopened per-session transcript before live SSE takes over. */
+export interface OutboundAttachmentRef {
+  /** Stored basename under the owning project's `.ccteam/uploads/`. */
+  id: string;
+  /** Human-readable source name. */
+  name: string;
+  kind: "image" | "file";
+  size: number;
+}
+
 export interface SessionHistoryEvent {
   turn_id: string;
   ts: string;
   role: string;
   user: string;
   assistant: string;
+  /** Reference metadata only — never bytes, base64, daemon paths, or URLs. */
+  attachments?: OutboundAttachmentRef[];
 }
 
 export interface SessionHistory {
   sid: string;
   events: SessionHistoryEvent[];
+}
+
+/** Authenticated same-origin URL for one project attachment. Hardcoded path
+ * construction keeps `data:`/`blob:` and agent-supplied URLs out of the DOM. */
+export function projectUploadUrl(slug: string, id: string): string {
+  return `/api/v1/projects/${encodeURIComponent(slug)}/uploads/${encodeURIComponent(id)}`;
 }
 
 /** Context-window usage for a session (`SessionStatus.context`). `pct` is a

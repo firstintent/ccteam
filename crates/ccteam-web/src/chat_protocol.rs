@@ -4,6 +4,7 @@
 //! `ccteam-web` does not depend on `ccteam-im`. The CLI gateway wiring
 //! translates these neutral shapes to/from the IM transport types.
 
+use ccteam_harness::execution::turns_mirror::AttachmentRef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,10 @@ pub enum ServerChatFrame {
     },
     Reply {
         content: String,
+        /// Project-scoped references only; raw file bytes and daemon paths
+        /// are structurally absent from the browser wire type.
+        #[serde(default)]
+        attachments: Vec<AttachmentRef>,
     },
     TurnDone {
         session: String,
@@ -112,6 +117,11 @@ pub struct WebSendMessage {
     pub recipient: String,
     pub subject: Option<String>,
     pub thread_ts: Option<String>,
+    /// Project-scoped attachment references. The browser resolves `id`
+    /// through the authenticated upload read route; this type has no byte or
+    /// source-path field.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRef>,
     /// Selectable options rendered as chips (v0.8.5 D3). Empty ⇒ ordinary
     /// message.
     #[serde(default)]
@@ -125,6 +135,7 @@ impl WebSendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            attachments: Vec::new(),
             options: Vec::new(),
         }
     }
@@ -196,6 +207,7 @@ mod tests {
         });
         round_trip_server(ServerChatFrame::Reply {
             content: "done".into(),
+            attachments: Vec::new(),
         });
         round_trip_server(ServerChatFrame::TurnDone {
             session: "s1".into(),

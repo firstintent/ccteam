@@ -32,6 +32,29 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A browser-safe reference to one project-scoped outbound attachment.
+///
+/// The file bytes stay under `<project>/.ccteam/uploads/`; transcript and
+/// web wire shapes carry only this metadata. `id` is the stored basename and
+/// is resolved by the project-ACL'd upload read route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentRef {
+    pub id: String,
+    pub name: String,
+    pub kind: AttachmentRefKind,
+    pub size: u64,
+}
+
+/// Display class for an outbound attachment. This is deliberately separate
+/// from HTTP inline-safety: the download route independently allowlists safe
+/// raster extensions and serves every other type as an attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentRefKind {
+    Image,
+    File,
+}
+
 /// One conversation turn the F108 dual-track stream observed. Optional
 /// fields default to empty / null so half-completed turns (e.g. the
 /// assistant errored before producing text) still round-trip.
@@ -62,6 +85,10 @@ pub struct TurnRecord {
     /// the file with full tool-input bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallSummary>,
+    /// Project-scoped outbound attachment references. Never contains file
+    /// bytes, base64, daemon paths, or browser-provided URLs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
     /// Terminal outcome when this row represents a failed vendor turn.
     /// Successful/interim rows omit the field so existing JSONL stays compact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,6 +208,7 @@ mod tests {
             assistant: assistant.to_string(),
             usage: Value::Null,
             tool_calls: Vec::new(),
+            attachments: Vec::new(),
             outcome: None,
             error_kind: None,
             error: None,
@@ -272,6 +300,22 @@ mod tests {
     }
 
     #[test]
+    fn attachment_references_survive_turn_record_round_trip() {
+        let mut record = mk_turn("t-file", "reviewer", "", "chart attached");
+        record.attachments.push(AttachmentRef {
+            id: "1780000000000-chart.png".into(),
+            name: "chart.png".into(),
+            kind: AttachmentRefKind::Image,
+            size: 12_345,
+        });
+
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(!encoded.contains("base64"));
+        let decoded: TurnRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
     fn pre_outcome_turn_record_remains_compatible() {
         let raw = serde_json::json!({
             "turn_id": "t-old",
@@ -281,7 +325,9 @@ mod tests {
             "assistant": "done"
         });
         let record: TurnRecord = serde_json::from_value(raw).unwrap();
+        assert!(record.attachments.is_empty());
         let encoded = serde_json::to_value(record).unwrap();
+        assert!(encoded.get("attachments").is_none());
         assert!(encoded.get("outcome").is_none());
         assert!(encoded.get("error_kind").is_none());
         assert!(encoded.get("error").is_none());

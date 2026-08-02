@@ -660,6 +660,22 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .bubble { padding: 10px 15px; border-radius: 14px; line-height: 1.65; font-size: 14.5px; white-space: pre-wrap; }
 .bubble.md { white-space: normal; }
+.outbound-attachments { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.outbound-attachment {
+  display: flex; flex-direction: column; gap: 5px; max-width: min(100%, 420px);
+  color: var(--text-muted); font-size: 12px; text-decoration: none;
+}
+.outbound-attachment.image img {
+  display: block; max-width: min(100%, 420px); max-height: 320px;
+  object-fit: contain; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-soft);
+}
+.outbound-attachment.file {
+  min-width: 220px; padding: 10px 12px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--bg-soft);
+}
+.outbound-attachment.file small { color: var(--text-faint); font-family: var(--font-mono); }
+.outbound-attachment:hover { color: var(--text); }
 .bubble .cursor { display: inline-block; width: 7px; height: 15px; background: var(--ink); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .conv-composer-wrap { padding: 0 28px 20px; }

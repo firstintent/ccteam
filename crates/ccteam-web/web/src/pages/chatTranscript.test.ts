@@ -285,4 +285,29 @@ describe("chatTranscript historyToRows", () => {
     expect(rows[1]).toMatchObject({ kind: "assistant", content: "hello" });
     expect(rows[2]).toMatchObject({ kind: "assistant", content: "just a reply" });
   });
+
+  it("renders an attachment-only mirrored turn after reload", () => {
+    const events: SessionHistoryEvent[] = [
+      {
+        turn_id: "t-file",
+        ts: "2026-08-02T00:00:00Z",
+        role: "cto",
+        user: "",
+        assistant: "",
+        attachments: [
+          { id: "1780000000000-chart.png", name: "chart.png", kind: "image", size: 42 },
+        ],
+      },
+    ];
+    expect(historyToRows(events)).toEqual([
+      {
+        id: "t-file-a",
+        kind: "assistant",
+        content: "",
+        attachments: [
+          { id: "1780000000000-chart.png", name: "chart.png", kind: "image", size: 42 },
+        ],
+      },
+    ]);
+  });
 });

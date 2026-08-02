@@ -23,6 +23,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createAuthedEventSource } from "../lib/authedEventSource";
+import type { OutboundAttachmentRef } from "../lib/sessionsApi";
 
 /** One selectable option on an approval ChoicePrompt (the SSE frame's
  *  `options[]`). `label` is the button text; `id` is the stable decision
@@ -62,6 +63,9 @@ export interface SessionEvent {
   content: string;
   done?: boolean;
   options?: SessionEventOption[];
+  /** Reference-only outbound files; the parser copies only these four scalar
+   * fields, so future/raw byte or path properties cannot enter transcript state. */
+  attachments?: OutboundAttachmentRef[];
   token?: string;
   /** Present on an "activity" frame: the structured per-step payload. */
   activity?: SessionActivity;
@@ -192,6 +196,24 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
       }
     }
     if (opts.length > 0) event.options = opts;
+  }
+  if (Array.isArray(obj.attachments)) {
+    const attachments: OutboundAttachmentRef[] = [];
+    for (const attachment of obj.attachments) {
+      if (typeof attachment !== "object" || attachment === null) continue;
+      const ref = attachment as Record<string, unknown>;
+      if (
+        typeof ref.id === "string" &&
+        typeof ref.name === "string" &&
+        (ref.kind === "image" || ref.kind === "file") &&
+        typeof ref.size === "number" &&
+        Number.isFinite(ref.size) &&
+        ref.size >= 0
+      ) {
+        attachments.push({ id: ref.id, name: ref.name, kind: ref.kind, size: ref.size });
+      }
+    }
+    if (attachments.length > 0) event.attachments = attachments;
   }
   if (typeof obj.token === "string") event.token = obj.token;
   return event;

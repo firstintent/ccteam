@@ -231,6 +231,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         ))
         // composer attachments — project uploads + installed-skill picker
         .routes(routes!(super::uploads::handle_project_upload))
+        .routes(routes!(super::uploads::handle_get_project_upload))
         .routes(routes!(super::uploads::handle_list_skills))
         .routes(routes!(super::skills::handle_list_library_skills))
         // sessions (gateway spine) — GET list + POST create share the path.

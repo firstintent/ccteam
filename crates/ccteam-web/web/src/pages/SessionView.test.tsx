@@ -112,6 +112,34 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(html).toContain("seeded-from-s9");
   });
 
+  it("renders attachment refs through the fixed project URL without data/blob URLs", () => {
+    vi.spyOn(globalThis.localStorage, "getItem").mockImplementation((k) =>
+      k === rowsKeyFor("s9")
+        ? JSON.stringify([
+            {
+              id: "file-row",
+              kind: "assistant",
+              content: "",
+              attachments: [
+                {
+                  id: "1780000000000-chart.png",
+                  name: "chart.png",
+                  kind: "image",
+                  size: 4,
+                },
+              ],
+            },
+          ])
+        : null,
+    );
+    const html = render();
+    expect(html).toContain(
+      "/api/v1/projects/demo/uploads/1780000000000-chart.png",
+    );
+    expect(html).not.toContain('src="data:');
+    expect(html).not.toContain('src="blob:');
+  });
+
   it("hides the terminal tab for a stream-json session (no pane) and shows it for claude terminal", () => {
     const streamJson = render({ ...SESSION, protocol: "stream-json" });
     expect(streamJson).not.toContain('data-testid="terminal-tab"');

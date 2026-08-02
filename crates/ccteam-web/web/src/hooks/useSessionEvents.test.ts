@@ -204,6 +204,30 @@ describe("parseSessionEvent (W2 payload shape)", () => {
     expect(ev!.options).toBeUndefined();
   });
 
+  it("copies only reference fields from outbound attachments", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({
+        kind: "answer",
+        content: "",
+        attachments: [
+          {
+            id: "1780000000000-chart.png",
+            name: "chart.png",
+            kind: "image",
+            size: 42,
+            path: "/daemon/secret/chart.png",
+            data: "forbidden",
+          },
+        ],
+      }),
+    );
+    expect(ev!.attachments).toEqual([
+      { id: "1780000000000-chart.png", name: "chart.png", kind: "image", size: 42 },
+    ]);
+    expect(ev!.attachments?.[0]).not.toHaveProperty("path");
+    expect(ev!.attachments?.[0]).not.toHaveProperty("data");
+  });
+
   it("parses a finalizing progress payload (done:true)", () => {
     const ev = parseSessionEvent(JSON.stringify({ kind: "progress", content: "x", done: true }));
     expect(ev!.kind).toBe("progress");

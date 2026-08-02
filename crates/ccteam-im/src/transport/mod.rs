@@ -388,6 +388,11 @@ pub enum OutboundFileKind {
 /// recorded assumption, not designed here).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutboundFile {
+    /// Project-upload handle for browser delivery: the staged basename under
+    /// `<project>/.ccteam/uploads/`. Empty on IM-only deliveries, whose
+    /// providers continue reading `path` directly.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Absolute path to the file on disk.
     pub path: String,
     /// Optional caption (placed on the first attachment).
@@ -395,6 +400,39 @@ pub struct OutboundFile {
     pub caption: Option<String>,
     /// Photo vs. document.
     pub kind: OutboundFileKind,
+}
+
+impl OutboundFile {
+    /// Build the reference-only browser/transcript shape. The returned type
+    /// cannot carry source paths or bytes; callers may serialize it directly.
+    pub fn attachment_ref(
+        &self,
+    ) -> std::io::Result<ccteam_harness::execution::turns_mirror::AttachmentRef> {
+        use ccteam_harness::execution::turns_mirror::{AttachmentRef, AttachmentRefKind};
+        if self.id.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "outbound attachment has no project upload id",
+            ));
+        }
+        let source = std::path::Path::new(&self.path);
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(sanitize_attachment_name)
+            .unwrap_or_else(|| "file".to_string());
+        let size = std::fs::metadata(source)?.len();
+        let kind = match self.kind {
+            OutboundFileKind::Photo => AttachmentRefKind::Image,
+            OutboundFileKind::Document => AttachmentRefKind::File,
+        };
+        Ok(AttachmentRef {
+            id: self.id.clone(),
+            name,
+            kind,
+            size,
+        })
+    }
 }
 
 /// A single selectable option rendered on an outbound [`SendMessage`]
@@ -637,6 +675,32 @@ pub fn sanitize_attachment_name(name: &str) -> String {
     }
 }
 
+/// The one project-scoped upload directory used by both inbound web-composer
+/// uploads and outbound browser attachments.
+pub fn project_uploads_dir(project_dir: &std::path::Path) -> std::path::PathBuf {
+    project_dir.join(".ccteam").join("uploads")
+}
+
+/// Allocate the existing `{millis}-{sanitized-name}` project-upload shape.
+/// A same-millisecond collision gains the established numeric bump rather
+/// than clobbering an earlier asset. The caller owns directory creation and
+/// the actual atomic write/copy.
+pub fn next_project_upload_path(
+    project_dir: &std::path::Path,
+    name: &str,
+    millis: i64,
+) -> (std::path::PathBuf, String) {
+    let name = sanitize_attachment_name(name);
+    let dir = project_uploads_dir(project_dir);
+    let mut path = dir.join(format!("{millis}-{name}"));
+    let mut bump = 0u32;
+    while path.exists() {
+        bump += 1;
+        path = dir.join(format!("{millis}-{bump}-{name}"));
+    }
+    (path, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +730,19 @@ mod tests {
         // Quotes/angle brackets would break the `image_path="…"` attr.
         assert_eq!(sanitize_attachment_name("foo\"bar.pdf"), "foobar.pdf");
         assert_eq!(sanitize_attachment_name("a<b>c.png"), "abc.png");
+    }
+
+    #[test]
+    fn project_upload_path_reuses_millis_name_and_bumps_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = project_uploads_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, name) = next_project_upload_path(tmp.path(), "../chart.png", 42);
+        assert_eq!(name, "chart.png");
+        assert_eq!(first.file_name().unwrap(), "42-chart.png");
+        std::fs::write(&first, b"one").unwrap();
+        let (second, _) = next_project_upload_path(tmp.path(), "chart.png", 42);
+        assert_eq!(second.file_name().unwrap(), "42-1-chart.png");
     }
 
     #[tokio::test]

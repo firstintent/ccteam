@@ -596,13 +596,18 @@ fn collect_session_turns(project_dir: &std::path::Path, sid: &str) -> Vec<serde_
 /// reopened per-session page can seed its transcript before the live SSE
 /// takes over.
 fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
-    json!({
+    let mut event = json!({
         "turn_id": turn.turn_id,
         "ts": turn.ts,
         "role": turn.role,
         "user": turn.user,
         "assistant": turn.assistant,
-    })
+    });
+    if !turn.attachments.is_empty() {
+        event["attachments"] =
+            serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
+    }
+    event
 }
 
 /// One live session's [`ThreadStatus`], awaited AFTER the caller has dropped
@@ -778,8 +783,6 @@ fn build_turn_text_with_attachments(
     vendor: &str,
 ) -> Result<String, String> {
     use ccteam_im::transport::{attachment_line, AttachmentKind, ChannelAttachment};
-    let uploads_root = project_dir.join(".ccteam").join("uploads");
-    let canonical_uploads = uploads_root.canonicalize().ok();
     let mut lines: Vec<String> = Vec::new();
     for att in attachments {
         let scope = match att.scope.as_deref() {
@@ -795,22 +798,18 @@ fn build_turn_text_with_attachments(
                 let Some(path) = att.path.as_deref().filter(|p| !p.trim().is_empty()) else {
                     return Err(format!("attachment kind `{}` requires `path`", att.kind));
                 };
-                // Canonicalize (also proves existence) and pin under the
-                // project's uploads dir, so a turn can only name files the
-                // upload endpoint stored for THIS project.
-                let canon = std::path::Path::new(path)
-                    .canonicalize()
-                    .map_err(|_| format!("attachment not found: {path}"))?;
-                // No uploads dir yet (nothing was ever uploaded for this
-                // project) ⇒ any path is by definition outside it.
-                if !canonical_uploads
-                    .as_ref()
-                    .is_some_and(|root| canon.starts_with(root))
-                {
-                    return Err(format!(
-                        "attachment path is outside this project's uploads dir: {path}"
-                    ));
-                }
+                let canon = super::uploads::canonical_project_upload(
+                    project_dir,
+                    std::path::Path::new(path),
+                )
+                .map_err(|err| match err {
+                    super::uploads::UploadPathError::NotFound => {
+                        format!("attachment not found: {path}")
+                    }
+                    super::uploads::UploadPathError::OutsideUploads => {
+                        format!("attachment path is outside this project's uploads dir: {path}")
+                    }
+                })?;
                 let kind = if att.kind == "image" {
                     AttachmentKind::Image
                 } else {
@@ -1822,8 +1821,9 @@ pub(crate) async fn handle_import_session(
 
 /// The per-session SSE filter key (cross-stage from the spine): keep a
 /// [`GatewayEvent`] iff its `sid` is exactly `Some(target)`. Events with a
-/// different `sid` — or none at all (the `chat_send_file` MCP path, the D6
-/// `interaction/ask` hook prompt) — are dropped.
+/// different `sid` — or none at all (for example the D6 `interaction/ask`
+/// hook prompt or an IM-only file send) — are dropped. Web-bound outbound
+/// files carry their server-resolved caller sid.
 fn event_matches_sid(ev: &GatewayEvent, target: &str) -> bool {
     ev.sid.as_deref() == Some(target)
 }
@@ -1909,6 +1909,15 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     });
     if done {
         payload["done"] = serde_json::Value::Bool(true);
+    }
+    let attachments = ev
+        .attachments
+        .iter()
+        .filter(|file| !file.id.is_empty())
+        .filter_map(|file| file.attachment_ref().ok())
+        .collect::<Vec<_>>();
+    if !attachments.is_empty() {
+        payload["attachments"] = serde_json::to_value(attachments).unwrap_or_else(|_| json!([]));
     }
     // v0.8.19 — attach the structured activity form so the web chat can render
     // it as an activity card (the shared `progress::activity_for` summary +
@@ -2075,6 +2084,7 @@ mod tests {
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            attachments: vec![],
             outcome: None,
             error_kind: None,
             error: None,
@@ -2118,6 +2128,7 @@ mod tests {
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            attachments: vec![],
             outcome: None,
             error_kind: None,
             error: None,
@@ -2155,6 +2166,12 @@ mod tests {
             assistant: "done — s2".into(),
             usage: serde_json::Value::Null,
             tool_calls: vec![],
+            attachments: vec![ccteam_harness::execution::turns_mirror::AttachmentRef {
+                id: "1780000000000-chart.png".into(),
+                name: "chart.png".into(),
+                kind: ccteam_harness::execution::turns_mirror::AttachmentRefKind::Image,
+                size: 42,
+            }],
             outcome: None,
             error_kind: None,
             error: None,
@@ -2164,6 +2181,9 @@ mod tests {
         assert_eq!(ev["role"], "cto");
         assert_eq!(ev["user"], "spawn a reviewer");
         assert_eq!(ev["assistant"], "done — s2");
+        assert_eq!(ev["attachments"][0]["id"], "1780000000000-chart.png");
+        assert_eq!(ev["attachments"][0]["kind"], "image");
+        assert!(ev["attachments"][0].get("path").is_none());
     }
 
     /// Build a minimal [`GatewayEvent`] with the given `sid` for filter tests.
@@ -2241,6 +2261,30 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    #[test]
+    fn session_event_carries_only_attachment_reference_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("chart.png");
+        std::fs::write(&source, b"png").unwrap();
+        let mut event = gw_event(Some("s1"));
+        event.content.clear();
+        event.attachments.push(ccteam_im::transport::OutboundFile {
+            id: "1780000000000-chart.png".into(),
+            path: source.to_string_lossy().into_owned(),
+            caption: None,
+            kind: ccteam_im::transport::OutboundFileKind::Photo,
+        });
+
+        let payload = session_event_payload(&event);
+        assert_eq!(payload["attachments"][0]["id"], "1780000000000-chart.png");
+        assert_eq!(payload["attachments"][0]["name"], "chart.png");
+        assert_eq!(payload["attachments"][0]["kind"], "image");
+        assert_eq!(payload["attachments"][0]["size"], 3);
+        let wire = payload.to_string();
+        assert!(!wire.contains(source.to_string_lossy().as_ref()));
+        assert!(!wire.contains("base64"));
     }
 
     #[test]

@@ -62,6 +62,9 @@ sha2 = { workspace = true }
 serde_yaml.workspace = true
 serde_urlencoded = "0.7"
 tokio.workspace = true
+# Stream project-scoped attachment files without buffering them into web
+# state. `StreamReader` remains shared by the SSE integration tests.
+tokio-util = { version = "0.7", features = ["io"] }
 notify.workspace = true
 tracing.workspace = true
 
@@ -145,10 +148,9 @@ reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
 # (sha2 moved to [dependencies] for the routing-charter endpoints; the
 # marketplace test fixture keeps using it from there.)
 # V0.3 M5.2 — SSE integration tests need to read the streaming body
-# line by line. `tokio-util` exposes `StreamReader` (bytes stream →
-# AsyncRead); `futures-util` provides the `StreamExt::map` adapter
-# we use to bridge `reqwest::Error` → `std::io::Error`.
-tokio-util = { version = "0.7", features = ["io"] }
+# line by line. `tokio-util::StreamReader` (declared above for runtime
+# attachment streaming too) bridges the response bytes to AsyncRead;
+# `futures-util` maps `reqwest::Error` → `std::io::Error`.
 # `serial_test` serialises tmux-touching tests so concurrent
 # session_name collisions can't happen even on `cargo test -j N`.
 serial_test = "3"

@@ -36,8 +36,10 @@ import {
   createScheduled,
   cancelScheduled,
   interruptSession as apiInterruptSession,
+  projectUploadUrl,
   resolveApproval as apiResolveApproval,
   submitTurn,
+  type OutboundAttachmentRef,
   type SessionView as SessionSummary,
   type ScheduledItem,
 } from "../lib/sessionsApi";
@@ -51,6 +53,50 @@ import {
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
+
+function formatAttachmentSize(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function OutboundAttachments({
+  project,
+  attachments,
+}: {
+  project?: string;
+  attachments?: OutboundAttachmentRef[];
+}) {
+  if (!project || !attachments || attachments.length === 0) return null;
+  return (
+    <div className="outbound-attachments" data-testid="outbound-attachments">
+      {attachments.map((attachment) => {
+        const url = projectUploadUrl(project, attachment.id);
+        return attachment.kind === "image" ? (
+          <a
+            key={attachment.id}
+            className="outbound-attachment image"
+            href={url}
+            aria-label={attachment.name}
+          >
+            <img loading="lazy" src={url} alt={attachment.name} />
+            <span>{attachment.name}</span>
+          </a>
+        ) : (
+          <a
+            key={attachment.id}
+            className="outbound-attachment file"
+            href={url}
+            download={attachment.name}
+          >
+            <span>📎 {attachment.name}</span>
+            <small>{formatAttachmentSize(attachment.size)}</small>
+          </a>
+        );
+      })}
+    </div>
+  );
+}
 
 export default function SessionView({
   sid,
@@ -514,7 +560,11 @@ export default function SessionView({
                     <div key={row.id} className="msg agent fade-in">
                       <span className="who">{who}</span>
                       <div className="bubble md">
-                        <Markdown content={row.content} />
+                        {row.content ? <Markdown content={row.content} /> : null}
+                        <OutboundAttachments
+                          project={session?.project}
+                          attachments={row.attachments}
+                        />
                       </div>
                     </div>
                   );

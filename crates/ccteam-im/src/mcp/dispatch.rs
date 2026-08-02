@@ -411,6 +411,25 @@ fn is_chat_send_file_call(req: &serde_json::Value) -> bool {
         && req.pointer("/params/name").and_then(|n| n.as_str()) == Some("chat_send_file")
 }
 
+#[derive(Debug, Clone)]
+struct ChatSendFileTarget {
+    channel: String,
+    chat_id: String,
+    /// Present for a live ccteam session. The server-resolved project path is
+    /// the only authority the web staging/persistence path trusts.
+    session: Option<crate::gateway::SessionResolve>,
+}
+
+impl ChatSendFileTarget {
+    fn delivery_only((channel, chat_id): (String, String)) -> Self {
+        Self {
+            channel,
+            chat_id,
+            session: None,
+        }
+    }
+}
+
 /// Resolve addressing, validate the file, and enqueue a `GatewayEvent`
 /// onto the shared sink (the IM consumer does the actual `sendPhoto` /
 /// `sendDocument`). Returns a tools/call-shaped JSON-RPC response.
@@ -434,12 +453,13 @@ async fn execute_chat_send_file(
     // into the sync builder so build_send_file_event stays unit-testable.
     let live_target = match caller.user_id() {
         Some(user_id) => match user_delivery_target(paths, user_id) {
-            Ok(target) => Some(target),
+            Ok(target) => Some(ChatSendFileTarget::delivery_only(target)),
             Err(text) => return session_tool_response(id, text, true),
         },
         None => resolve_live_reply_target(&args, gateway).await,
     };
-    let (text, is_error) = match run_chat_send_file(&args, sink, live_target) {
+    let (text, is_error) = match run_chat_send_file(&args, sink, gateway, paths, live_target).await
+    {
         Ok(text) => (text, false),
         Err(text) => (text, true),
     };
@@ -519,7 +539,7 @@ pub(crate) fn user_delivery_target(
 async fn resolve_live_reply_target(
     args: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
-) -> Option<(String, String)> {
+) -> Option<ChatSendFileTarget> {
     let gw = gateway?;
     let sid = args
         .get("_caller_sid")
@@ -529,26 +549,200 @@ async fn resolve_live_reply_target(
         return None;
     }
     let guard = gw.lock().await;
-    guard.reply_target_for(sid)
+    let (channel, chat_id) = guard.reply_target_for(sid)?;
+    // IM delivery historically needs only the live reply binding. Project
+    // metadata is an additional requirement solely for the web copy/read
+    // path, so do not make Telegram/Lark depend on it.
+    let session = if channel == "web" {
+        guard.session_resolve(sid)
+    } else {
+        None
+    };
+    Some(ChatSendFileTarget {
+        channel,
+        chat_id,
+        session,
+    })
 }
 
-fn run_chat_send_file(
+async fn run_chat_send_file(
     args: &serde_json::Value,
     sink: Option<&GatewayEventSink>,
-    live_target: Option<(String, String)>,
+    gateway: Option<&GatewayHandle>,
+    paths: &CcteamPaths,
+    live_target: Option<ChatSendFileTarget>,
 ) -> std::result::Result<String, String> {
     let sink = sink.ok_or_else(|| "chat_send_file: IM gateway not running".to_string())?;
     let seq = CHAT_SEND_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let event = build_send_file_event(args, seq, live_target)?;
+    let event_target = live_target
+        .as_ref()
+        .map(|target| (target.channel.clone(), target.chat_id.clone()));
+    let mut event = build_send_file_event(args, seq, event_target)?;
+    if event.channel == "web" {
+        let session = live_target
+            .as_ref()
+            .and_then(|target| target.session.as_ref())
+            .ok_or_else(|| "chat_send_file: web delivery has no live session scope".to_string())?;
+        stage_web_outbound_file(&mut event, session, paths, seq)?;
+    }
     let dest = format!("{}/{}", event.channel, event.chat_id);
-    sink.send(event)
+    sink.send(event.clone())
         .map_err(|_| "chat_send_file: gateway sink closed".to_string())?;
+    // The MCP dispatcher owns the delivery mpsc, while the gateway owns the
+    // per-session SSE fan-out. Publish the web reference after enqueueing so
+    // the current SPA renders it live; no bytes or daemon path enter the SSE.
+    if event.channel == "web" {
+        if let Some(gateway) = gateway {
+            gateway.lock().await.broadcast_external_event(event);
+        }
+    }
     Ok(format!("delivered: queued to {dest}"))
 }
 
 /// Telegram bot-send ceilings: `sendPhoto` ≤ 10 MB, `sendDocument` ≤ 50 MB.
 const OUTBOUND_PHOTO_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const OUTBOUND_DOCUMENT_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+fn outbound_max_bytes(kind: crate::transport::OutboundFileKind) -> u64 {
+    match kind {
+        crate::transport::OutboundFileKind::Photo => OUTBOUND_PHOTO_MAX_BYTES,
+        crate::transport::OutboundFileKind::Document => OUTBOUND_DOCUMENT_MAX_BYTES,
+    }
+}
+
+fn project_host(paths: &CcteamPaths, slug: &str) -> String {
+    ccteam_core::config::load(&paths.root)
+        .ok()
+        .and_then(|config| {
+            config
+                .projects
+                .into_iter()
+                .find(|project| project.slug == slug)
+        })
+        .map(|project| project.host)
+        .unwrap_or_else(|| ccteam_core::LOCAL_HOST.to_string())
+}
+
+/// Copy a web-bound outbound file into the owning project's asset directory,
+/// attach a basename handle, and append the reference-only transcript row.
+/// The agent-supplied source path never becomes a browser URL.
+fn stage_web_outbound_file(
+    event: &mut crate::gateway::GatewayEvent,
+    session: &crate::gateway::SessionResolve,
+    paths: &CcteamPaths,
+    seq: u64,
+) -> std::result::Result<(), String> {
+    use ccteam_harness::execution::turns_mirror::{
+        append_turn, AttachmentRef, AttachmentRefKind, TurnRecord,
+    };
+
+    let host = project_host(paths, &session.project);
+    if host != ccteam_core::LOCAL_HOST {
+        return Err(format!(
+            "project `{}` runs on remote host `{host}` — attachments are not yet supported for remote projects",
+            session.project
+        ));
+    }
+
+    let upload_dir = crate::transport::project_uploads_dir(&session.project_dir);
+    std::fs::create_dir_all(&upload_dir)
+        .map_err(|err| format!("chat_send_file: create uploads dir: {err}"))?;
+    let millis = chrono::Utc::now().timestamp_millis();
+    let mut staged_paths = Vec::new();
+    let mut references = Vec::with_capacity(event.attachments.len());
+
+    for (index, attachment) in event.attachments.iter_mut().enumerate() {
+        let source = std::path::Path::new(&attachment.path);
+        let original_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let (staged, name) =
+            crate::transport::next_project_upload_path(&session.project_dir, original_name, millis);
+        let staged_name = staged
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "chat_send_file: staged upload name is not valid UTF-8".to_string())?
+            .to_string();
+        let tmp = staged.with_file_name(format!(
+            ".{staged_name}.{}.{}.part",
+            std::process::id(),
+            seq.saturating_add(index as u64)
+        ));
+        let copied = match std::fs::copy(source, &tmp) {
+            Ok(size) => size,
+            Err(err) => {
+                for path in staged_paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(format!("chat_send_file: stage web attachment: {err}"));
+            }
+        };
+        if copied > outbound_max_bytes(attachment.kind) {
+            let _ = std::fs::remove_file(&tmp);
+            for path in staged_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(format!(
+                "chat_send_file: file grew beyond the {:?} limit while staging",
+                attachment.kind
+            ));
+        }
+        if let Err(err) = std::fs::rename(&tmp, &staged) {
+            let _ = std::fs::remove_file(&tmp);
+            for path in staged_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(format!("chat_send_file: commit web attachment: {err}"));
+        }
+
+        attachment.id = staged_name.clone();
+        let kind = match attachment.kind {
+            crate::transport::OutboundFileKind::Photo => AttachmentRefKind::Image,
+            crate::transport::OutboundFileKind::Document => AttachmentRefKind::File,
+        };
+        references.push(AttachmentRef {
+            id: staged_name,
+            name,
+            kind,
+            size: copied,
+        });
+        staged_paths.push(staged);
+    }
+
+    event.sid = Some(session.sid.clone());
+    event.slug = Some(session.project.clone());
+    if event.content.is_empty() {
+        event.content = event
+            .attachments
+            .first()
+            .and_then(|attachment| attachment.caption.clone())
+            .unwrap_or_default();
+    }
+    let record = TurnRecord {
+        turn_id: event.id.clone(),
+        ts: chrono::Utc::now(),
+        vendor: session.vendor.clone(),
+        role: session.role.clone(),
+        user: String::new(),
+        assistant: event.content.clone(),
+        usage: serde_json::Value::Null,
+        tool_calls: Vec::new(),
+        attachments: references,
+        outcome: None,
+        error_kind: None,
+        error: None,
+    };
+    if let Err(err) = append_turn(&session.project_dir, &session.sid, &record) {
+        for path in staged_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(format!(
+            "chat_send_file: persist web attachment reference: {err}"
+        ));
+    }
+    Ok(())
+}
 
 /// Pure core of `run_chat_send_file`: parse args, validate the file
 /// (exists + within the send ceiling), and build the `GatewayEvent`
@@ -560,7 +754,6 @@ fn build_send_file_event(
     seq: u64,
     live_target: Option<(String, String)>,
 ) -> std::result::Result<crate::gateway::GatewayEvent, String> {
-    use crate::transport::OutboundFileKind;
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -581,10 +774,7 @@ fn build_send_file_event(
 
     let meta =
         std::fs::metadata(path).map_err(|_| format!("chat_send_file: file not found: {path}"))?;
-    let max = match kind {
-        OutboundFileKind::Photo => OUTBOUND_PHOTO_MAX_BYTES,
-        OutboundFileKind::Document => OUTBOUND_DOCUMENT_MAX_BYTES,
-    };
+    let max = outbound_max_bytes(kind);
     if meta.len() > max {
         return Err(format!(
             "chat_send_file: file too large ({} MB) for {:?} (limit {} MB)",
@@ -614,12 +804,15 @@ fn build_send_file_event(
         content: String::new(),
         kind: crate::gateway::GatewayEventKind::Answer,
         attachments: vec![crate::transport::OutboundFile {
+            id: String::new(),
             path: path.to_string(),
             caption,
             kind,
         }],
         options: Vec::new(),
-        // No gateway session backs the `chat_send_file` MCP path.
+        // Web staging replaces this with the server-resolved caller sid so
+        // the current per-session SSE can render the reference live. IM-only
+        // delivery keeps the historical `None`.
         sid: None,
         slug: if slug.is_empty() {
             None
@@ -3451,6 +3644,108 @@ mod chat_send_file_tests {
     }
 
     #[test]
+    fn web_outbound_is_copied_and_persisted_as_project_reference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = paths.projects_root.join("dev-foo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let source = tmp.path().join("agent-output").join("chart.png");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"chart-bytes").unwrap();
+        let args = serde_json::json!({
+            "path": source.to_string_lossy(),
+            "caption": "the chart",
+            "slug": "spoofed-slug",
+            "role": "spoofed-role",
+            "_caller_sid": "s7",
+        });
+        let mut event =
+            build_send_file_event(&args, 9, Some(("web".to_string(), "web-api".to_string())))
+                .unwrap();
+        let session = crate::gateway::SessionResolve {
+            sid: "s7".into(),
+            role: "reviewer".into(),
+            vendor: "codex".into(),
+            project: "dev-foo".into(),
+            project_dir: project_dir.clone(),
+        };
+
+        stage_web_outbound_file(&mut event, &session, &paths, 9).unwrap();
+        assert_eq!(event.sid.as_deref(), Some("s7"));
+        assert_eq!(event.slug.as_deref(), Some("dev-foo"));
+        assert_eq!(event.content, "the chart");
+        assert_eq!(event.attachments[0].path, source.to_string_lossy());
+        let id = event.attachments[0].id.clone();
+        assert!(id.ends_with("-chart.png"), "got {id}");
+        assert_eq!(
+            std::fs::read(crate::transport::project_uploads_dir(&project_dir).join(&id)).unwrap(),
+            b"chart-bytes"
+        );
+
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, "s7").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].vendor, "codex");
+        assert_eq!(turns[0].role, "reviewer");
+        assert_eq!(turns[0].attachments.len(), 1);
+        assert_eq!(turns[0].attachments[0].id, id);
+        assert_eq!(turns[0].attachments[0].name, "chart.png");
+        assert_eq!(turns[0].attachments[0].size, 11);
+        let row = serde_json::to_string(&turns[0]).unwrap();
+        assert!(!row.contains(source.to_string_lossy().as_ref()));
+        assert!(!row.contains("base64"));
+    }
+
+    #[test]
+    fn web_outbound_rejects_remote_host_project_without_local_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let project_dir = paths.projects_root.join("remote-demo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        ccteam_core::config::upsert_project(
+            &paths.root,
+            ccteam_core::ProjectEntry {
+                slug: "remote-demo".into(),
+                path: project_dir.clone(),
+                host: "sat-a".into(),
+                remote_slug: Some("remote-demo".into()),
+                remote_path: None,
+                team: "dev".into(),
+                installed_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+        let source = tmp.path().join("report.txt");
+        std::fs::write(&source, b"report").unwrap();
+        let args = serde_json::json!({
+            "path": source.to_string_lossy(),
+            "slug": "remote-demo",
+            "role": "reviewer",
+            "_caller_sid": "s8",
+        });
+        let mut event =
+            build_send_file_event(&args, 10, Some(("web".to_string(), "web-api".to_string())))
+                .unwrap();
+        let session = crate::gateway::SessionResolve {
+            sid: "s8".into(),
+            role: "reviewer".into(),
+            vendor: "claude".into(),
+            project: "remote-demo".into(),
+            project_dir: project_dir.clone(),
+        };
+
+        let error = stage_web_outbound_file(&mut event, &session, &paths, 10).unwrap_err();
+        assert!(error.contains("remote host `sat-a`"), "got {error}");
+        assert!(!crate::transport::project_uploads_dir(&project_dir).exists());
+    }
+
+    #[test]
     fn build_send_file_event_errors_on_missing_file() {
         let args = serde_json::json!({
             "path": "/nope/does-not-exist.png", "slug": "dev-foo", "role": "lead",
@@ -5121,6 +5416,7 @@ mod session_tool_tests {
             assistant: format!("a-{id}"),
             usage: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            attachments: Vec::new(),
             outcome: None,
             error_kind: None,
             error: None,
@@ -5789,6 +6085,7 @@ mod session_tool_tests {
                 assistant: answer,
                 usage: serde_json::Value::Null,
                 tool_calls: Vec::new(),
+                attachments: Vec::new(),
                 outcome: None,
                 error_kind: None,
                 error: None,

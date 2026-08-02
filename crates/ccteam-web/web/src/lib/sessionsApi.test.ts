@@ -16,6 +16,7 @@ import {
   listHistorySessions,
   listProjectRoles,
   listSessions,
+  projectUploadUrl,
   resolveApproval,
   resumeSession,
   sessionUrl,
@@ -57,6 +58,15 @@ describe("sessionsApi url builders", () => {
   it("encodes slug + sid", () => {
     expect(sessionsUrl("a b")).toBe("/api/v1/projects/a%20b/sessions");
     expect(sessionUrl("s/odd")).toBe("/api/v1/sessions/s%2Fodd");
+  });
+
+  it("constructs only the authenticated project upload route", () => {
+    expect(projectUploadUrl("a b", "1-chart image.png")).toBe(
+      "/api/v1/projects/a%20b/uploads/1-chart%20image.png",
+    );
+    expect(projectUploadUrl("data:text/html", "blob:x")).toMatch(
+      /^\/api\/v1\/projects\//,
+    );
   });
 });
 

@@ -363,6 +363,7 @@ fn send_message_to_frames(message: WebSendMessage) -> Vec<ServerChatFrame> {
     }
     let mut frames = vec![ServerChatFrame::Reply {
         content: message.content.clone(),
+        attachments: message.attachments,
     }];
     if let Some(items) = parse_sessions_reply(&message.content) {
         frames.push(ServerChatFrame::Sessions { items });
