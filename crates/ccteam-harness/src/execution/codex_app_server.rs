@@ -1978,16 +1978,45 @@ impl HarnessAdapter for CodexAppServerAdapter {
                     s.boxed()
                 }
                 Ok(rx) => {
-                    let s = stream::unfold((rx, adapter_bridge), move |(mut rx, bridge)| {
-                        let wanted = thread_id.clone();
-                        async move {
-                            loop {
-                                match rx.recv().await {
-                                    Ok(notif) => {
-                                        if let Some(evt) =
-                                            translate_notification(&notif, &wanted)
-                                        {
-                                            if let Some(ctx) = bridge.bridge_for(&wanted).await {
+                    let s = stream::unfold(
+                        (rx, adapter_bridge, None),
+                        move |(mut rx, bridge, mut turn_usage)| {
+                            let wanted = thread_id.clone();
+                            async move {
+                                loop {
+                                    match rx.recv().await {
+                                        Ok(notif) => {
+                                            if notif.method == "turn/started" {
+                                                turn_usage = None;
+                                            }
+                                            if let Some(usage) =
+                                                codex_turn_usage_from_notification(&notif)
+                                            {
+                                                turn_usage = Some(usage);
+                                            }
+                                            if let Some(mut evt) =
+                                                translate_notification(&notif, &wanted)
+                                            {
+                                                let ctx = bridge.bridge_for(&wanted).await;
+                                                if matches!(evt, ThreadEvent::TurnFailed { .. }) {
+                                                    let fallback_model = match ctx
+                                                        .as_ref()
+                                                        .and_then(|ctx| ctx.model.clone())
+                                                    {
+                                                        Some(model) => Some(model),
+                                                        None => bridge
+                                                            .tracker_snapshot(&wanted)
+                                                            .await
+                                                            .and_then(|live| live.model),
+                                                    };
+                                                    enrich_codex_turn_failed(
+                                                        &mut evt,
+                                                        turn_usage,
+                                                        fallback_model,
+                                                    );
+                                                }
+                                                let terminal = is_terminal_progress(&evt);
+                                                if let Some(ctx) = ctx {
                                                 if let Some(line) =
                                                     build_progress_line(&evt, &wanted, &ctx)
                                                 {
@@ -2006,13 +2035,16 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                                     // double-write if codex
                                                     // re-fires the same
                                                     // notification.
-                                                    if is_terminal_progress(&evt) {
+                                                    if terminal {
                                                         bridge.drop_bridge(&wanted).await;
                                                     }
                                                 }
                                             }
-                                            return Some((evt, (rx, bridge)));
-                                        }
+                                                if terminal {
+                                                    turn_usage = None;
+                                                }
+                                                return Some((evt, (rx, bridge, turn_usage)));
+                                            }
                                         // V0.8 rmux W4-fu — some Codex
                                         // notifications (plan/tokenUsage/
                                         // status/rateLimits) carry no
@@ -2023,42 +2055,43 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                         // into the event stream; the bridge
                                         // mirrors them and the loop keeps
                                         // pumping the next notification.
-                                        if let Some(ctx) = bridge.bridge_for(&wanted).await {
-                                            if let Some(line) =
-                                                build_codex_notification_progress_line(
-                                                    &notif, &wanted,
-                                                )
-                                            {
-                                                if let Err(err) =
-                                                    append_event(&ctx.progress_path, &line)
+                                            if let Some(ctx) = bridge.bridge_for(&wanted).await {
+                                                if let Some(line) =
+                                                    build_codex_notification_progress_line(
+                                                        &notif, &wanted,
+                                                    )
                                                 {
-                                                    tracing::warn!(
-                                                        thread_id = %wanted,
-                                                        error = %err,
-                                                        "codex bridge: append codex-notif progress.jsonl failed"
-                                                    );
+                                                    if let Err(err) =
+                                                        append_event(&ctx.progress_path, &line)
+                                                    {
+                                                        tracing::warn!(
+                                                            thread_id = %wanted,
+                                                            error = %err,
+                                                            "codex bridge: append codex-notif progress.jsonl failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    Err(
-                                        tokio::sync::broadcast::error::RecvError::Lagged(n),
-                                    ) => {
-                                        tracing::warn!(
-                                            n,
-                                            "codex app-server event subscriber lagged"
-                                        );
-                                        continue;
-                                    }
-                                    Err(
-                                        tokio::sync::broadcast::error::RecvError::Closed,
-                                    ) => {
-                                        return None;
+                                        Err(
+                                            tokio::sync::broadcast::error::RecvError::Lagged(n),
+                                        ) => {
+                                            tracing::warn!(
+                                                n,
+                                                "codex app-server event subscriber lagged"
+                                            );
+                                            continue;
+                                        }
+                                        Err(
+                                            tokio::sync::broadcast::error::RecvError::Closed,
+                                        ) => {
+                                            return None;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
+                        },
+                    );
                     s.boxed()
                 }
             }
@@ -3031,6 +3064,8 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                         .unwrap_or("(no message)")
                         .to_string(),
                 },
+                usage: pluck_usage(&notif.params).unwrap_or_default(),
+                model: pluck_model(&notif.params),
             })
         }
         "item/started" => {
@@ -3148,7 +3183,7 @@ pub fn build_progress_line(
                 &ctx.role, &ctx.sid, &ctx.slug, "codex", thread_id, turn_id, usage, cost,
             ))
         }
-        ThreadEvent::TurnFailed { turn_id, err } => Some(build_agent_done_errored_event(
+        ThreadEvent::TurnFailed { turn_id, err, .. } => Some(build_agent_done_errored_event(
             &ctx.role,
             &ctx.sid,
             &ctx.slug,
@@ -3654,6 +3689,40 @@ fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
     serde_json::from_value(raw).ok()
 }
 
+/// Extract the current turn's token buckets from Codex's dedicated usage
+/// notification. The terminal `error` notification carries no usage, so the
+/// per-subscriber event stream retains this `last` block until the terminal
+/// boundary and attaches it there.
+fn codex_turn_usage_from_notification(notif: &Notification) -> Option<UnifiedTokenUsage> {
+    if notif.method != "thread/tokenUsage/updated" {
+        return None;
+    }
+    let token_usage = pluck_val(&notif.params, "token_usage", "tokenUsage")?;
+    let last = token_usage.get("last")?.clone();
+    serde_json::from_value(last).ok()
+}
+
+/// Fill accounting omitted by Codex's terminal `error` wire shape from the
+/// latest usage notification and the thread's resolved model. Inline values
+/// win for synthetic fixtures and future protocol additions.
+fn enrich_codex_turn_failed(
+    evt: &mut ThreadEvent,
+    fallback_usage: Option<UnifiedTokenUsage>,
+    fallback_model: Option<String>,
+) {
+    let ThreadEvent::TurnFailed { usage, model, .. } = evt else {
+        return;
+    };
+    if usage.total() == 0 && usage.reported_cost_usd.is_none() {
+        if let Some(value) = fallback_usage {
+            *usage = value;
+        }
+    }
+    if model.is_none() {
+        *model = fallback_model;
+    }
+}
+
 /// Convenience: build a placeholder client-less adapter. Test-only;
 /// production callers go through `client()` which dials the socket.
 #[cfg(test)]
@@ -3853,15 +3922,30 @@ mod tests {
                 "thread_id": "t-1",
                 "turn_id": "u-1",
                 "will_retry": false,
+                "model": "gpt-5.3-codex",
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 20,
+                    "cached_input_tokens": 5
+                },
                 "error": { "message": "context window exceeded" },
             }),
         };
         let e = translate_notification(&n, "t-1").expect("terminal error must surface");
         match e {
-            ThreadEvent::TurnFailed { turn_id, err } => {
+            ThreadEvent::TurnFailed {
+                turn_id,
+                err,
+                usage,
+                model,
+            } => {
                 assert_eq!(turn_id, "u-1");
                 assert_eq!(err.message, "context window exceeded");
                 assert_eq!(err.kind, "turn_failed");
+                assert_eq!(usage.input_tokens, 50);
+                assert_eq!(usage.output_tokens, 20);
+                assert_eq!(usage.cached_input_tokens, 5);
+                assert_eq!(model.as_deref(), Some("gpt-5.3-codex"));
             }
             other => panic!("expected TurnFailed, got {other:?}"),
         }
@@ -4108,6 +4192,49 @@ mod tests {
     }
 
     #[test]
+    fn terminal_error_uses_preceding_token_usage_and_thread_model() {
+        let usage_notification = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "tokenUsage": {
+                    "last": {
+                        "input_tokens": 80,
+                        "output_tokens": 21,
+                        "cached_input_tokens": 7,
+                        "reasoning_output_tokens": 3
+                    }
+                }
+            }),
+        };
+        let usage = codex_turn_usage_from_notification(&usage_notification)
+            .expect("token usage notification must expose the last turn");
+        let error_notification = Notification {
+            method: "error".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "willRetry": false,
+                "error": { "message": "output limit reached" }
+            }),
+        };
+        let mut event =
+            translate_notification(&error_notification, "t-1").expect("terminal error event");
+        enrich_codex_turn_failed(&mut event, Some(usage), Some("gpt-5.3-codex".into()));
+        match event {
+            ThreadEvent::TurnFailed { usage, model, .. } => {
+                assert_eq!(usage.input_tokens, 80);
+                assert_eq!(usage.output_tokens, 21);
+                assert_eq!(usage.cached_input_tokens, 7);
+                assert_eq!(usage.reasoning_output_tokens, Some(3));
+                assert_eq!(model.as_deref(), Some("gpt-5.3-codex"));
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn thread_token_usage_camelcase_wire() {
         let n = Notification {
             method: "thread/tokenUsage/updated".into(),
@@ -4313,7 +4440,7 @@ mod tests {
         };
         let e = translate_notification(&n, "t-1").expect("terminal camelCase error must surface");
         match e {
-            ThreadEvent::TurnFailed { turn_id, err } => {
+            ThreadEvent::TurnFailed { turn_id, err, .. } => {
                 assert_eq!(turn_id, "u-1");
                 assert_eq!(err.message, "context window exceeded");
                 assert_eq!(err.kind, "turn_failed");

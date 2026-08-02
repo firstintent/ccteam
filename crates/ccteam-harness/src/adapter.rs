@@ -498,6 +498,8 @@ pub enum ThreadEvent {
     TurnFailed {
         turn_id: String,
         err: ThreadErrorEvent,
+        usage: UnifiedTokenUsage,
+        model: Option<String>,
     },
     ItemStarted {
         item: ThreadItem,

@@ -669,6 +669,7 @@ pub fn finalize_from_prompt_result(
         .unwrap_or_else(|| "unknown".into());
     let text = buf.map(|b| b.text).unwrap_or_default();
     let stop = stop_reason_from_prompt_result(result);
+    let terminal_model = model.or_else(|| state.model.clone());
     let mut out = Vec::new();
     if let Some(message) = stop.failure_message() {
         // Partial output first — it was produced and paid for, and it is often
@@ -690,6 +691,8 @@ pub fn finalize_from_prompt_result(
                 kind: format!("stop_reason:{}", stop.wire()),
                 message,
             },
+            usage,
+            model: terminal_model,
         });
         return out;
     }
@@ -702,7 +705,7 @@ pub fn finalize_from_prompt_result(
     out.push(ThreadEvent::TurnCompleted {
         turn_id,
         usage,
-        model: model.or_else(|| state.model.clone()),
+        model: terminal_model,
     });
     out
 }
@@ -717,6 +720,8 @@ pub fn fail_turn(state: &mut SessionTranslateState, message: &str) -> Vec<Thread
             kind: "transport".into(),
             message: message.to_string(),
         },
+        usage: UnifiedTokenUsage::default(),
+        model: state.model.clone(),
     }]
 }
 
@@ -972,7 +977,17 @@ mod tests {
                 }),
             },
         );
-        let events = finalize_from_prompt_result(&mut st, &json!({ "stopReason": reason }));
+        let events = finalize_from_prompt_result(
+            &mut st,
+            &json!({
+                "stopReason": reason,
+                "_meta": {
+                    "inputTokens": 70,
+                    "outputTokens": 30,
+                    "modelId": "grok-4.5"
+                }
+            }),
+        );
         assert!(
             st.buffer.is_none(),
             "the turn buffer must be released whatever the outcome"
@@ -1002,10 +1017,18 @@ mod tests {
                 other => panic!("{reason}: unexpected {other:?}"),
             }
             match &events[1] {
-                ThreadEvent::TurnFailed { turn_id, err } => {
+                ThreadEvent::TurnFailed {
+                    turn_id,
+                    err,
+                    usage,
+                    model,
+                } => {
                     assert_eq!(turn_id, "t-stop");
                     assert_eq!(err.kind, want_kind);
                     assert!(err.message.contains(reason), "{reason}: {}", err.message);
+                    assert_eq!(usage.input_tokens, 70, "{reason}");
+                    assert_eq!(usage.output_tokens, 30, "{reason}");
+                    assert_eq!(model.as_deref(), Some("grok-4.5"), "{reason}");
                 }
                 other => panic!("{reason}: must be TurnFailed, got {other:?}"),
             }

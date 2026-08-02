@@ -185,7 +185,7 @@ async fn real_codex_reply_roundtrip_proves_model_output() {
                     );
                     break;
                 }
-                ThreadEvent::TurnFailed { turn_id, err } => {
+                ThreadEvent::TurnFailed { turn_id, err, .. } => {
                     return Err(format!("turn {turn_id} failed: {err:?}"));
                 }
                 ThreadEvent::Error(e) => return Err(format!("stream error: {e:?}")),

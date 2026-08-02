@@ -4067,6 +4067,8 @@ mod session_tool_tests {
                         ccteam_harness::ThreadEvent::TurnFailed {
                             turn_id: format!("turn-{}", h.identity),
                             err,
+                            usage: ccteam_harness::UnifiedTokenUsage::default(),
+                            model: None,
                         },
                     ));
                 } else {

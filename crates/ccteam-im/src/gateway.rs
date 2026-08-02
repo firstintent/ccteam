@@ -4221,7 +4221,7 @@ impl Gateway {
                                 );
                             }
                         }
-                        // v0.8.19 `/status` — a completed turn ends the in-flight
+                        // v0.8.19 `/status` — a terminal turn ends the in-flight
                         // window: clear `turn_started_at` (→ 🟢 idle) and the
                         // activity summary. Protocol-INDEPENDENT (both tmux and
                         // stream-json adapters emit `TurnCompleted`), unlike the
@@ -4231,14 +4231,9 @@ impl Gateway {
                         // v0.9 T5 — BEFORE clearing, capture duration + signals
                         // and append one kind:turn experience record (derived
                         // index; failure never breaks the pump).
-                        if let ThreadEvent::TurnCompleted {
-                            turn_id,
-                            usage,
-                            model,
-                        } = &evt
-                        {
-                            let completed_origin = take_turn_origin(&session, Some(turn_id));
-                            let mirror_answer = mirror_last_answer.take();
+                        if let Some((turn_id, usage, model)) = turn_terminal_accounting(&evt) {
+                            let is_completed =
+                                matches!(&evt, ThreadEvent::TurnCompleted { .. });
                             let duration_ms = session
                                 .turn_started_at
                                 .lock()
@@ -4263,10 +4258,12 @@ impl Gateway {
                             }
 
                             if let Some(dir) = project_dir.as_ref() {
-                                let model_owned = model.clone().filter(|m| !m.is_empty());
+                                let model_owned = model
+                                    .filter(|model| !model.is_empty())
+                                    .map(str::to_string);
                                 let cost_usd = {
                                     let m = model_owned.as_deref().unwrap_or("");
-                                    ccteam_cost::estimate_cost(
+                                    ccteam_cost::resolve_turn_cost(
                                         usage,
                                         session.vendor.cost_vendor(),
                                         m,
@@ -4278,9 +4275,12 @@ impl Gateway {
                                 let exp_turn_id = if turn_id.is_empty() {
                                     format!("{session_id}-{}", seq.saturating_add(1))
                                 } else {
-                                    turn_id.clone()
+                                    turn_id.to_string()
                                 };
-                                let usage_opt = if usage.total() == 0 && model_owned.is_none() {
+                                let usage_opt = if usage.total() == 0
+                                    && usage.reported_cost_usd.is_none()
+                                    && model_owned.is_none()
+                                {
                                     None
                                 } else {
                                     Some(*usage)
@@ -4316,44 +4316,49 @@ impl Gateway {
                                 }
                             }
 
-                            // v0.9.5 feedback fix — the vendor turn is DONE and
-                            // the child is idle: flush ONE boundary signal
-                            // carrying the turn's final answer (the last
-                            // mirrored message) + the whole turn's mirrored ids
-                            // for batch dedup. Interim messages already flowed
-                            // as non-boundary signals (an `all` watch consumes
-                            // those); the default `final` watch notifies here
-                            // and ONLY here.
-                            let finished = turn_last_answer.take();
-                            let covered = std::mem::take(&mut turn_covered);
-                            let notes = turn_notes;
-                            turn_notes = 0;
-                            if let (Some(dtx), Some((final_turn, final_text))) =
-                                (delegation_tx.as_ref(), finished.as_ref())
-                            {
-                                let _ = dtx.send(crate::delegation::DelegationSignal {
-                                    child_sid: session_id.clone(),
-                                    turn_id: final_turn.clone(),
-                                    tail: final_text.clone(),
-                                    vendor: pump_vendor,
-                                    host: pump_host.clone(),
-                                    boundary: true,
-                                    vendor_error: false,
-                                    interim_notes: notes.saturating_sub(1),
-                                    covered_turns: covered,
-                                });
-                            }
-                            if let Some((final_text, reply_to)) = mirror_answer {
-                                mirror_internal_web_answer(
-                                    &tx,
-                                    mirror_paths.as_ref(),
-                                    &session,
-                                    &reply_to,
-                                    completed_origin,
-                                    &session_id,
-                                    seq,
-                                    &final_text,
-                                );
+                            if is_completed {
+                                let completed_origin =
+                                    take_turn_origin(&session, Some(turn_id));
+                                let mirror_answer = mirror_last_answer.take();
+                                // v0.9.5 feedback fix — the vendor turn is DONE and
+                                // the child is idle: flush ONE boundary signal
+                                // carrying the turn's final answer (the last
+                                // mirrored message) + the whole turn's mirrored ids
+                                // for batch dedup. Interim messages already flowed
+                                // as non-boundary signals (an `all` watch consumes
+                                // those); the default `final` watch notifies here
+                                // and ONLY here.
+                                let finished = turn_last_answer.take();
+                                let covered = std::mem::take(&mut turn_covered);
+                                let notes = turn_notes;
+                                turn_notes = 0;
+                                if let (Some(dtx), Some((final_turn, final_text))) =
+                                    (delegation_tx.as_ref(), finished.as_ref())
+                                {
+                                    let _ = dtx.send(crate::delegation::DelegationSignal {
+                                        child_sid: session_id.clone(),
+                                        turn_id: final_turn.clone(),
+                                        tail: final_text.clone(),
+                                        vendor: pump_vendor,
+                                        host: pump_host.clone(),
+                                        boundary: true,
+                                        vendor_error: false,
+                                        interim_notes: notes.saturating_sub(1),
+                                        covered_turns: covered,
+                                    });
+                                }
+                                if let Some((final_text, reply_to)) = mirror_answer {
+                                    mirror_internal_web_answer(
+                                        &tx,
+                                        mirror_paths.as_ref(),
+                                        &session,
+                                        &reply_to,
+                                        completed_origin,
+                                        &session_id,
+                                        seq,
+                                        &final_text,
+                                    );
+                                }
                             }
                         }
                         // A canonical failure is a terminal turn boundary too.
@@ -4374,8 +4379,8 @@ impl Gateway {
                             }
                         }
                         // v0.8.11 E4 — for a paneless session (no hooks:
-                        // stream-json AND acp), the pump mirrors each completed
-                        // turn to progress.jsonl with the sid, so the
+                        // stream-json AND acp), the pump mirrors each terminal
+                        // turn's accounting to progress.jsonl with the sid, so the
                         // session-list activity classifier (which keys off the
                         // latest sid-tagged event) sees it as active and
                         // `last_activity_seconds` tracks — and the per-session
@@ -4386,20 +4391,16 @@ impl Gateway {
                         // hook → gate on protocol to avoid a double-write.
                         if !session.protocol.is_terminal() {
                             if let (
-                                ThreadEvent::TurnCompleted {
-                                    turn_id,
-                                    usage,
-                                    model,
-                                },
+                                Some((turn_id, usage, model)),
                                 Some(ppath),
-                            ) = (&evt, progress_path.as_ref())
+                            ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
                             {
                                 let ev = ccteam_core::progress::build_chat_turn_completed_event(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
-                                    model.as_deref(),
+                                    model,
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)
@@ -9181,7 +9182,7 @@ fn refresh_session_activity_meta(
 /// Sum the deterministic per-turn cost AND raw token count of every
 /// `chat_turn_completed` event in `progress_path` tagged with `sid`, pricing
 /// each turn's `usage` against its own canonical `model` via
-/// [`ccteam_cost::estimate_cost`] — mirrors `ccteam-web`'s
+/// [`ccteam_cost::resolve_turn_cost`] — mirrors `ccteam-web`'s
 /// `status::build_session_cost_rows`, scoped to one sid so it can run from the
 /// harness-side pump (which has no access to that web-layer helper). `None`
 /// when nothing priced/counted yet (never a faked `0.0`); a turn whose model
@@ -9223,7 +9224,7 @@ fn session_cost_and_tokens(
             counted += 1;
         }
         let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(cost) = ccteam_cost::estimate_cost(&usage, cost_vendor, model) {
+        if let Some(cost) = ccteam_cost::resolve_turn_cost(&usage, cost_vendor, model) {
             total += cost;
             priced += 1;
         }
@@ -9856,6 +9857,29 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
 fn thread_event_failure(evt: &ThreadEvent) -> Option<&ccteam_harness::ThreadErrorEvent> {
     match evt {
         ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => Some(err),
+        _ => None,
+    }
+}
+
+/// Accounting carried by a vendor turn's terminal boundary. Successful and
+/// failed turns deliberately share this projection so every paid token reaches
+/// the same existing `chat_turn_completed` ledger row without changing the
+/// progress schema.
+fn turn_terminal_accounting(
+    evt: &ThreadEvent,
+) -> Option<(&str, &ccteam_harness::UnifiedTokenUsage, Option<&str>)> {
+    match evt {
+        ThreadEvent::TurnCompleted {
+            turn_id,
+            usage,
+            model,
+        }
+        | ThreadEvent::TurnFailed {
+            turn_id,
+            usage,
+            model,
+            ..
+        } => Some((turn_id, usage, model.as_deref())),
         _ => None,
     }
 }
@@ -11477,6 +11501,13 @@ mod tests {
                             kind: "turn_failed".to_string(),
                             message: message.clone(),
                         },
+                        usage: ccteam_harness::UnifiedTokenUsage {
+                            input_tokens: 1_000,
+                            output_tokens: 500,
+                            reported_cost_usd: Some(0.42),
+                            ..Default::default()
+                        },
+                        model: Some("vendor-reported-model".to_string()),
                     },
                 ));
             } else {
@@ -14358,6 +14389,96 @@ mod tests {
             "stream-json pump must mirror a chat_turn_completed carrying the sid to {}",
             progress.display()
         );
+    }
+
+    #[tokio::test]
+    async fn failed_turn_usage_reaches_ledger_experience_and_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Opencode).with_turn_failure("output truncated"));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Opencode,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut ledger_row = None;
+        for _ in 0..100 {
+            ledger_row = ccteam_core::progress::read_all_events(&progress)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|event| {
+                    event.get("event").and_then(|value| value.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                        && event.get("sid").and_then(|value| value.as_str()) == Some(sid.as_str())
+                });
+            if ledger_row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ledger_row = ledger_row.unwrap_or_else(|| {
+            panic!(
+                "failed turn must append one usage ledger row to {}",
+                progress.display()
+            )
+        });
+        let usage: ccteam_harness::UnifiedTokenUsage =
+            serde_json::from_value(ledger_row["usage"].clone()).unwrap();
+        assert_eq!(usage.total(), 1_500);
+        assert_eq!(usage.reported_cost_usd, Some(0.42));
+        assert_eq!(ledger_row["model"].as_str(), Some("vendor-reported-model"));
+
+        let mut experience = None;
+        let mut meta = None;
+        for _ in 0..100 {
+            experience = ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|record| match record {
+                    ccteam_harness::execution::experience::ExperienceRecord::Turn(turn)
+                        if turn.sid == sid =>
+                    {
+                        Some(turn)
+                    }
+                    _ => None,
+                });
+            meta = read_session_meta(&project_dir, &sid)
+                .ok()
+                .filter(|session| {
+                    session.tokens_total == Some(1_500) && session.cost_usd == Some(0.42)
+                });
+            if experience.is_some() && meta.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let experience = experience.expect("failed terminal event must append experience row");
+        assert_eq!(experience.usage.map(|value| value.total()), Some(1_500));
+        assert_eq!(experience.cost_usd, Some(0.42));
+        let meta = meta.expect("failed terminal event must refresh token/cost meta");
+        assert_eq!(meta.tokens_total, Some(1_500));
+        assert_eq!(meta.cost_usd, Some(0.42));
     }
 
     /// Startup restore can be slow (e.g. stream-json waits for `system:init`).

@@ -47,10 +47,12 @@
 - **DoD**:两族在默认 shell TMPDIR(`/var/folders/…`)下全绿;`make test-baseline` 本机默认 shell 全绿;不动任何生产逻辑;writeback 绿。
 
 ### ACP-LEDGER-1 失败/截断 turn 的 usage 不入账本(跨 vendor 同形洞)
-- **状态**:待排 · **冲突域**:`crates/ccteam-im(gateway 事件泵记账段)` · **建议入口**:dev 会话
+- **状态**:完成(976b287) · **冲突域**:`crates/ccteam-im(gateway 事件泵记账段)` · **建议入口**:dev 会话
 - **背景**:`410647d` 修 ACP 结局契约时暴露的**既有**洞(非该 commit 引入):成本/token 账本行只在 `ThreadEvent::TurnCompleted` 分支写(`gateway.rs` 事件泵 `!protocol.is_terminal()` 段 → `ccteam_cost::estimate_cost`),而 `TurnFailed` 是终态事件、后面不跟 `TurnCompleted`(claude `is_failure` 早退、codex terminal error、现在 ACP 非 clean `stopReason` 三条路一致)。所以**失败 turn 烧掉的 token 全部不入账**;`max_tokens` 尤其刺眼——它定义上烧完了整个输出窗口,却在账本里消失。红线「成本全入账本」与之冲突。
 - **规格**:让终态失败也落账 —— 倾向让 `TurnFailed` 携带 usage(`ThreadEvent` 加字段属 additive,但 `CanonicalEvent`/progress schema 语义须零变,schema 权威 = `harness/progress_bridge`),或事件泵在 `TurnFailed` 分支复用同一 `estimate_cost` 路径取本 turn 已知 usage。**跨 vendor 一次修**(claude/codex/acp 同形),不做 per-vendor 补丁;若要改 `ThreadEvent` 公共形状先核全 caller(AGENTS §六)。
 - **DoD**:新定向测试先造缺陷态红(失败 turn 后账本零行)后修绿;三 vendor 路径各一断言;`make test` 基线只增;writeback 绿。
+- **验证**:实现 `976b287`;tests-first 红态:`ccteam-harness --lib` **409 绿/3 红**(Claude/Codex/ACP 三条失败终态 usage/model 均为 0),gateway 定向 **0 绿/1 红**(`TurnFailed` 后零 `chat_turn_completed` 账行);绿态 harness **414/0** + gateway **1/0**(失败 OpenCode turn 的 progress/experience/meta = 1500 tokens + vendor-reported `$0.42`)+ codex progress bridge **5/0** + experience rebuild reported-cost **1/0**。`make check`(fmt + workspace all-target clippy `-D warnings`)绿、0 warning;`make test-baseline` 同机前 **7 targets/1762 绿/1 红**→后 **7/1765/1**;`make test` 前 **120 targets/2477 绿/35 红/20 ignored**→最终 **120/2482/33/20**,同一 10 个失败 target、失败名集合为前态严格子集(2 个既有 UDS flake 本轮转绿),零新增、净 +3 测试。全仓 `TurnFailed` 54 处复核且 all-target 编译覆盖;`.loop/verify/writeback.sh` 绿。
+- **偏差**:无产品/架构偏差;`CanonicalEvent` 仅 additive 字段,`progress.jsonl` 仍复用既有 `chat_turn_completed` 账行与既有 errored 结局,未改 schema;明确排除的 transcript scanner / codex adapter cost producer / flow placeholder / web 已正确调用点均未动。macOS 已登记红不变:baseline 唯一 TMPDIR canonicalize;full suite 前 35 红→最终 33 红(含 UDS SUN_LEN 与 terminal/hook 环境族,同 10 targets),零 NEW failure。
 
 ### KIMI-UPSTREAM-1 kimi vendor 缺陷 watch(failed→end_turn 折叠 + 无 ctx 面)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness(kimi_acp)` · **建议入口**:dev 会话

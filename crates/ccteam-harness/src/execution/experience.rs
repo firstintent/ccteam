@@ -1,7 +1,7 @@
 //! Per-delegation experience records — a **derived index**, not a new SoT.
 //!
 //! Lives at `<project>/.ccteam/experience.jsonl` (project-level, shared across
-//! sids). Each line is one JSON object: either a completed-turn summary
+//! sids). Each line is one JSON object: either a terminal-turn summary
 //! (`kind: "turn"`) or a human verdict (`kind: "verdict"` — written by a
 //! future task; type + serde defined here).
 //!
@@ -37,7 +37,7 @@ pub enum ExperienceRecord {
     Verdict(VerdictExperience),
 }
 
-/// Per-completed-turn summary (live pump + rebuild both emit this shape).
+/// Per-terminal-turn summary (live pump + rebuild both emit this shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnExperience {
     pub sid: String,
@@ -360,7 +360,7 @@ pub fn rebuild_experience(
                     .map(str::to_string);
                 let cost_usd = usage.as_ref().and_then(|u| {
                     let m = model.as_deref().unwrap_or("");
-                    ccteam_cost::estimate_cost(u, cost_vendor, m)
+                    ccteam_cost::resolve_turn_cost(u, cost_vendor, m)
                 });
                 let tool_calls = tr.tool_calls.len() as u64;
                 turns.push(ExperienceRecord::Turn(TurnExperience {
@@ -575,6 +575,73 @@ mod tests {
         fs::write(skill.join("SKILL.md"), b"watch ci harder").unwrap();
         let c = skills_fingerprint(tmp.path()).unwrap();
         assert_ne!(a.get("ci-watcher"), c.get("ci-watcher"));
+    }
+
+    #[test]
+    fn rebuild_prefers_vendor_reported_turn_cost() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let now = Utc::now();
+        let meta = super::super::session_meta::SessionMeta {
+            sid: "s1".into(),
+            slug: "demo".into(),
+            vendor: crate::AgentVendor::Opencode,
+            protocol: crate::SessionProtocol::Acp,
+            role: String::new(),
+            permission_mode: crate::PermissionMode::Skip,
+            owner: "user:web-api".into(),
+            vendor_uuid: String::new(),
+            model: None,
+            effort: None,
+            host: "local".into(),
+            created_at: now.to_rfc3339(),
+            last_active: now.to_rfc3339(),
+            origin: super::super::session_meta::SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 1,
+            cost_usd: None,
+            tokens_total: None,
+            role_sha: None,
+            skills_sha: None,
+            trigger: None,
+            parent_sid: None,
+            spawned_by_role: None,
+            delegation_depth: 0,
+        };
+        super::super::session_meta::write_session_meta(project, &meta).unwrap();
+        super::super::turns_mirror::append_turn(
+            project,
+            "s1",
+            &super::super::turns_mirror::TurnRecord {
+                turn_id: "turn-1".into(),
+                ts: now,
+                vendor: "opencode".into(),
+                role: String::new(),
+                user: "hi".into(),
+                assistant: "partial".into(),
+                usage: serde_json::to_value(UnifiedTokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    reported_cost_usd: Some(0.73),
+                    ..Default::default()
+                })
+                .unwrap(),
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                outcome: Some("failed".into()),
+                error_kind: Some("max_tokens".into()),
+                error: Some("output truncated".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rebuild_experience(project, None).unwrap(), (1, 0));
+        let record = read_all_experience(project).unwrap().remove(0);
+        match record {
+            ExperienceRecord::Turn(turn) => assert_eq!(turn.cost_usd, Some(0.73)),
+            other => panic!("expected turn, got {other:?}"),
+        }
     }
 
     #[test]
