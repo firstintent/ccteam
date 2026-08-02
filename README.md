@@ -23,6 +23,12 @@ Each coding CLI is brilliant alone but works in isolation — one terminal, one 
 
 ccteam is the connective tissue they lack — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves *how* the team organizes itself to prompts you version.
 
+<p align="center">
+  <img src="docs/images/web-team-topology.png" width="1000" alt="Team page — live delegation topology: 50 live sessions across claude, codex, grok and kimi; who delegated whom, each session's model and reasoning effort, and the running cost ledger" />
+  <br/>
+  <sub><b>An afternoon on the Team page</b> — 50 live sessions across four vendors, every delegation a traceable parent→child edge, every dollar on the ledger.</sub>
+</p>
+
 ## Usage
 
 **1 · Remote control from Telegram / Lark**
@@ -37,9 +43,21 @@ Paste a bot token once (Settings → Access) and the chat becomes a full console
 /inbox +30m remind me …         # schedule a one-shot user turn; /inbox lists · cancel dN
 ```
 
+<p align="center">
+  <img src="docs/images/telegram-console.png" width="640" alt="Telegram as a full console — /projects to switch project, /use to pick a session, /status showing the session's model, context, usage and its working/idle children" />
+  <br/>
+  <sub><b>Telegram is the whole console</b> — switch projects, address any session, and one <code>/status</code> card shows the brain plus every delegate it hired.</sub>
+</p>
+
 **2 · Remote control from the web console**
 
 The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-ip>:7331/?token=…`) — open it from any device on your LAN. It's a chat shell, not a dashboard:
+
+<p align="center">
+  <img src="docs/images/web-launcher.png" width="1000" alt="The web launcher — pick a project, host, role, vendor and model in one pill, type, and the session is born on your first message; six formation playbooks below prefill a vendor lineup" />
+  <br/>
+  <sub><b>No “create session” form</b> — pick project · host · vendor · model in one pill and just type; the formation playbooks below prefill a whole lineup.</sub>
+</p>
 
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
 - a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
@@ -121,6 +139,12 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 - **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents, satellite join tokens for new machines, Telegram/Lark bot credentials (chat id captured automatically), and per-user login links
 - **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
+
+<p align="center">
+  <img src="docs/images/web-workflow-hub.png" width="1000" alt="Workflow hub — skills, roles, marketplace, MCP servers, and the per-project experience ledger: turn records with role and skill fingerprints" />
+  <br/>
+  <sub><b>The workflow hub</b> — skills, personas, marketplace and MCP servers in one place, next to the project's experience ledger (turn records + role/skill fingerprints).</sub>
+</p>
 
 > The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. To bind a specific host/port (e.g. loopback only), pass `--web-bind` when you start it: `ccteam daemon start --web-bind 127.0.0.1:7331`.
 
