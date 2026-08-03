@@ -10,7 +10,7 @@ function agent(vendor: string, installed: boolean): AgentHealth {
     version: installed ? "1.0.0" : null,
     bin: vendor,
     mcp_registered: false,
-    mcp_registrable: false,
+    tool_surface: "managed_session_bridge",
     status: installed ? "ready" : "not_installed",
     hint: null,
   };

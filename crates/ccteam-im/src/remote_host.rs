@@ -25,12 +25,32 @@ use ccteam_core::host_registry::{
     gate_remote_spawn, gate_remote_spawn_project, HostRegistry, DEFAULT_HEARTBEAT_TTL_SECS,
     LOCAL_HOST,
 };
-use ccteam_harness::{HostChannelHub, RemoteExecTarget, SessionProtocol};
+use ccteam_harness::{AgentVendor, HostChannelHub, RemoteExecTarget, SessionProtocol};
 use std::path::Path;
 
 /// Stable error returned when a v0.9.1 caller still supplies per-spawn host.
 pub const HOST_SPAWN_PARAM_REMOVED: &str =
     "removed in v0.9.2: host is bound to the project; spawn into a project on that host instead";
+
+/// Typed local-only rejection. Callers can downcast this through `anyhow`
+/// without parsing display text, and no adapter/fallback is consulted.
+#[derive(Debug, thiserror::Error)]
+#[error("vendor `pi` is local-only; project is bound to satellite host `{host}`; session was not created")]
+pub struct RemoteVendorUnsupported {
+    /// Satellite host bound to the project that rejected the local-only vendor.
+    pub host: String,
+}
+
+/// Reject a vendor/host combination that ccteam cannot execute remotely.
+/// Local and empty host ids are always accepted.
+pub fn ensure_vendor_host_supported(vendor: AgentVendor, host: &str) -> Result<()> {
+    if vendor == AgentVendor::Pi && !host.is_empty() && host != LOCAL_HOST {
+        return Err(anyhow::Error::new(RemoteVendorUnsupported {
+            host: host.to_string(),
+        }));
+    }
+    Ok(())
+}
 
 /// Decision after the host gate for a create/resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +227,7 @@ pub async fn prepare_host_for_spawn(
     ccteam_root: Option<&Path>,
     host: &str,
     slug: &str,
+    vendor: AgentVendor,
     protocol: SessionProtocol,
     proxy: Option<&Arc<dyn RemoteHostProxy>>,
 ) -> Result<HostTarget> {
@@ -215,6 +236,7 @@ pub async fn prepare_host_for_spawn(
     } else {
         host.to_string()
     };
+    ensure_vendor_host_supported(vendor, &host)?;
     if host == LOCAL_HOST {
         return Ok(HostTarget::local());
     }
@@ -266,13 +288,14 @@ pub async fn regate_remote_host(
     ccteam_root: Option<&Path>,
     host: &str,
     slug: &str,
+    vendor: AgentVendor,
     protocol: SessionProtocol,
     proxy: Option<&Arc<dyn RemoteHostProxy>>,
 ) -> Result<Option<RemoteExecTarget>> {
     if host.is_empty() || host == LOCAL_HOST {
         return Ok(None);
     }
-    let target = prepare_host_for_spawn(ccteam_root, host, slug, protocol, proxy).await?;
+    let target = prepare_host_for_spawn(ccteam_root, host, slug, vendor, protocol, proxy).await?;
     Ok(target.remote)
 }
 
@@ -313,6 +336,7 @@ mod tests {
             Some(tmp.path()),
             "sat",
             "demo",
+            AgentVendor::Claude,
             SessionProtocol::StreamJson,
             Some(&proxy),
         )
@@ -332,6 +356,7 @@ mod tests {
             Some(tmp.path()),
             "sat",
             "demo",
+            AgentVendor::Claude,
             SessionProtocol::StreamJson,
             Some(&proxy),
         )
@@ -357,6 +382,7 @@ mod tests {
             Some(tmp.path()),
             "sat",
             "other",
+            AgentVendor::Claude,
             SessionProtocol::StreamJson,
             Some(&proxy),
         )
@@ -369,18 +395,28 @@ mod tests {
 
     #[tokio::test]
     async fn regate_remote_host_is_a_zero_cost_noop_for_local() {
-        assert!(
-            regate_remote_host(None, "local", "demo", SessionProtocol::StreamJson, None)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            regate_remote_host(None, "", "demo", SessionProtocol::StreamJson, None)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(regate_remote_host(
+            None,
+            "local",
+            "demo",
+            AgentVendor::Claude,
+            SessionProtocol::StreamJson,
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(regate_remote_host(
+            None,
+            "",
+            "demo",
+            AgentVendor::Claude,
+            SessionProtocol::StreamJson,
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
@@ -393,12 +429,31 @@ mod tests {
             Some(tmp.path()),
             "sat",
             "demo",
+            AgentVendor::Claude,
             SessionProtocol::StreamJson,
             Some(&proxy),
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("offline"));
+    }
+
+    #[tokio::test]
+    async fn pi_remote_spawn_is_typed_and_never_calls_the_proxy() {
+        let fake = Arc::new(FakeRemoteHostProxy::default());
+        let proxy: Arc<dyn RemoteHostProxy> = fake.clone();
+        let err = prepare_host_for_spawn(
+            None,
+            "sat",
+            "demo",
+            AgentVendor::Pi,
+            SessionProtocol::StreamJson,
+            Some(&proxy),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<RemoteVendorUnsupported>().is_some());
+        assert!(fake.last_host.lock().unwrap().is_none());
     }
 
     /// Production [`HubRemoteHostProxy`]: a live control channel in the hub

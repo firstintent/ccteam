@@ -129,8 +129,9 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
         "grok" => Ok(AgentVendor::Grok),
         "opencode" => Ok(AgentVendor::Opencode),
         "kimi" => Ok(AgentVendor::Kimi),
+        "pi" => Ok(AgentVendor::Pi),
         other => Err(format!(
-            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi)"
+            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi|pi)"
         )),
     }
 }
@@ -295,7 +296,7 @@ pub struct CreateSessionForm {
 
 /// Map the create form's model/effort into a [`SpawnTuning`] — the ONE place
 /// this entry point decides what reaches the vendor, and it decides nothing:
-/// both facets ride through untouched for all five vendors.
+/// both facets ride through untouched for every vendor.
 ///
 /// `_vendor` stays in the signature deliberately. It used to gate the effort
 /// facet (grok/kimi were zeroed here on the theory that ccteam knew their
@@ -380,13 +381,10 @@ pub(crate) async fn handle_create_session(
         Ok(p) => p,
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
-    let protocol = if matches!(
-        vendor,
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
-    ) {
-        SessionProtocol::Acp
-    } else {
-        protocol
+    let protocol = match vendor {
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi => SessionProtocol::Acp,
+        AgentVendor::Pi => SessionProtocol::StreamJson,
+        AgentVendor::Claude | AgentVendor::Codex => protocol,
     };
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
@@ -2028,6 +2026,7 @@ mod tests {
         assert_eq!(parse_vendor("Codex").unwrap(), AgentVendor::Codex);
         assert_eq!(parse_vendor("grok").unwrap(), AgentVendor::Grok);
         assert_eq!(parse_vendor("opencode").unwrap(), AgentVendor::Opencode);
+        assert_eq!(parse_vendor("pi").unwrap(), AgentVendor::Pi);
         assert_eq!(parse_vendor("  CLAUDE ").unwrap(), AgentVendor::Claude);
     }
 
@@ -3011,6 +3010,7 @@ mod tests {
             (AgentVendor::Grok, "grok-code", "high"),
             (AgentVendor::Opencode, "anthropic/claude-opus-4-5", "high"),
             (AgentVendor::Kimi, "kimi-code/k3", "max"),
+            (AgentVendor::Pi, "anthropic/claude-sonnet-4-5", "high"),
         ] {
             let t = spawn_tuning_from_form(vendor, Some(model.into()), Some(effort.into()));
             assert_eq!(t.model.as_deref(), Some(model), "{vendor:?} dropped model");

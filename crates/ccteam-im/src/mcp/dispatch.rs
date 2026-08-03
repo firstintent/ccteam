@@ -2298,10 +2298,10 @@ fn mark_idempotent_replay(body: &str) -> String {
 }
 
 /// Stable error for the removed MCP `session_spawn.protocol` input.
-pub const PROTOCOL_SPAWN_PARAM_REMOVED: &str = "session_spawn: `protocol` was removed; the channel is derived from `vendor` (claude/codex = stream-json, grok/opencode/kimi = acp) — omit `protocol`";
+pub const PROTOCOL_SPAWN_PARAM_REMOVED: &str = "session_spawn: `protocol` was removed; the channel is derived from `vendor` (claude/codex/pi = stream-json, grok/opencode/kimi = acp) — omit `protocol`";
 
 /// Derive the sole wire channel for an MCP-spawned vendor session:
-/// claude/codex = stream-json; grok/opencode/kimi = acp. The `protocol`
+/// claude/codex/pi = stream-json; grok/opencode/kimi = acp. The `protocol`
 /// parameter was removed on 2026-07-26, mirroring the earlier `host` removal:
 /// callers must omit a facet that carries no choice.
 fn derive_session_protocol(vendor: ccteam_harness::AgentVendor) -> ccteam_harness::SessionProtocol {
@@ -2309,12 +2309,9 @@ fn derive_session_protocol(vendor: ccteam_harness::AgentVendor) -> ccteam_harnes
         ccteam_harness::AgentVendor::Grok
         | ccteam_harness::AgentVendor::Opencode
         | ccteam_harness::AgentVendor::Kimi => ccteam_harness::SessionProtocol::Acp,
-        ccteam_harness::AgentVendor::Claude | ccteam_harness::AgentVendor::Codex => {
-            ccteam_harness::SessionProtocol::StreamJson
-        }
-        ccteam_harness::AgentVendor::Pi => {
-            unreachable!("Pi session_spawn is gated until Wave 3")
-        }
+        ccteam_harness::AgentVendor::Claude
+        | ccteam_harness::AgentVendor::Codex
+        | ccteam_harness::AgentVendor::Pi => ccteam_harness::SessionProtocol::StreamJson,
     }
 }
 
@@ -3553,8 +3550,9 @@ fn parse_session_vendor(
             "grok" => Ok(ccteam_harness::AgentVendor::Grok),
             "opencode" => Ok(ccteam_harness::AgentVendor::Opencode),
             "kimi" => Ok(ccteam_harness::AgentVendor::Kimi),
+            "pi" => Ok(ccteam_harness::AgentVendor::Pi),
             other => Err(format!(
-                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, `opencode`, or `kimi`"
+                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, `opencode`, `kimi`, or `pi`"
             )),
         },
     }
@@ -5286,6 +5284,10 @@ mod session_tool_tests {
         assert_eq!(
             parse_session_vendor(&json!({ "vendor": "codex" })).unwrap(),
             ccteam_harness::AgentVendor::Codex
+        );
+        assert_eq!(
+            parse_session_vendor(&json!({ "vendor": "pi" })).unwrap(),
+            ccteam_harness::AgentVendor::Pi
         );
         assert!(parse_session_vendor(&json!({ "vendor": "gpt" })).is_err());
     }

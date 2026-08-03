@@ -420,6 +420,7 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         Some(&paths.root),
         "dead-sat",
         "demo",
+        AgentVendor::Claude,
         SessionProtocol::StreamJson,
         Some(&proxy),
     )
@@ -448,6 +449,7 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         Some(&paths.root),
         "dead-sat",
         "demo",
+        AgentVendor::Claude,
         SessionProtocol::StreamJson,
         Some(&proxy),
     )
@@ -462,6 +464,7 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         Some(&paths.root),
         "dead-sat",
         "demo",
+        AgentVendor::Claude,
         SessionProtocol::Terminal,
         Some(&proxy),
     )
@@ -474,6 +477,7 @@ async fn remote_spawn_offline_error_does_not_create_session() {
         Some(&paths.root),
         "dead-sat",
         "not-registered-there",
+        AgentVendor::Claude,
         SessionProtocol::StreamJson,
         Some(&proxy),
     )
@@ -592,6 +596,30 @@ async fn gateway_create_on_offline_host_fails_clean() {
         .unwrap_err();
     assert!(err.to_string().contains("offline"), "got: {err}");
     // No live sessions.
+    assert!(gw.session_views().is_empty());
+
+    let pi_err = gw
+        .create_session_api_tuned(
+            "alpha".into(),
+            "".into(),
+            AgentVendor::Pi,
+            PermissionMode::Skip,
+            SessionProtocol::StreamJson,
+            "web-api".into(),
+            ccteam_im::gateway::SpawnTuning::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        pi_err
+            .downcast_ref::<ccteam_im::remote_host::RemoteVendorUnsupported>()
+            .is_some(),
+        "Pi remote rejection must stay typed: {pi_err:#}"
+    );
+    assert!(
+        fake.last_host.lock().unwrap().is_none(),
+        "Pi local-only guard must reject before any satellite proxy/local adapter"
+    );
     assert!(gw.session_views().is_empty());
 }
 

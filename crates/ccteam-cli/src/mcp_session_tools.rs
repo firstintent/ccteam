@@ -329,14 +329,17 @@ mod tests {
             .find(|t| t["name"] == "session_spawn")
             .expect("session_spawn defined");
         let props = &spawn["inputSchema"]["properties"];
-        // v0.9.0 W1 (G1) — vendor enum lists all FIVE harnesses.
+        // Vendor enum lists every reachable harness.
         let vendors: Vec<&str> = props["vendor"]["enum"]
             .as_array()
             .expect("vendor enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
+        assert_eq!(
+            vendors,
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+        );
         // New facets present. v0.9.1 adds the one-call spawn+dispatch trio
         // (task / wait_seconds / notify).
         for key in ["model", "effort", "title", "task", "wait_seconds", "notify"] {

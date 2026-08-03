@@ -56,8 +56,8 @@ export type PendingAction =
 /** Actionable items for one probed host, in render order.
  *
  *  Local: vendors installed on PATH whose config still lacks ccteam's MCP
- *  entry (`mcp_registrable` is false for ACP vendors — MCP rides the session
- *  protocol there, so a CTA would be a no-op). Satellites: projects the
+ *  entry (`tool_surface` must be `native_mcp_config`, so a managed-bridge CTA
+ *  can never become a no-op). Satellites: projects the
  *  satellite reports but the daemon catalog has not adopted. The split is
  *  hard — register-mcp 404s off-local, and a local project is cataloged by
  *  definition. */
@@ -65,12 +65,27 @@ export type PendingAction =
 export function pendingActionsFor(detail: HostDetail): PendingAction[] {
   if (detail.is_local) {
     return detail.agents
-      .filter((a) => a.mcp_registrable && a.installed && !a.mcp_registered)
+      .filter(
+        (a) =>
+          a.tool_surface === "native_mcp_config" && a.installed && !a.mcp_registered,
+      )
       .map((a) => ({ kind: "register", vendor: a.vendor }) as PendingAction);
   }
   return (detail.projects ?? [])
     .filter((p) => !p.cataloged)
     .map((p) => ({ kind: "import", slug: p.slug, path: p.path }) as PendingAction);
+}
+
+/** Managed-session-only notices shown verbatim from the backend SoT. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located with its only consumer for unit tests.
+export function toolSurfaceNoticesFor(detail: HostDetail): string[] {
+  return [
+    ...new Set(
+      detail.agents.flatMap((agent) =>
+        agent.tool_surface_note ? [agent.tool_surface_note] : [],
+      ),
+    ),
+  ];
 }
 
 async function probeAll(refresh: boolean): Promise<HostState[]> {
@@ -255,6 +270,7 @@ export default function HostsView({
               hostname={h.detail.hostname}
               online
               actions={pendingActionsFor(h.detail)}
+              notices={toolSurfaceNoticesFor(h.detail)}
               busy={busy}
               lang={lang}
               onRegister={(vendor) => void onRegister(h.detail.host, vendor)}
@@ -267,6 +283,7 @@ export default function HostsView({
               hostname={h.summary.hostname || h.summary.host}
               online={false}
               actions={[]}
+              notices={[]}
               busy={busy}
               lang={lang}
               onRegister={() => {}}
@@ -398,6 +415,7 @@ export function HostActionRow({
   hostname,
   online,
   actions,
+  notices = [],
   busy,
   lang = "zh",
   onRegister,
@@ -407,6 +425,7 @@ export function HostActionRow({
   hostname: string;
   online: boolean;
   actions: PendingAction[];
+  notices?: string[];
   busy: string | null;
   lang?: Lang;
   onRegister: (vendor: string) => void;
@@ -469,6 +488,15 @@ export function HostActionRow({
           )
         )}
       </div>
+      {notices.map((notice) => (
+        <p
+          className="host-actions-idle"
+          data-testid={`host-tool-surface-${hostId}`}
+          key={notice}
+        >
+          {notice}
+        </p>
+      ))}
     </div>
   );
 }

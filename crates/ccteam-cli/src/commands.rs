@@ -1248,6 +1248,14 @@ fn render_install_mcp_body(
         "  registered ccteam MCP server for Kimi     in {}\n",
         kimi_path.display()
     ));
+    for spec in ccteam_core::host_registry::AGENT_PROBE_SPECS
+        .iter()
+        .filter(|spec| !spec.tool_surface.uses_native_mcp_config())
+    {
+        if let Some(notice) = spec.tool_surface_notice() {
+            out.push_str(&format!("  {} config unchanged: {notice}\n", spec.vendor));
+        }
+    }
     let total_tools = run_verify_mcp().total_tools;
     out.push_str(&format!("  tools surface : {total_tools}\n"));
     out.push('\n');
@@ -4794,6 +4802,10 @@ mod tests {
                 "report must name the {target} target path: {report}",
             );
         }
+        assert!(
+            report.contains(ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE),
+            "Pi must be described honestly without inventing a config target: {report}"
+        );
     }
 
     #[test]

@@ -1677,6 +1677,7 @@ impl Gateway {
             plan.ccteam_root.as_deref(),
             &plan.host,
             &plan.wire_slug,
+            plan.vendor,
             plan.protocol,
             plan.remote_proxy.as_ref(),
         )
@@ -3342,6 +3343,7 @@ impl Gateway {
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
             &wire_slug,
+            vendor,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -3412,6 +3414,8 @@ impl Gateway {
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+        let (host, wire_slug) = self.project_host_binding(&project)?;
+        crate::remote_host::ensure_vendor_host_supported(vendor, &host)?;
         // v0.8.7 (FIX-2) — reject a role with no `.claude/agents/<role>.md`
         // BEFORE allocating a session id or spawning, so any create path (web /
         // API / IM `/new` / cto-dispatch) that names an unseeded persona fails
@@ -3426,7 +3430,14 @@ impl Gateway {
         // v0.8.24 A-U3 — an explicit composer choice beats the role's
         // `model:` frontmatter; effort has no role-level default.
         let tuning = tuning.normalized();
-        let model_id = tuning.model.or_else(|| role_model_id(role_detail.as_ref()));
+        let model_id = tuning.model.or_else(|| {
+            // Pi owns a vendor-specific `pi.model` frontmatter key. Passing
+            // the generic role model through SpawnCtx would make it look like
+            // an explicit caller choice and incorrectly outrank that key.
+            (vendor != AgentVendor::Pi)
+                .then(|| role_model_id(role_detail.as_ref()))
+                .flatten()
+        });
         let effort = tuning.effort;
         self.next_session += 1;
         // Make the counter durable BEFORE the sid is used (a later spawn failure
@@ -3446,7 +3457,6 @@ impl Gateway {
         // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
-        let (host, wire_slug) = self.project_host_binding(&project)?;
         let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor, protocol);
         // Ownership is decided HERE, the one sync core every fresh spawn funnels
@@ -3503,6 +3513,7 @@ impl Gateway {
                 plan.ccteam_root.as_deref(),
                 &plan.host,
                 &plan.wire_slug,
+                plan.vendor,
                 plan.protocol,
                 plan.remote_proxy.as_ref(),
             )
@@ -5589,6 +5600,7 @@ impl Gateway {
             plan.ccteam_root.as_deref(),
             &plan.host,
             &plan.wire_slug,
+            plan.vendor,
             plan.protocol,
             plan.remote_proxy.as_ref(),
         )
@@ -5726,6 +5738,7 @@ impl Gateway {
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &bound_host,
             &wire_slug,
+            vendor,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -8301,6 +8314,7 @@ impl Gateway {
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
             &wire_slug,
+            vendor,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -10409,6 +10423,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "grok" => Ok(AgentVendor::Grok),
         "opencode" => Ok(AgentVendor::Opencode),
         "kimi" => Ok(AgentVendor::Kimi),
+        "pi" => Ok(AgentVendor::Pi),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -10492,14 +10507,14 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             }
         }
     }
-    // Grok/OpenCode/Kimi always speak ACP (v0.8.23) — settled after the loop
-    // so token order never changes the outcome.
-    if matches!(
-        vendor,
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
-    ) {
-        protocol = SessionProtocol::Acp;
-    }
+    // Vendor-fixed protocols settle after the loop so token order never
+    // changes the outcome. Pi RPC is canonical stream-json at the gateway
+    // boundary even though its child wire is Pi's own JSONL protocol.
+    protocol = match vendor {
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi => SessionProtocol::Acp,
+        AgentVendor::Pi => SessionProtocol::StreamJson,
+        AgentVendor::Claude | AgentVendor::Codex => protocol,
+    };
     Ok(NewSessionArgs {
         vendor,
         role,
@@ -10623,6 +10638,10 @@ mod tests {
         assert_eq!(
             parse_new("grok terminal").unwrap().protocol,
             SessionProtocol::Acp
+        );
+        assert_eq!(
+            parse_new("pi terminal").unwrap().protocol,
+            SessionProtocol::StreamJson
         );
     }
 
@@ -15779,7 +15798,7 @@ mod tests {
         > = Arc::new(|vendor, _| Arc::new(FakeAdapter::new(vendor)));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
             gateway
                 .handle_text("mock", "chat-1", "alice", &format!("/new {vendor}"))
                 .await
@@ -15792,7 +15811,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
             assert!(listing.contains(&format!(" {vendor}")), "{listing}");
         }
     }
@@ -17479,7 +17498,7 @@ mod tests {
                         AgentVendor::Grok => codex.clone(), // tests: no dedicated grok fake
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
-                        AgentVendor::Pi => panic!("Pi is unreachable until Wave 3"),
+                        AgentVendor::Pi => codex.clone(), // tests: no dedicated Pi fake
                     }
                 },
             )
@@ -17572,7 +17591,7 @@ mod tests {
                         AgentVendor::Grok => codex.clone(),
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
-                        AgentVendor::Pi => panic!("Pi is unreachable until Wave 3"),
+                        AgentVendor::Pi => codex.clone(),
                     }
                 },
             )
@@ -19702,7 +19721,7 @@ mod tests {
         // `events_notify` — a single shared fake's `notify_one` could wake the
         // wrong pump when two sessions (parent + child) run concurrently.
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
-            // `with_turn_boundary` mirrors every REAL adapter (all five emit
+            // `with_turn_boundary` mirrors every real adapter (all six emit
             // `TurnCompleted`) — required since v0.9.5: the delegation
             // notification fires on the turn boundary, not per answer.
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())

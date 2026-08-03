@@ -27,7 +27,7 @@ use axum::{
     Extension, Json,
 };
 use ccteam_core::host_registry::{
-    probe_bin_cached, resolve_bin, AgentProbeSpec, AGENT_PROBE_SPECS,
+    probe_bin_cached, resolve_bin, AgentProbeSpec, ToolSurfaceMode, AGENT_PROBE_SPECS,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -59,17 +59,16 @@ pub struct AgentHealth {
     pub version: Option<String>,
     /// Resolved binary path the probe ran (env override or `PATH` name).
     pub bin: String,
-    /// Whether the ccteam MCP server is registered in this vendor's config
-    /// (`~/.claude.json` / Codex `config.toml`). The single thing
-    /// `register-mcp` can flip. Always `false` when [`Self::mcp_registrable`]
-    /// is `false` (no config-file seam to register into).
+    /// Whether the ccteam MCP server is registered in this vendor's config.
+    /// Always false for a managed-session bridge.
     pub mcp_registered: bool,
-    /// Whether config-file MCP registration applies to this vendor at all
-    /// (`false` for grok/ACP — MCP rides the session protocol, not a config).
-    /// Drives whether the register CTA is offered.
-    pub mcp_registrable: bool,
-    /// `ready` (installed + MCP registered, or installed for a
-    /// non-registrable vendor) / `needs_config` (installed, MCP not
+    /// `native_mcp_config` or `managed_session_bridge`.
+    pub tool_surface: String,
+    /// Honest explanation for non-native tool surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_surface_note: Option<String>,
+    /// `ready` (installed + MCP registered, or installed with a managed
+    /// session bridge) / `needs_config` (installed, MCP not
     /// registered) / `not_installed`.
     pub status: String,
     /// Copy-paste remediation when not `ready`; `null` when ready.
@@ -171,9 +170,9 @@ fn mcp_registered(vendor: &str) -> bool {
 fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
     let bin = resolve_bin(spec);
     let (installed, version) = probe_bin_cached(&bin, refresh);
-    // A non-registrable vendor has no config-file seam → never "registered".
-    let registered = spec.mcp_registrable && mcp_registered(spec.vendor);
-    let status = classify_status(installed, registered, spec.mcp_registrable);
+    let native_mcp = spec.tool_surface.uses_native_mcp_config();
+    let registered = native_mcp && mcp_registered(spec.vendor);
+    let status = classify_status(installed, registered, spec.tool_surface);
     let hint: Option<String> = match status {
         "not_installed" => Some(format!(
             "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
@@ -192,7 +191,8 @@ fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
         version,
         bin,
         mcp_registered: registered,
-        mcp_registrable: spec.mcp_registrable,
+        tool_surface: tool_surface_token(spec.tool_surface).to_string(),
+        tool_surface_note: spec.tool_surface_notice(),
         status: status.to_string(),
         hint,
     }
@@ -200,17 +200,28 @@ fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
 
 /// The `ready | needs_config | not_installed` tri-state: `not_installed` when
 /// the binary isn't runnable; `ready` when it is AND the ccteam MCP is
-/// registered — OR the vendor has no config-file MCP seam (`!registrable`),
-/// where an installed binary is all there is to configure; `needs_config`
+/// registered — OR tools arrive via a managed-session bridge, where an
+/// installed binary is all there is to configure; `needs_config`
 /// when installed but the MCP isn't registered yet (the one thing
 /// `register-mcp` fixes).
-fn classify_status(installed: bool, registered: bool, registrable: bool) -> &'static str {
+fn classify_status(
+    installed: bool,
+    registered: bool,
+    tool_surface: ToolSurfaceMode,
+) -> &'static str {
     if !installed {
         "not_installed"
-    } else if registered || !registrable {
+    } else if registered || tool_surface == ToolSurfaceMode::ManagedSessionBridge {
         "ready"
     } else {
         "needs_config"
+    }
+}
+
+fn tool_surface_token(mode: ToolSurfaceMode) -> &'static str {
+    match mode {
+        ToolSurfaceMode::NativeMcpConfig => "native_mcp_config",
+        ToolSurfaceMode::ManagedSessionBridge => "managed_session_bridge",
     }
 }
 
@@ -341,16 +352,23 @@ pub(crate) async fn handle_host_detail(
                 let agents: Vec<AgentHealth> = h
                     .agents
                     .iter()
-                    .map(|a| AgentHealth {
-                        vendor: a.vendor.clone(),
-                        harness_id: a.vendor.clone(),
-                        installed: a.installed,
-                        version: a.version.clone(),
-                        bin: String::new(),
-                        mcp_registered: false,
-                        mcp_registrable: false,
-                        status: a.status.clone(),
-                        hint: None,
+                    .map(|a| {
+                        let spec = AgentProbeSpec::by_vendor(&a.vendor);
+                        AgentHealth {
+                            vendor: a.vendor.clone(),
+                            harness_id: a.vendor.clone(),
+                            installed: a.installed,
+                            version: a.version.clone(),
+                            bin: String::new(),
+                            mcp_registered: false,
+                            tool_surface: spec
+                                .map(|spec| tool_surface_token(spec.tool_surface))
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            tool_surface_note: spec.and_then(AgentProbeSpec::tool_surface_notice),
+                            status: a.status.clone(),
+                            hint: None,
+                        }
                     })
                     .collect();
                 Json(HostDetail {
@@ -466,19 +484,22 @@ pub(crate) async fn handle_register_mcp(
     }
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
-        // A valid vendor that has no config-file MCP seam (grok/ACP): reject
-        // explicitly rather than silently no-op, so the UI/API never presents
-        // a register action that does nothing.
+        // A valid vendor whose tools arrive through a managed-session bridge:
+        // Reject explicitly rather than pretending a config file was written,
+        // so the UI/API never presents a register action that does nothing.
         Some(v)
             if AGENT_PROBE_SPECS
                 .iter()
-                .any(|s| s.vendor == v && !s.mcp_registrable) =>
+                .any(|s| !s.tool_surface.uses_native_mcp_config() && s.vendor == v) =>
         {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": format!(
-                        "vendor {v} has no config-file MCP registration (its MCP rides the session protocol)"
+                        "vendor {v} has no config-file MCP registration. {}",
+                        AgentProbeSpec::by_vendor(v)
+                            .and_then(AgentProbeSpec::tool_surface_notice)
+                            .unwrap_or_else(|| "Its tools are available only in managed sessions.".to_string())
                     )
                 })),
             )
@@ -1186,26 +1207,59 @@ mod tests {
     #[test]
     fn classify_status_covers_the_tri_state() {
         // not installed dominates regardless of registration.
-        assert_eq!(classify_status(false, false, true), "not_installed");
-        assert_eq!(classify_status(false, true, true), "not_installed");
+        assert_eq!(
+            classify_status(false, false, ToolSurfaceMode::NativeMcpConfig),
+            "not_installed"
+        );
+        assert_eq!(
+            classify_status(false, true, ToolSurfaceMode::NativeMcpConfig),
+            "not_installed"
+        );
         // installed but MCP not registered → needs_config (register-mcp fixes it).
-        assert_eq!(classify_status(true, false, true), "needs_config");
+        assert_eq!(
+            classify_status(true, false, ToolSurfaceMode::NativeMcpConfig),
+            "needs_config"
+        );
         // installed + MCP registered → ready (the acceptance: claude ready).
-        assert_eq!(classify_status(true, true, true), "ready");
+        assert_eq!(
+            classify_status(true, true, ToolSurfaceMode::NativeMcpConfig),
+            "ready"
+        );
     }
 
     #[test]
     fn classify_status_non_registrable_vendor_is_ready_when_installed() {
-        // No current vendor is non-registrable; retain branch coverage for a
-        // future ACP-only vendor with no global config seam.
-        assert_eq!(classify_status(true, false, false), "ready");
-        assert_eq!(classify_status(false, false, false), "not_installed");
+        // Managed-session bridges are ready without a global config write.
+        assert_eq!(
+            classify_status(true, false, ToolSurfaceMode::ManagedSessionBridge),
+            "ready"
+        );
+        assert_eq!(
+            classify_status(false, false, ToolSurfaceMode::ManagedSessionBridge),
+            "not_installed"
+        );
     }
 
     #[test]
-    fn all_five_specs_are_mcp_registrable() {
-        assert_eq!(AGENT_PROBE_SPECS.len(), 5);
-        assert!(AGENT_PROBE_SPECS.iter().all(|spec| spec.mcp_registrable));
+    fn probe_specs_declare_their_tool_surface_mode() {
+        assert_eq!(AGENT_PROBE_SPECS.len(), 6);
+        assert_eq!(
+            AgentProbeSpec::by_vendor("pi").unwrap().tool_surface,
+            ToolSurfaceMode::ManagedSessionBridge
+        );
+        assert!(AGENT_PROBE_SPECS
+            .iter()
+            .any(|spec| spec.tool_surface == ToolSurfaceMode::NativeMcpConfig));
+        assert!(AGENT_PROBE_SPECS
+            .iter()
+            .any(|spec| spec.tool_surface == ToolSurfaceMode::ManagedSessionBridge));
+        for spec in AGENT_PROBE_SPECS {
+            assert_eq!(
+                spec.tool_surface_notice().is_some(),
+                spec.tool_surface == ToolSurfaceMode::ManagedSessionBridge,
+                "{spec:?}"
+            );
+        }
     }
 
     #[test]
@@ -1217,7 +1271,7 @@ mod tests {
             // of the host's real claude install.
             bin_env: "CCTEAM_TEST_UNSET_BIN_ENV_ZZZ",
             default_bin: "/nonexistent/ccteam-fake-zzz",
-            mcp_registrable: true,
+            tool_surface: ToolSurfaceMode::NativeMcpConfig,
         };
         let h = agent_health(&spec, true);
         assert!(!h.installed);

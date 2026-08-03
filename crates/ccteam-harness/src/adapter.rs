@@ -124,20 +124,18 @@ pub enum AgentVendor {
     Grok,
     Opencode,
     Kimi,
-    #[serde(skip_deserializing)]
     Pi,
 }
 
 impl AgentVendor {
-    /// Every user-reachable harness vendor — the source of truth for
-    /// side-effecting probe/registration iteration. Pi stays out until its
-    /// Wave 3 entry points and registration surfaces are ready.
+    /// Every user-reachable harness vendor.
     pub const ALL: &'static [AgentVendor] = &[
         AgentVendor::Claude,
         AgentVendor::Codex,
         AgentVendor::Grok,
         AgentVendor::Opencode,
         AgentVendor::Kimi,
+        AgentVendor::Pi,
     ];
 
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {

@@ -14,6 +14,7 @@
 use std::io::IsTerminal;
 use std::process::Command;
 
+use ccteam_core::host_registry::AgentProbeSpec;
 use ccteam_core::{CcteamPaths, Vendor};
 
 /// Severity of one readiness check.
@@ -182,6 +183,13 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
             "kimi",
             false,
             check_vendor_auth_kimi,
+        )),
+        ReportRow::visible(check_agent(
+            "pi",
+            ccteam_harness::PI_BIN_ENV,
+            "pi",
+            false,
+            check_vendor_auth_pi,
         )),
     ];
 
@@ -465,7 +473,26 @@ fn check_vendor_auth_kimi() -> AuthCheck {
     }
 }
 
+fn check_vendor_auth_pi() -> AuthCheck {
+    // Pi may use any configured provider. The RPC feature handshake is the
+    // authoritative model/auth verdict when a managed session starts.
+    AuthCheck {
+        ok: None,
+        login_hint: "",
+    }
+}
+
 fn check_vendor_mcp(vendor: &str) -> McpCheck {
+    if AgentProbeSpec::by_vendor(vendor).is_some_and(|spec| {
+        spec.tool_surface == ccteam_core::host_registry::ToolSurfaceMode::ManagedSessionBridge
+    }) {
+        return McpCheck {
+            status: CheckStatus::Pass,
+            detail: AgentProbeSpec::by_vendor(vendor)
+                .and_then(AgentProbeSpec::tool_surface_notice)
+                .unwrap_or_else(|| "tools arrive through the managed session bridge".to_string()),
+        };
+    }
     let resolved = match vendor {
         "claude" => ccteam_core::projects::resolve_claude_json_path().map(|path| {
             let registered = ccteam_core::mcp_register::claude_mcp_registered(&path);

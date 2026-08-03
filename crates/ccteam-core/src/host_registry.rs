@@ -61,7 +61,7 @@ pub struct HostProjectReport {
 ///   channel) via [`probe_agents`];
 /// - `ccteam-web::routes::{hosts,capabilities}` (wrap [`probe_bin_cached`]
 ///   for the LOCAL admin host-detail / capability matrix, plus the
-///   MCP-registration state keyed off [`Self::mcp_registrable`]);
+///   tool-surface state keyed off [`Self::tool_surface`]);
 /// - the MCP `status` vendor panel + `session_spawn` availability discovery
 ///   (`ccteam-im`) via [`probe_availability`].
 #[derive(Debug, Clone, Copy)]
@@ -75,41 +75,61 @@ pub struct AgentProbeSpec {
     pub bin_env: &'static str,
     /// Default binary name resolved on `PATH` when the env override is unset.
     pub default_bin: &'static str,
-    /// Whether ccteam registers its MCP server into a persistent vendor
-    /// config file for this vendor (claude `~/.claude.json` / codex
-    /// `config.toml` / kimi `mcp.json`).
-    pub mcp_registrable: bool,
+    /// How ccteam exposes its eight tools to this vendor.
+    pub tool_surface: ToolSurfaceMode,
 }
 
-/// The five vendor harnesses ccteam probes for. Extend here to add one.
+/// Where a vendor receives ccteam's tool surface. Adding a future vendor
+/// without native MCP configuration requires one honest enum choice here;
+/// generic config/status consumers then inherit the right behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSurfaceMode {
+    /// ccteam writes its own MCP entry to the vendor's global config.
+    NativeMcpConfig,
+    /// Only ccteam-managed sessions receive the runtime bridge.
+    ManagedSessionBridge,
+}
+
+impl ToolSurfaceMode {
+    pub const fn uses_native_mcp_config(self) -> bool {
+        matches!(self, Self::NativeMcpConfig)
+    }
+}
+
+/// The shared honesty sentence rendered by config, doctor, status, and hosts.
+pub const PI_MANAGED_BRIDGE_NOTICE: &str =
+    "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.";
+
+/// Every vendor harness ccteam probes. Extend here to add one.
 pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
     AgentProbeSpec {
         vendor: "claude",
         harness_id: "claude-code",
         bin_env: ccteam_harness::CLAUDE_BIN_ENV,
         default_bin: "claude",
-        mcp_registrable: true,
+        tool_surface: ToolSurfaceMode::NativeMcpConfig,
     },
     AgentProbeSpec {
         vendor: "codex",
         harness_id: "codex",
         bin_env: ccteam_harness::CODEX_BIN_ENV,
         default_bin: "codex",
-        mcp_registrable: true,
+        tool_surface: ToolSurfaceMode::NativeMcpConfig,
     },
     AgentProbeSpec {
         vendor: "grok",
         harness_id: "grok",
         bin_env: ccteam_harness::GROK_BIN_ENV,
         default_bin: "grok",
-        mcp_registrable: true,
+        tool_surface: ToolSurfaceMode::NativeMcpConfig,
     },
     AgentProbeSpec {
         vendor: "opencode",
         harness_id: "opencode",
         bin_env: ccteam_harness::OPENCODE_BIN_ENV,
         default_bin: "opencode",
-        mcp_registrable: true,
+        tool_surface: ToolSurfaceMode::NativeMcpConfig,
     },
     AgentProbeSpec {
         vendor: "kimi",
@@ -117,7 +137,14 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         bin_env: ccteam_harness::KIMI_BIN_ENV,
         default_bin: "kimi",
         // Kimi has a config-file MCP seam: `$KIMI_CODE_HOME/mcp.json`.
-        mcp_registrable: true,
+        tool_surface: ToolSurfaceMode::NativeMcpConfig,
+    },
+    AgentProbeSpec {
+        vendor: "pi",
+        harness_id: "pi",
+        bin_env: ccteam_harness::PI_BIN_ENV,
+        default_bin: "pi",
+        tool_surface: ToolSurfaceMode::ManagedSessionBridge,
     },
 ];
 
@@ -125,6 +152,20 @@ impl AgentProbeSpec {
     /// Look up a probe spec by its vendor token (`claude` / `codex` / …).
     pub fn by_vendor(vendor: &str) -> Option<&'static AgentProbeSpec> {
         AGENT_PROBE_SPECS.iter().find(|s| s.vendor == vendor)
+    }
+
+    pub fn tool_surface_notice(&self) -> Option<String> {
+        (self.tool_surface == ToolSurfaceMode::ManagedSessionBridge).then(|| {
+            let mut chars = self.vendor.chars();
+            let display = chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default();
+            format!(
+                "Managed {display} sessions get the ccteam bridge; a plain `{}` started in a shell does not.",
+                self.default_bin
+            )
+        })
     }
 }
 
@@ -1051,19 +1092,47 @@ mod tests {
     }
 
     #[test]
-    fn agent_probe_specs_covers_five_vendors() {
+    fn agent_probe_specs_covers_six_vendors() {
         let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
+        assert_eq!(
+            vendors,
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+        );
     }
 
     #[test]
-    fn agent_probe_specs_carry_harness_id_and_mcp_registrable() {
+    fn agent_probe_specs_carry_harness_id_and_tool_surface_mode() {
         // The web host page + capabilities matrix now read these off the
-        // shared spec (no parallel table). All current vendors have a global
-        // config-file MCP registration seam.
+        // shared spec (no parallel table). Native vendors share one mode;
+        // managed Pi names the bridge mode explicitly.
         let by = |v: &str| AgentProbeSpec::by_vendor(v).unwrap();
         assert_eq!(by("claude").harness_id, "claude-code");
-        assert!(AGENT_PROBE_SPECS.iter().all(|spec| spec.mcp_registrable));
+        assert_eq!(by("pi").harness_id, "pi");
+        assert_eq!(by("pi").tool_surface, ToolSurfaceMode::ManagedSessionBridge);
+        for spec in AGENT_PROBE_SPECS {
+            match spec.tool_surface {
+                ToolSurfaceMode::NativeMcpConfig => {
+                    assert!(spec.tool_surface_notice().is_none());
+                }
+                ToolSurfaceMode::ManagedSessionBridge => {
+                    let notice = spec.tool_surface_notice().unwrap();
+                    assert!(notice.contains(spec.default_bin), "{spec:?}: {notice}");
+                }
+            }
+        }
+        let future = AgentProbeSpec {
+            vendor: "future",
+            harness_id: "future",
+            bin_env: "CCTEAM_FUTURE_BIN",
+            default_bin: "future",
+            tool_surface: ToolSurfaceMode::ManagedSessionBridge,
+        };
+        assert_eq!(
+            future.tool_surface_notice().as_deref(),
+            Some(
+                "Managed Future sessions get the ccteam bridge; a plain `future` started in a shell does not."
+            )
+        );
         assert!(AgentProbeSpec::by_vendor("gemini").is_none());
     }
 
@@ -1103,7 +1172,10 @@ mod tests {
         let avail = probe_availability(true);
         assert_eq!(avail.len(), AGENT_PROBE_SPECS.len());
         let vendors: Vec<&str> = avail.iter().map(|a| a.vendor).collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
+        assert_eq!(
+            vendors,
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+        );
         // harness_id is carried through from the spec.
         assert_eq!(avail[0].harness_id, "claude-code");
     }

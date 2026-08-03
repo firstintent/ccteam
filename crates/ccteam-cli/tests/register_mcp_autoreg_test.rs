@@ -50,7 +50,7 @@ impl Sandbox {
         let bin_dir = root.join("bins");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let mut bins = std::collections::BTreeMap::new();
-        for vendor in ["claude", "codex", "grok"] {
+        for vendor in ["claude", "codex", "grok", "pi"] {
             let path = bin_dir.join(vendor);
             write_fake_bin(&path);
             bins.insert(vendor, path);
@@ -157,6 +157,7 @@ impl Sandbox {
             .env("CCTEAM_GROK_BIN", &self.bins["grok"])
             .env("CCTEAM_OPENCODE_BIN", &self.bins["opencode"])
             .env("CCTEAM_KIMI_BIN", &self.bins["kimi"])
+            .env("CCTEAM_PI_BIN", &self.bins["pi"])
             .output()
             .expect("run internal register-mcp")
     }
@@ -191,6 +192,14 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
     let first = parse_output(&sb.run());
     let results = first["results"].as_array().unwrap();
     assert_eq!(results.len(), 5);
+    assert!(
+        results.iter().all(|row| row["vendor"] != "pi"),
+        "managed-bridge Pi must never enter native MCP registration: {results:?}"
+    );
+    assert!(
+        !sb.home.join(".pi").exists(),
+        "an installed Pi binary must not cause any ~/.pi config write"
+    );
     for vendor in ["claude", "codex", "grok", "opencode"] {
         let row = results.iter().find(|row| row["vendor"] == vendor).unwrap();
         assert_eq!(row["status"], "registered");

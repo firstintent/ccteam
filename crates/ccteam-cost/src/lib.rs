@@ -1,8 +1,8 @@
-//! V0.6.0 Wave 1 — dual-vendor pricing + cost classification + budget caps.
+//! Cross-vendor pricing, reported-cost resolution, and budget caps.
 //!
 //! Extracted from `ccteam-core` so Anthropic Claude and OpenAI Codex
 //! share one pricing surface (`UnifiedTokenUsage` + `estimate_cost`)
-//! and one budget shape (`Budgets { claude, codex }`). The crate has
+//! and one per-vendor budget shape (`Budgets`). The crate has
 //! **no dependency on `ccteam-core`** — `classify()` takes primitives,
 //! not `ProjectState` — so the dep graph runs strictly cost → core,
 //! never the reverse.
@@ -16,8 +16,7 @@
 //!   model id prices to `None` (WARN-once, no silent fallback).
 //! - `level` — `CostLevel` + `classify(cost, soft, hard)` for the F84
 //!   budget-cap watchdog.
-//! - `budget` — `Budgets { claude: BudgetCap, codex: BudgetCap }` —
-//!   per-vendor cost / spawn caps. The V0.5.x flat `BudgetSpec` lives
+//! - `budget` — per-vendor cost / spawn caps. The V0.5.x flat `BudgetSpec` lives
 //!   in `ccteam-core::workflow` and feeds the legacy claude path;
 //!   V0.6 workflows can opt into per-vendor split via
 //!   `WorkflowSpec::budgets_v060`.

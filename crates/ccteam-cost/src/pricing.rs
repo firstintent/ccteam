@@ -75,19 +75,18 @@ pub enum Vendor {
     /// Kimi Code ACP — ACP `session/update` carries no usage/cost; always "—".
     Kimi,
     /// Pi RPC — no static table; cost is vendor-reported USD only.
-    #[serde(skip_deserializing)]
     Pi,
 }
 
 impl Vendor {
-    /// Every user-reachable pricing vendor. This list feeds budget iteration,
-    /// so Pi stays out until its Wave 3 entry points are reachable.
+    /// Every user-reachable pricing vendor. This list feeds budget iteration.
     pub const ALL: &'static [Vendor] = &[
         Vendor::Claude,
         Vendor::Codex,
         Vendor::Grok,
         Vendor::Opencode,
         Vendor::Kimi,
+        Vendor::Pi,
     ];
 }
 

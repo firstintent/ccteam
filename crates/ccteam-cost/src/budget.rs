@@ -30,7 +30,7 @@ pub const APPROX_COST_PER_CALL_USD: f64 = 0.005;
 /// supplied.
 pub const DEFAULT_ADVISE_BUDGET_USD_24H: f64 = 0.50;
 
-/// Per-vendor budget pair. Either side can be omitted in YAML and
+/// Per-vendor budget caps. Any vendor can be omitted in YAML and
 /// defaults to `BudgetCap::default()` (no caps).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Budgets {
@@ -244,6 +244,7 @@ mod vendor_wire {
             "grok" => Ok(Vendor::Grok),
             "opencode" => Ok(Vendor::Opencode),
             "kimi" => Ok(Vendor::Kimi),
+            "pi" => Ok(Vendor::Pi),
             other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }
@@ -267,6 +268,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(b.aggregated_cost_cap_24h(), Some(7.0));
+    }
+
+    #[test]
+    fn pi_budget_round_trips_and_participates_in_aggregate() {
+        let budgets: Budgets = serde_json::from_str(
+            r#"{"pi":{"max_cost_usd_per_24h":3.5,"max_agent_spawns_per_hour":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(budgets.pi.max_cost_usd_per_24h, Some(3.5));
+        assert_eq!(budgets.pi.max_agent_spawns_per_hour, Some(7));
+        assert_eq!(budgets.aggregated_cost_cap_24h(), Some(3.5));
+        let round_trip = serde_json::to_string(&budgets).unwrap();
+        let decoded: Budgets = serde_json::from_str(&round_trip).unwrap();
+        assert_eq!(decoded, budgets);
     }
 
     #[test]

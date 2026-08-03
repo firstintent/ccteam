@@ -15,7 +15,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
-import HostsView, { HostActionRow, JoinCard, pendingActionsFor } from "./HostsView";
+import HostsView, {
+  HostActionRow,
+  JoinCard,
+  pendingActionsFor,
+  toolSurfaceNoticesFor,
+} from "./HostsView";
 import { registerMcp } from "../lib/hostsApi";
 import { importProject } from "../lib/dashboardApi";
 import type { AgentHealth, HostDetail } from "../lib/hostsApi";
@@ -29,7 +34,7 @@ function agent(over: Partial<AgentHealth> & { vendor: string }): AgentHealth {
     version: null,
     bin: over.vendor,
     mcp_registered: false,
-    mcp_registrable: true,
+    tool_surface: "native_mcp_config",
     status: "ready",
     hint: null,
     ...over,
@@ -49,8 +54,14 @@ const LOCAL: HostDetail = {
     agent({ vendor: "claude", version: "claude 1.2.3", status: "needs_config" }),
     // not on PATH → never a CTA (ccteam does not install CLIs).
     agent({ vendor: "codex", installed: false, status: "not_installed" }),
-    // ACP vendor: MCP rides the session protocol → a CTA would be a no-op.
-    agent({ vendor: "grok", mcp_registrable: false, version: "grok 0.2.93" }),
+    // Managed bridge vendor: a native-registration CTA would be a no-op.
+    agent({
+      vendor: "pi",
+      tool_surface: "managed_session_bridge",
+      tool_surface_note:
+        "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
+      version: "pi 0.83.0",
+    }),
     // already registered → nothing to do.
     agent({ vendor: "kimi", mcp_registered: true, version: "kimi 0.26.0" }),
   ],
@@ -123,6 +134,14 @@ describe("pendingActionsFor", () => {
   });
 });
 
+describe("toolSurfaceNoticesFor", () => {
+  it("renders the managed-vs-plain Pi distinction from the backend", () => {
+    expect(toolSurfaceNoticesFor(LOCAL)).toEqual([
+      "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
+    ]);
+  });
+});
+
 describe("HostActionRow", () => {
   it("renders identity (online dot · hostname · mono host id) + one register CTA", () => {
     const html = renderToString(
@@ -131,6 +150,7 @@ describe("HostActionRow", () => {
         hostname="devbox"
         online
         actions={pendingActionsFor(LOCAL)}
+        notices={toolSurfaceNoticesFor(LOCAL)}
         busy={null}
         onRegister={() => {}}
         onImport={() => {}}
@@ -146,6 +166,9 @@ describe("HostActionRow", () => {
     expect(html).not.toContain('data-testid="register-mcp-codex"');
     expect(html).not.toContain('data-testid="register-mcp-grok"');
     expect(html).not.toContain('data-testid="register-mcp-kimi"');
+    expect(html).toContain(
+      "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
+    );
   });
 
   it("renders an import CTA per uncataloged satellite project, cataloged ones omitted", () => {

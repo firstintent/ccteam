@@ -10,14 +10,16 @@
 //! over the shared `AGENT_PROBE_SPECS` registry), shared with the host-keyed
 //! `GET /api/v1/hosts` report, the satellite report loop, and the MCP
 //! `status` panel, so none of them can drift apart. The wire shape here is
-//! unchanged (`harnesses` of `id, vendor, available, providers`), and
-//! `providers` stays reserved (empty).
+//! also names whether tools arrive through native MCP config or a managed
+//! session bridge; `providers` stays reserved (empty).
 //!
 //! Auth: merged into [`super::stateful_router`] via the `/api/v1`
 //! `OpenApiRouter`, so the existing `auth_layer` gate applies for free.
 
 use axum::{response::IntoResponse, Json};
-use ccteam_core::host_registry::{probe_bin_cached, resolve_bin, AGENT_PROBE_SPECS};
+use ccteam_core::host_registry::{
+    probe_bin_cached, resolve_bin, ToolSurfaceMode, AGENT_PROBE_SPECS,
+};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -35,6 +37,11 @@ pub struct HarnessCapability {
     pub available: bool,
     /// Reserved for per-vendor provider/model enumeration; empty for now.
     pub providers: Vec<String>,
+    /// `native_mcp_config` or `managed_session_bridge`.
+    pub tool_surface: &'static str,
+    /// Present for managed-session-only surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_surface_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -63,6 +70,11 @@ pub(crate) async fn handle_capabilities() -> impl IntoResponse {
                 vendor: spec.vendor,
                 available: probe_bin_cached(&resolve_bin(spec), false).0,
                 providers: Vec::new(),
+                tool_surface: match spec.tool_surface {
+                    ToolSurfaceMode::NativeMcpConfig => "native_mcp_config",
+                    ToolSurfaceMode::ManagedSessionBridge => "managed_session_bridge",
+                },
+                tool_surface_note: spec.tool_surface_notice(),
             })
             .collect::<Vec<_>>()
     })

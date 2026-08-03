@@ -59,6 +59,7 @@ struct Sandbox {
     kimi_home: std::path::PathBuf,
     xdg_config_home: std::path::PathBuf,
     claude_bin: std::path::PathBuf,
+    pi_bin: std::path::PathBuf,
 }
 
 fn sandbox() -> Sandbox {
@@ -73,6 +74,7 @@ fn sandbox() -> Sandbox {
     let kimi_home = tmp.path().join("kimi-home");
     let xdg_config_home = tmp.path().join("xdg-config");
     let claude_bin = write_fake_claude_bin(tmp.path());
+    let pi_bin = write_fake_vendor_bin(tmp.path(), "fake-pi.sh", "0.83.0");
     Sandbox {
         _tmp: tmp,
         claude_config_home,
@@ -83,6 +85,7 @@ fn sandbox() -> Sandbox {
         kimi_home,
         xdg_config_home,
         claude_bin,
+        pi_bin,
     }
 }
 
@@ -112,6 +115,7 @@ fn doctor_command(sb: &Sandbox) -> Command {
             sb._tmp.path().join("missing-opencode"),
         )
         .env("CCTEAM_KIMI_BIN", sb._tmp.path().join("missing-kimi"))
+        .env("CCTEAM_PI_BIN", &sb.pi_bin)
         .env("NO_COLOR", "1")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
@@ -139,6 +143,7 @@ fn bare_doctor_renders_the_readiness_contract() {
         "grok",
         "opencode",
         "kimi",
+        "pi",
         "daemon",
         "version",
         "pricing",
@@ -150,6 +155,10 @@ fn bare_doctor_renders_the_readiness_contract() {
             "bare doctor output missing {expected:?}. stdout:\n{stdout}",
         );
     }
+    assert!(
+        stdout.contains(ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE),
+        "doctor must explain managed Pi versus plain shell Pi: {stdout}"
+    );
     assert!(
         !stdout.contains("tmux"),
         "tmux is not a readiness dependency. stdout:\n{stdout}"

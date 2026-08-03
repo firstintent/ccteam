@@ -284,8 +284,15 @@ async fn get_capabilities_lists_both_vendors() {
     for h in harnesses {
         assert!(h.get("available").unwrap().is_boolean());
         assert!(h.get("providers").unwrap().as_array().unwrap().is_empty());
+        assert!(h.get("tool_surface").unwrap().is_string());
         assert!(h.get("vendor").unwrap().is_string());
     }
+    let pi = harnesses.iter().find(|e| e["vendor"] == "pi").unwrap();
+    assert_eq!(pi["tool_surface"], "managed_session_bridge");
+    assert_eq!(
+        pi["tool_surface_note"],
+        ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE
+    );
 }
 
 // ------------------------------ models ------------------------------
@@ -322,8 +329,7 @@ async fn get_models_reports_every_vendor_with_observed_and_fallback_rows() {
         .iter()
         .map(|e| e["vendor"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["claude", "codex", "grok", "opencode", "kimi"]);
-
+    assert_eq!(names, ["claude", "codex", "grok", "opencode", "kimi", "pi"]);
     let kimi = vendors.iter().find(|e| e["vendor"] == "kimi").unwrap();
     assert_eq!(kimi["source"], "ACP session availableModels");
     assert!(

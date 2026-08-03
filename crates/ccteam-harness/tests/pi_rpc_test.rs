@@ -157,15 +157,18 @@ fn terminal(events: &[ThreadEvent]) -> &ThreadEvent {
 
 #[tokio::test]
 #[serial]
-async fn pi_adapter_is_a_real_but_unreachable_vendor() {
+async fn pi_adapter_is_a_user_reachable_vendor() {
     let env = PiTestEnv::new();
     assert!(env.home.path().exists());
     assert!(env.ccteam_home.exists());
     assert!(env.sessions.exists());
     let adapter = PiRpcAdapter::new(role_reader());
     assert_eq!(adapter.vendor(), AgentVendor::Pi);
-    assert!(!AgentVendor::ALL.contains(&AgentVendor::Pi));
-    assert!(serde_json::from_str::<AgentVendor>("\"pi\"").is_err());
+    assert!(AgentVendor::ALL.contains(&AgentVendor::Pi));
+    assert_eq!(
+        serde_json::from_str::<AgentVendor>("\"pi\"").unwrap(),
+        AgentVendor::Pi
+    );
     assert_eq!(
         serde_json::from_str::<AgentVendor>("\"claude\"").unwrap(),
         AgentVendor::Claude

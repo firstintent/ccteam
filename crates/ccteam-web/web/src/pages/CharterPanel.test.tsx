@@ -62,7 +62,7 @@ function fixtureAgent(over: Partial<AgentHealth> = {}): AgentHealth {
     version: "2.1.34",
     bin: "/usr/bin/claude",
     mcp_registered: true,
-    mcp_registrable: true,
+    tool_surface: "native_mcp_config",
     status: "ready",
     hint: null,
     ...over,

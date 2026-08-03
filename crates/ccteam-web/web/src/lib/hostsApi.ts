@@ -17,10 +17,10 @@ export interface AgentHealth {
   version: string | null;
   bin: string;
   mcp_registered: boolean;
-  /** Whether config-file MCP registration applies to this vendor at all
-   *  (`false` for grok/ACP — MCP rides the session protocol). Gates the
-   *  register CTA. */
-  mcp_registrable: boolean;
+  /** How ccteam exposes its tools to this vendor. */
+  tool_surface: "native_mcp_config" | "managed_session_bridge" | "unknown";
+  /** Honest explanation for managed-session-only tool surfaces. */
+  tool_surface_note?: string | null;
   /** `ready` | `needs_config` | `not_installed`. */
   status: string;
   /** Copy-paste remediation when not ready; null when ready. */
