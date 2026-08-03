@@ -210,6 +210,30 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
     expect(html).toMatch(/agents-tree-model[^>]*>—</);
   });
 
+  it("renders Pi as its own topology identity with provider/model-id", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsTree
+          nodes={[
+            fixtureNode({
+              sid: "s6",
+              vendor: "pi",
+              model: "anthropic/claude-opus-4-6",
+              effort: "xhigh",
+            }),
+          ]}
+          edges={[]}
+          selected={null}
+          pulsing={new Set()}
+          onSelect={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-vendor="pi"');
+    expect(html).toContain("chip pi vendor-chip");
+    expect(html).toContain("anthropic/claude-opus-4-6 · xhigh");
+  });
+
   it("the effort token never translates — zh and en render the same cell", () => {
     const render = (lang: "zh" | "en") =>
       renderToString(

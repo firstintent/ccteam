@@ -27,9 +27,9 @@ function loadCatalog(): Promise<VendorCatalog> {
 
 /**
  * The vendor catalog, or `{}` until it resolves (and forever, if the route is
- * unavailable). Consumers pass it to `modelRowsFor` / `effortRowsFor` /
- * `normalizeDraft`, which fall back to the static registry per vendor — so an
- * empty catalog is a complete, working menu, never a blank one.
+ * unavailable). Picker helpers fall back to the static registry per vendor,
+ * while explicit values remain pass-through for adapter-side validation — so
+ * an empty catalog is a complete working menu, never a spawn whitelist.
  */
 export function useVendorCatalog(): VendorCatalog {
   const [catalog, setCatalog] = useState<VendorCatalog>(EMPTY);

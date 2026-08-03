@@ -190,6 +190,29 @@ async fn roleless_roleful_resume_and_transactional_role_restart() {
         .await
         .unwrap();
     assert_eq!(roleless.identity, "ccteam-s1");
+    let catalog = ccteam_harness::model_catalog::load_model_catalog_in(&env.ccteam_home);
+    let models = &catalog.0["pi"].models;
+    let efforts = |id: &str| {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap()
+            .efforts
+            .clone()
+    };
+    assert_eq!(
+        efforts("anthropic/claude-sonnet-4-20250514"),
+        ["off", "minimal", "low", "medium", "high"]
+    );
+    assert!(efforts("anthropic/claude-haiku-4-5").is_empty());
+    assert_eq!(
+        efforts("anthropic/claude-opus-4-6"),
+        ["off", "minimal", "low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(
+        efforts("openai/gpt-5.6"),
+        ["off", "low", "medium", "high", "max"]
+    );
     for message in ["one", "two"] {
         let events = submit_and_terminal(&adapter, &roleless, message).await;
         assert!(matches!(

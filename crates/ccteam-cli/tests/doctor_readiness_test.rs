@@ -155,8 +155,11 @@ fn bare_doctor_renders_the_readiness_contract() {
             "bare doctor output missing {expected:?}. stdout:\n{stdout}",
         );
     }
+    let pi_notice = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+        .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+        .unwrap();
     assert!(
-        stdout.contains(ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE),
+        stdout.contains(&pi_notice),
         "doctor must explain managed Pi versus plain shell Pi: {stdout}"
     );
     assert!(

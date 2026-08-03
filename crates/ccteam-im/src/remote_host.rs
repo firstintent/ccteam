@@ -25,7 +25,9 @@ use ccteam_core::host_registry::{
     gate_remote_spawn, gate_remote_spawn_project, HostRegistry, DEFAULT_HEARTBEAT_TTL_SECS,
     LOCAL_HOST,
 };
-use ccteam_harness::{AgentVendor, HostChannelHub, RemoteExecTarget, SessionProtocol};
+use ccteam_harness::{
+    AgentVendor, HostChannelHub, HostExecutionScope, RemoteExecTarget, SessionProtocol,
+};
 use std::path::Path;
 
 /// Stable error returned when a v0.9.1 caller still supplies per-spawn host.
@@ -35,8 +37,10 @@ pub const HOST_SPAWN_PARAM_REMOVED: &str =
 /// Typed local-only rejection. Callers can downcast this through `anyhow`
 /// without parsing display text, and no adapter/fallback is consulted.
 #[derive(Debug, thiserror::Error)]
-#[error("vendor `pi` is local-only; project is bound to satellite host `{host}`; session was not created")]
+#[error("vendor `{vendor}` is local-only; project is bound to satellite host `{host}`; session was not created")]
 pub struct RemoteVendorUnsupported {
+    /// Lowercase vendor wire token.
+    pub vendor: String,
     /// Satellite host bound to the project that rejected the local-only vendor.
     pub host: String,
 }
@@ -44,8 +48,12 @@ pub struct RemoteVendorUnsupported {
 /// Reject a vendor/host combination that ccteam cannot execute remotely.
 /// Local and empty host ids are always accepted.
 pub fn ensure_vendor_host_supported(vendor: AgentVendor, host: &str) -> Result<()> {
-    if vendor == AgentVendor::Pi && !host.is_empty() && host != LOCAL_HOST {
+    if vendor.host_execution_scope() == HostExecutionScope::LocalOnly
+        && !host.is_empty()
+        && host != LOCAL_HOST
+    {
         return Err(anyhow::Error::new(RemoteVendorUnsupported {
+            vendor: vendor.wire_name().to_string(),
             host: host.to_string(),
         }));
     }
@@ -452,7 +460,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.downcast_ref::<RemoteVendorUnsupported>().is_some());
+        let typed = err.downcast_ref::<RemoteVendorUnsupported>().unwrap();
+        assert_eq!(typed.vendor, "pi");
+        assert_eq!(typed.host, "sat");
         assert!(fake.last_host.lock().unwrap().is_none());
     }
 

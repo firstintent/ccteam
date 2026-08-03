@@ -127,6 +127,16 @@ pub enum AgentVendor {
     Pi,
 }
 
+/// Where ccteam may execute a vendor adapter. Declaring this beside
+/// [`AgentVendor`] makes the remote gate exhaustive for every future vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostExecutionScope {
+    /// The adapter may execute locally or through a registered satellite.
+    LocalOrSatellite,
+    /// The adapter may execute only in the daemon's local process.
+    LocalOnly,
+}
+
 impl AgentVendor {
     /// Every user-reachable harness vendor.
     pub const ALL: &'static [AgentVendor] = &[
@@ -146,6 +156,30 @@ impl AgentVendor {
             AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
             AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
             AgentVendor::Pi => ccteam_cost::Vendor::Pi,
+        }
+    }
+
+    /// Stable lowercase wire token used by REST/MCP/session metadata.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            AgentVendor::Claude => "claude",
+            AgentVendor::Codex => "codex",
+            AgentVendor::Grok => "grok",
+            AgentVendor::Opencode => "opencode",
+            AgentVendor::Kimi => "kimi",
+            AgentVendor::Pi => "pi",
+        }
+    }
+
+    /// Execution-location capability consulted by the shared host gate.
+    pub const fn host_execution_scope(self) -> HostExecutionScope {
+        match self {
+            AgentVendor::Claude
+            | AgentVendor::Codex
+            | AgentVendor::Grok
+            | AgentVendor::Opencode
+            | AgentVendor::Kimi => HostExecutionScope::LocalOrSatellite,
+            AgentVendor::Pi => HostExecutionScope::LocalOnly,
         }
     }
 }
@@ -1918,11 +1952,20 @@ mod tests {
 
     #[test]
     fn agent_vendor_serde_round_trip() {
-        for v in [AgentVendor::Claude, AgentVendor::Codex] {
+        for &v in AgentVendor::ALL {
             let json = serde_json::to_string(&v).unwrap();
             let back: AgentVendor = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
+            assert_eq!(json, format!("\"{}\"", v.wire_name()));
         }
+        assert_eq!(
+            AgentVendor::Pi.host_execution_scope(),
+            HostExecutionScope::LocalOnly
+        );
+        assert_eq!(
+            AgentVendor::Claude.host_execution_scope(),
+            HostExecutionScope::LocalOrSatellite
+        );
     }
 
     #[test]

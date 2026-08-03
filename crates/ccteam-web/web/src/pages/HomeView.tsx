@@ -33,6 +33,7 @@ import {
   modelSwitchFor,
   normalizeDraft,
   slugFromPath,
+  switchDraftVendor,
   wireProtocol,
   type ComposerDraft,
 } from "../lib/vendors";
@@ -53,12 +54,10 @@ export interface ProjectHostIdentity {
 
 const MODEL_DRAFT_KEY = "ccteam.home.model.v1";
 
-/** The persisted draft is deliberately NOT normalized here: the live vendor
- *  catalog (`GET /api/v1/models`) has not loaded at mount, so a static-only
- *  normalize would wipe a perfectly good `kimi-code/k3` for looking unknown.
- *  Render-time normalization below — which sees the catalog — is the single
- *  validity gate (it also drops the retired `effortKey` of an older SPA's
- *  draft, degrading it to the vendor default rather than crashing). */
+/** Load the persisted draft without consulting the advisory live catalog.
+ * Render-time structural normalization drops retired keys and repairs the
+ * registry-owned protocol, but preserves explicit model/effort values for
+ * adapter-side validation. */
 function loadModelDraft(): ComposerDraft {
   try {
     const raw = localStorage.getItem(MODEL_DRAFT_KEY);
@@ -229,7 +228,7 @@ export default function HomeView({
     const patch = applyPlaybook(id, lang);
     if (!patch) return;
     setPrefill((cur) => ({ text: patch.text, nonce: cur.nonce + 1 }));
-    setDraft((cur) => normalizeDraft({ ...cur, vendor: patch.vendor }, catalog));
+    setDraft((cur) => switchDraftVendor(cur, patch.vendor));
   };
 
   // Team page 起手 CTA lands `{ state: { playbook: id } }` on `/`: apply it
@@ -330,7 +329,7 @@ export default function HomeView({
   const hostVendors = allowedVendorsFor(hostDetails[effectiveHost]);
   const effectiveDraft = normalizeDraft(
     hostVendors && !hostVendors.includes(draft.vendor)
-      ? { ...draft, vendor: hostVendors[0]! }
+      ? switchDraftVendor(draft, hostVendors[0]!)
       : draft,
     catalog,
   );
@@ -374,8 +373,9 @@ export default function HomeView({
       // v0.8.24 A-U3 — an explicit model/effort pick rides the create form
       // (vendor-native spawn seam), replacing the old post-spawn `/model`
       // control turn. Both are the vendor's OWN tokens and both go out for
-      // EVERY vendor (omitted only on the default row): dropping grok's /
-      // kimi's / opencode's effort client-side is what made the menu lie.
+      // EVERY vendor (omitted only on the default row). The catalog guides the
+      // picker but never suppresses an explicit value; the adapter verifies
+      // the vendor's effective state and rejects clamps.
       const { sid } = await apiCreateSession(slug, {
         role,
         vendor: effectiveDraft.vendor,

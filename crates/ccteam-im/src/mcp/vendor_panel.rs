@@ -871,10 +871,10 @@ mod tests {
             empty.path(),
         );
         assert!(recipes.contains("session_spawn{vendor:\"pi\""), "{recipes}");
-        assert_eq!(
-            render_tool_surface_notice(&rows).trim(),
-            ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE
-        );
+        let expected = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+            .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+            .unwrap();
+        assert_eq!(render_tool_surface_notice(&rows).trim(), expected);
     }
 
     /// Discovery: each installed vendor's recipe carries its model ids +

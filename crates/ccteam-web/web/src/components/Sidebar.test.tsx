@@ -98,10 +98,11 @@ describe("Sidebar SSR structure", () => {
         row({ sid: "s4", vendor: "opencode", history: true }),
         // Second workspace so the WS_SHOW row cap never folds this row away.
         row({ sid: "s5", vendor: "kimi", project: "demo2" }),
+        row({ sid: "s6", vendor: "pi", project: "demo2" }),
       ],
       { projects: ["demo", "demo2"] },
     );
-    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi"]) {
+    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi", "pi"]) {
       expect(html).toContain(`data-vendor="${vendor}"`);
       expect(html).toContain(`chip ${vendor} vendor-chip`);
     }

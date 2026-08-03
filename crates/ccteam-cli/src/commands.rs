@@ -4802,8 +4802,11 @@ mod tests {
                 "report must name the {target} target path: {report}",
             );
         }
+        let pi_notice = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+            .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+            .unwrap();
         assert!(
-            report.contains(ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE),
+            report.contains(&pi_notice),
             "Pi must be described honestly without inventing a config target: {report}"
         );
     }

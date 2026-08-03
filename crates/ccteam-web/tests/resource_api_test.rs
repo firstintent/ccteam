@@ -289,10 +289,10 @@ async fn get_capabilities_lists_both_vendors() {
     }
     let pi = harnesses.iter().find(|e| e["vendor"] == "pi").unwrap();
     assert_eq!(pi["tool_surface"], "managed_session_bridge");
-    assert_eq!(
-        pi["tool_surface_note"],
-        ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE
-    );
+    let expected = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+        .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+        .unwrap();
+    assert_eq!(pi["tool_surface_note"], expected);
 }
 
 // ------------------------------ models ------------------------------

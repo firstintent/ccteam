@@ -1,5 +1,7 @@
 //! Minimal wire model for the stable `pi --mode rpc` JSONL protocol.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -23,12 +25,37 @@ pub struct PiModel {
     pub name: String,
     pub provider: String,
     #[serde(default)]
+    pub reasoning: bool,
+    /// Pi thinking level → provider value. A present `null` marks that level
+    /// unsupported; missing base levels retain Pi's standard mapping.
+    #[serde(default)]
+    pub thinking_level_map: BTreeMap<String, Option<String>>,
+    #[serde(default)]
     pub context_window: u64,
 }
 
 impl PiModel {
     pub fn canonical_id(&self) -> String {
         format!("{}/{}", self.provider, self.id)
+    }
+
+    /// Derive this model's actual Pi thinking-level axis. Extended levels are
+    /// opt-in, while a `null` map entry removes any level, including `off`.
+    pub fn supported_efforts(&self) -> Vec<String> {
+        if !self.reasoning {
+            return Vec::new();
+        }
+        const BASE: &[&str] = &["off", "minimal", "low", "medium", "high"];
+        const EXTENDED: &[&str] = &["xhigh", "max"];
+        BASE.iter()
+            .filter(|level| !matches!(self.thinking_level_map.get(**level), Some(None)))
+            .chain(
+                EXTENDED
+                    .iter()
+                    .filter(|level| matches!(self.thinking_level_map.get(**level), Some(Some(_)))),
+            )
+            .map(|level| (*level).to_string())
+            .collect()
     }
 }
 

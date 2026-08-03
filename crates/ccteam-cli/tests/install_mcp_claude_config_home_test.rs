@@ -63,8 +63,11 @@ fn install_mcp_writes_to_claude_config_home_when_set() {
         !fake_home.join(".pi").exists(),
         "config mcp must never invent a Pi config footprint"
     );
+    let pi_notice = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+        .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+        .unwrap();
     assert!(
-        stdout.contains(ccteam_core::host_registry::PI_MANAGED_BRIDGE_NOTICE),
+        stdout.contains(&pi_notice),
         "config output must explain managed Pi versus plain shell Pi: {stdout}"
     );
 

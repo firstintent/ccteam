@@ -97,10 +97,6 @@ impl ToolSurfaceMode {
     }
 }
 
-/// The shared honesty sentence rendered by config, doctor, status, and hosts.
-pub const PI_MANAGED_BRIDGE_NOTICE: &str =
-    "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.";
-
 /// Every vendor harness ccteam probes. Extend here to add one.
 pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
     AgentProbeSpec {

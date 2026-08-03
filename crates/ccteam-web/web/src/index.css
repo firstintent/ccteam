@@ -58,6 +58,7 @@
   --color-vendor-codex: #10a37f;
   --color-vendor-grok: #8b5cf6;
   --color-vendor-opencode: #0284c7;
+  --color-vendor-pi: #4f46e5;
 
   --color-accent-500: #0d9488;
   --color-accent-600: #0f766e;
@@ -121,6 +122,8 @@
   --opencode: #0284C7;
   /* kimi — 5th vendor (pink; distinct from all four above + the error red). */
   --kimi: #DB2777;
+  /* pi — 6th vendor (indigo; distinct from Grok violet and OpenCode sky). */
+  --pi: #4F46E5;
   --radius-card: 12px;
   --radius-input: 18px;
   --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 6px 24px rgba(16,24,40,.06);
@@ -147,6 +150,7 @@ html.dark {
   --red-text: #f1919b;
   --opencode: #38BDF8;
   --kimi: #F472B6;
+  --pi: #818CF8;
   --shadow-card: 0 1px 2px rgba(0,0,0,.4), 0 6px 24px rgba(0,0,0,.35);
   --shadow-menu: 0 4px 10px rgba(0,0,0,.5), 0 12px 32px rgba(0,0,0,.5);
   color-scheme: dark;
@@ -165,6 +169,7 @@ html.dark {
   --color-vendor-codex: var(--codex);
   --color-vendor-grok: var(--grok);
   --color-vendor-opencode: var(--opencode);
+  --color-vendor-pi: var(--pi);
   --color-surface-700: var(--border);
   --color-surface-800: var(--bg-soft);
   --color-surface-850: var(--bg-hover);
@@ -513,6 +518,9 @@ button { font-family: inherit; cursor: pointer; }
 .hitl-btn span, .model-btn span { white-space: nowrap; }
 .hitl-btn:hover { background: var(--bg-soft); }
 .hitl-btn.on { background: var(--ink); color: var(--on-ink); }
+.pi-hitl-note {
+  margin: 4px 4px 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.4;
+}
 
 .model-btn {
   display: flex; align-items: center; gap: 6px;
@@ -569,6 +577,7 @@ html.dark .sel-item.new { color: #67e8f9; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.claude { background: var(--claude); } .dot.codex { background: var(--codex); } .dot.grok { background: var(--grok); }
 .dot.opencode { background: var(--opencode); } .dot.kimi { background: var(--kimi); }
+.dot.pi { background: var(--pi); }
 .dot.on { background: var(--green); } .dot.off { background: #C9CBD1; } .dot.busy { background: #F59E0B; }
 .dot.err { background: var(--red); }
 html.dark .dot.off { background: #4b4e57; }
@@ -608,6 +617,7 @@ html.dark .dot.off { background: #4b4e57; }
 .chip.grok  { color: var(--grok);  border-color: #8b5cf655; }
 .chip.opencode { color: var(--opencode); border-color: #0284c755; }
 .chip.kimi { color: var(--kimi); border-color: #db277755; }
+.chip.pi { color: var(--pi); border-color: #4f46e555; }
 .chip.sid { color: var(--text-muted); }
 /* Icon-only vendor mark (replaces the text label). Fixed square so session
  * rows / cards don't burn horizontal space on "claude"/"opencode" strings. */

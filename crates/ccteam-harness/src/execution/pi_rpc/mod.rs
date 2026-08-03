@@ -197,7 +197,6 @@ struct ReadyTransport {
     events: broadcast::Receiver<PiTransportEvent>,
     state: PiSessionState,
     models: PiAvailableModels,
-    levels: PiThinkingLevels,
     version: String,
 }
 
@@ -252,10 +251,10 @@ impl PiRpcAdapter {
             if levels.levels.is_empty() {
                 return Err("Pi thinking-level feature probe returned no levels".to_string());
             }
-            Ok::<_, String>((state, models, levels))
+            Ok::<_, String>((state, models))
         };
         let ready_gate = wait_for_bridge_ready(sid, Arc::clone(&transport), &mut events, resolver);
-        let (state, models, levels) = match tokio::time::timeout(Duration::from_secs(30), async {
+        let (state, models) = match tokio::time::timeout(Duration::from_secs(30), async {
             let (handshake, _) = tokio::try_join!(handshake, ready_gate)?;
             Ok::<_, String>(handshake)
         })
@@ -321,7 +320,6 @@ impl PiRpcAdapter {
             events,
             state,
             models,
-            levels,
             version,
         })
     }
@@ -524,7 +522,6 @@ impl PiRpcAdapter {
                 effort.as_deref(),
             )
             .await?;
-        let efforts = ready.levels.levels.clone();
         crate::model_catalog::record_vendor_models_best_effort(
             "pi",
             "Pi RPC get_available_models",
@@ -535,7 +532,7 @@ impl PiRpcAdapter {
                 .map(|model| crate::model_catalog::CatalogModel {
                     id: model.canonical_id(),
                     display_name: (!model.name.trim().is_empty()).then(|| model.name.clone()),
-                    efforts: efforts.clone(),
+                    efforts: model.supported_efforts(),
                 })
                 .collect(),
         );

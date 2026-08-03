@@ -1,8 +1,9 @@
-// v0.8.24 Track A — the 5-way vendor registry driving the composer's
+// v0.8.24 Track A — the vendor registry driving the composer's
 // model+effort+protocol menu (prototype VENDORS + the opencode extension),
 // now a STATIC FALLBACK behind the live `GET /api/v1/models` catalog.
 
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 import { I18N } from "./i18n";
 import type { VendorCatalog } from "./modelsApi";
@@ -14,8 +15,10 @@ import {
   modelRowsFor,
   modelSwitchFor,
   normalizeDraft,
+  selectDraftModel,
   slugFromPath,
   statusDotClass,
+  switchDraftVendor,
   vendorChipClass,
   vendorDotClass,
   vendorSpec,
@@ -25,24 +28,52 @@ import {
   VENDORS,
 } from "./vendors";
 
-/** What the daemon reports for a box with kimi + opencode + grok observed. */
+/** What the daemon reports for a box with Pi + kimi + opencode + grok observed. */
 const CATALOG: VendorCatalog = {
   kimi: {
     models: [
-      "kimi-code/k3",
-      "kimi-code/k3-256k",
-      "kimi-code/kimi-for-coding",
-      "kimi-code/kimi-for-coding-highspeed",
+      { id: "kimi-code/k3" },
+      { id: "kimi-code/k3-256k" },
+      { id: "kimi-code/kimi-for-coding" },
+      { id: "kimi-code/kimi-for-coding-highspeed" },
     ],
     efforts: ["low", "high", "max"],
   },
-  grok: { models: ["grok-4.5"], efforts: ["low", "medium", "high"] },
-  opencode: { models: ["anthropic/claude-opus-5", "openai/gpt-5.5"], efforts: [] },
+  grok: { models: [{ id: "grok-4.5" }], efforts: ["low", "medium", "high"] },
+  opencode: {
+    models: [{ id: "anthropic/claude-opus-5" }, { id: "openai/gpt-5.5" }],
+    efforts: [],
+  },
+  pi: {
+    models: [
+      {
+        id: "anthropic/claude-opus-4-6",
+        efforts: ["off", "minimal", "low", "medium", "high", "xhigh"],
+      },
+      { id: "anthropic/claude-sonnet-4-6", efforts: [] },
+      { id: "openai/gpt-5.6", efforts: ["off", "low", "medium", "high", "max"] },
+    ],
+    efforts: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  },
 };
 
-describe("VENDORS registry (5-way)", () => {
-  it("lists exactly claude / codex / grok / opencode / kimi — never collapses", () => {
-    expect(VENDORS.map((v) => v.id)).toEqual(["claude", "codex", "grok", "opencode", "kimi"]);
+describe("VENDORS registry (6-way)", () => {
+  it("lists exactly six distinct harnesses — never collapses Pi", () => {
+    expect(VENDORS.map((v) => v.id)).toEqual([
+      "claude",
+      "codex",
+      "grok",
+      "opencode",
+      "kimi",
+      "pi",
+    ]);
+    expect(new Set(VENDORS.map((v) => v.label)).size).toBe(6);
+    expect(vendorSpec("pi").label).toBe("Pi");
+    const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
+    const color = (vendor: string) => css.match(new RegExp(`--${vendor}:\\s*(#[0-9A-F]+)`, "i"))?.[1];
+    const pi = color("pi");
+    expect(pi).toBeTruthy();
+    expect(["claude", "codex", "grok", "opencode", "kimi"].map(color)).not.toContain(pi);
   });
 
   it("claude offers stream-json (default) + terminal (frozen)", () => {
@@ -50,13 +81,16 @@ describe("VENDORS registry (5-way)", () => {
     expect(claude.protocols.map((p) => p.id)).toEqual(["stream-json", "terminal"]);
   });
 
-  it("codex = app-server (wire stream-json); grok/opencode/kimi = acp", () => {
+  it("Pi uses stream-json / Pi RPC JSONL while the ACP vendors remain ACP", () => {
     expect(vendorSpec("codex").protocols.map((p) => `${p.id}:${p.wire}`)).toEqual([
       "app-server:stream-json",
     ]);
     expect(vendorSpec("grok").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("opencode").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("kimi").protocols.map((p) => p.wire)).toEqual(["acp"]);
+    expect(vendorSpec("pi").protocols).toEqual([
+      { id: "stream-json", label: "stream-json", sub: "Pi RPC JSONL", wire: "stream-json" },
+    ]);
   });
 
   it("falls back to claude for an unknown vendor", () => {
@@ -115,15 +149,27 @@ describe("modelRowsFor (menu rows = default + what the vendor declared)", () => 
   });
 
   it("static fallback: the live-only catalogs offer the default alone (404 daemon)", () => {
-    for (const vendor of ["codex", "grok", "opencode", "kimi"] as const) {
+    for (const vendor of ["codex", "grok", "opencode", "kimi", "pi"] as const) {
       expect(modelRowsFor(vendor)).toEqual([MODEL_DEFAULT]);
     }
   });
 
   it("the live catalog supersedes the static list, in the vendor's own order", () => {
-    expect(modelRowsFor("kimi", CATALOG)).toEqual([MODEL_DEFAULT, ...CATALOG.kimi!.models]);
+    expect(modelRowsFor("kimi", CATALOG)).toEqual([
+      MODEL_DEFAULT,
+      ...CATALOG.kimi!.models.map((model) => model.id),
+    ]);
     expect(modelRowsFor("grok", CATALOG)).toEqual([MODEL_DEFAULT, "grok-4.5"]);
-    expect(modelRowsFor("opencode", CATALOG)).toEqual([MODEL_DEFAULT, ...CATALOG.opencode!.models]);
+    expect(modelRowsFor("opencode", CATALOG)).toEqual([
+      MODEL_DEFAULT,
+      ...CATALOG.opencode!.models.map((model) => model.id),
+    ]);
+    expect(modelRowsFor("pi", CATALOG)).toEqual([
+      MODEL_DEFAULT,
+      "anthropic/claude-opus-4-6",
+      "anthropic/claude-sonnet-4-6",
+      "openai/gpt-5.6",
+    ]);
   });
 
   it("a vendor missing from (or empty in) the catalog falls back to static", () => {
@@ -162,6 +208,39 @@ describe("effortRowsFor (there is NO global effort ladder)", () => {
     ]);
   });
 
+  it("prefers the selected model, including an explicit empty non-reasoning axis", () => {
+    expect(effortRowsFor("pi", CATALOG, "anthropic/claude-opus-4-6")).toEqual([
+      "",
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(effortRowsFor("pi", CATALOG, "openai/gpt-5.6")).toEqual([
+      "",
+      "off",
+      "low",
+      "medium",
+      "high",
+      "max",
+    ]);
+    expect(effortRowsFor("pi", CATALOG, "anthropic/claude-sonnet-4-6")).toEqual([""]);
+  });
+
+  it("uses the vendor union only before a model is selected or metadata exists", () => {
+    expect(effortRowsFor("pi", CATALOG, MODEL_DEFAULT)).toEqual([
+      "",
+      ...CATALOG.pi!.efforts,
+    ]);
+    expect(
+      effortRowsFor("kimi", {
+        kimi: { models: [{ id: "kimi-code/k3" }], efforts: ["low", "max"] },
+      }, "kimi-code/k3"),
+    ).toEqual(["", "low", "max"]);
+  });
+
   it("labels are language-independent by construction (no dictionary lookup)", () => {
     // 高 / 极高 are words no CLI takes and no statusline reports back — the
     // dictionary must never grow effort entries again.
@@ -195,9 +274,9 @@ describe("modelSwitchFor (create-form `model` field)", () => {
     expect(modelSwitchFor({ vendor: "grok", model: "grok-4.5" }, CATALOG)).toBe("grok-4.5");
   });
 
-  it("is null for a model the vendor never declared", () => {
-    expect(modelSwitchFor({ vendor: "codex", model: "made-up" })).toBeNull();
-    expect(modelSwitchFor({ vendor: "kimi", model: "opus" }, CATALOG)).toBeNull();
+  it("passes explicit values through because the advisory catalog is not a whitelist", () => {
+    expect(modelSwitchFor({ vendor: "codex", model: "made-up" })).toBe("made-up");
+    expect(modelSwitchFor({ vendor: "kimi", model: "opus" }, CATALOG)).toBe("opus");
   });
 });
 
@@ -223,39 +302,49 @@ describe("effortSwitchFor (create-form `effort` field — pass-through, no remap
     ).toBe("high");
   });
 
-  it("never invents a rung the vendor doesn't have", () => {
-    expect(effortSwitchFor({ vendor: "kimi", effort: "medium" }, CATALOG)).toBeNull();
-    expect(effortSwitchFor({ vendor: "grok", effort: "max" }, CATALOG)).toBeNull();
-    expect(effortSwitchFor({ vendor: "opencode", effort: "high" }, CATALOG)).toBeNull();
+  it("passes explicit values through for adapter-side validation", () => {
+    expect(effortSwitchFor({ vendor: "kimi", effort: "medium" }, CATALOG)).toBe("medium");
+    expect(effortSwitchFor({ vendor: "grok", effort: "max" }, CATALOG)).toBe("max");
+    expect(effortSwitchFor({ vendor: "opencode", effort: "high" }, CATALOG)).toBe("high");
   });
 });
 
-describe("normalizeDraft (the one validity gate)", () => {
+describe("draft transitions (catalog is advisory, vendor changes are explicit)", () => {
   it("repairs a cross-vendor model/protocol after a vendor switch", () => {
-    const next = normalizeDraft({
-      vendor: "codex",
-      model: "opus", // claude model — invalid for codex
+    const next = switchDraftVendor({
+      vendor: "claude",
+      model: "opus",
       effort: "xhigh",
-      protocol: "terminal", // claude protocol — invalid for codex
+      protocol: "terminal",
       hitl: false,
-    });
+    }, "codex");
     expect(next.model).toBe(MODEL_DEFAULT);
     expect(next.protocol).toBe("app-server");
-    expect(next.effort).toBe("xhigh"); // codex really does take xhigh
+    expect(next.effort).toBe("");
   });
 
-  it("drops an effort the NEW vendor doesn't offer (kimi has no medium)", () => {
+  it("clears only an effort explicitly unsupported by the newly picked model", () => {
+    const next = selectDraftModel({
+      vendor: "pi",
+      model: "anthropic/claude-opus-4-6",
+      effort: "xhigh",
+      protocol: "stream-json",
+      hitl: false,
+    }, "pi", "openai/gpt-5.6", CATALOG);
+    expect(next.effort).toBe("");
+    expect(next.model).toBe("openai/gpt-5.6");
+  });
+
+  it("resets vendor-owned axes on a vendor switch", () => {
     const claude = { ...defaultDraft(), effort: "medium" };
-    expect(normalizeDraft({ ...claude, vendor: "kimi" }, CATALOG).effort).toBe("");
-    // …and keeps one it does.
-    expect(normalizeDraft({ ...claude, vendor: "kimi", effort: "max" }, CATALOG).effort).toBe("max");
+    expect(switchDraftVendor(claude, "kimi").effort).toBe("");
+    expect(switchDraftVendor(claude, "kimi").model).toBe(MODEL_DEFAULT);
   });
 
-  it("keeps a live-catalog model that the static registry has never heard of", () => {
+  it("keeps explicit models with or without advisory catalog data", () => {
     const draft = { ...defaultDraft(), vendor: "kimi" as const, model: "kimi-code/k3", protocol: "acp" };
     expect(normalizeDraft(draft, CATALOG).model).toBe("kimi-code/k3");
-    // Without the catalog we know nothing about kimi's models → default row.
-    expect(normalizeDraft(draft).model).toBe(MODEL_DEFAULT);
+    expect(normalizeDraft(draft).model).toBe("kimi-code/k3");
   });
 
   it("degrades a stale draft persisted by an older SPA (effortKey) instead of crashing", () => {
@@ -275,13 +364,15 @@ describe("normalizeDraft (the one validity gate)", () => {
 });
 
 describe("dot / chip classes", () => {
-  it("emits prototype vendor classes for all five vendors", () => {
+  it("emits prototype vendor classes for all six vendors", () => {
     expect(vendorDotClass("claude")).toBe("dot claude");
     expect(vendorDotClass("opencode")).toBe("dot opencode");
     expect(vendorDotClass("kimi")).toBe("dot kimi");
     expect(vendorChipClass("grok")).toBe("chip grok");
     expect(vendorChipClass("codex")).toBe("chip codex");
     expect(vendorChipClass("kimi")).toBe("chip kimi");
+    expect(vendorDotClass("pi")).toBe("dot pi");
+    expect(vendorChipClass("pi")).toBe("chip pi");
   });
 
   it("maps live status to prototype dot states", () => {
