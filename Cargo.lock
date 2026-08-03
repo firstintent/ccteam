@@ -427,6 +427,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "ccteam-core",
  "ccteam-cost",
  "chrono",
  "dirs",

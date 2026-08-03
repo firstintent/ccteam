@@ -74,11 +74,14 @@ pub enum Vendor {
     Opencode,
     /// Kimi Code ACP — ACP `session/update` carries no usage/cost; always "—".
     Kimi,
+    /// Pi RPC — no static table; cost is vendor-reported USD only.
+    #[serde(skip_deserializing)]
+    Pi,
 }
 
 impl Vendor {
-    /// Every known pricing vendor — single source of truth for iteration.
-    /// Prefer `for v in Vendor::ALL` over listing arms at call sites.
+    /// Every user-reachable pricing vendor. This list feeds budget iteration,
+    /// so Pi stays out until its Wave 3 entry points are reachable.
     pub const ALL: &'static [Vendor] = &[
         Vendor::Claude,
         Vendor::Codex,
@@ -172,8 +175,8 @@ fn table_for(vendor: Vendor) -> Option<&'static PricingTable> {
         Vendor::Grok => Some(XAI_TABLE.get_or_init(|| {
             toml::from_str(XAI_TOML).expect("ccteam xai.toml embedded at compile time must parse")
         })),
-        // OpenCode: never use a static table; cost is reported_cost_usd only.
-        Vendor::Opencode => None,
+        // OpenCode/Pi: reported_cost_usd only; never use a static table.
+        Vendor::Opencode | Vendor::Pi => None,
         // Kimi: ACP `session/update` carries no usage/cost at all — no table.
         Vendor::Kimi => None,
     }
@@ -187,8 +190,9 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
         if c > 0.0 {
             return Some(c);
         }
-        // Reported zero: honest "—" for OpenCode/Kimi; other vendors may still estimate.
-        if matches!(vendor, Vendor::Opencode | Vendor::Kimi) {
+        // Reported zero: honest "—" for reported-cost-only vendors; others
+        // may still estimate from their static table.
+        if matches!(vendor, Vendor::Opencode | Vendor::Kimi | Vendor::Pi) {
             return None;
         }
     }
@@ -204,9 +208,9 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
 /// id surfaces in the logs; the caller renders the absent cost as "—" /
 /// excludes it from a sum. The matcher is permissive only on the `[1m]`
 /// suffix (so `claude-opus-4-8[1m]` resolves to `claude-opus-4-8`).
-/// OpenCode always returns `None` (no table).
+/// OpenCode and Pi always return `None` (no table).
 pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
-    if matches!(vendor, Vendor::Opencode | Vendor::Kimi) {
+    if matches!(vendor, Vendor::Opencode | Vendor::Kimi | Vendor::Pi) {
         return None;
     }
     let prices = resolve(vendor, model)?;

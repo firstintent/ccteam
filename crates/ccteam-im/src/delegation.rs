@@ -247,6 +247,7 @@ pub fn vendor_key(vendor: AgentVendor) -> &'static str {
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
+        AgentVendor::Pi => "pi",
     }
 }
 
@@ -257,6 +258,7 @@ fn vendor_to_cost(vendor: AgentVendor) -> ccteam_cost::Vendor {
         AgentVendor::Grok => ccteam_cost::Vendor::Grok,
         AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
         AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
+        AgentVendor::Pi => ccteam_cost::Vendor::Pi,
     }
 }
 

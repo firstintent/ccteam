@@ -78,6 +78,9 @@ pub use execution::host_channel::{
 };
 pub use execution::kimi_acp::{KimiAcpAdapter, KIMI_ACP_ADAPTER_NAME};
 pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME};
+pub use execution::pi_rpc::{
+    PiRoleDocument, PiRoleReader, PiRpcAdapter, PI_BIN_ENV, PI_RPC_ADAPTER_NAME,
+};
 pub use execution::remote_exec::{
     connect as remote_exec_connect, ExecExit, ExecFile, ExecSpec, ExecStarted, RemoteExecTarget,
     CONNECT_TIMEOUT, EXEC_SUBPROTOCOL, EXEC_WIRE_VERSION,

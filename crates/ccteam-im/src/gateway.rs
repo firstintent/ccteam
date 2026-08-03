@@ -9042,6 +9042,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
+        AgentVendor::Pi => "pi",
     }
 }
 
@@ -17449,6 +17450,7 @@ mod tests {
                         AgentVendor::Grok => codex.clone(), // tests: no dedicated grok fake
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
+                        AgentVendor::Pi => panic!("Pi is unreachable until Wave 3"),
                     }
                 },
             )
@@ -17541,6 +17543,7 @@ mod tests {
                         AgentVendor::Grok => codex.clone(),
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
+                        AgentVendor::Pi => panic!("Pi is unreachable until Wave 3"),
                     }
                 },
             )

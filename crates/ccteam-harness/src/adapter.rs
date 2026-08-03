@@ -124,11 +124,14 @@ pub enum AgentVendor {
     Grok,
     Opencode,
     Kimi,
+    #[serde(skip_deserializing)]
+    Pi,
 }
 
 impl AgentVendor {
-    /// Every known harness vendor — single source of truth for iteration.
-    /// Prefer `for v in AgentVendor::ALL` over listing arms at call sites.
+    /// Every user-reachable harness vendor — the source of truth for
+    /// side-effecting probe/registration iteration. Pi stays out until its
+    /// Wave 3 entry points and registration surfaces are ready.
     pub const ALL: &'static [AgentVendor] = &[
         AgentVendor::Claude,
         AgentVendor::Codex,
@@ -144,6 +147,7 @@ impl AgentVendor {
             AgentVendor::Grok => ccteam_cost::Vendor::Grok,
             AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
             AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
+            AgentVendor::Pi => ccteam_cost::Vendor::Pi,
         }
     }
 }
@@ -1439,6 +1443,7 @@ impl SessionHandle {
             AgentVendor::Grok => "grok",
             AgentVendor::Opencode => "opencode",
             AgentVendor::Kimi => "kimi",
+            AgentVendor::Pi => "pi",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

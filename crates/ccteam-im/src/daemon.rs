@@ -120,6 +120,7 @@ pub fn default_adapter_factory_with_stream_json_handle(
             AgentVendor::Grok => Arc::clone(&grok),
             AgentVendor::Opencode => Arc::clone(&opencode),
             AgentVendor::Kimi => Arc::clone(&kimi),
+            AgentVendor::Pi => panic!("Pi adapter factory is gated until Wave 3"),
         },
     );
     (factory, claude_stream_json)

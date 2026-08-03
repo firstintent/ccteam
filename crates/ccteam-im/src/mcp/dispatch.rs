@@ -2312,6 +2312,9 @@ fn derive_session_protocol(vendor: ccteam_harness::AgentVendor) -> ccteam_harnes
         ccteam_harness::AgentVendor::Claude | ccteam_harness::AgentVendor::Codex => {
             ccteam_harness::SessionProtocol::StreamJson
         }
+        ccteam_harness::AgentVendor::Pi => {
+            unreachable!("Pi session_spawn is gated until Wave 3")
+        }
     }
 }
 
@@ -2323,6 +2326,7 @@ fn session_vendor_wire(v: ccteam_harness::AgentVendor) -> &'static str {
         ccteam_harness::AgentVendor::Grok => "grok",
         ccteam_harness::AgentVendor::Opencode => "opencode",
         ccteam_harness::AgentVendor::Kimi => "kimi",
+        ccteam_harness::AgentVendor::Pi => "pi",
     }
 }
 
