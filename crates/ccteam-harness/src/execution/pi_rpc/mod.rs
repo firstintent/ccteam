@@ -1,12 +1,13 @@
 //! Long-lived adapter for Pi's stable `pi --mode rpc` stdio surface.
 
+pub mod bridge;
 pub mod protocol;
 pub mod role;
 pub mod spawn_spec;
 pub mod translate;
 pub mod transport;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -19,9 +20,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 
+use bridge::{
+    auto_allows_tool, materialize_bridge, parse_ready_status, MAX_PERMISSION_ENVELOPE_BYTES,
+    PERMISSION_DIALOG_TITLE,
+};
+pub use bridge::{
+    bridge_source, PiApprovalDecision, PiDialogKind, PiDialogRequest, PiDialogResponse,
+    PiInteractionResolver, REQUIRED_MCP_TOOL_NAMES,
+};
 use protocol::{
-    response_data, PiAvailableModels, PiContextUsage, PiModel, PiSessionState, PiSessionStats,
-    PiThinkingLevels,
+    response_data, PiAvailableModels, PiContextUsage, PiEvent, PiExtensionUiRequest, PiModel,
+    PiSessionState, PiSessionStats, PiThinkingLevels,
 };
 use role::resolve_role;
 pub use role::{PiRoleDocument, PiRoleReader};
@@ -35,10 +44,11 @@ use transport::{PiTransport, PiTransportEvent};
 use crate::execution::fs_atomic::atomic_write_durable;
 use crate::execution::session_status::write_status_file;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, ContextSource, ContextUsage,
-    Directive, DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, SessionTitleTarget,
-    SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadStatus, TitleSync,
-    TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind, ApprovalScope, ChoiceOption,
+    ChoicePrompt, ContextSource, ContextUsage, Directive, DirectiveOutcome, ExecutionMode,
+    HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadErrorEvent, ThreadEvent,
+    ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId, TurnInput, TurnRouting,
+    TurnSubmission,
 };
 
 pub const PI_RPC_ADAPTER_NAME: &str = "pi-rpc";
@@ -50,6 +60,7 @@ pub struct PiRpcAdapter {
     live: Arc<StdMutex<HashMap<String, Arc<LiveSession>>>>,
     known: Arc<StdMutex<HashMap<String, StartRecipe>>>,
     role_reader: PiRoleReader,
+    interaction_resolver: Arc<StdMutex<Option<Arc<dyn PiInteractionResolver>>>>,
 }
 
 impl std::fmt::Debug for PiRpcAdapter {
@@ -77,6 +88,7 @@ struct LiveSession {
     settling: AtomicBool,
     settled: Notify,
     cached_status: StdMutex<ThreadStatus>,
+    outstanding_ui: StdMutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +194,7 @@ struct PiStateSidecar {
 
 struct ReadyTransport {
     transport: Arc<PiTransport>,
+    events: broadcast::Receiver<PiTransportEvent>,
     state: PiSessionState,
     version: String,
 }
@@ -192,7 +205,12 @@ impl PiRpcAdapter {
             live: Arc::new(StdMutex::new(HashMap::new())),
             known: Arc::new(StdMutex::new(HashMap::new())),
             role_reader,
+            interaction_resolver: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    pub fn set_interaction_resolver(&self, resolver: Arc<dyn PiInteractionResolver>) {
+        *self.interaction_resolver.lock().unwrap() = Some(resolver);
     }
 
     fn lookup(&self, identity: &str) -> Option<Arc<LiveSession>> {
@@ -203,6 +221,7 @@ impl PiRpcAdapter {
         &self,
         spec: PiSpawnSpec,
         expected_identity: &str,
+        sid: &str,
         expected_session_file: Option<&Path>,
         expected_model: Option<&str>,
         expected_effort: Option<&str>,
@@ -211,6 +230,8 @@ impl PiRpcAdapter {
         let transport = PiTransport::connect_stdio(&spec)
             .await
             .map_err(HarnessError::SpawnFailed)?;
+        let mut events = transport.take_startup_events();
+        let resolver = self.interaction_resolver.lock().unwrap().clone();
         let handshake = async {
             let state_fut = transport.request(json!({"type":"get_state"}));
             let models_fut = transport.request(json!({"type":"get_available_models"}));
@@ -231,7 +252,13 @@ impl PiRpcAdapter {
             }
             Ok::<_, String>(state)
         };
-        let state = match tokio::time::timeout(Duration::from_secs(30), handshake).await {
+        let ready_gate = wait_for_bridge_ready(sid, Arc::clone(&transport), &mut events, resolver);
+        let state = match tokio::time::timeout(Duration::from_secs(30), async {
+            let (state, _) = tokio::try_join!(handshake, ready_gate)?;
+            Ok::<_, String>(state)
+        })
+        .await
+        {
             Ok(Ok(state)) => state,
             Ok(Err(error)) => {
                 let stderr = transport.stderr_tail();
@@ -289,18 +316,45 @@ impl PiRpcAdapter {
         }
         Ok(ReadyTransport {
             transport,
+            events,
             state,
             version,
         })
     }
 
-    fn spawn_event_pump(live: Arc<LiveSession>) {
+    fn spawn_event_pump(
+        live: Arc<LiveSession>,
+        mut input: broadcast::Receiver<PiTransportEvent>,
+        resolver: Option<Arc<dyn PiInteractionResolver>>,
+    ) {
         let live_for_task = Arc::clone(&live);
         let task = tokio::spawn(async move {
             let transport = live_for_task.transport.read().await.clone();
-            let mut input = transport.subscribe();
             loop {
                 let output = match input.recv().await {
+                    Ok(PiTransportEvent::Event(PiEvent::ExtensionUiRequest(request))) => {
+                        if let Err(error) = resolve_ui_request(
+                            &live_for_task.sid,
+                            Arc::clone(&transport),
+                            request,
+                            resolver.clone(),
+                            Some(&live_for_task.outstanding_ui),
+                        )
+                        .await
+                        {
+                            tracing::warn!(sid = %live_for_task.sid, %error, "Pi extension UI resolution failed");
+                        }
+                        continue;
+                    }
+                    Ok(PiTransportEvent::Event(PiEvent::ExtensionError { event, error })) => {
+                        let _ = live_for_task
+                            .event_tx
+                            .send(ThreadEvent::Error(ThreadErrorEvent {
+                                kind: "protocol".to_string(),
+                                message: format!("Pi extension `{event}` failed: {error}"),
+                            }));
+                        continue;
+                    }
                     Ok(PiTransportEvent::Event(event)) => live_for_task
                         .translate
                         .lock()
@@ -308,6 +362,10 @@ impl PiRpcAdapter {
                         .translator
                         .ingest(event),
                     Ok(PiTransportEvent::Error(message)) => {
+                        if let Some(resolver) = resolver.as_ref() {
+                            resolver.cancel_sid(&live_for_task.sid).await;
+                        }
+                        live_for_task.outstanding_ui.lock().unwrap().clear();
                         let mut state = live_for_task.translate.lock().unwrap();
                         let output = state.translator.transport_failed(message.clone());
                         if output.events.is_empty() {
@@ -446,6 +504,7 @@ impl PiRpcAdapter {
             ctx,
             PiSpawnInput {
                 session,
+                bridge_extension: materialize_bridge()?,
                 system_prompt: role.prompt_path.clone(),
                 model: model.clone(),
                 effort: effort.clone(),
@@ -455,6 +514,7 @@ impl PiRpcAdapter {
             .spawn_ready(
                 spawn,
                 &identity,
+                &ctx.sid,
                 expected_session_file.as_deref(),
                 model.as_deref(),
                 effort.as_deref(),
@@ -502,8 +562,13 @@ impl PiRpcAdapter {
             settling: AtomicBool::new(false),
             settled: Notify::new(),
             cached_status: StdMutex::new(status),
+            outstanding_ui: StdMutex::new(HashSet::new()),
         });
-        Self::spawn_event_pump(Arc::clone(&live));
+        Self::spawn_event_pump(
+            Arc::clone(&live),
+            ready.events,
+            self.interaction_resolver.lock().unwrap().clone(),
+        );
         self.live
             .lock()
             .unwrap()
@@ -550,6 +615,11 @@ impl PiRpcAdapter {
             task.abort();
         }
         let old_transport = live.transport.read().await.clone();
+        cancel_outstanding_ui(&live, &old_transport).await;
+        let resolver = { self.interaction_resolver.lock().unwrap().clone() };
+        if let Some(resolver) = resolver {
+            resolver.cancel_sid(&live.sid).await;
+        }
         old_transport
             .close()
             .await
@@ -561,6 +631,7 @@ impl PiRpcAdapter {
                 session: PiSessionArg::Resume {
                     session_file: config.session_file.clone(),
                 },
+                bridge_extension: materialize_bridge()?,
                 system_prompt: new_role.prompt_path.clone(),
                 model: config.model.clone(),
                 effort: config.effort.clone(),
@@ -570,6 +641,7 @@ impl PiRpcAdapter {
             .spawn_ready(
                 candidate_spec,
                 &live.identity,
+                &live.sid,
                 Some(&config.session_file),
                 config.model.as_deref(),
                 config.effort.as_deref(),
@@ -577,6 +649,7 @@ impl PiRpcAdapter {
             .await
         {
             Ok(ready) => {
+                let ready_events = ready.events;
                 *live.transport.write().await = ready.transport;
                 config.role = new_role.role;
                 config.role_prompt_path = new_role.prompt_path;
@@ -588,7 +661,11 @@ impl PiRpcAdapter {
                     &config,
                 )?;
                 drop(config);
-                Self::spawn_event_pump(Arc::clone(&live));
+                Self::spawn_event_pump(
+                    Arc::clone(&live),
+                    ready_events,
+                    self.interaction_resolver.lock().unwrap().clone(),
+                );
                 Ok(())
             }
             Err(candidate_error) => {
@@ -598,6 +675,7 @@ impl PiRpcAdapter {
                         session: PiSessionArg::Resume {
                             session_file: old.session_file.clone(),
                         },
+                        bridge_extension: materialize_bridge()?,
                         system_prompt: old.role_prompt_path.clone(),
                         model: old.model.clone(),
                         effort: old.effort.clone(),
@@ -607,6 +685,7 @@ impl PiRpcAdapter {
                     .spawn_ready(
                         rollback_spec,
                         &live.identity,
+                        &live.sid,
                         Some(&old.session_file),
                         old.model.as_deref(),
                         old.effort.as_deref(),
@@ -614,10 +693,15 @@ impl PiRpcAdapter {
                     .await
                 {
                     Ok(rollback) => {
+                        let rollback_events = rollback.events;
                         *live.transport.write().await = rollback.transport;
                         *config = old;
                         drop(config);
-                        Self::spawn_event_pump(Arc::clone(&live));
+                        Self::spawn_event_pump(
+                            Arc::clone(&live),
+                            rollback_events,
+                            self.interaction_resolver.lock().unwrap().clone(),
+                        );
                         Err(HarnessError::SpawnFailed(format!(
                             "Pi role restart failed and previous role was restored: {candidate_error}"
                         )))
@@ -718,6 +802,288 @@ impl PiRpcAdapter {
         )?;
         live.cached_status.lock().unwrap().effort = Some(effort.to_string());
         Ok(())
+    }
+}
+
+async fn wait_for_bridge_ready(
+    sid: &str,
+    transport: Arc<PiTransport>,
+    events: &mut broadcast::Receiver<PiTransportEvent>,
+    resolver: Option<Arc<dyn PiInteractionResolver>>,
+) -> Result<Vec<String>, String> {
+    loop {
+        match events.recv().await {
+            Ok(PiTransportEvent::Event(PiEvent::ExtensionUiRequest(request))) => {
+                if request.method == "setStatus" {
+                    let status_key = request
+                        .payload
+                        .get("statusKey")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let status_text = request.payload.get("statusText").and_then(Value::as_str);
+                    if let Some(names) = parse_ready_status(status_key, status_text)? {
+                        return Ok(names);
+                    }
+                }
+                resolve_ui_request(sid, Arc::clone(&transport), request, resolver.clone(), None)
+                    .await?;
+            }
+            Ok(PiTransportEvent::Event(PiEvent::ExtensionError { event, error })) => {
+                return Err(format!("Pi bridge extension `{event}` failed: {error}"));
+            }
+            Ok(PiTransportEvent::Error(error)) => return Err(error),
+            Ok(PiTransportEvent::Event(_)) => {}
+            Err(broadcast::error::RecvError::Lagged(count)) => {
+                return Err(format!(
+                    "Pi bridge readiness subscriber lagged by {count} records"
+                ));
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                return Err("Pi child closed before bridge readiness".to_string());
+            }
+        }
+    }
+}
+
+async fn resolve_ui_request(
+    sid: &str,
+    transport: Arc<PiTransport>,
+    request: PiExtensionUiRequest,
+    resolver: Option<Arc<dyn PiInteractionResolver>>,
+    outstanding: Option<&StdMutex<HashSet<String>>>,
+) -> Result<(), String> {
+    let is_dialog = matches!(
+        request.method.as_str(),
+        "select" | "confirm" | "input" | "editor"
+    );
+    if is_dialog {
+        if let Some(outstanding) = outstanding {
+            outstanding.lock().unwrap().insert(request.id.clone());
+        }
+    }
+    let result = resolve_ui_request_inner(sid, &transport, &request, resolver).await;
+    if is_dialog {
+        if let Some(outstanding) = outstanding {
+            outstanding.lock().unwrap().remove(&request.id);
+        }
+    }
+    result
+}
+
+async fn resolve_ui_request_inner(
+    sid: &str,
+    transport: &Arc<PiTransport>,
+    request: &PiExtensionUiRequest,
+    resolver: Option<Arc<dyn PiInteractionResolver>>,
+) -> Result<(), String> {
+    if request.method == "confirm"
+        && request.payload.get("title").and_then(Value::as_str) == Some(PERMISSION_DIALOG_TITLE)
+    {
+        return resolve_permission_request(sid, transport, request, resolver).await;
+    }
+
+    let title = request
+        .payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Pi extension request")
+        .to_string();
+    let kind = match request.method.as_str() {
+        "select" => PiDialogKind::Select {
+            options: request
+                .payload
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        },
+        "confirm" => PiDialogKind::Confirm {
+            message: request
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
+        "input" => PiDialogKind::Input {
+            placeholder: request
+                .payload
+                .get("placeholder")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+        "editor" => PiDialogKind::Editor {
+            prefill: request
+                .payload
+                .get("prefill")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+        // These Pi RPC UI methods are fire-and-forget. The adapter does not
+        // reinterpret their content as chat or prompt material.
+        "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text" => return Ok(()),
+        _ => {
+            return transport
+                .send(json!({"type":"extension_ui_response", "id":request.id, "cancelled":true}))
+                .await;
+        }
+    };
+    let dialog = PiDialogRequest {
+        request_id: request.id.clone(),
+        title,
+        kind,
+    };
+    let timeout = ui_timeout(request);
+    let response = match resolver.as_ref() {
+        Some(resolver) => {
+            tokio::select! {
+                result = tokio::time::timeout(timeout, resolver.resolve_dialog(sid, &dialog)) => {
+                    match result {
+                        Ok(response) => response,
+                        Err(_) => PiDialogResponse::Cancelled,
+                    }
+                }
+                _ = transport.wait_closed() => {
+                    resolver.cancel_sid(sid).await;
+                    PiDialogResponse::Cancelled
+                }
+            }
+        }
+        None => PiDialogResponse::Cancelled,
+    };
+    let response = match response {
+        PiDialogResponse::Value(value) => {
+            json!({"type":"extension_ui_response", "id":request.id, "value":value})
+        }
+        PiDialogResponse::Confirmed(confirmed) => {
+            json!({"type":"extension_ui_response", "id":request.id, "confirmed":confirmed})
+        }
+        PiDialogResponse::Cancelled => {
+            json!({"type":"extension_ui_response", "id":request.id, "cancelled":true})
+        }
+    };
+    if transport.is_alive() {
+        transport.send(response).await
+    } else {
+        Ok(())
+    }
+}
+
+async fn resolve_permission_request(
+    sid: &str,
+    transport: &Arc<PiTransport>,
+    request: &PiExtensionUiRequest,
+    resolver: Option<Arc<dyn PiInteractionResolver>>,
+) -> Result<(), String> {
+    let message = request
+        .payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut deny_reason = None;
+    let confirmed = if message.len() > MAX_PERMISSION_ENVELOPE_BYTES {
+        deny_reason = Some("payload too large".to_string());
+        false
+    } else {
+        let envelope: Value = match serde_json::from_str(message) {
+            Ok(value) => value,
+            Err(error) => {
+                deny_reason = Some(format!("invalid permission envelope: {error}"));
+                Value::Null
+            }
+        };
+        let tool_call_id = envelope
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tool_name = envelope
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let input = envelope.get("input").cloned().unwrap_or(Value::Null);
+        if tool_call_id.is_empty() || tool_name.is_empty() {
+            deny_reason = Some("permission envelope missing tool identity".to_string());
+            false
+        } else if auto_allows_tool(tool_name) {
+            true
+        } else if let Some(resolver) = resolver.as_ref() {
+            let approval = ApprovalIR {
+                req_id: format!("{sid}/{tool_call_id}"),
+                vendor: AgentVendor::Pi,
+                kind: ApprovalKind::ToolUse,
+                risk: resolver.classify_tool_risk(tool_name, &input),
+                scope: ApprovalScope::Once,
+                summary: Some(tool_name.to_string()),
+                raw: json!({
+                    "toolCallId": tool_call_id,
+                    "toolName": tool_name,
+                    "input": input,
+                }),
+            };
+            let decision = tokio::select! {
+                result = tokio::time::timeout(ui_timeout(request), resolver.resolve_approval(sid, &approval)) => {
+                    match result {
+                        Ok(decision) => decision,
+                        Err(_) => PiApprovalDecision::Deny("approval timed out".to_string()),
+                    }
+                }
+                _ = transport.wait_closed() => {
+                    resolver.cancel_sid(sid).await;
+                    PiApprovalDecision::Deny("session closed".to_string())
+                }
+            };
+            match decision {
+                PiApprovalDecision::Allow => true,
+                PiApprovalDecision::Deny(reason) => {
+                    deny_reason = Some(reason);
+                    false
+                }
+            }
+        } else {
+            deny_reason = Some("HITL approval resolver unavailable".to_string());
+            false
+        }
+    };
+    if let Some(reason) = deny_reason {
+        tracing::info!(%sid, %reason, "Pi tool call denied");
+    }
+    if transport.is_alive() {
+        transport
+            .send(json!({
+                "type":"extension_ui_response",
+                "id":request.id,
+                "confirmed":confirmed,
+            }))
+            .await
+    } else {
+        Ok(())
+    }
+}
+
+fn ui_timeout(request: &PiExtensionUiRequest) -> Duration {
+    request
+        .payload
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .filter(|duration| !duration.is_zero())
+        .unwrap_or_else(|| Duration::from_secs(120))
+}
+
+async fn cancel_outstanding_ui(live: &LiveSession, transport: &PiTransport) {
+    let ids = live
+        .outstanding_ui
+        .lock()
+        .unwrap()
+        .drain()
+        .collect::<Vec<_>>();
+    for id in ids {
+        let _ = transport
+            .send(json!({"type":"extension_ui_response", "id":id, "cancelled":true}))
+            .await;
     }
 }
 
@@ -881,10 +1247,15 @@ impl HarnessAdapter for PiRpcAdapter {
         let Some(live) = live else {
             return Ok(());
         };
+        let transport = live.transport.read().await.clone();
+        cancel_outstanding_ui(&live, &transport).await;
+        let resolver = { self.interaction_resolver.lock().unwrap().clone() };
+        if let Some(resolver) = resolver {
+            resolver.cancel_sid(&live.sid).await;
+        }
         if let Some(task) = live.event_task.lock().unwrap().take() {
             task.abort();
         }
-        let transport = live.transport.read().await.clone();
         transport
             .close()
             .await

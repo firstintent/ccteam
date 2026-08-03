@@ -33,6 +33,7 @@ pub struct PiTransport {
     child: Mutex<Option<Child>>,
     pending: StdMutex<HashMap<String, oneshot::Sender<PendingResult>>>,
     event_tx: broadcast::Sender<PiTransportEvent>,
+    startup_events: StdMutex<Option<broadcast::Receiver<PiTransportEvent>>>,
     request_seq: AtomicU64,
     alive: AtomicBool,
     closed: Notify,
@@ -86,11 +87,17 @@ impl PiTransport {
         W: AsyncWrite + Send + Unpin + 'static,
     {
         let (event_tx, _) = broadcast::channel(256);
+        // Subscribe before the stdout task can run. Pi emits extension
+        // session_start UI (including the bridge-ready marker) before it
+        // begins consuming stdin, so subscribing after spawn can lose the
+        // only readiness record.
+        let startup_events = event_tx.subscribe();
         let transport = Arc::new(Self {
             writer: Mutex::new(Some(Box::pin(writer))),
             child: Mutex::new(child),
             pending: StdMutex::new(HashMap::new()),
             event_tx,
+            startup_events: StdMutex::new(Some(startup_events)),
             request_seq: AtomicU64::new(1),
             alive: AtomicBool::new(true),
             closed: Notify::new(),
@@ -212,6 +219,14 @@ impl PiTransport {
         self.event_tx.subscribe()
     }
 
+    pub fn take_startup_events(&self) -> broadcast::Receiver<PiTransportEvent> {
+        self.startup_events
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| self.subscribe())
+    }
+
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
@@ -234,24 +249,11 @@ impl PiTransport {
             .as_object_mut()
             .ok_or_else(|| "Pi command must be a JSON object".to_string())?;
         object.insert("id".to_string(), Value::String(id.clone()));
-        let mut line = serde_json::to_vec(&command)
-            .map_err(|error| format!("serialize Pi command: {error}"))?;
-        line.push(b'\n');
         let (sender, receiver) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), sender);
-        let write_result = {
-            let mut writer = self.writer.lock().await;
-            match writer.as_mut() {
-                Some(writer) => writer.as_mut().write_all(&line).await,
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "Pi stdin closed",
-                )),
-            }
-        };
-        if let Err(error) = write_result {
+        if let Err(error) = self.send(command).await {
             self.pending.lock().unwrap().remove(&id);
-            return Err(format!("write Pi request: {error}"));
+            return Err(error);
         }
         match tokio::time::timeout(REQUEST_TIMEOUT, receiver).await {
             Ok(Ok(result)) => result,
@@ -260,6 +262,24 @@ impl PiTransport {
                 self.pending.lock().unwrap().remove(&id);
                 Err(format!("Pi request {id} timed out"))
             }
+        }
+    }
+
+    pub async fn send(&self, command: Value) -> Result<(), String> {
+        if !self.is_alive() {
+            return Err("Pi child is not alive".to_string());
+        }
+        let mut line = serde_json::to_vec(&command)
+            .map_err(|error| format!("serialize Pi command: {error}"))?;
+        line.push(b'\n');
+        let mut writer = self.writer.lock().await;
+        match writer.as_mut() {
+            Some(writer) => writer
+                .as_mut()
+                .write_all(&line)
+                .await
+                .map_err(|error| format!("write Pi request: {error}")),
+            None => Err("write Pi request: Pi stdin closed".to_string()),
         }
     }
 

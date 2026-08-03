@@ -168,6 +168,35 @@ impl PendingInteractions {
             .map(|p| &p.prompt)
     }
 
+    /// Take the outstanding free-text dialog for a ccteam sid. Empty options
+    /// distinguish input/editor prompts from button choices; routing is by the
+    /// ccteam sid tag, never a vendor-native session id.
+    pub fn take_free_text_for_sid(&mut self, sid: &str) -> Option<PendingInteraction> {
+        let key = self
+            .map
+            .iter()
+            .find(|(_, pending)| {
+                pending.sid.as_deref() == Some(sid) && pending.prompt.options.is_empty()
+            })
+            .map(|(key, _)| key.clone())?;
+        self.map.remove(&key)
+    }
+
+    /// Remove every outstanding interaction for one ccteam sid. Dropping an
+    /// External origin closes its oneshot, making teardown fail closed instead
+    /// of leaving an adapter child blocked forever.
+    pub fn drain_sid(&mut self, sid: &str) -> Vec<PendingInteraction> {
+        let keys = self
+            .map
+            .iter()
+            .filter(|(_, pending)| pending.sid.as_deref() == Some(sid))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| self.map.remove(&key))
+            .collect()
+    }
+
     /// Remove + return every entry whose `expires_at <= now`. Returned so
     /// External origins can be denied-with-reason rather than silently
     /// dropped.
@@ -337,5 +366,24 @@ mod tests {
         let mut p = PendingInteractions::new();
         p.tag_sid("nope", "s1".to_string());
         assert!(p.pending_for_sid("s1").is_none());
+    }
+
+    #[test]
+    fn pi_free_text_and_teardown_are_sid_scoped() {
+        let mut p = PendingInteractions::new();
+        let exp = Instant::now() + Duration::from_secs(60);
+        let mut text_prompt = prompt("text");
+        text_prompt.options.clear();
+        p.register("text".into(), text_prompt, directive_origin(), exp);
+        p.tag_sid("text", "s1".to_string());
+        p.register("choice".into(), prompt("choice"), directive_origin(), exp);
+        p.tag_sid("choice", "s1".to_string());
+        p.register("other".into(), prompt("other"), directive_origin(), exp);
+        p.tag_sid("other", "s2".to_string());
+
+        assert_eq!(p.take_free_text_for_sid("s1").unwrap().prompt.token, "text");
+        assert!(p.take_free_text_for_sid("s1").is_none());
+        assert_eq!(p.drain_sid("s1").len(), 1);
+        assert_eq!(p.len(), 1, "s2 remains registered");
     }
 }

@@ -122,6 +122,8 @@ impl PiTurnTranslator {
             | PiEvent::TurnEnd
             | PiEvent::AutoRetryStart
             | PiEvent::AutoRetryEnd { .. }
+            | PiEvent::ExtensionUiRequest(_)
+            | PiEvent::ExtensionError { .. }
             | PiEvent::Activity => TranslateOutput::default(),
         }
     }

@@ -15,6 +15,7 @@ pub enum PiSessionArg {
 #[derive(Debug, Clone)]
 pub struct PiSpawnInput {
     pub session: PiSessionArg,
+    pub bridge_extension: PathBuf,
     pub system_prompt: Option<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -44,6 +45,16 @@ pub fn build_spawn_spec(ctx: &SpawnCtx, input: PiSpawnInput) -> PiSpawnSpec {
             args.push(session_file.to_string_lossy().into_owned());
         }
     }
+    if ctx.permission_mode == PermissionMode::Hitl {
+        // Pi keeps explicitly supplied CLI extensions under this flag. In
+        // strict HITL mode that leaves the ccteam bridge loaded while keeping
+        // later user extensions from rewriting an already-approved tool call.
+        args.push("--no-extensions".to_string());
+    }
+    args.push("-e".to_string());
+    args.push(input.bridge_extension.to_string_lossy().into_owned());
+    // Catalog registration is ccteam's project-trust decision. Managed Pi
+    // sessions therefore bypass Pi's separate interactive trust prompt.
     args.push("--approve".to_string());
     if let Some(path) = input.system_prompt {
         args.push("--system-prompt".to_string());

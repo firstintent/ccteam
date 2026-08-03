@@ -27,7 +27,10 @@ use async_trait::async_trait;
 use ccteam_harness::execution::claude_stream_json::bridge::{
     ApprovalDecision, CanUseToolReq, CanUseToolResolver,
 };
-use ccteam_harness::{ApprovalRisk, ChoiceOption, ChoicePrompt, ChoiceSelection};
+use ccteam_harness::{
+    ApprovalIR, ApprovalRisk, ChoiceOption, ChoicePrompt, ChoiceSelection, PiApprovalDecision,
+    PiDialogKind, PiDialogRequest, PiDialogResponse, PiInteractionResolver,
+};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::gateway::{Gateway, GatewayEvent, GatewayEventKind, HitlPromptContext};
@@ -222,10 +225,35 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// treated as `Low`.
 pub fn classify_tool_risk(tool_name: &str, tool_input: &serde_json::Value) -> ApprovalRisk {
     match tool_name {
-        "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "TodoRead" | "WebSearch"
-        | "WebFetch" | "BashOutput" => ApprovalRisk::Low,
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "TodoWrite" => ApprovalRisk::Medium,
-        "Bash" | "KillShell" | "KillBash" => {
+        "Read"
+        | "Glob"
+        | "Grep"
+        | "LS"
+        | "NotebookRead"
+        | "TodoRead"
+        | "WebSearch"
+        | "WebFetch"
+        | "BashOutput"
+        | "read"
+        | "grep"
+        | "find"
+        | "ls"
+        | "ccteam_status"
+        | "ccteam_grok_claude_codex_kimi"
+        | "ccteam_session_list"
+        | "ccteam_session_collect" => ApprovalRisk::Low,
+        "Write"
+        | "Edit"
+        | "MultiEdit"
+        | "NotebookEdit"
+        | "TodoWrite"
+        | "write"
+        | "edit"
+        | "ccteam_chat_send_file"
+        | "ccteam_session_spawn"
+        | "ccteam_session_dispatch"
+        | "ccteam_session_stop" => ApprovalRisk::Medium,
+        "Bash" | "KillShell" | "KillBash" | "bash" => {
             let command = tool_input
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -307,6 +335,102 @@ pub enum PermissionAnswer {
     Unavailable,
 }
 
+enum ExternalChoiceAnswer {
+    Selected(ChoiceSelection),
+    Timeout,
+    Unavailable,
+}
+
+struct PermissionProgress<'a> {
+    path: &'a std::path::Path,
+    role: &'a str,
+    tool_name: &'a str,
+    summary: &'a str,
+    ttl_secs: u64,
+}
+
+fn mint_prompt_token(prefix: char) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}{:x}", (nanos as u64) & 0xff_ffff_ffff)
+}
+
+async fn ask_external_choice(
+    sink: &mpsc::UnboundedSender<GatewayEvent>,
+    pending: &Arc<Mutex<PendingInteractions>>,
+    ctx: &HitlPromptContext,
+    sid: &str,
+    prompt: ChoicePrompt,
+    ttl: Duration,
+    progress: Option<PermissionProgress<'_>>,
+) -> ExternalChoiceAnswer {
+    let token = prompt.token.clone();
+    let message_options = prompt
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| MessageOption {
+            data: format!("{token}:{index}"),
+            label: option.label.clone(),
+            id: option.id.clone(),
+        })
+        .collect();
+    let (reply, answer) = oneshot::channel::<ChoiceSelection>();
+    {
+        let mut guard = pending.lock().await;
+        guard.register(
+            token.clone(),
+            prompt.clone(),
+            InteractionOrigin::External { reply },
+            Instant::now() + ttl,
+        );
+        guard.tag_sid(&token, sid.to_string());
+    }
+    if sink
+        .send(GatewayEvent {
+            id: format!("permission-{token}"),
+            channel: ctx.channel.clone(),
+            chat_id: ctx.chat_id.clone(),
+            thread_ts: None,
+            content: prompt.title,
+            kind: GatewayEventKind::Answer,
+            attachments: Vec::new(),
+            options: message_options,
+            sid: Some(sid.to_string()),
+            slug: None,
+        })
+        .is_err()
+    {
+        pending.lock().await.take_by_token(&token);
+        return ExternalChoiceAnswer::Unavailable;
+    }
+    if let Some(progress) = progress {
+        let event = ccteam_core::progress::build_chat_permission_prompt_outstanding_event(
+            progress.role,
+            progress.tool_name,
+            progress.summary,
+            progress.ttl_secs,
+        );
+        if let Err(error) = ccteam_core::progress::append_event(progress.path, &event) {
+            tracing::warn!(
+                sid,
+                path = %progress.path.display(),
+                %error,
+                "hitl: failed to append permission-prompt-outstanding progress line"
+            );
+        }
+    }
+    match tokio::time::timeout(ttl, answer).await {
+        Ok(Ok(selection)) => ExternalChoiceAnswer::Selected(selection),
+        _ => {
+            pending.lock().await.take_by_token(&token);
+            ExternalChoiceAnswer::Timeout
+        }
+    }
+}
+
 /// Render an Approve/Deny prompt to `ctx`'s bound chat and block (bounded by
 /// [`permission_prompt_timeout_secs`]) until the user clicks or the prompt
 /// lapses. THE shared core both Claude HITL surfaces call so buttons / TTL /
@@ -337,11 +461,7 @@ pub async fn ask_permission(
     );
 
     // Mint a short token (≤16B ASCII, no `:` — the ChoicePrompt contract).
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let token = format!("p{:x}", (nanos as u64) & 0xff_ffff_ffff);
+    let token = mint_prompt_token('p');
 
     let prompt = ChoicePrompt {
         token: token.clone(),
@@ -358,87 +478,25 @@ pub async fn ask_permission(
         ],
         multi: false,
     };
-    let message_options: Vec<MessageOption> = prompt
-        .options
-        .iter()
-        .enumerate()
-        .map(|(i, opt)| MessageOption {
-            data: format!("{token}:{i}"),
-            label: opt.label.clone(),
-            id: opt.id.clone(),
-        })
-        .collect();
-
-    // Register the External-origin pending (token-keyed); release the guard
-    // BEFORE the long await (lock discipline §7-1).
-    let (tx, rx) = oneshot::channel::<ChoiceSelection>();
     let ttl_secs = permission_prompt_timeout_secs();
     let ttl = Duration::from_secs(ttl_secs);
-    {
-        let mut guard = pending.lock().await;
-        guard.register(
-            token.clone(),
-            prompt.clone(),
-            InteractionOrigin::External { reply: tx },
-            Instant::now() + ttl,
-        );
-        // v0.8.22 P1 (review §3.1-3) — tag this pending with its sid so a web
-        // SSE reconnect (or a brand-new tab) can re-seed it even if it fell
-        // outside the transport-layer replay ring's window.
-        guard.tag_sid(&token, sid_label.to_string());
-    }
 
-    // Render the approve/deny buttons in IM/web.
-    let sent = sink.send(GatewayEvent {
-        id: format!("permission-{token}"),
-        channel: ctx.channel.clone(),
-        chat_id: ctx.chat_id.clone(),
-        thread_ts: None,
-        content: title,
-        kind: GatewayEventKind::Answer,
-        attachments: Vec::new(),
-        options: message_options,
-        // sid set so a per-session web UI stream can show the approval
-        // (None would route to IM fine but be filtered out of SSE).
-        sid: Some(sid_label.to_string()),
-        // v0.9.0 W4 — `HitlPromptContext` doesn't carry the project slug;
-        // this prompt just won't ACL-filter into the team view's global SSE
-        // (tenant-visible only via the existing per-sid stream). Known scope
-        // reduction, documented in the W4 handoff.
-        slug: None,
+    let progress = ctx.progress_path.as_deref().map(|path| PermissionProgress {
+        path,
+        role: &ctx.role,
+        tool_name,
+        summary: &summary,
+        ttl_secs,
     });
-    if sent.is_err() {
-        pending.lock().await.take_by_token(&token);
-        return PermissionAnswer::Unavailable;
-    }
-
-    // Best-effort operator-visibility line: PARKED awaiting approval, not
-    // silently stuck. Never blocks/affects the approval flow.
-    if let Some(progress_path) = ctx.progress_path.as_ref() {
-        let ev = ccteam_core::progress::build_chat_permission_prompt_outstanding_event(
-            &ctx.role, tool_name, &summary, ttl_secs,
-        );
-        if let Err(err) = ccteam_core::progress::append_event(progress_path, &ev) {
-            tracing::warn!(
-                sid = %sid_label,
-                path = %progress_path.display(),
-                error = %err,
-                "hitl: failed to append permission-prompt-outstanding progress line"
-            );
+    match ask_external_choice(sink, pending, ctx, sid_label, prompt, ttl, progress).await {
+        ExternalChoiceAnswer::Selected(selection) => {
+            match selection.ids.first().map(String::as_str) {
+                Some("allow") => PermissionAnswer::Allow,
+                _ => PermissionAnswer::Deny,
+            }
         }
-    }
-
-    // Block on the click, holding NO lock. TTL enforced here; on lapse the
-    // caller degrades to deny.
-    match tokio::time::timeout(ttl, rx).await {
-        Ok(Ok(selection)) => match selection.ids.first().map(String::as_str) {
-            Some("allow") => PermissionAnswer::Allow,
-            _ => PermissionAnswer::Deny,
-        },
-        _ => {
-            pending.lock().await.take_by_token(&token);
-            PermissionAnswer::Timeout
-        }
+        ExternalChoiceAnswer::Timeout => PermissionAnswer::Timeout,
+        ExternalChoiceAnswer::Unavailable => PermissionAnswer::Unavailable,
     }
 }
 
@@ -515,6 +573,118 @@ impl CanUseToolResolver for GatewayCanUseToolResolver {
                 ApprovalDecision::deny("HITL approval channel unavailable — denied.")
             }
         }
+    }
+}
+
+#[async_trait]
+impl PiInteractionResolver for GatewayCanUseToolResolver {
+    fn classify_tool_risk(&self, tool_name: &str, input: &serde_json::Value) -> ApprovalRisk {
+        classify_tool_risk(tool_name, input)
+    }
+
+    async fn resolve_approval(&self, sid: &str, request: &ApprovalIR) -> PiApprovalDecision {
+        let tool_name = request
+            .raw
+            .get("toolName")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let input = request
+            .raw
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if tool_name.is_empty() {
+            return PiApprovalDecision::Deny(
+                "Pi approval request omitted its tool identity".to_string(),
+            );
+        }
+        let ctx = {
+            let guard = self.gateway.lock().await;
+            guard.hitl_prompt_context_for(sid)
+        };
+        let Some(ctx) = ctx else {
+            return PiApprovalDecision::Deny(
+                "HITL approval unavailable: session not tracked by the gateway".to_string(),
+            );
+        };
+        match ask_permission(&self.sink, &self.pending, &ctx, sid, tool_name, &input).await {
+            PermissionAnswer::Allow => PiApprovalDecision::Allow,
+            PermissionAnswer::Deny => {
+                PiApprovalDecision::Deny("Tool call not approved by the user".to_string())
+            }
+            PermissionAnswer::Timeout => PiApprovalDecision::Deny("Approval timed out".to_string()),
+            PermissionAnswer::Unavailable => {
+                PiApprovalDecision::Deny("HITL approval channel unavailable".to_string())
+            }
+        }
+    }
+
+    async fn resolve_dialog(&self, sid: &str, request: &PiDialogRequest) -> PiDialogResponse {
+        let ctx = {
+            let guard = self.gateway.lock().await;
+            guard.hitl_prompt_context_for(sid)
+        };
+        let Some(ctx) = ctx else {
+            return PiDialogResponse::Cancelled;
+        };
+        let mut prompt = ccteam_harness::execution::pi_rpc::bridge::dialog_prompt(
+            mint_prompt_token('d'),
+            request,
+        );
+        match &request.kind {
+            PiDialogKind::Confirm { message } if !message.is_empty() => {
+                prompt.title = format!("{}\n{}", prompt.title, message);
+            }
+            PiDialogKind::Input {
+                placeholder: Some(placeholder),
+            } if !placeholder.is_empty() => {
+                prompt.title = format!("{}\nReply with text ({placeholder})", prompt.title);
+            }
+            PiDialogKind::Editor {
+                prefill: Some(prefill),
+            } if !prefill.is_empty() => {
+                prompt.title = format!("{}\nReply with edited text:\n{prefill}", prompt.title);
+            }
+            PiDialogKind::Input { .. }
+            | PiDialogKind::Editor { .. }
+            | PiDialogKind::Confirm { .. }
+            | PiDialogKind::Select { .. } => {}
+        }
+        match ask_external_choice(
+            &self.sink,
+            &self.pending,
+            &ctx,
+            sid,
+            prompt,
+            Duration::from_secs(permission_prompt_timeout_secs()),
+            None,
+        )
+        .await
+        {
+            ExternalChoiceAnswer::Selected(selection) => match &request.kind {
+                PiDialogKind::Confirm { .. } => PiDialogResponse::Confirmed(
+                    selection.ids.first().map(String::as_str) == Some("true"),
+                ),
+                PiDialogKind::Select { .. } => selection
+                    .ids
+                    .into_iter()
+                    .next()
+                    .map(PiDialogResponse::Value)
+                    .unwrap_or(PiDialogResponse::Cancelled),
+                PiDialogKind::Input { .. } | PiDialogKind::Editor { .. } => selection
+                    .free_text
+                    .or_else(|| selection.ids.into_iter().next())
+                    .map(PiDialogResponse::Value)
+                    .unwrap_or(PiDialogResponse::Cancelled),
+            },
+            ExternalChoiceAnswer::Timeout | ExternalChoiceAnswer::Unavailable => {
+                PiDialogResponse::Cancelled
+            }
+        }
+    }
+
+    async fn cancel_sid(&self, sid: &str) {
+        self.pending.lock().await.drain_sid(sid);
     }
 }
 
@@ -661,6 +831,36 @@ mod tests {
                 "{tool} should be Low"
             );
         }
+    }
+
+    #[test]
+    fn pi_tool_names_use_the_shared_risk_classifier() {
+        for tool in [
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "ccteam_status",
+            "ccteam_grok_claude_codex_kimi",
+            "ccteam_session_list",
+            "ccteam_session_collect",
+        ] {
+            assert_eq!(classify_tool_risk(tool, &json!({})), ApprovalRisk::Low);
+        }
+        for tool in [
+            "write",
+            "edit",
+            "ccteam_chat_send_file",
+            "ccteam_session_spawn",
+            "ccteam_session_dispatch",
+            "ccteam_session_stop",
+        ] {
+            assert_eq!(classify_tool_risk(tool, &json!({})), ApprovalRisk::Medium);
+        }
+        assert_eq!(
+            classify_tool_risk("unknown_custom", &json!({})),
+            ApprovalRisk::Unknown
+        );
     }
 
     #[test]

@@ -522,11 +522,10 @@ pub enum ThreadEvent {
 /// named around `ThreadEvent`.
 pub type CanonicalEvent = ThreadEvent;
 
-/// Vendor-neutral approval request placeholder.
-///
-/// v8.1 runs agent processes with skip-permissions and does not produce
-/// or resolve approvals. The type lives here so future Claude hook and
-/// Codex app-server approval surfaces can share one IM-facing shape.
+/// Vendor-neutral approval request passed from a harness into the shared
+/// IM/web pending-interaction layer. Pi's RPC bridge populates this for strict
+/// HITL tool calls; other vendor-native approval surfaces can use the same
+/// semantic/risk shape without exposing their wire protocol to the gateway.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalIR {
     pub req_id: String,

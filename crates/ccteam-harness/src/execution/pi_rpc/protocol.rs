@@ -107,7 +107,16 @@ pub enum PiEvent {
     AutoRetryEnd { success: bool },
     ToolExecutionStart { name: String, args: Value },
     ToolExecutionEnd { name: String, is_error: bool },
+    ExtensionUiRequest(PiExtensionUiRequest),
+    ExtensionError { event: String, error: String },
     Activity,
+}
+
+#[derive(Debug, Clone)]
+pub struct PiExtensionUiRequest {
+    pub id: String,
+    pub method: String,
+    pub payload: Value,
 }
 
 /// Parse only fields the adapter consumes. Unknown event types are returned as
@@ -169,6 +178,31 @@ pub fn parse_event(value: Value) -> Result<Option<PiEvent>, String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         },
+        "extension_ui_request" => PiEvent::ExtensionUiRequest(PiExtensionUiRequest {
+            id: value
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Pi extension UI request missing string id".to_string())?
+                .to_string(),
+            method: value
+                .get("method")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Pi extension UI request missing string method".to_string())?
+                .to_string(),
+            payload: value,
+        }),
+        "extension_error" => PiEvent::ExtensionError {
+            event: value
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            error: value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown extension error")
+                .to_string(),
+        },
         "message_start"
         | "message_update"
         | "tool_execution_update"
@@ -177,7 +211,6 @@ pub fn parse_event(value: Value) -> Result<Option<PiEvent>, String> {
         | "summarization_retry_scheduled"
         | "summarization_retry_attempt_start"
         | "summarization_retry_finished"
-        | "extension_error"
         | "bash_execution_update" => PiEvent::Activity,
         _ => return Ok(None),
     };

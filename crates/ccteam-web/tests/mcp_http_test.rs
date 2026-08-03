@@ -1,6 +1,7 @@
 //! v0.9 T4 — in-process router tests for `POST /mcp`.
 //!
-//! Acceptance: initialize echoes protocolVersion; tools/list = 8;
+//! Acceptance: initialize echoes protocolVersion; tools/list matches the
+//! managed Pi bridge readiness contract;
 //! tools/call status succeeds; no/bad bearer → 401 (auth on AND off);
 //! GET /mcp → 405; notification → 202 empty.
 
@@ -8,6 +9,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use ccteam_core::CcteamPaths;
+use ccteam_harness::PI_REQUIRED_MCP_TOOL_NAMES;
 use ccteam_web::{router_with_state, token::generate_or_load_token, AppState, AuthState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -147,7 +149,14 @@ async fn mcp_tools_list_returns_the_full_surface() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let tools = body["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 8, "tools={tools:?}");
+    let mut actual = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    let mut expected = PI_REQUIRED_MCP_TOOL_NAMES.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "tools={tools:?}");
 }
 
 // ── ③ tools/call status succeeds ────────────────────────────────────

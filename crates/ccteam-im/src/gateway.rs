@@ -2140,6 +2140,12 @@ impl Gateway {
             }
             return self.resolve_selection(&chat, &reply.data).await;
         }
+        // Pi extension input/editor dialogs are represented by an External
+        // pending with no buttons. While one is tagged to this ccteam sid,
+        // the next text reply resolves it instead of becoming an agent turn.
+        if let Some(replies) = self.resolve_free_text(&chat, text).await? {
+            return Ok(replies);
+        }
         // (v0.8.5 D3) A bare number is a short-reply to a pending choice, but
         // only when one is outstanding for the current session; otherwise
         // it's ordinary text for the agent.
@@ -6285,6 +6291,26 @@ impl Gateway {
         self.apply_pending(chat, p, selection).await
     }
 
+    async fn resolve_free_text(&self, chat: &ChatKey, text: &str) -> Result<Option<Vec<String>>> {
+        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+            return Ok(None);
+        };
+        let pending = {
+            let mut registry = self.pending.lock().await;
+            registry.drain_expired(Instant::now());
+            registry.take_free_text_for_sid(&session_id)
+        };
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        let selection = ChoiceSelection {
+            token: pending.prompt.token.clone(),
+            ids: Vec::new(),
+            free_text: Some(text.to_string()),
+        };
+        self.apply_pending(chat, pending, selection).await.map(Some)
+    }
+
     /// Dispatch a resolved selection per the pending interaction's origin
     /// (v0.8.5). Directive origin re-enters `handle_directive` with the
     /// choice; External origin (D6, W2) delivers over the oneshot.
@@ -8848,7 +8874,7 @@ impl Gateway {
         // is absent we've already taken the pending; re-register would race, so
         // we instead resolve it as the rejection — but the cleaner contract is
         // a 4xx, and the pending is single-flight + about to time out anyway.)
-        if !p.prompt.options.iter().any(|o| o.id == option_id) {
+        if !p.prompt.options.is_empty() && !p.prompt.options.iter().any(|o| o.id == option_id) {
             // Put the waiter out of its misery deterministically: an unknown id
             // is treated as no valid choice → drop, which makes an External
             // hook observe RecvError → its own fail-safe deny. We surface a
@@ -8857,8 +8883,11 @@ impl Gateway {
         }
         let selection = ChoiceSelection {
             token: token.to_string(),
-            ids: vec![option_id.to_string()],
-            free_text: None,
+            ids: (!p.prompt.options.is_empty())
+                .then(|| option_id.to_string())
+                .into_iter()
+                .collect(),
+            free_text: p.prompt.options.is_empty().then(|| option_id.to_string()),
         };
         self.apply_pending(&web_api_chat(), p, selection).await?;
         Ok(())
@@ -19488,6 +19517,36 @@ mod tests {
         let got = rx.await.expect("oneshot delivered");
         assert_eq!(got.ids, vec!["deny".to_string()]);
         assert!(shared.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_resolve_delivers_pi_free_text_without_fabricating_an_option() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "pifreetext";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            ChoicePrompt {
+                token: token.to_string(),
+                title: "Pi extension input".to_string(),
+                options: Vec::new(),
+                multi: false,
+            },
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        gateway
+            .resolve_web_selection(token, "typed answer")
+            .await
+            .expect("free text resolves cleanly");
+        let got = rx.await.expect("oneshot delivered");
+        assert!(got.ids.is_empty());
+        assert_eq!(got.free_text.as_deref(), Some("typed answer"));
     }
 
     /// v0.8.7 review-fix (R-H1) — an unknown/expired token is a clean `Err`
