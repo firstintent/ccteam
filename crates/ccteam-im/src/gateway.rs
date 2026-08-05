@@ -203,6 +203,15 @@ struct GatewaySession {
     delegation_depth: u32,
 }
 
+/// How often a paneless session's pump mirrors a mid-turn "still working"
+/// heartbeat into `progress.jsonl`.
+///
+/// The row only has to keep the session's newest event younger than
+/// [`ccteam_core::stall::STALL_WARN_SECONDS`] (5 min), and it is written from
+/// the pump's hot path — one per minute leaves a 5× margin without turning
+/// every streamed token into a disk write and a file lock.
+const TURN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Snapshot used by the pure live-capacity eviction selector.
 ///
 /// `last_active` is the PERSISTED `meta.json.last_active` (RFC3339,
@@ -417,6 +426,9 @@ pub struct Gateway {
     /// v0.9.2 — optional programmatic capacity override. Production reads the
     /// hot config; deterministic gateway tests use this to exercise a tiny cap.
     sessions_config_override: Option<ccteam_core::SessionsConfig>,
+    /// How often a paneless pump mirrors its mid-turn liveness heartbeat.
+    /// Defaults to [`TURN_HEARTBEAT_INTERVAL`]; tests shrink it.
+    turn_heartbeat_interval: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1465,6 +1477,7 @@ impl Gateway {
             delegation_tx: None,
             delegation_config_override: None,
             sessions_config_override: None,
+            turn_heartbeat_interval: TURN_HEARTBEAT_INTERVAL,
         }
     }
 
@@ -4016,6 +4029,7 @@ impl Gateway {
         let delegation_tx = self.delegation_tx.clone();
         let pump_vendor = session.vendor;
         let pump_host = session.host.clone();
+        let heartbeat_interval = self.turn_heartbeat_interval;
         let handle = tokio::spawn(async move {
             use std::time::Instant;
             // V0.8.4 P1: split the event stream into ANSWER (new message)
@@ -4073,6 +4087,11 @@ impl Gateway {
             // suppress the watchdog forever.
             let mut open_work_items: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // The mid-turn liveness heartbeat's own bookkeeping: which turn is
+            // open (paneless protocols only) and when its last durable busy row
+            // was written. `None` turn = no window open, so nothing to refresh.
+            let mut heartbeat_turn: Option<(String, Instant)> = None;
+            let mut heartbeat_last: Option<Instant> = None;
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -4220,22 +4239,93 @@ impl Gateway {
                                 );
                             }
                         }
-                        // A paneless adapter's structured turn start is the
-                        // first authoritative proof that work is underway.
-                        // Persist it immediately: capacity eviction ranks by
-                        // meta.last_active, so waiting until a long turn ends
-                        // can misclassify an actively working child as oldest.
-                        // Terminal sessions have hook-owned activity updates.
-                        if !session.protocol.is_terminal()
-                            && matches!(&evt, ThreadEvent::TurnStarted { .. })
-                        {
-                            if let Some(dir) = project_dir.as_ref() {
-                                refresh_session_activity_meta(
-                                    dir,
-                                    &session_id,
-                                    session.vendor,
-                                    progress_path.as_deref(),
-                                );
+                        // The paneless turn-liveness mirror. A terminal session
+                        // gets mid-turn progress rows from its hooks; stream-json
+                        // and ACP have none, so the pump used to mirror only the
+                        // turn's END — and every reader that classifies activity
+                        // from the FILE (MCP `session_list`/`session_collect`,
+                        // web, CLI) saw a hard-working session as `idle`, or as
+                        // `stale` once the submit row aged past the 5-minute warn
+                        // window. Keyed on `is_terminal()` rather than on a
+                        // vendor, so a new paneless harness inherits it.
+                        if !session.protocol.is_terminal() {
+                            match &evt {
+                                ThreadEvent::TurnStarted { turn_id } => {
+                                    // A structured turn start is the first
+                                    // authoritative proof that work is underway.
+                                    // Persist it immediately: capacity eviction
+                                    // ranks by meta.last_active, so waiting until
+                                    // a long turn ends can misclassify an
+                                    // actively working child as oldest.
+                                    if let Some(dir) = project_dir.as_ref() {
+                                        refresh_session_activity_meta(
+                                            dir,
+                                            &session_id,
+                                            session.vendor,
+                                            progress_path.as_deref(),
+                                        );
+                                    }
+                                    let now = Instant::now();
+                                    heartbeat_turn = Some((turn_id.clone(), now));
+                                    heartbeat_last = Some(now);
+                                }
+                                // A terminal boundary closes the window. The
+                                // `chat_turn_completed` row appended below is the
+                                // idle tail; a heartbeat landing after it would
+                                // pin the session to `working` forever.
+                                ThreadEvent::TurnCompleted { .. }
+                                | ThreadEvent::TurnFailed { .. }
+                                | ThreadEvent::Error(_) => {
+                                    heartbeat_turn = None;
+                                    heartbeat_last = None;
+                                }
+                                // Anything else inside an open turn is real work
+                                // (tool step, assistant chunk). Refresh the sid's
+                                // tail timestamp so the classifier keeps reading
+                                // `working` — throttled, because this is the hot
+                                // path and the row only has to beat the warn
+                                // window, not track every token.
+                                _ => {
+                                    if let (Some((turn_id, started)), Some(ppath)) =
+                                        (heartbeat_turn.as_ref(), progress_path.as_ref())
+                                    {
+                                        let now = Instant::now();
+                                        let due = heartbeat_last.is_none_or(|last| {
+                                            now.duration_since(last) >= heartbeat_interval
+                                        });
+                                        if due {
+                                            heartbeat_last = Some(now);
+                                            let ev = ccteam_core::progress::build_chat_turn_running_long_event(
+                                                &session.role,
+                                                &session_id,
+                                                &session.project,
+                                                turn_id,
+                                                now.duration_since(*started).as_secs(),
+                                            );
+                                            if let Err(err) =
+                                                ccteam_core::progress::append_event(ppath, &ev)
+                                            {
+                                                tracing::warn!(
+                                                    session = %session_id,
+                                                    error = %err,
+                                                    "paneless pump: failed to mirror chat_turn_running_long"
+                                                );
+                                            }
+                                            // Keep the persisted activity stamp in
+                                            // step with the heartbeat: a long turn
+                                            // must not read as the least-recently
+                                            // active session to capacity eviction.
+                                            if let Some(dir) = project_dir.as_ref() {
+                                                refresh_session_activity_meta(
+                                                    dir,
+                                                    &session_id,
+                                                    session.vendor,
+                                                    progress_path.as_deref(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         // v0.8.19 `/status` — a terminal turn ends the in-flight
@@ -4393,6 +4483,43 @@ impl Gateway {
                             }
                             if let Ok(mut act) = session.latest_activity.lock() {
                                 *act = None;
+                            }
+                            // …and the SAME boundary has to reach the file, or
+                            // the durable truth outlives the in-memory one: the
+                            // opening row (or the last heartbeat) would stay the
+                            // session's newest event and a dead turn would read
+                            // as `working`, then `stale`, forever. Only paneless
+                            // sessions — a terminal session's Stop hook closes
+                            // its own window.
+                            if !session.protocol.is_terminal() {
+                                if let Some(ppath) = progress_path.as_ref() {
+                                    // `Error` is a session-level failure and
+                                    // carries no turn id; both variants carry
+                                    // the error itself.
+                                    let turn_id = match &evt {
+                                        ThreadEvent::TurnFailed { turn_id, .. } => {
+                                            turn_id.as_str()
+                                        }
+                                        _ => "",
+                                    };
+                                    let err = thread_event_failure(&evt);
+                                    let ev = ccteam_core::progress::build_chat_turn_failed_event(
+                                        &session.role,
+                                        &session_id,
+                                        turn_id,
+                                        err.map(|e| e.kind.as_str()).unwrap_or_default(),
+                                        err.map(|e| e.message.as_str()).unwrap_or_default(),
+                                    );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "paneless pump: failed to mirror chat_turn_failed"
+                                        );
+                                    }
+                                }
                             }
                         }
                         // v0.8.11 E4 — for a paneless session (no hooks:
@@ -6074,6 +6201,7 @@ impl Gateway {
                 session,
                 start_visible_events,
                 &turn_id.0,
+                &user_text,
                 submitted.disposition,
             )
             .await?;
@@ -6117,11 +6245,14 @@ impl Gateway {
                 }
                 // A directive that resolves to a turn was submitted by the
                 // adapter itself (`/model` re-prompt, grok steer): it is
-                // running, not queued.
+                // running, not queued. The turn body is the adapter's own
+                // re-prompt, not user text, so the progress row carries no
+                // excerpt rather than a fabricated one.
                 self.after_turn_submitted(
                     session,
                     start_visible_events,
                     &turn_id.0,
+                    "",
                     TurnDisposition::Started,
                 )
                 .await
@@ -6135,6 +6266,54 @@ impl Gateway {
         }
     }
 
+    /// Open the session's file-backed BUSY window: append one
+    /// `chat_turn_user_prompt` row for the turn just submitted.
+    ///
+    /// Every reader that answers "what is this session doing right now" from
+    /// OUTSIDE the daemon process — MCP `session_list` / `session_collect`, the
+    /// web session list, the CLI — classifies `progress.jsonl`, not the pump's
+    /// in-memory liveness. A paneless session used to mirror only the END of a
+    /// turn, so from submit until completion its newest row stayed the PREVIOUS
+    /// turn's `chat_turn_completed` — an idle boundary. A parent polling its
+    /// child therefore read `idle` seconds after dispatching work, and a
+    /// `session_collect(tail)` on that verdict returned the previous turn's
+    /// answer as if it were the new one.
+    ///
+    /// This is the one choke point every submission funnels through (IM text,
+    /// web chat, MCP `session_dispatch`, adapter-driven directive turns), so a
+    /// new entry point inherits the fix instead of needing its own. Written for
+    /// EVERY disposition: `Queued` means the work is outstanding behind a
+    /// running turn, which is busy, not idle. Terminal sessions write this row
+    /// from their own `UserPromptSubmit` hook — gate on protocol so they do not
+    /// get it twice.
+    fn open_turn_progress_window(
+        &self,
+        session: &GatewaySession,
+        turn_id: &str,
+        prompt_excerpt: &str,
+    ) {
+        if session.protocol.is_terminal() {
+            return;
+        }
+        let Some(paths) = self.project_paths.as_ref() else {
+            return;
+        };
+        let path = paths.progress_jsonl(&session.project);
+        let event = ccteam_core::progress::build_chat_turn_user_prompt_event(
+            &session.role,
+            &session.id,
+            turn_id,
+            prompt_excerpt,
+        );
+        if let Err(err) = ccteam_core::progress::append_event(&path, &event) {
+            tracing::warn!(
+                session = %session.id,
+                error = %err,
+                "ccteam-im: failed to append chat_turn_user_prompt progress event"
+            );
+        }
+    }
+
     /// Wire a freshly-submitted turn into the async pump (production) or
     /// drain its first answer synchronously (sink-less unit tests). Shared
     /// by the plain-text submit path and the directive `Turn` outcome.
@@ -6143,8 +6322,10 @@ impl Gateway {
         session: &GatewaySession,
         start_visible_events: u64,
         turn_id: &str,
+        prompt_excerpt: &str,
         disposition: TurnDisposition,
     ) -> Result<Vec<String>> {
+        self.open_turn_progress_window(session, turn_id, prompt_excerpt);
         if self.event_sink.is_some() {
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog
             // used to be a detached `tokio::spawn`ed task PER TURN
@@ -7945,6 +8126,13 @@ impl Gateway {
     /// config; deterministic tests use this to make eviction cheap to exercise.
     pub fn set_sessions_config(&mut self, cfg: ccteam_core::SessionsConfig) {
         self.sessions_config_override = Some(cfg);
+    }
+
+    /// Override the mid-turn heartbeat cadence. Production keeps
+    /// [`TURN_HEARTBEAT_INTERVAL`]; tests shrink it so a heartbeat is
+    /// observable without sleeping through a real minute.
+    pub fn set_turn_heartbeat_interval(&mut self, interval: std::time::Duration) {
+        self.turn_heartbeat_interval = interval;
     }
 
     /// Build the exclusion set for a session admission: the admitted sid plus
@@ -14597,6 +14785,262 @@ mod tests {
         resume_task.await.unwrap();
         // After restore completes, the session is live.
         assert_eq!(gateway.lock().await.session_views().len(), 1);
+    }
+
+    /// A paneless session must open its file-backed BUSY window at SUBMIT, not
+    /// at completion. `progress.jsonl` is what every out-of-process reader
+    /// classifies activity from (MCP `session_list`/`session_collect`, web,
+    /// CLI), and mirroring only the turn's end left the newest row on the
+    /// PREVIOUS turn's `chat_turn_completed` — an idle boundary — for the whole
+    /// of the next turn. A parent that polled its child right after dispatching
+    /// work read `idle` and collected the previous answer as the new one.
+    #[tokio::test]
+    async fn paneless_submit_opens_the_busy_window_before_the_turn_completes() {
+        use ccteam_core::stall::classify_progress_activity_for_sid;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // create_session_api defaults to the stream-json protocol.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let progress = paths.progress_jsonl("alpha");
+
+        // Turn 1 runs to completion, leaving an idle tail — the exact state the
+        // false-`idle` verdict came from.
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        let mut settled = false;
+        for _ in 0..100 {
+            let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+            // Wait for the pump's own completion row, not merely for an `idle`
+            // verdict — an empty file also classifies as idle, which would let
+            // the real assertion below pass without the tail it is about.
+            let completed = events.iter().any(|e| {
+                ccteam_core::progress::event_sid(e) == Some(sid.as_str())
+                    && e.get("event").and_then(|v| v.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+            });
+            if completed
+                && classify_progress_activity_for_sid(&events, &sid, 0, chrono::Utc::now())
+                    .status
+                    .activity
+                    == "idle"
+            {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            settled,
+            "turn 1 must settle to idle before turn 2 is judged"
+        );
+
+        // Turn 2: the submit itself must flip the file-backed verdict to
+        // `working`. Read synchronously right after submit — no pump event has
+        // to land first, which is the point.
+        gateway.submit_to_sid(&sid, "second".into()).await.unwrap();
+        let events = ccteam_core::progress::read_all_events(&progress).unwrap();
+        assert_eq!(
+            classify_progress_activity_for_sid(&events, &sid, 0, chrono::Utc::now())
+                .status
+                .activity,
+            "working",
+            "submitting a turn must open the busy window: {events:#?}"
+        );
+        let opened = events
+            .iter()
+            .rev()
+            .find(|e| ccteam_core::progress::event_sid(e) == Some(sid.as_str()))
+            .expect("a sid-tagged row");
+        assert_eq!(
+            opened["event"],
+            ccteam_core::progress::CHAT_TURN_USER_PROMPT
+        );
+        assert_eq!(
+            opened["prompt_excerpt"], "second",
+            "the row carries the turn's own prompt, not the previous one's"
+        );
+    }
+
+    /// The mid-turn heartbeat: a turn that keeps producing events keeps
+    /// refreshing its own `progress.jsonl` tail, so a long turn never ages into
+    /// `stale` while it is demonstrably working. Cadence is injected so the
+    /// assertion does not wait out the production minute.
+    #[tokio::test]
+    async fn paneless_pump_heartbeats_a_long_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // TurnStarted opens the window; no turn boundary, so the turn stays in
+        // flight and its item events are what the heartbeat rides on.
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_started());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "long job".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut beat = None;
+        for _ in 0..100 {
+            let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+            beat = events.into_iter().find(|e| {
+                e.get("event").and_then(|v| v.as_str())
+                    == Some(ccteam_core::progress::CHAT_TURN_RUNNING_LONG)
+            });
+            if beat.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let beat = beat.expect("an in-flight paneless turn must emit a heartbeat row");
+        // Tagged with the sid — the classifier selects a session's newest row by
+        // sid, so an untagged heartbeat would be invisible to the session it
+        // describes and would leak onto its siblings via the project-tail
+        // fallback.
+        assert_eq!(ccteam_core::progress::event_sid(&beat), Some(sid.as_str()));
+        assert_eq!(beat["slug"], "alpha");
+        assert!(!ccteam_core::progress::is_idle(Some(&beat)));
+    }
+
+    /// A turn that DIES must close its busy window on disk, not just in memory.
+    /// The pump already cleared the in-process markers on a canonical failure
+    /// but wrote nothing to `progress.jsonl`; now that submit opens a durable
+    /// busy window, that asymmetry would leave a dead session reading `working`
+    /// and then `stale` forever to every parent polling it.
+    #[tokio::test]
+    async fn paneless_turn_failure_closes_the_busy_window() {
+        use ccteam_core::stall::classify_progress_activity_for_sid;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_failure("boom"));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway.submit_to_sid(&sid, "doomed".into()).await.unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut settled = false;
+        for _ in 0..100 {
+            let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+            if classify_progress_activity_for_sid(&events, &sid, 0, chrono::Utc::now())
+                .status
+                .activity
+                == "idle"
+            {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+        assert!(settled, "a failed turn must settle to idle: {events:#?}");
+        let closed = events
+            .iter()
+            .rev()
+            .find(|e| ccteam_core::progress::event_sid(e) == Some(sid.as_str()))
+            .expect("a sid-tagged row");
+        assert_eq!(closed["event"], ccteam_core::progress::CHAT_TURN_FAILED);
+        assert_eq!(closed["error"], "boom");
+        // The failure row must NOT look like a completed turn: the cost ledger
+        // sums `chat_turn_completed`, and a failed turn has no priced usage.
+        assert!(
+            !events.iter().any(|e| {
+                ccteam_core::progress::event_sid(e) == Some(sid.as_str())
+                    && e.get("event").and_then(|v| v.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+            }),
+            "a failed turn must not enter the cost ledger: {events:#?}"
+        );
+    }
+
+    /// A terminal session already writes `chat_turn_user_prompt` from its own
+    /// `UserPromptSubmit` hook. The gateway must not write a second one.
+    #[tokio::test]
+    async fn terminal_submit_does_not_double_write_the_turn_open_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api_proto(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::Terminal,
+                "web-api".into(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.submit_to_sid(&sid, "hello".into()).await.unwrap();
+
+        let events = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
+            .unwrap_or_default();
+        assert!(
+            !events.iter().any(|e| {
+                e.get("event").and_then(|v| v.as_str())
+                    == Some(ccteam_core::progress::CHAT_TURN_USER_PROMPT)
+            }),
+            "the hook owns this row for terminal sessions: {events:#?}"
+        );
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — head-of-line regression: chat A's

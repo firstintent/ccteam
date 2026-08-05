@@ -227,6 +227,14 @@ fn spawn_status_tap(
         // on `assistant` steps), without one control_request per streamed step.
         let mut last_ctx: Option<Instant> = None;
         const CTX_REFRESH_MIN: Duration = Duration::from_secs(2);
+        // Whether this turn already asked the CLI for its applied effort. The
+        // level was only read at `TurnResult`, so the whole of a session's FIRST
+        // turn rendered `effort —` even when the session was spawned with an
+        // explicit level — and a long first turn is exactly when someone checks.
+        // Probing on the first assistant step closes that window. Reset per turn
+        // (the user can `/effort` mid-session), and skipped entirely once the
+        // level is known, so a settled session pays nothing.
+        let mut effort_probed_this_turn = false;
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -255,10 +263,27 @@ fn spawn_status_tap(
                         } else {
                             None
                         };
-                        if api_model.is_some() || fresh_ctx.is_some() {
+                        // Mid-turn effort, on the SAME observe-don't-echo rule as
+                        // model and context: the number comes from the vendor's
+                        // own `get_settings`, never from the spawn request — a
+                        // requested level that the CLI silently declined must not
+                        // be displayed as applied. One extra control request per
+                        // turn, and none at all once the answer is in.
+                        let effort_unknown =
+                            status.lock().map(|s| s.effort.is_none()).unwrap_or(false);
+                        let fresh_effort = if effort_unknown && !effort_probed_this_turn {
+                            effort_probed_this_turn = true;
+                            get_applied_effort(&transport).await
+                        } else {
+                            None
+                        };
+                        if api_model.is_some() || fresh_ctx.is_some() || fresh_effort.is_some() {
                             let snapshot = if let Ok(mut s) = status.lock() {
                                 if let Some(m) = api_model {
                                     s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
+                                }
+                                if let Some(e) = fresh_effort {
+                                    s.effort = Some(e);
                                 }
                                 if let Some((used, window)) = fresh_ctx {
                                     s.context = Some(crate::ContextUsage::known(
@@ -287,6 +312,7 @@ fn spawn_status_tap(
                     }
                     Ok(Outbound::TurnResult(_)) => {
                         active_turn.store(false, Ordering::Release);
+                        effort_probed_this_turn = false;
                         // The turn ended — turn-scoped tasks (sync subagents)
                         // cannot still be running, so drop them as a safety net in
                         // case a terminal task event was missed. Background

@@ -36,15 +36,16 @@ pub use ccteam_harness::execution::progress_bridge::{
     build_chat_permission_prompt_outstanding_event, build_chat_session_reset_event,
     build_chat_session_reset_event_with_reason, build_chat_session_reset_with_recovery_event,
     build_chat_session_started_event, build_chat_tool_call_started_event,
-    build_chat_turn_completed_event, build_chat_turn_running_long_event,
-    build_chat_turn_timeout_event, build_chat_turn_user_prompt_event,
-    build_codex_plan_updated_event, build_codex_rate_limit_event, build_codex_thread_status_event,
-    build_codex_token_usage_event, build_merger_lossy_partial_event, build_typed_event_event,
-    CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
-    CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET,
-    CHAT_SESSION_RESET_WITH_RECOVERY, CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED,
-    CHAT_TURN_COMPLETED, CHAT_TURN_RUNNING_LONG, CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT,
-    CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
+    build_chat_turn_completed_event, build_chat_turn_failed_event,
+    build_chat_turn_running_long_event, build_chat_turn_timeout_event,
+    build_chat_turn_user_prompt_event, build_codex_plan_updated_event,
+    build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
+    build_merger_lossy_partial_event, build_typed_event_event, CHAT_BOT_PERMANENT_FAILURE,
+    CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE, CHAT_MARKER_SELF_HEAL_ATTEMPT,
+    CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET, CHAT_SESSION_RESET_WITH_RECOVERY,
+    CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED, CHAT_TURN_COMPLETED, CHAT_TURN_FAILED,
+    CHAT_TURN_RUNNING_LONG, CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT, CODEX_PLAN_UPDATED,
+    CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
 
 /// Read + parse the last non-empty line of `path`. `Ok(None)` when the
@@ -231,6 +232,10 @@ pub fn is_idle(last: Option<&Value>) -> bool {
             // completes / session resets / compaction lands, the TUI
             // session is waiting for the next user input → idle.
             | CHAT_TURN_COMPLETED
+            // A turn that DIED is just as finished as one that answered. Without
+            // this, the row that closes a failed turn's busy window would itself
+            // read as busy and strand the session at `working` → `stale`.
+            | CHAT_TURN_FAILED
             | CHAT_SESSION_STARTED
             | CHAT_SESSION_RESET
             | CHAT_SESSION_RESET_WITH_RECOVERY
@@ -387,6 +392,7 @@ pub fn is_chat_event(kind: &str) -> bool {
         CHAT_SESSION_STARTED
             | CHAT_TURN_USER_PROMPT
             | CHAT_TURN_COMPLETED
+            | CHAT_TURN_FAILED
             | CHAT_SESSION_RESET
             | CHAT_SESSION_RESET_WITH_RECOVERY
             | CHAT_COMPACT_DONE
@@ -898,13 +904,34 @@ mod tests {
 
     #[test]
     fn build_chat_turn_running_long_event_shape() {
-        let ev = build_chat_turn_running_long_event("alice", "dev-foo", "turn-42", 95);
+        let ev = build_chat_turn_running_long_event("alice", "s7", "dev-foo", "turn-42", 95);
         assert_eq!(ev["event"], CHAT_TURN_RUNNING_LONG);
         assert_eq!(ev["role"], "alice");
+        // The classifier selects a session's latest event BY SID — an untagged
+        // heartbeat would never be read as the session's own activity.
+        assert_eq!(ev["sid"], "s7");
         assert_eq!(ev["slug"], "dev-foo");
         assert_eq!(ev["turn_id"], "turn-42");
         assert_eq!(ev["elapsed_sec"], 95);
         assert!(ev["ts"].is_string());
+        assert!(!is_idle(Some(&ev)), "a heartbeat must classify as busy");
+    }
+
+    #[test]
+    fn build_chat_turn_failed_event_shape() {
+        let ev = build_chat_turn_failed_event("alice", "s7", "turn-42", "transport", "boom");
+        assert_eq!(ev["event"], CHAT_TURN_FAILED);
+        assert_eq!(ev["role"], "alice");
+        assert_eq!(ev["sid"], "s7");
+        assert_eq!(ev["turn_id"], "turn-42");
+        assert_eq!(ev["error_kind"], "transport");
+        assert_eq!(ev["error"], "boom");
+        assert!(ev["ts"].is_string());
+        // A dead turn is a finished turn: this row CLOSES the busy window.
+        assert!(is_idle(Some(&ev)));
+        // …and it must never be priced — the cost ledger sums completed turns,
+        // and a failure carries no usage at all.
+        assert!(ev.get("usage").is_none());
     }
 
     #[test]
