@@ -5,6 +5,8 @@
 //! - All options come **before** the `stdio` mode token.
 //! - Skip → `--always-approve`; Hitl omits it.
 
+use std::path::PathBuf;
+
 use crate::PermissionMode;
 
 /// Inputs for [`build_argv`].
@@ -12,6 +14,13 @@ use crate::PermissionMode;
 pub struct GrokSpawnInput<'a> {
     pub permission_mode: PermissionMode,
     pub model_id: Option<&'a str>,
+    /// Empty stand-in plugin roots that shadow the user's ambient
+    /// Claude plugins by name, from
+    /// [`super::ambient_plugins::managed_shadow_dirs`]. `--plugin-dir` is
+    /// the highest-priority plugin scope and applies to this process only,
+    /// so the managed session loses the shadowed plugins' MCP children
+    /// while an interactive `grok` on the same machine is untouched.
+    pub plugin_shadows: &'a [PathBuf],
     /// Reasoning effort for the whole session (`grok agent --reasoning-effort`,
     /// alias `--effort`). Grok declares the levels it takes in its own
     /// handshake (`availableModels[]._meta.reasoningEfforts` — `low|medium|
@@ -41,7 +50,7 @@ pub fn build_envs() -> Vec<(String, String)> {
 }
 
 /// Build argv: `grok agent [--always-approve] [-m MODEL]
-/// [--reasoning-effort EFFORT] stdio`.
+/// [--reasoning-effort EFFORT] [--plugin-dir DIR]… stdio`.
 pub fn build_argv(bin: &str, input: &GrokSpawnInput<'_>) -> Vec<String> {
     let mut argv = vec![bin.to_string(), "agent".into()];
     if !input.permission_mode.is_hitl() {
@@ -55,6 +64,10 @@ pub fn build_argv(bin: &str, input: &GrokSpawnInput<'_>) -> Vec<String> {
     if let Some(effort) = input.effort.map(str::trim).filter(|e| !e.is_empty()) {
         argv.push("--reasoning-effort".into());
         argv.push(effort.to_string());
+    }
+    for dir in input.plugin_shadows {
+        argv.push("--plugin-dir".into());
+        argv.push(dir.to_string_lossy().into_owned());
     }
     // Mode last — `grok agent --help` requires options before the mode.
     argv.push("stdio".into());
@@ -73,6 +86,7 @@ mod tests {
                 permission_mode: PermissionMode::Skip,
                 model_id: None,
                 effort: None,
+                plugin_shadows: &[],
             },
         );
         assert_eq!(argv, vec!["grok", "agent", "--always-approve", "stdio"]);
@@ -86,6 +100,7 @@ mod tests {
                 permission_mode: PermissionMode::Hitl,
                 model_id: Some("grok-4.5"),
                 effort: None,
+                plugin_shadows: &[],
             },
         );
         assert_eq!(argv, vec!["grok", "agent", "-m", "grok-4.5", "stdio"]);
@@ -108,6 +123,7 @@ mod tests {
                 permission_mode: PermissionMode::Skip,
                 model_id: Some("x"),
                 effort: None,
+                plugin_shadows: &[],
             },
         );
         assert!(!argv.iter().any(|a| a.contains("system-prompt")));
@@ -125,6 +141,7 @@ mod tests {
                 permission_mode: PermissionMode::Skip,
                 model_id: Some("grok-4.5"),
                 effort: Some("high"),
+                plugin_shadows: &[],
             },
         );
         assert_eq!(
@@ -149,6 +166,7 @@ mod tests {
                     permission_mode: PermissionMode::Skip,
                     model_id: None,
                     effort,
+                    plugin_shadows: &[],
                 },
             );
             assert!(
@@ -156,5 +174,50 @@ mod tests {
                 "effort={effort:?} must not emit the flag"
             );
         }
+    }
+
+    /// Ambient Claude-plugin MCP children (the official Telegram plugin's
+    /// `getUpdates` poller among them) are shadowed out of managed sessions
+    /// by an empty same-name plugin at CLI scope — see
+    /// [`super::super::ambient_plugins`]. One repeated flag per shadow, and
+    /// like every other option it lands before the `stdio` mode token.
+    #[test]
+    fn plugin_shadows_emit_one_plugin_dir_flag_each_before_the_mode_token() {
+        let shadows = [PathBuf::from("/s/telegram"), PathBuf::from("/s/linear")];
+        let argv = build_argv(
+            "grok",
+            &GrokSpawnInput {
+                permission_mode: PermissionMode::Skip,
+                model_id: None,
+                effort: None,
+                plugin_shadows: &shadows,
+            },
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "grok",
+                "agent",
+                "--always-approve",
+                "--plugin-dir",
+                "/s/telegram",
+                "--plugin-dir",
+                "/s/linear",
+                "stdio"
+            ]
+        );
+
+        // No shadows (no MCP-bearing plugin installed) → byte-identical argv
+        // to before the shield existed.
+        let argv = build_argv(
+            "grok",
+            &GrokSpawnInput {
+                permission_mode: PermissionMode::Skip,
+                model_id: None,
+                effort: None,
+                plugin_shadows: &[],
+            },
+        );
+        assert!(!argv.iter().any(|a| a == "--plugin-dir"));
     }
 }

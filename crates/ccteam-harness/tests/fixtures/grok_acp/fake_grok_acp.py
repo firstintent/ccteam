@@ -91,6 +91,14 @@ def main() -> None:
                 + "\n"
             )
 
+    # Ambient-plugin shield — dump the argv this child was spawned with to
+    # $CCTEAM_ACP_ARGV_DUMP so a test can assert the `--plugin-dir` shadows
+    # that keep the user's Claude plugin MCP servers out of a managed session.
+    argv_dump = os.environ.get("CCTEAM_ACP_ARGV_DUMP")
+    if argv_dump:
+        with open(argv_dump, "w") as f:
+            f.write("\n".join(sys.argv[1:]) + "\n")
+
     # Spontaneous string-id frame (skills-reload) — transport must tolerate.
     emit({"jsonrpc": "2.0", "id": "skills-reload", "result": {"ok": True}})
 

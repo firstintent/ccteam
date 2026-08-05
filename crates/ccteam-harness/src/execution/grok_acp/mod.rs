@@ -5,6 +5,7 @@
 //!
 //! Wire SoT: `docs-local/versions/v0-8-23/dev-plan.md` §11 (grok 0.2.93).
 
+pub mod ambient_plugins;
 pub mod bridge;
 pub mod protocol;
 pub mod spawn_spec;
@@ -523,12 +524,19 @@ impl HarnessAdapter for GrokAcpAdapter {
         }
         // MVP roleless: ignore role (no systemPromptOverride / no --agent-profile).
         let bin = grok_bin();
+        // Second door to the ambient-MCP room `build_envs` already closed:
+        // Claude's installed plugins carry their own `.mcp.json` servers, which
+        // grok starts as stdio children of this process (the official Telegram
+        // plugin's poller fights ccteam's own IM gateway for the bot's single
+        // `getUpdates` slot). Shadow them at CLI scope — see `ambient_plugins`.
+        let plugin_shadows = ambient_plugins::managed_shadow_dirs();
         let argv = build_argv(
             &bin,
             &GrokSpawnInput {
                 permission_mode: ctx.permission_mode,
                 model_id: ctx.model_id.as_deref(),
                 effort: ctx.effort.as_deref(),
+                plugin_shadows: &plugin_shadows,
             },
         );
         let program = argv[0].clone();
