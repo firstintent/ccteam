@@ -19,11 +19,6 @@ pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
 pub const CHAT_TURN_USER_PROMPT: &str = "chat_turn_user_prompt";
 pub const CHAT_TURN_COMPLETED: &str = "chat_turn_completed";
-/// A turn that ended in a vendor/transport failure. Its own name rather than a
-/// zero-usage `chat_turn_completed`: this row must close the session's busy
-/// window WITHOUT entering the cost ledger (which sums completed turns) or
-/// reading back as a successful turn.
-pub const CHAT_TURN_FAILED: &str = "chat_turn_failed";
 pub const CHAT_SESSION_RESET_WITH_RECOVERY: &str = "chat_session_reset_with_recovery";
 pub const CHAT_COMPACT_DONE: &str = "chat_compact_done";
 pub const CHAT_HOP_ESCALATE: &str = "chat_hop_escalate";
@@ -209,29 +204,6 @@ pub fn build_chat_turn_completed_event(
         ev["model"] = Value::String(model.to_string());
     }
     ev
-}
-
-/// Build the terminal FAILURE row. Carries no `usage`, so a failed turn never
-/// reaches the cost ledger; its only job is to close the busy window the
-/// turn's opening row started, so a session whose turn died does not read as
-/// forever-`working` to the parents and consoles polling `progress.jsonl`.
-pub fn build_chat_turn_failed_event(
-    role: &str,
-    sid: &str,
-    turn_id: &str,
-    error_kind: &str,
-    message: &str,
-) -> Value {
-    let trimmed: String = message.chars().take(512).collect();
-    json!({
-        "event": CHAT_TURN_FAILED,
-        "role": role,
-        "sid": sid,
-        "turn_id": turn_id,
-        "error_kind": error_kind,
-        "error": trimmed,
-        "ts": Utc::now().to_rfc3339(),
-    })
 }
 
 /// Build the terminal success row consumed by progress and cost queries.

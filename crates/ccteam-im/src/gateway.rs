@@ -4485,38 +4485,35 @@ impl Gateway {
                                 *act = None;
                             }
                             // …and the SAME boundary has to reach the file, or
-                            // the durable truth outlives the in-memory one: the
-                            // opening row (or the last heartbeat) would stay the
-                            // session's newest event and a dead turn would read
-                            // as `working`, then `stale`, forever. Only paneless
-                            // sessions — a terminal session's Stop hook closes
-                            // its own window.
+                            // the durable truth outlives the in-memory one and a
+                            // dead session reads as forever-`working` to every
+                            // parent polling it. `TurnFailed` already lands a row
+                            // through the shared terminal accounting below;
+                            // `Error` is the third boundary and carries no
+                            // accounting at all, so it is absent from that
+                            // projection and needs its own close here. Zero usage
+                            // and no model → it contributes nothing to the ledger;
+                            // its only job is to end the busy window. Paneless
+                            // only: a terminal session's Stop hook closes its own.
                             if !session.protocol.is_terminal() {
-                                if let Some(ppath) = progress_path.as_ref() {
-                                    // `Error` is a session-level failure and
-                                    // carries no turn id; both variants carry
-                                    // the error itself.
-                                    let turn_id = match &evt {
-                                        ThreadEvent::TurnFailed { turn_id, .. } => {
-                                            turn_id.as_str()
-                                        }
-                                        _ => "",
-                                    };
-                                    let err = thread_event_failure(&evt);
-                                    let ev = ccteam_core::progress::build_chat_turn_failed_event(
-                                        &session.role,
-                                        &session_id,
-                                        turn_id,
-                                        err.map(|e| e.kind.as_str()).unwrap_or_default(),
-                                        err.map(|e| e.message.as_str()).unwrap_or_default(),
-                                    );
+                                if let (ThreadEvent::Error(_), Some(ppath)) =
+                                    (&evt, progress_path.as_ref())
+                                {
+                                    let ev =
+                                        ccteam_core::progress::build_chat_turn_completed_event(
+                                            &session.role,
+                                            &session_id,
+                                            "",
+                                            &ccteam_harness::UnifiedTokenUsage::default(),
+                                            None,
+                                        );
                                     if let Err(err) =
                                         ccteam_core::progress::append_event(ppath, &ev)
                                     {
                                         tracing::warn!(
                                             session = %session_id,
                                             error = %err,
-                                            "paneless pump: failed to mirror chat_turn_failed"
+                                            "paneless pump: failed to close the busy window on Error"
                                         );
                                     }
                                 }
@@ -14937,10 +14934,11 @@ mod tests {
     }
 
     /// A turn that DIES must close its busy window on disk, not just in memory.
-    /// The pump already cleared the in-process markers on a canonical failure
-    /// but wrote nothing to `progress.jsonl`; now that submit opens a durable
-    /// busy window, that asymmetry would leave a dead session reading `working`
-    /// and then `stale` forever to every parent polling it.
+    /// The pump clears its in-process markers on a canonical failure; now that
+    /// submit opens a DURABLE busy window, the file-backed boundary has to land
+    /// too, or a dead session reads `working` and then `stale` forever to every
+    /// parent polling it. (`TurnFailed` closes it through the shared terminal
+    /// accounting row, which deliberately carries a failed turn's usage.)
     #[tokio::test]
     async fn paneless_turn_failure_closes_the_busy_window() {
         use ccteam_core::stall::classify_progress_activity_for_sid;
@@ -14988,17 +14986,23 @@ mod tests {
             .rev()
             .find(|e| ccteam_core::progress::event_sid(e) == Some(sid.as_str()))
             .expect("a sid-tagged row");
-        assert_eq!(closed["event"], ccteam_core::progress::CHAT_TURN_FAILED);
-        assert_eq!(closed["error"], "boom");
-        // The failure row must NOT look like a completed turn: the cost ledger
-        // sums `chat_turn_completed`, and a failed turn has no priced usage.
-        assert!(
-            !events.iter().any(|e| {
-                ccteam_core::progress::event_sid(e) == Some(sid.as_str())
-                    && e.get("event").and_then(|v| v.as_str())
-                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
-            }),
-            "a failed turn must not enter the cost ledger: {events:#?}"
+        assert_eq!(
+            closed["event"],
+            ccteam_core::progress::CHAT_TURN_COMPLETED,
+            "the shared terminal-accounting row is what closes the window"
+        );
+        // Exactly one closing row — the busy window must not be closed twice.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| {
+                    ccteam_core::progress::event_sid(e) == Some(sid.as_str())
+                        && e.get("event").and_then(|v| v.as_str())
+                            == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                })
+                .count(),
+            1,
+            "one terminal row per turn: {events:#?}"
         );
     }
 
