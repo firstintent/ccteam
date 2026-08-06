@@ -7354,9 +7354,13 @@ impl Gateway {
         let now = Instant::now();
         let started = s.turn_started_at.lock().ok().and_then(|g| *g);
         let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
-        let silent_for = started.map(|t| match last_event {
-            Some(ev) => now.saturating_duration_since(ev),
-            None => now.saturating_duration_since(t),
+        // Silence is measured within THIS turn: `last_event_at` is written only
+        // by the pump, so a freshly submitted turn still carries the PREVIOUS
+        // turn's last event and would open minutes-silent (🔴 STUCK) until its
+        // first event streams back. Clamp the baseline to the turn's own start.
+        let silent_for = started.map(|t| {
+            let baseline = last_event.map_or(t, |ev| ev.max(t));
+            now.saturating_duration_since(baseline)
         });
         let (state, detail) = match (started, silent_for) {
             (None, _) => ("🟢", "idle".to_string()),
@@ -16432,16 +16436,17 @@ mod tests {
             "ctx still shown: {working:?}"
         );
 
-        // (3) In flight but the last event is stale past the idle window →
-        // 🔴 STUCK. Use the SAME threshold the code reads so the test is
-        // deterministic against any env-configured window.
+        // (3) In flight for a full idle window with the turn's own last event
+        // just as stale → 🔴 STUCK. Use the SAME threshold the code reads so
+        // the test is deterministic against any env-configured window.
         let mut window = gateway_turn_timeout_duration();
         if window.is_zero() {
             window = std::time::Duration::from_secs(300);
         }
         {
             let s = gateway.sessions.get("s1").expect("session s1");
-            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.turn_started_at.lock().unwrap() =
+                Some(now - (window + std::time::Duration::from_secs(120)));
             *s.last_event_at.lock().unwrap() =
                 Some(now - (window + std::time::Duration::from_secs(60)));
         }
@@ -16454,6 +16459,25 @@ mod tests {
             "stuck state: {stuck:?}"
         );
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
+
+        // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
+        // PREVIOUS turn's last event (the pump only writes that cell) must read
+        // 🔵 working, not 🔴 STUCK: silence is measured within the turn, so the
+        // baseline clamps to the turn's own start.
+        {
+            let s = gateway.sessions.get("s1").expect("session s1");
+            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.last_event_at.lock().unwrap() =
+                Some(now - (window + std::time::Duration::from_secs(60)));
+        }
+        let fresh = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            fresh[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
+        );
     }
 
     #[tokio::test]
