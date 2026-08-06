@@ -1015,14 +1015,15 @@ html.dark .cockpit-markdown a { color: #67e8f9; }
   text-transform: uppercase;
   color: var(--text-faint);
   border-bottom: 1px solid var(--border);
-  white-space: nowrap;
 }
+/* Cells wrap (prose stays readable in place); only tables whose min-content
+   width still exceeds the bubble fall back to the wrapper's horizontal
+   scroll — they never overflow the message. */
 .cockpit-markdown td {
   padding: 0.3125rem 0.625rem;
   font-family: var(--font-mono);
   font-size: 0.75rem;
   vertical-align: top;
-  white-space: nowrap;
   color: var(--text-muted);
   border-bottom: 1px solid var(--border-soft);
 }

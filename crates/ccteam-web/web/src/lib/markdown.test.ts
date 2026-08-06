@@ -49,3 +49,30 @@ describe("chat markdown URI sanitizer", () => {
     expect(rendered).not.toContain('href="javascript:');
   });
 });
+
+describe("chat markdown tables", () => {
+  it("wraps GFM tables in the scroll container so wide content cannot overflow", () => {
+    const rendered = renderMarkdown(
+      ["| col a | col b |", "| --- | --- |", "| one | two |"].join("\n"),
+    );
+
+    expect(rendered).toContain('<div class="cockpit-table-wrap"><table>');
+    expect(rendered).toContain("</table></div>");
+    expect(rendered).toContain("<td>one</td>");
+  });
+
+  it("wraps every table in a multi-table message", () => {
+    const table = ["| a |", "| --- |", "| 1 |"].join("\n");
+    const rendered = renderMarkdown(`${table}\n\nbetween\n\n${table}`);
+
+    expect(rendered.match(/cockpit-table-wrap/g)).toHaveLength(2);
+  });
+
+  it("does not double-wrap a table already inside the scroll container", () => {
+    const rendered = renderMarkdown(
+      '<div class="cockpit-table-wrap"><table><tbody><tr><td>x</td></tr></tbody></table></div>',
+    );
+
+    expect(rendered.match(/cockpit-table-wrap/g)).toHaveLength(1);
+  });
+});

@@ -60,6 +60,24 @@ function escapeHtml(text: string): string {
     .replaceAll("'", "&#39;");
 }
 
+/** Wrap each `<table>` in a `.cockpit-table-wrap` scroll container so a wide
+ * table scrolls inside the bubble instead of overflowing it (index.css owns
+ * the chrome: border, max-height, sticky thead). Runs on sanitized HTML and
+ * inserts only a static wrapper, so nothing user-controlled is added. */
+function wrapTables(html: string): string {
+  if (!html.includes("<table")) return html;
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  tpl.content.querySelectorAll("table").forEach((table) => {
+    if (table.parentElement?.classList.contains("cockpit-table-wrap")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "cockpit-table-wrap";
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+  });
+  return tpl.innerHTML;
+}
+
 /** Render chat Markdown → sanitized HTML (synchronous). Safe to feed to
  *  dangerouslySetInnerHTML. */
 export function renderMarkdown(md: string): string {
@@ -67,7 +85,7 @@ export function renderMarkdown(md: string): string {
   if (typeof DOMPurify.sanitize !== "function") return escapeHtml(md ?? "");
   DOMPurify.addHook("uponSanitizeAttribute", stripUnsafeUri);
   try {
-    return DOMPurify.sanitize(html, { ALLOWED_URI_REGEXP: CHAT_ALLOWED_URI_REGEXP });
+    return wrapTables(DOMPurify.sanitize(html, { ALLOWED_URI_REGEXP: CHAT_ALLOWED_URI_REGEXP }));
   } finally {
     DOMPurify.removeHook("uponSanitizeAttribute", stripUnsafeUri);
   }
