@@ -153,8 +153,10 @@ struct GatewaySession {
     /// every terminal canonical boundary. `/status` reads it to know whether a turn
     /// is in flight (→ 🔵 working, showing `now - start`) or the session is
     /// idle (`None` → 🟢). Shared (`Arc<Mutex>`) so the detached pump clears
-    /// the same cell the submit path set. PULL-only signal — nothing acts on it
-    /// except the `/status` render.
+    /// the same cell the submit path set. PULL-only signal — read ONLY through
+    /// [`Gateway::live_turn`] (which every activity surface goes through), and
+    /// nothing acts on it: it decides no control flow, only what a reader is
+    /// told the session is doing.
     turn_started_at: Arc<std::sync::Mutex<Option<Instant>>>,
     /// v0.9 T5 — set when a user turn is mirrored while a prior turn is still
     /// in flight (mid-turn steer). Cleared on the terminal boundary after the
@@ -7204,9 +7206,64 @@ impl Gateway {
             .and_then(|m| m.title)
     }
 
-    /// Classify live sessions from the same file-backed progress truth and
-    /// with the same `working|idle|stale|stuck` semantics as MCP
-    /// `session_list`. Reads each distinct project's progress stream once.
+    /// The daemon's own in-flight turn state for one session — [`LiveTurn`]
+    /// when a turn is open right now, `None` when the session is between
+    /// turns. Pure in-memory peeks (no I/O, no adapter round-trip), so callers
+    /// can snapshot it under the gateway lock and do the file read after
+    /// releasing it.
+    ///
+    /// The ONE place the `turn_started_at` / `last_event_at` pair is turned
+    /// into a verdict: `/status`'s own header line and every activity surface
+    /// (child rows, MCP, web) read it through here, so no surface can invent a
+    /// second definition of "is this session mid-turn".
+    fn live_turn(
+        &self,
+        session: &GatewaySession,
+        now: Instant,
+    ) -> Option<ccteam_core::stall::LiveTurn> {
+        let started = session.turn_started_at.lock().ok().and_then(|g| *g)?;
+        let last_event = session.last_event_at.lock().ok().and_then(|g| *g);
+        // Silence is measured within THIS turn: `last_event_at` is written only
+        // by the pump, so a freshly submitted turn still carries the PREVIOUS
+        // turn's last event and would open minutes-silent. Clamp to the turn's
+        // own start.
+        let baseline = last_event.map_or(started, |ev| ev.max(started));
+        let mut stuck_after = gateway_turn_timeout_duration();
+        if stuck_after.is_zero() {
+            // Watchdog disabled → keep a fixed threshold so STUCK still works.
+            stuck_after = std::time::Duration::from_secs(300);
+        }
+        Some(ccteam_core::stall::LiveTurn {
+            silent_seconds: now.saturating_duration_since(baseline).as_secs(),
+            elapsed_seconds: now.saturating_duration_since(started).as_secs(),
+            stuck_after_seconds: stuck_after.as_secs(),
+        })
+    }
+
+    /// In-flight turns for every tracked session, keyed by sid. The out-of-crate
+    /// half of [`Gateway::live_turn`]: web / MCP grab this under the same lock
+    /// that hands them `session_views()`, then classify after dropping it.
+    pub fn live_turns(&self) -> std::collections::HashMap<String, ccteam_core::stall::LiveTurn> {
+        let now = Instant::now();
+        self.sessions
+            .values()
+            .filter_map(|s| self.live_turn(s, now).map(|live| (s.id.clone(), live)))
+            .collect()
+    }
+
+    /// One session's in-flight turn by sid — [`Gateway::live_turns`] for callers
+    /// that classify a single session (MCP `session_collect`).
+    pub fn live_turn_for(&self, sid: &str) -> Option<ccteam_core::stall::LiveTurn> {
+        self.sessions
+            .get(sid)
+            .and_then(|s| self.live_turn(s, Instant::now()))
+    }
+
+    /// Classify live sessions through the shared resolver
+    /// (`ccteam_core::stall::classify_session_activity`) — file-backed progress
+    /// truth folded with the daemon's in-flight turns, the same
+    /// `working|idle|stale|stuck` vocabulary MCP `session_list` and the web
+    /// session list report. Reads each distinct project's progress stream once.
     fn session_activity_snapshot(
         &self,
         sessions: &[&GatewaySession],
@@ -7243,16 +7300,18 @@ impl Gateway {
                 });
         }
         let now = chrono::Utc::now();
+        let mono = Instant::now();
         sessions
             .iter()
             .map(|session| {
                 let (events, silent) = project_events
                     .get(&session.project)
                     .expect("every requested project was classified");
-                let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+                let activity = ccteam_core::stall::classify_session_activity(
                     events,
                     &session.id,
                     *silent,
+                    self.live_turn(session, mono),
                     now,
                 )
                 .status
@@ -7271,17 +7330,15 @@ impl Gateway {
     /// [`render_sessions`]; pure rendering (no side effects, no push, no
     /// mutation) — it only renders when the user types `/status`.
     ///
-    /// State derivation (mirrors the turn-timeout watchdog's own "silent for a
-    /// full idle window = stalled" definition, so 🔴 here means exactly what the
-    /// watchdog would flag):
-    /// - `turn_started_at == None` ⇒ 🟢 **idle**.
-    /// - in flight, last event recent (< idle window) ⇒ 🔵 **working** (show
-    ///   `now - start`).
-    /// - in flight, last event stale (≥ idle window) ⇒ 🔴 **STUCK** (show the
-    ///   silent duration).
-    ///
-    /// When the watchdog window is disabled (`CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS
-    /// == 0`), fall back to a fixed 300s stuck threshold so 🔴 still works.
+    /// State derivation = [`Gateway::live_turn`] — the same in-flight verdict
+    /// the child rows, MCP `session_list` and the web session list are given
+    /// (no turn ⇒ 🟢 **idle** · in flight ⇒ 🔵 **working** with `now - start` ·
+    /// in flight and silent for a full watchdog window ⇒ 🔴 **STUCK** with the
+    /// silent duration, exactly what the watchdog itself would flag). This line
+    /// adds one refinement it alone can afford: a BLOCKING subagent is an
+    /// authoritative "still working" straight from the vendor, so it upgrades
+    /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
+    /// which a fleet listing does not pay).
     async fn render_status(&self, chat: &ChatKey) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
@@ -7353,34 +7410,25 @@ impl Gateway {
         // Same vocabulary as the harness turn-end eviction
         // (`RunningTask::outlives_turn`).
         let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
-        let mut stuck_after = gateway_turn_timeout_duration();
-        if stuck_after.is_zero() {
-            stuck_after = std::time::Duration::from_secs(300);
-        }
-        let now = Instant::now();
-        let started = s.turn_started_at.lock().ok().and_then(|g| *g);
-        let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
-        // Silence is measured within THIS turn: `last_event_at` is written only
-        // by the pump, so a freshly submitted turn still carries the PREVIOUS
-        // turn's last event and would open minutes-silent (🔴 STUCK) until its
-        // first event streams back. Clamp the baseline to the turn's own start.
-        let silent_for = started.map(|t| {
-            let baseline = last_event.map_or(t, |ev| ev.max(t));
-            now.saturating_duration_since(baseline)
-        });
-        let (state, detail) = match (started, silent_for) {
-            (None, _) => ("🟢", "idle".to_string()),
+        // Same in-flight verdict the child rows / MCP / web get
+        // ([`Gateway::live_turn`]) — this line only dresses it with durations.
+        let live = self.live_turn(s, Instant::now());
+        let (state, detail) = match live {
+            None => ("🟢", "idle".to_string()),
             // Running subagents ⇒ definitively working (overrides silence).
-            (Some(t), _) if turn_scoped_running => (
-                "🔵",
-                format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+            Some(l) if l.is_stuck() && !turn_scoped_running => (
+                "🔴",
+                format!(
+                    "STUCK {} silent",
+                    humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
+                ),
             ),
-            (Some(_), Some(silent)) if silent >= stuck_after => {
-                ("🔴", format!("STUCK {} silent", humanize_dur(silent)))
-            }
-            (Some(t), _) => (
+            Some(l) => (
                 "🔵",
-                format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+                format!(
+                    "working {}",
+                    humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
+                ),
             ),
         };
 
@@ -16535,6 +16583,115 @@ mod tests {
                 "👥 直接子会话:\n      · s2 · claude · 🟡 working · delegated investigation"
             ),
             "working child is visible from its root status: {out:?}"
+        );
+    }
+
+    /// The 2026-08-08 report, from the IM end: `/status` showed every child
+    /// `🟢 idle` while the web console showed the same sessions working. Two
+    /// independent causes, both of which turned "the reader learned nothing"
+    /// into a confident green, and both fixed below the surfaces so the peer
+    /// ends cannot diverge again:
+    /// (1) one torn line (an interrupted append left a partial multi-byte
+    ///     character) failed the WHOLE progress read, and a read error degrades
+    ///     to "no events" everywhere;
+    /// (2) with no events for a sid, the classifier claimed `idle` — even for a
+    ///     session the daemon has an OPEN TURN for.
+    #[tokio::test]
+    async fn gateway_status_child_stays_working_when_the_stream_is_torn_or_silent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let child = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "researcher".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "s1".into(),
+                    depth: 0,
+                    role: "reviewer".into(),
+                }),
+                Some("delegated investigation".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        // (1) The child's turn IS in the stream — followed by a torn append.
+        let stream = paths.progress_jsonl("alpha");
+        ccteam_core::progress::append_event(
+            &stream,
+            &ccteam_core::progress::build_chat_turn_user_prompt_event(
+                "researcher",
+                &child,
+                "child-turn",
+                "investigate",
+            ),
+        )
+        .unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&stream)
+                .unwrap();
+            // `\xef` opens a 3-byte sequence that never completes.
+            f.write_all(b"{\"event\":\"note\",\"text\":\"\xef").unwrap();
+            f.write_all(b"{\"event\":\"PreToolUse\",\"tool\":\"Bash\"}\n")
+                .unwrap();
+        }
+        let torn = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            torn[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
+        );
+
+        // (2) Now the stream tells the reader NOTHING about the child (rotated,
+        // unreadable, or simply not yet written) — but the daemon holds an open
+        // turn for it. That turn is the honest answer.
+        std::fs::write(&stream, b"").unwrap();
+        {
+            let now = Instant::now();
+            let s = gateway.sessions.get(&child).expect("child session");
+            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.last_event_at.lock().unwrap() = Some(now);
+        }
+        let silent = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            silent[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            "an in-flight turn outranks a stream that says nothing: {silent:?}"
+        );
+
+        // …and with no open turn, an uninformative stream still reads idle: the
+        // fold only ever adds work, it never invents it.
+        {
+            let s = gateway.sessions.get(&child).expect("child session");
+            *s.turn_started_at.lock().unwrap() = None;
+        }
+        let idle = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            idle[0].contains(&format!("· {child} · claude · 🟢 idle ·")),
+            "no open turn ⇒ the file verdict stands: {idle:?}"
         );
     }
 

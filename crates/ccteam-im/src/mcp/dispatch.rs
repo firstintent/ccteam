@@ -3040,12 +3040,19 @@ fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (u
     (total_chars, truncated)
 }
 
-/// v0.9.1 — honest per-sid activity for the MCP surfaces: classify the
-/// session's progress stream the SAME way the web session list does
-/// (`ccteam_core::stall`, → `working|idle|stale|stuck`), so a polling parent
-/// can tell "child still thinking" from "turn done" without scraping
-/// anything. Best-effort: any read miss degrades to `None` (field omitted).
-fn classify_session_activity(slug: &str, sid: &str) -> Option<String> {
+/// v0.9.1 — honest per-sid activity for the MCP surfaces: the SAME resolver the
+/// web session list and IM `/status` use (`ccteam_core::stall`, →
+/// `working|idle|stale|stuck`), so a polling parent can tell "child still
+/// thinking" from "turn done" without scraping anything. `live` is the child's
+/// in-flight turn as the daemon sees it, snapshotted under the gateway lock by
+/// the caller — a mid-turn child reads `working` even if its project's progress
+/// stream is unreadable. Best-effort: any read miss degrades to `None` (field
+/// omitted).
+fn classify_session_activity(
+    slug: &str,
+    sid: &str,
+    live: Option<ccteam_core::stall::LiveTurn>,
+) -> Option<String> {
     let paths = ccteam_core::CcteamPaths::from_env().ok()?;
     let silent_seconds = ccteam_core::collect_projects(&paths)
         .ok()?
@@ -3054,10 +3061,11 @@ fn classify_session_activity(slug: &str, sid: &str) -> Option<String> {
         .map(|p| p.stall_silent_seconds)?;
     let events =
         ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
-    let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+    let activity = ccteam_core::stall::classify_session_activity(
         &events,
         sid,
         silent_seconds,
+        live,
         chrono::Utc::now(),
     );
     Some(activity.status.activity.to_string())
@@ -3083,10 +3091,11 @@ async fn run_session_collect(
     // R-M3 — only collect from sessions in the caller's own project.
     assert_caller_owns_session("session_collect", args, gateway, &sid, &caller).await?;
 
-    // Resolve under the lock (sync), then DROP the guard before the fs read.
-    let resolved = {
+    // Resolve under the lock (sync) — with the child's in-flight turn, which is
+    // a cheap in-memory peek — then DROP the guard before the fs read.
+    let (resolved, live) = {
         let gw = gateway.lock().await;
-        gw.session_resolve(&sid)
+        (gw.session_resolve(&sid), gw.live_turn_for(&sid))
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
     // A collectable session is one the gateway still tracks → "live" (the same
@@ -3152,10 +3161,10 @@ async fn run_session_collect(
     if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
         body["model"] = serde_json::json!(model);
     }
-    // v0.9.1 — honest per-sid activity (same classifier the web session list
+    // v0.9.1 — honest per-sid activity (same resolver the web session list
     // uses): `working` = the child is mid-turn (keep polling), `idle` = the
     // turn is done. Best-effort: a read miss just omits the field.
-    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid) {
+    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid, live) {
         body["activity"] = serde_json::json!(activity);
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
@@ -3241,11 +3250,15 @@ async fn run_session_list_at(
         .map(|n| (n as usize).clamp(1, 500))
         .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
 
-    let views = {
+    // Both halves of the activity answer come from under ONE lock hold, and
+    // both are cheap in-memory reads — the progress files are read below, after
+    // the guard drops (a fleet's streams are far too big to read under the
+    // gateway mutex).
+    let (views, live_turns) = {
         let gw = gateway.lock().await;
-        gw.session_views()
+        (gw.session_views(), gw.live_turns())
     };
-    // v0.9.1 — honest activity per row (same classifier as the web session
+    // v0.9.1 — honest activity per row (same resolver as the web session
     // list): one progress read per DISTINCT project, not per session.
     let mut activity_ctx: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
         std::collections::HashMap::new();
@@ -3275,10 +3288,16 @@ async fn run_session_list_at(
         .iter()
         .map(|v| {
             let activity = activity_ctx.get(&v.project).map(|(events, silent)| {
-                ccteam_core::stall::classify_progress_activity_for_sid(events, &v.sid, *silent, now)
-                    .status
-                    .activity
-                    .to_string()
+                ccteam_core::stall::classify_session_activity(
+                    events,
+                    &v.sid,
+                    *silent,
+                    live_turns.get(&v.sid).copied(),
+                    now,
+                )
+                .status
+                .activity
+                .to_string()
             });
             (v, activity)
         })

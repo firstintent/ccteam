@@ -124,25 +124,10 @@ pub fn append_experience(project_dir: &Path, record: &ExperienceRecord) -> Resul
 }
 
 /// Read every parseable record. Returns empty when the file is absent.
-/// Corrupt / half-flushed lines are skipped.
+/// Corrupt / half-flushed / torn lines are skipped one line at a time
+/// ([`super::fs_atomic::read_jsonl`]).
 pub fn read_all_experience(project_dir: &Path) -> Result<Vec<ExperienceRecord>> {
-    let path = experience_jsonl_path(project_dir);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut out = Vec::new();
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<ExperienceRecord>(trimmed) {
-            Ok(r) => out.push(r),
-            Err(_) => continue,
-        }
-    }
-    Ok(out)
+    super::fs_atomic::read_jsonl(&experience_jsonl_path(project_dir))
 }
 
 // ── fingerprints ─────────────────────────────────────────────────────────────
@@ -426,21 +411,7 @@ fn vendor_label(v: crate::AgentVendor) -> &'static str {
 }
 
 fn read_progress_events(path: &Path) -> Result<Vec<serde_json::Value>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str(trimmed) {
-            out.push(v);
-        }
-    }
-    Ok(out)
+    super::fs_atomic::read_jsonl(path)
 }
 
 #[cfg(test)]

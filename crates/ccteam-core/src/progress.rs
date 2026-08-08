@@ -159,24 +159,15 @@ fn last_line_from_buf(buf: &[u8]) -> Option<String> {
 /// Read + parse all events from `path`. Skips empty lines and lines
 /// that fail to deserialize as JSON (defensive: a half-flushed line
 /// shouldn't crash the orchestrator's read).
+///
+/// **Damage is per LINE, never per file** — see
+/// [`ccteam_harness::execution::fs_atomic::read_jsonl`], the shared tolerance
+/// rule for every append-only log ccteam writes. It matters most here: this
+/// stream is the state SoT, and a read that fails wholesale is degraded to "no
+/// events" by every caller, which then reads as `idle` / `$0` rather than as an
+/// error.
 pub fn read_all_events(path: &Path) -> Result<Vec<Value>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(trimmed) {
-            Ok(v) => out.push(v),
-            Err(_) => continue,
-        }
-    }
-    Ok(out)
+    ccteam_harness::execution::fs_atomic::read_jsonl(path)
 }
 
 /// Return the latest event that belongs to a gateway session id. New chat
@@ -799,6 +790,57 @@ mod tests {
     fn idle_aware_message_wraps_with_btw_when_busy() {
         assert_eq!(idle_aware_message("hello", true), "hello");
         assert_eq!(idle_aware_message("hello", false), "/btw hello");
+    }
+
+    /// A torn append (interrupted write leaving a partial multi-byte character,
+    /// with the next event's JSON glued behind it) costs THAT LINE and nothing
+    /// else. Reading the stream as a `String` made one such byte fail the whole
+    /// read, and every caller degrades a read error to "no events" — one torn
+    /// byte in a 120 MB log made every live session of that project report
+    /// `idle` and its cost roll-up report `$0` (seen in the wild 2026-08-08).
+    #[test]
+    fn read_all_events_survives_a_torn_line_mid_character() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(br#"{"event":"chat_turn_user_prompt","sid":"s1"}"#);
+        raw.push(b'\n');
+        // `\xef` opens a 3-byte sequence that never completes: the write was cut
+        // mid-character and the next event landed straight after it.
+        raw.extend_from_slice("{\"event\":\"note\",\"text\":\"配置\u{ff1a}".as_bytes());
+        raw.truncate(raw.len() - 2);
+        raw.extend_from_slice(br#"{"event":"PreToolUse","tool":"Bash"}"#);
+        raw.push(b'\n');
+        raw.extend_from_slice(br#"{"event":"chat_turn_completed","sid":"s1"}"#);
+        raw.push(b'\n');
+        std::fs::write(&path, &raw).unwrap();
+        assert!(
+            String::from_utf8(raw).is_err(),
+            "fixture must actually be invalid UTF-8"
+        );
+
+        let events = read_all_events(&path).expect("a torn line is not a read failure");
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| e.get("event").and_then(Value::as_str).unwrap_or_default())
+            .collect();
+        // The torn line is dropped; every intact line on both sides survives.
+        assert_eq!(kinds, vec!["chat_turn_user_prompt", "chat_turn_completed"]);
+        // …and the tail is still the real tail, so activity reads honestly.
+        assert!(is_idle(events.last()));
+    }
+
+    #[test]
+    fn read_all_events_skips_blank_and_non_json_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        std::fs::write(
+            &path,
+            "{\"event\":\"Stop\"}\n\n   \nnot json at all\n{\"event\":\"SessionEnd\"}\n",
+        )
+        .unwrap();
+        let events = read_all_events(&path).unwrap();
+        assert_eq!(events.len(), 2);
     }
 
     // ---------------- V0.2.2 F36 subagent_active helper ----------------

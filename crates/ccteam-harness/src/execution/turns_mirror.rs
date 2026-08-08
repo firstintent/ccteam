@@ -164,21 +164,10 @@ pub fn read_all_turns(project_dir: &Path, sid: &str) -> Result<Vec<TurnRecord>> 
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let mut out = Vec::new();
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<TurnRecord>(trimmed) {
-            Ok(r) => out.push(r),
-            // Skip half-flushed / older-shape rows defensively — F118
-            // recovery has to work on whatever survived.
-            Err(_) => continue,
-        }
-    }
-    Ok(out)
+    // Skip half-flushed / older-shape / torn rows defensively — F118 recovery
+    // has to work on whatever survived, so damage must cost one LINE, not the
+    // whole transcript ([`super::fs_atomic::read_jsonl`]).
+    super::fs_atomic::read_jsonl(&path)
 }
 
 /// Return the last `n` parseable turns, in chronological order. F118
