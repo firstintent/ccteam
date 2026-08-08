@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ccteam_harness::execution::{ClaudeStreamJsonAdapter, ClaudeTuiAdapter, CodexAppServerAdapter};
-use ccteam_harness::{AgentVendor, HarnessAdapter, SessionProtocol};
+use ccteam_harness::{
+    AgentVendor, HarnessAdapter, PiRoleDocument, PiRoleReader, PiRpcAdapter, SessionProtocol,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -74,6 +76,19 @@ pub fn default_adapter_factory() -> AdapterFactory {
     default_adapter_factory_with_stream_json_handle().0
 }
 
+fn pi_role_reader() -> PiRoleReader {
+    Arc::new(|project_dir: &Path, role: &str| {
+        ccteam_core::read_role(project_dir, role)
+            .map(|detail| {
+                detail.map(|detail| PiRoleDocument {
+                    frontmatter: detail.frontmatter,
+                    body: detail.body,
+                })
+            })
+            .map_err(|error| error.to_string())
+    })
+}
+
 /// Like [`default_adapter_factory`], but also returns a direct handle to the
 /// stream-json Claude adapter singleton the factory captured.
 ///
@@ -94,8 +109,11 @@ pub fn default_adapter_factory() -> AdapterFactory {
 /// gateway, pending registry, and event sink all exist; the composition
 /// root (`ccteam start`) gets its handle from [`build_gateway_for_daemon`],
 /// which also routes through here.
-pub fn default_adapter_factory_with_stream_json_handle(
-) -> (AdapterFactory, Arc<ClaudeStreamJsonAdapter>) {
+pub fn default_adapter_factory_with_stream_json_handle() -> (
+    AdapterFactory,
+    Arc<ClaudeStreamJsonAdapter>,
+    Arc<PiRpcAdapter>,
+) {
     let claude_tui: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ClaudeTuiAdapter::new());
     let claude_stream_json = Arc::new(ClaudeStreamJsonAdapter::new());
     let claude_stream: Arc<dyn HarnessAdapter + Send + Sync> = claude_stream_json.clone();
@@ -106,6 +124,8 @@ pub fn default_adapter_factory_with_stream_json_handle(
         Arc::new(ccteam_harness::OpencodeAcpAdapter::new());
     let kimi: Arc<dyn HarnessAdapter + Send + Sync> =
         Arc::new(ccteam_harness::KimiAcpAdapter::new());
+    let pi_rpc = Arc::new(PiRpcAdapter::new(pi_role_reader()));
+    let pi: Arc<dyn HarnessAdapter + Send + Sync> = pi_rpc.clone();
     // Vendor-first factory (v0.8.23 §3.E + v0.8.24 OpenCode): protocol is
     // Claude-only for stream-json/terminal; Grok/OpenCode/Kimi always ACP.
     let factory: AdapterFactory = Arc::new(
@@ -120,9 +140,10 @@ pub fn default_adapter_factory_with_stream_json_handle(
             AgentVendor::Grok => Arc::clone(&grok),
             AgentVendor::Opencode => Arc::clone(&opencode),
             AgentVendor::Kimi => Arc::clone(&kimi),
+            AgentVendor::Pi => Arc::clone(&pi),
         },
     );
-    (factory, claude_stream_json)
+    (factory, claude_stream_json, pi_rpc)
 }
 
 fn format_gateway_user_error(err: &anyhow::Error) -> String {
@@ -210,6 +231,9 @@ pub struct DaemonArgs {
     /// own via `default_adapter_factory_with_stream_json_handle`, UNLESS
     /// `adapter_factory` is test-overridden (no production adapter to wire).
     pub claude_stream_json_adapter: Option<Arc<ClaudeStreamJsonAdapter>>,
+    /// Pi RPC singleton paired with `gateway`, used to wire the same shared
+    /// IM/web interaction resolver as Claude HITL.
+    pub pi_rpc_adapter: Option<Arc<PiRpcAdapter>>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -235,6 +259,7 @@ impl std::fmt::Debug for DaemonArgs {
                 "claude_stream_json_adapter",
                 &self.claude_stream_json_adapter.is_some(),
             )
+            .field("pi_rpc_adapter", &self.pi_rpc_adapter.is_some())
             .finish()
     }
 }
@@ -269,13 +294,14 @@ where
     // onto the stream-json adapter it is ABOUT to bake into the gateway
     // below. A test-injected factory means test doubles, not the production
     // `ClaudeStreamJsonAdapter` — nothing to wire.
-    let (factory, standalone_stream_json_handle) = match args.adapter_factory.clone() {
-        Some(f) => (f, None),
-        None => {
-            let (f, handle) = default_adapter_factory_with_stream_json_handle();
-            (f, Some(handle))
-        }
-    };
+    let (factory, standalone_stream_json_handle, standalone_pi_handle) =
+        match args.adapter_factory.clone() {
+            Some(f) => (f, None, None),
+            None => {
+                let (f, stream, pi) = default_adapter_factory_with_stream_json_handle();
+                (f, Some(stream), Some(pi))
+            }
+        };
     // V0.6.8 F190 — load `~/.ccteam/config.yaml::projects[]` once at
     // startup so legacy bots (no `reg.project_dir`) whose project
     // lives outside the projects_root tree resolve correctly. Daemon
@@ -410,16 +436,20 @@ where
         // `None` (a test-injected `adapter_factory`) ⇒ skip: nothing to wire
         // (tests inject their own fake harness / deterministic resolver
         // stub, never the production `ClaudeStreamJsonAdapter`).
+        let resolver = Arc::new(crate::hitl::GatewayCanUseToolResolver::new(
+            Arc::clone(&gateway),
+            g.pending_handle(),
+            gateway_event_tx.clone(),
+        ));
         if let Some(adapter) = args
             .claude_stream_json_adapter
             .clone()
             .or(standalone_stream_json_handle)
         {
-            adapter.set_resolver(Arc::new(crate::hitl::GatewayCanUseToolResolver::new(
-                Arc::clone(&gateway),
-                g.pending_handle(),
-                gateway_event_tx.clone(),
-            )));
+            adapter.set_resolver(resolver.clone());
+        }
+        if let Some(adapter) = args.pi_rpc_adapter.clone().or(standalone_pi_handle) {
+            adapter.set_interaction_resolver(resolver);
         }
     }
     let restore_gateway = Arc::clone(&gateway);
@@ -1085,8 +1115,8 @@ fn build_gateway(
 /// would silently never receive the wiring).
 pub fn build_gateway_for_daemon(
     registry: Option<PathBuf>,
-) -> Result<(Gateway, Arc<ClaudeStreamJsonAdapter>)> {
-    let (factory, claude_stream_json) = default_adapter_factory_with_stream_json_handle();
+) -> Result<(Gateway, Arc<ClaudeStreamJsonAdapter>, Arc<PiRpcAdapter>)> {
+    let (factory, claude_stream_json, pi_rpc) = default_adapter_factory_with_stream_json_handle();
     let projects_root: PathBuf = registry.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
@@ -1096,7 +1126,7 @@ pub fn build_gateway_for_daemon(
     let config_projects = crate::load_config_projects_map(&ccteam_root).unwrap_or_default();
     let bots = list_bots()?;
     let gateway = build_gateway(factory, &projects_root, &config_projects, &bots);
-    Ok((gateway, claude_stream_json))
+    Ok((gateway, claude_stream_json, pi_rpc))
 }
 
 /// Best-effort: (re)publish the gateway command menu to Telegram's
@@ -2267,6 +2297,9 @@ mod tests {
             "F173: codex arm must return a Codex adapter, not the Claude fallback"
         );
         assert_eq!(codex.name(), "codex-app-server");
+        let pi = factory(AgentVendor::Pi, SessionProtocol::StreamJson);
+        assert_eq!(pi.vendor(), AgentVendor::Pi);
+        assert_eq!(pi.name(), ccteam_harness::PI_RPC_ADAPTER_NAME);
     }
 
     /// F10 (arch §8-2): the factory is a **per-vendor singleton** — two

@@ -157,6 +157,21 @@ pub struct SystemMsg {
     /// `task_updated.patch` (`{status, end_time}`) — read `patch.status` for removal.
     #[serde(default)]
     pub patch: Option<Value>,
+    /// `background_tasks_changed.tasks` — claude's FULL snapshot of the tasks
+    /// it currently runs in the background, re-sent on every change. Only the
+    /// id is typed: the snapshot carries no `subagent_type`, so it decides
+    /// BACKGROUND-ness only and never seeds the running list (`task_started`
+    /// stays the single membership source, with the richer fields).
+    #[serde(default)]
+    pub tasks: Vec<BackgroundTaskRef>,
+}
+
+/// One entry of a `system:background_tasks_changed` snapshot. Everything but
+/// the id is ignored on purpose — see [`SystemMsg::tasks`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BackgroundTaskRef {
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub task_id: String,
 }
 
 impl SystemMsg {
@@ -529,6 +544,38 @@ mod tests {
                 assert_eq!(c.request["tool_name"], "Bash");
             }
             other => panic!("expected ControlRequest, got {other:?}"),
+        }
+    }
+
+    /// `system:background_tasks_changed` — claude's FULL snapshot of the tasks
+    /// it currently runs in the background. Line captured verbatim from a live
+    /// stream-json probe (2026-08-07, an async `Agent` plus the background
+    /// shell it started). Only `task_id` is typed; the rest must not break the
+    /// parse, and an empty snapshot ("nothing in the background") must parse to
+    /// an empty list rather than fail the whole transport line.
+    #[test]
+    fn parses_background_tasks_changed_snapshot() {
+        let line = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[
+            {"task_id":"afed36d3e5045ac0c","task_type":"local_agent","description":"probe sleep"},
+            {"task_id":"b5aopurkr","task_type":"local_bash","description":"Sleep for 90 seconds"}]}"#;
+        match serde_json::from_str::<Outbound>(line).unwrap() {
+            Outbound::System(s) => {
+                assert_eq!(s.subtype, "background_tasks_changed");
+                let ids: Vec<&str> = s.tasks.iter().map(|t| t.task_id.as_str()).collect();
+                assert_eq!(ids, ["afed36d3e5045ac0c", "b5aopurkr"]);
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
+        let empty = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+        match serde_json::from_str::<Outbound>(empty).unwrap() {
+            Outbound::System(s) => assert!(s.tasks.is_empty()),
+            other => panic!("expected System, got {other:?}"),
+        }
+        // Every other system line still parses with no `tasks` at all.
+        let init = r#"{"type":"system","subtype":"init","tools":["Bash"]}"#;
+        match serde_json::from_str::<Outbound>(init).unwrap() {
+            Outbound::System(s) => assert!(s.tasks.is_empty()),
+            other => panic!("expected System, got {other:?}"),
         }
     }
 

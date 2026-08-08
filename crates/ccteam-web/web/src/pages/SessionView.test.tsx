@@ -158,6 +158,20 @@ describe("SessionView mount-empty invariant (key={sid} remount)", () => {
     expect(render()).toContain('<span class="eff">default</span>');
   });
 
+  it("renders Pi's vendor identity, current /role state, and strict-HITL notice", () => {
+    const html = render({
+      ...SESSION,
+      vendor: "pi",
+      role: "reviewer",
+      permission_mode: "hitl",
+      protocol: "stream-json",
+    });
+    expect(html).toContain('data-vendor="pi"');
+    expect(html).toContain('data-testid="session-role"');
+    expect(html).toContain("reviewer");
+    expect(html).toContain('data-testid="pi-hitl-tradeoff"');
+  });
+
   it("shows the @host chip only for a remote session", () => {
     const strip = (h: string) => h.replace(/<!-- -->/g, "");
     const local = render({ ...SESSION, host: "local" });

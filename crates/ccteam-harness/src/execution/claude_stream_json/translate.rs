@@ -100,6 +100,7 @@ impl StreamTranslator {
     /// clean idle close), so a graceful stop emits no spurious failure.
     pub fn on_close(&mut self) -> Option<ThreadEvent> {
         self.acc_text.clear();
+        let model = self.turn_model.take();
         self.active_turn
             .take()
             .map(|turn_id| ThreadEvent::TurnFailed {
@@ -111,6 +112,8 @@ impl StreamTranslator {
                           再发一条消息会自动 resume 续上下文。"
                         .to_string(),
                 },
+                usage: UnifiedTokenUsage::default(),
+                model,
             })
     }
 
@@ -168,6 +171,12 @@ impl StreamTranslator {
             .active_turn
             .take()
             .unwrap_or_else(|| "sj-0".to_string());
+        let usage = r
+            .usage
+            .as_ref()
+            .and_then(|u| serde_json::from_value::<UnifiedTokenUsage>(u.clone()).ok())
+            .unwrap_or_default();
+        let model = self.turn_model.take();
 
         if r.is_failure() {
             let message = r
@@ -190,6 +199,8 @@ impl StreamTranslator {
                     kind: r.subtype.clone(),
                     message,
                 },
+                usage,
+                model,
             });
             self.acc_text.clear();
             return out;
@@ -213,12 +224,6 @@ impl StreamTranslator {
                 },
             });
         }
-        let usage = r
-            .usage
-            .as_ref()
-            .and_then(|u| serde_json::from_value::<UnifiedTokenUsage>(u.clone()).ok())
-            .unwrap_or_default();
-        let model = self.turn_model.take();
         out.push(ThreadEvent::TurnCompleted {
             turn_id,
             usage,
@@ -430,19 +435,34 @@ mod tests {
     #[test]
     fn failure_result_emits_turn_failed_with_human_message() {
         let mut t = StreamTranslator::new();
+        t.ingest(Outbound::Assistant(MessageEnvelope {
+            message: json!({
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "partial"}],
+            }),
+            session_id: "u-1".into(),
+            parent_tool_use_id: None,
+        }));
         let evs = t.ingest(Outbound::TurnResult(ResultMsg {
             subtype: "error_max_turns".into(),
             result: None,
             is_error: true,
             total_cost_usd: None,
-            usage: None,
+            usage: Some(json!({"input_tokens": 40, "output_tokens": 8})),
             session_id: "u-1".into(),
         }));
-        let msg = evs.iter().find_map(|e| match e {
-            ThreadEvent::TurnFailed { err, .. } => Some(err.message.clone()),
+        let failed = evs.iter().find_map(|e| match e {
+            ThreadEvent::TurnFailed {
+                err, usage, model, ..
+            } => Some((err, usage, model)),
             _ => None,
         });
-        assert!(msg.unwrap().contains("error_max_turns"));
+        let (err, usage, model) = failed.expect("TurnFailed");
+        assert!(err.message.contains("error_max_turns"));
+        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
         assert!(answer_text(&evs).is_none());
     }
 

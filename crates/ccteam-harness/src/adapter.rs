@@ -124,17 +124,28 @@ pub enum AgentVendor {
     Grok,
     Opencode,
     Kimi,
+    Pi,
+}
+
+/// Where ccteam may execute a vendor adapter. Declaring this beside
+/// [`AgentVendor`] makes the remote gate exhaustive for every future vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostExecutionScope {
+    /// The adapter may execute locally or through a registered satellite.
+    LocalOrSatellite,
+    /// The adapter may execute only in the daemon's local process.
+    LocalOnly,
 }
 
 impl AgentVendor {
-    /// Every known harness vendor — single source of truth for iteration.
-    /// Prefer `for v in AgentVendor::ALL` over listing arms at call sites.
+    /// Every user-reachable harness vendor.
     pub const ALL: &'static [AgentVendor] = &[
         AgentVendor::Claude,
         AgentVendor::Codex,
         AgentVendor::Grok,
         AgentVendor::Opencode,
         AgentVendor::Kimi,
+        AgentVendor::Pi,
     ];
 
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {
@@ -144,6 +155,31 @@ impl AgentVendor {
             AgentVendor::Grok => ccteam_cost::Vendor::Grok,
             AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
             AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
+            AgentVendor::Pi => ccteam_cost::Vendor::Pi,
+        }
+    }
+
+    /// Stable lowercase wire token used by REST/MCP/session metadata.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            AgentVendor::Claude => "claude",
+            AgentVendor::Codex => "codex",
+            AgentVendor::Grok => "grok",
+            AgentVendor::Opencode => "opencode",
+            AgentVendor::Kimi => "kimi",
+            AgentVendor::Pi => "pi",
+        }
+    }
+
+    /// Execution-location capability consulted by the shared host gate.
+    pub const fn host_execution_scope(self) -> HostExecutionScope {
+        match self {
+            AgentVendor::Claude
+            | AgentVendor::Codex
+            | AgentVendor::Grok
+            | AgentVendor::Opencode
+            | AgentVendor::Kimi => HostExecutionScope::LocalOrSatellite,
+            AgentVendor::Pi => HostExecutionScope::LocalOnly,
         }
     }
 }
@@ -498,6 +534,8 @@ pub enum ThreadEvent {
     TurnFailed {
         turn_id: String,
         err: ThreadErrorEvent,
+        usage: UnifiedTokenUsage,
+        model: Option<String>,
     },
     ItemStarted {
         item: ThreadItem,
@@ -516,11 +554,10 @@ pub enum ThreadEvent {
 /// named around `ThreadEvent`.
 pub type CanonicalEvent = ThreadEvent;
 
-/// Vendor-neutral approval request placeholder.
-///
-/// v8.1 runs agent processes with skip-permissions and does not produce
-/// or resolve approvals. The type lives here so future Claude hook and
-/// Codex app-server approval surfaces can share one IM-facing shape.
+/// Vendor-neutral approval request passed from a harness into the shared
+/// IM/web pending-interaction layer. Pi's RPC bridge populates this for strict
+/// HITL tool calls; other vendor-native approval surfaces can use the same
+/// semantic/risk shape without exposing their wire protocol to the gateway.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalIR {
     pub req_id: String,
@@ -884,22 +921,45 @@ pub struct RunningTask {
     /// When `task_started` arrived — for the elapsed-time display. In-memory
     /// only (never persisted / serialized).
     pub started: std::time::Instant,
+    /// Whether the harness itself reports this task as running in the
+    /// BACKGROUND — claude's `system:background_tasks_changed` snapshot
+    /// (probed live 2026-08-07: an async `Agent` launch is listed, a
+    /// blocking `Task` subagent is never listed). The vendor's own answer to
+    /// "does this task block the turn", so ccteam never has to infer it from
+    /// `task_type`. Adapters with no such signal leave it `false` and fall
+    /// back to the `task_type` vocabulary in [`Self::outlives_turn`].
+    pub backgrounded: bool,
 }
 
 impl RunningTask {
-    /// True for a task that legitimately OUTLIVES the turn that spawned it:
-    /// background workflows (`local_workflow`) and background shells
-    /// (`local_bash` = Bash `run_in_background` + Monitor watches; vocabulary
-    /// probed live 2026-07-22) keep running after the spawning turn's result
-    /// and report their own terminal `task_updated`/`task_notification`
-    /// later. Sync subagents (`local_agent`) are turn-scoped. Single
-    /// authority for BOTH the stream-json turn-end eviction net and the IM
-    /// `/status` "authoritative working signal" — the two must never diverge:
-    /// an outliving task left over from an earlier turn must not mask a
-    /// genuinely stuck later turn, and conversely must survive turn end so an
-    /// idle session still shows it.
+    /// True for a task that legitimately OUTLIVES the turn that spawned it, so
+    /// the turn-end eviction net must not drop it and it must not be read as
+    /// proof that THIS turn is alive.
+    ///
+    /// Two legs, vendor signal first:
+    /// - the harness listed it as a background task (`backgrounded`) — the
+    ///   authoritative answer, which covers async `Agent` launches
+    ///   (`local_agent` that returns immediately and keeps running);
+    /// - else the `task_type` vocabulary: background workflows
+    ///   (`local_workflow`) and background shells (`local_bash` = Bash
+    ///   `run_in_background` + Monitor watches; probed live 2026-07-22).
+    ///
+    /// A BLOCKING subagent (`local_agent` the vendor never backgrounds) is
+    /// turn-scoped and stays so. Reading `backgrounded` instead of hard-coding
+    /// `local_agent` is what keeps this correct as the vendor moves task kinds
+    /// between blocking and background: before 2026-08, every `local_agent`
+    /// blocked its turn, so `/status` lost async agents the instant their
+    /// launching turn ended (they can run for hours) while the terminal
+    /// `task_updated`/`task_notification` that would have closed them arrived
+    /// much later.
+    ///
+    /// Single authority for BOTH the stream-json turn-end eviction net and the
+    /// IM `/status` "authoritative working signal" — the two must never
+    /// diverge: an outliving task left over from an earlier turn must not mask
+    /// a genuinely stuck later turn, and conversely must survive turn end so
+    /// an idle session still shows it.
     pub fn outlives_turn(&self) -> bool {
-        matches!(self.task_type.as_str(), "local_workflow" | "local_bash")
+        self.backgrounded || matches!(self.task_type.as_str(), "local_workflow" | "local_bash")
     }
 }
 
@@ -1437,6 +1497,7 @@ impl SessionHandle {
             AgentVendor::Grok => "grok",
             AgentVendor::Opencode => "opencode",
             AgentVendor::Kimi => "kimi",
+            AgentVendor::Pi => "pi",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),
@@ -1914,11 +1975,20 @@ mod tests {
 
     #[test]
     fn agent_vendor_serde_round_trip() {
-        for v in [AgentVendor::Claude, AgentVendor::Codex] {
+        for &v in AgentVendor::ALL {
             let json = serde_json::to_string(&v).unwrap();
             let back: AgentVendor = serde_json::from_str(&json).unwrap();
             assert_eq!(v, back);
+            assert_eq!(json, format!("\"{}\"", v.wire_name()));
         }
+        assert_eq!(
+            AgentVendor::Pi.host_execution_scope(),
+            HostExecutionScope::LocalOnly
+        );
+        assert_eq!(
+            AgentVendor::Claude.host_execution_scope(),
+            HostExecutionScope::LocalOrSatellite
+        );
     }
 
     #[test]

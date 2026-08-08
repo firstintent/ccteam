@@ -27,7 +27,7 @@ import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
-import { defaultDraft, normalizeDraft, type ComposerDraft } from "../lib/vendors";
+import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
 import {
   getHistory,
   getDaemonTimezone,
@@ -396,9 +396,7 @@ export default function SessionView({
     () =>
       normalizeDraft({
         ...defaultDraft(),
-        vendor: (["claude", "codex", "grok", "opencode", "kimi"].includes(vendor)
-          ? vendor
-          : "claude") as ComposerDraft["vendor"],
+        vendor: vendorSpec(vendor).id,
         model: statusModel ?? "",
         hitl: session?.permission_mode === "hitl",
         effort: statusEffort ?? "",
@@ -449,6 +447,11 @@ export default function SessionView({
         <div className="meta">
           <span className="chip sid">{sid}</span>
           {session ? <span className="chip">{session.project}</span> : null}
+          {session ? (
+            <span className="chip" data-testid="session-role">
+              {session.role || t("noRole")}
+            </span>
+          ) : null}
           <VendorChip vendor={vendor} />
           {session?.host && session.host !== "local" ? (
             <span className="chip">@ {session.host}</span>

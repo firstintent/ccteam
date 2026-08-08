@@ -76,7 +76,7 @@ pub(crate) const ROUTING_NOTES_MAX_CHARS: usize = 4000;
 /// Per-vendor caps keep the full status response within its one-screen budget.
 const CATALOG_IDS_PER_VENDOR: usize = 4;
 const CATALOG_ALIASES_PER_VENDOR: usize = 4;
-const CATALOG_VENDOR_LIMIT: usize = 5;
+const CATALOG_VENDOR_LIMIT: usize = 6;
 const CATALOG_TOKEN_CHARS: usize = 32;
 
 /// Vendors ccteam bundles a price table for (`anthropic`/`openai`/`xai`).
@@ -462,6 +462,7 @@ fn vendor_cap(budgets: Option<&ccteam_cost::Budgets>, vendor: &str) -> Option<f6
         "grok" => ccteam_cost::Vendor::Grok,
         "opencode" => ccteam_cost::Vendor::Opencode,
         "kimi" => ccteam_cost::Vendor::Kimi,
+        "pi" => ccteam_cost::Vendor::Pi,
         _ => return None,
     };
     budgets.cap_for(v).max_cost_usd_per_24h
@@ -541,13 +542,22 @@ pub(crate) fn render_section(
     };
     let notes = read_routing_file(paths, slug);
     let runtime = ccteam_core::model_catalog::load_model_catalog_in(&paths.root);
+    let bridge_notice = render_tool_surface_notice(&rows);
     format!(
-        "{}{}\n\n{}\n\n{}",
+        "{}{bridge_notice}{}\n\n{}\n\n{}",
         render_panel(&header, &rows),
         render_recipes(&rows, &runtime, &paths.root),
         render_catalog(&runtime, hub),
         render_routing_notes(notes.as_ref()),
     )
+}
+
+fn render_tool_surface_notice(rows: &[PanelRow]) -> String {
+    rows.iter()
+        .filter_map(|row| ccteam_core::host_registry::AgentProbeSpec::by_vendor(&row.vendor))
+        .filter_map(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+        .map(|notice| format!("\n{notice}"))
+        .collect()
 }
 
 /// MCP-BEACON-1 — one `session_spawn` recipe line per INSTALLED vendor, so
@@ -574,6 +584,7 @@ fn render_recipes(
             }
             "kimi" => "session_spawn{vendor:\"kimi\", task:\"…\"}",
             "opencode" => "session_spawn{vendor:\"opencode\", task:\"…\"}",
+            "pi" => "session_spawn{vendor:\"pi\", task:\"…\"} — managed local Pi RPC session with the ccteam bridge",
             _ => continue,
         };
         lines.push(format!("  {recipe}"));
@@ -848,6 +859,22 @@ mod tests {
 
         assert_eq!(render(&[panel_row("claude", false)]), "");
         assert_eq!(render(&[]), "");
+    }
+
+    #[test]
+    fn pi_recipe_and_tool_surface_notice_are_honest() {
+        let empty = tempfile::tempdir().unwrap();
+        let rows = [panel_row("pi", true)];
+        let recipes = render_recipes(
+            &rows,
+            &ccteam_core::model_catalog::ModelCatalog::default(),
+            empty.path(),
+        );
+        assert!(recipes.contains("session_spawn{vendor:\"pi\""), "{recipes}");
+        let expected = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+            .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+            .unwrap();
+        assert_eq!(render_tool_surface_notice(&rows).trim(), expected);
     }
 
     /// Discovery: each installed vendor's recipe carries its model ids +

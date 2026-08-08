@@ -165,10 +165,12 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     expect(html).toContain('class="ops-stack"');
     expect(html).toContain('data-testid="status-view"');
     expect(html).toContain('data-testid="hosts-view"');
-    // Daemon strip is the first status surface; hosts follow below.
+    // Daemon strip is the first status surface; hosts follow below. Project
+    // catalog management lives on the SIDEBAR workspace menus, not here.
     expect(html.indexOf('data-testid="status-view"')).toBeLessThan(
       html.indexOf('data-testid="hosts-view"'),
     );
+    expect(html).not.toContain('data-testid="projects-panel"');
   });
 
   it("uses a vertical ops stack (no side-by-side status/hosts columns)", () => {

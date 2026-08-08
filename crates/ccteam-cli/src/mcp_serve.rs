@@ -462,6 +462,7 @@ pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
 pub fn auto_register_vendor_mcp() -> Vec<(&'static str, Result<Option<std::path::PathBuf>>)> {
     ccteam_core::host_registry::AGENT_PROBE_SPECS
         .iter()
+        .filter(|spec| spec.tool_surface.uses_native_mcp_config())
         .map(|spec| {
             let result = auto_register_one(spec);
             if matches!(result, Ok(None)) {
@@ -478,6 +479,9 @@ pub fn auto_register_vendor_mcp() -> Vec<(&'static str, Result<Option<std::path:
 fn auto_register_one(
     spec: &ccteam_core::host_registry::AgentProbeSpec,
 ) -> Result<Option<std::path::PathBuf>> {
+    if !spec.tool_surface.uses_native_mcp_config() {
+        return Ok(None);
+    }
     let should_register = if ccteam_core::host_registry::bin_resolvable(spec) {
         true
     } else {

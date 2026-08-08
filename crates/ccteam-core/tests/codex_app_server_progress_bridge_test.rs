@@ -175,6 +175,8 @@ fn build_progress_line_turn_failed_marks_errored() {
             kind: "turn_failed".into(),
             message: "model unavailable".into(),
         },
+        usage: UnifiedTokenUsage::default(),
+        model: None,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).expect("turn/failed must bridge");
     assert_eq!(row["event"], "agent_done");

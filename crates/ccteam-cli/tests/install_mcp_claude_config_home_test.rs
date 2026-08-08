@@ -59,6 +59,17 @@ fn install_mcp_writes_to_claude_config_home_when_set() {
         !fake_home.join(".claude.json").exists(),
         "install_mcp wrote to fallback HOME path despite CLAUDE_CONFIG_HOME being set",
     );
+    assert!(
+        !fake_home.join(".pi").exists(),
+        "config mcp must never invent a Pi config footprint"
+    );
+    let pi_notice = ccteam_core::host_registry::AgentProbeSpec::by_vendor("pi")
+        .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+        .unwrap();
+    assert!(
+        stdout.contains(&pi_notice),
+        "config output must explain managed Pi versus plain shell Pi: {stdout}"
+    );
 
     // mcpServers.ccteam landed.
     let body = std::fs::read_to_string(&expected_json).unwrap();

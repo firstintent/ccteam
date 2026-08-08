@@ -171,7 +171,7 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
       status: 200,
       json: {
         hosts: [
-          { host: "local", hostname: "dev01", is_local: true, agent_count: 4, agents_ready: 4 },
+          { host: "local", hostname: "dev01", is_local: true, agent_count: 5, agents_ready: 5 },
         ],
       },
     }),
@@ -203,7 +203,7 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
             version: "claude 2.0.35",
             bin: "~/.local/bin/claude",
             mcp_registered: true,
-            mcp_registrable: true,
+            tool_surface: "native_mcp_config",
             status: "ready",
             hint: null,
           },
@@ -214,7 +214,7 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
             version: "codex 0.48.0",
             bin: "codex",
             mcp_registered: true,
-            mcp_registrable: true,
+            tool_surface: "native_mcp_config",
             status: "ready",
             hint: null,
           },
@@ -225,7 +225,7 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
             version: "grok 0.2.93",
             bin: "grok",
             mcp_registered: false,
-            mcp_registrable: false,
+            tool_surface: "native_mcp_config",
             status: "ready",
             hint: null,
           },
@@ -236,9 +236,48 @@ async function mockCcteamApi(page: Page): Promise<CapturedRequest[]> {
             version: "opencode 0.6.4",
             bin: "opencode",
             mcp_registered: false,
-            mcp_registrable: false,
+            tool_surface: "native_mcp_config",
             status: "ready",
             hint: null,
+          },
+          {
+            vendor: "pi",
+            harness_id: "pi",
+            installed: true,
+            version: "0.83.0",
+            bin: "pi",
+            mcp_registered: false,
+            tool_surface: "managed_session_bridge",
+            tool_surface_note:
+              "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
+            status: "ready",
+            hint: null,
+          },
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/v1/models", (route) =>
+    route.fulfill({
+      status: 200,
+      json: {
+        vendors: [
+          {
+            vendor: "pi",
+            source: "Pi RPC get_available_models",
+            models: [
+              {
+                id: "anthropic/claude-opus-4-6",
+                display_name: "Claude Opus 4.6",
+                efforts: ["off", "minimal", "low", "medium", "high", "xhigh"],
+              },
+              {
+                id: "anthropic/claude-sonnet-4-6",
+                display_name: "Claude Sonnet 4.6",
+                efforts: [],
+              },
+            ],
+            efforts: ["off", "minimal", "low", "medium", "high", "xhigh"],
           },
         ],
       },
@@ -389,6 +428,39 @@ test("home lazy-create: first message POSTs session without a host override, the
   const turn = captured.find((r) => r.url.endsWith("/api/v1/sessions/s2/turn"));
   expect(turn?.body).toEqual({ text: "修复登录页布局" });
   await expect(page).toHaveURL(/\/app\/chat\/s\/s2$/);
+});
+
+test("Pi picker keeps role, uses provider/model-id, and exposes strict-HITL trade-off", async ({
+  page,
+}) => {
+  const captured = await mockCcteamApi(page);
+  await page.goto("/app/");
+
+  await page.getByTestId("ctx-role").getByRole("button").first().click();
+  await page.getByRole("button", { name: /cto/ }).click();
+
+  await page.getByTestId("model-btn").click();
+  await page.getByRole("button", { name: /anthropic\/claude-opus-4-6/ }).click();
+  await expect(page.getByTestId("model-btn")).toContainText("Pi · anthropic/claude-opus-4-6");
+  await page.getByTestId("model-btn").click();
+  await page.getByRole("button", { name: "xhigh", exact: true }).click();
+
+  await page.getByTestId("hitl-toggle").click();
+  await expect(page.getByTestId("pi-hitl-tradeoff")).toContainText("用户扩展");
+  await expect(page.getByTestId("pi-hitl-tradeoff")).toContainText("技能、上下文文件和提示词模板不受影响");
+
+  await page.getByTestId("composer-textarea").fill("验证 Pi 配方");
+  await page.getByTestId("home-send").click();
+  await expect
+    .poll(() => captured.find((request) => request.url.endsWith("/projects/dev-team/sessions"))?.body)
+    .toMatchObject({
+      role: "cto",
+      vendor: "pi",
+      protocol: "stream-json",
+      model: "anthropic/claude-opus-4-6",
+      effort: "xhigh",
+      permission_mode: "hitl",
+    });
 });
 
 test("工作流 and 设置 render as set-nav views; ops merges Status + Hosts responsively", async ({

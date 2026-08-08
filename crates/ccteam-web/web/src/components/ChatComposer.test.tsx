@@ -284,8 +284,11 @@ describe("model menu (rows come from the vendor, never from a ccteam ladder)", (
     const html = renderMenu({
       draft: { ...defaultDraft(), vendor: "kimi", protocol: "acp" },
       catalog: {
-        kimi: { models: ["kimi-code/k3", "kimi-code/k3-256k"], efforts: ["low", "max"] },
-        opencode: { models: ["openai/gpt-5.5"], efforts: [] },
+        kimi: {
+          models: [{ id: "kimi-code/k3" }, { id: "kimi-code/k3-256k" }],
+          efforts: ["low", "max"],
+        },
+        opencode: { models: [{ id: "openai/gpt-5.5" }], efforts: [] },
       },
     });
     expect(html).toContain("kimi-code/k3-256k");
@@ -293,6 +296,55 @@ describe("model menu (rows come from the vendor, never from a ccteam ladder)", (
     // The catalog said low|max — `high` (static) is gone.
     expect(html).toContain(">low<");
     expect(html).not.toContain(">high<");
+  });
+
+  it("Pi switches effort rows per model and hides the axis for reasoning=false", () => {
+    const catalog = {
+      pi: {
+        models: [
+          { id: "anthropic/claude-opus-4-6", efforts: ["off", "low", "high", "xhigh"] },
+          { id: "anthropic/claude-sonnet-4-6", efforts: [] },
+        ],
+        efforts: ["off", "low", "high", "xhigh"],
+      },
+    };
+    const reasoning = renderMenu({
+      draft: {
+        ...defaultDraft(),
+        vendor: "pi",
+        model: "anthropic/claude-opus-4-6",
+        protocol: "stream-json",
+      },
+      catalog,
+    });
+    expect(reasoning).toContain("effort(Pi)");
+    expect(reasoning).toContain(">xhigh<");
+
+    const nonReasoning = renderMenu({
+      draft: {
+        ...defaultDraft(),
+        vendor: "pi",
+        model: "anthropic/claude-sonnet-4-6",
+        protocol: "stream-json",
+      },
+      catalog,
+    });
+    expect(nonReasoning).not.toContain('data-testid="effort-group"');
+  });
+
+  it("makes Pi strict-HITL's exact extension trade-off persistently visible", () => {
+    const html = renderMenu({
+      lang: "en",
+      draft: {
+        ...defaultDraft(),
+        vendor: "pi",
+        protocol: "stream-json",
+        hitl: true,
+      },
+    });
+    expect(html).toContain('data-testid="pi-hitl-tradeoff"');
+    expect(html).toContain("disables user extensions");
+    expect(html).toContain("Skills, context files, and prompt templates are unaffected");
   });
 });
 

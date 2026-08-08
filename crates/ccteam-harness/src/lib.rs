@@ -51,10 +51,10 @@ pub use adapter::{
     state_json_path, AccountUsage, AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind,
     ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection,
     ContextSource, ContextUsage, Directive, DirectiveOutcome, ExecutionMode, GoalStatus,
-    HarnessAdapter, HarnessError, HarnessSnapshot, PermissionMode, RunningTask, SessionHandle,
-    SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent,
-    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus, TitleSync,
-    TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
+    HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope, PermissionMode, RunningTask,
+    SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState,
+    ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus,
+    TitleSync, TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
     CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
     CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
@@ -78,6 +78,11 @@ pub use execution::host_channel::{
 };
 pub use execution::kimi_acp::{KimiAcpAdapter, KIMI_ACP_ADAPTER_NAME};
 pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME};
+pub use execution::pi_rpc::{
+    bridge_source as pi_bridge_source, PiApprovalDecision, PiDialogKind, PiDialogRequest,
+    PiDialogResponse, PiInteractionResolver, PiRoleDocument, PiRoleReader, PiRpcAdapter,
+    PI_BIN_ENV, PI_RPC_ADAPTER_NAME, REQUIRED_MCP_TOOL_NAMES as PI_REQUIRED_MCP_TOOL_NAMES,
+};
 pub use execution::remote_exec::{
     connect as remote_exec_connect, ExecExit, ExecFile, ExecSpec, ExecStarted, RemoteExecTarget,
     CONNECT_TIMEOUT, EXEC_SUBPROTOCOL, EXEC_WIRE_VERSION,

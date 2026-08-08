@@ -57,6 +57,13 @@ function VendorMark({ vendor }: { vendor: string }) {
           />
         </svg>
       );
+    case "pi":
+      // Pi's own mathematical mark; deliberately not another code/moon icon.
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden className="vendor-ico">
+          <path fill="currentColor" d="M2 3.2h12v2H11v8H8.9v-8H6.8v8H4.7v-8H2v-2z" />
+        </svg>
+      );
     default:
       return (
         <svg viewBox="0 0 16 16" aria-hidden className="vendor-ico">

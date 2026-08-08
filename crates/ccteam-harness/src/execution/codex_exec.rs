@@ -433,6 +433,8 @@ impl HarnessAdapter for CodexExecAdapter {
                                     s.code().unwrap_or(-1)
                                 ),
                             },
+                            usage: UnifiedTokenUsage::default(),
+                            model: None,
                         });
                     }
                     Err(err) => {
@@ -442,6 +444,8 @@ impl HarnessAdapter for CodexExecAdapter {
                                 kind: "wait_failed".into(),
                                 message: err.to_string(),
                             },
+                            usage: UnifiedTokenUsage::default(),
+                            model: None,
                         });
                     }
                 }
@@ -681,6 +685,8 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
                     .unwrap_or("(no message)")
                     .to_string(),
             },
+            usage: UnifiedTokenUsage::default(),
+            model: None,
         }],
         "item.started" | "item.updated" | "item.completed" => {
             let item = parse_jsonl_item(v.get("item").unwrap_or(v));

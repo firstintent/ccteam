@@ -46,12 +46,6 @@
 - **规格**:① 测试期望 path 改按 canonicalized root 构造(生产 canonicalize 行为不动);② 测试 UDS socket 落短路径(如 `/tmp/<短随机>`,测试自清理),不动生产 socket 布局。
 - **DoD**:两族在默认 shell TMPDIR(`/var/folders/…`)下全绿;`make test-baseline` 本机默认 shell 全绿;不动任何生产逻辑;writeback 绿。
 
-### ACP-LEDGER-1 失败/截断 turn 的 usage 不入账本(跨 vendor 同形洞)
-- **状态**:待排 · **冲突域**:`crates/ccteam-im(gateway 事件泵记账段)` · **建议入口**:dev 会话
-- **背景**:`410647d` 修 ACP 结局契约时暴露的**既有**洞(非该 commit 引入):成本/token 账本行只在 `ThreadEvent::TurnCompleted` 分支写(`gateway.rs` 事件泵 `!protocol.is_terminal()` 段 → `ccteam_cost::estimate_cost`),而 `TurnFailed` 是终态事件、后面不跟 `TurnCompleted`(claude `is_failure` 早退、codex terminal error、现在 ACP 非 clean `stopReason` 三条路一致)。所以**失败 turn 烧掉的 token 全部不入账**;`max_tokens` 尤其刺眼——它定义上烧完了整个输出窗口,却在账本里消失。红线「成本全入账本」与之冲突。
-- **规格**:让终态失败也落账 —— 倾向让 `TurnFailed` 携带 usage(`ThreadEvent` 加字段属 additive,但 `CanonicalEvent`/progress schema 语义须零变,schema 权威 = `harness/progress_bridge`),或事件泵在 `TurnFailed` 分支复用同一 `estimate_cost` 路径取本 turn 已知 usage。**跨 vendor 一次修**(claude/codex/acp 同形),不做 per-vendor 补丁;若要改 `ThreadEvent` 公共形状先核全 caller(AGENTS §六)。
-- **DoD**:新定向测试先造缺陷态红(失败 turn 后账本零行)后修绿;三 vendor 路径各一断言;`make test` 基线只增;writeback 绿。
-
 ### KIMI-UPSTREAM-1 kimi vendor 缺陷 watch(failed→end_turn 折叠 + 无 ctx 面)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness(kimi_acp)` · **建议入口**:dev 会话
 - **取活条件**:**watch 卡,平时不动** —— 仅在 kimi 升级后(或上游宣布修复)复核;无升级则本卡保持待排,不占并行位。

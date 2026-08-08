@@ -58,6 +58,7 @@
   --color-vendor-codex: #10a37f;
   --color-vendor-grok: #8b5cf6;
   --color-vendor-opencode: #0284c7;
+  --color-vendor-pi: #4f46e5;
 
   --color-accent-500: #0d9488;
   --color-accent-600: #0f766e;
@@ -121,6 +122,8 @@
   --opencode: #0284C7;
   /* kimi — 5th vendor (pink; distinct from all four above + the error red). */
   --kimi: #DB2777;
+  /* pi — 6th vendor (indigo; distinct from Grok violet and OpenCode sky). */
+  --pi: #4F46E5;
   --radius-card: 12px;
   --radius-input: 18px;
   --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 6px 24px rgba(16,24,40,.06);
@@ -147,6 +150,7 @@ html.dark {
   --red-text: #f1919b;
   --opencode: #38BDF8;
   --kimi: #F472B6;
+  --pi: #818CF8;
   --shadow-card: 0 1px 2px rgba(0,0,0,.4), 0 6px 24px rgba(0,0,0,.35);
   --shadow-menu: 0 4px 10px rgba(0,0,0,.5), 0 12px 32px rgba(0,0,0,.5);
   color-scheme: dark;
@@ -165,6 +169,7 @@ html.dark {
   --color-vendor-codex: var(--codex);
   --color-vendor-grok: var(--grok);
   --color-vendor-opencode: var(--opencode);
+  --color-vendor-pi: var(--pi);
   --color-surface-700: var(--border);
   --color-surface-800: var(--bg-soft);
   --color-surface-850: var(--bg-hover);
@@ -283,6 +288,26 @@ button { font-family: inherit; cursor: pointer; }
 .ws-head:hover .wplus { display: flex; }
 .ws-head:hover .project-host { display: none; }
 .ws-head .wplus:hover { background: var(--bg-hover); color: var(--text); }
+
+/* Workspace ⋯ menu (per-project actions: new session / copy path / remove). */
+.ws-head .ws-menu-wrap { position: relative; display: flex; flex: none; }
+.ws-head .wmore svg { width: 14px; height: 14px; }
+.ws-head .wmore.open { display: flex; background: var(--bg-hover); color: var(--text); }
+.ws-menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
+  min-width: 178px; padding: 4px; display: flex; flex-direction: column;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+}
+.ws-menu button {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 10px; border-radius: 7px; text-align: left; cursor: pointer;
+  font-size: 12.5px; color: var(--text); background: none; border: none;
+}
+.ws-menu button svg { width: 13px; height: 13px; color: var(--text-faint); flex: none; }
+.ws-menu button:hover { background: var(--bg-hover); }
+.ws-menu button.danger { color: var(--red-text); }
+.ws-menu button.danger svg { color: var(--red-text); }
 .srow {
   width: 100%; text-align: left;
   display: flex; align-items: center; gap: 8px;
@@ -513,6 +538,9 @@ button { font-family: inherit; cursor: pointer; }
 .hitl-btn span, .model-btn span { white-space: nowrap; }
 .hitl-btn:hover { background: var(--bg-soft); }
 .hitl-btn.on { background: var(--ink); color: var(--on-ink); }
+.pi-hitl-note {
+  margin: 4px 4px 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.4;
+}
 
 .model-btn {
   display: flex; align-items: center; gap: 6px;
@@ -569,6 +597,7 @@ html.dark .sel-item.new { color: #67e8f9; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .dot.claude { background: var(--claude); } .dot.codex { background: var(--codex); } .dot.grok { background: var(--grok); }
 .dot.opencode { background: var(--opencode); } .dot.kimi { background: var(--kimi); }
+.dot.pi { background: var(--pi); }
 .dot.on { background: var(--green); } .dot.off { background: #C9CBD1; } .dot.busy { background: #F59E0B; }
 .dot.err { background: var(--red); }
 html.dark .dot.off { background: #4b4e57; }
@@ -608,6 +637,7 @@ html.dark .dot.off { background: #4b4e57; }
 .chip.grok  { color: var(--grok);  border-color: #8b5cf655; }
 .chip.opencode { color: var(--opencode); border-color: #0284c755; }
 .chip.kimi { color: var(--kimi); border-color: #db277755; }
+.chip.pi { color: var(--pi); border-color: #4f46e555; }
 .chip.sid { color: var(--text-muted); }
 /* Icon-only vendor mark (replaces the text label). Fixed square so session
  * rows / cards don't burn horizontal space on "claude"/"opencode" strings. */
@@ -783,6 +813,9 @@ html.dark .dot.off { background: #4b4e57; }
 .btn.primary:hover { opacity: .85; }
 .btn.ghost { border: 1px solid var(--border); color: var(--text-muted); background: var(--bg-card); }
 .btn.ghost:hover { color: var(--text); background: var(--bg-soft); }
+.btn.danger { border: 1px solid color-mix(in srgb, var(--red-text) 40%, var(--border)); background: var(--red-soft); color: var(--red-text); }
+.btn.danger:hover:not(:disabled) { opacity: .85; }
+.btn.danger:disabled { opacity: .45; }
 .btn.mini { padding: 4px 11px; font-size: 12px; border-radius: 6px; }
 
 .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 500; border: 1px solid var(--border); color: var(--text-muted); }
@@ -790,9 +823,39 @@ html.dark .dot.off { background: #4b4e57; }
 .badge.ok { background: var(--green-soft); border-color: transparent; color: var(--green-text); }
 .badge.warn { background: var(--red-soft); border-color: transparent; color: var(--red-text); }
 
-/* Host ACTION rows (设置→运维总览). One compact row per machine: identity on
-   the left, its to-do list on the right. The per-vendor health grid that used
-   to live here moved to the Team page's charter roster. */
+/* Host MANAGEMENT cards (设置→运维总览): one card per machine, one row per
+   vendor harness (install / version / ready badge / MCP registration +
+   actions), satellite projects below. Fleet observation (sessions / spend)
+   stays on the Team page's charter roster. */
+.host-manage {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 18px; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius-card);
+}
+.host-manage.offline { opacity: .6; }
+.host-vendors { display: flex; flex-direction: column; }
+.host-vendor-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 0; border-top: 1px solid var(--border);
+}
+.host-vendor-name { font-size: 13px; font-weight: 600; min-width: 76px; }
+.host-vendor-version { font-size: 11.5px; color: var(--text-faint); min-width: 130px; }
+.host-vendor-mcp {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--text-faint);
+}
+.host-vendor-mcp .ok { color: var(--green-text); }
+.host-vendor-hint { width: 100%; font-size: 11px; color: var(--text-faint); }
+.host-projects {
+  display: flex; flex-direction: column; gap: 6px;
+  border-top: 1px solid var(--border); padding-top: 8px;
+}
+.host-projects-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+  color: var(--text-faint);
+}
+
+/* Compact identity+actions rows (shared by the 项目 catalog panel). */
 .host-actions {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   padding: 12px 18px; background: var(--bg-card);
@@ -1005,14 +1068,15 @@ html.dark .cockpit-markdown a { color: #67e8f9; }
   text-transform: uppercase;
   color: var(--text-faint);
   border-bottom: 1px solid var(--border);
-  white-space: nowrap;
 }
+/* Cells wrap (prose stays readable in place); only tables whose min-content
+   width still exceeds the bubble fall back to the wrapper's horizontal
+   scroll — they never overflow the message. */
 .cockpit-markdown td {
   padding: 0.3125rem 0.625rem;
   font-family: var(--font-mono);
   font-size: 0.75rem;
   vertical-align: top;
-  white-space: nowrap;
   color: var(--text-muted);
   border-bottom: 1px solid var(--border-soft);
 }

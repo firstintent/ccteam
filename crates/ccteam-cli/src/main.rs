@@ -1788,20 +1788,20 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         // before the gateway so it can be baked into both.
         let host_hub = std::sync::Arc::new(ccteam_harness::HostChannelHub::default());
 
-        let (shared_gateway, shared_claude_stream_json): (
-            Option<std::sync::Arc<tokio::sync::Mutex<ccteam_im::gateway::Gateway>>>,
-            Option<std::sync::Arc<ccteam_harness::ClaudeStreamJsonAdapter>>,
-        ) = if web.disabled || imd.disabled {
-            (None, None)
+        let (shared_gateway, shared_claude_stream_json, shared_pi_rpc) = if web.disabled
+            || imd.disabled
+        {
+            (None, None, None)
         } else {
             match ccteam_im::build_gateway_for_daemon(None) {
-                Ok((mut g, adapter)) => {
+                Ok((mut g, adapter, pi_rpc)) => {
                     g.set_remote_host_proxy(std::sync::Arc::new(
                         ccteam_im::remote_host::HubRemoteHostProxy::new(host_hub.clone()),
                     ));
                     (
                         Some(std::sync::Arc::new(tokio::sync::Mutex::new(g))),
                         Some(adapter),
+                        Some(pi_rpc),
                     )
                 }
                 Err(err) => {
@@ -1809,7 +1809,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         error = %err,
                         "ccteam start: failed to build shared gateway; web session API will be unavailable (503), daemon builds its own"
                     );
-                    (None, None)
+                    (None, None, None)
                 }
             }
         };
@@ -1919,6 +1919,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 // so the daemon can wire the production HITL resolver onto
                 // the EXACT adapter this gateway spawns sessions through.
                 claude_stream_json_adapter: shared_claude_stream_json.clone(),
+                pi_rpc_adapter: shared_pi_rpc.clone(),
                 ..Default::default()
             };
             if let Some(bridge) = web_chat_bridge.as_ref() {

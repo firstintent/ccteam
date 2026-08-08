@@ -40,13 +40,25 @@ fn install_fake() {
         perms.set_mode(0o755);
         std::fs::set_permissions(&wrapper, perms).unwrap();
     }
+    // `start_thread` materializes the ambient-plugin shadows under the ccteam
+    // home before it spawns, so every grok test in this binary — not just the
+    // one that asserts on them — would otherwise write into the developer's
+    // real `~/.ccteam`. Pin **both** homes: `CCTEAM_HOME` outranks the
+    // `$HOME`-derived default, so pinning `HOME` alone still hits real state.
+    let sandbox =
+        std::env::temp_dir().join(format!("ccteam-grok-test-home-{}", std::process::id()));
+    std::fs::create_dir_all(&sandbox).unwrap();
     // SAFETY: tests are serial for GROK_BIN_ENV.
     unsafe {
         std::env::set_var(GROK_BIN_ENV, &wrapper);
+        std::env::set_var("HOME", &sandbox);
+        std::env::set_var("CCTEAM_HOME", sandbox.join(".ccteam"));
     }
 }
 
 fn clear_fake() {
+    // The sandbox homes stay pinned for the rest of the process — restoring the
+    // developer's real `$HOME` mid-binary would just re-open the hole.
     unsafe {
         std::env::remove_var(GROK_BIN_ENV);
     }
@@ -75,6 +87,7 @@ fn spawn_spec_always_approve_before_stdio() {
             permission_mode: PermissionMode::Skip,
             model_id: Some("grok-4.5"),
             effort: None,
+            plugin_shadows: &[],
         },
     );
     assert_eq!(
@@ -863,6 +876,115 @@ async fn spawn_disables_claude_mcp_compat_scan() {
         Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_ENV_DUMP", v) },
         None => unsafe { std::env::remove_var("CCTEAM_ACP_ENV_DUMP") },
     }
+    clear_fake();
+}
+
+/// The env toggle above closes the `~/.claude.json` door to ambient MCP; the
+/// user's *Claude plugins* are a second door to the same room. Grok discovers
+/// everything Claude installed and starts each plugin's `.mcp.json` servers as
+/// its own stdio children — one orphan per session, and the official Telegram
+/// plugin's child claims the bot's single `getUpdates` slot away from ccteam's
+/// own IM gateway. No grok env / config / Claude-settings pin turns that off
+/// (see `grok_acp::ambient_plugins`), so the spawn shadows each MCP-bearing
+/// plugin with an empty same-name plugin at `--plugin-dir` (CLI) scope.
+///
+/// `HOME` **and** `CCTEAM_HOME` are both pinned: `CCTEAM_HOME` outranks the
+/// home-derived default, so pinning only `HOME` would write shadows into the
+/// real `~/.ccteam`.
+#[tokio::test]
+#[serial]
+async fn spawn_shadows_ambient_claude_plugin_mcps() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+
+    // A Claude home with two installed plugins: one shipping an MCP server,
+    // one skills-only. Only the first should be shadowed.
+    let home = tmp.path().join("home");
+    let mcp_plugin = home.join(".claude/plugins/cache/telegram");
+    let skills_plugin = home.join(".claude/plugins/cache/frontend-design");
+    std::fs::create_dir_all(&mcp_plugin).unwrap();
+    std::fs::create_dir_all(&skills_plugin).unwrap();
+    std::fs::write(
+        mcp_plugin.join(".mcp.json"),
+        r#"{"mcpServers":{"telegram":{}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude/plugins/installed_plugins.json"),
+        serde_json::json!({
+            "version": 2,
+            "plugins": {
+                "telegram@claude-plugins-official": [
+                    { "scope": "user", "installPath": mcp_plugin }
+                ],
+                "frontend-design@claude-plugins-official": [
+                    { "scope": "user", "installPath": skills_plugin }
+                ],
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let ccteam_home = tmp.path().join("ccteam-home");
+    let dump = tmp.path().join("argv-dump.txt");
+    let prev_home = std::env::var("HOME").ok();
+    let prev_ccteam = std::env::var("CCTEAM_HOME").ok();
+    let prev_dump = std::env::var("CCTEAM_ACP_ARGV_DUMP").ok();
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("CCTEAM_HOME", &ccteam_home);
+        std::env::set_var("CCTEAM_ACP_ARGV_DUMP", &dump);
+    }
+
+    let adapter = GrokAcpAdapter::new();
+    let started = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s1"),
+        ),
+    )
+    .await;
+
+    let recorded = std::fs::read_to_string(&dump).unwrap_or_default();
+
+    unsafe {
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_ccteam {
+            Some(v) => std::env::set_var("CCTEAM_HOME", v),
+            None => std::env::remove_var("CCTEAM_HOME"),
+        }
+        match prev_dump {
+            Some(v) => std::env::set_var("CCTEAM_ACP_ARGV_DUMP", v),
+            None => std::env::remove_var("CCTEAM_ACP_ARGV_DUMP"),
+        }
+    }
+    let handle = started.expect("start timeout").expect("start ok");
+
+    let shadow = ccteam_home.join("cache/grok-plugin-shadows/telegram");
+    let argv: Vec<&str> = recorded.lines().collect();
+    let flag = argv.iter().position(|a| *a == "--plugin-dir");
+    assert_eq!(
+        flag.map(|i| argv[i + 1]),
+        Some(shadow.to_string_lossy().as_ref()),
+        "managed grok must be spawned with a shadow for the MCP-bearing plugin; argv={argv:?}"
+    );
+    assert!(
+        !recorded.contains("frontend-design"),
+        "a skills-only plugin starts no child process and must be left alone; argv={argv:?}"
+    );
+    // The shadow declares the colliding name and nothing else — that is what
+    // keeps the real plugin's MCP server from ever being started.
+    assert!(shadow.join(".claude-plugin/plugin.json").is_file());
+    assert!(!shadow.join(".mcp.json").exists());
+
+    adapter.close_thread(&handle).await.unwrap();
     clear_fake();
 }
 

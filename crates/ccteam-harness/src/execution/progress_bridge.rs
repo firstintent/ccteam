@@ -340,8 +340,15 @@ pub fn build_chat_marker_self_heal_attempt_event(role: &str, attempt_n: u32) -> 
     })
 }
 
+/// The mid-turn "still working" heartbeat. `sid` is REQUIRED: the read-side
+/// activity classifier selects a session's latest event by sid, so an untagged
+/// heartbeat is invisible to the session it describes (and would leak onto its
+/// siblings through the project-tail fallback). Same field order as
+/// [`build_chat_turn_timeout_event`] — the two are the busy/stuck ends of the
+/// same turn-liveness family.
 pub fn build_chat_turn_running_long_event(
     role: &str,
+    sid: &str,
     slug: &str,
     turn_id: &str,
     elapsed_sec: u64,
@@ -349,6 +356,7 @@ pub fn build_chat_turn_running_long_event(
     json!({
         "event": CHAT_TURN_RUNNING_LONG,
         "role": role,
+        "sid": sid,
         "slug": slug,
         "turn_id": turn_id,
         "elapsed_sec": elapsed_sec,

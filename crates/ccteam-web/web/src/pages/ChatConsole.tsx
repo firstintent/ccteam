@@ -27,7 +27,7 @@ import WorkflowView from "./WorkflowView";
 import SettingsView from "./SettingsView";
 import AgentsView from "./AgentsView";
 import { Sidebar, type RailRow } from "../components/Sidebar";
-import { fetchDashboard } from "../lib/dashboardApi";
+import { deleteProject, fetchDashboard } from "../lib/dashboardApi";
 import {
   listHistorySessions,
   listSessions,
@@ -329,6 +329,34 @@ export default function ChatConsole() {
   const displayName = (settings.displayName || "").trim() || me?.handle || "user";
   const initial = displayName.slice(0, 1).toUpperCase() || "C";
 
+  // Sidebar ⋯ menu → remove a project FROM CCTEAM (deregister + stop its live
+  // sessions; disk untouched). Resolves true on success so the type-to-confirm
+  // dialog closes; errors toast and keep it open. The rail refresh also drops
+  // any of the project's rows the stop just ended.
+  const removeProject = useCallback(
+    async (slug: string): Promise<boolean> => {
+      try {
+        const res = await deleteProject(slug);
+        const stopped = res.sessions_stopped.length;
+        toastBus.handler?.info(
+          lang === "en"
+            ? `Removed ${slug} from ccteam (${stopped} live session${stopped === 1 ? "" : "s"} stopped) — files on disk untouched.`
+            : `已从 ccteam 移除 ${slug}(停止 ${stopped} 个 live 会话)—— 磁盘文件未动。`,
+        );
+        void refreshSessions();
+        return true;
+      } catch (e) {
+        if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
+          toastBus.handler?.error(
+            `${lang === "en" ? "Remove failed" : "移除失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+          );
+        }
+        return false;
+      }
+    },
+    [lang, refreshSessions],
+  );
+
   return (
     <div className="app" data-testid="app-shell">
       <Sidebar
@@ -338,6 +366,7 @@ export default function ChatConsole() {
         activeSid={view === "conv" ? sid : null}
         projects={projects}
         projectHosts={projectHosts}
+        projectPaths={projectPaths}
         rows={rows}
         query={query}
         flowActive={view === "flow"}
@@ -366,6 +395,7 @@ export default function ChatConsole() {
         onOpenRow={openRow}
         onStopRow={stopRow}
         onRenameRow={renameRow}
+        onRemoveProject={removeProject}
       />
 
       {/* 移动端:抽屉入口 + 遮罩 (prototype .hamb / .side-backdrop) */}

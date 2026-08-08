@@ -6,16 +6,21 @@
 use ccteam_core::host_registry::{probe_agents, AGENT_PROBE_SPECS};
 
 #[test]
-fn probe_agents_covers_five_vendors_and_folds_missing_binary() {
+fn probe_agents_covers_six_vendors_and_folds_missing_binary() {
+    let temp = tempfile::tempdir().unwrap();
+    std::env::set_var("HOME", temp.path().join("home"));
+    std::env::set_var("CCTEAM_HOME", temp.path().join("ccteam-home"));
     for spec in AGENT_PROBE_SPECS {
         std::env::set_var(spec.bin_env, "/nonexistent/ccteam-fake-zzz");
     }
     let agents = probe_agents();
-    assert_eq!(agents.len(), 5);
+    assert_eq!(agents.len(), 6);
     assert!(agents
         .iter()
         .all(|a| !a.installed && a.status == "not_installed" && a.version.is_none()));
     for spec in AGENT_PROBE_SPECS {
         std::env::remove_var(spec.bin_env);
     }
+    std::env::remove_var("HOME");
+    std::env::remove_var("CCTEAM_HOME");
 }

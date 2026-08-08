@@ -49,7 +49,7 @@ import {
   effortRowLabel,
   effortRowsFor,
   modelRowsFor,
-  normalizeDraft,
+  selectDraftModel,
   vendorSpec,
   visibleProtocols,
   VENDORS,
@@ -694,21 +694,7 @@ export function ChatComposer({
       setMenuOpen(false);
       return;
     }
-    const spec = vendorSpec(vendor);
-    // Switching vendor drops an effort/protocol the new vendor doesn't offer
-    // (kimi has no `medium`, opencode has no effort axis at all) —
-    // `normalizeDraft` is the one gate that decides that, catalog in hand.
-    onDraftChange(
-      normalizeDraft(
-        {
-          ...draft,
-          vendor: spec.id,
-          model,
-          protocol: draft.vendor === spec.id ? draft.protocol : spec.protocols[0]!.id,
-        },
-        catalog,
-      ),
-    );
+    onDraftChange(selectDraftModel(draft, vendor, model, catalog));
     setMenuOpen(false);
   };
 
@@ -742,7 +728,7 @@ export function ChatComposer({
   // Effort rows for the SELECTED vendor. Only the default row ⇒ this vendor
   // declares no effort axis ⇒ no section at all: a menu whose every entry
   // wires nothing is exactly the lie this replaced.
-  const efforts = effortRowsFor(draft.vendor, catalog);
+  const efforts = effortRowsFor(draft.vendor, catalog, draft.model);
   const sendable = scheduleMode
     ? !!text.trim() && !!resolvedScheduleWhen
     : !!text.trim() || attachments.length > 0;
@@ -1105,6 +1091,11 @@ export function ChatComposer({
           )}
         </div>
       </div>
+      {draft.vendor === "pi" && draft.hitl ? (
+        <p className="pi-hitl-note" data-testid="pi-hitl-tradeoff">
+          {t("piHitlTradeoff")}
+        </p>
+      ) : null}
     </div>
   );
 }

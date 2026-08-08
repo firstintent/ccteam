@@ -33,11 +33,11 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// - **Attachments**: a bare `claude` session does NOT auto-`Read` an
 ///   attachment path — it must be told to.
 pub const CCTEAM_MCP_INSTRUCTIONS: &str = "ccteam is the local agent bridge: any session can hire other agent sessions \
-(Claude Code / Codex / Grok / OpenCode / Kimi, on this machine or a registered satellite host) and ccteam does the identity, \
+(Claude Code / Codex / Grok / OpenCode / Kimi / Pi; Pi is local-only, the others may run on a registered satellite host) and ccteam does the identity, \
 routing, delivery, guardrails, cost ledger, and team observability underneath.\n\n\
 ORCHESTRATION (important): when the user asks you to call / use / delegate to another agent (e.g. \"call codex\", \
 \"use grok to search\", \"spawn a reviewer\"), use the `session_*` tools — `session_spawn` starts a session (pick \
-`vendor`: `claude` / `codex` / `grok` / `opencode` / `kimi`, optionally \
+`vendor`: `claude` / `codex` / `grok` / `opencode` / `kimi` / `pi`, optionally \
 `model` / `role`, and pass the first `task` in the same call); its execution host is inherited from the project \
 binding. `session_dispatch` sends follow-up tasks \
 (async with a completion notification for managed parent sessions, or `wait_seconds` to block inline), `session_collect` reads its output \
@@ -62,11 +62,8 @@ looked at the file they sent.";
 /// instructions from ambient context and surface tool NAMES only; in that
 /// world nothing in `status` / `chat_send_file` / `session_*` says "grok"
 /// or "codex", so "use grok to search" dies on first-turn discovery. This
-/// name front-loads every vendor keyword. Owner decisions (2026-07-26):
-/// alias — NOT a rename — so it stays cheap to change or drop; `opencode`
-/// sorts last. The name is derived from [`ccteam_harness::AgentVendor::ALL`]
-/// (test-enforced), so adding a vendor forces this name to grow in the
-/// same PR.
+/// name front-loads the owner-pinned discovery literal. Pi deliberately stays
+/// in the `status`/`session_spawn` descriptions instead of renaming this tool.
 pub const STATUS_BEACON_TOOL_NAME: &str = "grok_claude_codex_kimi";
 
 /// Full tool names in the session group, registration order.
@@ -159,12 +156,12 @@ pub fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         json!({
             "name": "status",
-            "description": "Discovery + health: registered projects, daemon health, today's cost/budget, and your project's bound-host vendor panel — which of claude / codex / grok / opencode / kimi are installed (version, auth state) + per-vendor session_spawn recipes + advisory model catalog + routing notes. Call this first to learn what you can spawn.",
+            "description": "Discovery + health: which of claude / codex / grok / opencode / kimi / pi are installed on your project's host, plus per-vendor session_spawn recipes, daemon health, cost/budget, advisory models, and routing notes. Managed Pi sessions get the bridge; plain shell pi does not.",
             "inputSchema": object_schema(&[]),
         }),
         json!({
             "name": STATUS_BEACON_TOOL_NAME,
-            "description": "Alias of status (discovery beacon for hosts that surface tool names only). Which agents this machine can spawn — claude / codex / grok / kimi / opencode — with install/auth state and per-vendor session_spawn recipes, plus registered projects, daemon health, today's cost. Identical response to status.",
+            "description": "Alias of status (discovery beacon for hosts that surface tool names only). Which agents this machine can spawn — claude / codex / grok / kimi / opencode / pi — with install/auth state and per-vendor session_spawn recipes. Identical response to status.",
             "inputSchema": object_schema(&[]),
         }),
     ];
@@ -195,14 +192,14 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex = coding agents for repo work; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch. Async managed-parent calls get ONE completion notification when the child's turn ends; a plain admin-fallback caller has no return transport, gets `notify_deliverable:false`, and must poll `session_collect` (or use `wait_seconds`). The response adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
+            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi | pi — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex/pi = coding agents; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch. Async managed-parent calls get ONE completion notification when the child's turn ends; a plain admin-fallback caller has no return transport, gets `notify_deliverable:false`, and must poll `session_collect` (or use `wait_seconds`). The response adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "role": { "type": "string", "description": "Optional work-role (must exist as `.claude/agents/<role>.md`). Omit or pass \"\" for a roleless session (bare vendor reads the project CLAUDE.md/AGENTS.md)." },
                     "vendor": {
                         "type": "string",
-                        "enum": ["claude", "codex", "grok", "opencode", "kimi"],
+                        "enum": ["claude", "codex", "grok", "opencode", "kimi", "pi"],
                         "description": "Harness vendor (lowercase). Default claude."
                     },
                     "model": { "type": "string", "description": "Optional explicit model id, passed to the vendor verbatim; overrides the role's `model:` frontmatter. Omitted → vendor default. `status` lists each installed vendor's observed ids." },
@@ -492,7 +489,7 @@ mod tests {
 
     /// MCP-DX-1 — external-agent feedback: callers searching for "grok" (or
     /// any vendor keyword) must hit the spawn tool without reading a 500-char
-    /// paragraph. The five vendor names live in the FIRST sentence.
+    /// paragraph. The six vendor names live in the FIRST sentence.
     ///
     /// MCP-DX-2 hardening: vendor keywords must be PLAIN TEXT. A host-side
     /// keyword matcher tokenizes the description — backtick-wrapped `grok`
@@ -505,7 +502,7 @@ mod tests {
         let spawn = defs.iter().find(|t| t["name"] == "session_spawn").unwrap();
         let description = spawn["description"].as_str().unwrap();
         let head: String = description.chars().take(140).collect();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
             assert!(
                 head.contains(vendor),
                 "vendor `{vendor}` must appear in the first 140 chars (discoverability): {head}"
@@ -520,10 +517,8 @@ mod tests {
 
     /// MCP-BEACON-1 — the bare-name beacon is a PURE alias: listed next to
     /// `status`, same handler, byte-identical response. Its NAME is the
-    /// contract — derived from `AgentVendor::ALL` with `opencode` sorted
-    /// last (owner decisions 2026-07-26), and it must survive the
-    /// `mcp__ccteam__` client prefix under the 64-char tool-name cap, so a
-    /// sixth vendor forces a conscious rename in the same PR.
+    /// contract — owner-pinned independently of `AgentVendor::ALL` — and it
+    /// must survive the `mcp__ccteam__` client prefix under the 64-char cap.
     #[tokio::test]
     async fn status_beacon_is_a_pure_alias_with_owner_pinned_literal_name() {
         assert_eq!(STATUS_BEACON_TOOL_NAME, "grok_claude_codex_kimi");
@@ -577,11 +572,18 @@ mod tests {
 
     /// MCP-DX-1 — `status` is the discovery surface (vendor availability per
     /// host); its description and the server instructions must say so, and the
-    /// instructions must list ALL five harnesses (Kimi was missing).
+    /// instructions must list every reachable harness.
     #[test]
     fn status_description_and_instructions_advertise_the_vendor_axis() {
         assert!(CCTEAM_MCP_INSTRUCTIONS.contains("Kimi"));
-        for vendor in ["`claude`", "`codex`", "`grok`", "`opencode`", "`kimi`"] {
+        for vendor in [
+            "`claude`",
+            "`codex`",
+            "`grok`",
+            "`opencode`",
+            "`kimi`",
+            "`pi`",
+        ] {
             assert!(
                 CCTEAM_MCP_INSTRUCTIONS.contains(vendor),
                 "instructions must enumerate {vendor}"
@@ -590,13 +592,13 @@ mod tests {
         let defs = tool_definitions();
         let status = defs.iter().find(|t| t["name"] == "status").unwrap();
         let description = status["description"].as_str().unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
             assert!(
                 description.contains(vendor),
                 "status description must enumerate `{vendor}`"
             );
         }
-        assert!(description.contains("vendor panel"));
+        assert!(description.contains("installed on your project's host"));
     }
 
     #[test]
@@ -642,14 +644,17 @@ mod tests {
             .collect();
         assert_eq!(pm, vec!["skip", "hitl"]);
 
-        // v0.9.0 W1 (G1) — vendor enum lists all FIVE harnesses.
+        // Vendor enum lists every reachable harness.
         let vendors: Vec<&str> = props["vendor"]["enum"]
             .as_array()
             .expect("vendor has an enum")
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(vendors, vec!["claude", "codex", "grok", "opencode", "kimi"]);
+        assert_eq!(
+            vendors,
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+        );
 
         // v0.9.0 W1 (G1) — new facets are present.
         for key in ["model", "effort", "title"] {

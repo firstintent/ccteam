@@ -25,7 +25,7 @@ interface Props {
 }
 
 /** The CLIs ccteam orchestrates — shown as chips under the tagline. */
-const VENDORS = ["Claude Code", "Codex", "Grok", "Kimi", "OpenCode"];
+const VENDORS = ["Claude Code", "Codex", "Grok", "Kimi", "OpenCode", "Pi"];
 
 /** Brand gradient — the mascot's palette (claude-orange body → kimi-pink ball). */
 const BRAND_GRADIENT = "linear-gradient(135deg, #D97757 0%, #DB2777 100%)";

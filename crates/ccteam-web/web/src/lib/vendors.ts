@@ -1,7 +1,6 @@
-// v0.8.24 Track A — the 5-way vendor registry driving the composer's
-// model+effort+protocol menu (prototype `VENDORS`), extended with opencode
-// (the prototype predates the 4th vendor) and kimi (the 5th; owner call:
-// never collapse a vendor into another vendor's colors).
+// v0.8.24 Track A — the vendor registry driving the composer's
+// model+effort+protocol menu. Every harness owns a distinct label, transport,
+// and visual identity; vendors never collapse into one another.
 //
 // What lives here is the STATIC fallback: what ccteam knows about a vendor
 // with no daemon on the line. The live truth is `GET /api/v1/models` (see
@@ -15,7 +14,7 @@
 
 import type { VendorCatalog } from "./modelsApi";
 
-export type VendorId = "claude" | "codex" | "grok" | "opencode" | "kimi";
+export type VendorId = "claude" | "codex" | "grok" | "opencode" | "kimi" | "pi";
 
 /** One selectable wire protocol for a vendor. `wire` is the value POSTed to
  *  `POST /projects/{slug}/sessions` (`protocol` field); `label` is what the
@@ -110,6 +109,19 @@ export const VENDORS: VendorSpec[] = [
     efforts: ["low", "high", "max"],
     protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
   },
+  {
+    id: "pi",
+    label: "Pi",
+    // Pi reports provider-scoped ids live; a static list would be an account-
+    // specific whitelist and would collide across providers.
+    models: [],
+    // Pi's effort axis is model-specific. The live vendor union is only a
+    // cold-start fallback until a model is selected.
+    efforts: [],
+    protocols: [
+      { id: "stream-json", label: "stream-json", sub: "Pi RPC JSONL", wire: "stream-json" },
+    ],
+  },
 ];
 
 export function vendorSpec(id: string): VendorSpec {
@@ -119,11 +131,12 @@ export function vendorSpec(id: string): VendorSpec {
 /** The model rows the composer shows for `vendor`: the default row first, then
  *  the vendor's OWN ids — live catalog when the daemon reported any, else the
  *  static registry (claude's `--model` aliases; nothing for the vendors whose
- *  catalog is only knowable live). Never a name the vendor didn't declare. */
+ *  catalog is only knowable live). This controls picker rows only; it is not
+ *  an adapter-side whitelist. */
 export function modelRowsFor(vendor: string, catalog?: VendorCatalog | null): string[] {
   const spec = vendorSpec(vendor);
   const live = catalog?.[spec.id]?.models ?? [];
-  return [MODEL_DEFAULT, ...(live.length > 0 ? live : spec.models)];
+  return [MODEL_DEFAULT, ...(live.length > 0 ? live.map((model) => model.id) : spec.models)];
 }
 
 /** The effort rows for `vendor`: the default row (`""` — wire nothing) first,
@@ -131,9 +144,18 @@ export function modelRowsFor(vendor: string, catalog?: VendorCatalog | null): st
  *  the default row ALONE, which the composer reads as "render no effort
  *  section" — the point of the whole change is to stop offering a menu that
  *  does nothing. */
-export function effortRowsFor(vendor: string, catalog?: VendorCatalog | null): string[] {
+export function effortRowsFor(
+  vendor: string,
+  catalog?: VendorCatalog | null,
+  selectedModel?: string | null,
+): string[] {
   const spec = vendorSpec(vendor);
-  const live = catalog?.[spec.id]?.efforts ?? [];
+  const liveCatalog = catalog?.[spec.id];
+  if (selectedModel && selectedModel !== MODEL_DEFAULT) {
+    const model = liveCatalog?.models.find((entry) => entry.id === selectedModel);
+    if (model?.efforts !== undefined) return ["", ...model.efforts];
+  }
+  const live = liveCatalog?.efforts ?? [];
   return ["", ...(live.length > 0 ? live : spec.efforts)];
 }
 
@@ -157,7 +179,7 @@ export function visibleProtocols(vendor: string): ProtocolOption[] {
 /** The composer draft — what the Home lazy-create POSTs from. */
 export interface ComposerDraft {
   vendor: VendorId;
-  /** A model id the vendor declared, or {@link MODEL_DEFAULT} for its own. */
+  /** An explicit model id, or {@link MODEL_DEFAULT} for the vendor's own. */
   model: string;
   /** The vendor's OWN effort token, verbatim; `""` = vendor default (wire
    *  nothing). Deliberately a plain string and not a ccteam-side enum: there
@@ -192,37 +214,70 @@ export function wireProtocol(draft: Pick<ComposerDraft, "vendor" | "protocol">):
  *  this used to drive a post-spawn `/model` control turn; it now rides
  *  `POST .../sessions` directly and the vendor-native spawn seam applies it:
  *  claude `--model`, codex turn/start override, grok `-m`, opencode
- *  `set_config_option`, kimi `session/set_model`). Applies to EVERY vendor —
+ *  `set_config_option`, kimi `session/set_model`, Pi RPC state). Applies to EVERY vendor —
  *  the old per-vendor "return null for opencode/kimi" arms were a silent drop
  *  of the user's pick, which is the same lie as an inert menu. */
 export function modelSwitchFor(
   draft: Pick<ComposerDraft, "vendor" | "model">,
   catalog?: VendorCatalog | null,
 ): string | null {
+  void catalog; // advisory picker data must never gate an explicit value
   if (!draft.model || draft.model === MODEL_DEFAULT) return null;
-  return modelRowsFor(draft.vendor, catalog).includes(draft.model) ? draft.model : null;
+  return draft.model;
 }
 
 /** The effort token to send (`effort` field), or null for the vendor default.
- *  Pure pass-through of the vendor's own token — no ccteam-side remapping,
- *  and no vendor is dropped. Same offer-only-what-was-declared guard as
- *  {@link modelSwitchFor}: a token this vendor never declared is not sent. */
+ * Pure pass-through with no ccteam-side remapping or advisory-catalog gate;
+ * the adapter must reject or confirm the explicit value with the vendor. */
 export function effortSwitchFor(
   draft: Pick<ComposerDraft, "vendor" | "effort">,
   catalog?: VendorCatalog | null,
 ): string | null {
+  void catalog; // advisory picker data must never gate an explicit value
   if (!draft.effort) return null;
-  return effortRowsFor(draft.vendor, catalog).includes(draft.effort) ? draft.effort : null;
+  return draft.effort;
 }
 
-/** The single validity gate for a draft: after a vendor switch (or a reload of
- *  a persisted draft) the model / effort / protocol must all be things THIS
- *  vendor offers — anything else falls back to its default row.
- *
- *  Pass the live catalog wherever it is available: without it only the static
- *  registry answers, so a perfectly good `kimi-code/k3` would be wiped for
- *  looking unknown. Callers that hold a catalog (Home, the composer) normalize
- *  at render, once it has loaded.
+/** Reset vendor-owned axes only at the moment the user actually changes
+ * vendor. Model catalogs are advisory, so ordinary normalization must never
+ * erase an explicit value merely because the daemon has not observed it. */
+export function switchDraftVendor(draft: ComposerDraft, vendor: string): ComposerDraft {
+  const spec = vendorSpec(vendor);
+  if (draft.vendor === spec.id) return normalizeDraft(draft);
+  return {
+    vendor: spec.id,
+    model: MODEL_DEFAULT,
+    effort: "",
+    protocol: spec.protocols[0]!.id,
+    hitl: !!draft.hitl,
+  };
+}
+
+/** Apply one picker model choice. Per-model metadata may clear a menu-picked
+ * effort that the newly selected model explicitly does not support; absent
+ * metadata leaves the value alone for adapter-side validation. */
+export function selectDraftModel(
+  draft: ComposerDraft,
+  vendor: string,
+  model: string,
+  catalog?: VendorCatalog | null,
+): ComposerDraft {
+  const next = switchDraftVendor(draft, vendor);
+  const modelEntry = catalog?.[next.vendor]?.models.find((entry) => entry.id === model);
+  return {
+    ...next,
+    model,
+    effort:
+      modelEntry?.efforts !== undefined && !["", ...modelEntry.efforts].includes(next.effort)
+        ? ""
+        : next.effort,
+  };
+}
+
+/** Normalize structural draft state without treating the advisory catalog as
+ * a whitelist. Protocol remains registry-owned; explicit model and effort
+ * strings survive until the adapter validates them. Actual vendor changes go
+ * through {@link switchDraftVendor}, which resets vendor-owned axes once.
  *
  *  The result is built field-by-field rather than spread over `draft` on
  *  purpose: a draft persisted by an older SPA carries the retired `effortKey`,
@@ -230,13 +285,12 @@ export function effortSwitchFor(
  *  localStorage. Such a draft degrades to the vendor default (`effort: ""`),
  *  never to a crash. */
 export function normalizeDraft(draft: ComposerDraft, catalog?: VendorCatalog | null): ComposerDraft {
+  void catalog; // callers may have it, but it is not a validity authority
   const spec = vendorSpec(draft.vendor);
-  const models = modelRowsFor(spec.id, catalog);
-  const efforts = effortRowsFor(spec.id, catalog);
   return {
     vendor: spec.id,
-    model: models.includes(draft.model) ? draft.model : MODEL_DEFAULT,
-    effort: efforts.includes(draft.effort) ? draft.effort : "",
+    model: typeof draft.model === "string" && draft.model ? draft.model : MODEL_DEFAULT,
+    effort: typeof draft.effort === "string" ? draft.effort : "",
     protocol: spec.protocols.some((p) => p.id === draft.protocol)
       ? draft.protocol
       : spec.protocols[0]!.id,

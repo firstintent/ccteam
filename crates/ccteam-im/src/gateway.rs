@@ -203,6 +203,15 @@ struct GatewaySession {
     delegation_depth: u32,
 }
 
+/// How often a paneless session's pump mirrors a mid-turn "still working"
+/// heartbeat into `progress.jsonl`.
+///
+/// The row only has to keep the session's newest event younger than
+/// [`ccteam_core::stall::STALL_WARN_SECONDS`] (5 min), and it is written from
+/// the pump's hot path — one per minute leaves a 5× margin without turning
+/// every streamed token into a disk write and a file lock.
+const TURN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Snapshot used by the pure live-capacity eviction selector.
 ///
 /// `last_active` is the PERSISTED `meta.json.last_active` (RFC3339,
@@ -417,6 +426,9 @@ pub struct Gateway {
     /// v0.9.2 — optional programmatic capacity override. Production reads the
     /// hot config; deterministic gateway tests use this to exercise a tiny cap.
     sessions_config_override: Option<ccteam_core::SessionsConfig>,
+    /// How often a paneless pump mirrors its mid-turn liveness heartbeat.
+    /// Defaults to [`TURN_HEARTBEAT_INTERVAL`]; tests shrink it.
+    turn_heartbeat_interval: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1465,6 +1477,7 @@ impl Gateway {
             delegation_tx: None,
             delegation_config_override: None,
             sessions_config_override: None,
+            turn_heartbeat_interval: TURN_HEARTBEAT_INTERVAL,
         }
     }
 
@@ -1677,6 +1690,7 @@ impl Gateway {
             plan.ccteam_root.as_deref(),
             &plan.host,
             &plan.wire_slug,
+            plan.vendor,
             plan.protocol,
             plan.remote_proxy.as_ref(),
         )
@@ -2139,6 +2153,12 @@ impl Gateway {
                 return self.resolve_nav_selection(&chat, nav).await;
             }
             return self.resolve_selection(&chat, &reply.data).await;
+        }
+        // Pi extension input/editor dialogs are represented by an External
+        // pending with no buttons. While one is tagged to this ccteam sid,
+        // the next text reply resolves it instead of becoming an agent turn.
+        if let Some(replies) = self.resolve_free_text(&chat, text).await? {
+            return Ok(replies);
         }
         // (v0.8.5 D3) A bare number is a short-reply to a pending choice, but
         // only when one is outstanding for the current session; otherwise
@@ -3336,6 +3356,7 @@ impl Gateway {
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
             &wire_slug,
+            vendor,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -3406,6 +3427,8 @@ impl Gateway {
             .get(&project)
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
+        let (host, wire_slug) = self.project_host_binding(&project)?;
+        crate::remote_host::ensure_vendor_host_supported(vendor, &host)?;
         // v0.8.7 (FIX-2) — reject a role with no `.claude/agents/<role>.md`
         // BEFORE allocating a session id or spawning, so any create path (web /
         // API / IM `/new` / cto-dispatch) that names an unseeded persona fails
@@ -3420,7 +3443,14 @@ impl Gateway {
         // v0.8.24 A-U3 — an explicit composer choice beats the role's
         // `model:` frontmatter; effort has no role-level default.
         let tuning = tuning.normalized();
-        let model_id = tuning.model.or_else(|| role_model_id(role_detail.as_ref()));
+        let model_id = tuning.model.or_else(|| {
+            // Pi owns a vendor-specific `pi.model` frontmatter key. Passing
+            // the generic role model through SpawnCtx would make it look like
+            // an explicit caller choice and incorrectly outrank that key.
+            (vendor != AgentVendor::Pi)
+                .then(|| role_model_id(role_detail.as_ref()))
+                .flatten()
+        });
         let effort = tuning.effort;
         self.next_session += 1;
         // Make the counter durable BEFORE the sid is used (a later spawn failure
@@ -3440,7 +3470,6 @@ impl Gateway {
         // inject it into the pane env (`CCTEAM_CHAT_SECRET`) at spawn so the
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
-        let (host, wire_slug) = self.project_host_binding(&project)?;
         let secret = ccteam_core::session_secret::mint();
         let adapter = (self.adapter_factory)(vendor, protocol);
         // Ownership is decided HERE, the one sync core every fresh spawn funnels
@@ -3497,6 +3526,7 @@ impl Gateway {
                 plan.ccteam_root.as_deref(),
                 &plan.host,
                 &plan.wire_slug,
+                plan.vendor,
                 plan.protocol,
                 plan.remote_proxy.as_ref(),
             )
@@ -3999,6 +4029,7 @@ impl Gateway {
         let delegation_tx = self.delegation_tx.clone();
         let pump_vendor = session.vendor;
         let pump_host = session.host.clone();
+        let heartbeat_interval = self.turn_heartbeat_interval;
         let handle = tokio::spawn(async move {
             use std::time::Instant;
             // V0.8.4 P1: split the event stream into ANSWER (new message)
@@ -4056,6 +4087,11 @@ impl Gateway {
             // suppress the watchdog forever.
             let mut open_work_items: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // The mid-turn liveness heartbeat's own bookkeeping: which turn is
+            // open (paneless protocols only) and when its last durable busy row
+            // was written. `None` turn = no window open, so nothing to refresh.
+            let mut heartbeat_turn: Option<(String, Instant)> = None;
+            let mut heartbeat_last: Option<Instant> = None;
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -4203,25 +4239,96 @@ impl Gateway {
                                 );
                             }
                         }
-                        // A paneless adapter's structured turn start is the
-                        // first authoritative proof that work is underway.
-                        // Persist it immediately: capacity eviction ranks by
-                        // meta.last_active, so waiting until a long turn ends
-                        // can misclassify an actively working child as oldest.
-                        // Terminal sessions have hook-owned activity updates.
-                        if !session.protocol.is_terminal()
-                            && matches!(&evt, ThreadEvent::TurnStarted { .. })
-                        {
-                            if let Some(dir) = project_dir.as_ref() {
-                                refresh_session_activity_meta(
-                                    dir,
-                                    &session_id,
-                                    session.vendor,
-                                    progress_path.as_deref(),
-                                );
+                        // The paneless turn-liveness mirror. A terminal session
+                        // gets mid-turn progress rows from its hooks; stream-json
+                        // and ACP have none, so the pump used to mirror only the
+                        // turn's END — and every reader that classifies activity
+                        // from the FILE (MCP `session_list`/`session_collect`,
+                        // web, CLI) saw a hard-working session as `idle`, or as
+                        // `stale` once the submit row aged past the 5-minute warn
+                        // window. Keyed on `is_terminal()` rather than on a
+                        // vendor, so a new paneless harness inherits it.
+                        if !session.protocol.is_terminal() {
+                            match &evt {
+                                ThreadEvent::TurnStarted { turn_id } => {
+                                    // A structured turn start is the first
+                                    // authoritative proof that work is underway.
+                                    // Persist it immediately: capacity eviction
+                                    // ranks by meta.last_active, so waiting until
+                                    // a long turn ends can misclassify an
+                                    // actively working child as oldest.
+                                    if let Some(dir) = project_dir.as_ref() {
+                                        refresh_session_activity_meta(
+                                            dir,
+                                            &session_id,
+                                            session.vendor,
+                                            progress_path.as_deref(),
+                                        );
+                                    }
+                                    let now = Instant::now();
+                                    heartbeat_turn = Some((turn_id.clone(), now));
+                                    heartbeat_last = Some(now);
+                                }
+                                // A terminal boundary closes the window. The
+                                // `chat_turn_completed` row appended below is the
+                                // idle tail; a heartbeat landing after it would
+                                // pin the session to `working` forever.
+                                ThreadEvent::TurnCompleted { .. }
+                                | ThreadEvent::TurnFailed { .. }
+                                | ThreadEvent::Error(_) => {
+                                    heartbeat_turn = None;
+                                    heartbeat_last = None;
+                                }
+                                // Anything else inside an open turn is real work
+                                // (tool step, assistant chunk). Refresh the sid's
+                                // tail timestamp so the classifier keeps reading
+                                // `working` — throttled, because this is the hot
+                                // path and the row only has to beat the warn
+                                // window, not track every token.
+                                _ => {
+                                    if let (Some((turn_id, started)), Some(ppath)) =
+                                        (heartbeat_turn.as_ref(), progress_path.as_ref())
+                                    {
+                                        let now = Instant::now();
+                                        let due = heartbeat_last.is_none_or(|last| {
+                                            now.duration_since(last) >= heartbeat_interval
+                                        });
+                                        if due {
+                                            heartbeat_last = Some(now);
+                                            let ev = ccteam_core::progress::build_chat_turn_running_long_event(
+                                                &session.role,
+                                                &session_id,
+                                                &session.project,
+                                                turn_id,
+                                                now.duration_since(*started).as_secs(),
+                                            );
+                                            if let Err(err) =
+                                                ccteam_core::progress::append_event(ppath, &ev)
+                                            {
+                                                tracing::warn!(
+                                                    session = %session_id,
+                                                    error = %err,
+                                                    "paneless pump: failed to mirror chat_turn_running_long"
+                                                );
+                                            }
+                                            // Keep the persisted activity stamp in
+                                            // step with the heartbeat: a long turn
+                                            // must not read as the least-recently
+                                            // active session to capacity eviction.
+                                            if let Some(dir) = project_dir.as_ref() {
+                                                refresh_session_activity_meta(
+                                                    dir,
+                                                    &session_id,
+                                                    session.vendor,
+                                                    progress_path.as_deref(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        // v0.8.19 `/status` — a completed turn ends the in-flight
+                        // v0.8.19 `/status` — a terminal turn ends the in-flight
                         // window: clear `turn_started_at` (→ 🟢 idle) and the
                         // activity summary. Protocol-INDEPENDENT (both tmux and
                         // stream-json adapters emit `TurnCompleted`), unlike the
@@ -4231,14 +4338,9 @@ impl Gateway {
                         // v0.9 T5 — BEFORE clearing, capture duration + signals
                         // and append one kind:turn experience record (derived
                         // index; failure never breaks the pump).
-                        if let ThreadEvent::TurnCompleted {
-                            turn_id,
-                            usage,
-                            model,
-                        } = &evt
-                        {
-                            let completed_origin = take_turn_origin(&session, Some(turn_id));
-                            let mirror_answer = mirror_last_answer.take();
+                        if let Some((turn_id, usage, model)) = turn_terminal_accounting(&evt) {
+                            let is_completed =
+                                matches!(&evt, ThreadEvent::TurnCompleted { .. });
                             let duration_ms = session
                                 .turn_started_at
                                 .lock()
@@ -4263,10 +4365,12 @@ impl Gateway {
                             }
 
                             if let Some(dir) = project_dir.as_ref() {
-                                let model_owned = model.clone().filter(|m| !m.is_empty());
+                                let model_owned = model
+                                    .filter(|model| !model.is_empty())
+                                    .map(str::to_string);
                                 let cost_usd = {
                                     let m = model_owned.as_deref().unwrap_or("");
-                                    ccteam_cost::estimate_cost(
+                                    ccteam_cost::resolve_turn_cost(
                                         usage,
                                         session.vendor.cost_vendor(),
                                         m,
@@ -4278,9 +4382,12 @@ impl Gateway {
                                 let exp_turn_id = if turn_id.is_empty() {
                                     format!("{session_id}-{}", seq.saturating_add(1))
                                 } else {
-                                    turn_id.clone()
+                                    turn_id.to_string()
                                 };
-                                let usage_opt = if usage.total() == 0 && model_owned.is_none() {
+                                let usage_opt = if usage.total() == 0
+                                    && usage.reported_cost_usd.is_none()
+                                    && model_owned.is_none()
+                                {
                                     None
                                 } else {
                                     Some(*usage)
@@ -4316,44 +4423,49 @@ impl Gateway {
                                 }
                             }
 
-                            // v0.9.5 feedback fix — the vendor turn is DONE and
-                            // the child is idle: flush ONE boundary signal
-                            // carrying the turn's final answer (the last
-                            // mirrored message) + the whole turn's mirrored ids
-                            // for batch dedup. Interim messages already flowed
-                            // as non-boundary signals (an `all` watch consumes
-                            // those); the default `final` watch notifies here
-                            // and ONLY here.
-                            let finished = turn_last_answer.take();
-                            let covered = std::mem::take(&mut turn_covered);
-                            let notes = turn_notes;
-                            turn_notes = 0;
-                            if let (Some(dtx), Some((final_turn, final_text))) =
-                                (delegation_tx.as_ref(), finished.as_ref())
-                            {
-                                let _ = dtx.send(crate::delegation::DelegationSignal {
-                                    child_sid: session_id.clone(),
-                                    turn_id: final_turn.clone(),
-                                    tail: final_text.clone(),
-                                    vendor: pump_vendor,
-                                    host: pump_host.clone(),
-                                    boundary: true,
-                                    vendor_error: false,
-                                    interim_notes: notes.saturating_sub(1),
-                                    covered_turns: covered,
-                                });
-                            }
-                            if let Some((final_text, reply_to)) = mirror_answer {
-                                mirror_internal_web_answer(
-                                    &tx,
-                                    mirror_paths.as_ref(),
-                                    &session,
-                                    &reply_to,
-                                    completed_origin,
-                                    &session_id,
-                                    seq,
-                                    &final_text,
-                                );
+                            if is_completed {
+                                let completed_origin =
+                                    take_turn_origin(&session, Some(turn_id));
+                                let mirror_answer = mirror_last_answer.take();
+                                // v0.9.5 feedback fix — the vendor turn is DONE and
+                                // the child is idle: flush ONE boundary signal
+                                // carrying the turn's final answer (the last
+                                // mirrored message) + the whole turn's mirrored ids
+                                // for batch dedup. Interim messages already flowed
+                                // as non-boundary signals (an `all` watch consumes
+                                // those); the default `final` watch notifies here
+                                // and ONLY here.
+                                let finished = turn_last_answer.take();
+                                let covered = std::mem::take(&mut turn_covered);
+                                let notes = turn_notes;
+                                turn_notes = 0;
+                                if let (Some(dtx), Some((final_turn, final_text))) =
+                                    (delegation_tx.as_ref(), finished.as_ref())
+                                {
+                                    let _ = dtx.send(crate::delegation::DelegationSignal {
+                                        child_sid: session_id.clone(),
+                                        turn_id: final_turn.clone(),
+                                        tail: final_text.clone(),
+                                        vendor: pump_vendor,
+                                        host: pump_host.clone(),
+                                        boundary: true,
+                                        vendor_error: false,
+                                        interim_notes: notes.saturating_sub(1),
+                                        covered_turns: covered,
+                                    });
+                                }
+                                if let Some((final_text, reply_to)) = mirror_answer {
+                                    mirror_internal_web_answer(
+                                        &tx,
+                                        mirror_paths.as_ref(),
+                                        &session,
+                                        &reply_to,
+                                        completed_origin,
+                                        &session_id,
+                                        seq,
+                                        &final_text,
+                                    );
+                                }
                             }
                         }
                         // A canonical failure is a terminal turn boundary too.
@@ -4372,10 +4484,44 @@ impl Gateway {
                             if let Ok(mut act) = session.latest_activity.lock() {
                                 *act = None;
                             }
+                            // …and the SAME boundary has to reach the file, or
+                            // the durable truth outlives the in-memory one and a
+                            // dead session reads as forever-`working` to every
+                            // parent polling it. `TurnFailed` already lands a row
+                            // through the shared terminal accounting below;
+                            // `Error` is the third boundary and carries no
+                            // accounting at all, so it is absent from that
+                            // projection and needs its own close here. Zero usage
+                            // and no model → it contributes nothing to the ledger;
+                            // its only job is to end the busy window. Paneless
+                            // only: a terminal session's Stop hook closes its own.
+                            if !session.protocol.is_terminal() {
+                                if let (ThreadEvent::Error(_), Some(ppath)) =
+                                    (&evt, progress_path.as_ref())
+                                {
+                                    let ev =
+                                        ccteam_core::progress::build_chat_turn_completed_event(
+                                            &session.role,
+                                            &session_id,
+                                            "",
+                                            &ccteam_harness::UnifiedTokenUsage::default(),
+                                            None,
+                                        );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "paneless pump: failed to close the busy window on Error"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         // v0.8.11 E4 — for a paneless session (no hooks:
-                        // stream-json AND acp), the pump mirrors each completed
-                        // turn to progress.jsonl with the sid, so the
+                        // stream-json AND acp), the pump mirrors each terminal
+                        // turn's accounting to progress.jsonl with the sid, so the
                         // session-list activity classifier (which keys off the
                         // latest sid-tagged event) sees it as active and
                         // `last_activity_seconds` tracks — and the per-session
@@ -4386,20 +4532,16 @@ impl Gateway {
                         // hook → gate on protocol to avoid a double-write.
                         if !session.protocol.is_terminal() {
                             if let (
-                                ThreadEvent::TurnCompleted {
-                                    turn_id,
-                                    usage,
-                                    model,
-                                },
+                                Some((turn_id, usage, model)),
                                 Some(ppath),
-                            ) = (&evt, progress_path.as_ref())
+                            ) = (turn_terminal_accounting(&evt), progress_path.as_ref())
                             {
                                 let ev = ccteam_core::progress::build_chat_turn_completed_event(
                                     &session.role,
                                     &session_id,
                                     turn_id,
                                     usage,
-                                    model.as_deref(),
+                                    model,
                                 );
                                 if let Err(err) =
                                     ccteam_core::progress::append_event(ppath, &ev)
@@ -5582,6 +5724,7 @@ impl Gateway {
             plan.ccteam_root.as_deref(),
             &plan.host,
             &plan.wire_slug,
+            plan.vendor,
             plan.protocol,
             plan.remote_proxy.as_ref(),
         )
@@ -5719,6 +5862,7 @@ impl Gateway {
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &bound_host,
             &wire_slug,
+            vendor,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -6054,6 +6198,7 @@ impl Gateway {
                 session,
                 start_visible_events,
                 &turn_id.0,
+                &user_text,
                 submitted.disposition,
             )
             .await?;
@@ -6097,11 +6242,14 @@ impl Gateway {
                 }
                 // A directive that resolves to a turn was submitted by the
                 // adapter itself (`/model` re-prompt, grok steer): it is
-                // running, not queued.
+                // running, not queued. The turn body is the adapter's own
+                // re-prompt, not user text, so the progress row carries no
+                // excerpt rather than a fabricated one.
                 self.after_turn_submitted(
                     session,
                     start_visible_events,
                     &turn_id.0,
+                    "",
                     TurnDisposition::Started,
                 )
                 .await
@@ -6115,6 +6263,54 @@ impl Gateway {
         }
     }
 
+    /// Open the session's file-backed BUSY window: append one
+    /// `chat_turn_user_prompt` row for the turn just submitted.
+    ///
+    /// Every reader that answers "what is this session doing right now" from
+    /// OUTSIDE the daemon process — MCP `session_list` / `session_collect`, the
+    /// web session list, the CLI — classifies `progress.jsonl`, not the pump's
+    /// in-memory liveness. A paneless session used to mirror only the END of a
+    /// turn, so from submit until completion its newest row stayed the PREVIOUS
+    /// turn's `chat_turn_completed` — an idle boundary. A parent polling its
+    /// child therefore read `idle` seconds after dispatching work, and a
+    /// `session_collect(tail)` on that verdict returned the previous turn's
+    /// answer as if it were the new one.
+    ///
+    /// This is the one choke point every submission funnels through (IM text,
+    /// web chat, MCP `session_dispatch`, adapter-driven directive turns), so a
+    /// new entry point inherits the fix instead of needing its own. Written for
+    /// EVERY disposition: `Queued` means the work is outstanding behind a
+    /// running turn, which is busy, not idle. Terminal sessions write this row
+    /// from their own `UserPromptSubmit` hook — gate on protocol so they do not
+    /// get it twice.
+    fn open_turn_progress_window(
+        &self,
+        session: &GatewaySession,
+        turn_id: &str,
+        prompt_excerpt: &str,
+    ) {
+        if session.protocol.is_terminal() {
+            return;
+        }
+        let Some(paths) = self.project_paths.as_ref() else {
+            return;
+        };
+        let path = paths.progress_jsonl(&session.project);
+        let event = ccteam_core::progress::build_chat_turn_user_prompt_event(
+            &session.role,
+            &session.id,
+            turn_id,
+            prompt_excerpt,
+        );
+        if let Err(err) = ccteam_core::progress::append_event(&path, &event) {
+            tracing::warn!(
+                session = %session.id,
+                error = %err,
+                "ccteam-im: failed to append chat_turn_user_prompt progress event"
+            );
+        }
+    }
+
     /// Wire a freshly-submitted turn into the async pump (production) or
     /// drain its first answer synchronously (sink-less unit tests). Shared
     /// by the plain-text submit path and the directive `Turn` outcome.
@@ -6123,8 +6319,10 @@ impl Gateway {
         session: &GatewaySession,
         start_visible_events: u64,
         turn_id: &str,
+        prompt_excerpt: &str,
         disposition: TurnDisposition,
     ) -> Result<Vec<String>> {
+        self.open_turn_progress_window(session, turn_id, prompt_excerpt);
         if self.event_sink.is_some() {
             // v0.8.x (concurrency review §4.1 P2) — the turn-timeout watchdog
             // used to be a detached `tokio::spawn`ed task PER TURN
@@ -6282,6 +6480,26 @@ impl Gateway {
             free_text: None,
         };
         self.apply_pending(chat, p, selection).await
+    }
+
+    async fn resolve_free_text(&self, chat: &ChatKey, text: &str) -> Result<Option<Vec<String>>> {
+        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+            return Ok(None);
+        };
+        let pending = {
+            let mut registry = self.pending.lock().await;
+            registry.drain_expired(Instant::now());
+            registry.take_free_text_for_sid(&session_id)
+        };
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        let selection = ChoiceSelection {
+            token: pending.prompt.token.clone(),
+            ids: Vec::new(),
+            free_text: Some(text.to_string()),
+        };
+        self.apply_pending(chat, pending, selection).await.map(Some)
     }
 
     /// Dispatch a resolved selection per the pending interaction's origin
@@ -7121,13 +7339,15 @@ impl Gateway {
         }
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
-        // 🔴 stuck — EXCEPT running subagents are an AUTHORITATIVE "still working"
-        // signal (straight from claude) that overrides the silence heuristic, so
-        // a main session quietly awaiting subagents never mis-reads idle/stuck.
-        // Turn-OUTLIVING tasks (background workflows / shells / monitors) do NOT
-        // override: they survive the spawning turn by design, so a leftover run
-        // must not mask a genuinely stuck later turn. Same vocabulary as the
-        // harness turn-end eviction (`RunningTask::outlives_turn`).
+        // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
+        // working" signal (straight from claude) that overrides the silence
+        // heuristic, so a main session quietly awaiting one never mis-reads
+        // idle/stuck. Turn-OUTLIVING tasks (background workflows / shells /
+        // monitors, and async `Agent` launches the vendor reports as
+        // background) do NOT override: they survive the spawning turn by
+        // design, so a leftover run must not mask a genuinely stuck later turn.
+        // Same vocabulary as the harness turn-end eviction
+        // (`RunningTask::outlives_turn`).
         let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
         let mut stuck_after = gateway_turn_timeout_duration();
         if stuck_after.is_zero() {
@@ -7136,9 +7356,13 @@ impl Gateway {
         let now = Instant::now();
         let started = s.turn_started_at.lock().ok().and_then(|g| *g);
         let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
-        let silent_for = started.map(|t| match last_event {
-            Some(ev) => now.saturating_duration_since(ev),
-            None => now.saturating_duration_since(t),
+        // Silence is measured within THIS turn: `last_event_at` is written only
+        // by the pump, so a freshly submitted turn still carries the PREVIOUS
+        // turn's last event and would open minutes-silent (🔴 STUCK) until its
+        // first event streams back. Clamp the baseline to the turn's own start.
+        let silent_for = started.map(|t| {
+            let baseline = last_event.map_or(t, |ev| ev.max(t));
+            now.saturating_duration_since(baseline)
         });
         let (state, detail) = match (started, silent_for) {
             (None, _) => ("🟢", "idle".to_string()),
@@ -7907,6 +8131,13 @@ impl Gateway {
         self.sessions_config_override = Some(cfg);
     }
 
+    /// Override the mid-turn heartbeat cadence. Production keeps
+    /// [`TURN_HEARTBEAT_INTERVAL`]; tests shrink it so a heartbeat is
+    /// observable without sleeping through a real minute.
+    pub fn set_turn_heartbeat_interval(&mut self, interval: std::time::Duration) {
+        self.turn_heartbeat_interval = interval;
+    }
+
     /// Build the exclusion set for a session admission: the admitted sid plus
     /// its live parent chain. The bounded/cycle-safe walk is defensive against
     /// corrupt in-memory lineage and deliberately independent of max_depth.
@@ -8274,6 +8505,7 @@ impl Gateway {
             self.project_paths.as_ref().map(|p| p.root.as_path()),
             &host,
             &wire_slug,
+            vendor,
             protocol,
             self.remote_host_proxy.as_ref(),
         )
@@ -8847,7 +9079,7 @@ impl Gateway {
         // is absent we've already taken the pending; re-register would race, so
         // we instead resolve it as the rejection — but the cleaner contract is
         // a 4xx, and the pending is single-flight + about to time out anyway.)
-        if !p.prompt.options.iter().any(|o| o.id == option_id) {
+        if !p.prompt.options.is_empty() && !p.prompt.options.iter().any(|o| o.id == option_id) {
             // Put the waiter out of its misery deterministically: an unknown id
             // is treated as no valid choice → drop, which makes an External
             // hook observe RecvError → its own fail-safe deny. We surface a
@@ -8856,8 +9088,11 @@ impl Gateway {
         }
         let selection = ChoiceSelection {
             token: token.to_string(),
-            ids: vec![option_id.to_string()],
-            free_text: None,
+            ids: (!p.prompt.options.is_empty())
+                .then(|| option_id.to_string())
+                .into_iter()
+                .collect(),
+            free_text: p.prompt.options.is_empty().then(|| option_id.to_string()),
         };
         self.apply_pending(&web_api_chat(), p, selection).await?;
         Ok(())
@@ -9041,6 +9276,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Grok => "grok",
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
+        AgentVendor::Pi => "pi",
     }
 }
 
@@ -9181,7 +9417,7 @@ fn refresh_session_activity_meta(
 /// Sum the deterministic per-turn cost AND raw token count of every
 /// `chat_turn_completed` event in `progress_path` tagged with `sid`, pricing
 /// each turn's `usage` against its own canonical `model` via
-/// [`ccteam_cost::estimate_cost`] — mirrors `ccteam-web`'s
+/// [`ccteam_cost::resolve_turn_cost`] — mirrors `ccteam-web`'s
 /// `status::build_session_cost_rows`, scoped to one sid so it can run from the
 /// harness-side pump (which has no access to that web-layer helper). `None`
 /// when nothing priced/counted yet (never a faked `0.0`); a turn whose model
@@ -9223,7 +9459,7 @@ fn session_cost_and_tokens(
             counted += 1;
         }
         let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(cost) = ccteam_cost::estimate_cost(&usage, cost_vendor, model) {
+        if let Some(cost) = ccteam_cost::resolve_turn_cost(&usage, cost_vendor, model) {
             total += cost;
             priced += 1;
         }
@@ -9860,6 +10096,29 @@ fn thread_event_failure(evt: &ThreadEvent) -> Option<&ccteam_harness::ThreadErro
     }
 }
 
+/// Accounting carried by a vendor turn's terminal boundary. Successful and
+/// failed turns deliberately share this projection so every paid token reaches
+/// the same existing `chat_turn_completed` ledger row without changing the
+/// progress schema.
+fn turn_terminal_accounting(
+    evt: &ThreadEvent,
+) -> Option<(&str, &ccteam_harness::UnifiedTokenUsage, Option<&str>)> {
+    match evt {
+        ThreadEvent::TurnCompleted {
+            turn_id,
+            usage,
+            model,
+        }
+        | ThreadEvent::TurnFailed {
+            turn_id,
+            usage,
+            model,
+            ..
+        } => Some((turn_id, usage, model.as_deref())),
+        _ => None,
+    }
+}
+
 /// Whether this item is long-running work that can legitimately go silent
 /// between start and complete (tools, shell, search — not the final answer).
 fn is_openable_work_item(details: &ThreadItemDetails) -> bool {
@@ -10355,6 +10614,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "grok" => Ok(AgentVendor::Grok),
         "opencode" => Ok(AgentVendor::Opencode),
         "kimi" => Ok(AgentVendor::Kimi),
+        "pi" => Ok(AgentVendor::Pi),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -10438,14 +10698,14 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             }
         }
     }
-    // Grok/OpenCode/Kimi always speak ACP (v0.8.23) — settled after the loop
-    // so token order never changes the outcome.
-    if matches!(
-        vendor,
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi
-    ) {
-        protocol = SessionProtocol::Acp;
-    }
+    // Vendor-fixed protocols settle after the loop so token order never
+    // changes the outcome. Pi RPC is canonical stream-json at the gateway
+    // boundary even though its child wire is Pi's own JSONL protocol.
+    protocol = match vendor {
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi => SessionProtocol::Acp,
+        AgentVendor::Pi => SessionProtocol::StreamJson,
+        AgentVendor::Claude | AgentVendor::Codex => protocol,
+    };
     Ok(NewSessionArgs {
         vendor,
         role,
@@ -10569,6 +10829,10 @@ mod tests {
         assert_eq!(
             parse_new("grok terminal").unwrap().protocol,
             SessionProtocol::Acp
+        );
+        assert_eq!(
+            parse_new("pi terminal").unwrap().protocol,
+            SessionProtocol::StreamJson
         );
     }
 
@@ -11477,6 +11741,13 @@ mod tests {
                             kind: "turn_failed".to_string(),
                             message: message.clone(),
                         },
+                        usage: ccteam_harness::UnifiedTokenUsage {
+                            input_tokens: 1_000,
+                            output_tokens: 500,
+                            reported_cost_usd: Some(0.42),
+                            ..Default::default()
+                        },
+                        model: Some("vendor-reported-model".to_string()),
                     },
                 ));
             } else {
@@ -14360,6 +14631,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_turn_usage_reaches_ledger_experience_and_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake =
+            Arc::new(FakeAdapter::new(AgentVendor::Opencode).with_turn_failure("output truncated"));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Opencode,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut ledger_row = None;
+        for _ in 0..100 {
+            ledger_row = ccteam_core::progress::read_all_events(&progress)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|event| {
+                    event.get("event").and_then(|value| value.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                        && event.get("sid").and_then(|value| value.as_str()) == Some(sid.as_str())
+                });
+            if ledger_row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ledger_row = ledger_row.unwrap_or_else(|| {
+            panic!(
+                "failed turn must append one usage ledger row to {}",
+                progress.display()
+            )
+        });
+        let usage: ccteam_harness::UnifiedTokenUsage =
+            serde_json::from_value(ledger_row["usage"].clone()).unwrap();
+        assert_eq!(usage.total(), 1_500);
+        assert_eq!(usage.reported_cost_usd, Some(0.42));
+        assert_eq!(ledger_row["model"].as_str(), Some("vendor-reported-model"));
+
+        let mut experience = None;
+        let mut meta = None;
+        for _ in 0..100 {
+            experience = ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|record| match record {
+                    ccteam_harness::execution::experience::ExperienceRecord::Turn(turn)
+                        if turn.sid == sid =>
+                    {
+                        Some(turn)
+                    }
+                    _ => None,
+                });
+            meta = read_session_meta(&project_dir, &sid)
+                .ok()
+                .filter(|session| {
+                    session.tokens_total == Some(1_500) && session.cost_usd == Some(0.42)
+                });
+            if experience.is_some() && meta.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let experience = experience.expect("failed terminal event must append experience row");
+        assert_eq!(experience.usage.map(|value| value.total()), Some(1_500));
+        assert_eq!(experience.cost_usd, Some(0.42));
+        let meta = meta.expect("failed terminal event must refresh token/cost meta");
+        assert_eq!(meta.tokens_total, Some(1_500));
+        assert_eq!(meta.cost_usd, Some(0.42));
+    }
+
     /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
     /// The web API shares the same Gateway mutex, so restore work must not hold
     /// that lock while awaiting the adapter; otherwise `POST /sessions` blocks
@@ -14427,6 +14788,269 @@ mod tests {
         resume_task.await.unwrap();
         // After restore completes, the session is live.
         assert_eq!(gateway.lock().await.session_views().len(), 1);
+    }
+
+    /// A paneless session must open its file-backed BUSY window at SUBMIT, not
+    /// at completion. `progress.jsonl` is what every out-of-process reader
+    /// classifies activity from (MCP `session_list`/`session_collect`, web,
+    /// CLI), and mirroring only the turn's end left the newest row on the
+    /// PREVIOUS turn's `chat_turn_completed` — an idle boundary — for the whole
+    /// of the next turn. A parent that polled its child right after dispatching
+    /// work read `idle` and collected the previous answer as the new one.
+    #[tokio::test]
+    async fn paneless_submit_opens_the_busy_window_before_the_turn_completes() {
+        use ccteam_core::stall::classify_progress_activity_for_sid;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // create_session_api defaults to the stream-json protocol.
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        let progress = paths.progress_jsonl("alpha");
+
+        // Turn 1 runs to completion, leaving an idle tail — the exact state the
+        // false-`idle` verdict came from.
+        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        let mut settled = false;
+        for _ in 0..100 {
+            let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+            // Wait for the pump's own completion row, not merely for an `idle`
+            // verdict — an empty file also classifies as idle, which would let
+            // the real assertion below pass without the tail it is about.
+            let completed = events.iter().any(|e| {
+                ccteam_core::progress::event_sid(e) == Some(sid.as_str())
+                    && e.get("event").and_then(|v| v.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+            });
+            if completed
+                && classify_progress_activity_for_sid(&events, &sid, 0, chrono::Utc::now())
+                    .status
+                    .activity
+                    == "idle"
+            {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            settled,
+            "turn 1 must settle to idle before turn 2 is judged"
+        );
+
+        // Turn 2: the submit itself must flip the file-backed verdict to
+        // `working`. Read synchronously right after submit — no pump event has
+        // to land first, which is the point.
+        gateway.submit_to_sid(&sid, "second".into()).await.unwrap();
+        let events = ccteam_core::progress::read_all_events(&progress).unwrap();
+        assert_eq!(
+            classify_progress_activity_for_sid(&events, &sid, 0, chrono::Utc::now())
+                .status
+                .activity,
+            "working",
+            "submitting a turn must open the busy window: {events:#?}"
+        );
+        let opened = events
+            .iter()
+            .rev()
+            .find(|e| ccteam_core::progress::event_sid(e) == Some(sid.as_str()))
+            .expect("a sid-tagged row");
+        assert_eq!(
+            opened["event"],
+            ccteam_core::progress::CHAT_TURN_USER_PROMPT
+        );
+        assert_eq!(
+            opened["prompt_excerpt"], "second",
+            "the row carries the turn's own prompt, not the previous one's"
+        );
+    }
+
+    /// The mid-turn heartbeat: a turn that keeps producing events keeps
+    /// refreshing its own `progress.jsonl` tail, so a long turn never ages into
+    /// `stale` while it is demonstrably working. Cadence is injected so the
+    /// assertion does not wait out the production minute.
+    #[tokio::test]
+    async fn paneless_pump_heartbeats_a_long_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // TurnStarted opens the window; no turn boundary, so the turn stays in
+        // flight and its item events are what the heartbeat rides on.
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_started());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid(&sid, "long job".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut beat = None;
+        for _ in 0..100 {
+            let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+            beat = events.into_iter().find(|e| {
+                e.get("event").and_then(|v| v.as_str())
+                    == Some(ccteam_core::progress::CHAT_TURN_RUNNING_LONG)
+            });
+            if beat.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let beat = beat.expect("an in-flight paneless turn must emit a heartbeat row");
+        // Tagged with the sid — the classifier selects a session's newest row by
+        // sid, so an untagged heartbeat would be invisible to the session it
+        // describes and would leak onto its siblings via the project-tail
+        // fallback.
+        assert_eq!(ccteam_core::progress::event_sid(&beat), Some(sid.as_str()));
+        assert_eq!(beat["slug"], "alpha");
+        assert!(!ccteam_core::progress::is_idle(Some(&beat)));
+    }
+
+    /// A turn that DIES must close its busy window on disk, not just in memory.
+    /// The pump clears its in-process markers on a canonical failure; now that
+    /// submit opens a DURABLE busy window, the file-backed boundary has to land
+    /// too, or a dead session reads `working` and then `stale` forever to every
+    /// parent polling it. (`TurnFailed` closes it through the shared terminal
+    /// accounting row, which deliberately carries a failed turn's usage.)
+    #[tokio::test]
+    async fn paneless_turn_failure_closes_the_busy_window() {
+        use ccteam_core::stall::classify_progress_activity_for_sid;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_failure("boom"));
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap();
+        gateway.submit_to_sid(&sid, "doomed".into()).await.unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut settled = false;
+        for _ in 0..100 {
+            let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+            if classify_progress_activity_for_sid(&events, &sid, 0, chrono::Utc::now())
+                .status
+                .activity
+                == "idle"
+            {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let events = ccteam_core::progress::read_all_events(&progress).unwrap_or_default();
+        assert!(settled, "a failed turn must settle to idle: {events:#?}");
+        let closed = events
+            .iter()
+            .rev()
+            .find(|e| ccteam_core::progress::event_sid(e) == Some(sid.as_str()))
+            .expect("a sid-tagged row");
+        assert_eq!(
+            closed["event"],
+            ccteam_core::progress::CHAT_TURN_COMPLETED,
+            "the shared terminal-accounting row is what closes the window"
+        );
+        // Exactly one closing row — the busy window must not be closed twice.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| {
+                    ccteam_core::progress::event_sid(e) == Some(sid.as_str())
+                        && e.get("event").and_then(|v| v.as_str())
+                            == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                })
+                .count(),
+            1,
+            "one terminal row per turn: {events:#?}"
+        );
+    }
+
+    /// A terminal session already writes `chat_turn_user_prompt` from its own
+    /// `UserPromptSubmit` hook. The gateway must not write a second one.
+    #[tokio::test]
+    async fn terminal_submit_does_not_double_write_the_turn_open_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api_proto(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::Terminal,
+                "web-api".into(),
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway.submit_to_sid(&sid, "hello".into()).await.unwrap();
+
+        let events = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
+            .unwrap_or_default();
+        assert!(
+            !events.iter().any(|e| {
+                e.get("event").and_then(|v| v.as_str())
+                    == Some(ccteam_core::progress::CHAT_TURN_USER_PROMPT)
+            }),
+            "the hook owns this row for terminal sessions: {events:#?}"
+        );
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — head-of-line regression: chat A's
@@ -15628,7 +16252,7 @@ mod tests {
         > = Arc::new(|vendor, _| Arc::new(FakeAdapter::new(vendor)));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
             gateway
                 .handle_text("mock", "chat-1", "alice", &format!("/new {vendor}"))
                 .await
@@ -15641,7 +16265,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
             assert!(listing.contains(&format!(" {vendor}")), "{listing}");
         }
     }
@@ -15814,16 +16438,17 @@ mod tests {
             "ctx still shown: {working:?}"
         );
 
-        // (3) In flight but the last event is stale past the idle window →
-        // 🔴 STUCK. Use the SAME threshold the code reads so the test is
-        // deterministic against any env-configured window.
+        // (3) In flight for a full idle window with the turn's own last event
+        // just as stale → 🔴 STUCK. Use the SAME threshold the code reads so
+        // the test is deterministic against any env-configured window.
         let mut window = gateway_turn_timeout_duration();
         if window.is_zero() {
             window = std::time::Duration::from_secs(300);
         }
         {
             let s = gateway.sessions.get("s1").expect("session s1");
-            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.turn_started_at.lock().unwrap() =
+                Some(now - (window + std::time::Duration::from_secs(120)));
             *s.last_event_at.lock().unwrap() =
                 Some(now - (window + std::time::Duration::from_secs(60)));
         }
@@ -15836,6 +16461,25 @@ mod tests {
             "stuck state: {stuck:?}"
         );
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
+
+        // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
+        // PREVIOUS turn's last event (the pump only writes that cell) must read
+        // 🔵 working, not 🔴 STUCK: silence is measured within the turn, so the
+        // baseline clamps to the turn's own start.
+        {
+            let s = gateway.sessions.get("s1").expect("session s1");
+            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.last_event_at.lock().unwrap() =
+                Some(now - (window + std::time::Duration::from_secs(60)));
+        }
+        let fresh = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            fresh[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
+        );
     }
 
     #[tokio::test]
@@ -16007,6 +16651,7 @@ mod tests {
                 description: desc.into(),
                 task_type: task_type.into(),
                 started: std::time::Instant::now(),
+                backgrounded: false,
             }
         }
         // Nothing running → nothing rendered.
@@ -16045,23 +16690,35 @@ mod tests {
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the
-    /// harness turn-end eviction: background workflows AND background shells
-    /// survive a turn boundary; sync subagents are turn-scoped.
+    /// harness turn-end eviction: whatever the vendor reports as BACKGROUND,
+    /// plus the `local_workflow` / `local_bash` fallback, survives a turn
+    /// boundary; a subagent that BLOCKS its turn is turn-scoped.
+    ///
+    /// The `backgrounded` leg is what keeps `/status` honest about an async
+    /// `Agent` launch (same `local_agent` task_type as a blocking one, but it
+    /// keeps running for hours after its launching turn ends), while a
+    /// blocking subagent still counts as proof THIS turn is alive so a main
+    /// session waiting on one never mis-reads STUCK.
     #[test]
-    fn outlives_turn_vocabulary_covers_workflows_and_bg_shells() {
-        fn t(task_type: &str) -> RunningTask {
+    fn outlives_turn_vocabulary_covers_workflows_bg_shells_and_backgrounded() {
+        fn t(task_type: &str, backgrounded: bool) -> RunningTask {
             RunningTask {
                 task_id: "x".into(),
                 kind: String::new(),
                 description: String::new(),
                 task_type: task_type.into(),
                 started: std::time::Instant::now(),
+                backgrounded,
             }
         }
-        assert!(t("local_workflow").outlives_turn());
-        assert!(t("local_bash").outlives_turn());
-        assert!(!t("local_agent").outlives_turn());
-        assert!(!t("").outlives_turn());
+        assert!(t("local_workflow", false).outlives_turn());
+        assert!(t("local_bash", false).outlives_turn());
+        assert!(
+            !t("local_agent", false).outlives_turn(),
+            "blocking subagent"
+        );
+        assert!(t("local_agent", true).outlives_turn(), "async Agent launch");
+        assert!(!t("", false).outlives_turn());
     }
 
     /// v0.8.19 `/status` — ACL: a foreign IM chat does NOT see another chat's
@@ -17328,6 +17985,7 @@ mod tests {
                         AgentVendor::Grok => codex.clone(), // tests: no dedicated grok fake
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
+                        AgentVendor::Pi => codex.clone(), // tests: no dedicated Pi fake
                     }
                 },
             )
@@ -17420,6 +18078,7 @@ mod tests {
                         AgentVendor::Grok => codex.clone(),
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
+                        AgentVendor::Pi => codex.clone(),
                     }
                 },
             )
@@ -19366,6 +20025,36 @@ mod tests {
         assert!(shared.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn web_resolve_delivers_pi_free_text_without_fabricating_an_option() {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
+        gateway.set_pending(shared.clone());
+
+        let token = "pifreetext";
+        let (tx, rx) = tokio::sync::oneshot::channel::<ChoiceSelection>();
+        shared.lock().await.register(
+            token.to_string(),
+            ChoicePrompt {
+                token: token.to_string(),
+                title: "Pi extension input".to_string(),
+                options: Vec::new(),
+                multi: false,
+            },
+            InteractionOrigin::External { reply: tx },
+            Instant::now() + std::time::Duration::from_secs(600),
+        );
+
+        gateway
+            .resolve_web_selection(token, "typed answer")
+            .await
+            .expect("free text resolves cleanly");
+        let got = rx.await.expect("oneshot delivered");
+        assert!(got.ids.is_empty());
+        assert_eq!(got.free_text.as_deref(), Some("typed answer"));
+    }
+
     /// v0.8.7 review-fix (R-H1) — an unknown/expired token is a clean `Err`
     /// (the HTTP layer maps it to a 4xx), NOT a turn and NOT a panic; the
     /// registry is left untouched. Likewise a valid token with an option id
@@ -19519,7 +20208,7 @@ mod tests {
         // `events_notify` — a single shared fake's `notify_one` could wake the
         // wrong pump when two sessions (parent + child) run concurrently.
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
-            // `with_turn_boundary` mirrors every REAL adapter (all five emit
+            // `with_turn_boundary` mirrors every real adapter (all six emit
             // `TurnCompleted`) — required since v0.9.5: the delegation
             // notification fires on the turn boundary, not per answer.
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())

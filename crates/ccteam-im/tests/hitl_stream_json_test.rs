@@ -199,7 +199,8 @@ async fn run_round_trip(decision: &str, expect_answer: &str) {
     // threaded into `DaemonArgs` (`gateway` / `claude_stream_json_adapter`)
     // so `run_daemon_with_shutdown`'s post-build wiring reaches the SAME
     // adapter singleton this gateway spawns sessions through.
-    let (factory, stream_json_handle) = default_adapter_factory_with_stream_json_handle();
+    let (factory, stream_json_handle, _pi_rpc_handle) =
+        default_adapter_factory_with_stream_json_handle();
     let gateway = Arc::new(Mutex::new(Gateway::new_with_factory(
         factory,
         "default",

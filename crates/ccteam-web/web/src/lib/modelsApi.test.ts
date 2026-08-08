@@ -76,7 +76,10 @@ describe("indexCatalog", () => {
     const catalog = indexCatalog(RESPONSE);
     expect(Object.keys(catalog).sort()).toEqual(["kimi", "opencode"]);
     expect(catalog.kimi).toEqual({
-      models: ["kimi-code/k3", "kimi-code/k3-256k"],
+      models: [
+        { id: "kimi-code/k3", display_name: "K3", efforts: ["low", "high", "max"] },
+        { id: "kimi-code/k3-256k", display_name: "K3 256K" },
+      ],
       efforts: ["low", "high", "max"],
     });
   });
@@ -109,6 +112,6 @@ describe("indexCatalog", () => {
         },
       ],
     });
-    expect(catalog.grok).toEqual({ models: ["grok-4.5"], efforts: ["low", "high"] });
+    expect(catalog.grok).toEqual({ models: [{ id: "grok-4.5" }], efforts: ["low", "high"] });
   });
 });

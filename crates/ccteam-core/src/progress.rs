@@ -898,13 +898,17 @@ mod tests {
 
     #[test]
     fn build_chat_turn_running_long_event_shape() {
-        let ev = build_chat_turn_running_long_event("alice", "dev-foo", "turn-42", 95);
+        let ev = build_chat_turn_running_long_event("alice", "s7", "dev-foo", "turn-42", 95);
         assert_eq!(ev["event"], CHAT_TURN_RUNNING_LONG);
         assert_eq!(ev["role"], "alice");
+        // The classifier selects a session's latest event BY SID — an untagged
+        // heartbeat would never be read as the session's own activity.
+        assert_eq!(ev["sid"], "s7");
         assert_eq!(ev["slug"], "dev-foo");
         assert_eq!(ev["turn_id"], "turn-42");
         assert_eq!(ev["elapsed_sec"], 95);
         assert!(ev["ts"].is_string());
+        assert!(!is_idle(Some(&ev)), "a heartbeat must classify as busy");
     }
 
     #[test]

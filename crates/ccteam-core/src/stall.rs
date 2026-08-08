@@ -312,6 +312,68 @@ mod tests {
         assert_eq!(working.last_activity_seconds, None);
     }
 
+    /// The heartbeat's whole purpose: a turn that has legitimately run past the
+    /// warn window still reads `working`, because the pump keeps refreshing the
+    /// session's newest row. Without one, the same turn's opening row ages out
+    /// and a busy child is reported to its parent as `stale`.
+    #[test]
+    fn heartbeat_keeps_a_long_turn_working_past_the_warn_window() {
+        let now = Utc::now();
+        let prompt = serde_json::json!({
+            "event": progress::CHAT_TURN_USER_PROMPT,
+            "sid": "s3",
+            "ts": (now - chrono::Duration::minutes(20)).to_rfc3339(),
+        });
+
+        let without_heartbeat =
+            classify_progress_activity_for_sid(std::slice::from_ref(&prompt), "s3", 0, now);
+        assert_eq!(without_heartbeat.status.activity, "stale");
+
+        let events = vec![
+            prompt,
+            serde_json::json!({
+                "event": progress::CHAT_TURN_RUNNING_LONG,
+                "sid": "s3",
+                "turn_id": "t1",
+                "elapsed_sec": 1200,
+                "ts": (now - chrono::Duration::seconds(30)).to_rfc3339(),
+            }),
+        ];
+        let with_heartbeat = classify_progress_activity_for_sid(&events, "s3", 0, now);
+        assert_eq!(with_heartbeat.status.activity, "working");
+        assert_eq!(with_heartbeat.status.verdict, "OK");
+        // A working turn hides its ever-growing age from status surfaces.
+        assert_eq!(with_heartbeat.last_activity_seconds, None);
+    }
+
+    /// A stuck flag is a verdict about ONE moment of silence, not a permanent
+    /// label: the next heartbeat becomes the newest row and the session reads
+    /// `working` again. (The classifier only ever looks at the latest sid row,
+    /// so this holds by construction — pin it so it stays that way.)
+    #[test]
+    fn heartbeat_after_a_timeout_flag_returns_to_working() {
+        let now = Utc::now();
+        let events = vec![
+            serde_json::json!({
+                "event": progress::CHAT_TURN_TIMEOUT,
+                "sid": "s3",
+                "stuck": true,
+                "ts": (now - chrono::Duration::minutes(6)).to_rfc3339(),
+            }),
+            serde_json::json!({
+                "event": progress::CHAT_TURN_RUNNING_LONG,
+                "sid": "s3",
+                "ts": (now - chrono::Duration::seconds(10)).to_rfc3339(),
+            }),
+        ];
+        assert_eq!(
+            classify_progress_activity_for_sid(&events, "s3", 0, now)
+                .status
+                .activity,
+            "working"
+        );
+    }
+
     #[test]
     fn from_phase_none_uses_defaults() {
         let t = StallThresholds::from_phase(None);

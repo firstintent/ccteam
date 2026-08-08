@@ -8,8 +8,8 @@ const SNAP: StatusSnapshot = {
   daemon_healthy: true,
   sessions_live: 2,
   sessions_idle: 1,
-  cost_24h_usd: 2.14,
-  cost_24h_by_vendor: { claude: 1.62, codex: 0.52 },
+  cost_24h_usd: 2.27,
+  cost_24h_by_vendor: { claude: 1.62, codex: 0.52, pi: 0.13 },
   budget_cap_24h: 20,
 };
 
@@ -48,8 +48,8 @@ describe("StatusCards", () => {
     const html = renderToString(<StatusCards status={SNAP} />);
     expect(html).toContain("live ·");
     expect(html).toContain("idle");
-    expect(html).toContain("$2.14 / $20.00");
-    expect(html).toContain("claude $1.62 · codex $0.52");
+    expect(html).toContain("$2.27 / $20.00");
+    expect(html).toContain("claude $1.62 · codex $0.52 · pi $0.13");
   });
 
   it("shows daemon-down and the empty cost line", () => {

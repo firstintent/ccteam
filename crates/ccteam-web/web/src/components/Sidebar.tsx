@@ -9,13 +9,16 @@
 // acceptance): logo → expand → search → new → flow → blank(click expands) →
 // settings → avatar.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
+  Copy,
   Folder,
+  FolderMinus,
+  MoreHorizontal,
   Pencil,
   Plus,
   Search,
@@ -26,6 +29,9 @@ import {
 import { CcLogo } from "./Logo";
 import { InlineRename } from "./InlineRename";
 import { VendorChip } from "./VendorChip";
+import { Dialog, Input } from "./ui";
+import { copyText } from "../lib/clipboard";
+import { toastBus } from "../lib/toastBus";
 import { makeT, tShowMore, type Lang } from "../lib/i18n";
 
 /** One sidebar session row — a live gateway session OR a stopped (history)
@@ -84,6 +90,76 @@ export function rowStoppable(row: Pick<RailRow, "history">): boolean {
   return !row.history;
 }
 
+/** The 「从 ccteam 移除」 confirm dialog behind the workspace ⋯ menu.
+ *  Type-the-slug gate for a destructive-looking action that is deliberately
+ *  NOT destructive on disk (`DELETE /api/v1/projects/{slug}` = deregister +
+ *  stop live sessions only) — the copy says exactly that. Controlled (state
+ *  lives in {@link Sidebar}) so tests can render it open directly. */
+export function RemoveProjectDialog({
+  lang,
+  project,
+  path,
+  typed,
+  busy,
+  onTyped,
+  onCancel,
+  onConfirm,
+}: {
+  lang: Lang;
+  project: string;
+  path?: string;
+  typed: string;
+  busy: boolean;
+  onTyped: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const t = makeT(lang);
+  return (
+    <Dialog
+      open
+      onClose={onCancel}
+      title={`${t("projectRemoveTitle")} · ${project}`}
+      className="max-w-md"
+    >
+      <div className="flex flex-col gap-3" data-testid={`project-remove-dialog-${project}`}>
+        <p className="text-xs leading-relaxed text-text-muted">{t("projectRemoveHint")}</p>
+        {path ? (
+          <code className="break-all font-mono text-[11px] text-text-dim">{path}</code>
+        ) : null}
+        <label className="text-xs text-text-secondary" htmlFor="project-remove-typed">
+          {t("projectRemoveType")}
+        </label>
+        <Input
+          id="project-remove-typed"
+          data-testid="project-remove-typed"
+          value={typed}
+          spellCheck={false}
+          autoComplete="off"
+          placeholder={project}
+          disabled={busy}
+          onChange={(e) => onTyped(e.target.value)}
+          className="font-mono"
+        />
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button type="button" className="btn ghost mini" onClick={onCancel} disabled={busy}>
+            {t("cancel")}
+          </button>
+          <button
+            type="button"
+            className="btn danger mini"
+            data-testid="project-remove-go"
+            disabled={busy || typed.trim() !== project}
+            onClick={onConfirm}
+          >
+            {busy ? t("projectRemoveBusy") : t("projectRemoveConfirm")}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
 export function Sidebar({
   lang,
   collapsed,
@@ -110,6 +186,8 @@ export function Sidebar({
   onOpenRow,
   onStopRow,
   onRenameRow,
+  onRemoveProject,
+  projectPaths = {},
 }: {
   lang: Lang;
   collapsed: boolean;
@@ -117,6 +195,8 @@ export function Sidebar({
   activeSid: string | null;
   projects: string[];
   projectHosts?: Record<string, { host: string; online: boolean }>;
+  /** Real working-tree path per slug — the ⋯ menu's 复制路径 source. */
+  projectPaths?: Record<string, string>;
   rows: RailRow[];
   query: string;
   flowActive: boolean;
@@ -139,12 +219,52 @@ export function Sidebar({
   /** Rename a row's session (live or stopped) — double-click a row, or use
    *  its ✎ button. Optional so embedding surfaces can omit the affordance. */
   onRenameRow?: (sid: string, title: string) => void;
+  /** Remove a project FROM CCTEAM (deregister only — disk untouched). The
+   *  caller owns the API call + toast + list refresh and resolves `true` on
+   *  success (closes the dialog). Omitted ⇒ the ⋯ menu hides the entry. */
+  onRemoveProject?: (slug: string) => Promise<boolean>;
 }) {
   const t = makeT(lang);
   const [closedWs, setClosedWs] = useState<Record<string, boolean>>({});
   const [expandedWs, setExpandedWs] = useState<Record<string, boolean>>({});
   /** sid currently being renamed inline (at most one at a time). */
   const [renaming, setRenaming] = useState<string | null>(null);
+  /** Project whose ⋯ menu is open (at most one), and the remove-confirm
+   *  dialog's target + typed echo + in-flight flag. */
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [removeFor, setRemoveFor] = useState<string | null>(null);
+  const [removeTyped, setRemoveTyped] = useState("");
+  const [removeBusy, setRemoveBusy] = useState(false);
+
+  // Any click outside the open ⋯ menu closes it (the menu's own buttons
+  // stopPropagation, so choosing an item wins the race).
+  useEffect(() => {
+    if (menuFor === null) return;
+    const close = () => setMenuFor(null);
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, [menuFor]);
+
+  const confirmRemove = async () => {
+    if (!onRemoveProject || !removeFor || removeBusy) return;
+    setRemoveBusy(true);
+    try {
+      if (await onRemoveProject(removeFor)) {
+        setRemoveFor(null);
+        setRemoveTyped("");
+      }
+    } finally {
+      setRemoveBusy(false);
+    }
+  };
+
+  const copyProjectPath = (project: string) => {
+    const path = projectPaths[project];
+    if (!path) return;
+    void copyText(path).then((ok) =>
+      ok ? toastBus.handler?.info(t("pathCopied")) : toastBus.handler?.error(t("copyFailed")),
+    );
+  };
 
   const q = query.trim();
   const filtered = filterRows(rows, q);
@@ -270,6 +390,72 @@ export function Sidebar({
                   >
                     ＋
                   </button>
+                  <span className="ws-menu-wrap">
+                    <button
+                      type="button"
+                      className={`wplus wmore ${menuFor === project ? "open" : ""}`}
+                      title={t("wsMenu")}
+                      aria-label={`${t("wsMenu")} ${project}`}
+                      aria-expanded={menuFor === project}
+                      data-testid={`ws-menu-btn-${project}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setMenuFor((cur) => (cur === project ? null : project));
+                      }}
+                    >
+                      <MoreHorizontal />
+                    </button>
+                    {menuFor === project ? (
+                      <div
+                        className="ws-menu"
+                        data-testid={`ws-menu-${project}`}
+                        role="menu"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setMenuFor(null);
+                            onNewInProject(project);
+                          }}
+                        >
+                          <Plus />
+                          {t("newInWs")}
+                        </button>
+                        {projectPaths[project] ? (
+                          <button
+                            type="button"
+                            role="menuitem"
+                            data-testid={`ws-menu-copy-${project}`}
+                            onClick={() => {
+                              setMenuFor(null);
+                              copyProjectPath(project);
+                            }}
+                          >
+                            <Copy />
+                            {t("wsMenuCopyPath")}
+                          </button>
+                        ) : null}
+                        {onRemoveProject ? (
+                          <button
+                            type="button"
+                            role="menuitem"
+                            className="danger"
+                            data-testid={`ws-menu-remove-${project}`}
+                            onClick={() => {
+                              setMenuFor(null);
+                              setRemoveTyped("");
+                              setRemoveFor(project);
+                            }}
+                          >
+                            <FolderMinus />
+                            {t("wsMenuRemove")}
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </span>
                 </div>
                 {closed
                   ? null
@@ -467,6 +653,24 @@ export function Sidebar({
           {userInitial}
         </div>
       </div>
+
+      {removeFor && onRemoveProject ? (
+        <RemoveProjectDialog
+          lang={lang}
+          project={removeFor}
+          path={projectPaths[removeFor]}
+          typed={removeTyped}
+          busy={removeBusy}
+          onTyped={setRemoveTyped}
+          onCancel={() => {
+            if (!removeBusy) {
+              setRemoveFor(null);
+              setRemoveTyped("");
+            }
+          }}
+          onConfirm={() => void confirmRemove()}
+        />
+      ) : null}
     </aside>
   );
 }

@@ -2118,6 +2118,7 @@ impl Orchestrator {
             AgentVendor::Grok => "grok",
             AgentVendor::Opencode => "opencode",
             AgentVendor::Kimi => "kimi",
+            AgentVendor::Pi => "pi",
         };
         match evt {
             ThreadEvent::ThreadStarted { .. } => None,
@@ -2139,6 +2140,7 @@ impl Orchestrator {
                         AgentVendor::Grok => ccteam_cost::Vendor::Grok,
                         AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
                         AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
+                        AgentVendor::Pi => ccteam_cost::Vendor::Pi,
                     },
                     priced_model,
                 );

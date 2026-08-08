@@ -6,6 +6,7 @@ import { renderToString } from "react-dom/server";
 import {
   filterRows,
   groupRows,
+  RemoveProjectDialog,
   rowStoppable,
   Sidebar,
   WS_SHOW,
@@ -98,10 +99,11 @@ describe("Sidebar SSR structure", () => {
         row({ sid: "s4", vendor: "opencode", history: true }),
         // Second workspace so the WS_SHOW row cap never folds this row away.
         row({ sid: "s5", vendor: "kimi", project: "demo2" }),
+        row({ sid: "s6", vendor: "pi", project: "demo2" }),
       ],
       { projects: ["demo", "demo2"] },
     );
-    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi"]) {
+    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi", "pi"]) {
       expect(html).toContain(`data-vendor="${vendor}"`);
       expect(html).toContain(`chip ${vendor} vendor-chip`);
     }
@@ -184,5 +186,50 @@ describe("Sidebar SSR structure", () => {
     expect(html).toContain("团队");
     // Active state reflected on the expanded button.
     expect(html).toMatch(/class="sflow active"[^>]*data-testid="side-team"/);
+  });
+
+  it("every workspace header carries the ⋯ menu button (closed by default)", () => {
+    const html = renderSidebar([row()], { onRemoveProject: async () => true });
+    expect(html).toContain('data-testid="ws-menu-btn-demo"');
+    // The dropdown itself only mounts on click.
+    expect(html).not.toContain('data-testid="ws-menu-demo"');
+    expect(html).not.toContain('data-testid="project-remove-dialog-demo"');
+  });
+});
+
+describe("RemoveProjectDialog (⋯ → 从 ccteam 移除)", () => {
+  it("states catalog-only semantics and gates 确认 on the typed slug", () => {
+    const mistyped = renderToString(
+      <RemoveProjectDialog
+        lang="zh"
+        project="demo"
+        path="/home/u/demo"
+        typed="dem"
+        busy={false}
+        onTyped={() => {}}
+        onCancel={() => {}}
+        onConfirm={() => {}}
+      />,
+    );
+    expect(mistyped).toContain('data-testid="project-remove-dialog-demo"');
+    // The whole safety story: disk files stay, sessions stop, re-addable.
+    expect(mistyped).toContain("磁盘上的目录与代码不动");
+    expect(mistyped).toContain("/home/u/demo");
+    const goBtn = mistyped.slice(mistyped.indexOf('data-testid="project-remove-go"'));
+    expect(goBtn.slice(0, goBtn.indexOf(">"))).toContain("disabled");
+
+    const exact = renderToString(
+      <RemoveProjectDialog
+        lang="zh"
+        project="demo"
+        typed="demo"
+        busy={false}
+        onTyped={() => {}}
+        onCancel={() => {}}
+        onConfirm={() => {}}
+      />,
+    );
+    const goBtn2 = exact.slice(exact.indexOf('data-testid="project-remove-go"'));
+    expect(goBtn2.slice(0, goBtn2.indexOf(">"))).not.toContain("disabled");
   });
 });
