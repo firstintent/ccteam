@@ -921,22 +921,45 @@ pub struct RunningTask {
     /// When `task_started` arrived — for the elapsed-time display. In-memory
     /// only (never persisted / serialized).
     pub started: std::time::Instant,
+    /// Whether the harness itself reports this task as running in the
+    /// BACKGROUND — claude's `system:background_tasks_changed` snapshot
+    /// (probed live 2026-08-07: an async `Agent` launch is listed, a
+    /// blocking `Task` subagent is never listed). The vendor's own answer to
+    /// "does this task block the turn", so ccteam never has to infer it from
+    /// `task_type`. Adapters with no such signal leave it `false` and fall
+    /// back to the `task_type` vocabulary in [`Self::outlives_turn`].
+    pub backgrounded: bool,
 }
 
 impl RunningTask {
-    /// True for a task that legitimately OUTLIVES the turn that spawned it:
-    /// background workflows (`local_workflow`) and background shells
-    /// (`local_bash` = Bash `run_in_background` + Monitor watches; vocabulary
-    /// probed live 2026-07-22) keep running after the spawning turn's result
-    /// and report their own terminal `task_updated`/`task_notification`
-    /// later. Sync subagents (`local_agent`) are turn-scoped. Single
-    /// authority for BOTH the stream-json turn-end eviction net and the IM
-    /// `/status` "authoritative working signal" — the two must never diverge:
-    /// an outliving task left over from an earlier turn must not mask a
-    /// genuinely stuck later turn, and conversely must survive turn end so an
-    /// idle session still shows it.
+    /// True for a task that legitimately OUTLIVES the turn that spawned it, so
+    /// the turn-end eviction net must not drop it and it must not be read as
+    /// proof that THIS turn is alive.
+    ///
+    /// Two legs, vendor signal first:
+    /// - the harness listed it as a background task (`backgrounded`) — the
+    ///   authoritative answer, which covers async `Agent` launches
+    ///   (`local_agent` that returns immediately and keeps running);
+    /// - else the `task_type` vocabulary: background workflows
+    ///   (`local_workflow`) and background shells (`local_bash` = Bash
+    ///   `run_in_background` + Monitor watches; probed live 2026-07-22).
+    ///
+    /// A BLOCKING subagent (`local_agent` the vendor never backgrounds) is
+    /// turn-scoped and stays so. Reading `backgrounded` instead of hard-coding
+    /// `local_agent` is what keeps this correct as the vendor moves task kinds
+    /// between blocking and background: before 2026-08, every `local_agent`
+    /// blocked its turn, so `/status` lost async agents the instant their
+    /// launching turn ended (they can run for hours) while the terminal
+    /// `task_updated`/`task_notification` that would have closed them arrived
+    /// much later.
+    ///
+    /// Single authority for BOTH the stream-json turn-end eviction net and the
+    /// IM `/status` "authoritative working signal" — the two must never
+    /// diverge: an outliving task left over from an earlier turn must not mask
+    /// a genuinely stuck later turn, and conversely must survive turn end so
+    /// an idle session still shows it.
     pub fn outlives_turn(&self) -> bool {
-        matches!(self.task_type.as_str(), "local_workflow" | "local_bash")
+        self.backgrounded || matches!(self.task_type.as_str(), "local_workflow" | "local_bash")
     }
 }
 

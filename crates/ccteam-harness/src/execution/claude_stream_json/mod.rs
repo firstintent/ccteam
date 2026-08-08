@@ -33,7 +33,7 @@ pub mod spawn_spec;
 pub mod translate;
 pub mod transport;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -100,9 +100,9 @@ struct LiveSession {
     /// v0.8.20 `/status` — the session's currently-running subagent/workflow
     /// tasks, reflected from claude's `system:task_*` lifecycle by the same
     /// [`spawn_status_tap`] (`task_started` adds, a terminal status removes; the
-    /// per-turn `result` clears as a safety net). Read by
+    /// per-turn `result` clears TURN-SCOPED ones as a safety net). Read by
     /// [`HarnessAdapter::running_tasks`]. Interior-mutable, shared with the tap.
-    running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>>,
+    running_tasks: Arc<StdMutex<TaskTracker>>,
     /// Adapter-local vendor-turn occupancy for truthful Started vs Injected
     /// submission receipts. Set before writing input; cleared on TurnResult.
     active_turn: Arc<AtomicBool>,
@@ -215,7 +215,7 @@ fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
 fn spawn_status_tap(
     transport: Arc<StreamJsonTransport>,
     status: Arc<StdMutex<ThreadStatus>>,
-    running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>>,
+    running_tasks: Arc<StdMutex<TaskTracker>>,
     active_turn: Arc<AtomicBool>,
     project_dir: PathBuf,
     sid: String,
@@ -313,16 +313,17 @@ fn spawn_status_tap(
                     Ok(Outbound::TurnResult(_)) => {
                         active_turn.store(false, Ordering::Release);
                         effort_probed_this_turn = false;
-                        // The turn ended — turn-scoped tasks (sync subagents)
-                        // cannot still be running, so drop them as a safety net in
-                        // case a terminal task event was missed. Background
-                        // workflows AND background shells (Bash run_in_background
-                        // / Monitor) OUTLIVE the turn by design (the tool returns
-                        // immediately and the run keeps going), so they stay until
-                        // their own terminal task event arrives — this is what
-                        // lets an idle session still show its in-flight work.
+                        // The turn ended — BLOCKING tasks cannot still be running,
+                        // so drop them as a safety net in case a terminal task
+                        // event was missed. Anything the vendor runs in the
+                        // BACKGROUND outlives the turn by design (the tool returns
+                        // immediately and the run keeps going) and stays until its
+                        // own terminal task event arrives — background workflows,
+                        // background shells (Bash run_in_background / Monitor) and
+                        // async `Agent` launches alike. That is what lets an idle
+                        // session still show its in-flight work.
                         if let Ok(mut t) = running_tasks.lock() {
-                            t.retain(task_outlives_turn);
+                            t.tasks.retain(task_outlives_turn);
                         }
                         // Context is read STRICTLY from claude's OWN accounting
                         // (`get_context_usage` → real totalTokens + maxTokens). No
@@ -382,11 +383,45 @@ fn spawn_status_tap(
 /// True for a task that legitimately OUTLIVES the turn that spawned it, so the
 /// turn-end safety net must not evict it. Thin alias for
 /// [`crate::RunningTask::outlives_turn`] (the vocabulary's single authority,
-/// shared with the IM `/status` working-signal check): background workflows
-/// AND background shells (Bash `run_in_background` / Monitor) survive; sync
-/// subagents are turn-scoped.
+/// shared with the IM `/status` working-signal check): anything the vendor
+/// backgrounded — plus the `local_workflow` / `local_bash` fallback — survives;
+/// a task that BLOCKS its turn is turn-scoped.
 fn task_outlives_turn(t: &crate::RunningTask) -> bool {
     t.outlives_turn()
+}
+
+/// The session's running-task mirror: claude's `system:task_*` list plus the
+/// ids claude currently reports as BACKGROUND
+/// (`system:background_tasks_changed`, a FULL snapshot re-sent on every
+/// change).
+///
+/// Both live behind ONE lock so the two events agree whichever order they
+/// arrive in. claude sends the snapshot just BEFORE the matching `task_started`
+/// (probed 2026-08-07), but nothing in the protocol promises that, and a
+/// backgrounded task read as blocking is exactly the bug this replaces: an
+/// async `Agent` launch vanished from `/status` the moment its launching turn
+/// ended, while it kept working for hours.
+#[derive(Default)]
+struct TaskTracker {
+    /// Running tasks, in `task_started` order.
+    tasks: Vec<crate::RunningTask>,
+    /// Ids from the latest `background_tasks_changed` snapshot.
+    background_ids: HashSet<String>,
+}
+
+impl TaskTracker {
+    /// Adopt a fresh background snapshot and re-stamp every tracked task.
+    ///
+    /// Re-stamping BOTH ways is deliberate: a task claude drops from the
+    /// snapshot becomes turn-scoped again, so the turn-end net can still
+    /// reclaim it if its terminal event is ever missed — the snapshot narrows
+    /// the eviction net, it must never disable it.
+    fn set_background(&mut self, ids: HashSet<String>) {
+        self.background_ids = ids;
+        for t in &mut self.tasks {
+            t.backgrounded = self.background_ids.contains(&t.task_id);
+        }
+    }
 }
 
 /// True for a task `status` that means the task is no longer running, so it
@@ -425,23 +460,38 @@ fn task_status_is_terminal(s: &str) -> bool {
 /// A plain `Agent` subagent and a workflow task both flow through these events
 /// (distinguished by `task_type`). Non-task system subtypes (`init`,
 /// `commands_changed`) are ignored.
-fn reflect_task_event(
-    running_tasks: &StdMutex<Vec<crate::RunningTask>>,
-    sys: &protocol::SystemMsg,
-) {
+///
+/// `background_tasks_changed` rides the same path but only records WHICH ids
+/// the vendor currently runs in the background: it carries no `subagent_type`,
+/// so it never seeds the list — `task_started` stays the single membership
+/// source, with the richer fields `/status` renders.
+fn reflect_task_event(running_tasks: &StdMutex<TaskTracker>, sys: &protocol::SystemMsg) {
     match sys.subtype.as_str() {
+        "background_tasks_changed" => {
+            if let Ok(mut tracker) = running_tasks.lock() {
+                let ids = sys
+                    .tasks
+                    .iter()
+                    .filter(|t| !t.task_id.is_empty())
+                    .map(|t| t.task_id.clone())
+                    .collect();
+                tracker.set_background(ids);
+            }
+        }
         "task_started" if !sys.task_id.is_empty() => {
-            if let Ok(mut tasks) = running_tasks.lock() {
+            if let Ok(mut tracker) = running_tasks.lock() {
                 // Idempotent: a duplicate `task_started` must not double-insert.
-                if tasks.iter().any(|t| t.task_id == sys.task_id) {
+                if tracker.tasks.iter().any(|t| t.task_id == sys.task_id) {
                     return;
                 }
-                tasks.push(crate::RunningTask {
+                let backgrounded = tracker.background_ids.contains(&sys.task_id);
+                tracker.tasks.push(crate::RunningTask {
                     task_id: sys.task_id.clone(),
                     kind: sys.subagent_type.clone(),
                     description: sys.description.clone(),
                     task_type: sys.task_type.clone(),
                     started: Instant::now(),
+                    backgrounded,
                 });
             }
         }
@@ -454,14 +504,14 @@ fn reflect_task_event(
                 .map(task_status_is_terminal)
                 .unwrap_or(false);
             if terminal {
-                if let Ok(mut tasks) = running_tasks.lock() {
-                    tasks.retain(|t| t.task_id != sys.task_id);
+                if let Ok(mut tracker) = running_tasks.lock() {
+                    tracker.tasks.retain(|t| t.task_id != sys.task_id);
                 }
             }
         }
         "task_notification" if !sys.task_id.is_empty() && task_status_is_terminal(&sys.status) => {
-            if let Ok(mut tasks) = running_tasks.lock() {
-                tasks.retain(|t| t.task_id != sys.task_id);
+            if let Ok(mut tracker) = running_tasks.lock() {
+                tracker.tasks.retain(|t| t.task_id != sys.task_id);
             }
         }
         _ => {}
@@ -1200,8 +1250,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         }));
         // v0.8.20 `/status` — the live running-subagent/workflow list, kept
         // current by the SAME status tap from claude's `system:task_*` events.
-        let running_tasks: Arc<StdMutex<Vec<crate::RunningTask>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let running_tasks: Arc<StdMutex<TaskTracker>> =
+            Arc::new(StdMutex::new(TaskTracker::default()));
         let active_turn = Arc::new(AtomicBool::new(false));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
@@ -1771,7 +1821,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             Some(live) => live
                 .running_tasks
                 .lock()
-                .map(|t| t.clone())
+                .map(|t| t.tasks.clone())
                 .unwrap_or_default(),
             None => Vec::new(),
         }
@@ -1836,7 +1886,7 @@ mod effort_tests {
     use super::{
         claude_model_options, is_model_placeholder, normalize_effort, parse_latest_goal_status,
         persisted_session_model, preserve_1m_tag, reflect_task_event, set_effort_level,
-        split_model_effort, task_outlives_turn, write_status_file, ClaudeModelOption,
+        split_model_effort, task_outlives_turn, write_status_file, ClaudeModelOption, TaskTracker,
         EFFORT_LEVELS,
     };
     use crate::ThreadStatus;
@@ -1907,7 +1957,7 @@ mod effort_tests {
     /// lines are ignored.
     #[test]
     fn reflect_task_event_mirrors_claude_task_lifecycle() {
-        let tasks = Mutex::new(Vec::new());
+        let tasks = Mutex::new(TaskTracker::default());
         // task_started adds, carrying kind/description from the event.
         let mut started = task_sys("task_started", "t1");
         started.subagent_type = "code-reviewer".into();
@@ -1918,20 +1968,20 @@ mod effort_tests {
         reflect_task_event(&tasks, &task_sys("task_started", "t1"));
         {
             let g = tasks.lock().unwrap();
-            assert_eq!(g.len(), 1);
-            assert_eq!(g[0].kind, "code-reviewer");
-            assert_eq!(g[0].description, "review auth");
-            assert_eq!(g[0].task_type, "local_agent");
+            assert_eq!(g.tasks.len(), 1);
+            assert_eq!(g.tasks[0].kind, "code-reviewer");
+            assert_eq!(g.tasks[0].description, "review auth");
+            assert_eq!(g.tasks[0].task_type, "local_agent");
         }
         // A second task.
         reflect_task_event(&tasks, &task_sys("task_started", "t2"));
-        assert_eq!(tasks.lock().unwrap().len(), 2);
+        assert_eq!(tasks.lock().unwrap().tasks.len(), 2);
         // A NON-terminal patch keeps the task running.
         let mut running = task_sys("task_updated", "t1");
         running.patch = Some(serde_json::json!({"status": "in_progress"}));
         reflect_task_event(&tasks, &running);
         assert_eq!(
-            tasks.lock().unwrap().len(),
+            tasks.lock().unwrap().tasks.len(),
             2,
             "non-terminal patch keeps it"
         );
@@ -1941,17 +1991,17 @@ mod effort_tests {
         reflect_task_event(&tasks, &done);
         {
             let g = tasks.lock().unwrap();
-            assert_eq!(g.len(), 1, "completed patch removes t1");
-            assert_eq!(g[0].task_id, "t2");
+            assert_eq!(g.tasks.len(), 1, "completed patch removes t1");
+            assert_eq!(g.tasks[0].task_id, "t2");
         }
         // task_notification{status:completed} removes t2.
         let mut note = task_sys("task_notification", "t2");
         note.status = "completed".into();
         reflect_task_event(&tasks, &note);
-        assert!(tasks.lock().unwrap().is_empty());
+        assert!(tasks.lock().unwrap().tasks.is_empty());
         // A non-task system line (init) is ignored (no panic, no insert).
         reflect_task_event(&tasks, &task_sys("init", ""));
-        assert!(tasks.lock().unwrap().is_empty());
+        assert!(tasks.lock().unwrap().tasks.is_empty());
     }
 
     /// The turn-end safety net evicts turn-scoped tasks (subagents) but keeps
@@ -1959,7 +2009,7 @@ mod effort_tests {
     /// turn; the workflow still leaves the list on its OWN terminal event.
     #[test]
     fn turn_end_safety_net_keeps_background_workflows() {
-        let tasks = Mutex::new(Vec::new());
+        let tasks = Mutex::new(TaskTracker::default());
         let mut agent = task_sys("task_started", "a1");
         agent.subagent_type = "general-purpose".into();
         agent.task_type = "local_agent".into();
@@ -1969,17 +2019,17 @@ mod effort_tests {
         wf.task_type = "local_workflow".into();
         reflect_task_event(&tasks, &wf);
         // What the TurnResult arm applies: retain only tasks that outlive a turn.
-        tasks.lock().unwrap().retain(task_outlives_turn);
+        tasks.lock().unwrap().tasks.retain(task_outlives_turn);
         {
             let g = tasks.lock().unwrap();
-            assert_eq!(g.len(), 1, "subagent evicted, workflow retained");
-            assert_eq!(g[0].task_id, "w1");
+            assert_eq!(g.tasks.len(), 1, "subagent evicted, workflow retained");
+            assert_eq!(g.tasks[0].task_id, "w1");
         }
         // The workflow's own terminal notification still removes it.
         let mut note = task_sys("task_notification", "w1");
         note.status = "completed".into();
         reflect_task_event(&tasks, &note);
-        assert!(tasks.lock().unwrap().is_empty());
+        assert!(tasks.lock().unwrap().tasks.is_empty());
     }
 
     /// Background SHELLS (`local_bash` — Bash `run_in_background` + Monitor
@@ -1990,23 +2040,114 @@ mod effort_tests {
     /// `make test` — the exact observability gap reported from the field.
     #[test]
     fn turn_end_safety_net_keeps_background_shells() {
-        let tasks = Mutex::new(Vec::new());
+        let tasks = Mutex::new(TaskTracker::default());
         let mut sh = task_sys("task_started", "b1");
         sh.description = "make test".into();
         sh.task_type = "local_bash".into();
         reflect_task_event(&tasks, &sh);
         // What the TurnResult arm applies at turn end.
-        tasks.lock().unwrap().retain(task_outlives_turn);
+        tasks.lock().unwrap().tasks.retain(task_outlives_turn);
         {
             let g = tasks.lock().unwrap();
-            assert_eq!(g.len(), 1, "background shell survives turn end");
-            assert_eq!(g[0].task_id, "b1");
+            assert_eq!(g.tasks.len(), 1, "background shell survives turn end");
+            assert_eq!(g.tasks[0].task_id, "b1");
         }
         // Its own terminal notification still removes it.
         let mut note = task_sys("task_notification", "b1");
         note.status = "completed".into();
         reflect_task_event(&tasks, &note);
-        assert!(tasks.lock().unwrap().is_empty());
+        assert!(tasks.lock().unwrap().tasks.is_empty());
+    }
+
+    /// Build the `background_tasks_changed` snapshot claude re-sends on every
+    /// change (ids only — the wire entry carries no `subagent_type`).
+    fn background_sys(ids: &[&str]) -> SystemMsg {
+        SystemMsg {
+            subtype: "background_tasks_changed".into(),
+            tasks: ids
+                .iter()
+                .map(|id| super::protocol::BackgroundTaskRef {
+                    task_id: (*id).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// THE REPORTED BUG (2026-08-07, real machine) — an ASYNC `Agent` launch
+    /// disappeared from IM `/status` the instant its launching turn ended,
+    /// while it kept working for another 24+ minutes (s234: `B5p-pre` /
+    /// `mm-audit` launched 21:24, turn ended 21:24:51, their sidechain jsonl
+    /// still growing at 21:48; every `/status` card from 21:25 on showed only
+    /// `后台任务`). Both kinds are `task_type: local_agent`, so the old
+    /// `task_type`-only rule could not tell them apart and evicted BOTH.
+    ///
+    /// Probed protocol truth (2026-08-07): claude announces the async one in a
+    /// `background_tasks_changed` snapshot and closes it with its own terminal
+    /// event much later (t=7.0s started → t=11.4s turn result → t=20.6s
+    /// completed); a BLOCKING `Task` subagent is never in a snapshot and
+    /// completes before its turn's result (t=8.9s → t=59.9s → t=63.4s).
+    #[test]
+    fn turn_end_safety_net_keeps_agents_the_vendor_backgrounded() {
+        let tasks = Mutex::new(TaskTracker::default());
+        // Async `Agent`: the snapshot lands just before its `task_started`.
+        reflect_task_event(&tasks, &background_sys(&["async1"]));
+        let mut async_agent = task_sys("task_started", "async1");
+        async_agent.subagent_type = "claude".into();
+        async_agent.description = "B5p 硬前置".into();
+        async_agent.task_type = "local_agent".into();
+        reflect_task_event(&tasks, &async_agent);
+        // Blocking `Task` subagent: same task_type, never in a snapshot.
+        let mut blocking = task_sys("task_started", "sync1");
+        blocking.subagent_type = "Explore".into();
+        blocking.task_type = "local_agent".into();
+        reflect_task_event(&tasks, &blocking);
+        {
+            let g = tasks.lock().unwrap();
+            assert!(g.tasks[0].backgrounded, "vendor said async1 is background");
+            assert!(!g.tasks[1].backgrounded, "sync1 blocks its turn");
+        }
+        // What the TurnResult arm applies at turn end.
+        tasks.lock().unwrap().tasks.retain(task_outlives_turn);
+        {
+            let g = tasks.lock().unwrap();
+            assert_eq!(g.tasks.len(), 1, "only the blocking subagent is evicted");
+            assert_eq!(g.tasks[0].task_id, "async1");
+            // Still rendered with the RICH fields — the snapshot decides
+            // background-ness only, `task_started` owns membership + labels.
+            assert_eq!(g.tasks[0].kind, "claude");
+            assert_eq!(g.tasks[0].description, "B5p 硬前置");
+        }
+        // The async agent still leaves on its OWN terminal event.
+        let mut note = task_sys("task_notification", "async1");
+        note.status = "completed".into();
+        reflect_task_event(&tasks, &note);
+        assert!(tasks.lock().unwrap().tasks.is_empty());
+    }
+
+    /// The snapshot and `task_started` must agree whichever order they arrive
+    /// in (claude sends the snapshot first today; nothing promises it), and a
+    /// task the vendor DROPS from the snapshot becomes turn-scoped again — the
+    /// snapshot narrows the eviction net, it must never disable it.
+    #[test]
+    fn background_snapshot_is_order_independent_and_reversible() {
+        let tasks = Mutex::new(TaskTracker::default());
+        // task_started FIRST, snapshot second.
+        let mut agent = task_sys("task_started", "a1");
+        agent.task_type = "local_agent".into();
+        reflect_task_event(&tasks, &agent);
+        assert!(!tasks.lock().unwrap().tasks[0].backgrounded);
+        reflect_task_event(&tasks, &background_sys(&["a1"]));
+        assert!(
+            tasks.lock().unwrap().tasks[0].backgrounded,
+            "a later snapshot re-stamps an already-tracked task"
+        );
+        // Dropped from the snapshot ⇒ turn-scoped again ⇒ the net reclaims it
+        // even if its terminal event never arrives.
+        reflect_task_event(&tasks, &background_sys(&[]));
+        assert!(!tasks.lock().unwrap().tasks[0].backgrounded);
+        tasks.lock().unwrap().tasks.retain(task_outlives_turn);
+        assert!(tasks.lock().unwrap().tasks.is_empty());
     }
 
     /// TaskStop closes a task with `task_notification{status:"stopped"}`, and
@@ -2016,7 +2157,7 @@ mod effort_tests {
     /// "running" forever (observed as a `/status` zombie aging past 14h).
     #[test]
     fn stopped_and_killed_are_terminal_statuses() {
-        let tasks = Mutex::new(Vec::new());
+        let tasks = Mutex::new(TaskTracker::default());
         let mut wf = task_sys("task_started", "w1");
         wf.task_type = "local_workflow".into();
         reflect_task_event(&tasks, &wf);
@@ -2024,7 +2165,7 @@ mod effort_tests {
         note.status = "stopped".into();
         reflect_task_event(&tasks, &note);
         assert!(
-            tasks.lock().unwrap().is_empty(),
+            tasks.lock().unwrap().tasks.is_empty(),
             "task_notification stopped must evict"
         );
         let mut wf2 = task_sys("task_started", "w2");
@@ -2034,7 +2175,7 @@ mod effort_tests {
         patch.patch = Some(serde_json::json!({"status": "killed"}));
         reflect_task_event(&tasks, &patch);
         assert!(
-            tasks.lock().unwrap().is_empty(),
+            tasks.lock().unwrap().tasks.is_empty(),
             "task_updated killed must evict"
         );
     }

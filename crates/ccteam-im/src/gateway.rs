@@ -7339,13 +7339,15 @@ impl Gateway {
         }
 
         // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
-        // 🔴 stuck — EXCEPT running subagents are an AUTHORITATIVE "still working"
-        // signal (straight from claude) that overrides the silence heuristic, so
-        // a main session quietly awaiting subagents never mis-reads idle/stuck.
-        // Turn-OUTLIVING tasks (background workflows / shells / monitors) do NOT
-        // override: they survive the spawning turn by design, so a leftover run
-        // must not mask a genuinely stuck later turn. Same vocabulary as the
-        // harness turn-end eviction (`RunningTask::outlives_turn`).
+        // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
+        // working" signal (straight from claude) that overrides the silence
+        // heuristic, so a main session quietly awaiting one never mis-reads
+        // idle/stuck. Turn-OUTLIVING tasks (background workflows / shells /
+        // monitors, and async `Agent` launches the vendor reports as
+        // background) do NOT override: they survive the spawning turn by
+        // design, so a leftover run must not mask a genuinely stuck later turn.
+        // Same vocabulary as the harness turn-end eviction
+        // (`RunningTask::outlives_turn`).
         let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
         let mut stuck_after = gateway_turn_timeout_duration();
         if stuck_after.is_zero() {
@@ -16649,6 +16651,7 @@ mod tests {
                 description: desc.into(),
                 task_type: task_type.into(),
                 started: std::time::Instant::now(),
+                backgrounded: false,
             }
         }
         // Nothing running → nothing rendered.
@@ -16687,23 +16690,35 @@ mod tests {
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the
-    /// harness turn-end eviction: background workflows AND background shells
-    /// survive a turn boundary; sync subagents are turn-scoped.
+    /// harness turn-end eviction: whatever the vendor reports as BACKGROUND,
+    /// plus the `local_workflow` / `local_bash` fallback, survives a turn
+    /// boundary; a subagent that BLOCKS its turn is turn-scoped.
+    ///
+    /// The `backgrounded` leg is what keeps `/status` honest about an async
+    /// `Agent` launch (same `local_agent` task_type as a blocking one, but it
+    /// keeps running for hours after its launching turn ends), while a
+    /// blocking subagent still counts as proof THIS turn is alive so a main
+    /// session waiting on one never mis-reads STUCK.
     #[test]
-    fn outlives_turn_vocabulary_covers_workflows_and_bg_shells() {
-        fn t(task_type: &str) -> RunningTask {
+    fn outlives_turn_vocabulary_covers_workflows_bg_shells_and_backgrounded() {
+        fn t(task_type: &str, backgrounded: bool) -> RunningTask {
             RunningTask {
                 task_id: "x".into(),
                 kind: String::new(),
                 description: String::new(),
                 task_type: task_type.into(),
                 started: std::time::Instant::now(),
+                backgrounded,
             }
         }
-        assert!(t("local_workflow").outlives_turn());
-        assert!(t("local_bash").outlives_turn());
-        assert!(!t("local_agent").outlives_turn());
-        assert!(!t("").outlives_turn());
+        assert!(t("local_workflow", false).outlives_turn());
+        assert!(t("local_bash", false).outlives_turn());
+        assert!(
+            !t("local_agent", false).outlives_turn(),
+            "blocking subagent"
+        );
+        assert!(t("local_agent", true).outlives_turn(), "async Agent launch");
+        assert!(!t("", false).outlives_turn());
     }
 
     /// v0.8.19 `/status` — ACL: a foreign IM chat does NOT see another chat's
