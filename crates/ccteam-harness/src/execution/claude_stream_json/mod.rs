@@ -1054,17 +1054,23 @@ impl ClaudeStreamJsonAdapter {
                 exec_spec.env.insert(k.clone(), v.clone());
             }
         }
-        if ship_mcp {
-            let daemon_url_mcp = format!(
-                "{}/mcp",
-                crate::execution::remote_exec::ExecSpec::DAEMON_URL_TOKEN
-            );
-            let input = crate::execution::mcp_config::CuratedMcpInput {
-                sid: &ctx.sid,
-                secret: &ctx.secret,
-                http_url: Some(&daemon_url_mcp),
-            };
-            let body = crate::execution::mcp_config::build_curated_mcp_json(&input);
+        // Same endpoint semantics as a local spawn; only the URL differs — a
+        // token the satellite substitutes with its own daemon_url, so the main
+        // daemon never has to guess its LAN-reachable address.
+        let endpoint = ship_mcp
+            .then(|| {
+                crate::execution::mcp_config::SessionMcpEndpoint::at(
+                    &format!(
+                        "{}/mcp",
+                        crate::execution::remote_exec::ExecSpec::DAEMON_URL_TOKEN
+                    ),
+                    &ctx.sid,
+                    &ctx.secret,
+                )
+            })
+            .flatten();
+        if let Some(endpoint) = endpoint {
+            let body = crate::execution::mcp_config::project_claude_mcp_json(&endpoint);
             match serde_json::to_string_pretty(&body) {
                 Ok(content) => exec_spec
                     .files

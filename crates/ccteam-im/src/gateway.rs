@@ -1704,21 +1704,24 @@ impl Gateway {
         // and LOSE all ccteam MCP tools (it could no longer delegate).
         // ACP/codex pass mcpServers inline with the current secret each resume,
         // so this file rewrite is the one gap. Best-effort (mirrors fresh path).
-        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
-        {
-            let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
-                sid: &plan.sid,
-                secret: &plan.secret,
-                http_url: None,
-            };
-            if let Err(e) =
-                ccteam_harness::execution::mcp_config::write_session_mcp_config(&plan.cwd, &input)
+        // `resolve` IS the principal check (no sid/secret -> no tool face), so
+        // this path no longer repeats it.
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) {
+            if let Some(endpoint) =
+                ccteam_harness::execution::mcp_config::SessionMcpEndpoint::resolve(
+                    &plan.sid,
+                    &plan.secret,
+                )
             {
-                tracing::warn!(
-                    sid = %plan.sid,
-                    error = %e,
-                    "curated mcp.json rewrite on resume failed; session continues without MCP"
-                );
+                if let Err(e) = ccteam_harness::execution::mcp_config::write_session_mcp_config(
+                    &plan.cwd, &plan.sid, &endpoint,
+                ) {
+                    tracing::warn!(
+                        sid = %plan.sid,
+                        error = %e,
+                        "curated mcp.json rewrite on resume failed; session continues without MCP"
+                    );
+                }
             }
         }
         plan.adapter
@@ -3537,21 +3540,22 @@ impl Gateway {
         // well-known (chat/<sid>/mcp.json); the adapter attaches --mcp-config
         // when the file exists. Best-effort: spawn still proceeds if write fails
         // (session runs without in-agent ccteam tools).
-        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
-        {
-            let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
-                sid: &plan.id,
-                secret: &plan.secret,
-                http_url: None,
-            };
-            if let Err(e) =
-                ccteam_harness::execution::mcp_config::write_session_mcp_config(&plan.cwd, &input)
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) {
+            if let Some(endpoint) =
+                ccteam_harness::execution::mcp_config::SessionMcpEndpoint::resolve(
+                    &plan.id,
+                    &plan.secret,
+                )
             {
-                tracing::warn!(
-                    sid = %plan.id,
-                    error = %e,
-                    "curated mcp.json write failed; session continues without MCP"
-                );
+                if let Err(e) = ccteam_harness::execution::mcp_config::write_session_mcp_config(
+                    &plan.cwd, &plan.id, &endpoint,
+                ) {
+                    tracing::warn!(
+                        sid = %plan.id,
+                        error = %e,
+                        "curated mcp.json write failed; session continues without MCP"
+                    );
+                }
             }
         }
         plan.adapter

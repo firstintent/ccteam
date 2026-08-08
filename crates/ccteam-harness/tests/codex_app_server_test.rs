@@ -2983,7 +2983,7 @@ async fn start_thread_injects_per_thread_mcp_config_with_identity() {
     let srv = &start["params"]["config"]["mcp_servers"]["ccteam"];
     assert_eq!(
         srv["url"],
-        ccteam_harness::execution::mcp_config::default_mcp_http_url(),
+        ccteam_harness::execution::mcp_config::daemon_mcp_http_url(),
         "per-thread config must target the daemon HTTP MCP endpoint: {start}"
     );
     assert_eq!(

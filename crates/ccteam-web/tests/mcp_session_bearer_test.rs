@@ -375,9 +375,9 @@ async fn codex_http_thread_config_passes_session_principal_gate() {
     let addr = spawn_server(app).await;
     let url = format!("http://{addr}/mcp");
 
-    let config =
-        ccteam_harness::execution::mcp_config::codex_thread_mcp_config_at(&sid, &secret, &url)
-            .expect("live session principal produces a Codex thread override");
+    let config = ccteam_harness::execution::mcp_config::SessionMcpEndpoint::at(&url, &sid, &secret)
+        .map(|ep| ccteam_harness::execution::mcp_config::project_codex_thread_config(&ep))
+        .expect("live session principal produces a Codex thread override");
     let server = &config["mcp_servers"]["ccteam"];
     assert_eq!(server["url"], url);
     assert!(server.get("command").is_none(), "Codex MCP must be HTTP");
@@ -444,7 +444,8 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
     ccteam_core::mcp_register::install_codex_mcp_into(&config_toml, &url, TOKEN_HEX).unwrap();
 
     let thread_config =
-        ccteam_harness::execution::mcp_config::codex_thread_mcp_config_at(&sid, &secret, &url)
+        ccteam_harness::execution::mcp_config::SessionMcpEndpoint::at(&url, &sid, &secret)
+            .map(|ep| ccteam_harness::execution::mcp_config::project_codex_thread_config(&ep))
             .unwrap();
     let mut child = Command::new("codex")
         .args(["app-server", "--listen", "stdio://"])

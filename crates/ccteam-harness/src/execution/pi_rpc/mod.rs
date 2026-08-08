@@ -42,6 +42,7 @@ use translate::PiTurnTranslator;
 use transport::{PiTransport, PiTransportEvent};
 
 use crate::execution::fs_atomic::atomic_write_durable;
+use crate::execution::mcp_config::SessionMcpEndpoint;
 use crate::execution::session_status::write_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind, ApprovalScope, ChoiceOption,
@@ -436,6 +437,21 @@ impl PiRpcAdapter {
         }
     }
 
+    /// Pi's tool surface is `ManagedSessionBridge`: the ccteam-owned extension
+    /// IS the MCP client, and it hard-fails on load without an endpoint. So
+    /// resolve it BEFORE spawning and refuse here with an actionable message —
+    /// otherwise the missing endpoint surfaces as a dead child wrapped in
+    /// "Pi RPC feature handshake failed", which reads like a version problem.
+    fn session_mcp_endpoint(ctx: &SpawnCtx) -> Result<SessionMcpEndpoint, HarnessError> {
+        SessionMcpEndpoint::resolve(&ctx.sid, &ctx.secret).ok_or_else(|| {
+            HarnessError::SpawnFailed(format!(
+                "Pi sessions need a ccteam MCP principal (sid + per-session secret); \
+                 sid=`{}` has none, so the ccteam bridge extension cannot authenticate",
+                ctx.sid
+            ))
+        })
+    }
+
     async fn start_impl(
         &self,
         spec: &AgentSpecBrief,
@@ -507,6 +523,7 @@ impl PiRpcAdapter {
             PiSpawnInput {
                 session,
                 bridge_extension: materialize_bridge()?,
+                mcp: Self::session_mcp_endpoint(ctx)?,
                 system_prompt: role.prompt_path.clone(),
                 model: model.clone(),
                 effort: effort.clone(),
@@ -648,6 +665,7 @@ impl PiRpcAdapter {
                     session_file: config.session_file.clone(),
                 },
                 bridge_extension: materialize_bridge()?,
+                mcp: Self::session_mcp_endpoint(&config.ctx)?,
                 system_prompt: new_role.prompt_path.clone(),
                 model: config.model.clone(),
                 effort: config.effort.clone(),
@@ -692,6 +710,7 @@ impl PiRpcAdapter {
                             session_file: old.session_file.clone(),
                         },
                         bridge_extension: materialize_bridge()?,
+                        mcp: Self::session_mcp_endpoint(&old.ctx)?,
                         system_prompt: old.role_prompt_path.clone(),
                         model: old.model.clone(),
                         effort: old.effort.clone(),

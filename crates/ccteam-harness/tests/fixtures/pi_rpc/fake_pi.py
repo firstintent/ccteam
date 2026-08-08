@@ -191,31 +191,25 @@ with log_path.open("a", encoding="utf-8") as log:
     )
 
 if bridge_path is not None:
+    # Mirror the real bridge extension: the endpoint is MANDATORY, so a
+    # missing/blank CCTEAM_MCP_HTTP_URL is an extension_error here too. The
+    # fake used to synthesize a tool list when the variable was absent, which
+    # is exactly why every pi_rpc_test stayed green while managed `/new pi`
+    # died on load in production — never let a fixture paper over the one
+    # input the real thing hard-requires.
     try:
-        if os.environ.get("CCTEAM_MCP_HTTP_URL"):
-            mcp_call(
-                "initialize",
-                {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {},
-                    "clientInfo": {"name": "ccteam-pi-bridge", "version": "1"},
-                },
-                "pi-1",
-            )
-            mcp_call("notifications/initialized", {}, None)
-            listed = mcp_call("tools/list", {}, "pi-2")
-            tool_names = [f"ccteam_{tool['name']}" for tool in listed["tools"]]
-        else:
-            tool_names = [
-                "ccteam_status",
-                "ccteam_grok_claude_codex_kimi",
-                "ccteam_chat_send_file",
-                "ccteam_session_spawn",
-                "ccteam_session_dispatch",
-                "ccteam_session_collect",
-                "ccteam_session_list",
-                "ccteam_session_stop",
-            ]
+        mcp_call(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "ccteam-pi-bridge", "version": "1"},
+            },
+            "pi-1",
+        )
+        mcp_call("notifications/initialized", {}, None)
+        listed = mcp_call("tools/list", {}, "pi-2")
+        tool_names = [f"ccteam_{tool['name']}" for tool in listed["tools"]]
         emit(
             {
                 "type": "extension_ui_request",

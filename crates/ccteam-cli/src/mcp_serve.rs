@@ -377,7 +377,8 @@ pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
     let paths = CcteamPaths::from_env()?;
     let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
     install_mcp_into(&claude_json, &mcp_http_url, &admin_token)?;
     Ok(claude_json)
 }
@@ -403,7 +404,8 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     let config_toml = codex_home.join("config.toml");
     let paths = CcteamPaths::from_env()?;
     let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
     install_codex_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
     Ok(config_toml)
 }
@@ -417,7 +419,8 @@ pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
     let config_toml = ccteam_core::mcp_register::resolve_grok_config_path()?;
     let paths = CcteamPaths::from_env()?;
     let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
     ccteam_core::mcp_register::install_grok_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
     Ok(config_toml)
 }
@@ -429,7 +432,8 @@ pub fn install_opencode_mcp() -> Result<std::path::PathBuf> {
     let opencode_json = ccteam_core::mcp_register::resolve_opencode_config_path()?;
     let paths = CcteamPaths::from_env()?;
     let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
     ccteam_core::mcp_register::install_opencode_mcp_into(
         &opencode_json,
         &mcp_http_url,
@@ -447,7 +451,8 @@ pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
     let mcp_json = ccteam_core::mcp_register::resolve_kimi_config_path()?;
     let paths = CcteamPaths::from_env()?;
     let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
     ccteam_core::mcp_register::install_kimi_mcp_into(&mcp_json, &mcp_http_url, &admin_token)?;
     Ok(mcp_json)
 }

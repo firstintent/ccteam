@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::execution::mcp_config::{project_bridge_child_env, SessionMcpEndpoint};
 use crate::{PermissionMode, SpawnCtx};
 
 pub const PI_BIN_ENV: &str = "CCTEAM_PI_BIN";
@@ -16,6 +17,12 @@ pub enum PiSessionArg {
 pub struct PiSpawnInput {
     pub session: PiSessionArg,
     pub bridge_extension: PathBuf,
+    /// The ccteam MCP endpoint this session's bridge extension dials.
+    /// **Required, not optional**: `ToolSurfaceMode::ManagedSessionBridge`
+    /// means the bridge IS the tool surface, and the extension hard-fails on
+    /// load without it — so a Pi spawn spec cannot be built without one, and
+    /// the caller resolves it (or refuses the spawn) up front.
+    pub mcp: SessionMcpEndpoint,
     pub system_prompt: Option<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -72,12 +79,17 @@ pub fn build_spawn_spec(ctx: &SpawnCtx, input: PiSpawnInput) -> PiSpawnSpec {
     PiSpawnSpec {
         bin: pi_bin(),
         args,
-        env: child_env(ctx),
+        env: child_env(ctx, &input.mcp),
         cwd: ctx.cwd.clone(),
     }
 }
 
-fn child_env(ctx: &SpawnCtx) -> Vec<(String, String)> {
+/// Pi's dialect of the session MCP endpoint is child env — the same projection
+/// every other vendor gets as a config file or an RPC parameter. It is built
+/// from the resolved endpoint, never read off the parent process: `ccteam
+/// start` exports nothing, so an inherited-env bridge dies on load even on a
+/// perfectly healthy default daemon.
+fn child_env(ctx: &SpawnCtx, mcp: &SessionMcpEndpoint) -> Vec<(String, String)> {
     let mut env = vec![
         ("CCTEAM_CHAT_SID".to_string(), ctx.sid.clone()),
         (
@@ -89,17 +101,7 @@ fn child_env(ctx: &SpawnCtx) -> Vec<(String, String)> {
             .to_string(),
         ),
     ];
-    if !ctx.secret.is_empty() {
-        env.push((
-            "CCTEAM_MCP_BEARER".to_string(),
-            format!("ccteam-sid:{}:{}", ctx.sid, ctx.secret),
-        ));
-    }
-    if let Ok(url) = std::env::var("CCTEAM_MCP_HTTP_URL") {
-        if !url.trim().is_empty() {
-            env.push(("CCTEAM_MCP_HTTP_URL".to_string(), url));
-        }
-    }
+    env.extend(project_bridge_child_env(mcp));
     env
 }
 
@@ -109,4 +111,94 @@ pub fn deterministic_session_id(sid: &str) -> String {
 
 pub fn is_absolute_prompt(path: &Path) -> bool {
     path.is_absolute()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::mcp_config::{BRIDGE_MCP_BEARER_ENV, BRIDGE_MCP_URL_ENV};
+
+    fn ctx(mode: PermissionMode) -> SpawnCtx {
+        SpawnCtx {
+            slug: "demo".to_string(),
+            sid: "s42".to_string(),
+            cwd: PathBuf::from("/tmp/demo"),
+            project_dir: PathBuf::from("/tmp/demo"),
+            secret: "sekret".to_string(),
+            permission_mode: mode,
+            ..SpawnCtx::default()
+        }
+    }
+
+    fn spec(mode: PermissionMode) -> PiSpawnSpec {
+        build_spawn_spec(
+            &ctx(mode),
+            PiSpawnInput {
+                session: PiSessionArg::Fresh {
+                    session_id: deterministic_session_id("s42"),
+                },
+                bridge_extension: PathBuf::from("/tmp/bridge.mjs"),
+                mcp: SessionMcpEndpoint::at("http://127.0.0.1:9100/mcp", "s42", "sekret").unwrap(),
+                system_prompt: None,
+                model: None,
+                effort: None,
+            },
+        )
+    }
+
+    fn env_of(spec: &PiSpawnSpec, key: &str) -> Option<String> {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// The regression this whole seam exists for: the bridge extension
+    /// hard-fails on load without an endpoint, and `ccteam start` exports
+    /// nothing — so an endpoint inherited from the parent process meant every
+    /// `/new pi` died on a perfectly healthy default daemon. The endpoint is
+    /// now an input, so a Pi spawn spec cannot exist without one.
+    #[test]
+    fn child_env_always_carries_the_resolved_endpoint() {
+        for mode in [PermissionMode::Skip, PermissionMode::Hitl] {
+            let spec = spec(mode);
+            assert_eq!(
+                env_of(&spec, BRIDGE_MCP_URL_ENV).as_deref(),
+                Some("http://127.0.0.1:9100/mcp"),
+                "bridge url must come from the endpoint, never the parent env"
+            );
+            assert_eq!(
+                env_of(&spec, BRIDGE_MCP_BEARER_ENV).as_deref(),
+                Some("ccteam-sid:s42:sekret")
+            );
+            assert_eq!(env_of(&spec, "CCTEAM_CHAT_SID").as_deref(), Some("s42"));
+        }
+    }
+
+    #[test]
+    fn permission_mode_is_projected_and_hitl_pins_extensions() {
+        assert_eq!(
+            env_of(&spec(PermissionMode::Skip), "CCTEAM_PERMISSION_MODE").as_deref(),
+            Some("skip")
+        );
+        let hitl = spec(PermissionMode::Hitl);
+        assert_eq!(
+            env_of(&hitl, "CCTEAM_PERMISSION_MODE").as_deref(),
+            Some("hitl")
+        );
+        assert!(hitl.args.iter().any(|a| a == "--no-extensions"));
+        assert!(!spec(PermissionMode::Skip)
+            .args
+            .iter()
+            .any(|a| a == "--no-extensions"));
+    }
+
+    /// The bearer is the session principal; it must never reach argv (process
+    /// listings are world-readable).
+    #[test]
+    fn the_principal_never_lands_in_argv() {
+        let spec = spec(PermissionMode::Skip);
+        assert!(spec.args.iter().all(|a| !a.contains("sekret")));
+        assert!(spec.args.iter().any(|a| a == "-e"));
+    }
 }

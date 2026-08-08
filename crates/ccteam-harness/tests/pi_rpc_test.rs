@@ -10,6 +10,10 @@ use ccteam_harness::{
 use futures::StreamExt;
 use serial_test::serial;
 
+#[path = "support/fake_mcp.rs"]
+mod fake_mcp;
+use fake_mcp::{start_fake_mcp, McpCapture};
+
 fn role_reader() -> ccteam_harness::PiRoleReader {
     Arc::new(|project_dir: &Path, role: &str| {
         ccteam_core::read_role(project_dir, role)
@@ -30,10 +34,19 @@ struct PiTestEnv {
     log: PathBuf,
     sessions: PathBuf,
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _mcp: tokio::task::JoinHandle<()>,
 }
 
 impl PiTestEnv {
-    fn new() -> Self {
+    /// Managed Pi sessions ALWAYS carry an MCP endpoint (the bridge is their
+    /// whole tool surface), so every test here needs a daemon to dial. The
+    /// stub's URL is published the way a real daemon publishes it — the
+    /// `run/mcp-url` record — which also keeps these tests honest about the
+    /// resolution chain: no `CCTEAM_MCP_HTTP_URL` override, and no falling
+    /// through to the default bind (that would dial the developer's own live
+    /// daemon on 7331).
+    async fn new() -> Self {
+        let (mcp, mcp_url) = start_fake_mcp(McpCapture::default()).await;
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let ccteam_home = home.path().join("ccteam-home");
@@ -57,6 +70,8 @@ impl PiTestEnv {
             previous.push((key, std::env::var_os(key)));
             std::env::set_var(key, value);
         }
+        std::fs::create_dir_all(ccteam_home.join("run")).unwrap();
+        std::fs::write(ccteam_home.join("run/mcp-url"), &mcp_url).unwrap();
         Self {
             home,
             project,
@@ -64,6 +79,7 @@ impl PiTestEnv {
             log,
             sessions,
             previous,
+            _mcp: mcp,
         }
     }
 
@@ -101,6 +117,7 @@ impl PiTestEnv {
 
 impl Drop for PiTestEnv {
     fn drop(&mut self) {
+        self._mcp.abort();
         for (key, value) in self.previous.drain(..).rev() {
             if let Some(value) = value {
                 std::env::set_var(key, value);
@@ -158,7 +175,7 @@ fn terminal(events: &[ThreadEvent]) -> &ThreadEvent {
 #[tokio::test]
 #[serial]
 async fn pi_adapter_is_a_user_reachable_vendor() {
-    let env = PiTestEnv::new();
+    let env = PiTestEnv::new().await;
     assert!(env.home.path().exists());
     assert!(env.ccteam_home.exists());
     assert!(env.sessions.exists());
@@ -178,7 +195,7 @@ async fn pi_adapter_is_a_user_reachable_vendor() {
 #[tokio::test]
 #[serial]
 async fn roleless_roleful_resume_and_transactional_role_restart() {
-    let env = PiTestEnv::new();
+    let env = PiTestEnv::new().await;
     let adapter = PiRpcAdapter::new(role_reader());
 
     let roleless_spec = AgentSpecBrief {
@@ -357,7 +374,7 @@ async fn roleless_roleful_resume_and_transactional_role_restart() {
 #[tokio::test]
 #[serial]
 async fn settled_terminal_routing_usage_context_and_directives() {
-    let env = PiTestEnv::new();
+    let env = PiTestEnv::new().await;
     let adapter = PiRpcAdapter::new(role_reader());
     let handle = adapter
         .start_thread(
@@ -531,7 +548,7 @@ async fn settled_terminal_routing_usage_context_and_directives() {
 #[tokio::test]
 #[serial]
 async fn explicit_spawn_clamp_and_missing_native_session_fail_hard() {
-    let env = PiTestEnv::new();
+    let env = PiTestEnv::new().await;
     let adapter = PiRpcAdapter::new(role_reader());
     let spec = AgentSpecBrief {
         role: String::new(),

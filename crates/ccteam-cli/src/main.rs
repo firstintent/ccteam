@@ -1642,9 +1642,10 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     // `ccteam config mcp` — targets the port we actually listen on. The old
     // stdio entry was port-agnostic; an HTTP one is not, so guessing the default
     // here would break exactly the operators who bind somewhere else.
-    if let Err(err) =
-        ccteam_core::mcp_register::record_daemon_mcp_url(&paths.root.join("run"), &web.bind)
-    {
+    if let Err(err) = ccteam_harness::execution::mcp_config::record_daemon_mcp_url(
+        &paths.root.join("run"),
+        &web.bind,
+    ) {
         tracing::warn!(error = %err, bind = %web.bind, "could not record the daemon MCP URL; vendor registration falls back to the default bind");
     }
 

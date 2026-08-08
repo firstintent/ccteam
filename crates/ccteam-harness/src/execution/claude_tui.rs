@@ -1806,15 +1806,14 @@ mod tests {
     fn terminal_argv_attaches_session_mcp_config_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
-        let path = crate::execution::mcp_config::write_session_mcp_config(
-            cwd,
-            &crate::execution::mcp_config::CuratedMcpInput {
-                sid: "s7",
-                secret: "sek",
-                http_url: Some("http://127.0.0.1:7331/mcp"),
-            },
+        let endpoint = crate::execution::mcp_config::SessionMcpEndpoint::at(
+            "http://127.0.0.1:7331/mcp",
+            "s7",
+            "sek",
         )
         .unwrap();
+        let path =
+            crate::execution::mcp_config::write_session_mcp_config(cwd, "s7", &endpoint).unwrap();
 
         for spec in [
             spec_for_new(test_spec_input("dev", "slug", "s7", cwd, "sid-1")),

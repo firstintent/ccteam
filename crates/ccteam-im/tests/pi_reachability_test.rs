@@ -47,6 +47,78 @@ fn log_rows(path: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// A managed Pi session's tool surface IS the ccteam bridge, so every spawn
+/// here dials a real `POST /mcp`. Without a stub the endpoint resolves to the
+/// default-bind fallback and the test dials the developer's own live daemon on
+/// 7331 (401) — or gets ECONNREFUSED on CI. Kept dependency-free: three
+/// JSON-RPC calls over `Connection: close`, which is all the fake bridge makes.
+async fn start_stub_mcp() -> (tokio::task::JoinHandle<()>, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let Ok(read) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..at]).to_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if raw.len() >= at + 4 + len {
+                            break raw[at + 4..at + 4 + len].to_vec();
+                        }
+                    }
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let result = match request["method"].as_str().unwrap_or_default() {
+                    // The adapter refuses a partial tool set, so serve exactly
+                    // the eight the bridge contract requires.
+                    "tools/list" => serde_json::json!({
+                        "tools": ccteam_harness::PI_REQUIRED_MCP_TOOL_NAMES
+                            .iter()
+                            .map(|name| serde_json::json!({
+                                "name": name,
+                                "description": name,
+                                "inputSchema": {"type": "object"},
+                            }))
+                            .collect::<Vec<_>>()
+                    }),
+                    _ => serde_json::json!({}),
+                };
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "result": result,
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    (task, url)
+}
+
 #[tokio::test]
 async fn all_four_entry_spines_share_pi_role_recipe_and_rejection_contract() {
     let home = tempfile::tempdir().unwrap();
@@ -64,6 +136,11 @@ async fn all_four_entry_spines_share_pi_role_recipe_and_rejection_contract() {
         ("CCTEAM_PI_FAKE_LOG", &log),
         ("CCTEAM_PI_FAKE_SESSION_DIR", &session_dir),
     ]);
+    // Publish the stub the way a real daemon publishes its bind, so the spawn
+    // path resolves through `run/mcp-url` instead of the default fallback.
+    let (_mcp, mcp_url) = start_stub_mcp().await;
+    std::fs::create_dir_all(ccteam_home.join("run")).unwrap();
+    std::fs::write(ccteam_home.join("run/mcp-url"), &mcp_url).unwrap();
 
     let agents = project.path().join(".claude/agents");
     std::fs::create_dir_all(&agents).unwrap();
