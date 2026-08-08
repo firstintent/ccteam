@@ -793,6 +793,9 @@ html.dark .dot.off { background: #4b4e57; }
 .btn.primary:hover { opacity: .85; }
 .btn.ghost { border: 1px solid var(--border); color: var(--text-muted); background: var(--bg-card); }
 .btn.ghost:hover { color: var(--text); background: var(--bg-soft); }
+.btn.danger { border: 1px solid color-mix(in srgb, var(--red-text) 40%, var(--border)); background: var(--red-soft); color: var(--red-text); }
+.btn.danger:hover:not(:disabled) { opacity: .85; }
+.btn.danger:disabled { opacity: .45; }
 .btn.mini { padding: 4px 11px; font-size: 12px; border-radius: 6px; }
 
 .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 500; border: 1px solid var(--border); color: var(--text-muted); }
@@ -800,9 +803,39 @@ html.dark .dot.off { background: #4b4e57; }
 .badge.ok { background: var(--green-soft); border-color: transparent; color: var(--green-text); }
 .badge.warn { background: var(--red-soft); border-color: transparent; color: var(--red-text); }
 
-/* Host ACTION rows (设置→运维总览). One compact row per machine: identity on
-   the left, its to-do list on the right. The per-vendor health grid that used
-   to live here moved to the Team page's charter roster. */
+/* Host MANAGEMENT cards (设置→运维总览): one card per machine, one row per
+   vendor harness (install / version / ready badge / MCP registration +
+   actions), satellite projects below. Fleet observation (sessions / spend)
+   stays on the Team page's charter roster. */
+.host-manage {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 18px; background: var(--bg-card);
+  border: 1px solid var(--border); border-radius: var(--radius-card);
+}
+.host-manage.offline { opacity: .6; }
+.host-vendors { display: flex; flex-direction: column; }
+.host-vendor-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 0; border-top: 1px solid var(--border);
+}
+.host-vendor-name { font-size: 13px; font-weight: 600; min-width: 76px; }
+.host-vendor-version { font-size: 11.5px; color: var(--text-faint); min-width: 130px; }
+.host-vendor-mcp {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--text-faint);
+}
+.host-vendor-mcp .ok { color: var(--green-text); }
+.host-vendor-hint { width: 100%; font-size: 11px; color: var(--text-faint); }
+.host-projects {
+  display: flex; flex-direction: column; gap: 6px;
+  border-top: 1px solid var(--border); padding-top: 8px;
+}
+.host-projects-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+  color: var(--text-faint);
+}
+
+/* Compact identity+actions rows (shared by the 项目 catalog panel). */
 .host-actions {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   padding: 12px 18px; background: var(--bg-card);

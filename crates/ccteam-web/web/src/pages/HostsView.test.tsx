@@ -1,22 +1,22 @@
-// v0.9.11 TEAM-9 — HostsView is an ACTION panel; these tests pin that shape.
+// v0.9.13 — HostsView is the hosts & harness MANAGEMENT panel; these tests
+// pin that shape: one card per machine, the FULL vendor inventory per card
+// (installed / version / ready badge / MCP registration state), CTAs only
+// where the backend accepts the write, satellite projects with adopt state.
 //
 // No DOM env: `renderToString` proves structure (the header's Team-page Link
 // needs a Router context → MemoryRouter), and click wiring is exercised by
-// walking the hook-free `HostActionRow` element tree and invoking `onClick`
+// walking the hook-free `HostManageCard` element tree and invoking `onClick`
 // directly. The container's own handlers are hook-bound and cannot run under
-// SSR, so the wiring tests hand the row the very same API calls the container
-// makes and assert the resulting HTTP shape against a mocked `fetch`.
-//
-// What this file no longer covers, by design: the per-host × per-vendor
-// health grid (versions / installed / MCP badges / project catalog listing)
-// — that observation surface moved to the Team page's charter roster and is
-// covered by CharterPanel.test.tsx.
+// SSR, so the wiring tests hand the card the very same API calls the
+// container makes and assert the resulting HTTP shape against a mocked
+// `fetch`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import HostsView, {
-  HostActionRow,
+  HostManageCard,
+  OfflineHostCard,
   JoinCard,
   pendingActionsFor,
   toolSurfaceNoticesFor,
@@ -48,12 +48,17 @@ const LOCAL: HostDetail = {
   is_local: true,
   os: "linux",
   arch: "x86_64",
-  ccteam_version: "0.9.11",
+  ccteam_version: "0.9.12",
   agents: [
     // installed + registrable + unregistered → the one CTA.
     agent({ vendor: "claude", version: "claude 1.2.3", status: "needs_config" }),
-    // not on PATH → never a CTA (ccteam does not install CLIs).
-    agent({ vendor: "codex", installed: false, status: "not_installed" }),
+    // not on PATH → shown with its remediation hint, never a CTA.
+    agent({
+      vendor: "codex",
+      installed: false,
+      status: "not_installed",
+      hint: "npm install -g @openai/codex",
+    }),
     // Managed bridge vendor: a native-registration CTA would be a no-op.
     agent({
       vendor: "pi",
@@ -62,7 +67,7 @@ const LOCAL: HostDetail = {
         "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
       version: "pi 0.83.0",
     }),
-    // already registered → nothing to do.
+    // already registered → state shown, nothing to do.
     agent({ vendor: "kimi", mcp_registered: true, version: "kimi 0.26.0" }),
   ],
 };
@@ -74,7 +79,7 @@ const SAT: HostDetail = {
   is_local: false,
   os: "linux",
   arch: "aarch64",
-  ccteam_version: "0.9.11",
+  ccteam_version: "0.9.12",
   // Deliberately register-shaped: a satellite must still never get the CTA.
   agents: [agent({ vendor: "claude", version: "claude 1.2.3", status: "needs_config" })],
   projects: [
@@ -86,22 +91,31 @@ const SAT: HostDetail = {
 type ClickHandler = (e?: unknown) => void;
 
 /** Collect every `onClick` prop in a (hook-free) component's element tree,
- *  in render order — the node-env stand-in for a DOM click. */
+ *  in render order — the node-env stand-in for a DOM click. Hook-free child
+ *  function components (the per-vendor rows) are invoked and walked too. */
 function collectOnClicks(el: unknown, out: ClickHandler[] = []): ClickHandler[] {
   if (el == null || typeof el !== "object") return out;
   if (Array.isArray(el)) {
     for (const child of el) collectOnClicks(child, out);
     return out;
   }
-  const props = (el as { props?: { onClick?: unknown; children?: unknown } }).props;
-  if (props) {
-    if (typeof props.onClick === "function") out.push(props.onClick as ClickHandler);
-    collectOnClicks(props.children, out);
+  const node = el as {
+    type?: unknown;
+    props?: { onClick?: unknown; children?: unknown };
+  };
+  if (typeof node.type === "function" && node.props) {
+    // Render the hook-free child component and walk its output.
+    collectOnClicks((node.type as (props: unknown) => unknown)(node.props), out);
+    return out;
+  }
+  if (node.props) {
+    if (typeof node.props.onClick === "function") out.push(node.props.onClick as ClickHandler);
+    collectOnClicks(node.props.children, out);
   }
   return out;
 }
 
-describe("pendingActionsFor", () => {
+describe("pendingActionsFor (CTA eligibility single home)", () => {
   it("offers register-mcp only for installed + registrable + unregistered local vendors", () => {
     expect(pendingActionsFor(LOCAL)).toEqual([{ kind: "register", vendor: "claude" }]);
   });
@@ -142,113 +156,90 @@ describe("toolSurfaceNoticesFor", () => {
   });
 });
 
-describe("HostActionRow", () => {
-  it("renders identity (online dot · hostname · mono host id) + one register CTA", () => {
+describe("HostManageCard (full vendor inventory)", () => {
+  it("renders identity + os/arch/build + EVERY vendor row, not just pending ones", () => {
     const html = renderToString(
-      <HostActionRow
-        hostId="local"
-        hostname="devbox"
-        online
-        actions={pendingActionsFor(LOCAL)}
-        notices={toolSurfaceNoticesFor(LOCAL)}
-        busy={null}
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
+      <HostManageCard detail={LOCAL} busy={null} onRegister={() => {}} onImport={() => {}} />,
     );
-    expect(html).toContain('data-testid="host-actions-local"');
+    expect(html).toContain('data-testid="host-manage-local"');
     expect(html).toContain('class="dot on"');
     expect(html).toContain("devbox");
-    expect(html).toContain('class="host-actions-id mono"');
-    expect(html).toContain("注册 MCP");
+    expect(html.replace(/<!-- -->/g, "")).toContain("linux/x86_64 · ccteam 0.9.12");
+    // The whole inventory shows — including the vendors with nothing to do.
+    for (const vendor of ["claude", "codex", "pi", "kimi"]) {
+      expect(html).toContain(`data-testid="host-vendor-local-${vendor}"`);
+    }
+  });
+
+  it("per-vendor row: version / not-installed label / ready badge / hint verbatim", () => {
+    const html = renderToString(
+      <HostManageCard detail={LOCAL} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).toContain("claude 1.2.3");
+    expect(html).toContain("kimi 0.26.0");
+    // Not installed: label + copy-paste remediation hint, never a CTA.
+    expect(html).toContain("未安装");
+    expect(html).toContain("npm install -g @openai/codex");
+    // Ready-state badges verbatim off the API.
+    expect(html).toContain("需配置");
+    expect(html).toContain("就绪");
+  });
+
+  it("MCP column: register CTA only where eligible, ✓ where registered", () => {
+    const html = renderToString(
+      <HostManageCard detail={LOCAL} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
     expect(html).toContain('data-testid="register-mcp-claude"');
-    // The non-actionable vendors never reach the panel at all.
+    // Registered vendor shows the state, not a button.
+    expect(html).toContain('data-testid="host-vendor-mcp-ok-kimi"');
+    expect(html).toContain("MCP 已注册");
+    // Not-installed / managed-bridge vendors get neither CTA nor state.
     expect(html).not.toContain('data-testid="register-mcp-codex"');
-    expect(html).not.toContain('data-testid="register-mcp-grok"');
-    expect(html).not.toContain('data-testid="register-mcp-kimi"');
+    expect(html).not.toContain('data-testid="register-mcp-pi"');
     expect(html).toContain(
       "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
     );
   });
 
-  it("renders an import CTA per uncataloged satellite project, cataloged ones omitted", () => {
+  it("satellite: installed-but-unregistered shows state WITHOUT a dead-end CTA", () => {
     const html = renderToString(
-      <HostActionRow
-        hostId="sat-1"
-        hostname="gpu-box"
-        online
-        actions={pendingActionsFor(SAT)}
-        busy={null}
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
+      <HostManageCard detail={SAT} busy={null} onRegister={() => {}} onImport={() => {}} />,
     );
+    expect(html).not.toContain('data-testid="register-mcp-claude"');
+    expect(html).toContain("MCP 未注册");
+  });
+
+  it("satellite projects: adopted badge (with catalog slug) vs import CTA", () => {
+    const html = renderToString(
+      <HostManageCard detail={SAT} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).toContain('data-testid="host-projects-sat-1"');
+    expect(html).toContain('data-testid="host-project-adopted-already"');
+    expect(html.replace(/<!-- -->/g, "")).toContain("已接入 → already-local");
     expect(html).toContain('data-testid="import-project-fresh"');
-    expect(html).toContain("fresh");
-    expect(html).not.toContain('data-testid="import-project-already"');
-    expect(html).not.toContain("already");
   });
 
-  it("says 无待办 when a reachable host has nothing pending", () => {
+  it("local host renders no projects section (its projects ARE the catalog)", () => {
+    const withProjects: HostDetail = {
+      ...LOCAL,
+      projects: [{ slug: "solo", path: "/srv/solo", cataloged: false, catalog_slug: null }],
+    };
     const html = renderToString(
-      <HostActionRow
-        hostId="local"
-        hostname="devbox"
-        online
-        actions={[]}
-        busy={null}
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
+      <HostManageCard detail={withProjects} busy={null} onRegister={() => {}} onImport={() => {}} />,
     );
-    expect(html).toContain('data-testid="host-idle-local"');
-    expect(html).toContain("无待办");
-    expect(html).not.toContain("<button");
-  });
-
-  it("says an offline host cannot be probed instead of claiming it is clean", () => {
-    const html = renderToString(
-      <HostActionRow
-        hostId="sat-1"
-        hostname="gpu-box"
-        online={false}
-        actions={[]}
-        busy={null}
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
-    );
-    expect(html).toContain('class="host-actions offline"');
-    expect(html).toContain('class="dot off"');
-    expect(html).toContain("无法探测");
-    expect(html).not.toContain("无待办");
+    expect(html).not.toContain('data-testid="host-projects-local"');
+    expect(html).not.toContain('data-testid="import-project-solo"');
   });
 
   it("swaps to the busy label only for the exact host:vendor being registered", () => {
     const busyHere = renderToString(
-      <HostActionRow
-        hostId="local"
-        hostname="devbox"
-        online
-        actions={pendingActionsFor(LOCAL)}
-        busy="local:claude"
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
+      <HostManageCard detail={LOCAL} busy="local:claude" onRegister={() => {}} onImport={() => {}} />,
     );
     expect(busyHere).toContain("注册中…");
     expect(busyHere).toContain("disabled");
     // Same vendor on a different machine must not steal the spinner.
     const busyElsewhere = renderToString(
-      <HostActionRow
-        hostId="local"
-        hostname="devbox"
-        online
-        actions={pendingActionsFor(LOCAL)}
-        busy="sat-1:claude"
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
+      <HostManageCard detail={LOCAL} busy="sat-1:claude" onRegister={() => {}} onImport={() => {}} />,
     );
     expect(busyElsewhere).not.toContain("注册中…");
     expect(busyElsewhere).toContain("注册 MCP");
@@ -256,22 +247,24 @@ describe("HostActionRow", () => {
 
   it("renders English labels when lang='en'", () => {
     const html = renderToString(
-      <HostActionRow
-        hostId="local"
-        hostname="devbox"
-        online
-        actions={[]}
-        busy={null}
-        lang="en"
-        onRegister={() => {}}
-        onImport={() => {}}
-      />,
+      <HostManageCard detail={LOCAL} busy={null} lang="en" onRegister={() => {}} onImport={() => {}} />,
     );
-    expect(html).toContain("Nothing to do");
+    expect(html).toContain("Register MCP");
+    expect(html).toContain("MCP registered");
+    expect(html).toContain("not installed");
   });
 });
 
-describe("HostActionRow click wiring", () => {
+describe("OfflineHostCard", () => {
+  it("says an offline host cannot be probed instead of claiming it is clean", () => {
+    const html = renderToString(<OfflineHostCard hostId="sat-1" hostname="gpu-box" />);
+    expect(html).toContain('class="host-manage offline"');
+    expect(html).toContain('class="dot off"');
+    expect(html).toContain("无法探测");
+  });
+});
+
+describe("HostManageCard click wiring", () => {
   beforeEach(() => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
   });
@@ -282,11 +275,8 @@ describe("HostActionRow click wiring", () => {
 
   it("register click reaches POST /hosts/{host}/register-mcp for that vendor", () => {
     const clicks = collectOnClicks(
-      HostActionRow({
-        hostId: "local",
-        hostname: "devbox",
-        online: true,
-        actions: pendingActionsFor(LOCAL),
+      HostManageCard({
+        detail: LOCAL,
         busy: null,
         // Exactly what the container's onRegister does with the vendor.
         onRegister: (vendor) => void registerMcp("local", vendor),
@@ -303,11 +293,8 @@ describe("HostActionRow click wiring", () => {
 
   it("import click reaches POST /projects/import with the satellite's remote slug", () => {
     const clicks = collectOnClicks(
-      HostActionRow({
-        hostId: "sat-1",
-        hostname: "gpu-box",
-        online: true,
-        actions: pendingActionsFor(SAT),
+      HostManageCard({
+        detail: SAT,
         busy: null,
         onRegister: () => {},
         // Exactly what the container's onImport does with the slug.
@@ -326,7 +313,7 @@ describe("HostActionRow click wiring", () => {
   });
 });
 
-describe("HostsView (action panel shell)", () => {
+describe("HostsView (management panel shell)", () => {
   beforeEach(() => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
   });
@@ -360,19 +347,6 @@ describe("HostsView (action panel shell)", () => {
     expect(html).toContain('class="hosts-head-desc"');
   });
 
-  it("no longer renders the per-vendor observation grid", () => {
-    const html = renderToString(
-      <MemoryRouter>
-        <HostsView />
-      </MemoryRouter>,
-    );
-    expect(html).not.toContain("host-card");
-    expect(html).not.toContain("agent-row");
-    expect(html).not.toContain("agents-absent-row");
-    expect(html).not.toContain("host-projects");
-    expect(html).not.toContain("agent-version-");
-  });
-
   it("renders the English header + Team-page link", () => {
     const html = renderToString(
       <MemoryRouter>
@@ -402,14 +376,17 @@ describe("JoinCard", () => {
     expect(html).not.toContain('data-testid="join-copy"');
   });
 
-  it("HostsView points to Settings · Access instead of embedding the join card", () => {
+  it("HostsView points to Settings · Access via a ROUTER link (SPA basename)", () => {
+    // The SPA mounts under `/app` (BrowserRouter basename) — a raw anchor to
+    // `/settings/access` 404s outside the app. Rendering under a basename
+    // proves the pointer is a router Link that picks the prefix up.
     const html = renderToString(
-      <MemoryRouter>
+      <MemoryRouter basename="/app" initialEntries={["/app/settings/ops"]}>
         <HostsView />
       </MemoryRouter>,
     );
     expect(html).not.toContain('data-testid="join-card"');
-    expect(html).toContain('href="/settings/access"');
+    expect(html).toContain('href="/app/settings/access"');
     expect(html).toContain("连接新主机 → 设置·接入");
   });
 });

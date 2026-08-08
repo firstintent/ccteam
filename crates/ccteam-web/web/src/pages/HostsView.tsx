@@ -1,20 +1,25 @@
-// v0.9.11 TEAM-9 — 主机接入与注册: the ops ACTION panel (设置→运维总览).
+// v0.9.13 — 主机与 harness 管理 (设置→运维总览), grown out of the v0.9.11
+// TEAM-9 action-only panel: ops can now SEE and MANAGE every vendor harness
+// per host, not just the rows that happened to need something.
 //
-// This panel carries actions ONLY. Fleet observation — per-host × per-vendor
-// health, live session counts, spend, offline age, host removal — lives on the
-// Team page's charter roster, which is strictly richer; the health grid that
-// used to duplicate it here is deleted and the header links there instead.
-// What stays is what the Team page deliberately does not do:
-//   · register-mcp — write ccteam's own MCP server into a LOCAL vendor config
-//     (never a vendor login, never a CLI install; the backend 404s non-local).
+// One card per machine, one row per vendor (the full `AGENT_PROBE_SPECS`
+// axis): installed / version / ready-state badge / MCP registration state,
+// plus the ONLY management actions that exist server-side —
+//   · register-mcp — write ccteam's own MCP server into a LOCAL vendor
+//     config (never a vendor login, never a CLI install; the backend 404s
+//     non-local, so satellites render the state without a CTA).
 //   · import — adopt a satellite-reported project into the daemon catalog.
-//   · JoinCard — the real `ccteam host join` command. Exported from here and
-//     ALSO rendered by AccessView (设置·接入), where this panel's footer points
-//     rather than embedding a second copy.
+// A vendor that is not installed shows its copy-paste remediation `hint`
+// verbatim (ccteam never installs a CLI for you — red line).
+//
+// Fleet observation (live session counts, spend, offline age, host removal)
+// stays on the Team page's charter roster; the header links there. JoinCard
+// (the real `ccteam host join` command) is exported from here and ALSO
+// rendered by AccessView (设置·接入), where this panel's footer points.
 //
 // Data: GET /api/v1/hosts (registry) fanned into GET /api/v1/hosts/{host}; a
-// host whose detail probe fails renders offline (honest state — we then say we
-// cannot see what it needs, not that there is nothing to do).
+// host whose detail probe fails renders offline (honest state — we then say
+// we cannot see what it needs, not that there is nothing to do).
 
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -24,6 +29,7 @@ import {
   getJoinToken,
   mintJoinToken,
   registerMcp,
+  type AgentHealth,
   type HostDetail,
   type HostSummary,
   type JoinTokenInfo,
@@ -53,7 +59,8 @@ export type PendingAction =
   | { kind: "register"; vendor: string }
   | { kind: "import"; slug: string; path: string };
 
-/** Actionable items for one probed host, in render order.
+/** Actionable items for one probed host — the ELIGIBILITY single home the
+ *  vendor rows consult before offering a CTA.
  *
  *  Local: vendors installed on PATH whose config still lacks ccteam's MCP
  *  entry (`tool_surface` must be `native_mcp_config`, so a managed-bridge CTA
@@ -264,39 +271,29 @@ export default function HostsView({
       ) : (
         state.hosts.map((h) =>
           h.kind === "ready" ? (
-            <HostActionRow
+            <HostManageCard
               key={h.detail.host}
-              hostId={h.detail.host}
-              hostname={h.detail.hostname}
-              online
-              actions={pendingActionsFor(h.detail)}
-              notices={toolSurfaceNoticesFor(h.detail)}
+              detail={h.detail}
               busy={busy}
               lang={lang}
               onRegister={(vendor) => void onRegister(h.detail.host, vendor)}
               onImport={(remoteSlug) => void onImport(h.detail.host, remoteSlug)}
             />
           ) : (
-            <HostActionRow
+            <OfflineHostCard
               key={h.summary.host}
               hostId={h.summary.host}
               hostname={h.summary.hostname || h.summary.host}
-              online={false}
-              actions={[]}
-              notices={[]}
-              busy={busy}
               lang={lang}
-              onRegister={() => {}}
-              onImport={() => {}}
             />
           ),
         )
       )}
 
       <p className="text-xs text-text-muted">
-        <a className="text-brand-400 hover:underline" href="/settings/access">
+        <Link className="text-brand-400 hover:underline" to="/settings/access">
           {t("hostsAccessPointer")}
-        </a>
+        </Link>
       </p>
     </div>
   );
@@ -407,96 +404,187 @@ ccteam host join --daemon ${origin} --token ${token ?? "<join-token>"}`;
   );
 }
 
-/** One compact row per machine: identity (dot · hostname · host id) on the
- *  left, its to-do list on the right. Hook-free so the node test suite can
- *  walk it and fire `onClick` without a DOM. */
-export function HostActionRow({
+/** Ready-state → badge, verbatim off the API (an unknown status falls
+ *  through as its own label — honesty over prettiness). */
+function statusBadge(status: string, t: (key: string) => string): { cls: string; label: string } {
+  if (status === "ready") return { cls: "badge ok", label: t("rosterStatusReady") };
+  if (status === "needs_config") return { cls: "badge warn", label: t("rosterStatusNeedsConfig") };
+  if (status === "not_installed") return { cls: "badge", label: t("notInstalled") };
+  return { cls: "badge", label: status };
+}
+
+/** One vendor's management row: identity · version · ready badge · MCP
+ *  registration state (CTA only where {@link pendingActionsFor} says the
+ *  backend will accept it) · remediation hint verbatim. Hook-free. */
+function VendorManageRow({
   hostId,
-  hostname,
-  online,
-  actions,
-  notices = [],
+  agent,
+  registerable,
+  busy,
+  lang = "zh",
+  onRegister,
+}: {
+  hostId: string;
+  agent: AgentHealth;
+  /** Vendors {@link pendingActionsFor} deems register-eligible on this host. */
+  registerable: ReadonlySet<string>;
+  busy: string | null;
+  lang?: Lang;
+  onRegister: (vendor: string) => void;
+}) {
+  const t = makeT(lang);
+  const badge = statusBadge(agent.status, t);
+  return (
+    <div className="host-vendor-row" data-testid={`host-vendor-${hostId}-${agent.vendor}`}>
+      <span className={vendorDotClass(agent.vendor)} />
+      <span className="host-vendor-name">{agent.vendor}</span>
+      <span className="host-vendor-version mono" data-testid={`host-vendor-version-${agent.vendor}`}>
+        {agent.installed ? (agent.version ?? "—") : t("notInstalled")}
+      </span>
+      <span className={badge.cls}>{badge.label}</span>
+      <span className="host-vendor-mcp">
+        {agent.tool_surface === "native_mcp_config" && agent.installed ? (
+          agent.mcp_registered ? (
+            <span className="ok" data-testid={`host-vendor-mcp-ok-${agent.vendor}`}>
+              ✓ {t("mcpOk")}
+            </span>
+          ) : registerable.has(agent.vendor) ? (
+            <button
+              type="button"
+              className="btn primary mini"
+              data-testid={`register-mcp-${agent.vendor}`}
+              disabled={busy !== null}
+              onClick={() => onRegister(agent.vendor)}
+            >
+              {busy === registerKey(hostId, agent.vendor)
+                ? t("registeringMcp")
+                : t("registerMcp")}
+            </button>
+          ) : (
+            // Installed but unregistered on a host where the backend refuses
+            // the write (satellite): state without a dead-end CTA.
+            <span>{t("mcpNotRegistered")}</span>
+          )
+        ) : null}
+      </span>
+      {agent.hint ? <span className="host-vendor-hint mono">{agent.hint}</span> : null}
+    </div>
+  );
+}
+
+/** One machine's management card: identity head (dot · hostname · host id ·
+ *  os/arch · ccteam build), the full vendor inventory, tool-surface notices,
+ *  and — for a satellite — its reported projects with adopt state. Hook-free
+ *  so the node test suite can walk it and fire `onClick` without a DOM. */
+export function HostManageCard({
+  detail,
   busy,
   lang = "zh",
   onRegister,
   onImport,
 }: {
-  hostId: string;
-  hostname: string;
-  online: boolean;
-  actions: PendingAction[];
-  notices?: string[];
+  detail: HostDetail;
   busy: string | null;
   lang?: Lang;
   onRegister: (vendor: string) => void;
   onImport: (remoteSlug: string) => void;
 }) {
   const t = makeT(lang);
+  const registerable: ReadonlySet<string> = new Set(
+    pendingActionsFor(detail).flatMap((a) => (a.kind === "register" ? [a.vendor] : [])),
+  );
+  const notices = toolSurfaceNoticesFor(detail);
+  const projects = detail.is_local ? [] : (detail.projects ?? []);
   return (
-    <div
-      className={`host-actions${online ? "" : " offline"}`}
-      data-testid={`host-actions-${hostId}`}
-    >
+    <div className="host-manage" data-testid={`host-manage-${detail.host}`}>
       <div className="host-actions-head">
-        <span className={`dot ${online ? "on" : "off"}`} />
-        <span className="host-actions-name">{hostname}</span>
-        <span className="host-actions-id mono">{hostId}</span>
+        <span className="dot on" />
+        <span className="host-actions-name">{detail.hostname}</span>
+        <span className="host-actions-id mono">{detail.host}</span>
+        <span className="host-actions-id mono" style={{ marginLeft: "auto" }}>
+          {detail.os}/{detail.arch} · ccteam {detail.ccteam_version}
+        </span>
       </div>
-      <div className="host-actions-items">
-        {actions.length === 0 ? (
-          // An unreachable host has no to-do list we can trust — say that
-          // rather than claiming it is clean.
-          <span className="host-actions-idle" data-testid={`host-idle-${hostId}`}>
-            {online ? t("nothingToDo") : t("offlineRow")}
-          </span>
-        ) : (
-          actions.map((action) =>
-            action.kind === "register" ? (
-              <span className="host-action" key={`register:${action.vendor}`}>
-                <span className={vendorDotClass(action.vendor)} />
-                <span className="host-action-label">{action.vendor}</span>
-                <button
-                  type="button"
-                  className="btn primary mini"
-                  data-testid={`register-mcp-${action.vendor}`}
-                  disabled={busy !== null}
-                  onClick={() => onRegister(action.vendor)}
-                >
-                  {busy === registerKey(hostId, action.vendor)
-                    ? t("registeringMcp")
-                    : t("registerMcp")}
-                </button>
-              </span>
-            ) : (
-              <span className="host-action" key={`import:${action.slug}`}>
-                <span className="host-action-label mono" title={action.path}>
-                  {action.slug}
-                </span>
-                <button
-                  type="button"
-                  className="btn primary mini"
-                  data-testid={`import-project-${action.slug}`}
-                  disabled={busy !== null}
-                  onClick={() => onImport(action.slug)}
-                >
-                  {busy === importKey(hostId, action.slug)
-                    ? t("importingProject")
-                    : t("importProject")}
-                </button>
-              </span>
-            ),
-          )
-        )}
+      <div className="host-vendors">
+        {detail.agents.map((agent) => (
+          <VendorManageRow
+            key={agent.vendor}
+            hostId={detail.host}
+            agent={agent}
+            registerable={registerable}
+            busy={busy}
+            lang={lang}
+            onRegister={onRegister}
+          />
+        ))}
       </div>
       {notices.map((notice) => (
         <p
           className="host-actions-idle"
-          data-testid={`host-tool-surface-${hostId}`}
+          data-testid={`host-tool-surface-${detail.host}`}
           key={notice}
         >
           {notice}
         </p>
       ))}
+      {projects.length > 0 ? (
+        <div className="host-projects" data-testid={`host-projects-${detail.host}`}>
+          <span className="host-projects-title">{t("hostSatProjects")}</span>
+          {projects.map((project) => (
+            <span className="host-action" key={project.slug}>
+              <span className="host-action-label mono" title={project.path}>
+                {project.slug}
+              </span>
+              {project.cataloged ? (
+                <span className="badge ok" data-testid={`host-project-adopted-${project.slug}`}>
+                  {t("hostCataloged")}
+                  {project.catalog_slug && project.catalog_slug !== project.slug
+                    ? ` → ${project.catalog_slug}`
+                    : ""}
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="btn primary mini"
+                  data-testid={`import-project-${project.slug}`}
+                  disabled={busy !== null}
+                  onClick={() => onImport(project.slug)}
+                >
+                  {busy === importKey(detail.host, project.slug)
+                    ? t("importingProject")
+                    : t("importProject")}
+                </button>
+              )}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** A registered host whose detail probe failed: identity + the honest
+ *  offline line (we cannot see what it needs — not "nothing to do"). */
+export function OfflineHostCard({
+  hostId,
+  hostname,
+  lang = "zh",
+}: {
+  hostId: string;
+  hostname: string;
+  lang?: Lang;
+}) {
+  const t = makeT(lang);
+  return (
+    <div className="host-manage offline" data-testid={`host-manage-${hostId}`}>
+      <div className="host-actions-head">
+        <span className="dot off" />
+        <span className="host-actions-name">{hostname}</span>
+        <span className="host-actions-id mono">{hostId}</span>
+      </div>
+      <span className="host-actions-idle" data-testid={`host-offline-${hostId}`}>
+        {t("offlineRow")}
+      </span>
     </div>
   );
 }

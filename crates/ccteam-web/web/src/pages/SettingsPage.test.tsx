@@ -86,10 +86,25 @@ describe("Settings sections", () => {
     expect(html).toContain("fail-closed");
   });
 
-  it("keeps the tenant MyImSection named export available to Account", () => {
+  it("MyImSection guides Telegram and Lark as two separate stepped cards", () => {
     const html = renderToString(<MyImSection />);
     expect(html).toContain('data-testid="settings-my-im"');
     expect(html).toContain("我的 IM bot · My bot");
+    // Two independent cards, each with its OWN save button — the old
+    // form-wide 保存 that mixed both providers is retired.
+    expect(html).toContain('data-testid="my-im-telegram"');
+    expect(html).toContain('data-testid="my-im-lark"');
+    expect(html).toContain('data-testid="my-im-telegram-save"');
+    expect(html).toContain('data-testid="my-im-lark-save"');
+    expect(html).not.toContain('type="submit">保存</button>');
+    // Each card reads as a numbered two-step flow: credential → binding.
+    expect(html).toContain("保存 bot token");
+    expect(html).toContain("绑定你的 chat");
+    expect(html).toContain("保存 App 凭据");
+    expect(html).toContain("允许 open_id");
+    // Secrets never pre-filled (red line).
+    expect(html).toContain('type="password"');
+    expect(html).not.toContain('value="123456');
   });
 
   it("UserManagementSection (管理员 tab content) renders its testid + heading", () => {

@@ -10,29 +10,37 @@ use anyhow::{anyhow, Context, Result};
 use crate::state::ProjectState;
 
 /// Starter for the global, user-owned routing notes. The file is transported
-/// verbatim by MCP `status`; the table below is explicitly marked as a SAMPLE
-/// to edit (owner decision 2026-07-21: a worked example beats a blank page),
-/// so ccteam still asserts no routing opinion — the user's edit is the point,
-/// and sample model names are expected to age in the user's hands.
+/// verbatim by MCP `status`; the starter asserts NO routing opinion (owner
+/// decision 2026-08-08: no pre-assigned roles — it only lists the harness
+/// axis ccteam registers, so a session understands the multi-vendor surface,
+/// and leaves the division of labor entirely to the user). Installed state,
+/// versions, and per-vendor model/effort catalogs are deliberately NOT
+/// snapshotted here: the vendor panel in the same `status` response is their
+/// live home, and a written-once copy would go stale. A unit test pins this
+/// list to `host_registry::AGENT_PROBE_SPECS` so a new vendor cannot be
+/// added without updating the starter.
 const DEFAULT_ROUTING_NOTES: &str = "# ccteam routing notes\n\n\
 Your division of labor, in your own words. Sessions that call `status` receive\n\
-this file verbatim; ccteam never parses, merges, or acts on it. Default\n\
-posture: omit `model` at spawn and ride the vendor's default — list only the\n\
-exceptions and upgrades below.\n\n\
-The table is a SAMPLE to edit, not a recommendation: model names age fast, and\n\
-your taste is the point. Cross-check exact model ids against the advisory\n\
-catalog in `status` before pinning one.\n\n\
+this file verbatim; ccteam never parses, merges, or acts on it.\n\n\
+## Harnesses ccteam can drive\n\n\
+ccteam registers these agent harnesses (spawn any of them via `session_spawn`\n\
+or the web/IM entry points):\n\n\
+- `claude` — Claude Code (Anthropic)\n\
+- `codex` — Codex CLI (OpenAI)\n\
+- `grok` — Grok CLI (xAI)\n\
+- `opencode` — OpenCode\n\
+- `kimi` — Kimi Code (Moonshot)\n\
+- `pi` — Pi (local-only harness)\n\n\
+Which of them are actually installed on this machine — with versions and each\n\
+vendor's advisory model + effort catalog — arrives live in the vendor panel of\n\
+the same `status` response as these notes. Trust that panel, not a list here.\n\n\
+## Division of labor (yours to write)\n\n\
+ccteam pre-assigns no roles. Default posture: omit `model` at spawn and ride\n\
+each vendor's default. When you develop preferences, write them below in your\n\
+own words — e.g. one row per task type:\n\n\
 | Task type | vendor / model / effort | Why |\n\
 |---|---|---|\n\
-| Daily coding | codex / gpt-5.6-sol / medium | steady everyday grind |\n\
-| Hard problems | codex / gpt-5.6-sol / max | deep, long reasoning |\n\
-| Speed & search | grok / grok-4.5 / — | minute-scale answers |\n\
-| UI & interface work | claude / fable-5 / — | strongest design taste |\n\
-| Planning & architecture | claude / fable-5 / high | deepest decomposition |\n\
-| Vulnerabilities & security | claude / fable-5 / high | careful adversarial eye |\n\
-| Large refactors | claude / opus-4.8 / high | long-haul stability |\n\
-| Frontend games & 3D | kimi / kimi-k3 / — | strong spatial/visual work |\n\
-| Budget / open-model work | kimi / kimi-k3 / — | best cost-effectiveness |\n\n\
+| (yours) | | |\n\n\
 <!--\n\
 A project replaces these global notes entirely with its own\n\
 <project>/.ccteam/routing.md (never merged). Never store secrets in either\n\
@@ -721,5 +729,27 @@ mod tests {
             std::fs::read_to_string(&routing).unwrap(),
             "# My routing\nkeep this\n"
         );
+    }
+
+    /// The starter lists every harness ccteam registers and assigns none of
+    /// them a role: adding a vendor to `AGENT_PROBE_SPECS` must update the
+    /// starter, and the starter must never regrow a pre-filled assignment
+    /// table (owner decision 2026-08-08 — division of labor is the user's).
+    #[test]
+    fn default_routing_notes_list_the_vendor_axis_without_assigning_roles() {
+        for spec in crate::host_registry::AGENT_PROBE_SPECS {
+            assert!(
+                DEFAULT_ROUTING_NOTES.contains(&format!("`{}`", spec.vendor)),
+                "starter must list vendor `{}`",
+                spec.vendor
+            );
+        }
+        // The division-of-labor table stays a blank skeleton for the user.
+        assert!(DEFAULT_ROUTING_NOTES.contains("| (yours) | | |"));
+        let table_rows = DEFAULT_ROUTING_NOTES
+            .lines()
+            .filter(|l| l.starts_with('|') && !l.starts_with("|---"))
+            .count();
+        assert_eq!(table_rows, 2, "header + blank row only — no sample roles");
     }
 }

@@ -8,9 +8,10 @@
 // web token); tenant self-serve IM and global admin credentials live as the
 // two identity-specific shapes of Access.
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  FolderMinus,
   PlugZap,
   SlidersHorizontal,
   User,
@@ -21,6 +22,7 @@ import StatusView from "./StatusView";
 import { UserManagementSection } from "./SettingsPage";
 import AccessView from "./AccessView";
 import { copyText } from "../lib/clipboard";
+import { deleteProject, fetchDashboard, type DashboardRow } from "../lib/dashboardApi";
 import { makeT, type Lang } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useMe } from "../hooks/useMe";
@@ -152,9 +154,196 @@ export function OpsPanel({ lang }: { lang: Lang }) {
       <section className="ops-panel" aria-label="Status">
         <StatusView embedded />
       </section>
+      <section className="ops-panel" aria-label="Projects">
+        <ProjectsPanel lang={lang} />
+      </section>
       <section className="ops-panel" aria-label="Hosts">
         <HostsView embedded lang={lang} />
       </section>
+    </div>
+  );
+}
+
+/** 项目 · Projects — catalog management inside 运维总览. One row per
+ *  registered project; 移除 arms an inline type-the-slug confirm (mistype-proof
+ *  for a destructive-looking action that is deliberately NOT destructive on
+ *  disk: `DELETE /api/v1/projects/{slug}` deregisters + stops live sessions
+ *  only — the working tree stays, and the copy says so). Hook-free row view
+ *  exported for node-env tests; this container owns arming/typing state. */
+export function ProjectsPanel({ lang }: { lang: Lang }) {
+  const t = makeT(lang);
+  const [rows, setRows] = useState<DashboardRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  /** Slug whose remove-confirm is open (one at a time), + its typed echo. */
+  const [arming, setArming] = useState<string | null>(null);
+  const [typed, setTyped] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    fetchDashboard()
+      .then((next) => {
+        setRows(next);
+        setError(null);
+      })
+      .catch((e) => {
+        if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
+        setError(e instanceof Error ? e.message : "load failed");
+      });
+  }, []);
+  useEffect(() => load(), [load]);
+
+  const arm = (slug: string) => {
+    setArming(slug);
+    setTyped("");
+  };
+  const cancel = () => {
+    setArming(null);
+    setTyped("");
+  };
+  const confirm = async (slug: string) => {
+    if (busy) return;
+    setBusy(slug);
+    try {
+      const res = await deleteProject(slug);
+      const stopped = res.sessions_stopped.length;
+      toastBus.handler?.info(
+        lang === "en"
+          ? `Removed ${slug} from ccteam (${stopped} live session${stopped === 1 ? "" : "s"} stopped) — files on disk untouched.`
+          : `已从 ccteam 移除 ${slug}(停止 ${stopped} 个 live 会话)—— 磁盘文件未动。`,
+      );
+      cancel();
+      load();
+    } catch (e) {
+      if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
+        toastBus.handler?.error(
+          `${lang === "en" ? "Remove failed" : "移除失败"}: ${e instanceof Error ? e.message : "unknown"}`,
+        );
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="hosts-stack" data-testid="projects-panel">
+      <header className="hosts-head-bar">
+        <div className="hosts-head-copy">
+          <h2 className="hosts-section-title">{t("projectsTitle")}</h2>
+          <p className="hosts-head-desc">{t("projectsDesc")}</p>
+        </div>
+      </header>
+      {error ? (
+        <div role="alert" className="badge warn" style={{ padding: "8px 12px", borderRadius: 10, fontSize: 12.5 }}>
+          {t("projectsLoadFailed")}: {error}
+        </div>
+      ) : rows === null ? (
+        <p data-testid="projects-loading" style={{ fontSize: 13, color: "var(--text-faint)" }}>
+          {t("loading")}
+        </p>
+      ) : rows.length === 0 ? (
+        <p style={{ fontSize: 13, color: "var(--text-faint)" }}>{t("projectsEmpty")}</p>
+      ) : (
+        rows.map((row) => (
+          <ProjectRemoveRow
+            key={row.slug}
+            row={row}
+            lang={lang}
+            arming={arming === row.slug}
+            typed={arming === row.slug ? typed : ""}
+            busy={busy === row.slug}
+            onArm={() => arm(row.slug)}
+            onCancel={cancel}
+            onTyped={setTyped}
+            onConfirm={() => void confirm(row.slug)}
+          />
+        ))
+      )}
+    </div>
+  );
+}
+
+/** One project row + its inline remove confirm. Hook-free (state lives in
+ *  {@link ProjectsPanel}) so node-env tests can walk it and fire callbacks. */
+export function ProjectRemoveRow({
+  row,
+  lang = "zh",
+  arming,
+  typed,
+  busy,
+  onArm,
+  onCancel,
+  onTyped,
+  onConfirm,
+}: {
+  row: DashboardRow;
+  lang?: Lang;
+  arming: boolean;
+  typed: string;
+  busy: boolean;
+  onArm: () => void;
+  onCancel: () => void;
+  onTyped: (value: string) => void;
+  onConfirm: () => void;
+}) {
+  const t = makeT(lang);
+  return (
+    <div className="host-actions" data-testid={`project-row-${row.slug}`}>
+      <div className="host-actions-head">
+        <span className="host-actions-name mono">{row.slug}</span>
+        {row.host !== "local" ? (
+          <span className="host-actions-id mono">@ {row.host}</span>
+        ) : null}
+        {row.broken ? <span className="badge warn">orphaned</span> : null}
+        <span className="host-actions-id mono" title={row.path} style={{ marginLeft: "auto" }}>
+          {row.path}
+        </span>
+        {!arming ? (
+          <button
+            type="button"
+            className="btn ghost mini"
+            data-testid={`project-remove-${row.slug}`}
+            disabled={busy}
+            onClick={onArm}
+          >
+            <FolderMinus aria-hidden="true" style={{ width: 13, height: 13 }} />
+            {t("projectRemove")}
+          </button>
+        ) : null}
+      </div>
+      {arming ? (
+        <div
+          className="host-actions-items"
+          data-testid={`project-remove-confirm-${row.slug}`}
+          style={{ alignItems: "center" }}
+        >
+          <span className="host-actions-idle">{t("projectRemoveHint")}</span>
+          <label className="host-actions-idle" htmlFor={`project-remove-typed-${row.slug}`}>
+            {t("projectRemoveType")}
+          </label>
+          <input
+            id={`project-remove-typed-${row.slug}`}
+            data-testid={`project-remove-typed-${row.slug}`}
+            className="mono"
+            value={typed}
+            spellCheck={false}
+            placeholder={row.slug}
+            onChange={(e) => onTyped(e.target.value)}
+            style={{ width: 160, fontSize: 12 }}
+          />
+          <button
+            type="button"
+            className="btn danger mini"
+            data-testid={`project-remove-go-${row.slug}`}
+            disabled={busy || typed.trim() !== row.slug}
+            onClick={onConfirm}
+          >
+            {busy ? t("projectRemoveBusy") : t("projectRemoveConfirm")}
+          </button>
+          <button type="button" className="btn ghost mini" disabled={busy} onClick={onCancel}>
+            {t("cancel")}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

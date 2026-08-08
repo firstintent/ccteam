@@ -63,7 +63,6 @@ import {
   putMyLarkAllowedUsers,
   putMyTelegramAllowedChats,
   type SenderCandidate,
-  type PutMyImForm,
   type TenantView,
 } from "../lib/usersApi";
 import { makeT, type Lang } from "../lib/i18n";
@@ -673,199 +672,78 @@ export function LarkSection({
 // v0.8.20 F2 — a tenant's OWN IM bot (self-serve). The owner's bot is the
 // global one (admin Settings); a per-user tenant runs its own bot so its
 // Telegram/Lark drives ONLY its sessions, not a shared admin bot.
+//
+// v0.9.13 — rebuilt as two independent guided cards (Telegram / Lark), each a
+// numbered two-step flow: ① save the credential (its own small save button,
+// `putMyIm` only carries that provider) → ② bind who the bot answers (the
+// capture auto-starts right after a save, so the next action is never a
+// guess). The old single form-wide 保存 button — which mixed the token, the
+// Lark credential and the allowlist into one ambiguous submit next to two
+// 开始 buttons — is gone.
 // --------------------------------------------------------------------------
 
+/** Poll `fetchCandidates(since)` every CHAT_ID_POLL_MS while `since` is set.
+ *  One timer per card, always cleared on unmount / restart. */
+function useSenderCapture(
+  since: number | null,
+  fetchCandidates: (since: number) => Promise<{ candidates: SenderCandidate[] }>,
+  errorLabel: string,
+) {
+  const [candidates, setCandidates] = useState<SenderCandidate[]>([]);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (since === null) return;
+    let cancelled = false;
+    const tick = () => {
+      fetchCandidates(since)
+        .then((res) => {
+          if (cancelled) return;
+          setCandidates(res.candidates);
+          timerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          if (!(err instanceof Error) || err.message !== "UNAUTHENTICATED") {
+            toastBus.handler?.error(err instanceof Error ? err.message : errorLabel);
+          }
+          timerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
+        });
+    };
+    timerRef.current = setTimeout(tick, 300);
+    return () => {
+      cancelled = true;
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+    // fetchCandidates / errorLabel are stable module-level fns + literals.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [since]);
+  // Render-side gating (instead of a reset-setState in the effect): an
+  // inactive capture always reads as empty; a restart repopulates on the
+  // first poll tick.
+  return since === null ? [] : candidates;
+}
+
+/** Step number chip + title for the guided cards. */
+function StepHead({ n, title, done }: { n: number; title: string; done?: boolean }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className={`flex size-4.5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold ${
+          done ? "bg-status-running/20 text-status-running" : "bg-brand-500/15 text-brand-400"
+        }`}
+        aria-hidden="true"
+      >
+        {done ? "✓" : n}
+      </span>
+      <span className="text-[11px] font-medium text-text-secondary">{title}</span>
+    </div>
+  );
+}
+
 export function MyImSection() {
-  const [telegram, setTelegram] = useState("");
-  const [larkOpen, setLarkOpen] = useState(false);
-  const [larkAppId, setLarkAppId] = useState("");
-  const [larkSecret, setLarkSecret] = useState("");
-  const [larkUsersRaw, setLarkUsersRaw] = useState("");
-  const [useFeishu, setUseFeishu] = useState(true);
-  const [larkCaptureSince, setLarkCaptureSince] = useState<number | null>(null);
-  const [larkCandidates, setLarkCandidates] = useState<SenderCandidate[]>([]);
-  // Telegram twin of the Lark capture: a per-tenant bot answers nobody until a
-  // chat is bound, so every DM it drops is recorded and offered here.
-  const [tgCaptureSince, setTgCaptureSince] = useState<number | null>(null);
-  const [tgCandidates, setTgCandidates] = useState<SenderCandidate[]>([]);
-  const [tgAllowed, setTgAllowed] = useState<string[]>([]);
-  const tgCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [pending, setPending] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const larkCaptureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const larkUserIds = parseUserIds(larkUsersRaw);
-
-  useEffect(() => {
-    if (larkCaptureSince === null) return;
-    let cancelled = false;
-
-    const tick = () => {
-      getMyLarkOpenIdCandidates(larkCaptureSince)
-        .then((res) => {
-          if (cancelled) return;
-          setLarkCandidates(res.candidates);
-          larkCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
-        })
-        .catch((err) => {
-          if (cancelled) return;
-          if (!(err instanceof Error) || err.message !== "UNAUTHENTICATED") {
-            toastBus.handler?.error(err instanceof Error ? err.message : "open_id capture failed");
-          }
-          larkCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
-        });
-    };
-    larkCaptureTimerRef.current = setTimeout(tick, 300);
-    return () => {
-      cancelled = true;
-      if (larkCaptureTimerRef.current) {
-        clearTimeout(larkCaptureTimerRef.current);
-        larkCaptureTimerRef.current = null;
-      }
-    };
-  }, [larkCaptureSince]);
-
-  useEffect(() => {
-    if (tgCaptureSince === null) return;
-    let cancelled = false;
-
-    const tick = () => {
-      getMyTelegramChatIdCandidates(tgCaptureSince)
-        .then((res) => {
-          if (cancelled) return;
-          setTgCandidates(res.candidates);
-          tgCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
-        })
-        .catch((err) => {
-          if (cancelled) return;
-          if (!(err instanceof Error) || err.message !== "UNAUTHENTICATED") {
-            toastBus.handler?.error(err instanceof Error ? err.message : "chat_id capture failed");
-          }
-          tgCaptureTimerRef.current = setTimeout(tick, CHAT_ID_POLL_MS);
-        });
-    };
-    tgCaptureTimerRef.current = setTimeout(tick, 300);
-    return () => {
-      cancelled = true;
-      if (tgCaptureTimerRef.current) {
-        clearTimeout(tgCaptureTimerRef.current);
-        tgCaptureTimerRef.current = null;
-      }
-    };
-  }, [tgCaptureSince]);
-
-  function onStartTelegramCapture() {
-    setTgCandidates([]);
-    // eslint-disable-next-line react-hooks/purity -- user-action timestamp, never called during render
-    setTgCaptureSince(Math.floor(Date.now() / 1000) - 2);
-    toastBus.handler?.info("现在私聊你的 Telegram bot,这里会出现你的 chat_id");
-  }
-
-  async function saveTelegramAllowlist(ids: string[]) {
-    if (pending) return;
-    const normalized = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).sort();
-    setPending(true);
-    try {
-      const res = await putMyTelegramAllowedChats(normalized);
-      setTgAllowed(normalized);
-      setTgCaptureSince(null);
-      setTgCandidates([]);
-      setSaved(true);
-      toastBus.handler?.info(res.note || "chat_id 已保存,bot 现在只回你");
-    } catch (err) {
-      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
-    } finally {
-      setPending(false);
-    }
-  }
-
-  function onStartLarkCapture() {
-    setLarkCandidates([]);
-    // eslint-disable-next-line react-hooks/purity -- user-action timestamp, never called during render
-    setLarkCaptureSince(Math.floor(Date.now() / 1000) - 2);
-    toastBus.handler?.info("私聊 Lark / 飞书 bot,或在群里 @ bot,这里会出现 open_id");
-  }
-
-  async function onSave(e: React.FormEvent) {
-    e.preventDefault();
-    if (pending) return;
-    const tok = telegram.trim();
-    const larkApp = larkAppId.trim();
-    const larkSecretValue = larkSecret.trim();
-    if (larkOpen && (larkApp || larkSecretValue) && !(larkApp && larkSecretValue)) {
-      toastBus.handler?.error("Lark App ID 和 App Secret 需要一起填写");
-      return;
-    }
-    if (larkOpen && !larkApp && !larkSecretValue && larkUserIds.length > 0) {
-      if (tok) {
-        toastBus.handler?.error("请先单独保存 Lark open_id,再保存 Telegram token");
-        return;
-      }
-      void saveLarkAllowlist(larkUserIds);
-      return;
-    }
-    setPending(true);
-    setSaved(false);
-    const form: PutMyImForm = {};
-    if (tok) form.telegram_bot_token = tok;
-    if (larkOpen && larkApp && larkSecretValue) {
-      form.lark = {
-        app_id: larkApp,
-        app_secret: larkSecretValue,
-        allowed_user_ids: larkUserIds,
-        use_feishu: useFeishu,
-      };
-    }
-    try {
-      const res = await putMyIm(form);
-      setSaved(true);
-      setTelegram("");
-      setLarkAppId("");
-      setLarkSecret("");
-      if (larkOpen && larkUserIds.length === 0) {
-        onStartLarkCapture();
-      }
-      // A saved-but-unbound Telegram bot answers NOBODY (fail-closed, like
-      // Lark). Say so and open the capture instead of leaving the tenant to
-      // discover it as silence.
-      if (tok && res.telegram_unbound) {
-        onStartTelegramCapture();
-        toastBus.handler?.info("已保存 —— 现在私聊 bot 绑定你的 chat,绑定前它不回任何人");
-      } else {
-        toastBus.handler?.info("已保存 / Saved");
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
-    } finally {
-      setPending(false);
-    }
-  }
-
-  async function saveLarkAllowlist(ids: string[]) {
-    if (pending) return;
-    const normalized = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).sort();
-    setPending(true);
-    try {
-      const res = await putMyLarkAllowedUsers(normalized);
-      setLarkUsersRaw(normalized.join("\n"));
-      setSaved(true);
-      setLarkCaptureSince(null);
-      setLarkCandidates([]);
-      toastBus.handler?.info(res.note || "open_id 已保存到 allowlist");
-    } catch (err) {
-      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
-      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
-    } finally {
-      setPending(false);
-    }
-  }
-
-  async function saveCapturedOpenId(openId: string) {
-    const merged = Array.from(new Set([...larkUserIds, openId])).sort();
-    await saveLarkAllowlist(merged);
-  }
-
   return (
     <section data-testid="settings-my-im" className="flex flex-col gap-4">
       <div className="flex flex-col gap-1">
@@ -875,207 +753,368 @@ export function MyImSection() {
           <Badge variant="accent">自助</Badge>
         </div>
         <p className="text-[11px] text-text-muted leading-relaxed">
-          配置你自己的 Telegram / Lark 机器人 —— 它只驱动你自己的 session(不再共用管理员的全局 bot)。
-          只保存你<b className="text-text-secondary">填了的那一项</b>,另一项原样保留(留空 = 不动它)。
-          两边都<b className="text-text-secondary">只回被你允许的人</b>,绑定前谁也不回。保存后即时生效。
+          配置你自己的 Telegram / Lark 机器人 —— 它只驱动你自己的 session(不共用管理员的全局
+          bot)。两边各自独立配置,互不影响;都<b className="text-text-secondary">只回被你允许的人</b>
+          ,绑定前谁也不回。保存后即时生效。
         </p>
       </div>
 
-      <Card className="p-4">
-        <form onSubmit={onSave} className="flex flex-col gap-3">
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="my-im-telegram">Telegram bot token</Label>
+      <MyTelegramCard />
+      <MyLarkCard />
+    </section>
+  );
+}
+
+function MyTelegramCard() {
+  const [token, setToken] = useState("");
+  const [pending, setPending] = useState(false);
+  const [tokenSaved, setTokenSaved] = useState(false);
+  const [captureSince, setCaptureSince] = useState<number | null>(null);
+  const [allowed, setAllowed] = useState<string[]>([]);
+  const candidates = useSenderCapture(
+    captureSince,
+    getMyTelegramChatIdCandidates,
+    "chat_id capture failed",
+  );
+
+  function startCapture() {
+    setCaptureSince(Math.floor(Date.now() / 1000) - 2);
+  }
+
+  async function saveToken(e: React.FormEvent) {
+    e.preventDefault();
+    const tok = token.trim();
+    if (pending || !tok) return;
+    setPending(true);
+    try {
+      const res = await putMyIm({ telegram_bot_token: tok });
+      setToken("");
+      setTokenSaved(true);
+      if (res.telegram_unbound) {
+        // Fail-closed: an unbound bot answers nobody — walk straight into ②.
+        startCapture();
+        toastBus.handler?.info("token 已保存 —— 现在私聊 bot 完成第 2 步绑定,绑定前它不回任何人");
+      } else {
+        toastBus.handler?.info("token 已保存,原有绑定继续生效");
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function bindChat(chatId: string) {
+    if (pending) return;
+    const normalized = Array.from(new Set([...allowed, chatId.trim()].filter(Boolean))).sort();
+    setPending(true);
+    try {
+      const res = await putMyTelegramAllowedChats(normalized);
+      setAllowed(normalized);
+      setCaptureSince(null);
+      toastBus.handler?.info(res.note || "chat_id 已保存,bot 现在只回你");
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Card data-testid="my-im-telegram" className="p-4">
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <Send className="size-4 text-text-secondary" />
+          <h3 className="text-[13px] font-semibold text-text-primary">Telegram</h3>
+        </div>
+
+        <form onSubmit={saveToken} className="flex flex-col gap-1.5">
+          <StepHead n={1} title="保存 bot token" done={tokenSaved} />
+          <div className="flex items-center gap-2">
             <Input
-              id="my-im-telegram"
+              id="my-im-telegram-token"
+              aria-label="Telegram bot token"
               type="password"
               autoComplete="off"
-              value={telegram}
-              onChange={(e) => setTelegram(e.target.value)}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
               disabled={pending}
               spellCheck={false}
               placeholder="123456:ABC-DEF…"
               className="font-mono"
             />
-            <p className="text-[10px] text-text-dim">
-              从 @BotFather 拿一个新 bot 的 token(每个 bot 的 token 唯一,保存前会校验)。
-            </p>
-
-            <div
-              className="flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2"
-              data-testid="my-im-telegram-bind"
+            <Button
+              type="submit"
+              size="sm"
+              data-testid="my-im-telegram-save"
+              disabled={pending || token.trim().length === 0}
             >
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-medium text-text-secondary">
-                  绑定你的 chat
-                </span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  data-testid="my-im-telegram-capture"
-                  onClick={onStartTelegramCapture}
-                  disabled={pending}
-                >
-                  开始
-                </Button>
-              </div>
-              <p className="text-[10px] text-status-error">
-                你的 bot 只回被绑定的 chat。绑定前它不回任何人 —— 否则任何找到 bot
-                的人都会以你的身份驱动你的 session。
-              </p>
-              {tgAllowed.length > 0 ? (
-                <p className="text-[10px] font-mono text-status-running">
-                  已绑定 {tgAllowed.length} 个 chat:{tgAllowed.join(", ")}
-                </p>
-              ) : null}
-              {tgCaptureSince !== null ? (
-                <p className="text-[10px] text-text-dim">
-                  现在私聊这个 bot 发一条消息;消息会被拒绝,只用于显示你的 chat_id。
-                </p>
-              ) : null}
-              {tgCandidates.length > 0 ? (
-                <div className="flex flex-col gap-1">
-                  {tgCandidates.map((candidate) => (
-                    <button
-                      key={`${candidate.sender_id}:${candidate.message_id}`}
-                      type="button"
-                      data-testid={`my-im-telegram-candidate-${candidate.sender_id}`}
-                      onClick={() =>
-                        void saveTelegramAllowlist([...tgAllowed, candidate.sender_id])
-                      }
-                      disabled={pending}
-                      className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
-                    >
-                      <span>{candidate.sender_id}</span>
-                      <span className="text-[10px] text-text-dim">绑定并保存</span>
-                    </button>
-                  ))}
-                </div>
-              ) : tgCaptureSince !== null ? (
-                <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
-              ) : null}
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => setLarkOpen((v) => !v)}
-            className="self-start text-[11px] text-text-dim hover:text-text-secondary"
-          >
-            {larkOpen ? "▾" : "▸"} Lark / 飞书(可选)
-          </button>
-          {larkOpen ? (
-            <div className="flex flex-col gap-2 rounded-md border border-surface-800 p-3">
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="my-im-lark-id">Lark App ID</Label>
-                <Input
-                  id="my-im-lark-id"
-                  value={larkAppId}
-                  onChange={(e) => setLarkAppId(e.target.value)}
-                  disabled={pending}
-                  spellCheck={false}
-                  placeholder="cli_…"
-                  className="font-mono"
-                />
-              </div>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="my-im-lark-secret">Lark App Secret</Label>
-                <Input
-                  id="my-im-lark-secret"
-                  type="password"
-                  value={larkSecret}
-                  onChange={(e) => setLarkSecret(e.target.value)}
-                  disabled={pending}
-                  spellCheck={false}
-                  className="font-mono"
-                />
-              </div>
-              <label className="flex items-center gap-2 text-[11px] text-text-secondary">
-                <input
-                  type="checkbox"
-                  checked={useFeishu}
-                  onChange={(e) => setUseFeishu(e.target.checked)}
-                  disabled={pending}
-                  className="accent-brand-500"
-                />
-                飞书(CN);取消勾选 = Lark intl
-              </label>
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="my-im-lark-users">允许的 open_id</Label>
-                <Textarea
-                  id="my-im-lark-users"
-                  value={larkUsersRaw}
-                  onChange={(e) => setLarkUsersRaw(e.target.value)}
-                  disabled={pending}
-                  rows={3}
-                  spellCheck={false}
-                  placeholder="ou_abc…"
-                  className="font-mono"
-                />
-                {larkUserIds.length === 0 ? (
-                  <p className="text-[10px] text-status-error">
-                    空 allowlist = fail-closed。保存 App 后可在下方发现自己的 open_id。
-                  </p>
-                ) : (
-                  <p className="text-[10px] text-text-dim">
-                    {larkUserIds.length} 个 open_id 将被允许。
-                  </p>
-                )}
-              </div>
-              <div className="flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11px] font-medium text-text-secondary">
-                    发现 open_id
-                  </span>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={onStartLarkCapture}
-                    disabled={pending}
-                  >
-                    开始
-                  </Button>
-                </div>
-                {larkCaptureSince !== null ? (
-                  <p className="text-[10px] text-text-dim">
-                    现在私聊这个 Lark / 飞书 bot,或在群里 @ bot;消息会被拒绝,只用于显示 sender
-                    open_id。
-                  </p>
-                ) : null}
-                {larkCandidates.length > 0 ? (
-                  <div className="flex flex-col gap-1">
-                    {larkCandidates.map((c) => (
-                      <button
-                        key={`${c.open_id}:${c.message_id}`}
-                        type="button"
-                        onClick={() => void saveCapturedOpenId(c.open_id)}
-                        disabled={pending}
-                        className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
-                      >
-                        <span>{c.open_id}</span>
-                        <span className="text-[10px] text-text-dim">填入并保存</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : larkCaptureSince !== null ? (
-                  <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
-
-          <div className="flex items-center gap-2">
-            <Button type="submit" disabled={pending}>
-              {pending ? "保存中…" : "保存"}
+              {pending ? "保存中…" : "保存 token"}
             </Button>
-            {saved ? (
-              <span className="text-[11px] font-mono text-status-running">已保存 ✓</span>
+          </div>
+          <p className="text-[10px] text-text-dim">
+            从 @BotFather 拿一个新 bot 的 token(每个 bot 的 token 唯一,保存前会校验)。
+          </p>
+        </form>
+
+        <div
+          className="flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2"
+          data-testid="my-im-telegram-bind"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <StepHead n={2} title="绑定你的 chat" done={allowed.length > 0} />
+            {captureSince === null ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="my-im-telegram-capture"
+                onClick={startCapture}
+                disabled={pending}
+              >
+                {allowed.length > 0 ? "再绑一个" : "开始绑定"}
+              </Button>
             ) : null}
           </div>
+          <p className="text-[10px] text-status-error">
+            你的 bot 只回被绑定的 chat。绑定前它不回任何人 —— 否则任何找到 bot
+            的人都会以你的身份驱动你的 session。
+          </p>
+          {allowed.length > 0 ? (
+            <p className="text-[10px] font-mono text-status-running">
+              已绑定 {allowed.length} 个 chat:{allowed.join(", ")}
+            </p>
+          ) : null}
+          {captureSince !== null ? (
+            <p className="text-[10px] text-text-dim">
+              现在私聊这个 bot 发一条消息;消息会被拒绝,只用于显示你的 chat_id。
+            </p>
+          ) : null}
+          {candidates.length > 0 ? (
+            <div className="flex flex-col gap-1">
+              {candidates.map((candidate) => (
+                <button
+                  key={`${candidate.sender_id}:${candidate.message_id}`}
+                  type="button"
+                  data-testid={`my-im-telegram-candidate-${candidate.sender_id}`}
+                  onClick={() => void bindChat(candidate.sender_id)}
+                  disabled={pending}
+                  className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
+                >
+                  <span>{candidate.sender_id}</span>
+                  <span className="text-[10px] text-text-dim">绑定并保存</span>
+                </button>
+              ))}
+            </div>
+          ) : captureSince !== null ? (
+            <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
+          ) : null}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function MyLarkCard() {
+  const [appId, setAppId] = useState("");
+  const [appSecret, setAppSecret] = useState("");
+  const [useFeishu, setUseFeishu] = useState(true);
+  const [pending, setPending] = useState(false);
+  const [credsSaved, setCredsSaved] = useState(false);
+  const [usersRaw, setUsersRaw] = useState("");
+  const [allowlistSaved, setAllowlistSaved] = useState(false);
+  const [captureSince, setCaptureSince] = useState<number | null>(null);
+  const candidates = useSenderCapture(
+    captureSince,
+    getMyLarkOpenIdCandidates,
+    "open_id capture failed",
+  );
+  const userIds = parseUserIds(usersRaw);
+
+  function startCapture() {
+    setCaptureSince(Math.floor(Date.now() / 1000) - 2);
+  }
+
+  async function saveCreds(e: React.FormEvent) {
+    e.preventDefault();
+    const app = appId.trim();
+    const secret = appSecret.trim();
+    if (pending || !app || !secret) return;
+    setPending(true);
+    try {
+      await putMyIm({
+        lark: { app_id: app, app_secret: secret, allowed_user_ids: userIds, use_feishu: useFeishu },
+      });
+      setAppId("");
+      setAppSecret("");
+      setCredsSaved(true);
+      // Fail-closed: an empty allowlist answers nobody — walk straight into ②.
+      if (userIds.length === 0) startCapture();
+      toastBus.handler?.info("Lark 凭据已保存 —— 现在完成第 2 步,允许你自己的 open_id");
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function saveAllowlist(ids: string[]) {
+    if (pending) return;
+    const normalized = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).sort();
+    setPending(true);
+    try {
+      const res = await putMyLarkAllowedUsers(normalized);
+      setUsersRaw(normalized.join("\n"));
+      setAllowlistSaved(true);
+      setCaptureSince(null);
+      toastBus.handler?.info(res.note || "open_id 已保存到 allowlist");
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      toastBus.handler?.error(err instanceof Error ? err.message : "save failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <Card data-testid="my-im-lark" className="p-4">
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <MessageSquare className="size-4 text-text-secondary" />
+          <h3 className="text-[13px] font-semibold text-text-primary">Lark / 飞书</h3>
+          <Badge variant="idle">可选</Badge>
+        </div>
+
+        <form onSubmit={saveCreds} className="flex flex-col gap-2">
+          <StepHead n={1} title="保存 App 凭据" done={credsSaved} />
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="my-im-lark-id">App ID</Label>
+              <Input
+                id="my-im-lark-id"
+                value={appId}
+                onChange={(e) => setAppId(e.target.value)}
+                disabled={pending}
+                spellCheck={false}
+                placeholder="cli_…"
+                className="font-mono"
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="my-im-lark-secret">App Secret</Label>
+              <Input
+                id="my-im-lark-secret"
+                type="password"
+                autoComplete="off"
+                value={appSecret}
+                onChange={(e) => setAppSecret(e.target.value)}
+                disabled={pending}
+                spellCheck={false}
+                placeholder="(永不回显)"
+                className="font-mono"
+              />
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <label className="flex items-center gap-2 text-[11px] text-text-secondary">
+              <input
+                type="checkbox"
+                checked={useFeishu}
+                onChange={(e) => setUseFeishu(e.target.checked)}
+                disabled={pending}
+                className="accent-brand-500"
+              />
+              飞书(CN);取消勾选 = Lark intl
+            </label>
+            <Button
+              type="submit"
+              size="sm"
+              data-testid="my-im-lark-save"
+              disabled={pending || appId.trim().length === 0 || appSecret.trim().length === 0}
+            >
+              {pending ? "保存中…" : "保存凭据"}
+            </Button>
+          </div>
         </form>
-      </Card>
-    </section>
+
+        <div
+          className="flex flex-col gap-2 rounded-md border border-surface-800 bg-surface-950/40 p-2"
+          data-testid="my-im-lark-bind"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <StepHead n={2} title="允许 open_id(发现或手填)" done={allowlistSaved} />
+            {captureSince === null ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                data-testid="my-im-lark-capture"
+                onClick={startCapture}
+                disabled={pending}
+              >
+                发现 open_id
+              </Button>
+            ) : null}
+          </div>
+          <p className="text-[10px] text-status-error">
+            空 allowlist = fail-closed:bot 谁也不回。私聊 bot 或群里 @ 它即可发现你的 open_id。
+          </p>
+          {captureSince !== null ? (
+            <p className="text-[10px] text-text-dim">
+              现在私聊这个 Lark / 飞书 bot,或在群里 @ bot;消息会被拒绝,只用于显示 sender
+              open_id。
+            </p>
+          ) : null}
+          {candidates.length > 0 ? (
+            <div className="flex flex-col gap-1">
+              {candidates.map((c) => (
+                <button
+                  key={`${c.open_id}:${c.message_id}`}
+                  type="button"
+                  data-testid={`my-im-lark-candidate-${c.open_id}`}
+                  onClick={() => void saveAllowlist([...userIds, c.open_id])}
+                  disabled={pending}
+                  className="flex items-center justify-between gap-2 rounded border border-surface-800 px-2 py-1 text-left text-[11px] font-mono text-text-secondary hover:border-brand-500 hover:text-text-primary"
+                >
+                  <span>{c.open_id}</span>
+                  <span className="text-[10px] text-text-dim">绑定并保存</span>
+                </button>
+              ))}
+            </div>
+          ) : captureSince !== null ? (
+            <p className="text-[10px] font-mono text-text-dim">等待消息…</p>
+          ) : null}
+          <div className="flex items-end gap-2">
+            <div className="flex flex-1 flex-col gap-1.5">
+              <Label htmlFor="my-im-lark-users">允许的 open_id(逗号或换行分隔)</Label>
+              <Textarea
+                id="my-im-lark-users"
+                value={usersRaw}
+                onChange={(e) => setUsersRaw(e.target.value)}
+                disabled={pending}
+                rows={2}
+                spellCheck={false}
+                placeholder="ou_abc…"
+                className="font-mono"
+              />
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-testid="my-im-lark-allowlist-save"
+              onClick={() => void saveAllowlist(userIds)}
+              disabled={pending || userIds.length === 0}
+            >
+              保存 allowlist
+            </Button>
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }
 
