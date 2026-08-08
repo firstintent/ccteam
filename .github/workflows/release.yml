@@ -18,10 +18,13 @@
 # static-link sanity step at the end of the build job guards against
 # silent regressions if a dep upgrade re-introduces a glibc dependency.
 #
-# Windows is intentionally out of scope: ccteam's foundation is tmux +
-# inotify + POSIX signals (`libc::SIGKILL` / `SIGTERM` in
-# `crates/ccteam-core/src/harness.rs`), which are unix-only. Windows
-# users run ccteam under WSL2 with the linux-x64 binary.
+# Windows is intentionally out of scope: ccteam builds on POSIX —
+# signals (`libc::SIGKILL` / `SIGTERM` in
+# `crates/ccteam-core/src/harness.rs`), unix domain sockets, and
+# filesystem watches. Windows users run ccteam under WSL2 with the
+# linux-x64 binary. (tmux is NOT among these: it belongs to the frozen
+# `terminal` protocol, and the default stream-json / ACP path needs no
+# PTY at all.)
 #
 # The repo-guard on every job stops a fork that accidentally inherits
 # this workflow from publishing under the upstream release page.
@@ -193,11 +196,15 @@ jobs:
 
           Prebuilt binaries for Linux (x86_64 + aarch64, statically
           linked against musl libc so they run on any glibc version) and
-          macOS (Intel + Apple Silicon). Windows users: run ccteam under
-          WSL2 with the linux-x64 binary (ccteam's foundation is tmux +
-          inotify + POSIX signals, which are unix-only).
+          macOS (Intel + Apple Silicon). No runtime dependencies: no Rust
+          toolchain, no Node, no tmux. Windows users: run ccteam under
+          WSL2 with the linux-x64 binary (ccteam builds on POSIX signals,
+          unix sockets and filesystem watches).
 
-          ## Install (zero-Rust)
+          ## Install (one prebuilt binary, ~14 MB)
+
+          Nothing to compile and no toolchain to install — each archive below
+          holds a single self-contained \`ccteam\` executable.
 
           \`\`\`sh
           curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
@@ -221,10 +228,6 @@ jobs:
           xattr -d com.apple.quarantine ccteam
           \`\`\`
 
-          ## What's next
-
-          Read [docs/quickstart.md](https://github.com/firstintent/ccteam/blob/main/docs/quickstart.md)
-          for the 5-minute walkthrough.
           EOF
 
       - name: Create GitHub Release
