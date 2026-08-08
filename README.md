@@ -20,6 +20,7 @@ Each coding CLI is brilliant alone but works in isolation — one terminal, one 
 - **Codex** — grinds long jobs without wobbling
 - **Grok** — answers fastest
 - **Kimi** — bulk work on a tiny bill
+- **Pi** — one CLI over many providers (`anthropic/…`, `openai/…`), on your own machine
 
 ccteam is the connective tissue they lack — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves *how* the team organizes itself to prompts you version.
 
@@ -63,6 +64,7 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 - a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
 - a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place
 - a cost pill with daily budget caps
+- a per-project ⋯ menu in the sidebar: start a session there, copy its path, or take the project out of ccteam (deregister + stop its live sessions — your directory and code are never touched)
 - marketplace and settings
 
 Everything the console does is also `/api/v1` (OpenAPI at `/api/docs`).
@@ -136,8 +138,8 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
-- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents, satellite join tokens for new machines, Telegram/Lark bot credentials (chat id captured automatically), and per-user login links
-- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team
+- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents, satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
+- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. Pi is the exception by design: it gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
 
 <p align="center">
@@ -168,7 +170,7 @@ Async by default: the completion notification lands in the parent's chat like a 
 
 Who gets what starts from facts, not guesses: one `status` call is the roster — vendors installed, authenticated, and in-budget on the project's host, each one's models and reasoning-effort levels as it last declared them, and your routing notes (`<project>/.ccteam/routing.md` over the global fallback).
 
-Every spawn surface takes `model` and `effort` for every vendor and forwards both verbatim — the vendor owns the verdict on its own values, so a level it refuses comes back as a real error instead of a session quietly running at the default. Omit them and the vendor's own defaults hold. The ladders differ (claude `low…max`, codex `low…xhigh`, grok `low|medium|high`, kimi `low|high|max`), so ask rather than guess: `status` for agents, `GET /api/v1/models` for programs, and the web composer's menus render from the same source.
+Every spawn surface takes `model` and `effort` for every vendor and forwards both verbatim — the vendor owns the verdict on its own values, so a level it refuses comes back as a real error instead of a session quietly running at the default. Omit them and the vendor's own defaults hold. The ladders differ (claude `low…max`, codex `low…xhigh`, grok `low|medium|high`, kimi `low|high|max`, and pi's is per *model* — it declares which levels the chosen model actually supports), so ask rather than guess: `status` for agents, `GET /api/v1/models` for programs, and the web composer's menus render from the same source.
 
 ## Project context
 
@@ -185,7 +187,7 @@ ccteam adds a team to your repo without taking it over:
 
 ## Why
 
-Five excellent coding CLIs shipped in two years, and each assumes it's alone. The result: you, alt-tabbing between vendors, re-pasting context, playing message bus. The fix isn't a framework on top — the vendors' harnesses are already great. It's the connective tissue they lack: identity, routing, delivery, cost, observability, across vendors and machines. That's ccteam — `cc` for the Claude Code it grew out of, `team` for what your agents become.
+Six excellent coding CLIs shipped in two years, and each assumes it's alone. The result: you, alt-tabbing between vendors, re-pasting context, playing message bus. The fix isn't a framework on top — the vendors' harnesses are already great. It's the connective tissue they lack: identity, routing, delivery, cost, observability, across vendors and machines. That's ccteam — `cc` for the Claude Code it grew out of, `team` for what your agents become.
 
 It stays deliberately underneath:
 
@@ -220,4 +222,4 @@ Per project, delete `.ccteam/` and ccteam's section of `.claude/settings.local.j
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on **Claude Code**, driving **Codex**, **Grok**, **OpenCode** and **Kimi**.
+MIT — see [LICENSE](LICENSE). Built on **Claude Code**, driving **Codex**, **Grok**, **OpenCode**, **Kimi** and **Pi**.

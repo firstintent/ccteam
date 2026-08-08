@@ -29,7 +29,7 @@ These are the only terminal steps required. Afterward, the web console is the re
 
 ### 1. Install
 
-ccteam calls the Claude Code, Codex, Grok Build, OpenCode, and Kimi Code CLIs already installed and logged in on your machine. It does not bundle them.
+ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, and Pi CLIs already installed and logged in on your machine. It does not bundle them.
 
 **1 · Let an agent do it**
 
@@ -59,6 +59,7 @@ codex --version    # optional; only needed for Codex sessions
 grok --version     # optional; only needed for Grok Build sessions
 opencode --version # optional; only needed for OpenCode sessions
 kimi --version     # optional; only needed for Kimi Code sessions (`kimi login` first)
+pi --version       # optional; only needed for Pi sessions (0.83.0 or newer)
 ```
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
@@ -94,24 +95,26 @@ Open that link to enter the console.
 
 ## 1. Web Console (Recommended)
 
-Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / Marketplace / MCP / Evolution (read-only). **Settings** has Ops overview (daemon health + host onboarding/registration actions; fleet observation lives on the Team page), Access (external-agent MCP config, developer REST API, satellite join, IM credentials — the admin manages the global bot, regular users configure their own; user login links stay admin-only), General, and Account (with self-serve token reset for every identity). Only the Users (admin) tab is admin-exclusive. Theme defaults to **light** (dark remains available).
+Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / Marketplace / MCP / Evolution (read-only). **Settings** has Ops overview (daemon health, plus a management card per host: its full vendor inventory — installed / version / readiness / whether the ccteam tools are registered — with register and import buttons offered only where the backend will actually accept the write, remediation hints verbatim, and that machine's reported projects with their adopt state; fleet observation lives on the Team page), Access (external-agent MCP config, developer REST API, satellite join, IM credentials — the admin manages the global bot, regular users configure their own; user login links stay admin-only), General, and Account (with self-serve token reset for every identity). Only the Users (admin) tab is admin-exclusive. Theme defaults to **light** (dark remains available).
 
 > **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
 
 ### Register MCP (Automatic)
 
-Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
+Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. **Pi is deliberately not on that list**: its managed sessions receive the team tools through a ccteam-owned bridge extension loaded at spawn, so no Pi config of yours is ever written — and a `pi` you start by hand in a shell has no ccteam tools. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
 In the new-session dialog, choose **+ New project...**, enter a slug and directory path, and ccteam registers that directory as a project. If the same slug already exists, ccteam appends a number such as `demo2` or `demo3`.
 
+Managing one afterwards happens where the project lives: hover its workspace header in the sidebar and open the **⋯** menu — start a session in it, copy its path, or **remove it from ccteam**. Removal asks you to type the slug, then deregisters the project and stops its live sessions; the directory on disk and your code are untouched, and you can add it back any time. (Same semantics as `ccteam project rm` and `DELETE /api/v1/projects/{slug}`.)
+
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode and Kimi), the model and reasoning effort, and HITL at spawn time. Both menus are built per vendor from what that vendor declared at its last handshake (`GET /api/v1/models`), so you pick from its own ids and its own levels — a vendor that has no effort axis shows no effort menu, and leaving either on **default** sends nothing and lets the vendor decide. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi / Pi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode and Kimi, Pi's own RPC for Pi), the model and reasoning effort, and HITL at spawn time. Both menus are built per vendor from what that vendor declared at its last handshake (`GET /api/v1/models`), so you pick from its own ids and its own levels — a vendor that has no effort axis shows no effort menu, and leaving either on **default** sends nothing and lets the vendor decide. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
-- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, and Kimi are chat-only (Grok / OpenCode / Kimi run over ACP, with no terminal mirror).
+- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, Kimi, and Pi are chat-only (Grok / OpenCode / Kimi run over ACP and Pi over its own RPC, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
 - **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
 - **Schedule a message:** tap the **clock** on the composer to enter schedule mode. Enter **how many minutes and/or hours** from now (or tap chips `+15m` / `+30m` / `+1h` / `+2h`), or pick a **local-clock** datetime — the UI converts everything to a relative delay so browser timezone and daemon timezone never disagree. A preview shows the expected local send time. Type the text and send — the message joins a **queue above the input**, sorted by send time; cancel with **×**. At fire time the text is a normal user turn into that session. Schedule mode does not carry file/skill attachments. Caps: 20 pending per session, farthest **7 days** ahead. Failed deliveries stay in the queue (marked failed) for 24 hours so you can dismiss them.
@@ -146,12 +149,12 @@ Detailed bot setup is in [2. Telegram / Lark](#setup).
 One daemon can serve multiple users on one machine. This is **soft isolation** under one OS account: a UX boundary, not a security boundary.
 
 - Admins can create users in **Settings -> User Management**. Each user receives a one-time personal login link and sees only their own projects and sessions.
-- Each user can configure their own IM bot in **Settings -> My IM bot**. Save validates the token and applies immediately without daemon restart. That bot drives only that user's sessions. **Each bot token must be unique.**
+- Each user can configure their own IM bot in **Settings → Access → My IM bot**: one guided card per platform (Telegram / Lark), each a numbered two-step flow — ① save that platform's credential with its own button, ② bind who the bot answers, with sender capture starting by itself right after the save, so the next action is never a guess. Saving one platform never touches the other's credential. Save validates the token and applies immediately without a daemon restart. That bot drives only that user's sessions. **Each bot token must be unique.**
 
 ### Status and Cost
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.
-- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode uses only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table); **Kimi always shows "—"** (its ACP wire carries no usage/cost).
+- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode and Pi use only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table); **Kimi always shows "—"** (its ACP wire carries no usage/cost). A turn that fails part-way is still billed by the vendor, so its tokens and cost land on the ledger like any other turn — a failure never reads as free.
 
 ### Standard Resource API
 
@@ -230,9 +233,10 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 # Sessions
 /new [vendor] [role] [hitl] [model=<id>] [effort=<level>]
                              Create a session and return handle s<N>.
-                             vendor = claude (default) | codex | grok | opencode | kimi
+                             vendor = claude (default) | codex | grok | opencode | kimi | pi
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
                              grok/opencode/kimi = roleless ACP session (role arg ignored)
+                             pi = local-only session; roles supported
                              add hitl = approve tools in IM; default skip runs directly
                              model= / effort= (or m= / e=) go to the vendor verbatim, in any
                              order; omit them to ride the vendor's own default. Ladders differ
@@ -245,9 +249,14 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.
 /status                    Team health: idle / working / stuck plus model, effort and context
-                           usage. Context occupancy is only shown when it was actually
+                           usage, the session's own background work (subagents and background
+                           shells stay listed for as long as the vendor reports them running,
+                           not just during the turn that launched them), and its delegates.
+                           Context occupancy is only shown when it was actually
                            measured — a session whose vendor has not reported yet reads as
                            unknown rather than 0%, and survives daemon restarts.
+                           A session you have just sent a message to reads as working, not
+                           stuck: silence is measured within the current turn.
 /help                      List gateway commands.
 
 # Delayed send (one-shot user turns)
@@ -286,7 +295,7 @@ List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows 
 
 ### Human-in-the-Loop (HITL)
 
-Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Codex sessions have their own sandbox and ignore this mode. Grok and Kimi sessions currently run in `skip` (auto-approve) only; IM approval for them is planned but not yet wired.
+Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Claude and Pi sessions both support this — Pi routes its own permission dialogs through the same approve / deny buttons, and its auto-allowed tools never prompt. Codex sessions have their own sandbox and ignore this mode. Grok and Kimi sessions currently run in `skip` (auto-approve) only; IM approval for them is planned but not yet wired.
 
 ### Let Any Session Dispatch Work
 
@@ -461,7 +470,7 @@ The satellite reports its agents and registered projects every ~25s over its con
 - **Create remotely:** web console → new project → pick the satellite in the host picker → absolute path on that machine. The daemon asks the satellite to bootstrap and register it in place.
 - **Import an existing checkout:** `ccteam init` in the repo on that machine, then hosts page → 接入/Import next to the reported project. Same-slug collisions get a distinct catalog slug (`demo` → `demo2`) — slug equality across machines is not project identity.
 
-Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn. Fleet capacity: at most 50 live sessions daemon-wide (configurable `sessions.max_live`); admitting one more gracefully stops the least-recently-active idle session, which stays resumable.
+Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn. Pi is local-only by design — its sessions always run in the daemon's own process, and a project bound to a satellite refuses a Pi spawn with a plain error rather than quietly running it somewhere else. Fleet capacity: at most 50 live sessions daemon-wide (configurable `sessions.max_live`); admitting one more gracefully stops the least-recently-active idle session, which stays resumable.
 
 ---
 

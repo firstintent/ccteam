@@ -59,6 +59,7 @@ codex --version    # 可选,用 Codex 会话才需要
 grok --version     # 可选,用 Grok Build 会话才需要
 opencode --version  # 可选,用 OpenCode 会话才需要
 kimi --version      # 可选,用 Kimi Code 会话才需要(先 `kimi login`)
+pi --version        # 可选,用 Pi 会话才需要(0.83.0 及以上)
 ```
 
 > 若提示 `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"` 后重开终端。
@@ -87,7 +88,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过。**Pi 刻意不在这张表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
 ### 创建项目
 
@@ -95,7 +96,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode / Kimi)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode·Kimi)、模型与思考强度、spawn 前 HITL 开关。两个菜单都按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 干脆不显示强度菜单,留在**默认**则什么都不发、由 vendor 自己定。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless。建好回句柄 `s<N>`。
+- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode / Kimi / Pi)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode·Kimi / Pi 自己的 RPC)、模型与思考强度、spawn 前 HITL 开关。两个菜单都按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 干脆不显示强度菜单,留在**默认**则什么都不发、由 vendor 自己定。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
 - **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
@@ -213,9 +214,10 @@ Authorization: Bearer ccteam:<hex>
 # 会话
 /new [vendor] [role] [hitl] [model=<id>] [effort=<level>]
                            新建会话 → 回一个句柄 s<N>
-                             · vendor = claude(默认)| codex | grok | opencode | kimi
+                             · vendor = claude(默认)| codex | grok | opencode | kimi | pi
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
                              · grok / opencode / kimi = 无角色 ACP 会话(忽略 role 参数)
+                             · pi = 只在本机跑;支持角色
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
                              · model= / effort=(或 m= / e=)顺序随意,原文透传给 vendor;
                                不传就吃 vendor 自己的默认。各家梯度不同,`/status` 列出各自自报的档位
@@ -304,7 +306,7 @@ ccteam init --in /path/to/repo # 在别处初始化
 ccteam init --slug demo        # 覆盖自动推断的 slug
 ccteam init --owner user:u123  # 多用户:把项目归属给某租户
 ccteam config                  # 一次性配置:① 注册 MCP ② 配 IM bot ③ 偏好(交互菜单)
-ccteam config mcp              # 注册/刷新 ccteam MCP(五个 vendor 全写:Claude/Codex/Grok/OpenCode/Kimi;无 TTY 用这个)
+ccteam config mcp              # 注册/刷新 ccteam MCP(五个 vendor 全写:Claude/Codex/Grok/OpenCode/Kimi;Pi 走受管会话 bridge、不写配置;无 TTY 用这个)
 ccteam start                   # 起常驻服务(见「开始之前」;加 & 后台跑)
 ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌)
 ccteam start --no-web | --no-imd         # 只要网关 / 只要 web

@@ -14,7 +14,7 @@
 |---|---|
 | **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;说一句「也问问 codex 和 grok」,它自己把问题扇给几个 vendor,再把几份答案比出结论。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
-| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具,**零安装** |
+| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi / Pi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具,**零安装** |
 
 人的完整入口手册见 [usage-cn.md](usage-cn.md)。本文讲第三种——**怎么在你日常的 AI 里,用一句话指挥一整个团队。**
 
@@ -76,7 +76,7 @@
 挑谁干活靠三层,刻意分开:
 
 - **事实,探测出来。** 一次 `status` 调用返回**厂商面板**——按你项目绑定的主机出:各 vendor 装没装、版本,诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录,`unknown` 也绝不拦 spawn),预算态,主机在线还是快照已过期。远程主机经卫星通道上报;主机离线时给你最后一份快照并标 `stale`,绝不拿本机能力顶替。
-- **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。每个 vendor 的 spawn 配方旁边还挂着它自己的**思考强度梯**——它自报的档位,没自报就是 ccteam 用 CLI 实测钉死的那套。各家的梯**真不一样**(claude `low…max`、codex `low…xhigh`、grok `low|medium|high`、kimi `low|high|max`,opencode 干脆不公告共享梯),所以别拿另一家的拼写去猜,读一眼就是了。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。但它也**绝不吞掉你的选择**:点名了 vendor 拒绝的模型或强度,spawn 直接报错,而不是悄悄按默认档跑起来。
+- **目录,advisory。** 模型 id、显示名、别名档位,两个来源分开标注:**runtime 最近所见**(adapter 白拿的目录,带观测时间)和 hub **`models.json`**(社区维护)。每个 vendor 的 spawn 配方旁边还挂着它自己的**思考强度梯**——它自报的档位,没自报就是 ccteam 用 CLI 实测钉死的那套。各家的梯**真不一样**(claude `low…max`、codex `low…xhigh`、grok `low|medium|high`、kimi `low|high|max`,opencode 干脆不公告共享梯,pi 的梯**按模型**走——它自报你选的那个模型到底支持哪几档),所以别拿另一家的拼写去猜,读一眼就是了。目录是参考,永不当 spawn 白名单:`model`/`effort` 在 spawn 时原文透传,不在目录里的模型照样能传,目录过期最坏是推荐过时——挡不住任何东西。但它也**绝不吞掉你的选择**:点名了 vendor 拒绝的模型或强度,spawn 直接报错,而不是悄悄按默认档跑起来。
 - **观点,你的文本。** 全局分工写在 `~/.ccteam/routing.md`(缺失时由统一 home 初始化生成中立模板,绝不覆盖),可选的项目级覆盖写在 `<project>/.ccteam/routing.md`。项目文件存在时完整取代全局文件,二者不合并。它们都是 dumb markdown,无 schema。`status` 把选中的一份原文带给任何开口问的会话(注明来源/sha/是否截断)——任何 vendor、任何主机上的规划者拿到同一份——ccteam 永不解析、不执行。
 
 远程项目的 routing 仍是主 daemon 控制面配置:`<project>` 指 catalog 中的 daemon-side project data home;ccteam 不会偷偷同步或读取卫星工作树文件。
@@ -125,7 +125,7 @@
 
 ## 8. 装一次
 
-编排本身**无需安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进**全部五个 vendor**——Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
+编排本身**无需安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进**所有允许 ccteam 写配置的 vendor**——Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。唯一的例外是 Pi,且是刻意设计:ccteam 不写它任何配置,改为在自己 spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
 
 - 本机 `ccteam start` 起着 daemon。
 - 你在一个**已注册的 ccteam 项目**目录里(会话从当前目录认出项目)。
@@ -147,7 +147,7 @@
 
 平时你不用报工具名——会话听懂人话自己调。但如果你在**写 persona / skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
-- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`。**没有 `protocol` 参数**——wire 通道由 vendor 派生(claude/codex = stream-json;grok/opencode/kimi = acp),传入就是硬错误,与 `host` 相同;`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
+- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`/`pi`。**没有 `protocol` 参数**——wire 通道由 vendor 派生(claude/codex = stream-json;grok/opencode/kimi = acp;pi = 它自己的 RPC),传入就是硬错误,与 `host` 相同;`pi` 只在 daemon 本机跑:把它 spawn 进绑定卫星的项目会直接报错,绝不悄悄换台机器;`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话调的,它就是子会话的 `parent_sid`)或 `admin`(owner 前门 / 主会话 fallback,**永远是根 spawn**、`parent_sid: null`)。期望有父边却看到 `caller: "admin"`,说明这次调用走的是 admin 鉴权的 MCP server 而非你会话自己的 bearer。
 - **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?, notify?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。默认异步:**子会话一整个 vendor turn 干完、转 idle 时,只发一条完成通知**(话痨子会话的中途叙述不通知、只进账本);通知里明确写「已 idle、在等下一个 dispatch」——任务没真完,这就是你补派下一步的信号(「静默停摆」不再存在:idle 必有信号)。`notify` 选模式:`"final"`(默认)/`"all"`(每条消息都通知,调试用)/`"off"`(只记账本)。`wait_seconds`(≤600)阻塞到 turn 真正干完、返回**最终** `result_text`(中途叙述不会提前结束等待),超时返回 `pending`(子会话继续跑,绝不取消)。
 - **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本;并带累计账:`cost_usd`(有价表的 vendor)+ `tokens_total`(原始 token 数——只要 vendor 报 usage 就有,codex/grok/opencode/kimi 不再一片空白)。
 - **`session_list`** — 委派树(谁是谁的下属、忙闲、成本/token、`parent_sid`),按最近活跃排序。支持 `{project?, activity?, limit?}` 过滤(默认最多 30 行,截断时带 `truncated`/`total`;空字段省略),大船队不再灌爆你的上下文。web 团队视图渲染的是同一张图。
