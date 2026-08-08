@@ -23,13 +23,11 @@ import SettingsView, {
   AdminPanel,
   GeneralPanel,
   OpsPanel,
-  ProjectRemoveRow,
   maskToken,
   resolveSettingsTab,
   settingsDetailWidthClass,
   visibleSettingsItems,
 } from "./SettingsView";
-import type { DashboardRow } from "../lib/dashboardApi";
 
 describe("visibleSettingsItems (fail-closed ACL)", () => {
   it("tenant sees every settings surface except 用户管理", () => {
@@ -156,7 +154,7 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     vi.restoreAllMocks();
   });
 
-  it("stacks daemon status above projects above hosts without changing test ids", () => {
+  it("stacks daemon status above hosts (single column) without changing test ids", () => {
     // Router context: the hosts panel header links to the Team page (TEAM-9).
     const html = renderToString(
       <MemoryRouter>
@@ -166,15 +164,13 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     expect(html).toContain('data-testid="ops-view"');
     expect(html).toContain('class="ops-stack"');
     expect(html).toContain('data-testid="status-view"');
-    expect(html).toContain('data-testid="projects-panel"');
     expect(html).toContain('data-testid="hosts-view"');
-    // Daemon strip first, then the project catalog, hosts below.
+    // Daemon strip is the first status surface; hosts follow below. Project
+    // catalog management lives on the SIDEBAR workspace menus, not here.
     expect(html.indexOf('data-testid="status-view"')).toBeLessThan(
-      html.indexOf('data-testid="projects-panel"'),
-    );
-    expect(html.indexOf('data-testid="projects-panel"')).toBeLessThan(
       html.indexOf('data-testid="hosts-view"'),
     );
+    expect(html).not.toContain('data-testid="projects-panel"');
   });
 
   it("uses a vertical ops stack (no side-by-side status/hosts columns)", () => {
@@ -183,95 +179,6 @@ describe("OpsPanel (merged Status + Hosts)", () => {
     expect(css).toMatch(/\.daemon-strip\s*\{/);
     // Retired two-column layout must not sneak back.
     expect(css).not.toMatch(/\.ops-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,/s);
-  });
-});
-
-describe("ProjectRemoveRow (从 ccteam 移除项目 — type-to-confirm)", () => {
-  const row: DashboardRow = {
-    slug: "demo",
-    path: "/home/u/demo",
-    host: "local",
-    host_online: true,
-    team: "dev",
-    kind: "project",
-    last_event_label: "",
-    badge_class: "",
-    badge_label: "",
-    cost_label: "",
-  };
-
-  it("renders identity + a 移除 CTA when not armed", () => {
-    const html = renderToString(
-      <ProjectRemoveRow
-        row={row}
-        arming={false}
-        typed=""
-        busy={false}
-        onArm={() => {}}
-        onCancel={() => {}}
-        onTyped={() => {}}
-        onConfirm={() => {}}
-      />,
-    );
-    expect(html).toContain('data-testid="project-row-demo"');
-    expect(html).toContain("demo");
-    expect(html).toContain("/home/u/demo");
-    expect(html).toContain('data-testid="project-remove-demo"');
-    expect(html).toContain("移除");
-    expect(html).not.toContain('data-testid="project-remove-confirm-demo"');
-  });
-
-  it("armed: explains catalog-only semantics and gates 确认 on the typed slug", () => {
-    const armedWrong = renderToString(
-      <ProjectRemoveRow
-        row={row}
-        arming
-        typed="dem"
-        busy={false}
-        onArm={() => {}}
-        onCancel={() => {}}
-        onTyped={() => {}}
-        onConfirm={() => {}}
-      />,
-    );
-    expect(armedWrong).toContain('data-testid="project-remove-confirm-demo"');
-    // The copy must say disk files stay — that is the whole safety story.
-    expect(armedWrong).toContain("磁盘上的目录与代码不动");
-    // Mistyped slug keeps the destructive button disabled.
-    const goBtn = armedWrong.slice(armedWrong.indexOf('data-testid="project-remove-go-demo"'));
-    expect(goBtn.slice(0, goBtn.indexOf(">"))).toContain("disabled");
-
-    const armedRight = renderToString(
-      <ProjectRemoveRow
-        row={row}
-        arming
-        typed="demo"
-        busy={false}
-        onArm={() => {}}
-        onCancel={() => {}}
-        onTyped={() => {}}
-        onConfirm={() => {}}
-      />,
-    );
-    const goBtn2 = armedRight.slice(armedRight.indexOf('data-testid="project-remove-go-demo"'));
-    expect(goBtn2.slice(0, goBtn2.indexOf(">"))).not.toContain("disabled");
-  });
-
-  it("shows the satellite host + orphaned badge when applicable", () => {
-    const html = renderToString(
-      <ProjectRemoveRow
-        row={{ ...row, host: "sat-1", broken: true }}
-        arming={false}
-        typed=""
-        busy={false}
-        onArm={() => {}}
-        onCancel={() => {}}
-        onTyped={() => {}}
-        onConfirm={() => {}}
-      />,
-    );
-    expect(html.replace(/<!-- -->/g, "")).toContain("@ sat-1");
-    expect(html).toContain("orphaned");
   });
 });
 
