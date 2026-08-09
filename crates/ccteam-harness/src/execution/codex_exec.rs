@@ -519,6 +519,13 @@ impl HarnessAdapter for CodexExecAdapter {
         Box::pin(s)
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // One-shot batch execution: the stream describes a single `codex exec`
+        // run, and its end IS that run finishing. There is nothing to re-attach
+        // to.
+        crate::EventAttachment::OneShot
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if persistent_id.is_empty() {
             return Err(HarnessError::SpawnFailed(

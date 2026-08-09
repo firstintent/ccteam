@@ -185,6 +185,12 @@ impl HarnessAdapter for GatewayAdapter {
             .map(ccteam_harness::TurnSubmission::started)
     }
 
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        // Scripted test stream: one-shot. Re-attaching would replay
+        // the script, which is exactly what `Rebuildable` forbids.
+        ccteam_harness::EventAttachment::OneShot
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         let events = Arc::clone(&self.events);
         Box::pin(futures::stream::unfold((), move |_| {
@@ -280,6 +286,12 @@ impl HarnessAdapter for FailingGatewayAdapter {
             .map(ccteam_harness::TurnSubmission::started)
     }
 
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        // Scripted test stream: one-shot. Re-attaching would replay
+        // the script, which is exactly what `Rebuildable` forbids.
+        ccteam_harness::EventAttachment::OneShot
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         Box::pin(futures::stream::empty())
     }
@@ -352,6 +364,12 @@ impl HarnessAdapter for StubAdapter {
             .await
             .map(ccteam_harness::TurnSubmission::started)
     }
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        // Scripted test stream: one-shot. Re-attaching would replay
+        // the script, which is exactly what `Rebuildable` forbids.
+        ccteam_harness::EventAttachment::OneShot
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         Box::pin(futures::stream::empty())
     }
@@ -1122,6 +1140,287 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
         .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
 }
 
+/// The 2026-08-09 attachment double: a `Rebuildable` adapter whose FIRST
+/// `events()` stream ends while the session stays perfectly alive (a shared
+/// connection swapped out from under it, a satellite link reconnecting), and
+/// whose SECOND stream is the live one.
+struct DetachingAdapter {
+    attaches: AtomicUsize,
+    /// Emit an answer on the first attachment before ending it (so the test
+    /// can also assert nothing is replayed), or end it silently mid-turn.
+    answer_before_detach: bool,
+}
+
+impl DetachingAdapter {
+    fn new(answer_before_detach: bool) -> Self {
+        Self {
+            attaches: AtomicUsize::new(0),
+            answer_before_detach,
+        }
+    }
+}
+
+#[async_trait]
+impl HarnessAdapter for DetachingAdapter {
+    fn name(&self) -> &'static str {
+        "detaching-stub"
+    }
+    fn vendor(&self) -> AgentVendor {
+        AgentVendor::Claude
+    }
+    async fn start_thread(
+        &self,
+        spec: &AgentSpecBrief,
+        ctx: &SpawnCtx,
+    ) -> Result<ThreadHandle, HarnessError> {
+        Ok(ThreadHandle {
+            vendor: AgentVendor::Claude,
+            mode: ExecutionMode::Chat,
+            identity: format!("detaching-{}-{}-{}", ctx.slug, spec.role, ctx.sid),
+            started_at: chrono::Utc::now(),
+            raw_extras: serde_json::json!({}),
+        })
+    }
+    async fn submit_turn(
+        &self,
+        _h: &ThreadHandle,
+        _input: TurnInput,
+    ) -> Result<TurnId, HarnessError> {
+        Ok(TurnId::new("detaching-turn"))
+    }
+    async fn submit_turn_routed(
+        &self,
+        h: &ThreadHandle,
+        input: TurnInput,
+        _routing: ccteam_harness::TurnRouting,
+    ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
+        self.submit_turn(h, input)
+            .await
+            .map(ccteam_harness::TurnSubmission::started)
+    }
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        // Subscription-based, like every long-lived stdio/app-server vendor.
+        ccteam_harness::EventAttachment::Rebuildable
+    }
+
+    fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
+        let attach = self.attaches.fetch_add(1, Ordering::SeqCst);
+        let answer_first = self.answer_before_detach;
+        Box::pin(futures::stream::unfold(
+            (attach, 0u32),
+            move |(attach, step)| async move {
+                match (attach, step) {
+                    // First attachment: live long enough for the session's
+                    // turn to actually be in flight, (optionally) answer, then
+                    // the transport disappears — the stream ENDS while the
+                    // session is still very much alive.
+                    (0, 0) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if !answer_first {
+                            return None;
+                        }
+                        let evt = ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: "a-0".into(),
+                                details: ThreadItemDetails::AgentMessage(
+                                    "answer before the drop".into(),
+                                ),
+                            },
+                        };
+                        Some((evt, (attach, step + 1)))
+                    }
+                    (0, _) => None,
+                    // Every rebuild after it is healthy: one answer, then quiet.
+                    (_, 0) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let evt = ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: "a-1".into(),
+                                details: ThreadItemDetails::AgentMessage(
+                                    "answer after the rebuild".into(),
+                                ),
+                            },
+                        };
+                        Some((evt, (attach, step + 1)))
+                    }
+                    _ => {
+                        futures::future::pending::<()>().await;
+                        None
+                    }
+                }
+            },
+        ))
+    }
+
+    async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "test double".into(),
+        })
+    }
+    async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
+        Ok(())
+    }
+    async fn handle_directive(
+        &self,
+        _h: &ThreadHandle,
+        _d: Directive,
+    ) -> Result<DirectiveOutcome, HarnessError> {
+        Err(HarnessError::NotImplemented {
+            reason: "test double".into(),
+        })
+    }
+    async fn thread_status(&self, _h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
+        Ok(ThreadStatus::default())
+    }
+}
+
+/// 2026-08-09 — an ended `events()` stream is an ATTACHMENT fact, not a session
+/// fact. The pump must rebuild it against the current transport (and record
+/// the blind window), or a session whose connection was swapped goes silently
+/// unobservable while it keeps working.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pump_reattaches_after_the_inbound_stream_ends() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    mock.push(ChannelMessage {
+        id: "reattach-1".into(),
+        sender: "alice".into(),
+        reply_target: "chat-1".into(),
+        content: "/new claude helper".into(),
+        channel: "telegram".into(),
+        timestamp: 0,
+        thread_ts: None,
+        attachments: Vec::new(),
+        selection: None,
+    })
+    .await;
+    let adapter = Arc::new(DetachingAdapter::new(true));
+    run_mock_gateway_daemon_for(
+        projects_root,
+        Arc::clone(&mock),
+        Arc::clone(&adapter),
+        Duration::from_millis(1200),
+    )
+    .await;
+
+    assert!(
+        adapter.attaches.load(Ordering::SeqCst) >= 2,
+        "the pump must re-acquire the event stream, got {} attach(es)",
+        adapter.attaches.load(Ordering::SeqCst)
+    );
+    let contents: Vec<String> = mock.outbox().await.into_iter().map(|m| m.content).collect();
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("answer before the drop")),
+        "the first attachment's answer must still land: {contents:?}"
+    );
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("answer after the rebuild")),
+        "the rebuilt attachment must deliver: {contents:?}"
+    );
+
+    // …and the blind window is on the record, both ends of it.
+    let paths = ccteam_core::CcteamPaths {
+        root: ccteam_im::default_ccteam_root_public(),
+        projects_root: home.path().join("projects"),
+    };
+    let body = std::fs::read_to_string(paths.progress_jsonl("default")).unwrap_or_default();
+    let rows: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let detached = rows
+        .iter()
+        .find(|row| row["event"] == "session_stream_detached")
+        .expect("a detach must be recorded");
+    assert_eq!(detached["sid"], "s1");
+    assert_eq!(detached["slug"], "default");
+    let reattached = rows
+        .iter()
+        .find(|row| row["event"] == "session_stream_reattached")
+        .expect("a proven rebuild must be recorded");
+    assert_eq!(reattached["sid"], "s1");
+    assert!(reattached["gap_ms"].is_number());
+}
+
+/// The other half of the same invariant: a turn that was in flight when the
+/// transport died cannot be observed to completion, so it must be CLOSED
+/// honestly — 永久假装在工作 is the failure this replaces.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_stream_closes_the_turn_it_swallowed() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    for (id, content, ts) in [
+        ("detach-close-1", "/new claude helper", 0),
+        ("detach-close-2", "do the thing", 1),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            timestamp: ts,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+    let adapter = Arc::new(DetachingAdapter::new(false));
+    run_mock_gateway_daemon_for(
+        projects_root,
+        Arc::clone(&mock),
+        Arc::clone(&adapter),
+        Duration::from_millis(1200),
+    )
+    .await;
+
+    let contents: Vec<String> = mock.outbox().await.into_iter().map(|m| m.content).collect();
+    assert!(
+        contents
+            .iter()
+            .any(|c| c.contains("can no longer be observed")),
+        "the swallowed turn must be reported, not left working: {contents:?}"
+    );
+    // Exactly once — the re-attach loop keeps retrying, but the report does not
+    // repeat per attempt.
+    assert_eq!(
+        contents
+            .iter()
+            .filter(|c| c.contains("can no longer be observed"))
+            .count(),
+        1,
+        "one report per detachment: {contents:?}"
+    );
+    // The ledger closes the busy window too, or file-backed readers keep
+    // calling the session `working`.
+    let paths = ccteam_core::CcteamPaths {
+        root: ccteam_im::default_ccteam_root_public(),
+        projects_root: home.path().join("projects"),
+    };
+    let body = std::fs::read_to_string(paths.progress_jsonl("default")).unwrap_or_default();
+    assert!(
+        body.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row["event"] == "chat_turn_completed" && row["sid"] == "s1"),
+        "the open turn must reach a terminal ledger row: {body}"
+    );
+}
+
 /// Emits a steady stream of NON-visible activity (`ItemUpdated`) for well past
 /// the idle window, then a final answer — a "long but actively working" turn.
 /// The idle watchdog must NOT interrupt it (each event resets the idle clock).
@@ -1167,6 +1466,12 @@ impl HarnessAdapter for StreamingGatewayAdapter {
             .await
             .map(ccteam_harness::TurnSubmission::started)
     }
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        // Scripted test stream: one-shot. Re-attaching would replay
+        // the script, which is exactly what `Rebuildable` forbids.
+        ccteam_harness::EventAttachment::OneShot
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         // 15 reasoning ticks @ 20ms = 300ms of activity (past the 200ms idle
         // window — an old "no answer in window" watchdog would have killed it),
@@ -2098,6 +2403,19 @@ async fn run_mock_gateway_daemon<T>(
 ) where
     T: HarnessAdapter + Send + Sync + 'static,
 {
+    run_mock_gateway_daemon_for(projects_root, mock, adapter, Duration::from_millis(600)).await
+}
+
+/// Same harness with an explicit runtime, for cases that need more than the
+/// default 600ms window (a re-attach backoff, say).
+async fn run_mock_gateway_daemon_for<T>(
+    projects_root: std::path::PathBuf,
+    mock: Arc<MockChannel>,
+    adapter: Arc<T>,
+    max_runtime: Duration,
+) where
+    T: HarnessAdapter + Send + Sync + 'static,
+{
     let mut channels: ChannelMap = std::collections::HashMap::new();
     channels.insert(
         "telegram".to_string(),
@@ -2110,7 +2428,7 @@ async fn run_mock_gateway_daemon<T>(
     let args = DaemonArgs {
         credentials: None,
         registry: Some(projects_root),
-        max_runtime: Some(Duration::from_millis(600)),
+        max_runtime: Some(max_runtime),
         adapter_factory: Some(adapter_factory),
         channels_override: Some(channels),
         extra_channels: None,

@@ -1006,6 +1006,15 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         }))
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // The pane path tails a transcript from a persisted cursor and spawns
+        // that tail loop inside `events()`. Calling it twice would fork a
+        // second tail over the same jsonl and double every answer, so the
+        // stream is one-shot — and the terminal protocol is frozen
+        // (维护-only), so it stays that way.
+        crate::EventAttachment::OneShot
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         // The persistent_id is the tmux session name
         // (`ccteam-chat-<slug>-<role>`). If it's live, hand back a

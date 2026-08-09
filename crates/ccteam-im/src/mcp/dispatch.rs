@@ -4132,6 +4132,12 @@ mod session_tool_tests {
                 .await
                 .map(ccteam_harness::TurnSubmission::started)
         }
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
+        }
+
         fn events(
             &self,
             h: &ccteam_harness::ThreadHandle,

@@ -19,10 +19,10 @@ use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
     format_tokens, list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
-    Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
-    PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
-    TitleSync, TurnDisposition, TurnInput, TurnRouting,
+    Directive, DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter,
+    HarnessError, PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin,
+    SessionProtocol, SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
+    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -4042,6 +4042,11 @@ impl Gateway {
             // and PROGRESS (one live, edited status message per turn).
             let progress_on = progress_enabled();
             let throttle = progress_throttle();
+            // The session's INBOUND attachment. Deliberately re-acquired, not
+            // snapshotted once: `events()` attaches to the transport that
+            // carries the session NOW (see `HarnessAdapter::events`), and the
+            // state machine below rebuilds it whenever a stream ends.
+            let attachment = session.adapter.event_attachment();
             let mut events = session.adapter.events(&session.thread);
             let mut seq: u64 = 0; // answer sequence → message ids
             let mut epoch: u64 = 0; // status epoch → one per turn
@@ -4071,17 +4076,28 @@ impl Gateway {
             // per-session pump's own `tokio::select!` loop (one fewer task per
             // turn; the pump already lives for the session's whole lifetime).
             // `watch_timeout == 0` disables it entirely (matches the pre-fold
-            // early return). `stream_ended` tracks whether the adapter's own
-            // event stream has terminated (child exited): once it has, the
-            // `events.next()` branch is permanently disabled (a `select!`
-            // guard, not a `break`) so this loop doesn't hot-spin re-polling
-            // an exhausted stream, but the watchdog keeps ticking (mirrors the
+            // early return). The `events.next()` branch is gated on `streaming`
+            // (a `select!` guard, not a `break`) so the loop never hot-spins on
+            // an exhausted stream, while the watchdog keeps ticking (mirrors the
             // pre-fold design, where the watchdog task was fully independent
             // of the pump's own stream lifecycle — a dead/hung child still
             // gets the heads-up).
             let watch_timeout = gateway_turn_timeout_duration();
             let watch_poll = watch_timeout.min(std::time::Duration::from_secs(10));
-            let mut stream_ended = false;
+            // ---- inbound attachment state (2026-08-09) ----
+            // `events` holds a pollable stream.
+            let mut streaming = true;
+            // No further attachment is possible (a one-shot stream that ended).
+            let mut closed = false;
+            // Set the moment a vendor stream ends and cleared by the first
+            // event that proves a rebuilt attachment: `(detached_at, attempts)`.
+            // While it is `Some` the session is BLIND, and an `Error` arriving
+            // on the unproven stream is an attach diagnostic (a failed re-dial),
+            // not a turn outcome.
+            let mut detached: Option<(Instant, u32)> = None;
+            // `events` holds the synthetic detach report rather than a vendor
+            // attachment — its end must not be read as a second detach.
+            let mut reporting = false;
             let mut watch_tracked_turn: Option<String> = None;
             let mut watch_idle = std::time::Duration::ZERO;
             let mut watch_last_activity: u64 = 0;
@@ -4123,17 +4139,156 @@ impl Gateway {
                         tokio::time::sleep(watch_poll).await;
                     }
                 };
+                // Re-attach timer, armed only while the session is detached and
+                // a rebuild is still possible. Backoff is per attempt so a
+                // vendor that is genuinely down is retried at a 60s floor
+                // forever rather than given up on: the session outlives any one
+                // transport, so the pump keeps offering to re-attach for as
+                // long as the session is live.
+                let reattach_tick = async {
+                    match detached {
+                        Some((_, attempts)) if !streaming && !closed => {
+                            tokio::time::sleep(reattach_backoff(attempts)).await;
+                        }
+                        _ => std::future::pending::<()>().await,
+                    }
+                };
 
                 tokio::select! {
                     biased;
-                    maybe = events.next(), if !stream_ended => {
+                    maybe = events.next(), if streaming => {
                         let Some(evt) = maybe else {
-                            stream_ended = true;
-                            if watch_timeout.is_zero() {
-                                break;
+                            streaming = false;
+                            if reporting {
+                                // The synthetic detach report drained; the
+                                // re-attach schedule below owns what happens next.
+                                reporting = false;
+                                continue;
+                            }
+                            if attachment == EventAttachment::OneShot {
+                                // Nothing to rebuild (terminal protocol tails a
+                                // transcript from a cursor; a second tail loop
+                                // would double every answer). Keep the watchdog
+                                // ticking, exactly as before.
+                                closed = true;
+                                if watch_timeout.is_zero() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // A vendor stream ended. That is an ATTACHMENT fact,
+                            // never a session fact — the sid is still live and
+                            // the write path (resume-by-sid / re-dial) already
+                            // rebuilds itself. Record the blind window, tell the
+                            // truth about any turn it swallowed, and rebuild.
+                            if detached.is_none() {
+                                detached = Some((Instant::now(), 0));
+                                if let Some(ppath) = progress_path.as_ref() {
+                                    let ev = ccteam_core::progress::build_session_stream_detached_event(
+                                        &session.role,
+                                        &session_id,
+                                        &session.project,
+                                        "stream_ended",
+                                    );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "pump: failed to record session_stream_detached"
+                                        );
+                                    }
+                                }
+                                tracing::warn!(
+                                    session = %session_id,
+                                    vendor = ?pump_vendor,
+                                    "pump: inbound event stream detached — re-attaching"
+                                );
+                                // A turn that was in flight died with the
+                                // transport carrying it: whatever completion it
+                                // had is on the far side of a connection that no
+                                // longer exists. Feed the loss through the SAME
+                                // path a vendor-reported failure takes (one
+                                // terminal ledger row, one turns.jsonl `failed`
+                                // record, one parent notification, one IM
+                                // message) instead of leaving the session
+                                // "working" forever.
+                                let open_turn = session
+                                    .turn_started_at
+                                    .lock()
+                                    .map(|g| g.is_some())
+                                    .unwrap_or(false);
+                                if open_turn {
+                                    let turn_id = session
+                                        .watched_turn
+                                        .lock()
+                                        .ok()
+                                        .and_then(|g| g.as_ref().map(|(id, _)| id.clone()))
+                                        .or_else(|| {
+                                            heartbeat_turn.as_ref().map(|(id, _)| id.clone())
+                                        })
+                                        .unwrap_or_default();
+                                    events = Box::pin(futures::stream::once(async move {
+                                        ThreadEvent::Error(ccteam_harness::ThreadErrorEvent {
+                                            kind: "stream_detached".to_string(),
+                                            message: detached_turn_message(&turn_id),
+                                        })
+                                    }));
+                                    reporting = true;
+                                    streaming = true;
+                                }
                             }
                             continue;
                         };
+                        // First event on a rebuilt attachment — but only a
+                        // non-`Error` one proves it. A failed re-dial surfaces as
+                        // a single `Error` followed by the stream ending again,
+                        // so forwarding it would put one message per retry in
+                        // the chat. Nothing is lost by holding it back: if a
+                        // turn was open, the detach above ALREADY reported and
+                        // closed it, and if none was, a connect diagnostic is
+                        // not a turn boundary. An adapter's own in-flight-loss
+                        // signal arrives on the PROVEN attachment (before its
+                        // stream ends), so it is never the event suppressed here.
+                        if detached.is_some() && !reporting {
+                            if let ThreadEvent::Error(err) = &evt {
+                                tracing::warn!(
+                                    session = %session_id,
+                                    kind = %err.kind,
+                                    error = %err.message,
+                                    "pump: re-attach attempt failed"
+                                );
+                                continue;
+                            }
+                            if let Some((since, attempts)) = detached.take() {
+                                let gap_ms = since.elapsed().as_millis() as u64;
+                                if let Some(ppath) = progress_path.as_ref() {
+                                    let ev = ccteam_core::progress::build_session_stream_reattached_event(
+                                        &session.role,
+                                        &session_id,
+                                        &session.project,
+                                        gap_ms,
+                                        attempts,
+                                    );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "pump: failed to record session_stream_reattached"
+                                        );
+                                    }
+                                }
+                                tracing::info!(
+                                    session = %session_id,
+                                    gap_ms,
+                                    attempts,
+                                    "pump: inbound event stream re-attached"
+                                );
+                            }
+                        }
                         // Liveness tick: ANY event (assistant delta, tool-use,
                         // progress, turn-completed) means the turn is doing work,
                         // so the turn-timeout watchdog resets its idle clock. Only
@@ -4836,6 +4991,18 @@ impl Gateway {
                         ) {
                             break;
                         }
+                    }
+                    _ = reattach_tick, if !streaming && !closed && detached.is_some() => {
+                        // Rebuild against the CURRENT transport. `events()` is
+                        // subscription-based on every rebuildable protocol, so
+                        // this replays nothing; if the transport is still gone
+                        // the new stream simply ends again and the backoff
+                        // widens.
+                        if let Some((_, attempts)) = detached.as_mut() {
+                            *attempts = attempts.saturating_add(1);
+                        }
+                        events = session.adapter.events(&session.thread);
+                        streaming = true;
                     }
                     _ = watchdog_tick => {
                         // Snapshot + release immediately (never hold this
@@ -9725,6 +9892,39 @@ impl Drop for Gateway {
     }
 }
 
+/// How long the pump waits before rebuilding a detached inbound attachment:
+/// 250ms, 500ms, 1s … capped at 60s. The first wait is short because the
+/// common case (a shared connection swapped out under an idle session) heals
+/// in milliseconds, and the blind window is exactly the cost. Capping rather
+/// than giving up is the other half: a session outlives any single transport,
+/// so while the session is live the pump keeps offering to re-attach, and a
+/// vendor that comes back after an outage becomes observable again without the
+/// user doing anything.
+fn reattach_backoff(attempts: u32) -> std::time::Duration {
+    const BASE_MS: u64 = 250;
+    const CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempts.min(10))).min(CEILING)
+}
+
+/// The one message a turn gets when its transport disappeared underneath it.
+/// Deliberately routed through the ordinary vendor-failure path (see the
+/// pump's stream-end arm), so a swallowed turn produces the same ledger row,
+/// `turns.jsonl` record and parent notification a vendor-reported failure
+/// would — 兜底不写进账本、不通知父会话,就等于没有兜底.
+fn detached_turn_message(turn_id: &str) -> String {
+    let turn = if turn_id.is_empty() {
+        String::new()
+    } else {
+        format!(" {turn_id}")
+    };
+    format!(
+        "⚠️ The inbound event stream dropped while turn{turn} was running — the transport \
+         carrying it was replaced or its child exited, so this turn can no longer be observed \
+         and is recorded as failed. ccteam re-attaches automatically (its side effects, if any, \
+         are already on disk); resend the task if it produced nothing."
+    )
+}
+
 /// v0.8.x (concurrency review §4.1 P2) — the ONE-SHOT "turn went silent"
 /// warn-only heads-up, folded from the old detached per-turn
 /// `spawn_turn_timeout_watchdog` task into the session's own event pump (see
@@ -11866,6 +12066,12 @@ mod tests {
                 TurnDisposition::Injected => ccteam_harness::TurnSubmission::injected(turn_id),
                 TurnDisposition::Queued => ccteam_harness::TurnSubmission::queued(turn_id),
             })
+        }
+
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
         }
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {

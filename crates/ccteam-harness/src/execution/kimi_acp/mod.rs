@@ -671,6 +671,13 @@ impl HarnessAdapter for KimiAcpAdapter {
         .boxed()
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // The ACP child owns a broadcast channel; `events()` looks the live
+        // session up and subscribes to it, so a rebuild picks up the current
+        // child and replays nothing.
+        crate::EventAttachment::Rebuildable
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if let Some(live) = self.get_live(persistent_id) {
             return Ok(Self::make_handle(&live));

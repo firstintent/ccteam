@@ -31,6 +31,13 @@ pub const AGENT_DONE: &str = "agent_done";
 /// v0.9.2 — a live session was gracefully stopped to admit another session
 /// under the daemon-wide capacity limit.
 pub const SESSION_EVICTED: &str = "session_evicted";
+/// 2026-08-09 — the pump's inbound attachment to a live session ended (the
+/// transport under it was replaced, a shared connection was dropped, a child
+/// exited). The session is NOT over; the pump is rebuilding the attachment.
+pub const SESSION_STREAM_DETACHED: &str = "session_stream_detached";
+/// 2026-08-09 — the pump proved a rebuilt attachment by receiving an event on it.
+/// Pairs with [`SESSION_STREAM_DETACHED`]; `gap_ms` is the blind window.
+pub const SESSION_STREAM_REATTACHED: &str = "session_stream_reattached";
 /// v0.8.7 review-fix (R-L1) — a HITL session is PARKED awaiting a human
 /// approve/deny on a non-allowlist tool call. Emitted when the permission
 /// prompt is outstanding so an operator (status / dashboard / `progress`)
@@ -379,6 +386,47 @@ pub fn build_chat_turn_timeout_event(
         "turn_id": turn_id,
         "elapsed_sec": elapsed_sec,
         "stuck": true,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// 2026-08-09 — the inbound attachment for `sid` ended while the session is still
+/// live. `sid` is REQUIRED (the read-side classifier selects by sid) and the
+/// row is deliberately an IDLE boundary: a detached session is not working,
+/// and claiming otherwise is the exact lie this family exists to stop.
+pub fn build_session_stream_detached_event(
+    role: &str,
+    sid: &str,
+    slug: &str,
+    reason: &str,
+) -> Value {
+    json!({
+        "event": SESSION_STREAM_DETACHED,
+        "role": role,
+        "sid": sid,
+        "slug": slug,
+        "reason": reason,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// 2026-08-09 — the rebuilt attachment for `sid` delivered its first event.
+/// `gap_ms` measures how long the session was unobservable, `attempts` how
+/// many rebuilds it took.
+pub fn build_session_stream_reattached_event(
+    role: &str,
+    sid: &str,
+    slug: &str,
+    gap_ms: u64,
+    attempts: u32,
+) -> Value {
+    json!({
+        "event": SESSION_STREAM_REATTACHED,
+        "role": role,
+        "sid": sid,
+        "slug": slug,
+        "gap_ms": gap_ms,
+        "attempts": attempts,
         "ts": Utc::now().to_rfc3339(),
     })
 }

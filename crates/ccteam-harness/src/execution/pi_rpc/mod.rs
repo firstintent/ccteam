@@ -1254,6 +1254,12 @@ impl HarnessAdapter for PiRpcAdapter {
         ))
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // Pi's RPC sidecar publishes canonical events on a broadcast channel;
+        // `events()` re-looks-up the live session and subscribes afresh.
+        crate::EventAttachment::Rebuildable
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if let Some(live) = self.lookup(persistent_id) {
             if live.transport.read().await.is_alive() {

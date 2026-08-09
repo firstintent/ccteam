@@ -454,6 +454,13 @@ impl CodexAppServerAdapter {
     ///   mid-turn we skip and warn; the new session uses the previous config until
     ///   the child is idle (or ccteam restarts).
     ///
+    /// What the idle guard does NOT protect is every OTHER session's inbound
+    /// subscription: dropping the connection closes their broadcast too. That
+    /// is deliberate and safe only because the read path is rebuildable —
+    /// `event_attachment() == Rebuildable`, and the gateway pump re-attaches
+    /// (2026-08-09: before that contract existed, this exact line silently
+    /// blinded every attached codex session).
+    ///
     /// Called from `start_thread`. Existing resumed threads keep codex's
     /// per-thread config regardless (codex resume semantics), so this targets new
     /// threads only.
@@ -2099,6 +2106,16 @@ impl HarnessAdapter for CodexAppServerAdapter {
         Box::pin(s)
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // THE case this exists for. Every codex session shares ONE app-server
+        // connection, and that connection is replaced out from under them by
+        // design — `forget_client` on transport death, and the planned respawn
+        // when `config.toml` changes. A re-call re-dials (`client()`) and
+        // re-subscribes to the current broadcast, exactly like
+        // `ensure_thread_loaded` re-resumes the thread on the write side.
+        crate::EventAttachment::Rebuildable
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         let client = self.client().await?;
         let result = self
@@ -3008,20 +3025,37 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         "turn/started" => Some(ThreadEvent::TurnStarted {
             turn_id: pluck_turn_id_from_params(&notif.params),
         }),
-        "turn/completed" => Some(ThreadEvent::TurnCompleted {
-            turn_id: pluck_turn_id_from_params(&notif.params),
-            // NOTE: the real `turn/completed` wire has NO `usage` field
-            // anywhere (the `Turn` struct carries id/items/status/error/
-            // timing only). Token accounting flows through the separate
-            // `thread/tokenUsage/updated` notification (W4-fu bridge). This
-            // lookup therefore returns `None` against a live binary →
-            // default usage; it stays only to satisfy synthetic test
-            // fixtures that inline `usage`. Do NOT "fix" it to read the
-            // turn object — there is nothing there to read.
-            usage: pluck_usage(&notif.params).unwrap_or_default(),
-            // Codex per-turn cost is priced from `ctx.model` in
-            // `build_progress_line` (the wire carries no model here).
-            model: None,
+        // The turn's VERDICT lives in `turn.status` (+ `turn.error`), not in
+        // the method name: codex reports a failed or interrupted turn through
+        // this same notification (`emit_turn_completed_with_status`).
+        // Translating on the method alone made success the DEFAULT branch, so
+        // a turn killed upstream (`server_overloaded`) was booked as a clean
+        // answer — ledger row, parent completion notification and chat reply
+        // all lying at once. `codex_turn_outcome` states the outcome
+        // explicitly and never falls through to `Ok`.
+        //
+        // NOTE (both arms): the real `turn/completed` wire has NO `usage`
+        // field anywhere (the `Turn` struct carries id/items/status/error/
+        // timing only). Token accounting flows through the separate
+        // `thread/tokenUsage/updated` notification (W4-fu bridge), and a
+        // failed turn is re-enriched from it by `enrich_codex_turn_failed`.
+        // The lookup here returns `None` against a live binary → default
+        // usage; it stays only to satisfy synthetic test fixtures that inline
+        // `usage`. Do NOT "fix" it to read the turn object — there is nothing
+        // there to read. Codex per-turn cost is priced from `ctx.model` in
+        // `build_progress_line` (the wire carries no model here).
+        "turn/completed" => Some(match codex_turn_outcome(&notif.params) {
+            CodexTurnOutcome::Ok => ThreadEvent::TurnCompleted {
+                turn_id: pluck_turn_id_from_params(&notif.params),
+                usage: pluck_usage(&notif.params).unwrap_or_default(),
+                model: None,
+            },
+            CodexTurnOutcome::Failed { kind, message } => ThreadEvent::TurnFailed {
+                turn_id: pluck_turn_id_from_params(&notif.params),
+                err: ThreadErrorEvent { kind, message },
+                usage: pluck_usage(&notif.params).unwrap_or_default(),
+                model: None,
+            },
         }),
         // W3b catalog §8.4 defect fix: the mode-3 app-server protocol has
         // **no** `turn/failed` notification. The real wire name for a turn
@@ -3149,6 +3183,51 @@ fn codex_error_kind(params: &Value) -> Option<String> {
         Value::String(kind) if !kind.is_empty() => Some(camel_to_snake(kind)),
         Value::Object(fields) => fields.keys().next().map(|kind| camel_to_snake(kind)),
         _ => None,
+    }
+}
+
+/// The explicit outcome of a codex `turn/completed`. There is deliberately no
+/// `Unknown`-that-means-success: any terminal shape ccteam cannot read as a
+/// success is a failure, so an unrecognized future status surfaces instead of
+/// silently becoming a clean answer.
+enum CodexTurnOutcome {
+    Ok,
+    Failed { kind: String, message: String },
+}
+
+/// Read the verdict a `turn/completed` carries.
+///
+/// `params.turn.status` is `completed` | `interrupted` | `failed` (camelCase
+/// on the wire, `TurnStatus`), with the detail in `params.turn.error`
+/// (`TurnError { message, codexErrorInfo }`).
+fn codex_turn_outcome(params: &Value) -> CodexTurnOutcome {
+    // No `turn` object / no `status` at all: a fixture or a build with no
+    // failure channel on this notification — there is no verdict to demote.
+    let Some(turn) = params.get("turn") else {
+        return CodexTurnOutcome::Ok;
+    };
+    let status = turn
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if status.is_empty() || status.eq_ignore_ascii_case("completed") {
+        return CodexTurnOutcome::Ok;
+    }
+    let error_message = turn
+        .get("error")
+        .and_then(|err| err.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let kind = match status {
+        "interrupted" => "interrupted".to_string(),
+        "failed" => codex_error_kind(turn).unwrap_or_else(|| "turn_failed".to_string()),
+        _ => "unknown_turn_status".to_string(),
+    };
+    CodexTurnOutcome::Failed {
+        message: error_message
+            .unwrap_or_else(|| format!("codex turn ended with status `{status}`")),
+        kind,
     }
 }
 
@@ -3882,6 +3961,90 @@ mod tests {
                 assert_eq!(usage.output_tokens, 50);
             }
             _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    /// 2026-08-09 incident — three consecutive turns died upstream
+    /// (`server_overloaded`) and codex reported each one through
+    /// `turn/completed` carrying `status: "failed"`. Reading only the method
+    /// name booked all three as clean answers.
+    #[test]
+    fn translate_turn_completed_failed_status_is_a_failure() {
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turn": {
+                    "id": "u-9",
+                    "items": [],
+                    "status": "failed",
+                    "error": {
+                        "message": "Selected model is at capacity. Try again later.",
+                        "codexErrorInfo": { "serverOverloaded": {} },
+                    },
+                },
+            }),
+        };
+        match translate_notification(&n, "t-1").expect("a failed turn must surface") {
+            ThreadEvent::TurnFailed { turn_id, err, .. } => {
+                assert_eq!(turn_id, "u-9");
+                assert_eq!(err.kind, "server_overloaded");
+                assert!(err.message.contains("at capacity"), "{}", err.message);
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_turn_completed_interrupted_is_not_a_success() {
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turn": { "id": "u-2", "items": [], "status": "interrupted", "error": null },
+            }),
+        };
+        match translate_notification(&n, "t-1").expect("an interrupted turn must surface") {
+            ThreadEvent::TurnFailed { turn_id, err, .. } => {
+                assert_eq!(turn_id, "u-2");
+                assert_eq!(err.kind, "interrupted");
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    /// No default-success fall-through: a status ccteam does not recognize is
+    /// reported, never laundered into a clean answer.
+    #[test]
+    fn translate_turn_completed_unknown_status_is_a_failure() {
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turn": { "id": "u-3", "items": [], "status": "quantumCollapsed" },
+            }),
+        };
+        match translate_notification(&n, "t-1").expect("an unknown status must surface") {
+            ThreadEvent::TurnFailed { err, .. } => {
+                assert_eq!(err.kind, "unknown_turn_status");
+                assert!(err.message.contains("quantumCollapsed"), "{}", err.message);
+            }
+            other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_turn_completed_success_status_stays_completed() {
+        let n = Notification {
+            method: "turn/completed".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turn": { "id": "u-4", "items": [], "status": "completed", "error": null },
+            }),
+        };
+        match translate_notification(&n, "t-1").expect("a completed turn must surface") {
+            ThreadEvent::TurnCompleted { turn_id, .. } => assert_eq!(turn_id, "u-4"),
+            other => panic!("expected TurnCompleted, got {other:?}"),
         }
     }
 

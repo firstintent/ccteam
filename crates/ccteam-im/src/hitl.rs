@@ -1089,6 +1089,12 @@ mod tests {
         ) -> Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError> {
             unimplemented!("not exercised by this test")
         }
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
+        }
+
         fn events(
             &self,
             _h: &ccteam_harness::ThreadHandle,

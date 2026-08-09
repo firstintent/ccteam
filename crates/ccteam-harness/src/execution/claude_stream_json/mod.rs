@@ -1508,6 +1508,14 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         }))
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // `events()` looks the sid's live transport up again and subscribes to
+        // its broadcast — future events only. A respawned child (dead-child
+        // resume) or a reconnected satellite link is therefore observable
+        // again without the consumer knowing which of the two happened.
+        crate::EventAttachment::Rebuildable
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         // A live session for this uuid (idle wake within one daemon
         // lifetime) → hand back a handle pointing at it. Otherwise we
