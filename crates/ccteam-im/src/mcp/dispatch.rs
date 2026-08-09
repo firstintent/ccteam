@@ -1745,6 +1745,92 @@ async fn run_session_tool(
 /// `role` empty/absent = roleless (bare vendor reads the project
 /// CLAUDE.md/AGENTS.md). `title` is metadata/ledger only — NEVER concatenated
 /// into any prompt.
+/// **Which session is this call coming FROM** — the one answer every
+/// lineage-carrying feature reads (delegation parent, depth guardrails, the
+/// dispatcher stamped on a first task, the `caller_sid` echo).
+///
+/// Deliberately separate from the authentication TIER. The two were conflated:
+/// `McpCaller::Admin => None` read "authenticated as admin" as "is not a
+/// session", so a plain local agent that ccteam already mirrors in the ledger
+/// spawned children that mounted as ROOTS — the topology lost an edge that
+/// exists. Each lineage feature derived itself from the tier independently,
+/// which is why fixing one of them would not have fixed the others.
+///
+/// Sources, strongest first:
+///
+/// 1. **Verified principal** (`Ambient`) — cryptographic, server-resolved.
+/// 2. **Declared and validated** (`Admin`) — a plain local caller holds no
+///    per-session principal, and the HTTP front door carries no process
+///    context to infer one from, so it may NAME its own sid. Same-uid is
+///    already this path's trust boundary (an admin caller can spawn and stop
+///    anything), so declaring a parent adds no authority — but it is checked
+///    against the ledger, never taken on faith: an unknown sid is a loud error
+///    rather than a silent root.
+/// 3. **Never** for a tenant (`User`): their `_caller_*` args are stripped
+///    upstream, and a declaration must not smuggle identity back in.
+async fn resolve_call_origin(
+    caller: &McpCaller,
+    args: &Value,
+    gateway: Option<&std::sync::Arc<tokio::sync::Mutex<crate::gateway::Gateway>>>,
+) -> Result<Option<crate::gateway::DelegationParent>, String> {
+    match caller {
+        McpCaller::Ambient => {
+            let caller_sid = args
+                .get("_caller_sid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if caller_sid.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(crate::gateway::DelegationParent {
+                sid: caller_sid,
+                depth: args
+                    .get("_caller_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                role: args
+                    .get("_caller_role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }))
+        }
+        McpCaller::Admin => {
+            let Some(declared) = args
+                .get("parent_sid")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                // Nothing declared → a root spawn, as before: the admin front
+                // door IS rootless when a human drives it.
+                return Ok(None);
+            };
+            let Some(gateway) = gateway else {
+                return Err(format!(
+                    "session_spawn: parent_sid `{declared}` cannot be validated (no live gateway)"
+                ));
+            };
+            let view = {
+                let gw = gateway.lock().await;
+                gw.session_views().into_iter().find(|v| v.sid == declared)
+            };
+            let Some(view) = view else {
+                return Err(format!(
+                    "session_spawn: parent_sid `{declared}` is not a live session — run session_list to find your own sid, or omit parent_sid for a root spawn"
+                ));
+            };
+            Ok(Some(crate::gateway::DelegationParent {
+                sid: view.sid,
+                depth: view.delegation_depth,
+                role: view.role,
+            }))
+        }
+        McpCaller::User { .. } => Ok(None),
+    }
+}
+
 async fn run_session_spawn_at(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
@@ -1853,32 +1939,7 @@ async fn run_session_spawn_at(
     // from CallerCtx — never caller-supplied). Admin (HTTP front door) = a
     // human/root spawn (no parent, unrestricted). Guardrails apply only when a
     // real parent is present.
-    let parent = match &caller {
-        McpCaller::Ambient => {
-            let caller_sid = args
-                .get("_caller_sid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if caller_sid.is_empty() {
-                None
-            } else {
-                Some(crate::gateway::DelegationParent {
-                    sid: caller_sid,
-                    depth: args
-                        .get("_caller_depth")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32,
-                    role: args
-                        .get("_caller_role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                })
-            }
-        }
-        McpCaller::Admin | McpCaller::User { .. } => None,
-    };
+    let parent = resolve_call_origin(&caller, args, Some(gateway)).await?;
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
@@ -1888,7 +1949,10 @@ async fn run_session_spawn_at(
     // "my agent's children lost their parent edge" class of misconfiguration
     // (e.g. the agent's calls silently riding an admin-authenticated server).
     let caller_label = match (&caller, parent.as_ref()) {
-        (McpCaller::Admin, _) => "admin".to_string(),
+        // Echo the RESOLVED origin, not just the tier: a caller that declared
+        // itself can see what ccteam actually attributed the child to.
+        (McpCaller::Admin, Some(p)) => format!("admin:{}", p.sid),
+        (McpCaller::Admin, None) => "admin".to_string(),
         (McpCaller::Ambient, Some(p)) => format!("ambient:{}", p.sid),
         (McpCaller::Ambient, None) => "ambient".to_string(),
         (McpCaller::User { user_id }, _) => format!("user:{user_id}"),
@@ -4665,7 +4729,74 @@ mod session_tool_tests {
         .unwrap();
 
         assert_eq!(meta.owner, "user:ualice");
-        assert!(meta.parent_sid.is_none(), "admin spawn remains a root");
+        assert!(
+            meta.parent_sid.is_none(),
+            "an admin spawn that declares NO origin stays a root"
+        );
+
+        // …but a plain local session that names itself gets the edge. It is
+        // anonymous to the bridge (no per-session principal, no process
+        // context on the HTTP front door), so the declaration is the only
+        // signal — validated against the ledger, never taken on faith.
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_spawn",
+                json!({
+                    "project": "alice",
+                    "vendor": "claude",
+                    "parent_sid": sid,
+                }),
+            ),
+            Some(&gateway),
+            McpCaller::Admin,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(body["parent_sid"].as_str(), Some(sid), "{body}");
+        assert_eq!(body["delegation_depth"].as_u64(), Some(1), "{body}");
+        assert_eq!(
+            body["caller"].as_str(),
+            Some(format!("admin:{sid}").as_str()),
+            "the response echoes the resolved origin: {body}"
+        );
+        let child_meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alice"),
+            body["sid"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            child_meta.parent_sid.as_deref(),
+            Some(sid),
+            "the ledger carries the edge, so the tree mounts"
+        );
+
+        // An unknown sid is a LOUD error, never a silent root.
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_spawn",
+                json!({
+                    "project": "alice",
+                    "vendor": "claude",
+                    "parent_sid": "s404",
+                }),
+            ),
+            Some(&gateway),
+            McpCaller::Admin,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a live session"),
+            "{response}"
+        );
     }
 
     #[tokio::test]
