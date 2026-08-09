@@ -101,6 +101,10 @@ struct StubAdapter {
 struct GatewayAdapter {
     starts: AtomicUsize,
     submits: AtomicUsize,
+    /// How many times the gateway asked this session to rebuild its ccteam
+    /// tool face — the first-activation priming must be exactly once per
+    /// session, not once per turn.
+    tool_face_rebuilds: AtomicUsize,
     submitted_threads: tokio::sync::Mutex<Vec<String>>,
     submitted_payloads: tokio::sync::Mutex<Vec<String>>,
     events: Arc<tokio::sync::Mutex<VecDeque<ThreadEvent>>>,
@@ -189,10 +193,8 @@ impl HarnessAdapter for GatewayAdapter {
         &self,
         _h: &ThreadHandle,
     ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
-        // Test double: no tool face to rebuild.
-        Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
-            reason: "test double".to_string(),
-        })
+        self.tool_face_rebuilds.fetch_add(1, Ordering::SeqCst);
+        Ok(ccteam_harness::ToolSurfaceRebuild::Rebuilt)
     }
 
     fn event_attachment(&self) -> ccteam_harness::EventAttachment {
@@ -1168,6 +1170,52 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
     assert!(rows
         .iter()
         .any(|row| { row["state"] == "sent" && row["message"]["content"] == expected }));
+}
+
+/// A child session is driven by its PARENT agent, so nobody is there to type
+/// `/mcp` into it — the tool face has to be rebuilt automatically, at the
+/// moment the session first does work under this daemon. Once per session: a
+/// rebuild per turn would tear down a healthy MCP client on every message.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_activation_rebuilds_the_tool_face_once_per_session() {
+    let _g = env_lock();
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(MockChannel::new());
+    for (id, content, ts) in [
+        ("prime-1", "/new claude helper", 0),
+        ("prime-2", "first task", 1),
+        ("prime-3", "second task", 2),
+    ] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: content.into(),
+            channel: "telegram".into(),
+            timestamp: ts,
+            thread_ts: None,
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+    let adapter = Arc::new(GatewayAdapter::default());
+    run_mock_gateway_daemon(projects_root, Arc::clone(&mock), Arc::clone(&adapter)).await;
+
+    assert_eq!(
+        adapter.submits.load(Ordering::SeqCst),
+        2,
+        "both tasks must reach the vendor"
+    );
+    assert_eq!(
+        adapter.tool_face_rebuilds.load(Ordering::SeqCst),
+        1,
+        "the tool face is primed on first activation and never again"
+    );
 }
 
 /// The 2026-08-09 attachment double: a `Rebuildable` adapter whose FIRST

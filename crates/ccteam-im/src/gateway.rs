@@ -162,6 +162,16 @@ struct GatewaySession {
     /// in flight (mid-turn steer). Cleared on the terminal boundary after the
     /// experience writer reads it. Shared with `mirror_user_turn` + pump.
     steered_this_turn: Arc<AtomicBool>,
+    /// Whether this session's ccteam TOOL FACE has been rebuilt since the
+    /// current daemon started — see [`Gateway::prime_tool_surface`].
+    ///
+    /// Starts `false` for EVERY session, including one this daemon just
+    /// spawned: whether a given child predates the current endpoint is not
+    /// something the gateway can tell (a satellite may hold a child across a
+    /// main-daemon restart, and a local child can start in the seconds before
+    /// the web bind is listening), and the cost of assuming the worst is one
+    /// control request per session per daemon lifetime.
+    tool_face_primed: Arc<AtomicBool>,
     /// v0.8.19 — timestamp of the most recent pump event for this session
     /// (set next to the `activity_events` tick, on EVERY event). `/status`
     /// derives the 🔴 stuck state the same way the turn-timeout watchdog does:
@@ -1785,6 +1795,7 @@ impl Gateway {
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
+                tool_face_primed: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -3657,6 +3668,7 @@ impl Gateway {
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
+                tool_face_primed: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -3899,6 +3911,7 @@ impl Gateway {
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
+                tool_face_primed: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -6276,6 +6289,10 @@ impl Gateway {
         // assistant side, so without this the user's message is lost on a
         // history reseed / session switch).
         let user_text = payload.clone();
+        // The session is about to do work under THIS daemon for the first
+        // time — rebuild its tool face before the turn rather than discover
+        // it is gone from the agent's failed tool call.
+        self.prime_tool_surface(session_id).await;
         // Submit with reactive resume-and-retry: a turn is idempotent on a
         // `ThreadDied` (the child exited before the line was delivered), so on
         // that signal resume-by-sid and retry EXACTLY once — closing the
@@ -6627,6 +6644,60 @@ impl Gateway {
             free_text: None,
         };
         self.apply_pending(chat, p, selection).await
+    }
+
+    /// Rebuild a session's ccteam tool face the FIRST time it is activated
+    /// under this daemon — once per session per daemon lifetime, then never
+    /// again (the flag is on the session, which does not outlive the daemon's
+    /// live map).
+    ///
+    /// This is the automatic half of the tool-face contract, and it exists
+    /// because the manual half cannot serve the sessions that need it most: a
+    /// child session is driven by its PARENT agent, so there is nobody to type
+    /// `/mcp` into it, and a child whose MCP client died is not visibly broken
+    /// — it works normally right up until it tries to delegate.
+    ///
+    /// "First activation" rather than "endpoint came back" on purpose. Which
+    /// children predate the current endpoint is not knowable from the gateway
+    /// (a satellite may hold one across a main-daemon restart; a local one can
+    /// start in the seconds before the web bind is listening), and a blanket
+    /// broadcast at daemon start would rebuild every healthy client for
+    /// nothing. Priming at the moment the session first does work costs one
+    /// control request, at the point where a stale tool face is about to
+    /// matter, and vendors that cannot rebuild answer instantly.
+    ///
+    /// Never fails a turn: a rebuild that errors or times out is logged and
+    /// the turn proceeds — a session with a doubtful tool face is still a
+    /// session that can answer.
+    async fn prime_tool_surface(&self, session_id: &str) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        if session.tool_face_primed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let adapter = Arc::clone(&session.adapter);
+        let thread = session.thread.clone();
+        let sid = session_id.to_string();
+        match tokio::time::timeout(
+            TOOL_FACE_PRIME_TIMEOUT,
+            adapter.rebuild_tool_surface(&thread),
+        )
+        .await
+        {
+            Ok(Ok(ccteam_harness::ToolSurfaceRebuild::Rebuilt)) => {
+                tracing::info!(session = %sid, "ccteam-im: rebuilt the session's ccteam tool face on first activation");
+            }
+            Ok(Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason })) => {
+                tracing::debug!(session = %sid, %reason, "ccteam-im: tool face cannot be rebuilt in place");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(session = %sid, error = %err, "ccteam-im: tool-face rebuild failed; the turn proceeds");
+            }
+            Err(_) => {
+                tracing::warn!(session = %sid, "ccteam-im: tool-face rebuild timed out; the turn proceeds");
+            }
+        }
     }
 
     /// `/mcp` — rebuild the current session's ccteam TOOL FACE in place.
@@ -10523,6 +10594,11 @@ fn gateway_reply_wait_duration() -> std::time::Duration {
         .unwrap_or(DEFAULT_MS);
     std::time::Duration::from_millis(ms)
 }
+
+/// Ceiling on the first-activation tool-face rebuild. Short on purpose: it
+/// sits in front of a user's turn, and a vendor that cannot answer a control
+/// request this quickly has a bigger problem than a stale MCP client.
+const TOOL_FACE_PRIME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn gateway_submit_timeout_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5_000;
