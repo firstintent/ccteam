@@ -52,6 +52,12 @@ fn seed_web_token(paths: &CcteamPaths, hex: &str) {
 struct SecretRecordingAdapter {
     vendor: AgentVendor,
     secrets: Arc<StdMutex<HashMap<String, String>>>,
+    /// Stands in for a vendor that uses its principal DURING the spawn
+    /// (OpenCode's `session/new`, Pi's bridge `session_start`): filled by the
+    /// test once the gateway exists, read inside `start_thread`.
+    principals: Arc<StdMutex<Option<Arc<ccteam_im::principals::SessionPrincipals>>>>,
+    /// What that mid-spawn verification returned.
+    verified_during_spawn: Arc<StdMutex<Option<bool>>>,
 }
 
 #[async_trait::async_trait]
@@ -71,6 +77,12 @@ impl HarnessAdapter for SecretRecordingAdapter {
             .lock()
             .unwrap()
             .insert(ctx.sid.clone(), ctx.secret.clone());
+        // The vendor's tool-face handshake, at the only moment that matters.
+        let registry = self.principals.lock().unwrap().clone();
+        if let Some(registry) = registry {
+            let ok = registry.verify(&ctx.sid, &ctx.secret).is_some();
+            *self.verified_during_spawn.lock().unwrap() = Some(ok);
+        }
         Ok(ThreadHandle {
             vendor: self.vendor,
             mode: ExecutionMode::Chat,
@@ -194,13 +206,20 @@ async fn state_with_one_session(paths: CcteamPaths, auth: AuthState) -> (AppStat
     std::fs::create_dir_all(&project_dir).unwrap();
     let secrets: Arc<StdMutex<HashMap<String, String>>> = Arc::new(StdMutex::new(HashMap::new()));
     let secrets_f = Arc::clone(&secrets);
+    let principals_cell: Arc<StdMutex<Option<Arc<ccteam_im::principals::SessionPrincipals>>>> =
+        Arc::new(StdMutex::new(None));
+    let verified: Arc<StdMutex<Option<bool>>> = Arc::new(StdMutex::new(None));
+    let (principals_f, verified_f) = (Arc::clone(&principals_cell), Arc::clone(&verified));
     let factory = Arc::new(move |vendor, _protocol| {
         Arc::new(SecretRecordingAdapter {
             vendor,
             secrets: Arc::clone(&secrets_f),
+            principals: Arc::clone(&principals_f),
+            verified_during_spawn: Arc::clone(&verified_f),
         }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let mut gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+    *principals_cell.lock().unwrap() = Some(gateway.principals());
     let sid = gateway
         .create_session_api(
             "demo".into(),
@@ -218,9 +237,81 @@ async fn state_with_one_session(paths: CcteamPaths, auth: AuthState) -> (AppStat
         .cloned()
         .expect("adapter recorded the session secret");
     assert_eq!(secret.len(), 32, "the minted secret is 128-bit hex");
-    let app =
-        AppState::with_auth(paths, auth).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway)));
+    // THE regression this registry exists for: OpenCode dials `/mcp` inside
+    // `session/new` and Pi's bridge blocks `session_start` on `initialize` +
+    // `tools/list`. When the principal was only registered at apply, that
+    // handshake 401'd and OpenCode burned a 30s startup timeout on every
+    // managed spawn.
+    assert_eq!(
+        *verified.lock().unwrap(),
+        Some(true),
+        "the session principal must verify WHILE the vendor is spawning"
+    );
+    let app = AppState::with_auth(paths, auth).with_gateway_owned(gateway);
     (app, sid, secret)
+}
+
+/// A vendor uses its principal DURING spawn — OpenCode dials `/mcp` inside
+/// `session/new`, Pi's bridge blocks `session_start` on `initialize` +
+/// `tools/list`. Before the principal registry, that authenticated against a
+/// session that was not in the live map yet, so it 401'd and OpenCode burned
+/// its 30s MCP startup timeout on EVERY managed spawn.
+///
+/// A reserved principal must therefore be able to DISCOVER its tool face — and
+/// nothing more, because the session it belongs to does not exist yet.
+#[tokio::test]
+async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    seed_web_token(&paths, TOKEN_HEX);
+    let (app, _sid, _secret) = state_with_one_session(paths, AuthState::disabled()).await;
+    // A sid that is mid-spawn: reserved, never applied.
+    let principals = app
+        .session_principals
+        .as_ref()
+        .expect("the registry travels with the gateway")
+        .clone();
+    principals.reserve("s99", "spawning-secret", "demo", "reviewer", 0);
+    let addr = spawn_server(app).await;
+    let bearer = "ccteam-sid:s99:spawning-secret".to_string();
+
+    // Discovery: what the vendor's handshake actually needs.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "a spawning session must not be 401'd");
+    let body: Value = resp.json().await.unwrap();
+    let tools = body["result"]["tools"]
+        .as_array()
+        .expect("tools/list answers a spawning principal");
+    assert!(!tools.is_empty(), "the tool face must be discoverable");
+
+    // Authority: withheld until the session is real.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+               "params":{"name":"session_list","arguments":{}}}),
+    )
+    .await;
+    let body: Value = resp.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("still starting"),
+        "a session that does not exist yet must not be able to act: {body}"
+    );
+
+    // …and a wrong secret is still just 401, spawning or not.
+    let resp = post_mcp(
+        addr,
+        "ccteam-sid:s99:wrong",
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 401);
 }
 
 /// The full sid-bearer round-trip: session_list + session_spawn (with the slug

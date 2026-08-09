@@ -438,7 +438,12 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         }
         // MVP roleless: ignore role (no persona injection).
         let bin = opencode_bin();
-        let argv = build_argv(&bin, &OpencodeSpawnInput::default());
+        let argv = build_argv(
+            &bin,
+            &OpencodeSpawnInput {
+                permission_mode: ctx.permission_mode,
+            },
+        );
         let program = argv[0].clone();
         let args: Vec<String> = argv.into_iter().skip(1).collect();
         let cwd = if ctx.cwd.as_os_str().is_empty() {

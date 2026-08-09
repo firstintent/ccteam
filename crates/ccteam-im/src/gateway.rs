@@ -403,6 +403,12 @@ pub struct Gateway {
     /// the inbound hot path (see [`SpawnClaims`]); deliberately its own lock,
     /// never held under the gateway's own mutex for longer than a map lookup.
     spawn_claims: Arc<SpawnClaims>,
+    /// The `(sid, secret)` authority behind every managed session's tool face
+    /// — see [`crate::principals`]. Separate from `sessions` because a
+    /// principal has to work BEFORE its session is live (the vendor uses it
+    /// during spawn) and has to be verifiable WITHOUT this gateway's lock (the
+    /// vendor's `/mcp` call happens while a spawn path may be holding it).
+    principals: Arc<crate::principals::SessionPrincipals>,
     /// v0.8.24 Track D — optional satellite agent proxy for remote-host
     /// stdio spawn. `None` ⇒ production [`crate::remote_host::HttpRemoteHostProxy`].
     remote_host_proxy: Option<std::sync::Arc<dyn crate::remote_host::RemoteHostProxy>>,
@@ -1487,6 +1493,7 @@ impl Gateway {
             config: None,
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
+            principals: Arc::new(crate::principals::SessionPrincipals::new()),
             remote_host_proxy: None,
             local_vendor_availability_override: None,
             delegations: std::collections::HashMap::new(),
@@ -1670,6 +1677,16 @@ impl Gateway {
         } else {
             meta.role.clone()
         };
+        // Same contract as a fresh plan: the secret has to verify while the
+        // vendor is spawning, not only once the rebuilt session is applied.
+        let rebuild_secret = ccteam_core::session_secret::mint();
+        self.principals.reserve(
+            &meta.sid,
+            &rebuild_secret,
+            slug,
+            &meta.role,
+            meta.delegation_depth,
+        );
         Ok(MetaRebuildPlan {
             sid: meta.sid.clone(),
             slug: slug.to_string(),
@@ -1685,7 +1702,7 @@ impl Gateway {
             handle,
             model_id,
             effort: meta.effort.clone(),
-            secret: ccteam_core::session_secret::mint(),
+            secret: rebuild_secret,
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
@@ -1774,6 +1791,14 @@ impl Gateway {
         let sid = plan.sid.clone();
         let excluded = self.live_capacity_exclusions(&sid, plan.parent_sid.as_deref());
         self.ensure_live_capacity(&excluded).await;
+        // Rebuilt session is live: full authority, same secret.
+        self.principals.promote(
+            &sid,
+            &plan.secret,
+            &plan.slug,
+            &plan.role,
+            plan.delegation_depth,
+        );
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -1823,7 +1848,13 @@ impl Gateway {
         reply_to: ChatKey,
     ) -> Result<()> {
         let plan = self.plan_session_rebuild(slug, cwd, meta, &reply_to)?;
-        let thread = Self::spawn_for_plan(&plan).await?;
+        let thread = match Self::spawn_for_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.forget_principal(&plan.sid);
+                return Err(err.into());
+            }
+        };
         self.apply_rebuilt_session(plan, thread, reply_to).await;
         Ok(())
     }
@@ -1936,6 +1967,7 @@ impl Gateway {
                         .await;
                 }
                 Err(err) => {
+                    gateway.lock().await.forget_principal(&plan.sid);
                     tracing::warn!(
                         session = %plan.sid,
                         error = %err,
@@ -2382,7 +2414,13 @@ impl Gateway {
             };
             if let EnsureSessionOutcome::Spawn(plan) = outcome {
                 // The slow part — deliberately NO gateway lock held here.
-                let thread = Self::spawn_for_new_session_plan(&plan).await?;
+                let thread = match Self::spawn_for_new_session_plan(&plan).await {
+                    Ok(thread) => thread,
+                    Err(err) => {
+                        gateway.lock().await.forget_principal(&plan.id);
+                        return Err(err.into());
+                    }
+                };
                 let sid = {
                     let mut g = gateway.lock().await;
                     let outcome = g.apply_new_session(*plan, thread, None).await?;
@@ -3160,7 +3198,13 @@ impl Gateway {
         match self.plan_ensure_current_session(chat)? {
             EnsureSessionOutcome::AlreadyHasSession => Ok(()),
             EnsureSessionOutcome::Spawn(plan) => {
-                let thread = Self::spawn_for_new_session_plan(&plan).await?;
+                let thread = match Self::spawn_for_new_session_plan(&plan).await {
+                    Ok(thread) => thread,
+                    Err(err) => {
+                        self.forget_principal(&plan.id);
+                        return Err(err.into());
+                    }
+                };
                 let outcome = self.apply_new_session(*plan, thread, None).await?;
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
@@ -3404,7 +3448,13 @@ impl Gateway {
             tuning,
         )?;
         plan.remote = host_target.remote;
-        let thread = Self::spawn_for_new_session_plan(&plan).await?;
+        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.forget_principal(&plan.id);
+                return Err(err.into());
+            }
+        };
         let outcome = self.apply_new_session(plan, thread, None).await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
         Ok(outcome)
@@ -3494,6 +3544,13 @@ impl Gateway {
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
         let secret = ccteam_core::session_secret::mint();
+        // The vendor is handed this secret as part of the spawn and USES it
+        // before the spawn returns (OpenCode dials `/mcp` inside `session/new`;
+        // Pi's bridge blocks `session_start` on `initialize` + `tools/list`).
+        // Registering it only at apply made those handshakes authenticate
+        // against a session that did not exist yet — a 401 the vendor answers
+        // by burning its 30s MCP startup timeout, on EVERY managed spawn.
+        self.principals.reserve(&id, &secret, &project, &role, 0);
         let adapter = (self.adapter_factory)(vendor, protocol);
         // Ownership is decided HERE, the one sync core every fresh spawn funnels
         // through (IM `/new` → `start_session`, REST `POST …/sessions` →
@@ -3645,6 +3702,10 @@ impl Gateway {
         let owner_channel = reply_to.channel.clone();
         let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
         self.ensure_live_capacity(&excluded).await;
+        // The session is live: the same secret now carries full authority
+        // (`Spawning` only ever allowed tool-face discovery).
+        self.principals
+            .promote(&id, &secret, &project, &role, delegation_depth);
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -8282,19 +8343,38 @@ impl Gateway {
     /// defense-in-depth, NOT a hard boundary. Real isolation = per-agent OS
     /// user / sandbox (deferred). See `ccteam_core::session_secret`.
     pub fn verify_session_principal(&self, sid: &str, presented_secret: &str) -> Option<CallerCtx> {
-        if presented_secret.is_empty() {
-            return None;
-        }
-        let s = self.sessions.get(sid)?;
-        if s.secret.is_empty() || !ccteam_core::session_secret::ct_eq(&s.secret, presented_secret) {
+        // Reads the principal REGISTRY, not the live map: a session's secret
+        // is valid from the moment it is minted (the vendor uses it during
+        // spawn), and only a live principal may invoke tools.
+        let matched = self.principals.verify(sid, presented_secret)?;
+        if !crate::principals::may_invoke_tools(matched.state) {
             return None;
         }
         Some(CallerCtx {
-            sid: s.id.clone(),
-            slug: s.project.clone(),
-            role: s.role.clone(),
-            depth: s.delegation_depth,
+            sid: matched.sid,
+            slug: matched.slug,
+            role: matched.role,
+            depth: matched.depth,
         })
+    }
+
+    /// A spawn that never became a session takes its credential with it. The
+    /// `Spawning` state already withholds every authority except listing the
+    /// tool face, so a leak is untidy rather than dangerous — but a secret for
+    /// a session that does not exist has no reason to keep verifying.
+    fn forget_principal(&self, sid: &str) {
+        self.principals.forget(sid);
+    }
+
+    /// Handle to the `(sid, secret)` registry, so a front door can verify a
+    /// principal WITHOUT taking this gateway's lock. That independence is
+    /// load-bearing, not an optimization: a spawn path may hold the gateway
+    /// lock while the vendor it is spawning calls `/mcp` to build its tool
+    /// face, and sharing one lock across both ends deadlocks the spawn (Pi,
+    /// 2026-08-09: `/new` held the lock, the bridge's `fetch` waited for it,
+    /// the child never read stdin, 30s timeout).
+    pub fn principals(&self) -> Arc<crate::principals::SessionPrincipals> {
+        Arc::clone(&self.principals)
     }
 
     /// v0.8.8 F1 — confirm a HITL-firing `sid` maps to a live tracked session,
@@ -8865,7 +8945,13 @@ impl Gateway {
         plan.delegation_depth = child_depth;
         plan.title = title.clone();
         let child_sid = plan.id.clone();
-        let thread = Self::spawn_for_new_session_plan(&plan).await?;
+        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.forget_principal(&plan.id);
+                return Err(err.into());
+            }
+        };
         let outcome = self
             .apply_new_session(plan, thread, Some("session_spawn"))
             .await?;
@@ -9443,6 +9529,9 @@ impl Gateway {
             .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
+        // The secret dies with the session — before the close, so a racing
+        // `/mcp` call from the dying child cannot slip through behind it.
+        self.principals.forget(sid);
         // Abort the pump before closing so no stale pump keeps draining the
         // retired transcript (mirrors switch_current_role).
         if let Some(pump) = self.event_pumps.remove(sid) {

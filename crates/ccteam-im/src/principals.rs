@@ -1,0 +1,247 @@
+//! The registry behind `ccteam-sid:<sid>:<secret>` — who a managed session is
+//! allowed to be, for as long as that secret is worth anything.
+//!
+//! **Why this is not just a field on the live session.** A session's principal
+//! is minted with its sid, handed to the vendor as part of the spawn (an
+//! `mcp.json`, an ACP `mcpServers[]`, a bridge env var), and USED by the vendor
+//! before the spawn returns — OpenCode dials `/mcp` inside `session/new`, and
+//! Pi's bridge blocks its whole `session_start` on `initialize` + `tools/list`.
+//! Authority that only begins when the session lands in the gateway's live map
+//! therefore arrives too late for the very handshake it was minted for:
+//!
+//! - OpenCode: 401 during `session/new` → its MCP client burns a 30s startup
+//!   timeout → EVERY managed spawn cost half a minute.
+//! - Pi: the bridge's `fetch` never returns, so `session_start` never ends, so
+//!   the child never reads stdin, so the handshake times out at 30s.
+//!
+//! Keeping it separate buys a second, larger property: **verifying a principal
+//! must not need the gateway lock.** Pi's deadlock was exactly that cycle —
+//! `/new` held the gateway mutex across `start_thread`, and the bridge's `/mcp`
+//! call needed the same mutex to check a secret. A credential check is a
+//! read-only string comparison; giving it its own lock means no spawn path,
+//! present or future, can deadlock against a vendor's tool-face handshake.
+//!
+//! Lifecycle mirrors the session's, one state ahead of it:
+//!
+//! ```text
+//! plan_*    reserve(sid, secret)  → Spawning   // the vendor may DISCOVER
+//! apply_*   promote(sid)          → Live       // …and now USE
+//! failure / stop_session          → forget     // the secret dies with it
+//! ```
+
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+
+/// How far along the session behind a principal is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrincipalState {
+    /// Minted, spawn in flight, not yet in the live map. The vendor is
+    /// building its tool face right now.
+    Spawning,
+    /// The session is live and dispatchable.
+    Live,
+}
+
+/// A verified principal: the server-side identity, never the caller's word for
+/// it.
+#[derive(Debug, Clone)]
+pub struct PrincipalMatch {
+    /// The session id, echoed back from the registry rather than trusted from
+    /// the wire.
+    pub sid: String,
+    /// Project the session belongs to — the scope every `session_*` call is
+    /// server-side clamped to.
+    pub slug: String,
+    /// Role label, for prompts and receipts.
+    pub role: String,
+    /// Delegation depth, for the A2A guardrails.
+    pub depth: u32,
+    /// Whether the session behind this principal is live yet.
+    pub state: PrincipalState,
+}
+
+#[derive(Debug, Clone)]
+struct Principal {
+    secret: String,
+    slug: String,
+    role: String,
+    depth: u32,
+    state: PrincipalState,
+}
+
+/// The one place a `(sid, secret)` pair becomes an identity.
+#[derive(Debug, Default)]
+pub struct SessionPrincipals {
+    inner: RwLock<BTreeMap<String, Principal>>,
+}
+
+impl SessionPrincipals {
+    /// An empty registry — one per gateway, shared with every front door that
+    /// has to verify a principal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint-time registration: the secret starts working NOW, at
+    /// [`PrincipalState::Spawning`], because the vendor is about to use it.
+    ///
+    /// Idempotent per sid — a re-plan for the same sid (a `/role` switch mints
+    /// a fresh secret for a session that already exists) REPLACES the record,
+    /// so the superseded secret stops verifying immediately.
+    pub fn reserve(&self, sid: &str, secret: &str, slug: &str, role: &str, depth: u32) {
+        if sid.is_empty() || secret.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.inner.write() {
+            map.insert(
+                sid.to_string(),
+                Principal {
+                    secret: secret.to_string(),
+                    slug: slug.to_string(),
+                    role: role.to_string(),
+                    depth,
+                    state: PrincipalState::Spawning,
+                },
+            );
+        }
+    }
+
+    /// The session is live: the same secret now carries full authority.
+    /// `slug` / `role` are re-stamped from the applied session, which is the
+    /// authority for them (a plan can be adjusted before it lands).
+    pub fn promote(&self, sid: &str, secret: &str, slug: &str, role: &str, depth: u32) {
+        if sid.is_empty() || secret.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.inner.write() {
+            map.insert(
+                sid.to_string(),
+                Principal {
+                    secret: secret.to_string(),
+                    slug: slug.to_string(),
+                    role: role.to_string(),
+                    depth,
+                    state: PrincipalState::Live,
+                },
+            );
+        }
+    }
+
+    /// The session ended, or never began. The secret is worthless from here —
+    /// called on spawn failure as well as on stop, so a failed spawn cannot
+    /// leave a usable credential behind.
+    pub fn forget(&self, sid: &str) {
+        if let Ok(mut map) = self.inner.write() {
+            map.remove(sid);
+        }
+    }
+
+    /// Resolve `(sid, secret)` to an identity. Constant-time secret compare;
+    /// an unknown sid and a wrong secret are indistinguishable to the caller.
+    pub fn verify(&self, sid: &str, presented_secret: &str) -> Option<PrincipalMatch> {
+        if sid.is_empty() || presented_secret.is_empty() {
+            return None;
+        }
+        let map = self.inner.read().ok()?;
+        let principal = map.get(sid)?;
+        if principal.secret.is_empty()
+            || !ccteam_core::session_secret::ct_eq(&principal.secret, presented_secret)
+        {
+            return None;
+        }
+        Some(PrincipalMatch {
+            sid: sid.to_string(),
+            slug: principal.slug.clone(),
+            role: principal.role.clone(),
+            depth: principal.depth,
+            state: principal.state,
+        })
+    }
+
+    #[cfg(test)]
+    fn count(&self) -> usize {
+        self.inner.read().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+/// Whether a principal in this state may invoke a tool, as opposed to merely
+/// discovering which tools exist.
+///
+/// A spawning session is not yet a session: it has no live thread, nothing can
+/// be dispatched to it, and it must not be able to spawn children or stop
+/// anybody. It only needs `initialize` + `tools/list` to finish building its
+/// tool face — so that is all it gets, and the window where a secret exists
+/// for a session that may never come to life is closed by construction rather
+/// than by hoping the cleanup ran.
+pub fn may_invoke_tools(state: PrincipalState) -> bool {
+    matches!(state, PrincipalState::Live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reserved_principal_verifies_before_the_session_is_live() {
+        // The whole point: the vendor dials `/mcp` DURING spawn.
+        let reg = SessionPrincipals::new();
+        reg.reserve("s1", "sek", "alpha", "cto", 0);
+        let m = reg
+            .verify("s1", "sek")
+            .expect("reserved principal verifies");
+        assert_eq!(m.state, PrincipalState::Spawning);
+        assert_eq!(m.slug, "alpha");
+        assert!(
+            !may_invoke_tools(m.state),
+            "a session that does not exist yet must not be able to act"
+        );
+    }
+
+    #[test]
+    fn promote_grants_tool_authority_and_forget_revokes_everything() {
+        let reg = SessionPrincipals::new();
+        reg.reserve("s1", "sek", "alpha", "cto", 0);
+        reg.promote("s1", "sek", "alpha", "reviewer", 2);
+        let m = reg.verify("s1", "sek").expect("live principal verifies");
+        assert_eq!(m.state, PrincipalState::Live);
+        assert_eq!(m.role, "reviewer", "apply is the authority for role");
+        assert_eq!(m.depth, 2);
+        assert!(may_invoke_tools(m.state));
+
+        reg.forget("s1");
+        assert!(
+            reg.verify("s1", "sek").is_none(),
+            "a stopped session's secret must die with it"
+        );
+        assert_eq!(reg.count(), 0);
+    }
+
+    #[test]
+    fn a_failed_spawn_leaves_no_usable_credential() {
+        let reg = SessionPrincipals::new();
+        reg.reserve("s7", "sek", "alpha", "cto", 0);
+        reg.forget("s7"); // what the spawn-failure path does
+        assert!(reg.verify("s7", "sek").is_none());
+    }
+
+    #[test]
+    fn wrong_secret_and_unknown_sid_are_both_rejected() {
+        let reg = SessionPrincipals::new();
+        reg.reserve("s1", "sek", "alpha", "cto", 0);
+        assert!(reg.verify("s1", "nope").is_none());
+        assert!(reg.verify("s2", "sek").is_none());
+        assert!(reg.verify("s1", "").is_none());
+        assert!(reg.verify("", "sek").is_none());
+    }
+
+    /// A `/role` switch mints a fresh secret for an existing sid. The old one
+    /// must stop working the moment the new one is registered.
+    #[test]
+    fn re_reserving_a_sid_supersedes_the_previous_secret() {
+        let reg = SessionPrincipals::new();
+        reg.promote("s1", "old", "alpha", "cto", 0);
+        reg.reserve("s1", "new", "alpha", "auditor", 0);
+        assert!(reg.verify("s1", "old").is_none());
+        assert!(reg.verify("s1", "new").is_some());
+    }
+}

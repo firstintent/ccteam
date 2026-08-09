@@ -1874,6 +1874,14 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             // factory so HTTP session endpoints drive the same session map the
             // daemon owns.
             let web_gateway = shared_gateway.clone();
+            // The `(sid, secret)` registry travels beside the gateway handle,
+            // taken here (async context) because `/mcp` must verify a managed
+            // session's principal WITHOUT the gateway lock — see
+            // `ccteam_im::principals`.
+            let web_principals = match web_gateway.as_ref() {
+                Some(gw) => Some(gw.lock().await.principals()),
+                None => None,
+            };
             // v0.9 T4 — same sink/pending the mcp.sock handler gets, so
             // `POST /mcp` can drive session_* / chat_send_file / HITL.
             let web_mcp_sink = gw_event_tx.clone();
@@ -1887,8 +1895,8 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         if let Some((inbound, outbound, backlog, conns)) = web_bridge {
                             state = state.with_chat_bridge(inbound, outbound, backlog, conns);
                         }
-                        if let Some(gw) = web_gateway {
-                            state = state.with_gateway(gw);
+                        if let (Some(gw), Some(principals)) = (web_gateway, web_principals) {
+                            state = state.with_gateway(gw, principals);
                         }
                         state = state.with_mcp(web_mcp_sink, web_mcp_pending);
                         state = state.with_host_hub(web_host_hub);

@@ -60,6 +60,11 @@ pub struct AppState {
     /// coupling is a direct crate dep (`ccteam-web -> ccteam-im`), acyclic
     /// because `ccteam-im` does not depend on `ccteam-web`.
     pub gateway: Option<Arc<Mutex<ccteam_im::gateway::Gateway>>>,
+    /// The `(sid, secret)` registry, held DIRECTLY rather than reached through
+    /// `gateway`: verifying a managed session's principal must not queue behind
+    /// whatever else holds the gateway lock — including a spawn that is at that
+    /// very moment waiting for the vendor to finish this call.
+    pub session_principals: Option<Arc<ccteam_im::principals::SessionPrincipals>>,
     /// v0.8.8 F4 — IM credentials file path the `config/im/*` handlers
     /// read + write. Defaults to `ccteam_im::credentials::default_path()`
     /// (`~/.ccteam/im/credentials.json`); integration tests override it via
@@ -151,6 +156,7 @@ impl AppState {
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
+            session_principals: None,
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
             session_ring: Arc::new(crate::ring::SessionEventRing::new()),
@@ -199,7 +205,12 @@ impl AppState {
     /// independently recording the same events into the ring under
     /// different seqs — harmless in practice (nothing production does this)
     /// but not something to do casually.
-    pub fn with_gateway(mut self, gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>) -> Self {
+    pub fn with_gateway(
+        mut self,
+        gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>,
+        principals: Arc<ccteam_im::principals::SessionPrincipals>,
+    ) -> Self {
+        self.session_principals = Some(principals);
         crate::ring::spawn_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.session_ring));
         // v0.9.0 W4 — the team view's global feeder, spawned alongside the
         // per-sid one (same composition-root call, same "one feeder per
@@ -207,6 +218,14 @@ impl AppState {
         crate::ring::spawn_global_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.global_ring));
         self.gateway = Some(gateway);
         self
+    }
+
+    /// [`Self::with_gateway`] for a caller that still OWNS the gateway — it
+    /// takes the principal registry off it before wrapping, so the two can
+    /// never be wired from different gateways.
+    pub fn with_gateway_owned(self, gateway: ccteam_im::gateway::Gateway) -> Self {
+        let principals = gateway.principals();
+        self.with_gateway(Arc::new(Mutex::new(gateway)), principals)
     }
 
     /// v0.8.8 F4 — point the `config/im/*` handlers at a non-default

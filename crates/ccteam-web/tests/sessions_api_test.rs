@@ -436,7 +436,10 @@ async fn session_events_fresh_connect_reseeds_a_pending_approval() {
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
 
-    let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
+    let addr = spawn_server(
+        AppState::new(paths).with_gateway(Arc::clone(&gateway), gateway.lock().await.principals()),
+    )
+    .await;
     let created = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/projects/demo/sessions"))
         .json(&serde_json::json!({"role": "", "vendor": "claude"}))
@@ -486,7 +489,10 @@ async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
     });
     let gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
     let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
-    let addr = spawn_server(AppState::new(paths).with_gateway(Arc::clone(&gateway))).await;
+    let addr = spawn_server(
+        AppState::new(paths).with_gateway(Arc::clone(&gateway), gateway.lock().await.principals()),
+    )
+    .await;
 
     // The sid under test is a REAL spawned session (see the fresh-connect
     // test above: `gate_sid` fails closed on a sid it can't resolve to a
@@ -559,9 +565,7 @@ async fn history_and_resume_roundtrip_over_http() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
 
@@ -711,9 +715,7 @@ async fn import_external_claude_session_over_http() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
 
@@ -818,9 +820,7 @@ async fn rename_session_over_http_happy_path_and_validation() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
 
@@ -970,7 +970,7 @@ async fn rename_session_denies_cross_tenant_project() {
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
     const ADMIN_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
     let state = AppState::with_auth(paths, ccteam_web::AuthState::enabled(ADMIN_HEX.into()))
-        .with_gateway(Arc::new(tokio::sync::Mutex::new(gateway)));
+        .with_gateway_owned(gateway);
     let addr = spawn_server(state).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://{addr}/api/v1");
@@ -1069,9 +1069,7 @@ async fn upload_then_turn_weaves_attachment_lines_into_turn_text() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
 
@@ -1164,9 +1162,7 @@ async fn skill_list_and_attach_names_skill_file_in_turn() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
 
@@ -1279,9 +1275,7 @@ async fn global_skill_list_and_nested_attach_use_library_path_only() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
 
@@ -1353,9 +1347,7 @@ async fn global_skill_attach_rejects_invalid_missing_and_unknown_scope() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
     let created = client
@@ -1451,7 +1443,7 @@ async fn tenant_can_list_and_attach_global_skills_in_own_session() {
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
     const ADMIN_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd";
     let state = AppState::with_auth(paths, ccteam_web::AuthState::enabled(ADMIN_HEX.into()))
-        .with_gateway(Arc::new(tokio::sync::Mutex::new(gateway)));
+        .with_gateway_owned(gateway);
     let addr = spawn_server(state).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let base = format!("http://{addr}/api/v1");
@@ -1512,10 +1504,7 @@ async fn global_skill_attach_rejects_remote_host_project() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr = spawn_server(
-        AppState::new(paths.clone()).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))),
-    )
-    .await;
+    let addr = spawn_server(AppState::new(paths.clone()).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
     let created = client
@@ -1581,9 +1570,7 @@ async fn turn_attachments_reject_foreign_paths_and_unknown_skills() {
     });
     let gateway =
         ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
-    let addr =
-        spawn_server(AppState::new(paths).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway))))
-            .await;
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1");
     let created = client

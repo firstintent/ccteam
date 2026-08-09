@@ -2921,7 +2921,7 @@ mod tests {
             "demo",
             paths.projects_root.join("demo"),
         );
-        AppState::new(paths).with_gateway(std::sync::Arc::new(tokio::sync::Mutex::new(gateway)))
+        AppState::new(paths).with_gateway_owned(gateway)
     }
 
     #[tokio::test]

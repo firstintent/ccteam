@@ -70,8 +70,19 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
 
 #[test]
 fn spawn_spec_is_acp_only_no_pty_flags() {
+    // Skip (the default) carries `--auto`: opencode's own sub-sessions
+    // (`task` / `@explore`) resolve permissions INTERNALLY, so an
+    // `external_directory` ask from one never reaches the ACP wire for the
+    // in-band auto-allow to answer — the parent's `task` then hangs forever.
     let argv = build_argv("opencode", &OpencodeSpawnInput::default());
-    assert_eq!(argv, vec!["opencode", "acp"]);
+    assert_eq!(argv, vec!["opencode", "acp", "--auto"]);
+    let hitl = build_argv(
+        "opencode",
+        &OpencodeSpawnInput {
+            permission_mode: ccteam_harness::PermissionMode::Hitl,
+        },
+    );
+    assert_eq!(hitl, vec!["opencode", "acp"], "hitl never auto-approves");
     assert!(!argv
         .iter()
         .any(|a| a.contains("tmux") || a.contains("rmux")));

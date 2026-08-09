@@ -104,7 +104,32 @@ async fn handle_post(
             role,
             secret,
             slug,
+            may_invoke_tools,
         } => {
+            // A session that is still spawning is not a session yet: nothing
+            // can be dispatched to it and it must not be able to spawn or stop
+            // anybody. It only needs discovery (`initialize` / `tools/list`) to
+            // finish building its tool face, so the window where a secret
+            // exists for a session that may never come to life carries no
+            // authority to act — by construction, not by cleanup timing.
+            if !may_invoke_tools && is_tool_call(&req) {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req.get("id").cloned().unwrap_or(Value::Null),
+                        "error": {
+                            "code": -32000,
+                            "message": format!(
+                                "session {sid} is still starting: its tool face can be listed but not called yet"
+                            ),
+                        },
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
             inject_session_caller(&mut req, &sid, &role, &secret, &slug);
             (ccteam_im::mcp::McpCaller::Ambient, req)
         }
@@ -133,6 +158,10 @@ enum McpAuth {
         role: String,
         secret: String,
         slug: String,
+        /// `false` while the session is still spawning — it may DISCOVER its
+        /// tool face (`initialize`, `tools/list`) but not call anything with
+        /// it. See [`ccteam_im::principals`].
+        may_invoke_tools: bool,
     },
 }
 
@@ -159,9 +188,7 @@ async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth
     // Session-scoped bearer first (works regardless of AuthState.enabled).
     if let Some(tok) = raw {
         if let Some((sid, secret)) = parse_session_bearer(tok) {
-            return verify_session_bearer(app, &sid, &secret)
-                .await
-                .map_err(|_| unauthorized());
+            return verify_session_bearer(app, &sid, &secret).map_err(|_| unauthorized());
         }
     }
 
@@ -195,6 +222,14 @@ async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth
     }
 }
 
+/// Is this request an attempt to CALL a tool (as opposed to discovering the
+/// tool face)? Deliberately positive: anything that is not a recognized
+/// `tools/call` counts as discovery, and the only methods a spawning session
+/// needs are `initialize`, `notifications/initialized` and `tools/list`.
+fn is_tool_call(req: &Value) -> bool {
+    req.get("method").and_then(Value::as_str) == Some("tools/call")
+}
+
 /// Parse `ccteam-sid:<sid>:<secret>` → (sid, secret).
 fn parse_session_bearer(tok: &str) -> Option<(String, String)> {
     let rest = tok.strip_prefix("ccteam-sid:")?;
@@ -205,20 +240,29 @@ fn parse_session_bearer(tok: &str) -> Option<(String, String)> {
     Some((sid.to_string(), secret.to_string()))
 }
 
-async fn verify_session_bearer(app: &AppState, sid: &str, secret: &str) -> Result<McpAuth, ()> {
-    let Some(gw) = app.gateway.as_ref() else {
+/// Resolve `ccteam-sid:<sid>:<secret>` against the principal REGISTRY.
+///
+/// v0.9.0 W1 (F1/G4) — role/slug come from the matched principal, never the
+/// client; an empty secret / unknown sid → 401.
+///
+/// **No gateway lock.** This used to lock the gateway to read a session's
+/// secret, which made a credential check wait on whatever else held that lock
+/// — including the very spawn whose vendor was making this call. Pi deadlocked
+/// exactly there (2026-08-09): IM `/new` held the lock across `start_thread`,
+/// the bridge's `session_start` blocked on this request, and the child never
+/// reached the point of reading its stdin. The registry has its own lock, so
+/// no spawn path can starve the handshake it is waiting for.
+fn verify_session_bearer(app: &AppState, sid: &str, secret: &str) -> Result<McpAuth, ()> {
+    let Some(principals) = app.session_principals.as_ref() else {
         return Err(());
     };
-    let guard = gw.lock().await;
-    // v0.9.0 W1 (F1/G4) — resolve the `(sid, secret)` PRINCIPAL to a CallerCtx
-    // (server-side sid + slug + role). role/slug come from the matched session,
-    // never the client; an empty secret / unknown sid returns None → 401.
-    match guard.verify_session_principal(sid, secret) {
-        Some(ctx) => Ok(McpAuth::Session {
-            sid: ctx.sid,
-            role: ctx.role,
+    match principals.verify(sid, secret) {
+        Some(matched) => Ok(McpAuth::Session {
+            sid: matched.sid,
+            role: matched.role,
             secret: secret.to_string(),
-            slug: ctx.slug,
+            slug: matched.slug,
+            may_invoke_tools: ccteam_im::principals::may_invoke_tools(matched.state),
         }),
         None => Err(()),
     }

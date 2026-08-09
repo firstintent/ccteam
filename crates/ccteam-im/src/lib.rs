@@ -55,6 +55,7 @@ pub mod onboarding;
 pub mod outbound_format;
 pub mod pending;
 pub mod pending_turns;
+pub mod principals;
 pub mod progress;
 pub mod rate_limit;
 // v0.8.24 Track D — multi-host remote spawn gate + satellite proxy seam.

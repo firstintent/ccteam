@@ -346,7 +346,8 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
 
     let (gateway, child_sid) = spawn_delegated_child(project_dir).await;
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
-    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into())).with_gateway(gw);
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
+        .with_gateway(Arc::clone(&gw), gw.lock().await.principals());
     let addr = spawn(state).await;
 
     // Admin sees the graph: one node (the delegated child) + one edge s0→child.
@@ -417,7 +418,8 @@ async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
     idle_meta(&project_dir, "s9", Some("spawn-time-override"));
 
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
-    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into())).with_gateway(gw);
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
+        .with_gateway(Arc::clone(&gw), gw.lock().await.principals());
     let addr = spawn(state).await;
 
     let resp = client()
@@ -482,7 +484,8 @@ async fn agents_graph_survives_a_stalled_adapter() {
     let (gateway, child_sid) = spawn_delegated_child_in("stall", project_dir.clone()).await;
 
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
-    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into())).with_gateway(gw);
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
+        .with_gateway(Arc::clone(&gw), gw.lock().await.principals());
     let addr = spawn(state).await;
 
     let started = std::time::Instant::now();
@@ -531,8 +534,8 @@ async fn agents_events_delivers_delegation_frame_with_slug_and_replays_last_even
 
     let gateway = Gateway::new_with_factory(factory(), "demo", project_dir.clone());
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
-    let state =
-        AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into())).with_gateway(gw.clone());
+    let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
+        .with_gateway(Arc::clone(&gw), gw.lock().await.principals());
     let addr = spawn(state).await;
 
     // Let the global-ring feeder task actually subscribe to the gateway's
