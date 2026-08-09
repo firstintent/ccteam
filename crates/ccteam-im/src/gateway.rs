@@ -1270,6 +1270,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/mcp",
+        arg_hint: None,
+        help: "rebuild this session's ccteam tool face (MCP reconnect)",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
         name: "/inbox",
         arg_hint: Some("[<time> <text>|cancel <dN>]"),
         help: "list, schedule, or cancel delayed user messages",
@@ -2624,6 +2630,7 @@ impl Gateway {
                 }
             }
             "/status" => Ok(Some(self.render_status(chat).await)),
+            "/mcp" => self.rebuild_tool_surface(chat).await.map(Some),
             "/projects" => {
                 // Button-capable channel (Telegram) → a text header + one inline
                 // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
@@ -6620,6 +6627,39 @@ impl Gateway {
             free_text: None,
         };
         self.apply_pending(chat, p, selection).await
+    }
+
+    /// `/mcp` — rebuild the current session's ccteam TOOL FACE in place.
+    ///
+    /// The outbound twin of the pump's inbound re-attach: ccteam reaches into a
+    /// session through its event stream, and the session reaches back through
+    /// its own MCP client aimed at daemon `POST /mcp`. Restarting the daemon
+    /// kills that client, and no vendor retries a failed MCP server on its own,
+    /// so a live session can sit there fully functional with no ccteam tools.
+    ///
+    /// Vendors that CAN reconnect in place do (claude stream-json speaks
+    /// `mcp_reconnect` — the same control request the TUI's own `/mcp` issues);
+    /// the rest answer with what would restore it instead of pretending.
+    async fn rebuild_tool_surface(&self, chat: &ChatKey) -> Result<String> {
+        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+            return Ok("当前没有会话可重连;先 /new 或 /use <sid>".to_string());
+        };
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Ok(format!(
+                "会话 {session_id} 不在活跃列表里;/sessions 查看现有会话"
+            ));
+        };
+        let adapter = Arc::clone(&session.adapter);
+        let thread = session.thread.clone();
+        match adapter.rebuild_tool_surface(&thread).await {
+            Ok(ccteam_harness::ToolSurfaceRebuild::Rebuilt) => {
+                Ok(format!("🔌 {session_id} 的 ccteam 工具面已重连"))
+            }
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => {
+                Ok(format!("🔌 {session_id} 无法原地重连:{reason}"))
+            }
+            Err(err) => Ok(format!("🔌 {session_id} 重连失败:{err}")),
+        }
     }
 
     /// Resolve a numeric short-reply (1-based) against the current session's
@@ -12065,6 +12105,16 @@ mod tests {
                 TurnDisposition::Started => ccteam_harness::TurnSubmission::started(turn_id),
                 TurnDisposition::Injected => ccteam_harness::TurnSubmission::injected(turn_id),
                 TurnDisposition::Queued => ccteam_harness::TurnSubmission::queued(turn_id),
+            })
+        }
+
+        async fn rebuild_tool_surface(
+            &self,
+            _h: &ThreadHandle,
+        ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+            // Test double: no tool face to rebuild.
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+                reason: "test double".to_string(),
             })
         }
 

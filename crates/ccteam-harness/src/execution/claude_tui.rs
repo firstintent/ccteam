@@ -1015,6 +1015,17 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         crate::EventAttachment::OneShot
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "the pane's claude read its MCP config at process start and the terminal \
+             protocol has no control channel — `/new` rebuilds the tool face"
+                .to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         // The persistent_id is the tmux session name
         // (`ccteam-chat-<slug>-<role>`). If it's live, hand back a

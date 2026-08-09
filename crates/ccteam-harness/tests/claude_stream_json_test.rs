@@ -114,6 +114,13 @@ while True:
                   "request_id":rid,"response":{}}})
         continue
     n += 1
+    # Real claude emits `system:init` on the FIRST user turn (not at spawn),
+    # and that line is where it reports each MCP server's connection status.
+    # `FAKE_SJ_INIT_MCP_FAILED=1` reproduces a child that came up while the
+    # daemon's `/mcp` was not listening yet: alive, working, and toolless.
+    if n == 1 and os.environ.get("FAKE_SJ_INIT_MCP_FAILED") == "1":
+        emit({"type":"system","subtype":"init","session_id":sid,
+              "mcp_servers":[{"name":"ccteam","status":"failed"}]})
     if os.environ.get("FAKE_SJ_DIE_MID_TURN") == "1":
         # Emit an assistant block (turn now in flight) then die WITHOUT a
         # result — the in-flight-loss fault.
@@ -184,6 +191,8 @@ fn setup(tmp: &Path) -> PathBuf {
     // — one real failure masqueraded as a second, unrelated "flaky" one.
     // Every fault switch belongs here so each test starts from a clean slate.
     std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
+    std::env::remove_var("FAKE_SJ_INIT_MCP_FAILED");
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
     fake
 }
 
@@ -279,6 +288,98 @@ async fn spawn_init_and_turn_emits_answer() {
     let _ = completed;
     assert_eq!(answer.as_deref(), Some("ok"), "expected the fake's answer");
 
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// A session whose ccteam MCP server failed to connect is alive, answering,
+/// and toolless — and no vendor retries a failed MCP server on its own. The
+/// adapter must heal it from the session's OWN `system:init` report, using the
+/// `mcp_reconnect` control request (the same action the TUI's `/mcp` performs).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn dead_tool_face_at_init_is_reconnected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let ctl_log = tmp.path().join("ctl.log");
+    std::env::set_var("FAKE_SJ_CTL_LOG", &ctl_log);
+    std::env::set_var("FAKE_SJ_INIT_MCP_FAILED", "1");
+    let adapter = ClaudeStreamJsonAdapter::new();
+
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+
+    // The heal runs off the status tap, so give it a bounded moment to land.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut sent = false;
+    while tokio::time::Instant::now() < deadline {
+        if std::fs::read_to_string(&ctl_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.trim() == "mcp_reconnect")
+        {
+            sent = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        sent,
+        "a failed ccteam tool face must trigger mcp_reconnect; control log: {:?}",
+        std::fs::read_to_string(&ctl_log).unwrap_or_default()
+    );
+
+    std::env::remove_var("FAKE_SJ_INIT_MCP_FAILED");
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// …and the same rebuild is available on demand (what IM `/mcp` drives), so a
+/// tool face that dies after init — a daemon restart — is recoverable without
+/// respawning the session.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn rebuild_tool_surface_reconnects_on_demand() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let ctl_log = tmp.path().join("ctl.log");
+    std::env::set_var("FAKE_SJ_CTL_LOG", &ctl_log);
+    let adapter = ClaudeStreamJsonAdapter::new();
+
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let outcome = adapter
+        .rebuild_tool_surface(&handle)
+        .await
+        .expect("live stream-json session rebuilds in place");
+    assert_eq!(outcome, ccteam_harness::ToolSurfaceRebuild::Rebuilt);
+    assert!(
+        std::fs::read_to_string(&ctl_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.trim() == "mcp_reconnect"),
+        "rebuild must go over the vendor's control channel"
+    );
+
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
     adapter.close_thread(&handle).await.unwrap();
 }
 

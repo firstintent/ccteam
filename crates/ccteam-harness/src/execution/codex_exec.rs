@@ -526,6 +526,15 @@ impl HarnessAdapter for CodexExecAdapter {
         crate::EventAttachment::OneShot
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "one-shot `codex exec` run — the next run dials the endpoint fresh".to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if persistent_id.is_empty() {
             return Err(HarnessError::SpawnFailed(

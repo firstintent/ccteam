@@ -82,6 +82,16 @@ impl HarnessAdapter for FakeAdapter {
             .map(ccteam_harness::TurnSubmission::started)
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+        // Test double: no tool face to rebuild.
+        Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+            reason: "test double".to_string(),
+        })
+    }
+
     fn event_attachment(&self) -> ccteam_harness::EventAttachment {
         // Scripted test stream: one-shot. Re-attaching would replay
         // the script, which is exactly what `Rebuildable` forbids.

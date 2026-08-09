@@ -222,6 +222,14 @@ impl SessionMcpEndpoint {
     }
 }
 
+/// The name every dialect registers ccteam's MCP server under. It is what a
+/// vendor calls the server back by — Claude's `mcp_reconnect` control request
+/// takes exactly this string — so the projections below and any code that asks
+/// a vendor about its ccteam tool face read it from one place.
+/// `session_mcp_projections_use_the_shared_server_name` holds the `json!`
+/// literals (macro object keys must be literals) to this constant.
+pub const CCTEAM_MCP_SERVER_NAME: &str = "ccteam";
+
 // =====================================================================
 // Dialect projections — pure functions of the endpoint
 // =====================================================================
@@ -359,6 +367,27 @@ mod tests {
         assert_eq!(
             srv["headers"]["Authorization"],
             "Bearer ccteam-sid:s3:sekret"
+        );
+    }
+
+    /// The projections' `json!` object keys must be literals, so this holds
+    /// all four of them to [`CCTEAM_MCP_SERVER_NAME`] — the string a vendor is
+    /// asked to reconnect BY (Claude's `mcp_reconnect{serverName}`). If a
+    /// dialect ever renamed its entry, the rebuild would silently target a
+    /// server that does not exist.
+    #[test]
+    fn session_mcp_projections_use_the_shared_server_name() {
+        let ep = ep("http://127.0.0.1:7331/mcp", "s1", "abc");
+        assert!(project_claude_mcp_json(&ep)["mcpServers"][CCTEAM_MCP_SERVER_NAME].is_object());
+        assert!(
+            project_codex_thread_config(&ep)["mcp_servers"][CCTEAM_MCP_SERVER_NAME].is_object()
+        );
+        let acp = project_acp_mcp_servers(&ep);
+        assert_eq!(acp[0]["name"], CCTEAM_MCP_SERVER_NAME);
+        let env = project_bridge_child_env(&ep);
+        assert!(
+            env.iter().any(|(k, _)| k == BRIDGE_MCP_URL_ENV),
+            "bridge dialect must still deliver the url: {env:?}"
         );
     }
 

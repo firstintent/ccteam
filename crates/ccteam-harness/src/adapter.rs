@@ -355,6 +355,26 @@ pub enum EventAttachment {
     OneShot,
 }
 
+/// What [`HarnessAdapter::rebuild_tool_surface`] was able to do about a
+/// session's ccteam tool face.
+///
+/// A managed session talks back to ccteam over its own MCP client
+/// (`POST /mcp`, per-session principal). That client is established when the
+/// vendor process starts, and every vendor treats a dead MCP server as
+/// terminal until something tells it to reconnect — so a daemon restart, or a
+/// child that started a moment before the endpoint was listening, leaves a
+/// perfectly live session with no ccteam tools and no way to notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSurfaceRebuild {
+    /// The vendor re-established the connection in place, on the live session.
+    Rebuilt,
+    /// The endpoint reached the child once, at spawn (baked into an env var, a
+    /// config file read at startup, or a session-creation RPC parameter), and
+    /// the protocol has no way to re-apply it. `reason` is user-facing: it
+    /// says what would restore the tool face.
+    RespawnRequired { reason: String },
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -1272,6 +1292,24 @@ pub trait HarnessAdapter: Send + Sync {
     /// guessing wrong fails SILENTLY — the session keeps working while every
     /// reader goes blind.
     fn event_attachment(&self) -> EventAttachment;
+
+    /// Rebuild this session's **tool face** — the vendor's own MCP client
+    /// pointed at the daemon's `POST /mcp` — in place, without respawning the
+    /// session. See [`ToolSurfaceRebuild`].
+    ///
+    /// The outbound counterpart of [`event_attachment`](Self::event_attachment):
+    /// ccteam reaches INTO a session through `events()`, and the session
+    /// reaches BACK through this connection. Both die the same way (the daemon
+    /// that carries them restarts) and both used to fail the same way —
+    /// silently, with the session still alive and apparently fine.
+    ///
+    /// **No default impl**: a vendor that cannot rebuild in place must say so
+    /// with [`ToolSurfaceRebuild::RespawnRequired`] and a reason a user can
+    /// act on, rather than inherit a silent no-op that reports success.
+    async fn rebuild_tool_surface(
+        &self,
+        h: &ThreadHandle,
+    ) -> Result<ToolSurfaceRebuild, HarnessError>;
 
     /// Resume an already-existing thread by persistent id (e.g. Claude
     /// session-id, Codex thread id). Bg adapters return

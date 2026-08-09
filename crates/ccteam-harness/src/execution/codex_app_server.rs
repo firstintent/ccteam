@@ -2116,6 +2116,18 @@ impl HarnessAdapter for CodexAppServerAdapter {
         crate::EventAttachment::Rebuildable
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "codex applies ccteam's MCP config when a thread is started or resumed \
+             (`thread/start` / `thread/resume` config override) and the app-server \
+             offers no mid-thread re-apply — `/new` rebuilds the tool face"
+                .to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         let client = self.client().await?;
         let result = self

@@ -2857,6 +2857,16 @@ mod tests {
         ) -> Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError> {
             unimplemented!("not exercised by these tests")
         }
+        async fn rebuild_tool_surface(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> Result<ccteam_harness::ToolSurfaceRebuild, ccteam_harness::HarnessError> {
+            // Test double: no tool face to rebuild.
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+                reason: "test double".to_string(),
+            })
+        }
+
         fn event_attachment(&self) -> ccteam_harness::EventAttachment {
             // Scripted test stream: one-shot. Re-attaching would replay
             // the script, which is exactly what `Rebuildable` forbids.

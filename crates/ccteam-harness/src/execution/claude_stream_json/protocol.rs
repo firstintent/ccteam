@@ -25,7 +25,12 @@ use serde_json::{json, Value};
 pub enum Outbound {
     /// Capability broadcast at startup (`subtype: "init"`): confirms the
     /// session id and ships the slash-command table.
-    System(SystemMsg),
+    ///
+    /// Boxed: `SystemMsg` carries the widest payload of any variant (task
+    /// lifecycle + command table + MCP server report), and an unboxed one
+    /// makes EVERY `Outbound` — one per streamed line — as large as the
+    /// rarest.
+    System(Box<SystemMsg>),
     /// An assistant turn message (full Anthropic `Message` with content
     /// blocks). Accumulated for fallback final text + tool-use progress.
     Assistant(MessageEnvelope),
@@ -164,6 +169,14 @@ pub struct SystemMsg {
     /// stays the single membership source, with the richer fields).
     #[serde(default)]
     pub tasks: Vec<BackgroundTaskRef>,
+    /// `system:init.mcp_servers` — the session's OWN report of every MCP
+    /// server it loaded and whether the connection stands. This is the only
+    /// place a vendor tells ccteam about the health of the tool face pointed
+    /// back at the daemon; a stream-json session under `--strict-mcp-config`
+    /// carries exactly one entry (`ccteam`), so the read is unambiguous.
+    /// Absent on every other system subtype → empty.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerStatus>,
 }
 
 /// One entry of a `system:background_tasks_changed` snapshot. Everything but
@@ -172,6 +185,27 @@ pub struct SystemMsg {
 pub struct BackgroundTaskRef {
     #[serde(default, deserialize_with = "de_null_string")]
     pub task_id: String,
+}
+
+/// One `system:init.mcp_servers` entry: `{name, status}`. `status` is
+/// `"connected"` when the client is up; anything else (`"failed"`,
+/// `"needs-auth"`, "pending", a future token) means the session cannot call
+/// that server's tools.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpServerStatus {
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub name: String,
+    #[serde(default, deserialize_with = "de_null_string")]
+    pub status: String,
+}
+
+impl McpServerStatus {
+    /// Connected is the ONLY healthy value, stated positively on purpose: an
+    /// unrecognized future status must read as "not usable" and get a rebuild
+    /// attempt, never be waved through as fine.
+    pub fn is_connected(&self) -> bool {
+        self.status.eq_ignore_ascii_case("connected")
+    }
 }
 
 impl SystemMsg {

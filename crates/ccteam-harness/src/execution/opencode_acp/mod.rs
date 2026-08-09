@@ -609,6 +609,17 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         crate::EventAttachment::Rebuildable
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "ACP carries `mcpServers` only on `session/new` / `session/load`; there is \
+             no mid-session re-apply — `/new` rebuilds the tool face"
+                .to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if let Some(live) = self.get_live(persistent_id) {
             return Ok(Self::make_handle(&live));

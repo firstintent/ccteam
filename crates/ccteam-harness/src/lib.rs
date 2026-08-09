@@ -54,10 +54,10 @@ pub use adapter::{
     GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope, PermissionMode,
     RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts,
     SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails,
-    ThreadStatus, TitleSync, TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission,
-    UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV,
-    CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV,
-    OPENCODE_BIN_ENV,
+    ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId, TurnInput, TurnRouting,
+    TurnSubmission, UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
+    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
+    KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,

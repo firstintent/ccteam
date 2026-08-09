@@ -1260,6 +1260,17 @@ impl HarnessAdapter for PiRpcAdapter {
         crate::EventAttachment::Rebuildable
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "the ccteam bridge reads its endpoint from the child environment, fixed at \
+             spawn (`ManagedSessionBridge`) — `/new` rebuilds the tool face"
+                .to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if let Some(live) = self.lookup(persistent_id) {
             if live.transport.read().await.is_alive() {

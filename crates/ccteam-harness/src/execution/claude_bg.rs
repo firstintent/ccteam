@@ -300,6 +300,15 @@ impl HarnessAdapter for ClaudeBgAdapter {
         crate::EventAttachment::OneShot
     }
 
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "one-shot background job — the next job dials the endpoint fresh".to_string(),
+        })
+    }
+
     async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         Err(HarnessError::NotImplemented {
             reason: "claude --bg is single-turn fresh-context every spawn (red line R3 \

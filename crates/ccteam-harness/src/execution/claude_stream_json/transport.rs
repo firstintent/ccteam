@@ -321,7 +321,7 @@ async fn run_reader<R: AsyncRead + Unpin + Send>(
                 // Capture the one-time init.
                 if let Outbound::System(ref sys) = parsed {
                     if sys.is_init() {
-                        *init.payload.lock().unwrap() = Some(sys.clone());
+                        *init.payload.lock().unwrap() = Some((**sys).clone());
                         init.notify.notify_waiters();
                     }
                 }
