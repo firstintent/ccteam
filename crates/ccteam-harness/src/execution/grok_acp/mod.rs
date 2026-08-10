@@ -542,8 +542,8 @@ impl HarnessAdapter for GrokAcpAdapter {
         let program = argv[0].clone();
         let args: Vec<String> = argv.into_iter().skip(1).collect();
         // Child-only env: kill Grok's Claude MCP compat scan so the managed
-        // session doesn't import ccteam's global stdio `mcp-serve` entry on
-        // top of the ACP-injected HTTP server (see `spawn_spec::build_envs`).
+        // session doesn't import ccteam's global `ccteam` entry on top of the
+        // ACP-injected server (see `spawn_spec::build_envs`).
         let envs = build_envs();
         let cwd = if ctx.cwd.as_os_str().is_empty() {
             ctx.project_dir.clone()

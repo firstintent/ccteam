@@ -13,9 +13,11 @@
 //! temp dir without touching the real `~/.claude.json` / `~/.codex`.
 //!
 //! **One transport for all five vendors: Streamable HTTP against the daemon's
-//! `POST /mcp`, authenticated with the admin web token.** No global
-//! registration spawns a `ccteam internal mcp-serve` stdio child any more —
-//! the shapes differ only in each vendor's config dialect (Claude/Kimi
+//! `POST /mcp`, authenticated with the admin web token.** No registration
+//! spawns a stdio child: the `internal mcp-serve` command that served that
+//! shape is deleted, and a legacy `command`/`args` entry left in a user's
+//! config reads as NOT registered so the repair pass replaces it. The shapes
+//! differ only in each vendor's config dialect (Claude/Kimi
 //! `mcpServers` JSON, Codex/Grok `[mcp_servers]` TOML, OpenCode `mcp` JSON)
 //! and in the header key (`headers` vs Codex's `http_headers`). A global entry
 //! serves a **plain main session** with Admin semantics; ccteam-managed

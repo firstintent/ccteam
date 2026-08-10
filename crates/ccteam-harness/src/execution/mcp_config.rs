@@ -27,9 +27,9 @@
 //! **One wire form: HTTP.** `type:"http"` against daemon `POST /mcp`. This is
 //! the same transport the global per-vendor registration uses
 //! (`ccteam_core::mcp_register`, admin bearer); a managed session's config just
-//! overrides the same-named entry with its own principal. Nothing spawns a
-//! `ccteam internal mcp-serve` stdio child any more — that binary stays only as
-//! a manually-wired escape hatch.
+//! overrides the same-named entry with its own principal. There is no stdio
+//! transport at all any more — the `internal mcp-serve` command that hosted it
+//! is deleted, so nothing can fall back to a per-session child process.
 //!
 //! Claude's spawn also passes `--strict-mcp-config` on the stream-json path so
 //! ambient user MCP servers are not inherited (avoids the historical

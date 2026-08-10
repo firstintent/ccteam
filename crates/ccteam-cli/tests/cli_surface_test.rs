@@ -13,9 +13,9 @@
 //!    (`hook` / `spawn` / `attach` / `pause` / `new` / `web` / ...) do
 //!    not appear at the top level.
 //! 2. `t02_internal_help_lists_subcommands` — `ccteam internal --help`
-//!    enumerates the internal subcommands (hook / mcp-serve / attach /
-//!    peek / progress / resume / send / spawn) plus the W4a additions
-//!    (mux / probe-project / web).
+//!    enumerates the internal subcommands (hook / attach / peek /
+//!    progress / mux / web). `mcp-serve` is asserted GONE: the stdio MCP
+//!    server is deleted, every caller reaches ccteam over `POST /mcp`.
 //! 3. `t03_deprecated_top_level_hook_alias_is_removed` — the six deleted
 //!    top-level aliases (`hook` / `mcp-serve` / `spawn` / `send` /
 //!    `peek` / `progress`) now fail clap parsing with a non-zero exit +
@@ -94,9 +94,10 @@ fn t01_help_user_facing_only() {
 }
 
 /// `t02` — `ccteam internal --help` enumerates the surviving internal
-/// subcommands (hook / mcp-serve / attach / peek / progress / mux / web /
-/// experience). The de-legacy pass removed `resume` / `send` / `spawn` /
-/// `probe-project` outright (pre-v1.0 = no back-compat shims).
+/// subcommands (hook / attach / peek / progress / mux / web / experience).
+/// The de-legacy pass removed `resume` / `send` / `spawn` / `probe-project`
+/// outright, and `mcp-serve` went with the stdio MCP server (pre-v1.0 = no
+/// back-compat shims).
 #[test]
 fn t02_internal_help_lists_subcommands() {
     let bin = env!("CARGO_BIN_EXE_ccteam");
@@ -112,14 +113,9 @@ fn t02_internal_help_lists_subcommands() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     for required in [
-        "hook",
-        "mcp-serve",
-        "attach",
-        "peek",
-        "progress",
+        "hook", "attach", "peek", "progress",
         // v0.8.6 W4a folded `mux` / `web` into the hidden `internal` group.
-        "mux",
-        "web",
+        "mux", "web",
     ] {
         assert!(
             stdout.contains(required),
@@ -127,8 +123,10 @@ fn t02_internal_help_lists_subcommands() {
         );
     }
 
-    // Removed internal subcommands must NOT appear anymore.
-    for gone in ["resume", "send", "spawn", "probe-project"] {
+    // Removed internal subcommands must NOT appear anymore. `mcp-serve` is on
+    // this list on purpose: the stdio MCP server is deleted, and a command
+    // that still runs is a command a stale vendor config will still invoke.
+    for gone in ["resume", "send", "spawn", "probe-project", "mcp-serve"] {
         let pattern = format!("  {gone} ");
         assert!(
             !stdout.contains(&pattern),
