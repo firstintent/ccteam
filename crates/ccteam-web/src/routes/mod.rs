@@ -30,6 +30,12 @@ pub mod capabilities;
 // successor to the flat `capabilities` probe; shares `hosts::probe_bin`.
 pub mod chat_ws;
 pub mod dashboard;
+// Enrollment credentials for hand-started / EXTERNAL agents: the console's
+// one-click "copy an MCP config another machine can paste" surface
+// (`GET`/`POST /api/v1/enroll` + `DELETE /api/v1/enroll/{id}`). Merged into the
+// `/api/v1` OpenApiRouter (see `openapi::build_api_v1`), so it rides the same
+// auth gate as every other resource route.
+pub mod enroll;
 pub mod evolution;
 pub mod health;
 pub mod hosts;

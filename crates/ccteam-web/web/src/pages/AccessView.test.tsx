@@ -25,7 +25,7 @@ vi.mock("../hooks/useMe", () => ({
 
 import { renderToString } from "react-dom/server";
 import AccessView, {
-  externalMcpConfig,
+  ExternalAgentCard,
   externalRestSnippet,
   LoginLinkRow,
 } from "./AccessView";
@@ -38,9 +38,23 @@ describe("AccessView", () => {
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
   });
 
-  it("builds the external MCP JSON from the current origin and fake login token", () => {
-    const json = externalMcpConfig("https://team.example", "fake-login-token");
-    expect(JSON.parse(json)).toEqual({ mcpServers: { ccteam: { transport: "http", url: "https://team.example/mcp", headers: { Authorization: "Bearer fake-login-token" }, disabled: false } } });
+  // The external-agent card no longer hand-rolls a snippet around the
+  // operator's own login token: it mints a SCOPED credential server-side and
+  // renders the bodies the daemon produced. So the card's contract here is its
+  // controls (scope · label · mint) plus the absence of any client-built config.
+  it("offers the scope/label/mint controls and never pastes the login token as the credential", () => {
+    const html = renderToString(<ExternalAgentCard lang="en" />);
+    expect(html).toContain('data-testid="access-mcp"');
+    expect(html).toContain('data-testid="access-mcp-scope"');
+    expect(html).toContain('data-testid="access-mcp-label"');
+    expect(html).toContain('data-testid="access-mcp-mint"');
+    // Machine-user scope is always offerable; a project is the default when one
+    // is visible (the list arrives from an effect, so SSR shows just this one).
+    expect(html).toContain("Machine user (all my projects)");
+    // Nothing to copy — and no credential on the page — until a mint happens.
+    expect(html).not.toContain('data-testid="access-mcp-snippet"');
+    expect(html).not.toContain("fake-login-token");
+    expect(html).not.toContain("mcpServers");
   });
 
   it("keeps the admin shape with all six access cards in people → programs → machines order", () => {
@@ -53,14 +67,16 @@ describe("AccessView", () => {
     expect(html).toContain('data-testid="access-api"');
     expect(html).toContain('data-testid="access-satellite"');
     expect(html).not.toContain('data-testid="access-my-im"');
-    expect(html).toContain('data-testid="access-mcp-copy"');
+    expect(html).toContain('data-testid="access-mcp-mint"');
     const people = html.indexOf('data-testid="access-people"');
     const programs = html.indexOf('data-testid="access-programs"');
     const machines = html.indexOf('data-testid="access-machines"');
     expect(people).toBeGreaterThan(-1);
     expect(people).toBeLessThan(programs);
     expect(programs).toBeLessThan(machines);
-    expect(html).toContain("https://team.example/mcp");
+    // The REST card still inlines the caller's own login token (that IS its
+    // credential); the MCP card deliberately does not.
+    expect(html).toContain("https://team.example/api/v1");
     expect(html).toContain("fake-login-token");
   });
 
