@@ -29,10 +29,7 @@ use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol};
 pub fn vendor_from_client(client_name: &str) -> Option<AgentVendor> {
     let name = client_name.trim().to_ascii_lowercase();
     // Match on the leading token so `codex-cli` / `claude-code-sdk` still land.
-    let head = name
-        .split(|c: char| c == '/' || c == ' ' || c == '_')
-        .next()
-        .unwrap_or("");
+    let head = name.split(['/', ' ', '_']).next().unwrap_or("");
     match head {
         h if h.starts_with("claude") => Some(AgentVendor::Claude),
         h if h.starts_with("codex") => Some(AgentVendor::Codex),
