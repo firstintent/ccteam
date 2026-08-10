@@ -365,19 +365,18 @@ async fn rebuild_tool_surface_refuses_in_place_and_sends_no_reconnect() {
         .rebuild_tool_surface(&handle)
         .await
         .expect("declaring a limitation is an answer, not an error");
-    match outcome {
-        ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason } => {
-            assert!(
-                reason.contains("/new"),
-                "say what restores the tool face: {reason:?}"
-            );
-            assert!(
-                reason.contains("principal") || reason.contains("credential"),
-                "say WHY an in-place reconnect is refused: {reason:?}"
-            );
-        }
-        other => panic!("stream-json must not claim an in-place rebuild: {other:?}"),
-    }
+    // "Claims an in-place rebuild" is unrepresentable since the `Rebuilt`
+    // variant was deleted (no vendor has a producer), so this destructure is
+    // irrefutable and the remaining question is whether the reason is usable.
+    let ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason } = outcome;
+    assert!(
+        reason.contains("/new"),
+        "say what restores the tool face: {reason:?}"
+    );
+    assert!(
+        reason.contains("principal") || reason.contains("credential"),
+        "say WHY an in-place reconnect is refused: {reason:?}"
+    );
     // The control request must NOT be sent. Measured on a real machine: it makes
     // the vendor re-resolve its server list without honouring
     // `--strict-mcp-config`, attach the global same-named `ccteam` entry, and

@@ -1320,7 +1320,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     GatewayCommandSpec {
         name: "/mcp",
         arg_hint: None,
-        help: "rebuild this session's ccteam tool face (MCP reconnect)",
+        help: "check this session's ccteam tool face (and what restores it)",
         in_menu: false,
     },
     GatewayCommandSpec {
@@ -6761,7 +6761,7 @@ impl Gateway {
         self.apply_pending(chat, p, selection).await
     }
 
-    /// Rebuild a session's ccteam tool face the FIRST time it is activated
+    /// Ask about a session's ccteam tool face the FIRST time it is activated
     /// under this daemon — once per session per daemon lifetime, then never
     /// again (the flag is on the session, which does not outlive the daemon's
     /// live map).
@@ -6772,16 +6772,21 @@ impl Gateway {
     /// `/mcp` into it, and a child whose MCP client died is not visibly broken
     /// — it works normally right up until it tries to delegate.
     ///
+    /// What it can DO about a dead one is state it. No vendor reapplies its MCP
+    /// config to a live session (see [`ccteam_harness::ToolSurfaceRebuild`]), so
+    /// the adapter answers with what WOULD restore the face and this probe logs
+    /// that next to [`Self::assert_principal_reached_the_session`] — together,
+    /// the diagnostic pair for "this session's tools are not its own".
+    ///
     /// "First activation" rather than "endpoint came back" on purpose. Which
     /// children predate the current endpoint is not knowable from the gateway
     /// (a satellite may hold one across a main-daemon restart; a local one can
     /// start in the seconds before the web bind is listening), and a blanket
-    /// broadcast at daemon start would rebuild every healthy client for
-    /// nothing. Priming at the moment the session first does work costs one
-    /// control request, at the point where a stale tool face is about to
-    /// matter, and vendors that cannot rebuild answer instantly.
+    /// broadcast at daemon start would probe every healthy client for nothing.
+    /// Asking at the moment the session first does work costs one adapter call,
+    /// at the point where a stale tool face is about to matter.
     ///
-    /// Never fails a turn: a rebuild that errors or times out is logged and
+    /// Never fails a turn: an answer that errors or times out is logged and
     /// the turn proceeds — a session with a doubtful tool face is still a
     /// session that can answer.
     async fn prime_tool_surface(&self, session_id: &str) {
@@ -6800,17 +6805,14 @@ impl Gateway {
         )
         .await
         {
-            Ok(Ok(ccteam_harness::ToolSurfaceRebuild::Rebuilt)) => {
-                tracing::info!(session = %sid, "ccteam-im: rebuilt the session's ccteam tool face on first activation");
-            }
             Ok(Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason })) => {
                 tracing::debug!(session = %sid, %reason, "ccteam-im: tool face cannot be rebuilt in place");
             }
             Ok(Err(err)) => {
-                tracing::warn!(session = %sid, error = %err, "ccteam-im: tool-face rebuild failed; the turn proceeds");
+                tracing::warn!(session = %sid, error = %err, "ccteam-im: tool-face probe failed; the turn proceeds");
             }
             Err(_) => {
-                tracing::warn!(session = %sid, "ccteam-im: tool-face rebuild timed out; the turn proceeds");
+                tracing::warn!(session = %sid, "ccteam-im: tool-face probe timed out; the turn proceeds");
             }
         }
         self.assert_principal_reached_the_session(&sid);
@@ -6827,20 +6829,68 @@ impl Gateway {
     /// roots, project scope is not the session's own, completion
     /// notifications have nowhere to go).
     ///
-    /// Warn-only, by the same rule as the rebuild above: a session with a
-    /// doubtful identity is still a session that can answer, and a spawn is
-    /// never failed on a diagnostic.
+    /// **This is a measurement, not a belt-and-braces check.** The override a
+    /// managed session relies on is only ENFORCED where the vendor gives ccteam
+    /// a lever for it (Claude `--strict-mcp-config`; Codex's per-thread
+    /// `config.mcp_servers`). On the ACP path there is no such lever on any of
+    /// the three vendors, and grok 1.0.0 was measured resolving the same-name
+    /// collision in favour of its OWN `~/.grok/config.toml` entry — so a
+    /// managed grok session runs its tools as the machine. See
+    /// `ccteam_harness::execution::mcp_config`'s module doc for the per-dialect
+    /// evidence. That is exactly why the outcome is verified here instead of
+    /// assumed: this is the one place that knows both which credential ccteam
+    /// minted and whether anything ever presented it.
+    ///
+    /// Loud, never fatal: a warn plus the same `SessionLifecycle` signal family
+    /// eviction uses ([`Self::emit_session_evicted`]), so the condition shows up
+    /// on the web event stream instead of only in a log nobody tails. It stays
+    /// broadcast-only (IM has no `SessionLifecycle` representation), so a
+    /// degraded identity never turns into chat noise in the parent's thread. A
+    /// session with a doubtful identity is still a session that can answer, and
+    /// a spawn is never failed on a diagnostic.
+    ///
+    /// Not yet durable: a `progress.jsonl` twin needs a new kind in
+    /// `harness/progress_bridge`, the schema's single authority, which this
+    /// change deliberately does not touch.
     fn assert_principal_reached_the_session(&self, sid: &str) {
         if self.principals.was_used(sid) {
             return;
         }
+        let (slug, vendor) = match self.sessions.get(sid) {
+            Some(session) => (session.project.clone(), session.vendor),
+            // Gone from the live map between the probe and here: still worth
+            // saying, just without the coordinates.
+            None => (String::new(), AgentVendor::Claude),
+        };
         tracing::warn!(
             session = %sid,
-            "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); check that the session's curated MCP config is the one its vendor loaded"
+            %slug,
+            vendor = %vendor_str(vendor),
+            "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); the vendor loaded a same-named `ccteam` MCP entry from its own global config instead of the one ccteam handed this session"
         );
+        self.emit_user_signal(GatewayEvent {
+            id: format!("principal-unused-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!(
+                "{sid}: ccteam tools are running as this machine, not as this session"
+            ),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "identity_degraded".to_string(),
+                reason: format!(
+                    "the {} session never presented its own principal: its vendor served the ccteam tool face from its global config, so children mount as roots and its project scope is not its own",
+                    vendor_str(vendor)
+                ),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+            slug: (!slug.is_empty()).then_some(slug),
+        });
     }
 
-    /// `/mcp` — rebuild the current session's ccteam TOOL FACE in place.
+    /// `/mcp` — ask about the current session's ccteam TOOL FACE.
     ///
     /// The outbound twin of the pump's inbound re-attach: ccteam reaches into a
     /// session through its event stream, and the session reaches back through
@@ -6848,9 +6898,12 @@ impl Gateway {
     /// kills that client, and no vendor retries a failed MCP server on its own,
     /// so a live session can sit there fully functional with no ccteam tools.
     ///
-    /// Vendors that CAN reconnect in place do (claude stream-json speaks
-    /// `mcp_reconnect` — the same control request the TUI's own `/mcp` issues);
-    /// the rest answer with what would restore it instead of pretending.
+    /// Unlike the inbound half, this one cannot be repaired in place: no vendor
+    /// reapplies its MCP config to a live session, and the one that looked like
+    /// it could (claude stream-json's `mcp_reconnect`) was measured swapping the
+    /// session's own principal for the machine credential. So the receipt names
+    /// what WOULD restore the face — normally `/new` — instead of pretending to
+    /// have done it. See [`ccteam_harness::ToolSurfaceRebuild`].
     async fn rebuild_tool_surface(&self, chat: &ChatKey) -> Result<String> {
         let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
             return Ok("当前没有会话可重连;先 /new 或 /use <sid>".to_string());
@@ -6863,13 +6916,10 @@ impl Gateway {
         let adapter = Arc::clone(&session.adapter);
         let thread = session.thread.clone();
         match adapter.rebuild_tool_surface(&thread).await {
-            Ok(ccteam_harness::ToolSurfaceRebuild::Rebuilt) => {
-                Ok(format!("🔌 {session_id} 的 ccteam 工具面已重连"))
-            }
             Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => {
                 Ok(format!("🔌 {session_id} 无法原地重连:{reason}"))
             }
-            Err(err) => Ok(format!("🔌 {session_id} 重连失败:{err}")),
+            Err(err) => Ok(format!("🔌 {session_id} 查询工具面失败:{err}")),
         }
     }
 
@@ -12260,6 +12310,54 @@ mod tests {
         let sink = gw.event_sink.clone().expect("sink wired");
         assert!(sink.send(fake_event(Some("s7"))));
         assert_eq!(sub.recv().await.unwrap().sid.as_deref(), Some("s7"));
+    }
+
+    /// A managed session whose own principal never authenticated is running its
+    /// ccteam tools as the MACHINE (measured on grok 1.0.0: the vendor serves
+    /// the same-named `ccteam` entry from its own global config and no vendor
+    /// lever closes that door — see
+    /// `ccteam_harness::execution::mcp_config`'s module doc). Nothing about such
+    /// a session looks broken, so the ONLY way an operator learns is if ccteam
+    /// says it: a log line plus the `SessionLifecycle` signal the web event
+    /// stream already renders. A healthy session must stay silent, or the signal
+    /// is noise nobody reads.
+    #[tokio::test]
+    async fn principal_never_used_raises_an_operator_visible_signal() {
+        let adapter: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(FakeAdapter::default());
+        let mut gw = Gateway::new(adapter, "demo", std::env::temp_dir());
+        let mut sub = gw.subscribe_events();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+
+        // Minted but never presented — the defect's exact shape.
+        gw.principals.reserve("s41", "sekret", "demo", "", 0);
+        gw.assert_principal_reached_the_session("s41");
+        let ev = sub
+            .try_recv()
+            .expect("a degraded identity must be broadcast");
+        assert_eq!(ev.sid.as_deref(), Some("s41"));
+        match &ev.kind {
+            GatewayEventKind::SessionLifecycle { state, reason } => {
+                assert_eq!(state, "identity_degraded");
+                assert!(
+                    reason.contains("principal"),
+                    "the reason must name the cause, got: {reason}"
+                );
+            }
+            other => panic!("expected SessionLifecycle, got {other:?}"),
+        }
+
+        // Once the session HAS authenticated with its own credential there is
+        // nothing to report, on this call or any later one.
+        assert!(
+            gw.principals.verify("s41", "sekret").is_some(),
+            "verify records first use"
+        );
+        gw.assert_principal_reached_the_session("s41");
+        assert!(
+            sub.try_recv().is_err(),
+            "a healthy principal must emit nothing"
+        );
     }
 
     /// v0.8.24 A-U3 — an explicit `SpawnTuning` (composer model + effort)

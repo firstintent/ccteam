@@ -30,16 +30,56 @@
 //! global config is one static file shared by every process that vendor starts,
 //! so it carries only a machine-user ENROLLMENT credential (`ccteam_core::enroll`)
 //! that says whose config it is and grants nothing by itself. A managed session
-//! overrides that same-named entry with its own `(sid, secret)` principal, which
-//! is the only credential that says WHICH session is calling. There is no stdio
-//! transport at all any more — the `internal mcp-serve` command that hosted it
-//! is deleted, so nothing can fall back to a per-session child process.
+//! aims to override that same-named entry with its own `(sid, secret)`
+//! principal, which is the only credential that says WHICH session is calling.
+//! There is no stdio transport at all any more — the `internal mcp-serve`
+//! command that hosted it is deleted, so nothing can fall back to a per-session
+//! child process.
 //!
-//! Claude's spawn also passes `--strict-mcp-config` on the stream-json path so
-//! ambient user MCP servers are not inherited (avoids the historical
-//! self-referential init deadlock); the terminal path omits it and relies on
-//! `--mcp-config` winning the same-name merge, keeping the user's other
-//! ambient servers.
+//! ## Whether the override WINS is the vendor's call, and one door is open
+//!
+//! Both entries are named `ccteam` — they must be, because the server name is
+//! the tool-name prefix every agent-facing contract is written against
+//! (`mcp__ccteam__*`; grok's own `ccteam__session_list`). So on every dialect
+//! the projection below is a same-name collision with the machine credential,
+//! and who wins is decided by the vendor, not by ccteam:
+//!
+//! | dialect | what makes the session principal win |
+//! |---|---|
+//! | Claude stream-json | **enforced** — `--strict-mcp-config` means the curated file is the ONLY source (also avoids the historical self-referential init deadlock) |
+//! | Claude terminal | `--mcp-config` wins the same-name merge, keeping the user's other ambient servers |
+//! | Codex | per-thread `config.mcp_servers` deep-merges over the global entry; real-machine verified (0.144.3) |
+//! | Grok / OpenCode / Kimi (ACP) | **nothing** — see below |
+//! | Pi (bridge) | the child env IS the only source; there is no global pi config to collide with |
+//!
+//! **The ACP door is open, and no vendor lever closes it.** `session/new`'s
+//! `mcpServers[]` is the only thing carrying a session's principal on that
+//! path, and there is no ACP analogue of `--strict-mcp-config`. Measured on
+//! this machine (2026-08-10) against grok 1.0.0: a managed grok session's
+//! `tools/call` authenticated as the machine ENROLLMENT credential, grok's own
+//! session log showing exactly one `ccteam` server with `source:"local"`
+//! (`~/.grok/config.toml`) — i.e. the injected entry lost. Everything that
+//! could plausibly close it was checked and does not: `grok`/`grok agent`/
+//! `grok mcp --help` and grok's bundled `07-mcp-servers.md` have no strict flag;
+//! `GROK_{CLAUDE,CURSOR,CODEX}_MCPS_ENABLED` / `[compat.*] mcps` only turn off
+//! COMPAT sources (`~/.claude.json`, `~/.cursor/mcp.json`, `.mcp.json`), never
+//! grok's own `[mcp_servers]`; `disabled_mcp_servers` and
+//! `[mcp_servers.<n>].enabled=false` are persistent user-config writes that
+//! would disarm a hand-started grok too (and are outside ccteam's vendor-config
+//! footprint); `mcpInheritance` is subagent-scoped; and `--plugin-dir` — the
+//! lever v0.9.13 used to SHADOW ambient plugin MCP servers — was measured
+//! LOSING this collision to `config.toml`, so that precedent does not transfer.
+//! OpenCode and Kimi share this projection and have no lever either, though
+//! both vendors' own merge code takes the caller's entry on a same-name key
+//! (kimi `mergeCallerMcpServers`, opencode `MCP.add` replacing + closing the
+//! previous client), so they are believed unaffected — UNVERIFIED at runtime.
+//!
+//! Because that cannot be fixed here, it is not assumed here either: the daemon
+//! MEASURES the outcome per session and says so loudly
+//! (`ccteam_im::gateway::Gateway::assert_principal_reached_the_session` — a
+//! principal with no recorded first use means the tool face authenticated as
+//! somebody else). Renaming the server would close the door and is deliberately
+//! rejected: it would churn every `mcp__ccteam__*` tool name.
 
 use std::path::{Path, PathBuf};
 
@@ -285,6 +325,12 @@ pub fn project_codex_thread_config(ep: &SessionMcpEndpoint) -> Value {
 /// ACP (OpenCode 1.17.x / Grok 0.2.x) validates MCP entries strictly:
 /// `headers` must be an **array** of `{name, value}` (not a map). Wrong shape
 /// → jsonrpc -32602 Invalid params on `session/new` (smoke 2026-07-11).
+///
+/// This entry is the ONLY carrier of a session's principal on the ACP path,
+/// and the vendor decides whether it beats the same-named machine-credential
+/// entry in its own global config — see the module doc's "the ACP door is
+/// open" section. One projection, so a fourth ACP vendor inherits exactly one
+/// known-open door rather than adding a new one.
 pub fn project_acp_mcp_servers(ep: &SessionMcpEndpoint) -> Vec<Value> {
     vec![json!({
         "name": "ccteam",
@@ -335,6 +381,11 @@ pub fn write_session_mcp_config(
 
 /// ACP `mcpServers` for this session. Empty vec when sid/secret is missing
 /// (caller still gets a valid session, just without the in-agent tool face).
+///
+/// Non-empty here means "the principal was OFFERED", never "the principal is
+/// what the session calls with" — the vendor still owns the same-name
+/// collision. The daemon measures the difference
+/// (`assert_principal_reached_the_session`); see the module doc.
 pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
     SessionMcpEndpoint::resolve(sid, secret)
         .map(|ep| project_acp_mcp_servers(&ep))

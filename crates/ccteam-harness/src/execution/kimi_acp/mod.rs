@@ -509,6 +509,12 @@ impl HarnessAdapter for KimiAcpAdapter {
         // identically to session/new and session/resume|load. Empty when
         // sid/secret missing; failure to inject must not block the prompt
         // path (empty vec).
+        //
+        // Same open door as grok: this OFFERS the principal against a
+        // same-named machine-credential entry in `$KIMI_CODE_HOME/mcp.json`,
+        // and no flag makes it win (kimi's own `mergeCallerMcpServers` spreads
+        // the caller last, so it is believed fine — unverified at runtime; the
+        // daemon measures the outcome). See `mcp_config`'s module doc.
         let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         // Cold-resume ladder: if meta.json already has a Kimi ACP sessionId

@@ -454,6 +454,11 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         let inbound = Self::inbound_policy(ctx.permission_mode);
         // v0.8.24 C1 — best-effort ccteam MCP inject into session/new.
         // Failure to load MCP must not block the prompt path (empty vec).
+        // Same open door as grok: this OFFERS the principal against a
+        // same-named machine-credential entry in opencode's own global config,
+        // and no flag makes it win (opencode's own merge does replace on a
+        // same-name key, so it is believed fine — unverified at runtime; the
+        // daemon measures the outcome). See `mcp_config`'s module doc.
         let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         let prior_uuid = read_session_meta(&ctx.project_dir, &ctx.sid)

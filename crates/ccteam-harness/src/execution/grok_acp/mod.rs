@@ -554,6 +554,14 @@ impl HarnessAdapter for GrokAcpAdapter {
         // passed identically to session/new and session/load (shared ACP
         // helper). Empty when sid/secret missing (roleless still gets tools;
         // secret is the gate). `ctx.secret` was previously dropped.
+        //
+        // OFFERING the principal is all this can do. grok also loads a
+        // same-named `ccteam` entry from `~/.grok/config.toml` carrying the
+        // MACHINE credential, and grok 1.0.0 was measured resolving that
+        // collision in its own favour — no CLI flag, env var, config key or ACP
+        // field closes that door (evidence + everything ruled out:
+        // `mcp_config`'s module doc). The daemon therefore verifies the outcome
+        // per session rather than trusting this line.
         let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         // Cold-resume ladder: if meta.json already has a Grok ACP sessionId

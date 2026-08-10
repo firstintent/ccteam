@@ -194,7 +194,9 @@ impl HarnessAdapter for GatewayAdapter {
         _h: &ThreadHandle,
     ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
         self.tool_face_rebuilds.fetch_add(1, Ordering::SeqCst);
-        Ok(ccteam_harness::ToolSurfaceRebuild::Rebuilt)
+        Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+            reason: "stub: only a respawn reapplies the curated config; send /new".into(),
+        })
     }
 
     fn event_attachment(&self) -> ccteam_harness::EventAttachment {
@@ -1173,12 +1175,15 @@ async fn daemon_surfaces_submit_failure_to_im_and_ledger() {
 }
 
 /// A child session is driven by its PARENT agent, so nobody is there to type
-/// `/mcp` into it — the tool face has to be rebuilt automatically, at the
-/// moment the session first does work under this daemon. Once per session: a
-/// rebuild per turn would tear down a healthy MCP client on every message.
+/// `/mcp` into it — the tool face is therefore checked automatically, at the
+/// moment the session first does work under this daemon. EXACTLY once per
+/// session: the probe is a per-turn cost otherwise, and for the vendors that
+/// once answered it in place it also tore down a healthy MCP client per
+/// message. Held after the in-place rebuild was withdrawn: "once per session"
+/// is the property, whatever the adapter answers.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn first_activation_rebuilds_the_tool_face_once_per_session() {
+async fn first_activation_probes_the_tool_face_once_per_session() {
     let _g = env_lock();
     let home = isolate_home();
     let projects_root = home.path().join("projects");
@@ -1214,7 +1219,7 @@ async fn first_activation_rebuilds_the_tool_face_once_per_session() {
     assert_eq!(
         adapter.tool_face_rebuilds.load(Ordering::SeqCst),
         1,
-        "the tool face is primed on first activation and never again"
+        "the tool face is probed on first activation and never again"
     );
 }
 
