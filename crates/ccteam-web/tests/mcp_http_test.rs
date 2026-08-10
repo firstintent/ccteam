@@ -4,13 +4,28 @@
 //! managed Pi bridge readiness contract;
 //! tools/call status succeeds; no/bad bearer → 401 (auth on AND off);
 //! GET /mcp → 405; notification → 202 empty.
+//!
+//! **Credential.** The subject here is the TRANSPORT contract, so it uses the
+//! lightest credential that can carry it: a user-scoped ENROLLMENT credential,
+//! which needs no gateway and no live session. It used to use the admin web
+//! token; that family is no longer accepted at `/mcp` at all (see
+//! `mcp_tenant_bearer_test` for the refusal, and `routes::mcp`'s module doc for
+//! why a credential a static config file can carry must grant nothing).
+//!
+//! Two tests left with that family: `mcp_session_list_admin_bearer_bypasses_cto_gate`
+//! (an owner front door that no longer exists) and
+//! `mcp_internal_bus_methods_not_exposed_over_http` (the internal-bus refusal
+//! applies to front-door callers only — every HTTP caller is now an agent
+//! identity, and the stronger statement, that a console token cannot reach
+//! `permission/ask` at all, is asserted in `mcp_tenant_bearer_test`).
 
 use std::net::SocketAddr;
 
 use axum::Router;
+use ccteam_core::enroll::{self, EnrollCredential, EnrollScope};
 use ccteam_core::CcteamPaths;
 use ccteam_harness::PI_REQUIRED_MCP_TOOL_NAMES;
-use ccteam_web::{router_with_state, token::generate_or_load_token, AppState, AuthState};
+use ccteam_web::{router_with_state, AppState, AuthState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -23,21 +38,12 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     }
 }
 
-/// Write the admin web-token file under `paths` so the auth-disabled
-/// `/mcp` path can constant-time-validate against a known hex.
-fn seed_web_token(paths: &CcteamPaths, hex: &str) {
-    let path = paths.web_token_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(&path, hex).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms).unwrap();
-    }
+/// A hand-started client's credential, minted under the tempdir root the router
+/// verifies against (`_in(root)`-injected, so nothing reaches the real
+/// `~/.ccteam`). User-scoped: it names no project, which is exactly the posture
+/// of a vendor's global config entry.
+fn mint_enroll(paths: &CcteamPaths) -> EnrollCredential {
+    enroll::mint_in(&paths.root, EnrollScope::User, "user:web-api", None).unwrap()
 }
 
 async fn spawn(state: AppState) -> SocketAddr {
@@ -55,13 +61,10 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
-fn bearer(hex: &str) -> String {
-    format!("Bearer ccteam:{hex}")
-}
-
 async fn post_mcp(
     addr: SocketAddr,
     auth: Option<&str>,
+    mcp_session_id: Option<&str>,
     body: serde_json::Value,
 ) -> reqwest::Response {
     let mut req = client()
@@ -69,9 +72,42 @@ async fn post_mcp(
         .header("Content-Type", "application/json")
         .json(&body);
     if let Some(h) = auth {
-        req = req.header("Authorization", h);
+        req = req.header("Authorization", format!("Bearer {h}"));
+    }
+    if let Some(id) = mcp_session_id {
+        req = req.header("Mcp-Session-Id", id);
     }
     req.send().await.unwrap()
+}
+
+fn initialize_body() -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-03-26" }
+    })
+}
+
+/// Run `initialize` and return the `Mcp-Session-Id` the server issued — the
+/// per-process identity every later request must echo.
+async fn initialize(addr: SocketAddr, bearer: &str) -> String {
+    let resp = post_mcp(addr, Some(bearer), None, initialize_body()).await;
+    assert_eq!(resp.status(), 200, "initialize must succeed");
+    resp.headers()
+        .get("mcp-session-id")
+        .expect("initialize issues the per-process identity")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The common fixture: a router with no gateway plus one enrollment credential.
+async fn serve(tmp: &TempDir, auth: AuthState) -> (SocketAddr, EnrollCredential) {
+    let paths = fake_paths(tmp.path());
+    let cred = mint_enroll(&paths);
+    let addr = spawn(AppState::with_auth(paths, auth)).await;
+    (addr, cred)
 }
 
 // ── ① initialize echoes client protocolVersion ──────────────────────
@@ -79,22 +115,9 @@ async fn post_mcp(
 #[tokio::test]
 async fn mcp_initialize_echoes_client_protocol_version() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
 
-    let resp = post_mcp(
-        addr,
-        Some(&bearer(TOKEN_HEX)),
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": { "protocolVersion": "2025-03-26" }
-        }),
-    )
-    .await;
+    let resp = post_mcp(addr, Some(&cred.bearer()), None, initialize_body()).await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
@@ -104,14 +127,12 @@ async fn mcp_initialize_echoes_client_protocol_version() {
 #[tokio::test]
 async fn mcp_initialize_defaults_protocol_version_when_omitted() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
 
     let resp = post_mcp(
         addr,
-        Some(&bearer(TOKEN_HEX)),
+        Some(&cred.bearer()),
+        None,
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -130,14 +151,13 @@ async fn mcp_initialize_defaults_protocol_version_when_omitted() {
 #[tokio::test]
 async fn mcp_tools_list_returns_the_full_surface() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
+    let id = initialize(addr, &cred.bearer()).await;
 
     let resp = post_mcp(
         addr,
-        Some(&bearer(TOKEN_HEX)),
+        Some(&cred.bearer()),
+        Some(&id),
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -161,17 +181,22 @@ async fn mcp_tools_list_returns_the_full_surface() {
 
 // ── ③ tools/call status succeeds ────────────────────────────────────
 
+/// `status` answers every authenticated caller, including one with no project:
+/// a client must be able to see what exists and where it stands. What it does
+/// NOT get is a vendor panel for a workspace it never named — the panel is
+/// scoped to the caller's own project, and this credential (user-scoped, no
+/// ledger node) has none. The bound-caller panel is covered where a real
+/// project exists: `mcp_enroll_test::a_bound_client_gets_the_vendor_panel_for_its_own_project`.
 #[tokio::test]
 async fn mcp_tools_call_status_succeeds() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
+    let id = initialize(addr, &cred.bearer()).await;
 
     let resp = post_mcp(
         addr,
-        Some(&bearer(TOKEN_HEX)),
+        Some(&cred.bearer()),
+        Some(&id),
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
@@ -185,21 +210,18 @@ async fn mcp_tools_call_status_succeeds() {
     assert_eq!(body["result"]["isError"], false);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     // v0.10 T1 — the daemon-aware `status` returns the base health JSON, then
-    // the vendor panel + routing notes appended as trailing plain text
-    // (separated by a blank line). The JSON is the first `\n\n`-delimited
-    // chunk; the appended panel is the new observability surface.
+    // the vendor panel or an honest note appended as trailing plain text
+    // (separated by a blank line). The JSON is the first `\n\n`-delimited chunk.
     let json_chunk = text.split("\n\n").next().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(json_chunk).unwrap();
     assert!(parsed.get("projects").is_some() || parsed.get("orchestrator").is_some());
-    // Admin caller with no `project` arg and no cwd project → the panel falls
-    // back to the local host with a note, but the vendor section is present.
     assert!(
-        text.contains("vendors (project="),
-        "status must append the vendor panel, got: {text}"
+        text.contains("the vendor panel is scoped to your own project"),
+        "a projectless caller must be told why the panel is withheld, got: {text}"
     );
     assert!(
-        text.contains("routing notes"),
-        "status must append the routing-notes transport, got: {text}"
+        !text.contains("vendors (project="),
+        "ccteam must not render a panel for a project this caller never named, got: {text}"
     );
 }
 
@@ -208,82 +230,64 @@ async fn mcp_tools_call_status_succeeds() {
 #[tokio::test]
 async fn mcp_auth_enabled_rejects_missing_and_bad_bearer() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    let state = AppState::with_auth(paths, AuthState::enabled(TOKEN_HEX.into()));
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::enabled(TOKEN_HEX.into())).await;
+    let list = || serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
 
-    let missing = post_mcp(
-        addr,
-        None,
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
-    )
-    .await;
+    let missing = post_mcp(addr, None, None, list()).await;
     assert_eq!(missing.status(), 401, "no bearer under auth-enabled → 401");
 
-    let bad = post_mcp(
-        addr,
-        Some("Bearer ccteam:deadbeef"),
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
-    )
-    .await;
+    let bad = post_mcp(addr, Some("ccteam-enroll:deadbeef:nope"), None, list()).await;
     assert_eq!(bad.status(), 401, "bad bearer under auth-enabled → 401");
 
-    // Sanity: valid admin bearer works.
-    let ok = post_mcp(
-        addr,
-        Some(&bearer(TOKEN_HEX)),
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
-    )
-    .await;
+    // The web-console token is a different family entirely, valid or not.
+    let web = post_mcp(addr, Some(&format!("ccteam:{TOKEN_HEX}")), None, list()).await;
+    assert_eq!(
+        web.status(),
+        401,
+        "a LIVE web token is still not an MCP credential"
+    );
+
+    // Sanity: a valid enrollment credential works.
+    let id = initialize(addr, &cred.bearer()).await;
+    let ok = post_mcp(addr, Some(&cred.bearer()), Some(&id), list()).await;
     assert_eq!(
         ok.status(),
         200,
-        "valid admin bearer under auth-enabled → 200"
+        "valid enrollment bearer under auth-enabled → 200"
     );
 }
 
 #[tokio::test]
 async fn mcp_auth_disabled_still_requires_bearer() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    // Confirm generate_or_load_token reads our seed (same path the handler uses).
-    let loaded = generate_or_load_token(&paths.web_token_path()).unwrap();
-    assert_eq!(loaded, TOKEN_HEX);
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
+    let list = || serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
 
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
-
-    let missing = post_mcp(
-        addr,
-        None,
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
-    )
-    .await;
+    let missing = post_mcp(addr, None, None, list()).await;
     assert_eq!(
         missing.status(),
         401,
         "no bearer under auth-disabled still → 401"
     );
 
-    let bad = post_mcp(
-        addr,
-        Some("Bearer ccteam:0000000000000000000000000000000000000000000000000000000000000000"),
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
-    )
-    .await;
+    let bad = post_mcp(addr, Some("ccteam-enroll:deadbeef:nope"), None, list()).await;
     assert_eq!(
         bad.status(),
         401,
         "bad bearer under auth-disabled still → 401"
     );
 
-    let ok = post_mcp(
-        addr,
-        Some(&bearer(TOKEN_HEX)),
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
-    )
-    .await;
+    // Loopback / --no-auth does not resurrect the web family: it was the ONE
+    // configuration where the old gate loaded the admin token off disk itself.
+    let web = post_mcp(addr, Some(&format!("ccteam:{TOKEN_HEX}")), None, list()).await;
+    assert_eq!(
+        web.status(),
+        401,
+        "no web token is accepted, gate off or on"
+    );
+
+    let id = initialize(addr, &cred.bearer()).await;
+    let ok = post_mcp(addr, Some(&cred.bearer()), Some(&id), list()).await;
     assert_eq!(ok.status(), 200, "valid bearer under auth-disabled → 200");
 }
 
@@ -292,14 +296,11 @@ async fn mcp_auth_disabled_still_requires_bearer() {
 #[tokio::test]
 async fn mcp_get_returns_405() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
 
     let resp = client()
         .get(format!("http://{addr}/mcp"))
-        .header("Authorization", bearer(TOKEN_HEX))
+        .header("Authorization", format!("Bearer {}", cred.bearer()))
         .send()
         .await
         .unwrap();
@@ -311,14 +312,13 @@ async fn mcp_get_returns_405() {
 #[tokio::test]
 async fn mcp_notification_returns_202_empty() {
     let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
+    let id = initialize(addr, &cred.bearer()).await;
 
     let resp = post_mcp(
         addr,
-        Some(&bearer(TOKEN_HEX)),
+        Some(&cred.bearer()),
+        Some(&id),
         serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -332,70 +332,4 @@ async fn mcp_notification_returns_202_empty() {
         body.is_empty(),
         "notification body must be empty, got {body:?}"
     );
-}
-
-// ── ⑦ v0.9 review fix — admin front door: cto-gate bypass + internal-bus refusal ──
-
-/// The verified admin bearer must reach `session_*` WITHOUT ambient
-/// `_caller_role`/`_caller_secret` args: with no gateway attached the op
-/// reports gateway-down — proving the cto gate was bypassed (pre-fix this
-/// returned "permission denied").
-#[tokio::test]
-async fn mcp_session_list_admin_bearer_bypasses_cto_gate() {
-    let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
-
-    let resp = post_mcp(
-        addr,
-        Some(&bearer(TOKEN_HEX)),
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "session_list", "arguments": {} }
-        }),
-    )
-    .await;
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["result"]["isError"], true);
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(
-        !text.contains("permission denied"),
-        "admin bearer must bypass the cto gate, got: {text}"
-    );
-    assert!(text.contains("gateway not running"), "got: {text}");
-}
-
-/// The internal-bus methods (`permission/ask`, `interaction/ask`) are NOT
-/// exposed on the HTTP front door — JSON-RPC `-32601` (they stay on
-/// mcp.sock; HITL rides vendor-native in-band channels).
-#[tokio::test]
-async fn mcp_internal_bus_methods_not_exposed_over_http() {
-    let tmp = TempDir::new().unwrap();
-    let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
-    let state = AppState::with_auth(paths, AuthState::disabled());
-    let addr = spawn(state).await;
-
-    for method in ["permission/ask", "interaction/ask"] {
-        let resp = post_mcp(
-            addr,
-            Some(&bearer(TOKEN_HEX)),
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 9,
-                "method": method,
-                "params": {}
-            }),
-        )
-        .await;
-        assert_eq!(resp.status(), 200, "{method}");
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["error"]["code"], -32601, "{method}: {body}");
-        assert_eq!(body["id"], 9, "{method}: id must round-trip");
-    }
 }

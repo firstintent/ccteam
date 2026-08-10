@@ -21,7 +21,10 @@
 //! 6. an unbound (user-scoped) credential may discover, and nothing else —
 //!    ccteam never GUESSES the project, which is the bug class being deleted;
 //! 7. `DELETE` ends the binding, the principal and the node together;
-//! 8. the admin web token cannot open a binding at all.
+//! 8. the admin web token is refused outright — it cannot open a binding and
+//!    cannot ride one;
+//! 9. a bound client is a project-scoped caller in `status` too, not only in
+//!    `session_*`.
 //!
 //! Isolation (CLAUDE.md): every state seam is `_in(root)`-injected through
 //! `CcteamPaths` pointed at a tempdir, and `HOME` + `CCTEAM_HOME` are pinned to
@@ -731,26 +734,28 @@ async fn delete_ends_the_binding_the_principal_and_the_node() {
     assert_eq!(again.status(), 404, "nothing left to close");
 }
 
-// ── 8. the admin token is a different family ───────────────────────────────
+// ── 8. the web token is not a credential here at all ───────────────────────
 
-/// The credential that caused the defect must not be able to enter this path at
-/// all — and an id issued to somebody else must not be rideable by it either.
+/// The credential that caused the defect cannot enter this path — and, since the
+/// admin tier is gone rather than narrowed, it cannot enter any other one either:
+/// it neither opens a binding nor rides one somebody else opened.
 #[tokio::test]
 #[serial]
-async fn the_admin_web_token_cannot_open_or_ride_a_binding() {
+async fn the_admin_web_token_is_refused_and_cannot_ride_a_binding() {
     let tmp = TempDir::new().unwrap();
     let _env = isolate(&tmp);
     let paths = fake_paths(tmp.path());
     let app = state_with_project(&paths).await;
     let bindings = Arc::clone(&app.native_bindings);
+    let gateway = app.gateway.clone().unwrap();
     let addr = spawn_server(app).await;
     let admin = format!("ccteam:{ADMIN_HEX}");
 
     let resp = post_mcp(addr, &admin, None, initialize_body()).await;
-    assert_eq!(resp.status(), 200, "the admin front door still works");
-    assert!(
-        resp.headers().get("mcp-session-id").is_none(),
-        "no per-process identity is issued to a machine-wide token"
+    assert_eq!(
+        resp.status(),
+        401,
+        "a machine-wide token is not an MCP credential"
     );
     assert!(
         bindings.list().is_empty(),
@@ -758,11 +763,12 @@ async fn the_admin_web_token_cannot_open_or_ride_a_binding() {
         bindings.list()
     );
 
-    // An enrolled client's id under the admin bearer stays an admin call — a
-    // ROOT spawn, never an adoption of somebody else's node.
+    // An enrolled client's id under the admin bearer is refused at the gate,
+    // before the binding is even looked up — no adoption, no root spawn, and
+    // nothing created in the ledger.
     let cred = mint(&paths, project_scope());
     let id = initialize(addr, &cred.bearer()).await;
-    let node = bindings.list()[0].sid.clone().unwrap();
+    let sessions_before = gateway.lock().await.session_views().len();
     let resp = post_mcp(
         addr,
         &admin,
@@ -774,16 +780,14 @@ async fn the_admin_web_token_cannot_open_or_ride_a_binding() {
         ),
     )
     .await;
-    assert_eq!(resp.status(), 200);
-    let spawned = tool_json(&resp.json::<Value>().await.unwrap());
-    assert_eq!(spawned["ok"], true, "{spawned}");
-    assert!(
-        spawned["parent_sid"].is_null(),
-        "the admin door is rootless; it must not inherit a node: {spawned}"
+    assert_eq!(resp.status(), 401, "an id is not a credential either");
+    assert_eq!(
+        gateway.lock().await.session_views().len(),
+        sessions_before,
+        "a refused call must not have spawned anything"
     );
-    assert_ne!(spawned["caller"], format!("ambient:{node}"), "{spawned}");
 
-    // A garbage enrollment bearer is 401 — never downgraded to another family.
+    // A garbage enrollment bearer is 401 too — never downgraded to another family.
     let forged = post_mcp(
         addr,
         &format!("ccteam-enroll:{}:deadbeef", cred.id),
@@ -795,5 +799,42 @@ async fn the_admin_web_token_cannot_open_or_ride_a_binding() {
     assert!(
         bindings.list().len() == 1,
         "a rejected credential binds nothing"
+    );
+}
+
+// ── 9. a bound client is a project-scoped caller everywhere ────────────────
+
+/// `status` renders the vendor panel for the node's OWN project — the panel is
+/// scoped to the caller's workspace, so this is the bound counterpart of
+/// `mcp_http_test::mcp_tools_call_status_succeeds` (which pins that a caller with
+/// no project is told why the panel is withheld instead of being shown one for a
+/// workspace it never named).
+#[tokio::test]
+#[serial]
+async fn a_bound_client_gets_the_vendor_panel_for_its_own_project() {
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, project_scope());
+    let id = initialize(addr, &cred.bearer()).await;
+
+    // No `project` argument: the slug can only come from the node the server
+    // resolved for this process.
+    let resp = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(2, "status", json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("vendors (project={SLUG}")),
+        "a bound client's panel names its own project, got: {text}"
     );
 }

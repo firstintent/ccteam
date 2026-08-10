@@ -4,22 +4,34 @@
 //! [`ccteam_im::mcp::McpDispatch`]. No SSE push (a `GET` is 405, which the
 //! transport defines as "this server offers no server-initiated stream").
 //!
-//! **Auth — self-gated, bearer-only.** This router mounts OUTSIDE the web
-//! `auth_layer` (see `lib::router_with_state`): that layer only understands
-//! the web token family (`ccteam:<hex>` + cookies) and would 401 a session
-//! bearer before this handler ran — which silently downgraded every managed
-//! session's A2A call to an admin fallback and dropped the delegation parent
-//! (fixed v0.9.2). [`require_mcp_auth`] is the single gate, and it resolves the
-//! bearer families in this order — a credential that PARSES as one family is
-//! answered by that family or 401'd, never retried as another:
+//! **Auth — self-gated, bearer-only, and there is no admin tier.** This router
+//! mounts OUTSIDE the web `auth_layer` (see `lib::router_with_state`): that
+//! layer only understands the web-token family (`ccteam:<hex>` + cookies) and
+//! would 401 a session bearer before this handler ran — which silently
+//! downgraded every managed session's A2A call to an admin fallback and dropped
+//! the delegation parent (fixed v0.9.2). [`require_mcp_auth`] is the single
+//! gate, and it resolves exactly TWO families — a credential that PARSES as one
+//! is answered by that family or 401'd, never retried as another:
 //!
-//! 1. session principal `ccteam-sid:<sid>:<secret>` → Ambient with the FULL
-//!    caller identity injected (the delegation-parent edge)
-//! 2. enrollment credential `ccteam-enroll:<id>:<secret>` → see below
-//! 3. admin web token `ccteam:<hex>` → [`McpAuth::Admin`] (owner front door;
-//!    `session_spawn` is a root spawn by design)
-//! 4. tenant web token `ccteam:<hex>` → [`McpAuth::User`] (project-scoped root
-//!    caller; never promoted to admin or treated as a managed session)
+//! 1. session principal `ccteam-sid:<sid>:<secret>` → the caller IS that
+//!    managed session: Ambient with the FULL caller identity injected (the
+//!    delegation-parent edge)
+//! 2. enrollment credential `ccteam-enroll:<id>:<secret>` → a hand-started or
+//!    external client, whose per-process identity this route issues (see below)
+//!
+//! **Why the data plane has no admin tier.** The web token used to be a third
+//! family here, and it was written into all five vendors' GLOBAL MCP configs so
+//! that any hand-started agent could orchestrate. But a vendor's global config
+//! is one static file shared by every process that vendor ever starts, so a
+//! durable credential written into it cannot say WHICH caller is speaking.
+//! Measured consequence: two `codex` runs in different repos authenticated as
+//! the same machine-wide caller, so neither could be a delegation parent and
+//! their `session_spawn` children mounted as ROOTS in a project nobody had
+//! named. A credential a static file can carry must therefore grant nothing by
+//! itself — which is why the tier is *deleted* rather than narrowed: an
+//! identity-free caller has no correct amount of authority. The web token still
+//! authenticates the REST/web control plane (`/api/v1/**`, cookies, the SPA),
+//! where it names a browser session rather than a process.
 //!
 //! A bearer is ALWAYS required — even when `AuthState.enabled == false`
 //! (loopback / `--no-auth`): DNS-rebinding / local-script hardening; curated
@@ -28,15 +40,10 @@
 //!
 //! ## The enrollment family is the one STATEFUL path
 //!
-//! A hand-started vendor process reads a static global config, so whatever is
-//! written there is shared by every process that vendor ever starts. Measured
-//! consequence of putting the admin web token there: two `codex` runs in
-//! different repos authenticated as the same machine-wide caller, so neither
-//! could be a delegation parent and their `session_spawn` children mounted as
-//! ROOTS in a project nobody had named. An enrollment credential therefore says
-//! only *whose* the config is ([`ccteam_core::enroll`]) and carries no authority
-//! of its own; the per-PROCESS identity is issued HERE, at `initialize`, as the
-//! transport's own `Mcp-Session-Id`:
+//! An enrollment credential says only *whose* the config is
+//! ([`ccteam_core::enroll`]) and carries no authority of its own — that is what
+//! makes it safe to leave in a static file. The per-PROCESS identity is issued
+//! HERE, at `initialize`, as the transport's own `Mcp-Session-Id`:
 //!
 //! ```text
 //! initialize + enroll bearer            -> open a binding, mint its ledger node,
@@ -68,9 +75,8 @@ use serde_json::{json, Value};
 use ccteam_core::enroll::{self, EnrollCredential, ENROLL_BEARER_PREFIX};
 use ccteam_im::native_bindings::{NativeBinding, NativeBindings};
 
-use crate::auth::{resolve_identity, Identity, TOKEN_PREFIX};
+use crate::auth::Identity;
 use crate::state::AppState;
-use crate::token::generate_or_load_token;
 
 /// The transport's session header, lower-cased as [`HeaderName`] requires.
 /// Real-machine verified: claude, codex, grok, opencode and kimi all echo it on
@@ -116,9 +122,8 @@ async fn handle_post(
     headers: HeaderMap,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let auth = match require_mcp_auth(&app, &headers).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    let Some(auth) = require_mcp_auth(&app, &headers) else {
+        return unauthorized();
     };
 
     let mut req = match body {
@@ -143,23 +148,18 @@ async fn handle_post(
         }
     };
 
-    // The enrollment family owns the whole request cycle (open a binding on
-    // `initialize`, resolve it on everything after), so it branches before the
-    // caller-enum mapping the static families share.
-    if let McpAuth::Enroll { credential } = auth {
-        return handle_enroll_post(&app, &credential, &headers, req).await;
-    }
-
-    // Web-family bearer → Admin or project-scoped User. Session bearer
-    // `ccteam-sid:<sid>:<secret>` → Ambient path with the FULL caller identity.
-    // The managed-session fields are injected (_caller_sid/_caller_secret/_caller_role/
-    // _caller_slug) so session_* principal auth matches the live session
-    // (v0.9.0 W1 G4 — previously only role+secret were injected, so session_*
-    // over HTTP failed closed with "no project scope").
-    log_call_identity(&auth, &req);
-    let (caller, req) = match auth {
-        McpAuth::Admin => (ccteam_im::mcp::McpCaller::Admin, req),
-        McpAuth::User { user_id } => (ccteam_im::mcp::McpCaller::User { user_id }, req),
+    match auth {
+        // The enrollment family owns the whole request cycle (open a binding on
+        // `initialize`, resolve it on everything after), so it takes the request
+        // rather than just a caller tier.
+        McpAuth::Enroll { credential } => {
+            handle_enroll_post(&app, &credential, &headers, req).await
+        }
+        // Session bearer `ccteam-sid:<sid>:<secret>` → Ambient path with the FULL
+        // caller identity injected (_caller_sid/_caller_secret/_caller_role/
+        // _caller_slug) so session_* principal auth matches the live session
+        // (v0.9.0 W1 G4 — previously only role+secret were injected, so
+        // session_* over HTTP failed closed with "no project scope").
         McpAuth::Session {
             sid,
             role,
@@ -167,6 +167,7 @@ async fn handle_post(
             slug,
             may_invoke_tools,
         } => {
+            log_tier_call(&format!("session:{sid}"), &req);
             // A session that is still spawning is not a session yet: nothing
             // can be dispatched to it and it must not be able to spawn or stop
             // anybody. It only needs discovery (`initialize` / `tools/list`) to
@@ -192,21 +193,9 @@ async fn handle_post(
                     .into_response();
             }
             inject_session_caller(&mut req, &sid, &role, &secret, &slug);
-            (ccteam_im::mcp::McpCaller::Ambient, req)
+            dispatch_json_rpc(&app, req, ccteam_im::mcp::McpCaller::Ambient).await
         }
-        // Handled above — it needs the request cycle, not just a caller tier.
-        // Fail closed rather than panic: a broken invariant in an auth path must
-        // not serve the request, and must not take the connection down either.
-        McpAuth::Enroll { .. } => {
-            tracing::error!("POST /mcp: enrollment bearer reached the static-family match");
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "auth required"})),
-            )
-                .into_response();
-        }
-    };
-    dispatch_json_rpc(&app, req, caller).await
+    }
 }
 
 /// Run one JSON-RPC message through the dispatcher and shape the HTTP answer.
@@ -230,33 +219,25 @@ async fn dispatch_json_rpc(
     }
 }
 
-/// Record WHICH identity a tool call arrived with.
+/// Record WHICH identity a tool call arrived with — the one `POST /mcp`
+/// tool-call log line.
 ///
-/// The tier a request authenticates as is the single fact that decides its
-/// delegation parent, its project scope and what it may reach — and until now
-/// it was the one fact nothing wrote down. A managed session whose vendor
-/// loaded the wrong `ccteam` MCP entry silently served its calls as the
-/// machine-wide admin bearer instead, and the only evidence was a delegation
-/// tree missing an edge. One line per tool call makes that answerable by
-/// reading the log rather than by reconstructing it.
+/// The identity a request authenticates as is the single fact that decides its
+/// delegation parent, its project scope and what it may reach, and it used to be
+/// the one fact nothing wrote down: a managed session whose vendor loaded the
+/// wrong `ccteam` MCP entry silently served its calls as the machine-wide admin
+/// bearer, and the only evidence was a delegation tree missing an edge. That
+/// specific downgrade is now impossible (no admin tier exists to fall back to),
+/// but the question it hid is not — a session that reaches the wrong config now
+/// shows up as `enroll:<id>` or 401s, and either way the log answers "who was
+/// this?" by being read rather than reconstructed.
+///
+/// Callers pass the tier they resolved (`session:<sid>` for a managed session or
+/// an enrolled client's ledger node, `enroll:<id>` for a binding that has none)
+/// — an enrolled client is never logged as the identity that wrote its config
+/// file, which is the whole point of that family.
 ///
 /// Tool calls only: `initialize` / `tools/list` are discovery noise.
-fn log_call_identity(auth: &McpAuth, req: &Value) {
-    let tier = match auth {
-        McpAuth::Admin => "admin".to_string(),
-        McpAuth::User { user_id } => format!("user:{user_id}"),
-        McpAuth::Session { sid, .. } => format!("session:{sid}"),
-        // An enrolled client logs as the NODE it resolved to (or as the
-        // credential while it has none) — never as the identity that wrote the
-        // config file. That is the whole point of the family, so its log line is
-        // emitted where the binding is known.
-        McpAuth::Enroll { credential } => format!("enroll:{}", credential.id),
-    };
-    log_tier_call(&tier, req);
-}
-
-/// The one `POST /mcp` tool-call log line. See [`log_call_identity`] for why the
-/// authenticated tier is worth a line of its own.
 fn log_tier_call(tier: &str, req: &Value) {
     if !is_tool_call(req) {
         return;
@@ -265,12 +246,10 @@ fn log_tier_call(tier: &str, req: &Value) {
     tracing::info!(%tier, %tool, "ccteam-web: POST /mcp tool call");
 }
 
-/// Who authenticated against `POST /mcp`.
+/// Who authenticated against `POST /mcp`. Two families, no admin tier — see the
+/// module doc for why a credential a static config file can carry must grant
+/// nothing by itself.
 enum McpAuth {
-    Admin,
-    User {
-        user_id: String,
-    },
     Session {
         sid: String,
         role: String,
@@ -284,82 +263,67 @@ enum McpAuth {
     /// A hand-started client's config credential. It names an identity and
     /// (optionally) one project; the per-process identity is issued at
     /// `initialize` and carried by `Mcp-Session-Id`.
-    Enroll {
-        credential: EnrollCredential,
-    },
+    Enroll { credential: EnrollCredential },
 }
 
 /// Enforce bearer always (this route mounts outside `auth_layer`, so this is
-/// the ONLY gate). Accepts, in this order:
-/// - session-scoped `ccteam-sid:<sid>:<secret>` (curated per-session MCP → Ambient)
+/// the ONLY gate). Accepts exactly two families:
+/// - session principal `ccteam-sid:<sid>:<secret>` (curated per-session MCP → Ambient)
 /// - enrollment `ccteam-enroll:<id>:<secret>` (a hand-started client's config)
-/// - admin/tenant web token `ccteam:<hex>` (resolved by the shared web family)
 ///
-/// Each family is CLAIMED by its prefix: a bearer that claims one and fails it
-/// is 401, never retried as another. A downgrade between families is exactly how
-/// a managed session silently became an admin caller (v0.9.2), so the families
-/// must not be able to cover for each other.
-async fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Result<McpAuth, Response> {
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "auth required: Authorization: Bearer ccteam:<hex> | ccteam-sid:<sid>:<secret> | ccteam-enroll:<id>:<secret>"
-            })),
-        )
-            .into_response()
-    };
-
-    let raw = headers
+/// Anything else — including a valid web-console token — is 401. Each family is
+/// CLAIMED by its prefix: a bearer that claims one and fails it is 401, never
+/// retried as another. A downgrade between families is exactly how a managed
+/// session silently became an admin caller (v0.9.2), so the families must not be
+/// able to cover for each other.
+///
+/// **Synchronous on purpose.** Both families are verified from a registry lock or
+/// one credential file read: no gateway lock, no await. A vendor's `initialize`
+/// handshake therefore can never queue behind a spawn (the Pi deadlock,
+/// 2026-08-09), and the gate cannot grow a slow path by accident.
+///
+/// `None` = refuse; the caller answers [`unauthorized`]. Returning the identity
+/// rather than a response keeps the refusal's wording in ONE place instead of
+/// travelling as an error value through every caller.
+fn require_mcp_auth(app: &AppState, headers: &HeaderMap) -> Option<McpAuth> {
+    let tok = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(parse_bearer_value);
+        .and_then(parse_bearer_value)?;
 
     // Session-scoped bearer first (works regardless of AuthState.enabled).
-    if let Some(tok) = raw {
-        if let Some((sid, secret)) = parse_session_bearer(tok) {
-            return verify_session_bearer(app, &sid, &secret).map_err(|_| unauthorized());
-        }
-        // Enrollment credential: verified against the on-disk record, whose
-        // owner + scope are the only identity facts that matter. Reading it
-        // needs no lock and no gateway, so a vendor's `initialize` handshake
-        // can never queue behind a spawn (the Pi deadlock, 2026-08-09).
-        if tok.starts_with(ENROLL_BEARER_PREFIX) {
-            return match enroll::verify_in(&app.paths.root, tok) {
-                Some(credential) => Ok(McpAuth::Enroll { credential }),
-                None => Err(unauthorized()),
-            };
-        }
+    if let Some((sid, secret)) = parse_session_bearer(tok) {
+        return verify_session_bearer(app, &sid, &secret);
     }
+    // Enrollment credential: verified against the on-disk record, whose owner +
+    // scope are the only identity facts that matter.
+    if tok.starts_with(ENROLL_BEARER_PREFIX) {
+        return enroll::verify_in(&app.paths.root, tok)
+            .map(|credential| McpAuth::Enroll { credential });
+    }
+    None
+}
 
-    // Web token family — the LIVE admin token when the web gate is enabled
-    // (single source with REST, including rotation) plus the tenant registry;
-    // load the admin token from disk on loopback / --no-auth where AuthState
-    // holds none.
-    let expected = match app.auth.current_token() {
-        Some(hex) => hex,
-        None => match generate_or_load_token(&app.paths.web_token_path()) {
-            Ok(hex) => hex,
-            Err(err) => {
-                tracing::error!(error = %err, "POST /mcp: failed to load web token");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "auth misconfigured: cannot load web token"})),
-                )
-                    .into_response());
-            }
-        },
-    };
-    let Some(bare) = raw.and_then(|presented| presented.strip_prefix(TOKEN_PREFIX)) else {
-        return Err(unauthorized());
-    };
-    match resolve_identity(bare, &expected, &app.paths.users_dir()) {
-        Some(identity) if identity.is_admin => Ok(McpAuth::Admin),
-        Some(identity) => Ok(McpAuth::User {
-            user_id: identity.id,
-        }),
-        None => Err(unauthorized()),
-    }
+/// The one 401 this endpoint ever answers. It names both accepted families and
+/// where a credential comes from: an operator who reaches here is holding the
+/// wrong KIND of credential, and "auth required" alone would send them looking
+/// for a longer token instead of a different one.
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "auth required: POST /mcp accepts two credential families — \
+                      `Authorization: Bearer ccteam-sid:<sid>:<secret>` (a ccteam-managed \
+                      session's own principal, written into its curated MCP config at spawn) \
+                      or `Authorization: Bearer ccteam-enroll:<id>:<secret>` plus the \
+                      `Mcp-Session-Id` from `initialize` (any other client: `ccteam config` \
+                      writes one into each vendor's global config, and the web console's \
+                      project page mints a project-scoped one via \
+                      `POST /api/v1/projects/{slug}/enroll`). A web-console token \
+                      (`ccteam:<hex>`) authenticates `/api/v1/**`, never this endpoint."
+        })),
+    )
+        .into_response()
 }
 
 /// Is this request an attempt to CALL a tool (as opposed to discovering the
@@ -391,7 +355,7 @@ fn parse_session_bearer(tok: &str) -> Option<(String, String)> {
 /// Resolve `ccteam-sid:<sid>:<secret>` against the principal REGISTRY.
 ///
 /// v0.9.0 W1 (F1/G4) — role/slug come from the matched principal, never the
-/// client; an empty secret / unknown sid → 401.
+/// client; an empty secret / unknown sid → `None`, which the gate answers as 401.
 ///
 /// **No gateway lock.** This used to lock the gateway to read a session's
 /// secret, which made a credential check wait on whatever else held that lock
@@ -400,20 +364,15 @@ fn parse_session_bearer(tok: &str) -> Option<(String, String)> {
 /// the bridge's `session_start` blocked on this request, and the child never
 /// reached the point of reading its stdin. The registry has its own lock, so
 /// no spawn path can starve the handshake it is waiting for.
-fn verify_session_bearer(app: &AppState, sid: &str, secret: &str) -> Result<McpAuth, ()> {
-    let Some(principals) = app.session_principals.as_ref() else {
-        return Err(());
-    };
-    match principals.verify(sid, secret) {
-        Some(matched) => Ok(McpAuth::Session {
-            sid: matched.sid,
-            role: matched.role,
-            secret: secret.to_string(),
-            slug: matched.slug,
-            may_invoke_tools: ccteam_im::principals::may_invoke_tools(matched.state),
-        }),
-        None => Err(()),
-    }
+fn verify_session_bearer(app: &AppState, sid: &str, secret: &str) -> Option<McpAuth> {
+    let matched = app.session_principals.as_ref()?.verify(sid, secret)?;
+    Some(McpAuth::Session {
+        sid: matched.sid,
+        role: matched.role,
+        secret: secret.to_string(),
+        slug: matched.slug,
+        may_invoke_tools: ccteam_im::principals::may_invoke_tools(matched.state),
+    })
 }
 
 /// Inject the FULL caller identity (`_caller_sid` / `_caller_secret` /
@@ -443,7 +402,8 @@ fn inject_session_caller(req: &mut Value, sid: &str, role: &str, secret: &str, s
         map.insert("_caller_role".into(), json!(role));
         map.insert("_caller_slug".into(), json!(slug));
         // The local-socket admin fallback arg must never ride in over HTTP —
-        // this transport authenticates via bearer only (admin or sid).
+        // this transport has no admin tier at all (see the module doc); it
+        // authenticates a session principal or an enrolled client's node.
         map.remove("_caller_admin_token");
     }
 }
@@ -742,9 +702,8 @@ fn client_label(req: &Value) -> String {
 /// credential gets the transport's "this server does not let clients end
 /// sessions" answer instead of a misleading success.
 async fn handle_delete(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    let auth = match require_mcp_auth(&app, &headers).await {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    let Some(auth) = require_mcp_auth(&app, &headers) else {
+        return unauthorized();
     };
     let McpAuth::Enroll { credential } = auth else {
         return delete_not_supported();

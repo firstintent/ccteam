@@ -31,21 +31,6 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     }
 }
 
-fn seed_web_token(paths: &CcteamPaths, hex: &str) {
-    let path = paths.web_token_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(&path, hex).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms).unwrap();
-    }
-}
-
 /// A fake harness that records each spawned session's per-session secret, so a
 /// test can construct a real `ccteam-sid:<sid>:<secret>` bearer.
 #[derive(Clone)]
@@ -263,7 +248,6 @@ async fn state_with_one_session(paths: CcteamPaths, auth: AuthState) -> (AppStat
 async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, _sid, _secret) = state_with_one_session(paths, AuthState::disabled()).await;
     // A sid that is mid-spawn: reserved, never applied.
     let principals = app
@@ -320,7 +304,6 @@ async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
 async fn session_bearer_round_trip_list_and_spawn() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let bearer = format!("ccteam-sid:{sid}:{secret}");
@@ -382,13 +365,13 @@ async fn session_bearer_round_trip_list_and_spawn() {
 /// `ccteam:<hex>` and 401'd `ccteam-sid:...` before the handler ran — managed
 /// sessions lost their Ambient identity, their calls fell back to
 /// admin-authenticated servers, and every A2A spawn came out rootless
-/// (`parent_sid: null`). Also pins the Admin semantics: the owner front door
-/// stays a root spawn.
+/// (`parent_sid: null`). Also pins that the fallback it fell back TO is gone:
+/// the live web token — the one this very `AuthState` accepts for `/api/v1/**` —
+/// is refused here, so there is no longer a tier a lost identity can land on.
 #[tokio::test]
 async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) =
         state_with_one_session(paths, AuthState::enabled(TOKEN_HEX.into())).await;
     let addr = spawn_server(app).await;
@@ -430,7 +413,10 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     assert_eq!(spawned["delegation_depth"], 1, "got: {text}");
     assert_eq!(spawned["caller"], format!("ambient:{sid}"), "got: {text}");
 
-    // Admin front door (web token) stays a ROOT spawn — semantics unchanged.
+    // The VALID web token — the same one `AuthState::enabled` accepts on every
+    // `/api/v1` route — buys nothing here. It used to be an owner front door that
+    // spawned rootlessly into any project it named; that tier is deleted, because
+    // a credential shared by every process of a vendor cannot say who is calling.
     let resp = post_mcp(
         addr,
         &format!("ccteam:{TOKEN_HEX}"),
@@ -438,18 +424,11 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
                "params":{"name":"session_spawn","arguments":{"vendor":"claude","project":"demo"}}}),
     )
     .await;
-    assert_eq!(resp.status(), 200, "admin bearer must pass /mcp");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["result"]["isError"], false, "admin spawn: {body}");
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    let spawned: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(spawned["ok"], true);
-    assert!(
-        spawned["parent_sid"].is_null(),
-        "admin spawn stays a root spawn, got: {text}"
+    assert_eq!(
+        resp.status(),
+        401,
+        "the web-token family is not an MCP credential"
     );
-    assert_eq!(spawned["delegation_depth"], 0, "got: {text}");
-    assert_eq!(spawned["caller"], "admin", "got: {text}");
 
     // Garbage bearers of BOTH families are still rejected.
     let resp = post_mcp(
@@ -468,6 +447,50 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     assert_eq!(resp.status(), 401, "bad session bearer → 401");
 }
 
+/// The `parent_sid` declaration survives the family cull — and stays a
+/// declaration.
+///
+/// It exists for a caller that holds no per-session principal (the local
+/// `mcp.sock` fallback, where same-uid file access is already the trust
+/// boundary): it may NAME its own sid so the ledger keeps an edge that really
+/// exists, and the daemon validates that name against the live set. Kept per
+/// owner decision. What it must never become is a second identity source — a
+/// caller that DOES hold a principal is answered by the principal, so a declared
+/// parent from a session bearer is ignored rather than honoured. Otherwise any
+/// managed session could mount its children anywhere in somebody else's tree by
+/// asking.
+#[tokio::test]
+async fn a_declared_parent_sid_never_overrides_a_verified_session_principal() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
+    let addr = spawn_server(app).await;
+    let bearer = format!("ccteam-sid:{sid}:{secret}");
+
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+               "params":{"name":"session_spawn",
+                         "arguments":{"vendor":"claude","parent_sid":"s404"}}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // Not an error: the declaration is inert on this path, not rejected — the
+    // caller's verified identity simply answers the question first.
+    assert_eq!(body["result"]["isError"], false, "spawn: {body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let spawned: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        spawned["parent_sid"],
+        sid.as_str(),
+        "the verified principal is the parent, never the declared sid: {text}"
+    );
+    assert_eq!(spawned["delegation_depth"], 1, "got: {text}");
+    assert_eq!(spawned["caller"], format!("ambient:{sid}"), "got: {text}");
+}
+
 /// Deterministic fake-Codex acceptance: build the exact
 /// `thread/start.config.mcp_servers.ccteam` HTTP entry, then use its URL and
 /// Authorization header against the real `/mcp` route. This composes the
@@ -477,7 +500,6 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
 async fn codex_http_thread_config_passes_session_principal_gate() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let url = format!("http://{addr}/mcp");
@@ -538,7 +560,6 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
 
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let url = format!("http://{addr}/mcp");
@@ -662,7 +683,6 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
 async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, _secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
 
@@ -691,7 +711,6 @@ async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
 async fn session_bearer_denied_after_stop() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let gw = app.gateway.clone().expect("gateway attached");
     let addr = spawn_server(app).await;
