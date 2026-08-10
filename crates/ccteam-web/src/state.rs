@@ -65,6 +65,13 @@ pub struct AppState {
     /// whatever else holds the gateway lock — including a spawn that is at that
     /// very moment waiting for the vendor to finish this call.
     pub session_principals: Option<Arc<ccteam_im::principals::SessionPrincipals>>,
+    /// `Mcp-Session-Id` bindings — one identity per hand-started vendor PROCESS
+    /// (see `crate::routes::mcp`). Always present, like the rings below: it is
+    /// pure in-memory state the `/mcp` front door owns, and a daemon restart has
+    /// already ended every conversation it described. The idle sweep that reaps
+    /// it is spawned alongside the gateway in [`Self::with_gateway`], because
+    /// closing a node needs one.
+    pub native_bindings: Arc<ccteam_im::native_bindings::NativeBindings>,
     /// v0.8.8 F4 — IM credentials file path the `config/im/*` handlers
     /// read + write. Defaults to `ccteam_im::credentials::default_path()`
     /// (`~/.ccteam/im/credentials.json`); integration tests override it via
@@ -157,6 +164,7 @@ impl AppState {
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
             session_principals: None,
+            native_bindings: Arc::new(ccteam_im::native_bindings::NativeBindings::new()),
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
             session_ring: Arc::new(crate::ring::SessionEventRing::new()),
@@ -210,7 +218,16 @@ impl AppState {
         gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>,
         principals: Arc<ccteam_im::principals::SessionPrincipals>,
     ) -> Self {
-        self.session_principals = Some(principals);
+        self.session_principals = Some(Arc::clone(&principals));
+        // v0.10 — reap the `Mcp-Session-Id` bindings of hand-started clients that
+        // went away without saying so (most of them: only codex and grok were
+        // observed sending `DELETE`). Same one-task-per-`with_gateway` discipline
+        // as the feeders below.
+        crate::routes::mcp::spawn_binding_reaper(
+            Arc::clone(&gateway),
+            principals,
+            Arc::clone(&self.native_bindings),
+        );
         crate::ring::spawn_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.session_ring));
         // v0.9.0 W4 — the team view's global feeder, spawned alongside the
         // per-sid one (same composition-root call, same "one feeder per

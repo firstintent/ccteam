@@ -39,7 +39,7 @@ use std::sync::RwLock;
 use chrono::{DateTime, Utc};
 
 /// One hand-started vendor process, as ccteam sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NativeBinding {
     /// Server-issued opaque id, echoed by the client on every request.
     pub mcp_session_id: String,
@@ -54,12 +54,60 @@ pub struct NativeBinding {
     /// The ledger node representing this client, once created. It is what makes
     /// the client a delegation PARENT rather than an anonymous caller.
     pub sid: Option<String>,
+    /// The node's per-session secret — the server side of its identity.
+    ///
+    /// It is minted here and NEVER sent to the client: the client authenticates
+    /// with its enrollment bearer plus the id, and the daemon speaks for it
+    /// internally with this pair. That is what lets an enrolled client flow
+    /// through the existing managed-session principal gate unchanged. Non-empty
+    /// exactly when [`Self::sid`] is `Some` (both are set by
+    /// [`NativeBindings::attach_session`]).
+    principal_secret: String,
     /// `clientInfo` from `initialize` (`name/version`), for the console listing.
     pub client: String,
     /// When `initialize` issued this binding.
     pub created_at: DateTime<Utc>,
     /// Last request that resolved it — the liveness the idle sweep reads.
     pub last_seen_at: DateTime<Utc>,
+}
+
+impl NativeBinding {
+    /// The `(sid, secret)` principal this client authenticates as, or `None`
+    /// while it has no ledger node. One accessor so no caller can pair a sid with
+    /// an empty secret and get a silently unauthenticated call.
+    pub fn principal(&self) -> Option<(&str, &str)> {
+        let sid = self.sid.as_deref()?;
+        if sid.is_empty() || self.principal_secret.is_empty() {
+            return None;
+        }
+        Some((sid, self.principal_secret.as_str()))
+    }
+}
+
+/// Hand-written so the node secret cannot be printed by a `?binding` in some
+/// future log line — the one property this type promises is that the secret stays
+/// server-side, and a derived `Debug` would quietly break it.
+impl std::fmt::Debug for NativeBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeBinding")
+            .field("mcp_session_id", &self.mcp_session_id)
+            .field("enroll_id", &self.enroll_id)
+            .field("owner", &self.owner)
+            .field("project", &self.project)
+            .field("sid", &self.sid)
+            .field(
+                "principal_secret",
+                &if self.principal_secret.is_empty() {
+                    "<none>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("client", &self.client)
+            .field("created_at", &self.created_at)
+            .field("last_seen_at", &self.last_seen_at)
+            .finish()
+    }
 }
 
 /// The registry behind `Mcp-Session-Id`.
@@ -101,6 +149,7 @@ impl NativeBindings {
             owner: owner.to_string(),
             project,
             sid: None,
+            principal_secret: String::new(),
             client: client.to_string(),
             created_at: now,
             last_seen_at: now,
@@ -152,11 +201,15 @@ impl NativeBindings {
         }
     }
 
-    /// Attach the ledger node created for this client.
-    pub fn attach_session(&self, mcp_session_id: &str, sid: &str) {
+    /// Attach the ledger node created for this client, together with the secret
+    /// the daemon authenticates as that node with. Both at once: a sid without
+    /// its secret is a node nothing can speak for
+    /// ([`NativeBinding::principal`]).
+    pub fn attach_session(&self, mcp_session_id: &str, sid: &str, secret: &str) {
         if let Ok(mut map) = self.inner.write() {
             if let Some(binding) = map.get_mut(mcp_session_id) {
                 binding.sid = Some(sid.to_string());
+                binding.principal_secret = secret.to_string();
             }
         }
     }
@@ -259,12 +312,32 @@ mod tests {
     fn the_node_sid_travels_with_the_binding_and_comes_back_on_close() {
         let reg = NativeBindings::new();
         let id = reg.open("e1", "user:web-api", Some("alpha".into()), "kimi/1");
-        assert!(reg.resolve(&id, "e1").unwrap().sid.is_none());
-        reg.attach_session(&id, "s42");
-        assert_eq!(reg.resolve(&id, "e1").unwrap().sid.as_deref(), Some("s42"));
+        let before = reg.resolve(&id, "e1").unwrap();
+        assert!(before.sid.is_none());
+        assert!(
+            before.principal().is_none(),
+            "no node yet ⇒ nothing to authenticate as"
+        );
+        reg.attach_session(&id, "s42", "sek");
+        let bound = reg.resolve(&id, "e1").unwrap();
+        assert_eq!(bound.sid.as_deref(), Some("s42"));
+        assert_eq!(bound.principal(), Some(("s42", "sek")));
         assert_eq!(reg.close(&id).as_deref(), Some("s42"));
         assert!(reg.resolve(&id, "e1").is_none(), "closed binding is gone");
         assert!(reg.close(&id).is_none(), "second close is a no-op");
+    }
+
+    /// The node secret is the one thing here that must never be handed out, and
+    /// `{:?}` is the easiest way to leak it by accident.
+    #[test]
+    fn a_debug_dump_never_carries_the_node_secret() {
+        let reg = NativeBindings::new();
+        let id = reg.open("e1", "user:web-api", Some("alpha".into()), "codex/0.144");
+        reg.attach_session(&id, "s42", "topsecretvalue");
+        let dump = format!("{:?}", reg.resolve(&id, "e1").unwrap());
+        assert!(!dump.contains("topsecretvalue"), "secret leaked: {dump}");
+        assert!(dump.contains("<redacted>"), "{dump}");
+        assert!(dump.contains("s42"), "the sid IS safe to log: {dump}");
     }
 
     #[test]
@@ -272,7 +345,7 @@ mod tests {
         let reg = NativeBindings::new();
         let live = reg.open("e1", "user:web-api", None, "codex/0.144");
         let stale = reg.open("e1", "user:web-api", None, "codex/0.144");
-        reg.attach_session(&stale, "s7");
+        reg.attach_session(&stale, "s7", "sek");
         // Age the stale one past the cutoff.
         if let Ok(mut map) = reg.inner.write() {
             map.get_mut(&stale).unwrap().last_seen_at = Utc::now() - chrono::Duration::hours(2);
