@@ -3323,6 +3323,21 @@ async fn run_session_list_at(
                 .filter_map(|project| project.as_str().map(str::to_string))
                 .collect()
         });
+    // WHICH row is the caller. `current` cannot answer that — it means "the
+    // active session of some chat", a fact about the fleet's routing that has
+    // nothing to do with who is asking — and a caller that read it as "me"
+    // spent a debugging round treating another session's tool calls as its own
+    // identity being used by someone else (measured 2026-08-10, same title on
+    // both rows). The caller's sid is server-resolved (`_caller_sid`, written
+    // from the verified principal in `execute_session_tool`), so it covers a
+    // managed session and an enrolled client's ledger node alike. An
+    // admin/local/tenant-token caller is not a session and has no sid: nothing
+    // is marked rather than guessed.
+    let caller_sid = args
+        .get("_caller_sid")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty());
     let filter_project = args
         .get("project")
         .and_then(|v| v.as_str())
@@ -3431,6 +3446,12 @@ async fn run_session_list_at(
                 row.insert("role".into(), serde_json::json!(v.role));
             }
             row.insert("vendor".into(), serde_json::json!(v.vendor));
+            // The caller's OWN row (see `caller_sid`). Named nothing like
+            // `current` on purpose: the two answer different questions, and
+            // reading one as the other is the failure this ends.
+            if caller_sid == Some(v.sid.as_str()) {
+                row.insert("is_self".into(), serde_json::json!(true));
+            }
             if v.current {
                 row.insert("current".into(), serde_json::json!(true));
             }
@@ -5951,6 +5972,110 @@ mod session_tool_tests {
             .await
             .unwrap_err();
         assert!(err.contains("invalid `activity` filter"), "{err}");
+    }
+
+    /// A listing that never says which row is the CALLER makes every caller
+    /// guess, and the nearest-looking field (`current`) answers a different
+    /// question — "the active session of some chat". Measured 2026-08-10: a
+    /// caller took the `current` row for itself, and since that other session
+    /// ran the same prompt (same title), read its tool calls as its own
+    /// identity being used by somebody else. `is_self` follows the caller's
+    /// server-resolved principal; `current` follows the fleet's routing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_marks_the_calling_session_not_the_current_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let mut children = Vec::new();
+        for _ in 0..2 {
+            let spawned = parse(
+                &run_session_spawn(
+                    &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                    &gw,
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap(),
+            );
+            children.push(spawned["sid"].as_str().unwrap().to_string());
+        }
+
+        let marked = |list: &serde_json::Value| -> Vec<String> {
+            list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row.get("is_self") == Some(&json!(true)))
+                .map(|row| row["sid"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The principal asks: exactly its own row is marked.
+        let as_principal = parse(
+            &run_session_list(&ambient(&principal, "alpha", json!({})), &gw)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            marked(&as_principal),
+            vec![principal.clone()],
+            "exactly the caller's row is marked: {as_principal}"
+        );
+
+        // The incident's exact shape: a DIFFERENT session is `current`, and
+        // being `current` marks nothing.
+        let current_rows: Vec<&serde_json::Value> = as_principal["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row.get("current") == Some(&json!(true)))
+            .collect();
+        let foreign_current = current_rows
+            .iter()
+            .find(|row| row["sid"] != json!(principal.as_str()))
+            .expect("a session other than the caller is some chat's current one");
+        assert!(
+            foreign_current.get("is_self").is_none(),
+            "`current` never marks the caller: {foreign_current}"
+        );
+
+        // The marker follows the CALLER, not the fleet: same gateway, same
+        // rows, a child asking sees the mark move onto its own row.
+        let as_child = parse(
+            &run_session_list(&ambient(&children[0], "alpha", json!({})), &gw)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            marked(&as_child),
+            vec![children[0].clone()],
+            "the mark is the caller's, not a property of the row: {as_child}"
+        );
+    }
+
+    /// An admin / local caller is not a session: it has no sid, so no row is
+    /// its own. Marking the nearest candidate would be a guess, and a guessed
+    /// identity is exactly the failure this field exists to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_marks_nothing_when_the_caller_has_no_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        run_session_spawn(
+            &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+
+        for args in [json!({}), json!({ "_caller_sid": "" })] {
+            let list = parse(&run_session_list(&args, &gw).await.unwrap());
+            let rows = list["sessions"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "both sessions listed: {list}");
+            assert!(
+                rows.iter().all(|row| row.get("is_self").is_none()),
+                "a sid-less caller owns no row: {list}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
