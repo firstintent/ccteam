@@ -6,19 +6,22 @@
 //! a server.
 //!
 //! ccteam's OWN server is deliberately NOT written here. It is registered once
-//! per vendor in the user-global config (`ccteam_core::mcp_register`, HTTP +
-//! admin bearer) and overridden per session by the managed spawn path
-//! (`ccteam_harness::execution::mcp_config`, HTTP + session bearer). The
-//! historical stdio `mcpServers.ccteam` project template was retired with the
-//! move to HTTP — the reserved-name guard below is what keeps it from coming
-//! back through the third-party door.
+//! per vendor in the user-global config (`crate::mcp_register`, HTTP + a
+//! machine-user ENROLLMENT credential — that file is shared by every process the
+//! vendor starts, so it may name an identity but must grant nothing) and
+//! overridden per session by the managed spawn path
+//! (`ccteam_harness::execution::mcp_config`, HTTP + that session's own
+//! principal). The historical stdio `mcpServers.ccteam` project template was
+//! retired with the move to HTTP — the reserved-name guard below is what keeps
+//! it from coming back through the third-party door.
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 
-/// MCP server entry name we own. Matches `SERVER_NAME` in
-/// `crates/ccteam-cli/src/mcp_serve.rs` — V0.5 user muscle memory
-/// preserved (README §九 F111 decision).
+/// MCP server entry name we own. Must match the name every wire dialect
+/// registers ccteam under (`ccteam_harness::execution::mcp_config`'s
+/// `CCTEAM_MCP_SERVER_NAME`) — V0.5 user muscle memory preserved
+/// (README §九 F111 decision).
 pub const CCTEAM_MCP_SERVER_KEY: &str = "ccteam";
 
 /// v0.8.24 F1.12 — validate a third-party MCP server name for
@@ -120,7 +123,8 @@ mod tests {
     fn named_merge_rejects_reserved_and_bad_names() {
         // `ccteam` stays reserved: its entry is the global HTTP registration
         // (`crate::mcp_register`) + the per-session override — never a project
-        // file, and never a stdio `mcp-serve` child.
+        // file, and never a stdio child (there is no `mcp-serve` command left
+        // to be one).
         assert!(merge_named_mcp_server("", "ccteam", json!({})).is_err());
         assert!(merge_named_mcp_server("", "", json!({"command": "x"})).is_err());
         assert!(merge_named_mcp_server("", "bad name", json!({"command": "x"})).is_err());

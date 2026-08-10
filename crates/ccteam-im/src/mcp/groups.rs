@@ -101,9 +101,9 @@ pub fn parse_disable_env(env_value: Option<&str>) -> HashSet<ToolGroup> {
 }
 
 /// Production entry point: reads `CCTEAM_DISABLE_TOOLS` from the
-/// process env and parses it. `mcp-serve` calls this once per
+/// process env and parses it. The protocol core calls this once per
 /// `tools/list` so users can toggle groups without restarting the
-/// server (cheap: a single env-var read + small split loop).
+/// daemon (cheap: a single env-var read + small split loop).
 pub fn disabled_groups_from_env() -> HashSet<ToolGroup> {
     let env = std::env::var("CCTEAM_DISABLE_TOOLS").ok();
     parse_disable_env(env.as_deref())

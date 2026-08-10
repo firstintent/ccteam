@@ -26,8 +26,12 @@
 //!
 //! **One wire form: HTTP.** `type:"http"` against daemon `POST /mcp`. This is
 //! the same transport the global per-vendor registration uses
-//! (`ccteam_core::mcp_register`, admin bearer); a managed session's config just
-//! overrides the same-named entry with its own principal. There is no stdio
+//! (`ccteam_core::mcp_register`), but never the same credential: a vendor's
+//! global config is one static file shared by every process that vendor starts,
+//! so it carries only a machine-user ENROLLMENT credential (`ccteam_core::enroll`)
+//! that says whose config it is and grants nothing by itself. A managed session
+//! overrides that same-named entry with its own `(sid, secret)` principal, which
+//! is the only credential that says WHICH session is calling. There is no stdio
 //! transport at all any more — the `internal mcp-serve` command that hosted it
 //! is deleted, so nothing can fall back to a per-session child process.
 //!
@@ -257,9 +261,11 @@ pub fn project_claude_mcp_json(ep: &SessionMcpEndpoint) -> Value {
 /// The global Codex entry must also be HTTP. Codex deep-merges a per-thread
 /// server override with the same-named global entry; a legacy global stdio
 /// `command` plus this `url` is rejected as a mixed transport. With both sides
-/// HTTP, the per-thread Authorization value replaces the global admin bearer
-/// and carries this session's `(sid, secret)` principal directly to `/mcp`.
-/// No per-thread `ccteam internal mcp-serve` child is spawned.
+/// HTTP, the per-thread Authorization value replaces the global entry's
+/// enrollment credential (which names only whose machine-user config it is) and
+/// carries this session's `(sid, secret)` principal directly to `/mcp` — the
+/// difference between "some process of this user" and "this session". No
+/// per-thread child process is spawned; there is no stdio server to spawn one of.
 pub fn project_codex_thread_config(ep: &SessionMcpEndpoint) -> Value {
     json!({
         "mcp_servers": {
@@ -336,8 +342,9 @@ pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
 }
 
 /// Codex per-thread `config` for this session. `None` when sid/secret is empty
-/// — fall through to the daemon's global HTTP config, authenticated as admin
-/// — never an empty override that strips tools.
+/// — fall through to the daemon's global HTTP config, i.e. served as an enrolled
+/// client of this machine-user rather than as this session — never an empty
+/// override that strips tools.
 pub fn codex_thread_mcp_config(sid: &str, secret: &str) -> Option<Value> {
     SessionMcpEndpoint::resolve(sid, secret).map(|ep| project_codex_thread_config(&ep))
 }

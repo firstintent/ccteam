@@ -542,7 +542,8 @@ async fn codex_http_thread_config_passes_session_principal_gate() {
 /// a per-thread session override, then asks Codex itself to call
 /// `session_spawn` through `/mcp`. The project is intentionally omitted: only
 /// a successfully authenticated session principal can derive `demo`
-/// server-side, so accidentally retaining the global admin bearer fails.
+/// server-side, so a call that rode the global entry's enrollment credential
+/// instead of the per-thread principal fails.
 ///
 /// Run explicitly on a machine with Codex 0.144.x:
 /// `cargo test -p ccteam-web --test mcp_session_bearer_test \

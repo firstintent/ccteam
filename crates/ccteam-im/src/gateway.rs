@@ -2225,7 +2225,7 @@ impl Gateway {
     /// submitted turn text is wrapped in a `<channel …>` tag naming each
     /// file's on-disk path, so the agent `Read`s it — the load-bearing
     /// Read convention is taught by the daemon's MCP server instructions
-    /// (`ccteam mcp-serve` `initialize`).
+    /// (the `initialize` response, on whichever transport the session holds).
     // v0.8.5 D3 added the `selection` arg (inbound option click); the
     // per-field inbound signature is the established shape (same as the
     // daemon's `deliver_progress`), so allow the arg count.
@@ -9915,10 +9915,12 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
 ///
 /// Claude only: codex and the ACP vendors pass their MCP server inline on every
 /// `thread/start` / `session/new`, so they need no file. BOTH Claude protocols
-/// qualify — the global `~/.claude.json` entry is HTTP with the *admin* bearer,
-/// so without this file a managed session would authenticate as admin and lose
-/// its own principal (no delegation parent edge). The single fresh-spawn and
-/// single rebuild call site share this predicate so the two can't drift.
+/// qualify — the global `~/.claude.json` entry is HTTP with a machine-user
+/// ENROLLMENT credential, which identifies the config's owner and not the caller,
+/// so without this file a managed session would be served as an enrolled client
+/// of this user instead of as itself and lose its own principal (no delegation
+/// parent edge). The single fresh-spawn and single rebuild call site share this
+/// predicate so the two can't drift.
 fn claude_session_mcp_config_applies(vendor: AgentVendor, protocol: SessionProtocol) -> bool {
     vendor == AgentVendor::Claude
         && matches!(

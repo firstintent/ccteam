@@ -441,14 +441,25 @@ fn claude_spawn_argv_base(input: ClaudeTuiSpecInput<'_>) -> Vec<String> {
 /// Attach the curated per-session `--mcp-config` (HTTP + this session's
 /// `ccteam-sid:<sid>:<secret>` bearer) the gateway wrote before spawn.
 ///
-/// Why the terminal path needs it: the global `~/.claude.json` entry is HTTP
-/// with the *admin* bearer, so a pane that inherited only that would call
-/// `session_*` as admin and lose its own principal — no delegation parent edge.
-/// `--mcp-config` is claude's highest-precedence manual scope, so the
-/// same-named `ccteam` entry here overrides the global one.
+/// Why the terminal path needs it: the global `~/.claude.json` entry carries a
+/// machine-user ENROLLMENT credential, which says whose config it is and nothing
+/// about which process is speaking. A pane that inherited only that would be
+/// served as an enrolled client of this user — the daemon would issue it its own
+/// `Mcp-Session-Id` node — instead of as itself, so its own principal never
+/// reaches `/mcp`: its children mount under that node rather than under this
+/// session (no delegation parent edge), and under the daemon-written user-scoped
+/// credential every `session_*` call fails closed for having no project.
 ///
-/// Deliberately NOT paired with `--strict-mcp-config` (unlike stream-json): a
-/// terminal session is a human-facing TUI and must keep the user's other
+/// **UNVERIFIED ASSUMPTION:** that a same-named `ccteam` entry in
+/// `--mcp-config` (claude's manual scope) WINS the merge against the global one.
+/// No test and no real-machine probe pins it; if claude ever resolves the other
+/// way, the pane silently gets the identity described above and the only
+/// evidence is a missing edge in the delegation tree (or a "no project" refusal).
+/// The stream-json path does not depend on the assumption — it passes
+/// `--strict-mcp-config`, so the global entry is not in scope at all.
+///
+/// Deliberately NOT paired with `--strict-mcp-config` here (unlike stream-json):
+/// a terminal session is a human-facing TUI and must keep the user's other
 /// ambient MCP servers. Absent file ⇒ no flag (claude errors on a missing
 /// config path), which is also the pre-spawn / secret-less case.
 fn push_mcp_config_arg(argv: &mut Vec<String>, cwd: &Path, sid: &str) {

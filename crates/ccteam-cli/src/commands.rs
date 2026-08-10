@@ -1759,8 +1759,8 @@ pub struct WebOptions {
 
 /// `ccteam web --bind <addr>` entry. Translates clap-side string +
 /// flags into `ccteam_web::ServeOpts`, then drives a current-thread
-/// tokio runtime to `serve(opts)` (mirrors the `mcp-serve` shape so a
-/// future operator running both side-by-side sees the same harness).
+/// tokio runtime to `serve(opts)` — the same one-runtime-per-command shape
+/// every other long-running `internal` subcommand uses.
 pub fn run_web(opts: WebOptions) -> Result<()> {
     use std::net::SocketAddr;
 

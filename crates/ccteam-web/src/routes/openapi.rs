@@ -114,9 +114,13 @@ async fn serve_scalar_js() -> impl IntoResponse {
         description = "The `/api/v1` resource surface: capabilities, projects, roles, \
                        sessions (+ turn / events / stop), and workflow panels. \
                        Auth: the same web-token gate as every other `/api/v1` route \
-                       (`Authorization: Bearer ccteam:<hex>` or the `ccteam_token` cookie). \
+                       (`Authorization: Bearer ccteam:<hex>` or the `ccteam_token` cookie) — \
+                       a web token authenticates THIS surface only. \
                        Also available (not REST / not in this spec): `POST /mcp` — \
-                       streamable HTTP MCP (authenticated caller bearer required).",
+                       streamable HTTP MCP, which takes neither of the above: a managed \
+                       session's own `ccteam-sid:<sid>:<secret>`, or an enrolled client's \
+                       `ccteam-enroll:<id>:<secret>` plus the `Mcp-Session-Id` issued at \
+                       `initialize`.",
         version = env!("CARGO_PKG_VERSION"),
     ),
     tags(

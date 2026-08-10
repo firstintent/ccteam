@@ -83,12 +83,15 @@ pub fn build_argv(bin: &str, input: &StreamJsonSpawnInput<'_>) -> Vec<String> {
         "--debug".into(),
         "--debug-to-stderr".into(),
         // Do NOT inherit the user's ambient MCP servers. stream-json gates
-        // `system:init` on every MCP server connecting; the daemon's own
-        // `ccteam` MCP (`internal mcp-serve`) connects BACK to the daemon over
-        // `mcp.sock`, but the daemon is synchronously blocked in
-        // `wait_for_init` (holding the gateway lock the mcp.sock handler also
-        // needs) → that self-referential server can never initialize → init
-        // never arrives → timeout. The chat-only adapter reads stdout directly
+        // `system:init` on every MCP server connecting, so ANY ambient server
+        // that has to reach the daemon we are spawning from cannot connect: the
+        // daemon is synchronously blocked in `wait_for_init` while holding the
+        // gateway lock → that self-referential server never initializes → init
+        // never arrives → timeout. The historical shape of that trap was the
+        // global `ccteam` entry spawning an `internal mcp-serve` child that
+        // dialled `mcp.sock` (the command is now deleted; today's entry is HTTP
+        // against `POST /mcp`, whose credential check deliberately takes no
+        // gateway lock). The chat-only adapter reads stdout directly
         // and needs no in-pane MCP, so strip them all (also drops unrelated
         // ambient servers like a VS Code extension that would only add init
         // latency). When `mcp_config_path` is set, `--mcp-config` + this flag

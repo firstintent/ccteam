@@ -2,8 +2,10 @@
 //!
 //! Owns the live gateway / pending registry / event sink needed for
 //! `interaction/ask`, `permission/ask`, `chat_send_file`, `session_*`, and
-//! `ccteam/reload`. The thin socket (or future HTTP) loop only does
-//! read-line → [`McpDispatch::dispatch`] → write-line.
+//! `ccteam/reload`. Both transports on top stay thin: the local `mcp.sock` loop
+//! does read-line → [`McpDispatch::dispatch`] → write-line, and ccteam-web's
+//! `POST /mcp` resolves the caller's credential, then calls
+//! [`McpDispatch::dispatch_as`] with the tier it proved.
 
 use std::sync::Arc;
 
@@ -45,19 +47,39 @@ pub struct McpDispatch {
 /// authenticate (v0.9 T4 review fix).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum McpCaller {
-    /// mcp.sock / stdio-forwarder path: `session_*` authenticates via the
-    /// env-injected `_caller_role`/`_caller_secret` args (cto gate); the
+    /// A caller that speaks for ONE session: `session_*` authenticates by the
+    /// `(sid, secret)` principal carried in the `_caller_*` args, and the
     /// internal-bus methods (`interaction/ask`, `permission/ask`) are served.
+    ///
+    /// Every `POST /mcp` caller lands here — a managed session under its own
+    /// principal, or a hand-started client under the ledger node the daemon
+    /// minted for its enrollment binding at `initialize` — as does an mcp.sock
+    /// line that presents no admin token.
     Ambient,
-    /// HTTP `/mcp` behind a verified admin bearer — the owner's front door.
-    /// `session_*` skips the cto role/secret gate (that gate exists to stop
-    /// non-privileged *sessions*, not the authenticated owner); the
-    /// internal-bus methods are NOT exposed (in-band/daemon-internal
-    /// responsibility, not front-door API).
+    /// The local `mcp.sock` caller that presented the admin web token
+    /// (`_caller_admin_token`, promoted by `McpDispatch::promote_local_admin`):
+    /// reading that 0600 file proves same-uid, so `session_*` skips the
+    /// per-session principal gate and names its target with an explicit
+    /// `project`; the internal-bus methods are NOT exposed (in-band /
+    /// daemon-internal responsibility, not an operator API).
+    ///
+    /// **Not reachable over HTTP.** `POST /mcp` resolves only a session
+    /// principal or an enrollment credential and strips `_caller_admin_token`:
+    /// a durable credential a static vendor config can carry cannot say which
+    /// process is speaking, so the data plane's admin tier was deleted rather
+    /// than narrowed. Nothing ccteam ships injects the arg any more either (the
+    /// stdio forwarder that did is gone), so in practice this tier is reached
+    /// only by a same-uid local client that reads the token and writes to the
+    /// socket itself.
     Admin,
-    /// HTTP `/mcp` behind a verified per-user tenant web bearer. This is a
-    /// human/root caller like Admin, but every project/sid operation is scoped
-    /// to projects owned by `user:<user_id>`.
+    /// A per-user tenant: a human/root caller like Admin, but every project/sid
+    /// operation is scoped to projects owned by `user:<user_id>`.
+    ///
+    /// **No production producer.** It existed for a tenant web bearer at
+    /// `POST /mcp`, which that route no longer accepts — a tenant's external
+    /// agent enrolls instead, and the credential's owner carries the same
+    /// scoping into an Ambient node. The variant survives as the tenant-scoping
+    /// arm the tests drive directly.
     User {
         /// Stable tenant identity id resolved from the bearer registry.
         user_id: String,
@@ -72,25 +94,31 @@ impl McpCaller {
         }
     }
 
+    /// True for the tiers that are not one session speaking for itself (Admin /
+    /// User). The name is historical — neither is an HTTP door any more — but
+    /// the distinction it draws is the one the internal-bus refusal needs.
     fn is_front_door(&self) -> bool {
         !matches!(self, Self::Ambient)
     }
 }
 
 impl McpDispatch {
-    /// Dispatch one JSON-RPC request on the ambient (mcp.sock / stdio) path.
+    /// Dispatch one JSON-RPC request arriving on the local `mcp.sock` path.
     /// Wire-compatible with the historical `handle_mcp_socket_connection`.
     ///
-    /// v0.9.1 main-session fallback: a LOCAL caller may present the admin web
-    /// token (`_caller_admin_token` in the tool arguments — injected by the
-    /// stdio forwarder when its env carries no `(sid, secret)` principal, i.e.
-    /// the user's daily-driver Claude/Codex session that ccteam did not
-    /// spawn). A matching token promotes the call to [`McpCaller::Admin`] —
-    /// the same trust the HTTP `/mcp` admin bearer grants; the token file is
-    /// `0600` under `~/.ccteam/secrets/`, so presenting it proves same-user
-    /// file access, exactly like running the `ccteam` CLI. A missing or
-    /// wrong token leaves the call on the fail-closed Ambient path. The arg
-    /// is stripped either way so nothing downstream ever sees it.
+    /// A LOCAL caller may present the admin web token (`_caller_admin_token` in
+    /// the tool arguments). A matching token promotes the call to
+    /// [`McpCaller::Admin`]; the token file is `0600` under
+    /// `~/.ccteam/secrets/`, so presenting it proves same-user file access,
+    /// exactly like running the `ccteam` CLI. A missing or wrong token leaves
+    /// the call on the fail-closed Ambient path. The arg is stripped either way
+    /// so nothing downstream ever sees it.
+    ///
+    /// This socket is now the ONLY way that tier is reached: the stdio forwarder
+    /// that used to inject the arg for a hand-started session is deleted, and
+    /// `POST /mcp` has no admin tier to promote into (a hand-started session
+    /// enrolls and gets a real principal instead). What survives here is the
+    /// same-uid trust the socket already implies, not a route ccteam drives.
     pub async fn dispatch(&self, req: Value) -> Option<Value> {
         let (req, caller) = self.promote_local_admin(req);
         self.dispatch_as(req, caller).await
@@ -386,9 +414,14 @@ fn permission_prompt_timeout_secs() -> u64 {
 }
 
 /// JSON-RPC `-32601` for the internal-bus methods (`interaction/ask`,
-/// `permission/ask`) on the HTTP front door: those are in-band / daemon-
-/// internal (mcp.sock) responsibilities, deliberately not front-door API
+/// `permission/ask`) on the Admin / User tiers: those are in-band /
+/// daemon-internal responsibilities, deliberately not an operator API
 /// (tech-design v0.9 §1.1 — HITL stays on vendor-native channels).
+///
+/// Scope note: the gate is the caller TIER, not the transport. Since `POST /mcp`
+/// resolves every caller to Ambient, an HTTP caller — a managed session or an
+/// enrolled client — reaches these methods; what is refused is the local
+/// admin-token promotion (and the test-only tenant tier).
 fn internal_bus_not_exposed(req: &serde_json::Value) -> serde_json::Value {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -1351,12 +1384,13 @@ fn is_status_call(req: &serde_json::Value) -> bool {
 
 /// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
 /// vendor panel + routing notes appended for the caller's project's bound
-/// host. Ambient (session principal) is scoped to its OWN project — any
-/// self-reported `project`/`_caller_slug` is ignored (the panel would
-/// otherwise leak another project's host). Admin (HTTP `/mcp`, or the local
-/// main-session admin token) may name a `project`, else defaults to the
-/// cwd-resolved slug the forwarder injected (like `session_spawn`). The
-/// vendor panel probes + reads fs, so it runs off the async runtime.
+/// host. Ambient (session principal, which is every `POST /mcp` caller) is
+/// scoped to its OWN project — any self-reported `project`/`_caller_slug` is
+/// ignored (the panel would otherwise leak another project's host). Admin (the
+/// local mcp.sock admin-token tier) may name a `project`, else falls back to a
+/// supplied `_caller_slug` (like `session_spawn`; nothing ccteam ships injects
+/// one now that the stdio forwarder is gone). The vendor panel probes + reads
+/// fs, so it runs off the async runtime.
 async fn execute_status(
     req: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
@@ -1530,9 +1564,11 @@ async fn execute_session_tool_with_paths(
     // closed. We then OVERWRITE the identity args from CallerCtx so nothing
     // downstream trusts a caller-supplied `_caller_slug`/`_caller_sid`/role.
     //
-    // `McpCaller::Admin` (HTTP `/mcp`, admin bearer already verified at the
-    // transport layer) skips the principal gate: it names its target with an
-    // explicit `project` arg (fleet-wide, same as the web admin Identity).
+    // `McpCaller::Admin` (the local mcp.sock caller whose admin web token was
+    // already verified against the 0600 file) skips the principal gate: it names
+    // its target with an explicit `project` arg (fleet-wide, same as the web
+    // admin Identity). No HTTP caller arrives on this arm — `POST /mcp` has no
+    // admin tier.
     match &caller {
         McpCaller::Ambient => {
             let caller_sid = args
@@ -1746,8 +1782,8 @@ async fn run_session_tool(
 /// its `s{n}` id + vendor resume key + host. v0.9.0 W1 (F1/G1): the caller is
 /// authenticated by its `(sid, secret)` PRINCIPAL (see [`execute_session_tool`]),
 /// so `_caller_slug` here is the SERVER's view of the caller's project — an
-/// Ambient caller can only spawn into that project. Admin (HTTP front door)
-/// names the target with an explicit `project` (fleet-wide).
+/// Ambient caller can only spawn into that project. Admin (the local mcp.sock
+/// admin-token tier) names the target with an explicit `project` (fleet-wide).
 ///
 /// MCP facets are `{role?, vendor?, model?, effort?, permission_mode?, title?}`.
 /// `role` empty/absent = roleless (bare vendor reads the project
@@ -1766,14 +1802,16 @@ async fn run_session_tool(
 ///
 /// Sources, strongest first:
 ///
-/// 1. **Verified principal** (`Ambient`) — cryptographic, server-resolved.
-/// 2. **Declared and validated** (`Admin`) — a plain local caller holds no
-///    per-session principal, and the HTTP front door carries no process
-///    context to infer one from, so it may NAME its own sid. Same-uid is
-///    already this path's trust boundary (an admin caller can spawn and stop
-///    anything), so declaring a parent adds no authority — but it is checked
-///    against the ledger, never taken on faith: an unknown sid is a loud error
-///    rather than a silent root.
+/// 1. **Verified principal** (`Ambient`) — cryptographic, server-resolved. This
+///    is how a hand-started client gets its edge now: it enrolls, the daemon
+///    mints it a ledger node at `initialize`, and it calls as that node.
+/// 2. **Declared and validated** (`Admin`) — the local mcp.sock admin-token
+///    caller holds no per-session principal and carries no process context to
+///    infer one from, so it may NAME its own sid. Same-uid is already this
+///    path's trust boundary (an admin caller can spawn and stop anything), so
+///    declaring a parent adds no authority — but it is checked against the
+///    ledger, never taken on faith: an unknown sid is a loud error rather than
+///    a silent root.
 /// 3. **Never** for a tenant (`User`): their `_caller_*` args are stripped
 ///    upstream, and a declaration must not smuggle identity back in.
 async fn resolve_call_origin(
@@ -1944,18 +1982,19 @@ async fn run_session_spawn_at(
         .map(String::from);
     // v0.9.0 W2 (F2/F5) — the delegation parent. Ambient = the caller's
     // server-resolved principal (sid/depth/role, injected in `execute_session_tool`
-    // from CallerCtx — never caller-supplied). Admin (HTTP front door) = a
-    // human/root spawn (no parent, unrestricted). Guardrails apply only when a
-    // real parent is present.
+    // from CallerCtx — never caller-supplied). Admin (the local mcp.sock
+    // admin-token tier) = a human/root spawn unless it declares a `parent_sid`.
+    // Guardrails apply only when a real parent is present.
     let parent = resolve_call_origin(&caller, args, Some(gateway)).await?;
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
     // v0.9.2 — surface WHO spawned this child so a rootless spawn is
-    // self-explanatory: the admin front door is a root spawn BY DESIGN, an
+    // self-explanatory: an undeclared admin caller is a root spawn BY DESIGN, an
     // ambient caller is the delegation parent. This is the diagnostic for the
     // "my agent's children lost their parent edge" class of misconfiguration
-    // (e.g. the agent's calls silently riding an admin-authenticated server).
+    // (today: an agent whose vendor loaded the global config instead of its own,
+    // so its calls ride an enrolled client's node rather than its principal).
     let caller_label = match (&caller, parent.as_ref()) {
         // Echo the RESOLVED origin, not just the tier: a caller that declared
         // itself can see what ccteam actually attributed the child to.
@@ -2487,7 +2526,7 @@ fn parse_notify_mode(
 }
 
 /// The completion-notification route for one dispatch. A managed ambient
-/// caller has a parent session transport; admin/user front doors do not, and
+/// caller has a parent session transport; the admin/user tiers do not, and
 /// neither does an enrolled hand-started client (a real delegation parent that
 /// ccteam holds no thread for). `notify:off` is distinct from a missing route so
 /// it stays intentional and does not produce an operational warning.
@@ -3566,9 +3605,9 @@ async fn assert_caller_owns_session(
     sid: &str,
     caller: &McpCaller,
 ) -> std::result::Result<(), String> {
-    // v0.9 T4 review fix — the HTTP front door's verified admin operates
-    // fleet-wide (same semantics as the web admin Identity): no ambient slug
-    // to bind to. Unknown sids still fail inside the op itself.
+    // v0.9 T4 review fix — the verified admin (local mcp.sock admin token)
+    // operates fleet-wide (same semantics as the web admin Identity): no ambient
+    // slug to bind to. Unknown sids still fail inside the op itself.
     let resolved = {
         let gw = gateway.lock().await;
         gw.session_resolve(sid)
@@ -4008,9 +4047,10 @@ mod session_tool_tests {
         std::fs::write(secrets.join("web-token"), format!("{token}\n")).unwrap();
     }
 
-    // v0.9.1 — main-session fallback: the LOCAL socket promotes a caller
-    // presenting the admin web token to Admin semantics, and strips the
-    // token arg either way.
+    // The LOCAL socket promotes a caller presenting the admin web token to
+    // Admin semantics, and strips the token arg either way. This is the only
+    // remaining door into that tier — the hand-started-session fallback it was
+    // built for now enrolls and calls as a real principal instead.
     #[test]
     fn promote_local_admin_upgrades_on_matching_token_and_strips_arg() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4603,9 +4643,10 @@ mod session_tool_tests {
         );
     }
 
-    /// v0.9 T4 — the HTTP front door's verified admin skips the principal gate
-    /// entirely: NO `_caller_*` args, straight to the op (which then reports
-    /// gateway-down here — proving the gate was bypassed, not that it denied).
+    /// v0.9 T4 — the verified admin tier (local mcp.sock admin token) skips the
+    /// principal gate entirely: NO `_caller_*` args, straight to the op (which
+    /// then reports gateway-down here — proving the gate was bypassed, not that
+    /// it denied).
     #[tokio::test]
     async fn execute_session_tool_admin_bypasses_gate_reports_gateway_down() {
         let req = call("session_list", json!({}));
@@ -4724,10 +4765,10 @@ mod session_tool_tests {
             "an admin spawn that declares NO origin stays a root"
         );
 
-        // …but a plain local session that names itself gets the edge. It is
-        // anonymous to the bridge (no per-session principal, no process
-        // context on the HTTP front door), so the declaration is the only
-        // signal — validated against the ledger, never taken on faith.
+        // …but an admin-tier caller that names itself gets the edge. It is
+        // anonymous to the bridge (no per-session principal, and a socket line
+        // carries no process context), so the declaration is the only signal —
+        // validated against the ledger, never taken on faith.
         let response = execute_session_tool_with_paths(
             &call(
                 "session_spawn",
