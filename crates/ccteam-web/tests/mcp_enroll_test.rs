@@ -18,13 +18,20 @@
 //! 4. an id is not a credential: replayed under another one it is a 404 that
 //!    reveals nothing;
 //! 5. no id → 404 pointing at `initialize` (the transport's own recovery path);
-//! 6. an unbound (user-scoped) credential may discover, and nothing else —
-//!    ccteam never GUESSES the project, which is the bug class being deleted;
-//! 7. `DELETE` ends the binding, the principal and the node together;
-//! 8. the admin web token is refused outright — it cannot open a binding and
+//! 6. an unbound (user-scoped) credential that names NO project may discover, and
+//!    nothing else — ccteam never GUESSES the project, which is the bug class
+//!    being deleted;
+//! 7. …but it may NAME one it owns on a `session_*` call: that binds the session,
+//!    mints its node and makes its children hang off it (the machine-wide
+//!    credential every vendor config carries has no other rung — it names no
+//!    project by construction). One workspace for life: a later call naming a
+//!    different project is refused, and a project its owner cannot see is
+//!    answered exactly like one that does not exist;
+//! 8. `DELETE` ends the binding, the principal and the node together;
+//! 9. the admin web token is refused outright — it cannot open a binding and
 //!    cannot ride one;
-//! 9. a bound client is a project-scoped caller in `status` too, not only in
-//!    `session_*`.
+//! 10. a bound client is a project-scoped caller in `status` too, not only in
+//!     `session_*`.
 //!
 //! Isolation (CLAUDE.md): every state seam is `_in(root)`-injected through
 //! `CcteamPaths` pointed at a tempdir, and `HOME` + `CCTEAM_HOME` are pinned to
@@ -559,7 +566,7 @@ async fn a_call_without_the_id_is_404_pointing_at_initialize() {
     assert!(message.contains("Mcp-Session-Id"), "{message}");
 }
 
-// ── 6. unbound: discovery only, and no guessing ─────────────────────────────
+// ── 6. unbound + unnamed: discovery only, and no guessing ───────────────────
 
 #[tokio::test]
 #[serial]
@@ -628,24 +635,15 @@ async fn a_user_scoped_credential_discovers_but_cannot_act() {
         message.contains("never infers"),
         "the refusal is the feature: {message}"
     );
-
-    // Naming a project in the ARGUMENTS must not be a way around it either.
-    let named = post_mcp(
-        addr,
-        &cred.bearer(),
-        Some(&id),
-        call_body(
-            4,
-            "session_spawn",
-            json!({ "vendor": "claude", "project": SLUG }),
-        ),
-    )
-    .await;
-    let body: Value = named.json().await.unwrap();
-    assert_eq!(
-        body["result"]["isError"], true,
-        "a self-reported project is not authority: {body}"
+    assert!(
+        message.contains("Name one on the call"),
+        "…but it must point at the rung that DOES exist: {message}"
     );
+
+    // Nothing was created by the refused call, and no node appeared behind our
+    // back — a call that names NO project is the whole of rung 3. (Naming one is
+    // rung 2, and it is a different test:
+    // `a_user_scoped_credential_binds_the_project_it_names`.)
     assert_eq!(
         gateway.lock().await.session_views().len(),
         sessions_before,
@@ -653,11 +651,269 @@ async fn a_user_scoped_credential_discovers_but_cannot_act() {
     );
     assert!(
         bindings.list()[0].sid.is_none(),
-        "and no node appeared behind our back"
+        "an unnamed project must never mint a node"
+    );
+    assert!(
+        bindings.list()[0].project.is_none(),
+        "and must never bind one"
     );
 }
 
-// ── 7. DELETE ends binding + principal + node ──────────────────────────────
+// ── 7. rung 2: the client NAMES a project it owns ───────────────────────────
+
+/// The measured regression: the machine-wide credential `ccteam config` writes
+/// into all five vendor configs is user-scoped by construction, so every
+/// hand-started agent got "this MCP session has no project" — **even when it
+/// passed `project` explicitly**. Naming a project the credential's owner may see
+/// is the caller's own word, not an inference, so it binds.
+#[tokio::test]
+#[serial]
+async fn a_user_scoped_credential_binds_the_project_it_names() {
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    let bindings = Arc::clone(&app.native_bindings);
+    let gateway = app.gateway.clone().unwrap();
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+    let id = initialize(addr, &cred.bearer()).await;
+    assert!(
+        bindings.list()[0].sid.is_none(),
+        "initialize alone mints nothing for a user-scoped credential"
+    );
+
+    let resp = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(
+            2,
+            "session_spawn",
+            json!({ "vendor": "claude", "project": SLUG }),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false, "spawn: {body}");
+    let spawned = tool_json(&body);
+
+    // The binding is now the workspace's, and it minted its ledger node.
+    let binding = bindings.list()[0].clone();
+    assert_eq!(
+        binding.project.as_deref(),
+        Some(SLUG),
+        "the named project is bound to the session"
+    );
+    let node = binding
+        .sid
+        .clone()
+        .expect("naming it minted the ledger node");
+    assert_eq!(
+        gateway
+            .lock()
+            .await
+            .external_node(&node)
+            .expect("indexed as an external node")
+            .slug,
+        SLUG
+    );
+
+    // …and the child hangs off that node, in that project, at depth 1.
+    assert_eq!(spawned["ok"], true, "{spawned}");
+    assert_eq!(spawned["project"], SLUG, "{spawned}");
+    assert_eq!(
+        spawned["parent_sid"], node,
+        "the child must hang off the node the naming created: {spawned}"
+    );
+    assert_eq!(spawned["delegation_depth"], 1, "{spawned}");
+    assert_eq!(
+        spawned["caller"],
+        format!("ambient:{node}"),
+        "it acts as its node, never as the config's owner: {spawned}"
+    );
+
+    // The node persists for the binding's whole life: a second call is the SAME
+    // parent, not a fresh node per request.
+    let again = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(
+            3,
+            "session_spawn",
+            json!({ "vendor": "claude", "project": SLUG }),
+        ),
+    )
+    .await;
+    let body: Value = again.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    assert_eq!(
+        tool_json(&body)["parent_sid"],
+        node,
+        "one binding, one node: {body}"
+    );
+}
+
+/// One MCP session is one workspace for its whole life — the guard that stops a
+/// mid-conversation switch from smuggling a caller into another project.
+#[tokio::test]
+#[serial]
+async fn a_second_call_naming_another_project_is_refused_and_the_binding_holds() {
+    const OTHER: &str = "second";
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    // A project the SAME owner can see: the refusal must be about the binding
+    // already having a workspace, not about visibility.
+    seed_project(&paths, OTHER, "user:web-api");
+    let bindings = Arc::clone(&app.native_bindings);
+    let gateway = app.gateway.clone().unwrap();
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+    let id = initialize(addr, &cred.bearer()).await;
+
+    let first = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(2, "session_list", json!({ "project": SLUG })),
+    )
+    .await;
+    let body: Value = first.json().await.unwrap();
+    assert_eq!(
+        body["result"]["isError"], false,
+        "first naming binds: {body}"
+    );
+    let node = bindings.list()[0].sid.clone().expect("bound with a node");
+
+    let switched = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(
+            3,
+            "session_spawn",
+            json!({ "vendor": "claude", "project": OTHER }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        switched.status(),
+        200,
+        "a tool refusal is not a transport fault"
+    );
+    let body: Value = switched.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let message = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("bound to project `{SLUG}`")),
+        "the refusal must say which workspace it holds: {message}"
+    );
+    assert!(message.contains(OTHER), "{message}");
+
+    // The binding did not move, kept its node, and nothing was created in OTHER.
+    let binding = bindings.list()[0].clone();
+    assert_eq!(binding.project.as_deref(), Some(SLUG));
+    assert_eq!(binding.sid.as_deref(), Some(node.as_str()));
+    assert!(
+        !gateway
+            .lock()
+            .await
+            .session_views()
+            .iter()
+            .any(|v| v.project == OTHER),
+        "a refused switch must not create anything in the other project"
+    );
+}
+
+/// The refusal text of a `session_spawn` that named `slug`, as the AGENT reads
+/// it. A helper rather than a closure so the same credential can probe twice —
+/// which is the whole assertion below.
+async fn spawn_refusal(addr: SocketAddr, bearer: &str, id: &str, slug: &str) -> String {
+    let resp = post_mcp(
+        addr,
+        bearer,
+        Some(id),
+        call_body(
+            2,
+            "session_spawn",
+            json!({ "vendor": "claude", "project": slug }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "a tool refusal is not a transport fault"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// A named project the owner cannot see must be indistinguishable from one that
+/// does not exist — otherwise naming projects becomes an existence probe for
+/// another tenant's workspaces.
+#[tokio::test]
+#[serial]
+async fn a_project_the_owner_cannot_see_answers_exactly_like_an_unknown_one() {
+    const WALLED: &str = "walled";
+    const GHOST: &str = "ghost";
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    // Registered and real, but a per-user tenant's — the admin console pool this
+    // credential speaks for does not see it (`Identity::can_see_owner`).
+    seed_project(&paths, WALLED, "user:tenant-b");
+    let bindings = Arc::clone(&app.native_bindings);
+    let gateway = app.gateway.clone().unwrap();
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+    let id = initialize(addr, &cred.bearer()).await;
+    let sessions_before = gateway.lock().await.session_views().len();
+
+    let walled = spawn_refusal(addr, &cred.bearer(), &id, WALLED).await;
+    let ghost = spawn_refusal(addr, &cred.bearer(), &id, GHOST).await;
+
+    // Identical but for the slug the caller itself supplied: the answer carries no
+    // information about whether the project is there.
+    assert_eq!(
+        walled.replace(WALLED, "<named>"),
+        ghost.replace(GHOST, "<named>"),
+        "an invisible project and a missing one must read the same:\n{walled}\n{ghost}"
+    );
+    assert!(
+        walled.contains("not registered here"),
+        "and it must fail closed, not explain: {walled}"
+    );
+    assert!(
+        !walled.contains("tenant-b"),
+        "never name the owner it belongs to: {walled}"
+    );
+    assert!(
+        walled.contains(SLUG),
+        "the hint may only enumerate the caller's OWN projects: {walled}"
+    );
+
+    // Nothing bound, nothing minted, nothing spawned.
+    let binding = bindings.list()[0].clone();
+    assert!(binding.project.is_none(), "a refused name must not bind");
+    assert!(binding.sid.is_none(), "…and must not mint a node");
+    assert_eq!(
+        gateway.lock().await.session_views().len(),
+        sessions_before,
+        "nothing was created"
+    );
+}
+
+// ── 8. DELETE ends binding + principal + node ──────────────────────────────
 
 #[tokio::test]
 #[serial]
@@ -734,7 +990,7 @@ async fn delete_ends_the_binding_the_principal_and_the_node() {
     assert_eq!(again.status(), 404, "nothing left to close");
 }
 
-// ── 8. the web token is not a credential here at all ───────────────────────
+// ── 9. the web token is not a credential here at all ───────────────────────
 
 /// The credential that caused the defect cannot enter this path — and, since the
 /// admin tier is gone rather than narrowed, it cannot enter any other one either:
@@ -802,7 +1058,7 @@ async fn the_admin_web_token_is_refused_and_cannot_ride_a_binding() {
     );
 }
 
-// ── 9. a bound client is a project-scoped caller everywhere ────────────────
+// ── 10. a bound client is a project-scoped caller everywhere ───────────────
 
 /// `status` renders the vendor panel for the node's OWN project — the panel is
 /// scoped to the caller's workspace, so this is the bound counterpart of

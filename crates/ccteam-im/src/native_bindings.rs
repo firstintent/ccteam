@@ -205,13 +205,28 @@ impl NativeBindings {
     /// the daemon authenticates as that node with. Both at once: a sid without
     /// its secret is a node nothing can speak for
     /// ([`NativeBinding::principal`]).
-    pub fn attach_session(&self, mcp_session_id: &str, sid: &str, secret: &str) {
-        if let Ok(mut map) = self.inner.write() {
-            if let Some(binding) = map.get_mut(mcp_session_id) {
-                binding.sid = Some(sid.to_string());
-                binding.principal_secret = secret.to_string();
-            }
+    ///
+    /// Attaches ONCE, and returns the principal actually in force. A binding that
+    /// already has a node keeps it: two tool calls a client fired in parallel can
+    /// both see a nodeless binding and both mint one, and overwriting would leave
+    /// the loser's node parenting children the binding no longer points at. The
+    /// caller compares the returned sid with the one it minted and retires its own
+    /// when it lost. `None` = the id is gone (closed, or swept mid-flight).
+    pub fn attach_session(
+        &self,
+        mcp_session_id: &str,
+        sid: &str,
+        secret: &str,
+    ) -> Option<(String, String)> {
+        let mut map = self.inner.write().ok()?;
+        let binding = map.get_mut(mcp_session_id)?;
+        if binding.principal().is_none() {
+            binding.sid = Some(sid.to_string());
+            binding.principal_secret = secret.to_string();
         }
+        binding
+            .principal()
+            .map(|(sid, secret)| (sid.to_string(), secret.to_string()))
     }
 
     /// End a binding (client `DELETE`, or a sweep). Returns the node sid it
@@ -318,7 +333,11 @@ mod tests {
             before.principal().is_none(),
             "no node yet ⇒ nothing to authenticate as"
         );
-        reg.attach_session(&id, "s42", "sek");
+        assert_eq!(
+            reg.attach_session(&id, "s42", "sek"),
+            Some(("s42".to_string(), "sek".to_string())),
+            "the attach reports the principal in force"
+        );
         let bound = reg.resolve(&id, "e1").unwrap();
         assert_eq!(bound.sid.as_deref(), Some("s42"));
         assert_eq!(bound.principal(), Some(("s42", "sek")));
@@ -327,13 +346,39 @@ mod tests {
         assert!(reg.close(&id).is_none(), "second close is a no-op");
     }
 
+    /// Two tool calls a client fired in parallel can both find a nodeless binding
+    /// and both mint a node. Whichever attaches first IS the client's identity —
+    /// overwriting would leave the other node parenting children the binding no
+    /// longer points at, which is the rootless-child defect all over again.
+    #[test]
+    fn a_node_attaches_once_so_a_parallel_caller_learns_which_one_won() {
+        let reg = NativeBindings::new();
+        let id = reg.open("e1", "user:web-api", None, "claude/2.1");
+        assert_eq!(
+            reg.attach_session(&id, "s10", "sek-a").unwrap().0,
+            "s10",
+            "the first attach wins"
+        );
+        let lost = reg.attach_session(&id, "s11", "sek-b").unwrap();
+        assert_eq!(
+            lost,
+            ("s10".to_string(), "sek-a".to_string()),
+            "the loser is TOLD which principal is in force, so it can retire its own"
+        );
+        assert_eq!(reg.resolve(&id, "e1").unwrap().sid.as_deref(), Some("s10"));
+        assert!(
+            reg.attach_session("ms_unknown", "s12", "sek").is_none(),
+            "a binding that vanished mid-flight attaches nothing"
+        );
+    }
+
     /// The node secret is the one thing here that must never be handed out, and
     /// `{:?}` is the easiest way to leak it by accident.
     #[test]
     fn a_debug_dump_never_carries_the_node_secret() {
         let reg = NativeBindings::new();
         let id = reg.open("e1", "user:web-api", Some("alpha".into()), "codex/0.144");
-        reg.attach_session(&id, "s42", "topsecretvalue");
+        let _ = reg.attach_session(&id, "s42", "topsecretvalue");
         let dump = format!("{:?}", reg.resolve(&id, "e1").unwrap());
         assert!(!dump.contains("topsecretvalue"), "secret leaked: {dump}");
         assert!(dump.contains("<redacted>"), "{dump}");
@@ -345,7 +390,7 @@ mod tests {
         let reg = NativeBindings::new();
         let live = reg.open("e1", "user:web-api", None, "codex/0.144");
         let stale = reg.open("e1", "user:web-api", None, "codex/0.144");
-        reg.attach_session(&stale, "s7", "sek");
+        let _ = reg.attach_session(&stale, "s7", "sek");
         // Age the stale one past the cutoff.
         if let Ok(mut map) = reg.inner.write() {
             map.get_mut(&stale).unwrap().last_seen_at = Utc::now() - chrono::Duration::hours(2);

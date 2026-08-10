@@ -58,8 +58,23 @@
 //! The node is a real sid with a real `meta.json` (`managed_by: external`) that
 //! authenticates like any managed session — which is why nothing downstream
 //! needed a new code path for it. What it never gets is a project ccteam
-//! guessed: an unbound binding may discover its tool face and call `status`, and
-//! every other tool fails closed naming the projects it could have.
+//! GUESSED. A binding's workspace comes from exactly one of three rungs, in
+//! order:
+//!
+//! 1. the credential's own pinned scope ([`EnrollScope::Project`]);
+//! 2. a project **named on a `session_*` call** whose owner may see it
+//!    ([`bind_named_project`]) — the client says the word, ccteam checks it with
+//!    the same predicate the REST choke point uses, and the binding keeps it for
+//!    life;
+//! 3. otherwise refuse, naming the projects this credential could reach.
+//!
+//! Rung 2 is what makes the machine-wide credential `ccteam config` writes into
+//! every vendor's global config usable at all: that credential names no project
+//! by construction (it is one file shared by every process), so without a
+//! client-driven way to name one, a hand-started agent could only ever discover
+//! its tool face. It is still not inference — an unnamed project stays refused,
+//! and a named one the owner cannot see is answered exactly like one that does
+//! not exist.
 
 use std::sync::Arc;
 
@@ -442,6 +457,14 @@ async fn handle_enroll_post(
     let Some(binding) = resolve_binding(app, credential, headers) else {
         return no_such_mcp_session(&req);
     };
+    // Rung 2 of the project ladder, resolved BEFORE the identity is read: a
+    // `session_*` call that NAMES a project may turn a nodeless binding into a
+    // ledger node, and on a binding that already has one the naming is checked
+    // against it rather than silently ignored.
+    let binding = match bind_named_project(app, credential, binding, &req).await {
+        Ok(binding) => binding,
+        Err(refusal) => return refusal,
+    };
     match binding.principal() {
         // The binding has a ledger node, so this call IS that node: inject its
         // identity exactly as a managed session's and let the EXISTING Ambient
@@ -481,8 +504,10 @@ async fn open_binding(app: &AppState, credential: &EnrollCredential, req: Value)
             Ok((sid, secret)) => {
                 // The secret never leaves this process: the client authenticates
                 // with its enroll bearer + id, and the daemon speaks for it
-                // internally with the principal it minted here.
-                app.native_bindings.attach_session(&id, &sid, &secret);
+                // internally with the principal it minted here. Nothing else can
+                // hold this id yet (it was issued three statements ago), so the
+                // attach cannot lose a race and the in-force principal is ours.
+                let _ = app.native_bindings.attach_session(&id, &sid, &secret);
                 tracing::info!(
                     enroll = %credential.id, mcp_session = %id, sid = %sid,
                     project = %slug, %client,
@@ -505,23 +530,154 @@ async fn open_binding(app: &AppState, credential: &EnrollCredential, req: Value)
     response
 }
 
-/// Create the ledger node for a project-scoped credential and mint the principal
-/// it authenticates with.
+/// Rung 2 of the project ladder: **the caller names its workspace.**
 ///
-/// Fail-closed on visibility through the SAME predicate the REST ACL choke point
-/// uses: the credential is long-lived and pasted into config files, so "the
-/// operator could see this project when they minted it" is not enough — it has to
-/// still be true now.
+/// A `session_*` call carrying an explicit `project` is the client choosing where
+/// it works, which is the one rung ccteam can honour without guessing: it is the
+/// caller's own word, and the answer is [`may_bind_project`] — the same
+/// visibility predicate rung 1 and the REST choke point use. Without it the
+/// machine-wide credential in every vendor's global config could do nothing but
+/// discovery, because a file shared by every process cannot name a project.
+///
+/// Runs for EVERY `session_*` call, bound or not, so the naming is honoured once
+/// and enforced forever: [`NativeBindings::bind_project`] refuses a later switch,
+/// which is what keeps one MCP session to one workspace for its whole life. A
+/// call that names nothing, or is not a `session_*` call, passes through
+/// untouched — discovery and `status` must keep working unbound.
+///
+/// `Ok` = the binding as it stands afterwards (freshly noded, or unchanged);
+/// `Err` = the refusal to answer with.
+async fn bind_named_project(
+    app: &AppState,
+    credential: &EnrollCredential,
+    binding: NativeBinding,
+    req: &Value,
+) -> Result<NativeBinding, Response> {
+    let Some(tool) = called_tool(req) else {
+        return Ok(binding);
+    };
+    // The `session_*` face is the only one that takes a workspace argument;
+    // `status`/discovery name a project nowhere and must not bind one.
+    if !tool.starts_with("session_") {
+        return Ok(binding);
+    }
+    let Some(slug) = named_project(req) else {
+        return Ok(binding);
+    };
+    if !may_bind_project(app, credential, &slug) {
+        return Err(mcp_tool_error(
+            req,
+            unaddressable_project(app, credential, tool, &slug),
+        ));
+    }
+    // The registry is the arbiter of "one session, one workspace": a binding
+    // already pinned elsewhere refuses HERE, before anything is minted.
+    if let Err(err) = app
+        .native_bindings
+        .bind_project(&binding.mcp_session_id, &slug)
+    {
+        return Err(mcp_tool_error(req, format!("{tool}: {err}")));
+    }
+    if binding.principal().is_some() {
+        // Already the node for this very project (that is what `bind_project`
+        // just confirmed) — nothing to mint.
+        return Ok(binding);
+    }
+    let (sid, secret) = mint_ledger_node(app, credential, &slug, &binding.client)
+        .await
+        .map_err(|err| mcp_tool_error(req, format!("{tool}: cannot work in `{slug}`: {err}")))?;
+    // Attach ONCE: a client may fire two tool calls in parallel and both would
+    // see a nodeless binding. The registry decides which node the binding keeps;
+    // the loser retires the one it minted instead of overwriting an identity that
+    // children may already hang off.
+    let in_force = app
+        .native_bindings
+        .attach_session(&binding.mcp_session_id, &sid, &secret);
+    if in_force.as_ref().map(|(held, _)| held.as_str()) != Some(sid.as_str()) {
+        retire_node(
+            app.gateway.as_ref(),
+            app.session_principals.as_ref(),
+            std::slice::from_ref(&sid),
+        )
+        .await;
+    }
+    // Re-read rather than patch a local copy: the registry now holds the truth
+    // (including a parallel caller's node), and a binding that vanished mid-flight
+    // gets the transport's own re-initialize signal.
+    let bound = app
+        .native_bindings
+        .resolve(&binding.mcp_session_id, &credential.id)
+        .ok_or_else(|| no_such_mcp_session(req))?;
+    tracing::info!(
+        enroll = %credential.id, mcp_session = %binding.mcp_session_id,
+        sid = bound.sid.as_deref().unwrap_or("-"), project = %slug,
+        client = %binding.client, %tool,
+        "POST /mcp: enrolled client named its project and is now a ledger node"
+    );
+    Ok(bound)
+}
+
+/// The `project` argument of a `tools/call`, trimmed, `None` when absent/empty.
+/// Read verbatim from the caller: it is a NAME, never authority — what it may
+/// mean is decided by [`may_bind_project`].
+fn named_project(req: &Value) -> Option<String> {
+    let slug = req
+        .pointer("/params/arguments/project")
+        .and_then(Value::as_str)?
+        .trim();
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// Whether this credential's owner may work in `slug` at all: the project exists
+/// AND the REST ACL's own visibility predicate says yes.
+///
+/// One home for both rungs of the ladder. They MUST answer identically —
+/// otherwise naming a project on a call would reach a workspace the credential
+/// could never have been minted for, which is the same defect as an inferred
+/// project wearing different clothes.
+fn may_bind_project(app: &AppState, credential: &EnrollCredential, slug: &str) -> bool {
+    app.paths.project_state(slug).exists()
+        && crate::routes::api_v1::can_see_project(app, &identity_for_owner(&credential.owner), slug)
+}
+
+/// The ONE answer for a named project this credential cannot work in: unknown
+/// here and invisible to its owner are deliberately the same text, so a caller
+/// cannot probe for the existence of somebody else's workspace. Both halves
+/// depend only on the OWNER, never on the probed slug's fate.
+fn unaddressable_project(
+    app: &AppState,
+    credential: &EnrollCredential,
+    tool: &str,
+    slug: &str,
+) -> String {
+    let mut message = format!(
+        "{tool}: project `{slug}` is not registered here, or not this credential owner's — \
+         one answer for both on purpose."
+    );
+    match addressable_projects(app, &credential.owner) {
+        projects if projects.is_empty() => message.push_str(
+            " No project is registered for this credential's owner yet; create one in the web \
+             console first.",
+        ),
+        projects => message.push_str(&format!(" It can name: {}.", projects.join(", "))),
+    }
+    message
+}
+
+/// Create the ledger node for a project a binding may work in, and mint the
+/// principal it authenticates with.
+///
+/// Fail-closed on visibility through [`may_bind_project`] — the same predicate
+/// the REST ACL choke point uses: the credential is long-lived and pasted into
+/// config files, so "the operator could see this project when they minted it" is
+/// not enough — it has to still be true now.
 async fn mint_ledger_node(
     app: &AppState,
     credential: &EnrollCredential,
     slug: &str,
     client: &str,
 ) -> Result<(String, String), String> {
-    let identity = identity_for_owner(&credential.owner);
-    if !app.paths.project_state(slug).exists()
-        || !crate::routes::api_v1::can_see_project(app, &identity, slug)
-    {
+    if !may_bind_project(app, credential, slug) {
         return Err(format!(
             "project `{slug}` is not registered here (or not this credential owner's)"
         ));
@@ -613,17 +769,29 @@ fn refuse_projectless_call(
         "{tool}: this MCP session has no project — {cause}. ccteam never infers one from your \
          working directory, your address or the most recent project."
     );
-    match addressable_projects(app, &credential.owner) {
-        projects if projects.is_empty() => message.push_str(
+    let projects = addressable_projects(app, &credential.owner);
+    if projects.is_empty() {
+        message.push_str(
             " No project is registered for this credential's owner yet; create one in the web \
              console first.",
-        ),
-        projects => message.push_str(&format!(
-            " Ask for a project-scoped enrollment snippet (web console → the project → external \
-             agent) for one of: {}.",
-            projects.join(", ")
-        )),
+        );
+        return Some(mcp_tool_error(req, message));
     }
+    // Rung 2 is only open to a binding that has not committed yet: a pinned one
+    // cannot move ([`NativeBindings::bind_project`]), so offering it a project to
+    // name would be advice that gets refused.
+    if binding.project.is_none() {
+        message.push_str(&format!(
+            " Name one on the call (`project: \"{}\"`) — the first project a session names is its \
+             workspace for the rest of its life.",
+            projects[0]
+        ));
+    }
+    message.push_str(&format!(
+        " Or ask for a project-scoped enrollment snippet (web console → the project → external \
+         agent) for one of: {}.",
+        projects.join(", ")
+    ));
     Some(mcp_tool_error(req, message))
 }
 
