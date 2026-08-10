@@ -555,6 +555,7 @@ mod tests {
         live.insert(
             "s1".to_string(),
             SessionView {
+                driveable: true,
                 sid: "s1".to_string(),
                 project: "demo".to_string(),
                 role: "brain".to_string(),
@@ -616,6 +617,7 @@ mod tests {
         live.insert(
             "s1".to_string(),
             SessionView {
+                driveable: true,
                 sid: "s1".to_string(),
                 project: "demo".to_string(),
                 role: "brain".to_string(),

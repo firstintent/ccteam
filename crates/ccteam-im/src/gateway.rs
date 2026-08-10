@@ -358,6 +358,23 @@ pub struct Gateway {
     /// stream (v0.8.10 routing-isolation fix).
     current_session: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
     sessions: BTreeMap<String, GatewaySession>,
+    /// Ledger nodes for hand-started clients that enrolled over `POST /mcp`
+    /// (`sid → meta`, `managed_by: external`; see [`crate::external_nodes`]).
+    ///
+    /// Deliberately NOT rows in `sessions`: that map is the set of sessions
+    /// ccteam holds a thread for, so every driveable surface (dispatch, steer,
+    /// capacity eviction, budget, tool-face prime, event pump) stays correct
+    /// without checking anything — an external client simply is not in the
+    /// collection they iterate. The unification happens one level up, in the
+    /// LEDGER: same sid namespace, same `meta.json`, same tree ([`SessionView`]
+    /// carries `driveable` so a consumer can tell the two apart).
+    ///
+    /// In-memory by nature: an entry stands for a live client PROCESS, and a
+    /// daemon restart already ended every one of those. Cold start therefore
+    /// starts empty while each `meta.json` stays on disk as audit — see
+    /// [`Self::recover_routing_from_meta`], which excludes them from the
+    /// rebuild set rather than resurrecting a process that is gone.
+    external_nodes: BTreeMap<String, SessionMeta>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
     next_scheduled: u64,
@@ -844,6 +861,21 @@ pub struct SessionView {
     /// v0.9.0 W2 (F2/F5) — delegation depth (root = 0). `#[serde(default)]`.
     #[serde(default)]
     pub delegation_depth: u32,
+    /// Whether ccteam holds this session's thread and can therefore send it
+    /// work (dispatch / steer / stop). `true` for every managed session;
+    /// `false` for a hand-started client that enrolled over `POST /mcp` — it is
+    /// a real ledger node and a real delegation parent, but its own operator
+    /// drives it (see [`crate::external_nodes`]). Consumers must gate every
+    /// drive affordance on this rather than on "is it in the list".
+    /// `#[serde(default = "…")]` reads back `true` for a payload written before
+    /// the field existed, where every row was a managed session.
+    #[serde(default = "session_view_driveable_default")]
+    pub driveable: bool,
+}
+
+/// Pre-`driveable` payloads only ever described managed sessions.
+fn session_view_driveable_default() -> bool {
+    true
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -1478,6 +1510,7 @@ impl Gateway {
             current_project: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
+            external_nodes: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
             next_scheduled: 0,
@@ -1660,6 +1693,18 @@ impl Gateway {
         meta: &SessionMeta,
         reply_to: &ChatKey,
     ) -> Result<MetaRebuildPlan> {
+        // Every rebuild path funnels through here (cold-start restore, `/use`
+        // resume, external adopt), so the "ccteam never drives an external
+        // node" line is drawn once: a rebuild would spawn a NEW vendor process
+        // wearing a hand-started agent's sid and identity. A takeover is a real
+        // transition — flip `managed_by` first, then rebuild.
+        if meta.managed_by == ccteam_harness::execution::session_meta::ManagedBy::External {
+            anyhow::bail!(
+                "session {} is a hand-started agent that enrolled with ccteam (external); \
+                 ccteam holds no thread for it and cannot re-spawn one in its place",
+                meta.sid
+            );
+        }
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         let model_id = meta
@@ -5232,6 +5277,14 @@ impl Gateway {
             .projects
             .values()
             .flat_map(|dir| list_session_metas(dir))
+            // An external node's `meta.json` describes a process ccteam never
+            // started and whose client died with the daemon. There is nothing to
+            // rebuild: spawning a vendor in its place would mint a managed
+            // thread wearing another agent's identity. The meta stays as audit;
+            // the client re-enrolls (a fresh `initialize`) if it comes back.
+            .filter(|meta| {
+                meta.managed_by != ccteam_harness::execution::session_meta::ManagedBy::External
+            })
             .map(|meta| meta.sid)
             .collect();
     }
@@ -8099,15 +8152,95 @@ impl Gateway {
                     waiting_approval,
                     parent_sid: s.parent_sid.clone(),
                     delegation_depth: s.delegation_depth,
+                    // Every row of the live map is by definition a session
+                    // ccteam holds a thread for.
+                    driveable: true,
                 }
             })
             .collect();
+        // THE merge point for external ledger nodes: every consumer of
+        // `session_views()` (web agents graph, `/status`, projects, the REST
+        // session list, MCP `session_list` + its parent validation) sees a
+        // hand-started client because it is merged HERE and nowhere else — so a
+        // new consumer inherits it instead of having to remember a second map.
+        views.extend(self.external_nodes.values().map(external_node_view));
         views.sort_by(|a, b| {
             b.last_active
                 .cmp(&a.last_active)
                 .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
         });
         views
+    }
+
+    // ── external ledger nodes (hand-started clients) ──────────────────────────
+
+    /// Mint the ledger node for a hand-started client that just enrolled over
+    /// `POST /mcp`: a real sid, a real `meta.json`, a real place in the
+    /// delegation tree — and deliberately no row in the live map. Returns the
+    /// sid, which the caller binds to the client's `Mcp-Session-Id`
+    /// ([`crate::native_bindings::NativeBindings::attach_session`]).
+    ///
+    /// This is what stops a hand-started agent's `session_spawn` children from
+    /// mounting as ROOTS: they now have a parent that exists in the ledger.
+    /// `owner` is the enrollment credential's identity (never self-reported) and
+    /// `slug` must already be a registered project — execution location is a
+    /// project property, so an unknown slug is an error, not a default.
+    pub fn register_external_node(
+        &mut self,
+        slug: &str,
+        owner: &str,
+        client: &str,
+    ) -> Result<String> {
+        self.ensure_project_loaded(slug);
+        // Resolve the project BEFORE the counter bump so a rejected enrollment
+        // doesn't burn an `s{n}`.
+        let cwd = self
+            .projects
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {slug}"))?;
+        self.next_session += 1;
+        // Make the counter durable BEFORE the sid is used (a later failure then
+        // leaves a harmless gap, never a reused sid — red line: monotonic).
+        self.persist_next_sid()?;
+        let sid = format!("s{}", self.next_session);
+        let meta = crate::external_nodes::external_node_meta(
+            &sid,
+            slug,
+            owner,
+            client,
+            crate::external_nodes::vendor_from_client(client),
+        );
+        // Same durable write the managed path uses: one `meta.json` shape means
+        // a later takeover is a field flip, not a data migration.
+        write_session_meta(&cwd, &meta)?;
+        self.external_nodes.insert(sid.clone(), meta);
+        Ok(sid)
+    }
+
+    /// The ledger node for `sid`, or `None` when `sid` is not an enrolled
+    /// hand-started client (unknown, or a managed session).
+    pub fn external_node(&self, sid: &str) -> Option<SessionMeta> {
+        self.external_nodes.get(sid).cloned()
+    }
+
+    /// Whether `sid` is an enrolled hand-started client — i.e. a visible
+    /// session that ccteam must refuse to drive
+    /// ([`crate::external_nodes::not_driveable_error`]).
+    pub fn is_external_node(&self, sid: &str) -> bool {
+        self.external_nodes.contains_key(sid)
+    }
+
+    /// Retire an external node: the client's MCP `DELETE`, or the idle sweep
+    /// that reaps the far more common case of a client that just exited.
+    /// Returns whether it was still indexed (so a second close is a no-op, not
+    /// an error).
+    ///
+    /// The `meta.json` deliberately STAYS on disk — exactly like a stopped
+    /// managed session's — so the delegation history of whatever it spawned
+    /// keeps resolving to a real node.
+    pub fn close_external_node(&mut self, sid: &str) -> bool {
+        self.external_nodes.remove(sid).is_some()
     }
 
     // ── v0.8.21 history / resume / external-import ────────────────────────────
@@ -9723,6 +9856,56 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
         AgentVendor::Pi => "pi",
+    }
+}
+
+/// Project one external ledger node into the shared [`SessionView`] shape, so
+/// a hand-started client reads as the session it is on every surface that lists
+/// sessions.
+///
+/// Everything comes from its `meta.json` (the one ledger shape), and whatever
+/// ccteam cannot observe is left absent rather than invented: no cost/token
+/// fabrication, no `waiting_approval` (ccteam relays no permission request for
+/// a thread it does not hold), no role (nothing was projected onto this
+/// process), and `status` is never `working` — the only liveness ccteam has is
+/// when the client last spoke to `/mcp`, mirrored into `last_active`, so the row
+/// says `idle` and puts the honest silence in `last_activity_seconds`.
+fn external_node_view(meta: &SessionMeta) -> SessionView {
+    let silent_seconds = chrono::DateTime::parse_from_rfc3339(&meta.last_active)
+        .ok()
+        .map(|ts| {
+            (chrono::Utc::now() - ts.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        });
+    SessionView {
+        sid: meta.sid.clone(),
+        project: meta.slug.clone(),
+        role: String::new(),
+        vendor: vendor_str(meta.vendor).to_string(),
+        permission_mode: meta.permission_mode.as_str().to_string(),
+        protocol: meta.protocol.as_str().to_string(),
+        host: if meta.host.is_empty() {
+            "local".to_string()
+        } else {
+            meta.host.clone()
+        },
+        // `current` means "the focused session of some routed chat"; ccteam
+        // routes no chat to a client it cannot submit a turn to.
+        current: false,
+        status: "idle".to_string(),
+        last_activity_seconds: silent_seconds,
+        created_at: meta.created_at.clone(),
+        last_active: meta.last_active.clone(),
+        title: meta.title.clone(),
+        turn_count: meta.turn_count,
+        cost_usd: meta.cost_usd,
+        tokens_total: meta.tokens_total,
+        model: meta.model.clone(),
+        waiting_approval: false,
+        parent_sid: meta.parent_sid.clone(),
+        delegation_depth: meta.delegation_depth,
+        driveable: false,
     }
 }
 
@@ -11544,6 +11727,291 @@ mod tests {
             GatewayEventKind::SessionLifecycle { ref state, ref reason }
                 if state == "evicted" && reason == "capacity"
         ));
+    }
+
+    // ── external ledger nodes (hand-started clients) ──────────────────────────
+
+    /// A roleless managed session in project `alpha` — the foil every external
+    /// node assertion below is measured against.
+    async fn spawn_managed(gateway: &mut Gateway) -> String {
+        gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+    }
+
+    /// A hand-started client joins ONE sid namespace: its node cannot collide
+    /// with a managed spawn before or after it, and it lands a real `meta.json`
+    /// marked external (which is what makes it a delegation parent instead of an
+    /// anonymous caller whose children mount as roots).
+    #[tokio::test]
+    async fn external_node_gets_its_own_monotonic_sid_and_ledger_row() {
+        use ccteam_harness::execution::session_meta::{session_meta_path, ManagedBy};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let before = spawn_managed(&mut gateway).await;
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        let after = spawn_managed(&mut gateway).await;
+        assert_eq!(
+            [before.as_str(), node.as_str(), after.as_str()],
+            ["s1", "s2", "s3"],
+            "one monotonic namespace shared with managed spawns"
+        );
+
+        let meta = read_session_meta(tmp.path(), &node).unwrap();
+        assert_eq!(meta.managed_by, ManagedBy::External);
+        assert!(!meta.managed_by.is_driveable());
+        assert_eq!(meta.slug, "alpha");
+        assert_eq!(
+            meta.owner, "user:web-api",
+            "identity comes from the credential"
+        );
+        assert_eq!(meta.vendor, AgentVendor::Codex, "vendor from clientInfo");
+        assert!(meta.vendor_uuid.is_empty(), "no native session id is known");
+        let raw = std::fs::read_to_string(session_meta_path(tmp.path(), &node)).unwrap();
+        assert!(raw.contains("\"managed_by\": \"external\""), "{raw}");
+
+        // The whole point: a ledger row WITHOUT a live-map row.
+        assert!(!gateway.is_session_live(&node));
+        assert!(gateway.is_external_node(&node));
+        assert!(!gateway.is_external_node(&before));
+        assert_eq!(gateway.external_node(&node).map(|m| m.sid), Some(node));
+        assert!(gateway.external_node(&before).is_none());
+
+        // An unregistered project is refused, and refusal burns no sid.
+        assert!(gateway
+            .register_external_node("nope", "user:web-api", "codex")
+            .is_err());
+        assert_eq!(spawn_managed(&mut gateway).await, "s4");
+    }
+
+    /// `driveable` is the one bit every consumer gates drive affordances on:
+    /// true for a managed session, false for a client whose own operator drives
+    /// it. The external row invents nothing it cannot observe.
+    #[tokio::test]
+    async fn session_views_marks_only_managed_sessions_driveable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let managed = spawn_managed(&mut gateway).await;
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 2, "one listing, both kinds of session");
+        let m = views.iter().find(|v| v.sid == managed).unwrap();
+        assert!(m.driveable);
+        assert_eq!(m.status, "live");
+        let n = views.iter().find(|v| v.sid == node).unwrap();
+        assert!(!n.driveable);
+        assert_eq!(n.project, "alpha");
+        assert_eq!(n.vendor, "codex");
+        assert!(n.role.is_empty(), "ccteam projected no role onto it");
+        assert!(!n.current, "ccteam routes no chat to it");
+        assert_eq!(n.status, "idle", "never claims to be working");
+        assert_eq!(n.title.as_deref(), Some("codex/0.144.3"));
+        assert!(!n.last_active.is_empty());
+        assert!(
+            n.last_activity_seconds.is_some(),
+            "recency is derived from meta.last_active"
+        );
+        assert_eq!(
+            (n.cost_usd, n.tokens_total, n.turn_count, n.waiting_approval),
+            (None, None, 0, false),
+            "no cost, token, turn or approval fabrication"
+        );
+
+        // A payload written before the field existed described a managed
+        // session, so it must read back driveable.
+        let legacy: SessionView = serde_json::from_str(
+            r#"{"sid":"s9","project":"alpha","role":"","vendor":"claude","current":true,"status":"live"}"#,
+        )
+        .unwrap();
+        assert!(legacy.driveable);
+    }
+
+    /// The reason external nodes exist: a child spawned BY a hand-started agent
+    /// hangs under it instead of mounting as a root. `session_list`'s tree is
+    /// built purely from `parent_sid` over `session_views()`, and roots are rows
+    /// whose parent is absent from the set — so both rows being present with the
+    /// right linkage is exactly the tree property.
+    #[tokio::test]
+    async fn a_managed_child_stays_under_its_external_parent_in_session_views() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let parent = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        let child = spawn_managed(&mut gateway).await;
+        // The lineage `session_spawn` records for a delegated child.
+        {
+            let session = gateway.sessions.get_mut(&child).unwrap();
+            session.parent_sid = Some(parent.clone());
+            session.delegation_depth = 1;
+        }
+
+        let views = gateway.session_views();
+        let p = views.iter().find(|v| v.sid == parent).unwrap();
+        assert!(p.parent_sid.is_none(), "the node itself is a root");
+        assert!(!p.driveable);
+        let c = views.iter().find(|v| v.sid == child).unwrap();
+        assert_eq!(c.parent_sid.as_deref(), Some(parent.as_str()));
+        assert_eq!(c.delegation_depth, 1);
+        assert!(c.driveable);
+        let sids: HashSet<&str> = views.iter().map(|v| v.sid.as_str()).collect();
+        assert!(
+            sids.contains(parent.as_str()),
+            "the child's parent is IN the set, so the tree nests it instead of \
+             rooting it: {sids:?}"
+        );
+    }
+
+    /// `DELETE` / idle sweep retires the node from the index only. Its
+    /// `meta.json` stays, exactly like a stopped managed session's, so the
+    /// delegation history of whatever it spawned still resolves.
+    #[tokio::test]
+    async fn close_external_node_removes_it_from_views_and_is_idempotent() {
+        use ccteam_harness::execution::session_meta::ManagedBy;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        assert!(gateway.session_views().iter().any(|v| v.sid == node));
+
+        assert!(gateway.close_external_node(&node));
+        assert!(!gateway.session_views().iter().any(|v| v.sid == node));
+        assert!(!gateway.is_external_node(&node));
+        assert!(gateway.external_node(&node).is_none());
+        assert!(
+            !gateway.close_external_node(&node),
+            "a second close is a no-op, not an error"
+        );
+
+        assert_eq!(
+            read_session_meta(tmp.path(), &node).unwrap().managed_by,
+            ManagedBy::External,
+            "the ledger row survives the process"
+        );
+        assert_eq!(
+            gateway.project_slug_for_sid(&node).as_deref(),
+            Some("alpha"),
+            "a retired node still resolves to its project (ACL + audit)"
+        );
+    }
+
+    /// An external node is not a capacity subject in either direction: it never
+    /// occupies a `max_live` slot (ccteam holds no thread) and is never picked
+    /// for eviction (there is nothing to stop). Both follow from it not being in
+    /// `sessions` — this is the fence for anyone tempted to merge the two maps.
+    #[tokio::test]
+    async fn an_external_node_is_never_a_capacity_eviction_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 1 });
+
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        let first = spawn_managed(&mut gateway).await;
+        assert_eq!(
+            gateway.sessions.len(),
+            1,
+            "the node did not consume the single live slot"
+        );
+        assert!(gateway.is_external_node(&node));
+
+        // The next admission must take the managed session, never the node.
+        let second = spawn_managed(&mut gateway).await;
+        assert!(!gateway.sessions.contains_key(&first));
+        assert!(gateway.sessions.contains_key(&second));
+        assert!(
+            gateway.is_external_node(&node),
+            "an external node is never an eviction candidate"
+        );
+        assert_eq!(gateway.session_views().len(), 2, "node + admitted session");
+
+        // The parent-chain protection walks straight through a non-live parent:
+        // the external sid is listed (harmless — it is no candidate) and the
+        // walk stops there instead of hunting it in `sessions`.
+        assert_eq!(
+            gateway.live_capacity_exclusions(&second, Some(&node)),
+            vec![second.clone(), node.clone()]
+        );
+    }
+
+    /// A cold start must not resurrect a hand-started client: its process died
+    /// with the daemon, so its `meta.json` is audit, not a rebuild instruction —
+    /// re-spawning a vendor in its place would mint a managed thread wearing
+    /// another agent's sid. Covers both entries at once: the meta scan (the only
+    /// restore source that can see external rows — `routing.json.live_sids`
+    /// never held one) and the on-demand `/use` resume.
+    #[tokio::test]
+    async fn cold_start_and_resume_never_rebuild_an_external_node() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let managed;
+        let node;
+        {
+            // No persistence here on purpose: leaving routing.json absent is
+            // what routes the restart through the meta.json recovery scan.
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            managed = spawn_managed(&mut gateway).await;
+            node = gateway
+                .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+                .unwrap();
+        }
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake, "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        assert_eq!(
+            restarted.restore_pending,
+            vec![managed.clone()],
+            "only the managed session is rebuildable"
+        );
+        restarted.resume_restored_sessions().await;
+        assert!(restarted.is_session_live(&managed));
+        assert!(
+            !restarted.is_external_node(&node),
+            "the external index starts empty; the client re-enrolls if it returns"
+        );
+        assert!(!restarted.session_views().iter().any(|v| v.sid == node));
+        assert!(
+            read_session_meta(&project_dir, &node).is_ok(),
+            "the ledger row stays on disk as audit"
+        );
+
+        // Same line at the on-demand entry (`plan_session_rebuild` is the shared
+        // choke point for every rebuild path).
+        let err = restarted
+            .resume_stopped_session(&node, "web:web-api:web-api", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("external"), "got: {err}");
+        assert!(!restarted.is_session_live(&node), "nothing was spawned");
     }
 
     /// Seed a `.claude/agents/<role>.md` under `project_dir` so the `/role`

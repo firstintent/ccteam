@@ -2430,6 +2430,7 @@ mod tests {
 
     fn view(sid: &str) -> SessionView {
         SessionView {
+            driveable: true,
             sid: sid.into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2504,6 +2505,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
         let mut views = vec![SessionView {
+            driveable: true,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2553,6 +2555,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let mut views = vec![
             SessionView {
+                driveable: true,
                 sid: "s1".into(),
                 project: "demo".into(),
                 role: "cto".into(),
@@ -2575,6 +2578,7 @@ mod tests {
                 delegation_depth: 0,
             },
             SessionView {
+                driveable: true,
                 sid: "s2".into(),
                 project: "demo".into(),
                 role: "qa".into(),
@@ -2631,6 +2635,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
         let mut views = vec![SessionView {
+            driveable: true,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2674,6 +2679,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
         let mut views = vec![SessionView {
+            driveable: true,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
