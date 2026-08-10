@@ -1680,6 +1680,14 @@ async fn authorize_user_session_tool(
                 gateway
                     .session_resolve(sid)
                     .map(|resolved| resolved.project)
+                    // An enrolled hand-started client is a ledger row without a
+                    // live-map row, so the live map alone cannot answer "whose
+                    // project is this sid in". This gate decides VISIBILITY only
+                    // — a tenant who can see the node in `session_list` must
+                    // reach the honest not-driveable refusal instead of
+                    // "session not found", while a node in someone else's
+                    // project stays indistinguishable from an unknown sid.
+                    .or_else(|| gateway.external_node(sid).map(|meta| meta.slug))
             };
             if project
                 .as_deref()
@@ -2324,6 +2332,10 @@ async fn run_session_dispatch(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // Driveability before anything else: ccteam has no thread to submit into for
+    // an enrolled hand-started client, and every path below would call it
+    // unknown instead of saying so.
+    assert_target_is_driveable("session_dispatch", gateway, &sid).await?;
     let task = args
         .get("task")
         .and_then(|v| v.as_str())
@@ -2475,9 +2487,10 @@ fn parse_notify_mode(
 }
 
 /// The completion-notification route for one dispatch. A managed ambient
-/// caller has a parent session transport; admin/user front doors do not.
-/// `notify:off` is distinct from a missing route so it stays intentional and
-/// does not produce an operational warning.
+/// caller has a parent session transport; admin/user front doors do not, and
+/// neither does an enrolled hand-started client (a real delegation parent that
+/// ccteam holds no thread for). `notify:off` is distinct from a missing route so
+/// it stays intentional and does not produce an operational warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionNotificationRoute {
     ParentSession,
@@ -2492,10 +2505,20 @@ struct InlineWaitWindow {
 }
 
 impl CompletionNotificationRoute {
-    fn resolve(caller_sid: &str, notify: ccteam_harness::NotifyMode) -> Self {
+    /// `parent_is_external`: the parent sid is an enrolled hand-started client.
+    /// MCP is client-dial-in, so ccteam has no conversation of its own to put a
+    /// completion turn into — the edge is real, the return transport is not.
+    /// That is exactly what `Unavailable` already means for the admin front
+    /// door, hence no new variant. An explicit `notify:off` still wins: an
+    /// intentional opt-out is not a missing channel.
+    fn resolve(
+        caller_sid: &str,
+        notify: ccteam_harness::NotifyMode,
+        parent_is_external: bool,
+    ) -> Self {
         if notify == ccteam_harness::NotifyMode::Off {
             Self::Disabled
-        } else if caller_sid.is_empty() {
+        } else if caller_sid.is_empty() || parent_is_external {
             Self::Unavailable
         } else {
             Self::ParentSession
@@ -2569,9 +2592,14 @@ async fn dispatch_task(
     title: Option<String>,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
-    let notification_route = CompletionNotificationRoute::resolve(caller_sid, notify);
-    let (turn_id, rx) = {
+    let (turn_id, rx, parent_is_external) = {
         let mut gw = gateway.lock().await;
+        // Whether a completion turn is deliverable is a property of the PARENT's
+        // ledger row, not of the caller's auth tier: a hand-started client dials
+        // in over MCP, so there is no thread to steer and no session to resume.
+        // Asked once, here, so the armed watch and the response fragment can
+        // never disagree about it.
+        let parent_is_external = is_delegation && gw.is_external_node(caller_sid);
         // Subscribe BEFORE submitting so a fast child can't answer before we
         // start listening (the wait races the child's own turn).
         let rx = if effective_wait_seconds > 0 {
@@ -2584,10 +2612,21 @@ async fn dispatch_task(
             .await
             .map_err(|e| format!("{tool} failed: {e}"))?;
         if is_delegation {
+            // The watch is armed either way — the completion edge belongs in the
+            // ledger (`delegation_completed` fires off the mirror, whatever the
+            // notify mode). An external parent gets it with notifications OFF:
+            // left on, the first completion would submit into a session ccteam
+            // must never re-spawn, fail, and drop the watch — silently ending
+            // that child's completion accounting for every later turn.
+            let watch_notify = if parent_is_external {
+                ccteam_harness::NotifyMode::Off
+            } else {
+                notify
+            };
             gw.arm_delegation_watch(
                 sid,
                 caller_sid,
-                notify,
+                watch_notify,
                 title.clone(),
                 Some(turn_id.clone()),
             );
@@ -2605,14 +2644,17 @@ async fn dispatch_task(
                 );
             }
         }
-        (turn_id, rx)
+        (turn_id, rx, parent_is_external)
     };
+    let notification_route =
+        CompletionNotificationRoute::resolve(caller_sid, notify, parent_is_external);
     if notification_route == CompletionNotificationRoute::Unavailable {
         tracing::warn!(
             tool,
             child_sid = %sid,
             turn_id = %turn_id,
             notify = notify.as_str(),
+            parent_is_external,
             "ccteam MCP completion notification unavailable: caller has no managed parent session; poll session_collect"
         );
     }
@@ -3063,6 +3105,10 @@ async fn run_session_collect(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // Same gate as dispatch/stop: ccteam mirrors no transcript for a client it
+    // never spawned, so the honest answer is what the session is — not an empty
+    // page or an "unknown session" from the resolve below.
+    assert_target_is_driveable("session_collect", gateway, &sid).await?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
     let n = args
         .get("n")
@@ -3418,6 +3464,10 @@ async fn run_session_stop(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // Ahead of both scope checks: a hand-started client's process belongs to its
+    // operator, and the descendant walk below would otherwise reject it as "not
+    // a descendant" — true, but not the reason.
+    assert_target_is_driveable("session_stop", gateway, &sid).await?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
     assert_caller_owns_session("session_stop", args, gateway, &sid, &caller).await?;
@@ -3478,6 +3528,27 @@ fn arg_session_sid(args: &serde_json::Value) -> std::result::Result<String, Stri
         .filter(|s| !s.is_empty())
         .map(String::from)
         .ok_or_else(|| "missing required `sid`".to_string())
+}
+
+/// Refuse a sid-addressed DRIVE on a hand-started client's ledger node.
+///
+/// Every driving tool calls this the moment it has its target, ahead of its own
+/// resolution: an external node deliberately has no row in the live map (that
+/// map is the set of sessions ccteam holds a thread for), so `session_resolve`
+/// (dispatch/collect) and the descendant walk (stop) would report a session the
+/// caller can SEE in `session_list` as unknown — a correct refusal that reads as
+/// a ccteam bug. One shared message
+/// ([`crate::external_nodes::not_driveable_error`]) says what the session IS: a
+/// process its own operator drives, usable as a delegation parent.
+async fn assert_target_is_driveable(
+    tool: &str,
+    gateway: &GatewayHandle,
+    sid: &str,
+) -> std::result::Result<(), String> {
+    if gateway.lock().await.is_external_node(sid) {
+        return Err(crate::external_nodes::not_driveable_error(tool, sid));
+    }
+    Ok(())
 }
 
 /// v0.8.7 review-fix (R-M3) — project-scope a sid-addressed `session_*` call:
@@ -6530,5 +6601,292 @@ mod session_tool_tests {
         );
         drop(locked);
         let _ = waiter.await;
+    }
+
+    // ========================================================================
+    // External ledger nodes: a hand-started client that enrolled over `POST
+    // /mcp` is a delegation PARENT ccteam holds no thread for. It can be
+    // spawned FROM and never driven.
+    // ========================================================================
+
+    /// The enrollment a hand-started client gets over `POST /mcp` (a real sid +
+    /// `meta.json`, deliberately no live-map row).
+    async fn enroll_external_node(gateway: &GatewayHandle, slug: &str) -> String {
+        gateway
+            .lock()
+            .await
+            .register_external_node(slug, "user:web-api", "codex/0.144.3")
+            .unwrap()
+    }
+
+    /// All three driving tools refuse an external sid with the ONE shared
+    /// message, and it says what the session IS. "not found" would be a claim
+    /// the caller can immediately disprove — the sid is right there in
+    /// `session_list` — so it would read as a ccteam bug instead of an answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driving_tools_refuse_an_external_node_by_saying_what_it_is() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+
+        // The premise of the whole requirement: the caller can see it.
+        let listed = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert!(
+            listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["sid"] == json!(node)),
+            "the node is visible in session_list: {listed}"
+        );
+
+        let dispatch = run_session_dispatch(
+            &ambient(&principal, "alpha", json!({ "sid": node, "task": "do it" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        let collect = run_session_collect(
+            &ambient(&principal, "alpha", json!({ "sid": node })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        let stop = run_session_stop(
+            &ambient(&principal, "alpha", json!({ "sid": node })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        for (tool, message) in [
+            ("session_dispatch", &dispatch),
+            ("session_collect", &collect),
+            ("session_stop", &stop),
+        ] {
+            assert_eq!(
+                message,
+                &crate::external_nodes::not_driveable_error(tool, &node),
+                "{tool}: one shared refusal, named per tool"
+            );
+            assert!(
+                message.contains("delegation parent"),
+                "{tool}: says what it can still do: {message}"
+            );
+            assert!(!message.contains("not found"), "{tool}: {message}");
+            assert!(!message.contains("unknown session"), "{tool}: {message}");
+        }
+
+        // The ledger row is the reason, not the caller's auth tier.
+        let admin = run_session_dispatch(
+            &json!({ "sid": node, "task": "do it" }),
+            &gw,
+            McpCaller::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            admin,
+            crate::external_nodes::not_driveable_error("session_dispatch", &node)
+        );
+        // A refused stop is a no-op: the node keeps its place in the ledger.
+        assert!(gw.lock().await.is_external_node(&node));
+    }
+
+    /// The point of minting the node: a child spawned by a hand-started agent
+    /// hangs UNDER it instead of mounting as a root. An admin-tier caller (what
+    /// such a client authenticates as) declares its enrolled sid, which is
+    /// validated against `session_views()` — external rows included. The
+    /// guardrails then behave: a non-live parent is a legitimate depth-0 root
+    /// whose LIVE children are what the fan-out ceiling counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_declaring_an_external_parent_nests_the_child_at_depth_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+
+        let child = parse(
+            &run_session_spawn(
+                &json!({ "project": "alpha", "vendor": "claude", "parent_sid": node }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(child["parent_sid"], json!(node), "{child}");
+        assert_eq!(child["delegation_depth"], json!(1), "{child}");
+        assert_eq!(
+            child["caller"],
+            json!(format!("admin:{node}")),
+            "the echo names the resolved origin: {child}"
+        );
+
+        // Fan-out is counted from the live map, keyed on the parent sid — the
+        // node's own absence from that map contributes nothing, so the ceiling
+        // is enforced rather than silently passed.
+        gw.lock()
+            .await
+            .set_delegation_config(ccteam_core::DelegationConfig {
+                max_depth: 2,
+                max_children: 1,
+                max_delegated: 50,
+            });
+        let denied = run_session_spawn(
+            &json!({ "project": "alpha", "vendor": "claude", "parent_sid": node }),
+            &gw,
+            McpCaller::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("fan-out limit reached"), "{denied}");
+        assert!(denied.contains("already has 1 active children"), "{denied}");
+
+        // Acceptance comes from the ledger, never from faith in the declaration.
+        let unknown = run_session_spawn(
+            &json!({ "project": "alpha", "vendor": "claude", "parent_sid": "s999999" }),
+            &gw,
+            McpCaller::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert!(unknown.contains("not a live session"), "{unknown}");
+    }
+
+    /// Honest notifications. MCP is client-dial-in: ccteam cannot inject a
+    /// completion turn into a hand-started agent's conversation, so a task
+    /// delegated from an external parent must SAY the notification will not
+    /// come. Both sides are asserted — the distinction is the contract, not
+    /// either half on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_is_notify_deliverable_only_under_a_managed_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+
+        let external = parse(
+            &run_session_spawn(
+                &json!({
+                    "project": "alpha",
+                    "vendor": "claude",
+                    "parent_sid": node,
+                    "task": "review the diff"
+                }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            external["parent_sid"],
+            json!(node),
+            "the delegation edge is real: {external}"
+        );
+        assert_eq!(external["notify_deliverable"], json!(false), "{external}");
+        let hint = external["hint"].as_str().unwrap();
+        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        assert!(!hint.contains("you will be notified"), "{hint}");
+        // The armed watch agrees with the answer we just gave: the edge stays
+        // watched (so the child's completion keeps hitting the ledger) with no
+        // impossible delivery armed on it.
+        let watch =
+            ccteam_harness::read_delegation_watch(tmp.path(), external["sid"].as_str().unwrap())
+                .expect("the delegation edge is still watched");
+        assert_eq!(watch.parent_sid, node);
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Off, "{watch:?}");
+
+        // A managed parent has a transport, and keeps it.
+        let managed = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "vendor": "claude", "task": "review the diff" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(managed["notify_deliverable"], json!(true), "{managed}");
+        assert!(
+            managed["hint"]
+                .as_str()
+                .unwrap()
+                .contains("you will be notified"),
+            "{managed}"
+        );
+        let watch =
+            ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(watch.parent_sid, principal);
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+    }
+
+    /// The refusal sits BEHIND the ACL, not in front of it: a tenant who can see
+    /// the node reaches the honest message (the sid→project resolver knows both
+    /// indexes), while another tenant's node stays indistinguishable from an
+    /// unknown sid.
+    #[tokio::test]
+    async fn tenant_gets_the_refusal_only_for_a_node_in_its_own_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let (own, foreign) = {
+            let mut gw = gateway.lock().await;
+            (
+                gw.register_external_node("alice", "user:ualice", "codex/0.144.3")
+                    .unwrap(),
+                gw.register_external_node("bob", "user:ubob", "codex/0.144.3")
+                    .unwrap(),
+            )
+        };
+        let caller = McpCaller::User {
+            user_id: "ualice".into(),
+        };
+        for tool in ["session_dispatch", "session_collect", "session_stop"] {
+            let invoke = |sid: &str| {
+                let mut args = json!({ "sid": sid });
+                if tool == "session_dispatch" {
+                    args["task"] = json!("do not leak");
+                }
+                call(tool, args)
+            };
+            let mine = execute_session_tool_with_paths(
+                &invoke(&own),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            assert_eq!(mine["result"]["isError"], true, "{tool}: {mine}");
+            assert_eq!(
+                mine["result"]["content"][0]["text"],
+                json!(crate::external_nodes::not_driveable_error(tool, &own)),
+                "{tool}: {mine}"
+            );
+            let theirs = execute_session_tool_with_paths(
+                &invoke(&foreign),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            let unknown = execute_session_tool_with_paths(
+                &invoke("s999999"),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            assert_eq!(
+                theirs["result"]["content"][0]["text"], unknown["result"]["content"][0]["text"],
+                "{tool}: another tenant's node must stay indistinguishable from an unknown sid"
+            );
+        }
     }
 }
