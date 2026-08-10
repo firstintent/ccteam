@@ -232,6 +232,33 @@ fn bare_doctor_warns_when_claude_mcp_is_not_registered() {
     );
 }
 
+/// An entry left over from the shared-admin-token era must read as NOT
+/// registered so daemon start replaces it — otherwise a machine that upgraded
+/// would keep authenticating every hand-started `claude` as the same caller,
+/// silently, with doctor reporting PASS.
+#[test]
+fn bare_doctor_warns_when_the_claude_entry_still_carries_the_admin_token() {
+    let sb = sandbox();
+    std::fs::write(
+        &sb.claude_json,
+        json!({"mcpServers": {"ccteam": {
+            "type": "http",
+            "url": "http://127.0.0.1:7331/mcp",
+            "headers": {"Authorization": "Bearer ccteam:deadbeefcafe"},
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(sb.claude_config_home.join("credentials.json"), "{}").unwrap();
+
+    let (stdout, code) = run_bare_doctor(&sb);
+    assert!(
+        agent_row(&stdout, "claude").contains("MCP not registered"),
+        "legacy admin-token entry must read as not registered. stdout:\n{stdout}",
+    );
+    assert_eq!(code, 0, "MCP advisory must exit 0. stdout:\n{stdout}");
+}
+
 #[test]
 fn codex_config_created_by_mcp_registration_does_not_impersonate_login() {
     let sb = sandbox();
@@ -306,14 +333,15 @@ fn bare_doctor_fails_when_claude_version_probe_exits_nonzero() {
 fn bare_doctor_exits_zero_when_claude_binary_and_mcp_are_both_ok() {
     let sb = sandbox();
     // Pre-register MCP and provide auth so the consolidated Claude row PASSes.
-    // Readiness requires the CURRENT (HTTP + admin bearer) shape — a legacy
-    // stdio `mcp-serve` entry reads as not-registered so it gets repaired.
+    // Readiness requires the CURRENT (HTTP + enrollment bearer) shape — a legacy
+    // stdio `mcp-serve` entry, and equally a legacy `Bearer ccteam:<admin web
+    // token>` one, read as not-registered so they get repaired.
     std::fs::write(
         &sb.claude_json,
         json!({"mcpServers": {"ccteam": {
             "type": "http",
             "url": "http://127.0.0.1:7331/mcp",
-            "headers": {"Authorization": "Bearer ccteam:tok"},
+            "headers": {"Authorization": "Bearer ccteam-enroll:deadbeefdeadbeef:s3cret"},
         }}})
         .to_string(),
     )

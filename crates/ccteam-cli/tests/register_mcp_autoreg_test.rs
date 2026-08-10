@@ -89,6 +89,14 @@ impl Sandbox {
         self.kimi_home.join("mcp.json")
     }
 
+    /// Kimi's gate is "binary resolvable OR config already exists". Seeding an
+    /// empty-ish config is how a test gets all FIVE dialects written in one run
+    /// without pretending a kimi binary is installed.
+    fn seed_kimi_config(&self) {
+        std::fs::create_dir_all(&self.kimi_home).unwrap();
+        std::fs::write(self.kimi_config(), r#"{"mcpServers":{}}"#).unwrap();
+    }
+
     fn seed_siblings(&self) {
         std::fs::write(
             &self.claude_json,
@@ -138,6 +146,69 @@ impl Sandbox {
         std::fs::write(
             self.opencode_config(),
             r#"{"mcp":{"ccteam":{"type":"local","command":["/old/path/ccteam","internal","mcp-serve"]}}}"#,
+        )
+        .unwrap();
+    }
+
+    /// What a machine that ran a pre-enrollment ccteam looks like: the HTTP
+    /// shape is already current, but the bearer is the machine-wide SHARED admin
+    /// web token. All five dialects, kimi included, so the config-exists gate
+    /// also lets kimi through.
+    fn seed_legacy_admin_token_entries(&self) {
+        const LEGACY: &str = "Bearer ccteam:deadbeefcafe";
+        std::fs::write(
+            &self.claude_json,
+            serde_json::json!({
+                "userID": "keep-me",
+                "mcpServers": {
+                    "sibling": {"command": "sibling"},
+                    "ccteam": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:7331/mcp",
+                        "headers": {"Authorization": LEGACY},
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            self.codex_home.join("config.toml"),
+            format!(
+                "[mcp_servers.ccteam]\nurl = \"http://127.0.0.1:7331/mcp\"\n\
+                 [mcp_servers.ccteam.http_headers]\nAuthorization = \"{LEGACY}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(self.grok_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            self.grok_config(),
+            format!(
+                "[mcp_servers.ccteam]\nurl = \"http://127.0.0.1:7331/mcp\"\nenabled = true\n\
+                 [mcp_servers.ccteam.headers]\nAuthorization = \"{LEGACY}\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(self.opencode_config().parent().unwrap()).unwrap();
+        std::fs::write(
+            self.opencode_config(),
+            serde_json::json!({"mcp": {"ccteam": {
+                "type": "remote",
+                "url": "http://127.0.0.1:7331/mcp",
+                "enabled": true,
+                "headers": {"Authorization": LEGACY},
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&self.kimi_home).unwrap();
+        std::fs::write(
+            self.kimi_config(),
+            serde_json::json!({"mcpServers": {"ccteam": {
+                "url": "http://127.0.0.1:7331/mcp",
+                "headers": {"Authorization": LEGACY},
+            }}})
+            .to_string(),
         )
         .unwrap();
     }
@@ -220,7 +291,7 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
     let claude: Value =
         serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
     assert_eq!(claude["mcpServers"]["sibling"]["command"], "sibling");
-    // One transport for all five vendors: HTTP + admin bearer, no stdio child.
+    // One transport for all five vendors: HTTP + enrollment bearer, no stdio child.
     assert_eq!(claude["mcpServers"]["ccteam"]["type"], "http");
     assert!(claude["mcpServers"]["ccteam"]["url"].is_string());
     assert!(claude["mcpServers"]["ccteam"]
@@ -261,6 +332,156 @@ fn auto_registration_is_gated_idempotent_and_merge_preserving() {
     assert!(sb.ccteam_home.starts_with(&sb.root));
 }
 
+/// Read each dialect's `ccteam` Authorization header, in the shape that dialect
+/// stores it. Panics with the file body when the entry is missing, because a
+/// silently absent entry is the failure mode this suite exists to catch.
+fn authorization_headers(sb: &Sandbox) -> Vec<(&'static str, String)> {
+    let json_at = |path: &Path, container: &str| -> String {
+        let body = std::fs::read_to_string(path).unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        v[container]["ccteam"]["headers"]["Authorization"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no ccteam Authorization in {}: {body}", path.display()))
+            .to_string()
+    };
+    let toml_at = |path: &Path, header_key: &str| -> String {
+        let body = std::fs::read_to_string(path).unwrap();
+        let root: toml::Table = toml::from_str(&body).unwrap();
+        root["mcp_servers"]["ccteam"][header_key]["Authorization"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no ccteam Authorization in {}: {body}", path.display()))
+            .to_string()
+    };
+    vec![
+        ("claude", json_at(&sb.claude_json, "mcpServers")),
+        // Codex's header key is `http_headers`; every other dialect uses `headers`.
+        (
+            "codex",
+            toml_at(&sb.codex_home.join("config.toml"), "http_headers"),
+        ),
+        ("grok", toml_at(&sb.grok_config(), "headers")),
+        ("opencode", json_at(&sb.opencode_config(), "mcp")),
+        ("kimi", json_at(&sb.kimi_config(), "mcpServers")),
+    ]
+}
+
+/// The identity written into a vendor's global config must be an ENROLLMENT
+/// credential, never the admin web token: that file is shared by every process
+/// the vendor ever starts, so an admin token there made every hand-started
+/// `claude`/`codex`/`grok` the same caller — no delegation parent, no project of
+/// its own. One credential covers all five dialects, and re-registering must not
+/// mint a second one (daemon start rewrites five files on every restart).
+#[test]
+fn every_dialect_carries_one_stable_machine_user_enrollment_bearer() {
+    let sb = Sandbox::new();
+    sb.seed_siblings();
+    sb.seed_kimi_config();
+
+    let results = parse_output(&sb.run());
+    for row in results["results"].as_array().unwrap() {
+        assert_eq!(
+            row["status"], "registered",
+            "all five dialects must be written: {row}"
+        );
+    }
+
+    let creds = ccteam_core::enroll::list_in(&sb.ccteam_home);
+    assert_eq!(creds.len(), 1, "one machine credential, not one per vendor");
+    let cred = &creds[0];
+    assert_eq!(cred.scope, ccteam_core::enroll::EnrollScope::User);
+    assert_eq!(
+        cred.owner, "user:web-api",
+        "the machine credential belongs to this host's admin web identity"
+    );
+    let expected = format!("Bearer {}", cred.bearer());
+
+    let before = authorization_headers(&sb);
+    for (vendor, value) in &before {
+        assert_eq!(
+            value, &expected,
+            "{vendor} must carry the enrollment bearer"
+        );
+        assert!(
+            !value.starts_with("Bearer ccteam:"),
+            "{vendor} still carries the shared admin-token form: {value}"
+        );
+    }
+
+    // Byte-identical on re-registration, and still ONE credential: an idempotent
+    // repair pass that re-minted would invalidate every config it just wrote.
+    let bodies: Vec<String> = [
+        sb.claude_json.clone(),
+        sb.codex_home.join("config.toml"),
+        sb.grok_config(),
+        sb.opencode_config(),
+        sb.kimi_config(),
+    ]
+    .iter()
+    .map(|p| std::fs::read_to_string(p).unwrap())
+    .collect();
+    parse_output(&sb.run());
+    for (path, body) in [
+        sb.claude_json.clone(),
+        sb.codex_home.join("config.toml"),
+        sb.grok_config(),
+        sb.opencode_config(),
+        sb.kimi_config(),
+    ]
+    .iter()
+    .zip(&bodies)
+    {
+        assert_eq!(
+            &std::fs::read_to_string(path).unwrap(),
+            body,
+            "second registration rewrote {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        ccteam_core::enroll::list_in(&sb.ccteam_home).len(),
+        1,
+        "re-registration must not mint a second machine credential"
+    );
+
+    // The user's own sibling servers are untouched by the credential swap.
+    let claude: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
+    assert_eq!(claude["mcpServers"]["sibling"]["command"], "sibling");
+    let codex: toml::Table =
+        toml::from_str(&std::fs::read_to_string(sb.codex_home.join("config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        codex["mcp_servers"]["sibling"]["command"].as_str(),
+        Some("sibling")
+    );
+}
+
+/// A machine that upgraded still has `Bearer ccteam:<admin web token>` in five
+/// config files. Nobody edits those by hand, so the predicate must read them as
+/// NOT registered and daemon start must replace them in place — no migration
+/// code, per pre-v1.0 discipline.
+#[test]
+fn upgrade_replaces_the_legacy_admin_token_bearer_in_every_dialect() {
+    let sb = Sandbox::new();
+    sb.seed_legacy_admin_token_entries();
+
+    parse_output(&sb.run());
+
+    let cred = ccteam_core::enroll::list_in(&sb.ccteam_home)
+        .into_iter()
+        .next()
+        .expect("registration minted the machine credential");
+    let expected = format!("Bearer {}", cred.bearer());
+    for (vendor, value) in authorization_headers(&sb) {
+        assert_eq!(value, expected, "{vendor} kept the stale admin bearer");
+    }
+    // Merge, never clobber: the swap does not disturb unrelated keys/servers.
+    let claude: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sb.claude_json).unwrap()).unwrap();
+    assert_eq!(claude["userID"], "keep-me");
+    assert_eq!(claude["mcpServers"]["sibling"]["command"], "sibling");
+}
+
 /// The upgrade path for EXISTING users: nobody edits `~/.claude.json` by hand.
 /// Daemon start (`ccteam start` / `daemon restart` / the restart `ccteam update`
 /// performs) runs this same auto-registration unconditionally, so a legacy stdio
@@ -281,8 +502,8 @@ fn upgrade_rewrites_legacy_stdio_entries_to_http_for_every_vendor() {
     assert!(
         entry["headers"]["Authorization"]
             .as_str()
-            .is_some_and(|v| v.starts_with("Bearer ccteam:")),
-        "claude entry must carry the admin bearer: {entry}"
+            .is_some_and(|v| v.starts_with("Bearer ccteam-enroll:")),
+        "claude entry must carry the enrollment bearer: {entry}"
     );
     // The stdio child is gone — no leftover key can combine with `url`.
     for stale in ["command", "args", "env"] {

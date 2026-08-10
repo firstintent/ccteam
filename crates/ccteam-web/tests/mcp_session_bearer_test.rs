@@ -548,7 +548,19 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
     // thread/start fail with `url is not supported for stdio`.
     let codex_home = tmp.path().join("codex-home");
     let config_toml = codex_home.join("config.toml");
-    ccteam_core::mcp_register::install_codex_mcp_into(&config_toml, &url, TOKEN_HEX).unwrap();
+    // The global entry's IDENTITY is irrelevant here — what this test needs is
+    // that it is HTTP, so Codex's deep merge of global + per-thread tables does
+    // not reject a mixed transport. It still has to be a credential the writer
+    // accepts, so mint a throwaway enrollment one under the temp root.
+    let global_bearer = ccteam_core::enroll::mint_in(
+        tmp.path(),
+        ccteam_core::enroll::EnrollScope::User,
+        "user:web-api",
+        None,
+    )
+    .unwrap()
+    .bearer();
+    ccteam_core::mcp_register::install_codex_mcp_into(&config_toml, &url, &global_bearer).unwrap();
 
     let thread_config =
         ccteam_harness::execution::mcp_config::SessionMcpEndpoint::at(&url, &sid, &secret)

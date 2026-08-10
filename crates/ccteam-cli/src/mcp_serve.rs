@@ -59,27 +59,46 @@ pub(crate) async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -
     Err(anyhow!("mcp.sock forwarding is unix-only"))
 }
 
+/// What every global vendor registration carries: the machine-user ENROLLMENT
+/// credential (`ccteam-enroll:<id>:<secret>`), owned by this machine's admin web
+/// identity — the same `user:web-api` tag `identity::owner_tag` stamps on
+/// anything that console creates, so a hand-started vendor session and the web
+/// console are one principal instead of two.
+///
+/// It replaces the admin web token, which a vendor's global config turned into a
+/// machine-wide SHARED identity: every hand-started `claude`/`codex`/`grok`
+/// authenticated as the same caller, so none could be a delegation parent and
+/// none had a project of its own. `ensure_user_credential` is idempotent per
+/// owner, so the five writes below — and every later daemon restart — see one
+/// stable value; minting per call would rewrite five config files on every
+/// start.
+fn enroll_bearer(paths: &CcteamPaths) -> Result<String> {
+    let owner = ccteam_core::identity::owner_tag(ccteam_core::identity::ADMIN_WEB_ID, true);
+    Ok(ccteam_core::enroll::ensure_user_credential(paths, &owner)?.bearer())
+}
+
 /// `ccteam config` — register the ccteam MCP server in `~/.claude.json`.
 pub fn install_mcp_into(
     claude_json: &std::path::Path,
     mcp_http_url: &str,
-    admin_token: &str,
+    bearer: &str,
 ) -> Result<()> {
-    ccteam_core::mcp_register::install_mcp_into(claude_json, mcp_http_url, admin_token)
+    ccteam_core::mcp_register::install_mcp_into(claude_json, mcp_http_url, bearer)
 }
 
 /// Production path for Claude MCP install: like every other vendor, the global
 /// `~/.claude.json` entry points at the daemon's HTTP `/mcp` endpoint and
-/// authenticates with the admin web token, so a plain `claude` main session can
-/// orchestrate. ccteam-managed Claude sessions override the same-named entry via
-/// `--mcp-config` with their per-session bearer.
+/// carries the machine-user enrollment credential ([`enroll_bearer`]), so a
+/// plain `claude` main session is a first-class caller. ccteam-managed Claude
+/// sessions override the same-named entry via `--mcp-config` with their
+/// per-session bearer.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let bearer = enroll_bearer(&paths)?;
     let mcp_http_url =
         ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
-    install_mcp_into(&claude_json, &mcp_http_url, &admin_token)?;
+    install_mcp_into(&claude_json, &mcp_http_url, &bearer)?;
     Ok(claude_json)
 }
 
@@ -87,14 +106,14 @@ pub fn install_mcp() -> Result<std::path::PathBuf> {
 pub fn install_codex_mcp_into(
     config_toml: &std::path::Path,
     mcp_http_url: &str,
-    admin_token: &str,
+    bearer: &str,
 ) -> Result<()> {
-    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, mcp_http_url, admin_token)
+    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, mcp_http_url, bearer)
 }
 
 /// Production path for Codex MCP install. Unlike Claude's historical global
-/// stdio entry, Codex uses the daemon's HTTP MCP endpoint. The global entry is
-/// authenticated with the admin web token; ccteam-managed Codex threads
+/// stdio entry, Codex uses the daemon's HTTP MCP endpoint. The global entry
+/// carries the machine-user enrollment credential; ccteam-managed Codex threads
 /// override that header with their per-session bearer.
 pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     let codex_home = std::env::var_os("CODEX_HOME")
@@ -103,25 +122,25 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
         .ok_or_else(|| anyhow!("cannot resolve CODEX_HOME or ~/.codex (no home dir)"))?;
     let config_toml = codex_home.join("config.toml");
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let bearer = enroll_bearer(&paths)?;
     let mcp_http_url =
         ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
-    install_codex_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
+    install_codex_mcp_into(&config_toml, &mcp_http_url, &bearer)?;
     Ok(config_toml)
 }
 
 /// Production path for Grok CLI MCP install (v0.9.3 vendor symmetry): the
-/// global `~/.grok/config.toml` entry authenticates with the admin web token
-/// so a plain `grok` main session can orchestrate; ccteam-managed grok
-/// sessions keep their ACP-injected per-session principal (same-name dedup,
-/// injected server wins — real-machine verified).
+/// global `~/.grok/config.toml` entry carries the machine-user enrollment
+/// credential so a plain `grok` main session is a first-class caller;
+/// ccteam-managed grok sessions keep their ACP-injected per-session principal
+/// (same-name dedup, injected server wins — real-machine verified).
 pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
     let config_toml = ccteam_core::mcp_register::resolve_grok_config_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let bearer = enroll_bearer(&paths)?;
     let mcp_http_url =
         ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
-    ccteam_core::mcp_register::install_grok_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
+    ccteam_core::mcp_register::install_grok_mcp_into(&config_toml, &mcp_http_url, &bearer)?;
     Ok(config_toml)
 }
 
@@ -131,29 +150,25 @@ pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
 pub fn install_opencode_mcp() -> Result<std::path::PathBuf> {
     let opencode_json = ccteam_core::mcp_register::resolve_opencode_config_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let bearer = enroll_bearer(&paths)?;
     let mcp_http_url =
         ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
-    ccteam_core::mcp_register::install_opencode_mcp_into(
-        &opencode_json,
-        &mcp_http_url,
-        &admin_token,
-    )?;
+    ccteam_core::mcp_register::install_opencode_mcp_into(&opencode_json, &mcp_http_url, &bearer)?;
     Ok(opencode_json)
 }
 
 /// Production path for Kimi Code MCP install (vendor symmetry): the global
-/// `$KIMI_CODE_HOME/mcp.json` entry authenticates with the admin web token so
-/// a plain `kimi` main session can orchestrate; ccteam-managed kimi sessions
-/// keep their ACP-injected per-session principal (same-name dedup posture as
-/// grok/opencode).
+/// `$KIMI_CODE_HOME/mcp.json` entry carries the machine-user enrollment
+/// credential so a plain `kimi` main session is a first-class caller;
+/// ccteam-managed kimi sessions keep their ACP-injected per-session principal
+/// (same-name dedup posture as grok/opencode).
 pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
     let mcp_json = ccteam_core::mcp_register::resolve_kimi_config_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
+    let bearer = enroll_bearer(&paths)?;
     let mcp_http_url =
         ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
-    ccteam_core::mcp_register::install_kimi_mcp_into(&mcp_json, &mcp_http_url, &admin_token)?;
+    ccteam_core::mcp_register::install_kimi_mcp_into(&mcp_json, &mcp_http_url, &bearer)?;
     Ok(mcp_json)
 }
 
@@ -267,11 +282,16 @@ mod tests {
         }
     }
 
+    /// The bearer these seams forward is an ENROLLMENT credential, not the
+    /// admin web token — the global config is a shared file, so what it carries
+    /// must identify whose it is and grant nothing by itself.
+    const ENROLL_BEARER: &str = "ccteam-enroll:deadbeefdeadbeef:s3cret";
+
     #[test]
-    fn install_mcp_into_writes_http_url_and_admin_header() {
+    fn install_mcp_into_writes_http_url_and_enroll_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", "admin-token").unwrap();
+        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", ENROLL_BEARER).unwrap();
         let body = std::fs::read_to_string(&claude_json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         let entry = &v["mcpServers"]["ccteam"];
@@ -279,7 +299,7 @@ mod tests {
         assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
         assert_eq!(
             entry["headers"]["Authorization"],
-            "Bearer ccteam:admin-token"
+            format!("Bearer {ENROLL_BEARER}")
         );
         // Vendor symmetry: no global registration spawns an `mcp-serve` child.
         assert!(entry.get("command").is_none());
@@ -295,7 +315,7 @@ mod tests {
             r#"{"userID": "rob", "mcpServers": {"playwright": {"command": "npx"}}}"#,
         )
         .unwrap();
-        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "tok").unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(v["userID"], "rob");
@@ -307,10 +327,10 @@ mod tests {
     }
 
     #[test]
-    fn install_codex_mcp_into_writes_http_url_and_admin_header() {
+    fn install_codex_mcp_into_writes_http_url_and_enroll_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
-        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "admin-token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", ENROLL_BEARER).unwrap();
         let body = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(
@@ -321,7 +341,7 @@ mod tests {
             v["mcp_servers"]["ccteam"]["http_headers"]["Authorization"]
                 .as_str()
                 .unwrap(),
-            "Bearer ccteam:admin-token"
+            format!("Bearer {ENROLL_BEARER}")
         );
         assert!(v["mcp_servers"]["ccteam"].get("command").is_none());
     }
@@ -335,7 +355,7 @@ mod tests {
             "model = \"gpt-5\"\n\n[mcp_servers.foo]\ncommand = \"foo-server\"\nargs = [\"--flag\"]\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "tok").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(v["model"].as_str().unwrap(), "gpt-5");
@@ -362,7 +382,7 @@ mod tests {
             "[mcp_servers.ccteam]\ncommand = \"/old/bin/ccteam\"\nargs = [\"mcp-serve\"]\n\n[mcp_servers.playwright]\ncommand = \"npx\"\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "new-token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let first = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&first).unwrap();
         assert_eq!(
@@ -375,7 +395,7 @@ mod tests {
             v["mcp_servers"]["playwright"]["command"].as_str().unwrap(),
             "npx"
         );
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "new-token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let second = std::fs::read_to_string(&config_toml).unwrap();
         assert_eq!(first, second);
     }
@@ -385,7 +405,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
         assert!(!config_toml.exists());
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "tok").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         assert!(config_toml.exists());
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
