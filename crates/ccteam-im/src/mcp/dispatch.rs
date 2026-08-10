@@ -147,6 +147,35 @@ impl McpDispatch {
         }
     }
 
+    /// Is this Ambient caller an EXTERNAL ledger node rather than a session
+    /// ccteam spawned?
+    ///
+    /// The internal bus (`interaction/ask` / `permission/ask`) is refused for
+    /// the front-door tiers, which used to be the same thing as "not one of
+    /// ccteam's own sessions". Enrollment broke that equivalence: a
+    /// hand-started agent now arrives Ambient too, holding a principal ccteam
+    /// minted for its node. Legitimate for `session_*` — that is the whole
+    /// point of enrolling — but the ask bus is how ccteam's OWN sessions get a
+    /// human in front of a blocked tool call, and an outside process should not
+    /// be able to raise a prompt in the operator's IM that is indistinguishable
+    /// from one.
+    ///
+    /// Read from the LEDGER, not from the tier, so any future caller class that
+    /// arrives with an external node's sid is covered without another patch.
+    async fn caller_is_external_node(&self, req: &Value) -> bool {
+        let Some(sid) = req
+            .pointer("/params/arguments/_caller_sid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let Some(gateway) = self.gateway.as_ref() else {
+            return false;
+        };
+        gateway.lock().await.is_external_node(sid)
+    }
+
     /// Dispatch one JSON-RPC request as `caller`. Order matches the historical
     /// `handle_mcp_socket_connection` intercept chain exactly:
     /// `interaction/ask` → `permission/ask` → `chat_send_file` →
@@ -159,7 +188,7 @@ impl McpDispatch {
             strip_untrusted_caller_args(&mut req);
         }
         if is_interaction_ask_call(&req) {
-            if caller.is_front_door() {
+            if caller.is_front_door() || self.caller_is_external_node(&req).await {
                 return Some(internal_bus_not_exposed(&req));
             }
             Some(
@@ -172,7 +201,7 @@ impl McpDispatch {
                 .await,
             )
         } else if is_permission_ask_call(&req) {
-            if caller.is_front_door() {
+            if caller.is_front_door() || self.caller_is_external_node(&req).await {
                 return Some(internal_bus_not_exposed(&req));
             }
             Some(
@@ -6658,6 +6687,60 @@ mod session_tool_tests {
             .await
             .register_external_node(slug, "user:web-api", "codex/0.144.3")
             .unwrap()
+    }
+
+    /// The ask bus is for ccteam's OWN sessions. Enrollment made "Ambient" stop
+    /// meaning that — a hand-started agent now arrives Ambient too — so the
+    /// refusal reads the ledger instead of the tier. Without this, an outside
+    /// process could raise a prompt in the operator's IM indistinguishable from
+    /// one a managed session raised on a blocked tool call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ask_bus_refuses_an_external_node_but_serves_a_managed_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+        let dispatch = McpDispatch {
+            paths: CcteamPaths {
+                root: tmp.path().to_path_buf(),
+                projects_root: tmp.path().join("projects"),
+            },
+            sink: None,
+            pending: None,
+            gateway: Some(std::sync::Arc::clone(&gw)),
+        };
+
+        for method in ["interaction/ask", "permission/ask"] {
+            let from_node = dispatch
+                .dispatch_as(
+                    json!({"jsonrpc":"2.0","id":1,"method":method,
+                           "params":{"arguments":{"_caller_sid": node}}}),
+                    McpCaller::Ambient,
+                )
+                .await
+                .expect("a request gets a response");
+            assert!(
+                from_node["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not available on this transport")),
+                "{method} from an external node must be refused: {from_node}"
+            );
+
+            // A managed session's own principal still reaches the bus — the
+            // refusal must narrow to the new caller class, not close the door
+            // HITL depends on.
+            let from_managed = dispatch
+                .dispatch_as(
+                    json!({"jsonrpc":"2.0","id":2,"method":method,
+                           "params":{"arguments":{"_caller_sid": principal}}}),
+                    McpCaller::Ambient,
+                )
+                .await
+                .expect("a request gets a response");
+            let refused = from_managed["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not available on this transport"));
+            assert!(!refused, "{method} from a managed session: {from_managed}");
+        }
     }
 
     /// All three driving tools refuse an external sid with the ONE shared
