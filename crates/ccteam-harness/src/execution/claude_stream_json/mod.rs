@@ -387,23 +387,24 @@ fn spawn_status_tap(
                         // notice the tools are missing.
                         if let Some(dead) = dead_ccteam_tool_face(&sys) {
                             if !tool_face_healed.swap(true, Ordering::SeqCst) {
-                                let transport = Arc::clone(&transport);
-                                let sid = sid.clone();
-                                tokio::spawn(async move {
-                                    match reconnect_ccteam_mcp(&transport).await {
-                                        Ok(()) => tracing::info!(
-                                            session = %sid,
-                                            status = %dead,
-                                            "stream-json: ccteam tool face was not connected at init — reconnected"
-                                        ),
-                                        Err(err) => tracing::warn!(
-                                            session = %sid,
-                                            status = %dead,
-                                            error = %err,
-                                            "stream-json: ccteam tool face is down and could not be rebuilt"
-                                        ),
-                                    }
-                                });
+                                // Deliberately NOT healed by an in-place
+                                // reconnect any more. That reconnect re-resolves
+                                // the vendor's server list without honouring
+                                // `--strict-mcp-config`, so it would attach the
+                                // global same-named entry and this session would
+                                // spend the rest of its life calling with the
+                                // MACHINE's credential instead of its own —
+                                // wrong parent, wrong project scope, and nothing
+                                // visibly broken (see `rebuild_tool_surface`).
+                                // A session with no tools is a smaller problem
+                                // than a session wearing someone else's
+                                // identity, and this says so where an operator
+                                // will read it.
+                                tracing::warn!(
+                                    session = %sid,
+                                    status = %dead,
+                                    "stream-json: ccteam tool face was not connected at init and is NOT auto-reconnected (that would swap this session's principal for the machine credential) — send `/new` to restore it"
+                                );
                             }
                         }
                     }
@@ -570,30 +571,6 @@ fn dead_ccteam_tool_face(sys: &protocol::SystemMsg) -> Option<String> {
         .find(|server| server.name == crate::execution::mcp_config::CCTEAM_MCP_SERVER_NAME)
         .filter(|server| !server.is_connected())
         .map(|server| server.status.clone())
-}
-
-/// Ask a live claude to re-dial ccteam's MCP server — the `mcp_reconnect`
-/// control request, which is the exact action the TUI's `/mcp` → Reconnect
-/// item performs (same `serverName` argument, same handler). This is why the
-/// tool face is rebuildable for stream-json and for nothing else: no other
-/// vendor exposes a live "reconnect this MCP server" call.
-async fn reconnect_ccteam_mcp(transport: &StreamJsonTransport) -> Result<(), HarnessError> {
-    let body = transport
-        .request_control(
-            "mcp_reconnect",
-            json!({ "serverName": crate::execution::mcp_config::CCTEAM_MCP_SERVER_NAME }),
-            init_timeout(),
-        )
-        .await
-        .map_err(|err| HarnessError::Io(format!("mcp_reconnect: {err:#}")))?;
-    if body.subtype == "success" {
-        Ok(())
-    } else {
-        Err(HarnessError::Io(format!(
-            "mcp_reconnect rejected: {}",
-            body.error.unwrap_or_else(|| body.subtype.clone())
-        )))
-    }
 }
 
 /// Query claude's REAL context accounting via the `get_context_usage`
@@ -1594,15 +1571,45 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         crate::EventAttachment::Rebuildable
     }
 
+    /// **This protocol cannot rebuild its tool face in place, and trying was
+    /// worse than saying so.**
+    ///
+    /// `mcp_reconnect` looked like the perfect fit — the same control request
+    /// the TUI's `/mcp` → Reconnect item performs. Measured on this machine
+    /// (two rival servers both registered as `ccteam`, one via `--mcp-config`
+    /// and one in the vendor's global config): before the reconnect every
+    /// phase, `tools/call` included, went to the CURATED entry. After it, the
+    /// vendor re-resolved its server list WITHOUT honouring
+    /// `--strict-mcp-config`, connected the global same-named entry, and routed
+    /// every subsequent `tools/call` there.
+    ///
+    /// So an in-place reconnect silently replaces the session's own
+    /// `(sid, secret)` principal with whatever credential the machine's global
+    /// config carries. That is not a degraded tool face, it is a different
+    /// caller: children mount under the wrong parent, the project scope is not
+    /// the session's own, and nothing in the session looks broken. It was the
+    /// cause of the long-unexplained "a managed session's calls arrive as
+    /// admin" behaviour — ccteam was doing it to itself, once per session, at
+    /// first activation.
+    ///
+    /// A respawn re-reads the curated `--mcp-config`, so it is the only honest
+    /// answer here.
     async fn rebuild_tool_surface(
         &self,
         h: &ThreadHandle,
     ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
-        let live = self.lookup(&h.identity).ok_or_else(|| {
+        // Still resolve the session: "not live" is a different answer from
+        // "live, but not rebuildable", and the caller prints them differently.
+        let _live = self.lookup(&h.identity).ok_or_else(|| {
             HarnessError::Io(format!("stream-json session {} is not live", h.identity))
         })?;
-        reconnect_ccteam_mcp(&live.transport).await?;
-        Ok(crate::ToolSurfaceRebuild::Rebuilt)
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "claude's in-place MCP reconnect re-resolves servers from the vendor's \
+                     global config, which would replace this session's own principal with the \
+                     machine credential (measured). Send `/new` to restore the tool face with \
+                     this session's identity intact."
+                .to_string(),
+        })
     }
 
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {

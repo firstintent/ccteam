@@ -297,7 +297,7 @@ async fn spawn_init_and_turn_emits_answer() {
 /// `mcp_reconnect` control request (the same action the TUI's `/mcp` performs).
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn dead_tool_face_at_init_is_reconnected() {
+async fn dead_tool_face_at_init_is_reported_not_silently_reconnected() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());
     let ctl_log = tmp.path().join("ctl.log");
@@ -319,23 +319,18 @@ async fn dead_tool_face_at_init_is_reconnected() {
     let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
     let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
 
-    // The heal runs off the status tap, so give it a bounded moment to land.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let mut sent = false;
-    while tokio::time::Instant::now() < deadline {
-        if std::fs::read_to_string(&ctl_log)
+    // Give the status tap the same bounded moment the old auto-heal had, then
+    // assert nothing was sent. A dead tool face is reported, never "healed" by
+    // an in-place reconnect: that reconnect attaches the machine's global
+    // `ccteam` entry, so the session would trade "no tools" for "someone
+    // else's identity" — wrong parent, wrong project, nothing visibly broken.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !std::fs::read_to_string(&ctl_log)
             .unwrap_or_default()
             .lines()
-            .any(|line| line.trim() == "mcp_reconnect")
-        {
-            sent = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        sent,
-        "a failed ccteam tool face must trigger mcp_reconnect; control log: {:?}",
+            .any(|line| line.trim() == "mcp_reconnect"),
+        "a dead tool face must NOT be auto-reconnected; control log: {:?}",
         std::fs::read_to_string(&ctl_log).unwrap_or_default()
     );
 
@@ -344,12 +339,12 @@ async fn dead_tool_face_at_init_is_reconnected() {
     adapter.close_thread(&handle).await.unwrap();
 }
 
-/// …and the same rebuild is available on demand (what IM `/mcp` drives), so a
-/// tool face that dies after init — a daemon restart — is recoverable without
-/// respawning the session.
+/// …and the on-demand path (what IM `/mcp` drives) answers the same way: it
+/// states that only a respawn reapplies the curated config, and sends no
+/// control request at all.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn rebuild_tool_surface_reconnects_on_demand() {
+async fn rebuild_tool_surface_refuses_in_place_and_sends_no_reconnect() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());
     let ctl_log = tmp.path().join("ctl.log");
@@ -369,14 +364,31 @@ async fn rebuild_tool_surface_reconnects_on_demand() {
     let outcome = adapter
         .rebuild_tool_surface(&handle)
         .await
-        .expect("live stream-json session rebuilds in place");
-    assert_eq!(outcome, ccteam_harness::ToolSurfaceRebuild::Rebuilt);
+        .expect("declaring a limitation is an answer, not an error");
+    match outcome {
+        ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason } => {
+            assert!(
+                reason.contains("/new"),
+                "say what restores the tool face: {reason:?}"
+            );
+            assert!(
+                reason.contains("principal") || reason.contains("credential"),
+                "say WHY an in-place reconnect is refused: {reason:?}"
+            );
+        }
+        other => panic!("stream-json must not claim an in-place rebuild: {other:?}"),
+    }
+    // The control request must NOT be sent. Measured on a real machine: it makes
+    // the vendor re-resolve its server list without honouring
+    // `--strict-mcp-config`, attach the global same-named `ccteam` entry, and
+    // route every later `tools/call` there — so the session spends the rest of
+    // its life calling with the MACHINE's credential instead of its own.
     assert!(
-        std::fs::read_to_string(&ctl_log)
+        !std::fs::read_to_string(&ctl_log)
             .unwrap_or_default()
             .lines()
             .any(|line| line.trim() == "mcp_reconnect"),
-        "rebuild must go over the vendor's control channel"
+        "an in-place reconnect swaps this session's identity and must never be sent"
     );
 
     std::env::remove_var("FAKE_SJ_CTL_LOG");
