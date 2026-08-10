@@ -48,6 +48,10 @@ pub mod latency;
 // `ccteam-web` can later mount `POST /mcp` without depending on
 // `ccteam-cli` (dependency direction: cli → web → im).
 pub mod mcp;
+// `Mcp-Session-Id` bindings: one identity per hand-started vendor PROCESS,
+// issued at `initialize` because a shared vendor config cannot tell two
+// processes apart. Twin of `principals` (managed sessions).
+pub mod native_bindings;
 // v0.8.6 Item 4 — Telegram bot-token onboarding (token validation +
 // owner chat_id capture). Wrapped by `ccteam config` (the IM-token menu
 // item); the former `ccteam-im-setup` skill's job moves into the CLI.

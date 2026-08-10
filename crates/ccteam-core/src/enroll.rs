@@ -172,7 +172,7 @@ pub fn list_in(root: &Path) -> Vec<EnrollCredential> {
             .collect(),
         Err(_) => Vec::new(),
     };
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|c| std::cmp::Reverse(c.created_at));
     out
 }
 
