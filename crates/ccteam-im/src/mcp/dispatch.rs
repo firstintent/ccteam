@@ -1895,7 +1895,7 @@ async fn run_session_spawn_at(
     }
     // Resolve only after validating the request facets: falling through to
     // scratch is a side effect and malformed spawns must not create projects.
-    let project_resolution = resolve_spawn_project(args, gateway, &caller, paths).await?;
+    let project_resolution = resolve_spawn_project(args, &caller, paths)?;
     let project = project_resolution.slug.clone();
     // v0.9.1 delegation-ergonomics — optional FIRST task: spawn+dispatch in one
     // call (the dominant flow; saves the second round-trip and closes the
@@ -2116,9 +2116,6 @@ async fn run_session_spawn_at(
     if let Some(t) = &title {
         body["title"] = serde_json::json!(t);
     }
-    if project_resolution.scratch {
-        body["note"] = serde_json::json!(SCRATCH_PROJECT_NOTE);
-    }
     // v0.9.1 — dispatch the optional first task through the SAME submit path
     // session_dispatch uses; its outcome (turn_id / status / inline result /
     // hint) merges into the spawn body so one call returns everything. The
@@ -2166,18 +2163,26 @@ async fn run_session_spawn(
 struct SpawnProjectResolution {
     slug: String,
     source: &'static str,
-    scratch: bool,
 }
 
-const SCRATCH_PROJECT_NOTE: &str = "spawned into the shared default project — pass `project` to target a specific workspace; `status` lists slugs";
-
-/// Resolve the MCP spawn project. Admin callers use the owner-pinned ladder:
-/// explicit project, caller cwd, sole catalog project, configured default,
-/// then lazily provisioned scratch. Ambient principals and tenants retain
-/// their existing identity-scoped behavior.
-async fn resolve_spawn_project(
+/// Resolve the MCP spawn project. Every rung must NAME the project the caller
+/// is actually bound to — explicit argument, the caller's own cwd, or the sole
+/// registered project (zero ambiguity). A caller with none of those is
+/// REFUSED and told which slugs exist.
+///
+/// There is deliberately no "daemon default" or lazily-provisioned scratch
+/// rung. Falling back to a project the caller never named is the same defect
+/// as the chat-side `current_project_for` fallback that was removed on
+/// 2026-07-28: it lands somebody else's agent — and its turns, cost and files
+/// — in a workspace they were never granted. This entry point was the one the
+/// sweep missed, and it fires exactly when identity is already degraded (an
+/// HTTP caller carries no cwd), so the two defects compounded: a session whose
+/// principal did not arrive spawned children into a shared workspace and
+/// reported success.
+///
+/// Ambient principals and tenants keep their identity-scoped behavior.
+fn resolve_spawn_project(
     args: &serde_json::Value,
-    gateway: &GatewayHandle,
     caller: &McpCaller,
     paths: Option<&CcteamPaths>,
 ) -> std::result::Result<SpawnProjectResolution, String> {
@@ -2193,7 +2198,6 @@ async fn resolve_spawn_project(
             slug: arg("_caller_slug")
                 .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
             source: "principal",
-            scratch: false,
         }),
         McpCaller::User { .. } => Ok(SpawnProjectResolution {
             slug: arg("project").ok_or_else(|| {
@@ -2207,117 +2211,32 @@ async fn resolve_spawn_project(
                 Some("sole") => "sole",
                 _ => "explicit",
             },
-            scratch: false,
         }),
         McpCaller::Admin => {
             if let Some(slug) = arg("project") {
                 return Ok(SpawnProjectResolution {
                     slug,
                     source: "explicit",
-                    scratch: false,
                 });
             }
             if let Some(slug) = arg("_caller_slug") {
                 return Ok(SpawnProjectResolution {
                     slug,
                     source: "cwd",
-                    scratch: false,
                 });
             }
             if let Some(slug) = sole_registered_project(paths) {
                 return Ok(SpawnProjectResolution {
                     slug,
                     source: "sole",
-                    scratch: false,
                 });
             }
-            let Some(paths) = paths else {
-                return Err(format!(
-                    "session_spawn: missing `project`{}",
-                    admin_project_catalog_hint(paths)
-                ));
-            };
-            let config = ccteam_core::load_ccteam_config(&paths.root)
-                .map_err(|err| format!("session_spawn: load project catalog: {err}"))?;
-            if let Some(slug) = config.default_project.as_deref().and_then(|configured| {
-                config
-                    .projects
-                    .iter()
-                    .any(|entry| entry.slug == configured)
-                    .then(|| configured.to_string())
-            }) {
-                return Ok(SpawnProjectResolution {
-                    slug,
-                    source: "configured",
-                    scratch: false,
-                });
-            }
-            provision_scratch_project(gateway, paths).await
+            Err(format!(
+                "session_spawn: missing `project` — name the workspace to spawn into{}",
+                admin_project_catalog_hint(paths)
+            ))
         }
     }
-}
-
-fn paths_refer_to_same_project(left: &std::path::Path, right: &std::path::Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
-}
-
-async fn provision_scratch_project(
-    gateway: &GatewayHandle,
-    paths: &CcteamPaths,
-) -> std::result::Result<SpawnProjectResolution, String> {
-    let scratch = paths.root.join("default_project");
-    // Serialize lookup + create + registration through the gateway lock so
-    // concurrent first spawns cannot mint two catalog entries for one path.
-    let mut gateway = gateway.lock().await;
-    let config = ccteam_core::load_ccteam_config(&paths.root)
-        .map_err(|err| format!("session_spawn: load project catalog: {err}"))?;
-    if let Some(existing) = config
-        .projects
-        .iter()
-        .find(|entry| paths_refer_to_same_project(&entry.path, &scratch))
-    {
-        gateway.register_project(existing.slug.clone(), existing.path.clone());
-        return Ok(SpawnProjectResolution {
-            slug: existing.slug.clone(),
-            source: "scratch",
-            scratch: true,
-        });
-    }
-
-    let slug = ccteam_core::pick_unused_project_slug(&paths.root, "default")
-        .map_err(|err| format!("session_spawn: choose scratch project slug: {err}"))?;
-    ccteam_core::bootstrap_project_at_dir(
-        paths,
-        &scratch,
-        &slug,
-        "(created by MCP session_spawn default)",
-        "dev",
-    )
-    .map_err(|err| format!("session_spawn: create scratch project: {err}"))?;
-    ccteam_core::scaffold_workflow_yaml(&scratch, false)
-        .map_err(|err| format!("session_spawn: create scratch workflow: {err}"))?;
-    ccteam_core::upsert_project_in_config(
-        &paths.root,
-        ccteam_core::ProjectEntry {
-            slug: slug.clone(),
-            path: scratch.clone(),
-            host: ccteam_core::LOCAL_HOST.to_string(),
-            remote_slug: None,
-            remote_path: None,
-            team: "dev".to_string(),
-            installed_at: chrono::Utc::now(),
-        },
-    )
-    .map_err(|err| format!("session_spawn: register scratch project: {err}"))?;
-    gateway.register_project(slug.clone(), scratch);
-    Ok(SpawnProjectResolution {
-        slug,
-        source: "scratch",
-        scratch: true,
-    })
 }
 
 /// MCP-DX-1 — enrich a spawn-create failure. An ADMIN caller naming an
@@ -5079,10 +4998,13 @@ mod session_tool_tests {
         assert!(err.contains("demo"), "{err}");
     }
 
-    /// MCP-DX-3 — invalid configured defaults skip to scratch; first use
-    /// provisions a real project and later uses reuse it by catalog path.
+    /// A caller that names no project and has no cwd is REFUSED, even when a
+    /// `default_project` is configured and a shared `default_project` dir is
+    /// available. Landing an unnamed caller in a workspace it was never
+    /// granted is the defect, not a convenience: nothing may be created and
+    /// the error must name the real slugs so the caller can pick one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admin_spawn_invalid_config_falls_back_to_scratch_and_reuses_path() {
+    async fn admin_spawn_without_project_basis_is_refused_and_creates_nothing() {
         ccteam_core::tool_surface::disable_tool_surface_bootstrap_for_tests();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -5090,39 +5012,31 @@ mod session_tool_tests {
             projects_root: tmp.path().join("projects"),
         };
         let alpha = seed_owned_project(&paths, "alpha", "user:web-api");
-        let default = seed_owned_project(&paths, "default", "user:web-api");
+        let beta = seed_owned_project(&paths, "beta", "user:web-api");
         let config_path = ccteam_core::ccteam_config_path(&paths.root);
         let mut yaml = std::fs::read_to_string(&config_path).unwrap();
-        yaml.push_str("default_project: missing\n");
+        yaml.push_str("default_project: beta\n");
         std::fs::write(&config_path, yaml).unwrap();
         let (gw, _principal) = dispatch_gateway(false, 0, &alpha).await;
-        gw.lock().await.register_project("default", default);
+        gw.lock().await.register_project("beta", beta);
 
-        let mut bodies = Vec::new();
-        for _ in 0..2 {
-            bodies.push(parse(
-                &run_session_spawn_at(
-                    &json!({"vendor": "claude"}),
-                    &gw,
-                    McpCaller::Admin,
-                    Some(&paths),
-                )
-                .await
-                .unwrap(),
-            ));
-        }
-        assert_eq!(bodies[0]["project_source"], "scratch", "{:?}", bodies[0]);
-        assert_eq!(bodies[1]["project_source"], "scratch", "{:?}", bodies[1]);
-        assert_eq!(bodies[0]["project"], bodies[1]["project"]);
-        assert!(bodies.iter().all(|body| body.get("note").is_some()));
+        let err = run_session_spawn_at(
+            &json!({"vendor": "claude"}),
+            &gw,
+            McpCaller::Admin,
+            Some(&paths),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("missing `project`"), "{err}");
+        assert!(err.contains("alpha"), "error names the catalog: {err}");
+        assert!(err.contains("beta"), "error names the catalog: {err}");
+        // The configured default was NOT silently used, and no scratch
+        // workspace was provisioned as a side effect of a refused spawn.
         let scratch = paths.root.join("default_project");
-        assert!(CcteamPaths::project_state_in(&scratch).is_file());
-        assert!(scratch.join(".ccteam/workflow.yaml").is_file());
+        assert!(!scratch.exists(), "no scratch project provisioned");
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
-        let at_path: Vec<_> = cfg.projects.iter().filter(|p| p.path == scratch).collect();
-        assert_eq!(at_path.len(), 1, "scratch path registered once: {cfg:?}");
-        assert_eq!(at_path[0].slug, bodies[0]["project"].as_str().unwrap());
-        assert_eq!(at_path[0].slug, "default2");
+        assert_eq!(cfg.projects.len(), 2, "catalog untouched: {cfg:?}");
     }
 
     /// MCP-DX-2 — with exactly ONE registered project, an admin spawn that
@@ -5156,7 +5070,7 @@ mod session_tool_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admin_spawn_project_source_covers_explicit_cwd_principal_and_configured() {
+    async fn admin_spawn_project_source_covers_explicit_cwd_and_principal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -5164,10 +5078,6 @@ mod session_tool_tests {
         };
         let alpha = seed_owned_project(&paths, "alpha", "user:web-api");
         let beta = seed_owned_project(&paths, "beta", "user:web-api");
-        let config_path = ccteam_core::ccteam_config_path(&paths.root);
-        let mut yaml = std::fs::read_to_string(&config_path).unwrap();
-        yaml.push_str("default_project: beta\n");
-        std::fs::write(&config_path, yaml).unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, &alpha).await;
         gw.lock().await.register_project("beta", beta);
 
@@ -5189,12 +5099,6 @@ mod session_tool_tests {
                 McpCaller::Ambient,
                 "principal",
                 "alpha",
-            ),
-            (
-                json!({"vendor":"claude"}),
-                McpCaller::Admin,
-                "configured",
-                "beta",
             ),
         ] {
             let body = parse(

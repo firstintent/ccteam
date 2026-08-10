@@ -96,6 +96,7 @@ async fn handle_post(
     // _caller_slug) so session_* principal auth matches the live session
     // (v0.9.0 W1 G4 — previously only role+secret were injected, so session_*
     // over HTTP failed closed with "no project scope").
+    log_call_identity(&auth, &req);
     let (caller, req) = match auth {
         McpAuth::Admin => (ccteam_im::mcp::McpCaller::Admin, req),
         McpAuth::User { user_id } => (ccteam_im::mcp::McpCaller::User { user_id }, req),
@@ -145,6 +146,34 @@ async fn handle_post(
         // Notifications (e.g. notifications/initialized) → 202 empty.
         None => StatusCode::ACCEPTED.into_response(),
     }
+}
+
+/// Record WHICH identity a tool call arrived with.
+///
+/// The tier a request authenticates as is the single fact that decides its
+/// delegation parent, its project scope and what it may reach — and until now
+/// it was the one fact nothing wrote down. A managed session whose vendor
+/// loaded the wrong `ccteam` MCP entry silently served its calls as the
+/// machine-wide admin bearer instead, and the only evidence was a delegation
+/// tree missing an edge. One line per tool call makes that answerable by
+/// reading the log rather than by reconstructing it.
+///
+/// Tool calls only: `initialize` / `tools/list` are discovery noise.
+fn log_call_identity(auth: &McpAuth, req: &Value) {
+    if !is_tool_call(req) {
+        return;
+    }
+    let tool = req
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let tier = match auth {
+        McpAuth::Admin => "admin".to_string(),
+        McpAuth::User { user_id } => format!("user:{user_id}"),
+        McpAuth::Session { sid, .. } => format!("session:{sid}"),
+    };
+    tracing::info!(%tier, %tool, "ccteam-web: POST /mcp tool call");
 }
 
 /// Who authenticated against `POST /mcp`.

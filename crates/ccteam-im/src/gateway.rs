@@ -6759,6 +6759,31 @@ impl Gateway {
                 tracing::warn!(session = %sid, "ccteam-im: tool-face rebuild timed out; the turn proceeds");
             }
         }
+        self.assert_principal_reached_the_session(&sid);
+    }
+
+    /// Did the session actually CALL with the credential ccteam minted for it?
+    ///
+    /// By first activation a healthy session has already spent its principal on
+    /// `initialize` + `tools/list`, so a principal with no recorded use means
+    /// the tool face it is holding authenticated as somebody else — in
+    /// practice a same-named `ccteam` entry from the host's global vendor
+    /// config. Nothing about the session looks broken when that happens: the
+    /// tools work, and only the consequences are visible (children mount as
+    /// roots, project scope is not the session's own, completion
+    /// notifications have nowhere to go).
+    ///
+    /// Warn-only, by the same rule as the rebuild above: a session with a
+    /// doubtful identity is still a session that can answer, and a spawn is
+    /// never failed on a diagnostic.
+    fn assert_principal_reached_the_session(&self, sid: &str) {
+        if self.principals.was_used(sid) {
+            return;
+        }
+        tracing::warn!(
+            session = %sid,
+            "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); check that the session's curated MCP config is the one its vendor loaded"
+        );
     }
 
     /// `/mcp` — rebuild the current session's ccteam TOOL FACE in place.

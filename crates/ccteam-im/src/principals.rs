@@ -29,7 +29,7 @@
 //! failure / stop_session          → forget     // the secret dies with it
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 /// How far along the session behind a principal is.
@@ -73,6 +73,16 @@ struct Principal {
 #[derive(Debug, Default)]
 pub struct SessionPrincipals {
     inner: RwLock<BTreeMap<String, Principal>>,
+    /// Sids whose principal has actually authenticated a request at least once.
+    ///
+    /// Minting a credential and handing it to a vendor does not prove the
+    /// vendor USES it: a same-named MCP entry from the host's own global
+    /// config can serve the session instead, and then everything still works
+    /// — the session just silently speaks with somebody else's identity, so
+    /// its children mount as roots and its project scope is not its own.
+    /// Recording first use turns that into a fact the gateway can check
+    /// instead of a failure only visible in the delegation graph days later.
+    used: RwLock<BTreeSet<String>>,
 }
 
 impl SessionPrincipals {
@@ -134,28 +144,54 @@ impl SessionPrincipals {
         if let Ok(mut map) = self.inner.write() {
             map.remove(sid);
         }
+        if let Ok(mut used) = self.used.write() {
+            used.remove(sid);
+        }
+    }
+
+    /// Has this sid's principal ever authenticated a request?
+    ///
+    /// `false` after the session has had a chance to build its tool face means
+    /// the credential ccteam minted for it is not the one it is calling with.
+    pub fn was_used(&self, sid: &str) -> bool {
+        self.used
+            .read()
+            .map(|used| used.contains(sid))
+            .unwrap_or(false)
     }
 
     /// Resolve `(sid, secret)` to an identity. Constant-time secret compare;
     /// an unknown sid and a wrong secret are indistinguishable to the caller.
+    ///
+    /// A successful verification also records first use (see [`Self::used`]).
     pub fn verify(&self, sid: &str, presented_secret: &str) -> Option<PrincipalMatch> {
         if sid.is_empty() || presented_secret.is_empty() {
             return None;
         }
-        let map = self.inner.read().ok()?;
-        let principal = map.get(sid)?;
-        if principal.secret.is_empty()
-            || !ccteam_core::session_secret::ct_eq(&principal.secret, presented_secret)
-        {
-            return None;
+        let matched = {
+            let map = self.inner.read().ok()?;
+            let principal = map.get(sid)?;
+            if principal.secret.is_empty()
+                || !ccteam_core::session_secret::ct_eq(&principal.secret, presented_secret)
+            {
+                return None;
+            }
+            PrincipalMatch {
+                sid: sid.to_string(),
+                slug: principal.slug.clone(),
+                role: principal.role.clone(),
+                depth: principal.depth,
+                state: principal.state,
+            }
+        };
+        // Read-only on the hot path: only the FIRST verification per sid takes
+        // the write lock.
+        if !self.was_used(sid) {
+            if let Ok(mut used) = self.used.write() {
+                used.insert(sid.to_string());
+            }
         }
-        Some(PrincipalMatch {
-            sid: sid.to_string(),
-            slug: principal.slug.clone(),
-            role: principal.role.clone(),
-            depth: principal.depth,
-            state: principal.state,
-        })
+        Some(matched)
     }
 
     #[cfg(test)]
@@ -232,6 +268,25 @@ mod tests {
         assert!(reg.verify("s2", "sek").is_none());
         assert!(reg.verify("s1", "").is_none());
         assert!(reg.verify("", "sek").is_none());
+    }
+
+    /// First use is what distinguishes "ccteam minted a credential" from "the
+    /// session is actually calling with it" — the whole point of the flag.
+    #[test]
+    fn first_use_is_recorded_only_on_a_successful_verify() {
+        let reg = SessionPrincipals::new();
+        reg.promote("s1", "sek", "alpha", "cto", 0);
+        assert!(!reg.was_used("s1"), "minted is not used");
+
+        assert!(reg.verify("s1", "nope").is_none());
+        assert!(!reg.was_used("s1"), "a REJECTED attempt is not use");
+
+        assert!(reg.verify("s1", "sek").is_some());
+        assert!(reg.was_used("s1"));
+
+        // A sid that ends and is reused must not inherit the old verdict.
+        reg.forget("s1");
+        assert!(!reg.was_used("s1"));
     }
 
     /// A `/role` switch mints a fresh secret for an existing sid. The old one
