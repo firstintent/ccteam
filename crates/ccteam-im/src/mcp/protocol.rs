@@ -443,6 +443,21 @@ mod tests {
         }
     }
 
+    /// Group prefix + schema shape for the whole session group. Ported here
+    /// from the deleted stdio forwarder, which owned the only copy: the
+    /// invariant is about the wire surface, not about any transport.
+    #[test]
+    fn all_session_tools_carry_session_prefix() {
+        for t in session_tool_definitions() {
+            let n = t["name"].as_str().unwrap();
+            assert!(
+                n.starts_with("session_"),
+                "session tool name must start with session_: {n}"
+            );
+            assert_eq!(t["inputSchema"]["type"], "object");
+        }
+    }
+
     #[test]
     fn collect_schema_exposes_character_budget_and_delegation_prompts_are_terse() {
         let defs = session_tool_definitions();
