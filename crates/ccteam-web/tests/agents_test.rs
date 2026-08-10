@@ -226,6 +226,7 @@ async fn spawn_delegated_child_in(
 /// model.
 fn idle_meta(project_dir: &std::path::Path, sid: &str, model: Option<&str>) {
     let m = ccteam_harness::SessionMeta {
+        managed_by: Default::default(),
         sid: sid.to_string(),
         slug: "demo".to_string(),
         vendor: AgentVendor::Claude,

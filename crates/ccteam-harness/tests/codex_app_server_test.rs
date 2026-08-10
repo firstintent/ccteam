@@ -3038,6 +3038,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
     // Simulate the "before the restart" state: a prior codex session whose
     // vendor_uuid is persisted in meta.json (what apply_new_session writes).
     let meta = ccteam_harness::SessionMeta {
+        managed_by: Default::default(),
         sid: "codex-r1".into(),
         slug: "demo".into(),
         vendor: AgentVendor::Codex,

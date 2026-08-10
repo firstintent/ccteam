@@ -456,6 +456,7 @@ async fn load_resume_filters_is_replay() {
     let sid = "s-resume";
     // Seed meta as if a prior session existed with known ACP sessionId.
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Grok,
@@ -743,6 +744,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     // Phase B — cold resume via session/load (meta carries the vendor_uuid).
     let sid_load = "s-load-mcp";
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid_load.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Grok,

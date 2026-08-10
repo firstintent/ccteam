@@ -113,6 +113,40 @@ pub fn apply_title(meta: &mut SessionMeta, candidate: String, source: TitleSourc
 
 // ── core struct ───────────────────────────────────────────────────────────────
 
+/// Who runs the process behind a session.
+///
+/// The ledger is shared — one sid namespace, one `meta.json` shape, one
+/// delegation tree — but only one of these kinds has a thread ccteam owns, and
+/// every driveable surface has to be able to tell them apart:
+///
+/// | | [`Self::Ccteam`] | [`Self::External`] |
+/// |---|---|---|
+/// | thread | ccteam's | none — a hand-started process |
+/// | dispatch / steer / stop | yes | no: refuse, don't pretend |
+/// | capacity eviction, budget | applies | never (there is nothing to stop) |
+/// | delegation parent, project, tree | yes | yes — this is the whole point |
+///
+/// An external node exists so that a hand-started agent's children mount under
+/// it instead of as roots. Taking one over later is a real transition (stop the
+/// process, resume its vendor session under management, flip this field), not a
+/// flag that quietly changes meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBy {
+    /// ccteam spawned it and owns its thread.
+    #[default]
+    Ccteam,
+    /// A hand-started vendor process that enrolled over `POST /mcp`.
+    External,
+}
+
+impl ManagedBy {
+    /// Whether ccteam can send this session work.
+    pub fn is_driveable(self) -> bool {
+        matches!(self, ManagedBy::Ccteam)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub sid: String,
@@ -207,6 +241,10 @@ pub struct SessionMeta {
     /// `delegation.max_depth` guardrail caps this. Legacy metas parse as `0`.
     #[serde(default)]
     pub delegation_depth: u32,
+    /// Who runs the process behind this session — see [`ManagedBy`]. Legacy
+    /// metas parse as [`ManagedBy::Ccteam`], which is what they all are.
+    #[serde(default)]
+    pub managed_by: ManagedBy,
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────
@@ -451,6 +489,7 @@ mod title_tests {
 
     fn blank_meta() -> SessionMeta {
         SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: AgentVendor::Claude,

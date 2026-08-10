@@ -463,6 +463,7 @@ mod tests {
         depth: u32,
     ) {
         let mut m = ccteam_harness::SessionMeta {
+            managed_by: Default::default(),
             sid: sid.to_string(),
             slug: "demo".to_string(),
             vendor,

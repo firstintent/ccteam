@@ -3776,6 +3776,7 @@ impl Gateway {
                 }
             });
             let meta = SessionMeta {
+                managed_by: Default::default(),
                 sid: id.clone(),
                 slug: meta_project.clone(),
                 vendor,
@@ -8233,6 +8234,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
+            managed_by: Default::default(),
             sid: sid.clone(),
             slug: slug.to_string(),
             vendor: AgentVendor::Claude,
@@ -17835,6 +17837,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -17908,6 +17911,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,

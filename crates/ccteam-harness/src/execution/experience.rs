@@ -555,6 +555,7 @@ mod tests {
         let project = tmp.path();
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: crate::AgentVendor::Opencode,
@@ -623,6 +624,7 @@ mod tests {
         // Seed meta + turns for s1.
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: crate::AgentVendor::Claude,

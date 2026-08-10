@@ -15,6 +15,7 @@ use tempfile::TempDir;
 
 fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionMeta {
     SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: slug.into(),
         vendor: AgentVendor::Claude,
