@@ -31,6 +31,17 @@ These are the only terminal steps required. Afterward, the web console is the re
 
 ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, and Pi CLIs already installed and logged in on your machine. It does not bundle them.
 
+**Install and sign into at least one of them first** — a vendor that is missing, or installed but not authenticated, cannot host a session on that machine:
+
+| Vendor | Install | Sign in |
+|---|---|---|
+| Claude Code | [docs.claude.com/en/docs/claude-code](https://docs.claude.com/en/docs/claude-code) | `claude auth login` |
+| Codex | [github.com/openai/codex](https://github.com/openai/codex) | `codex login` |
+| Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
+| OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
+| Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+| Pi | `npm i -g @earendil-works/pi-coding-agent` | provider API key, verified with `pi auth check --provider <provider>` |
+
 **1 · Let an agent do it**
 
 Paste into any agent you already have:
@@ -101,7 +112,7 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 ### Register MCP (Automatic)
 
-Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The write is idempotent and merge-only (your other MCP servers are untouched), and vendors that are not installed are skipped. **Pi is deliberately not on that list**: its managed sessions receive the team tools through a ccteam-owned bridge extension loaded at spawn, so no Pi config of yours is ever written — and a `pi` you start by hand in a shell has no ccteam tools. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
+Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The entry carries a **user-scoped enrollment credential** — it says whose the config is and nothing more; the per-process identity is issued by the daemon when that vendor's session connects, so two agents started an hour apart from the same config are two callers with their own ledger rows. The write is idempotent and merge-only (your other MCP servers are untouched), vendors that are not installed are skipped, and an entry left over from an older ccteam (a `Bearer ccteam:<hex>` admin token, or a `command`-style stdio entry) reads as *not registered* and is replaced on the next start. **Pi is deliberately not on that list**: its managed sessions receive the team tools through a ccteam-owned bridge extension loaded at spawn, so no Pi config of yours is ever written — and a `pi` you start by hand in a shell has no ccteam tools. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -166,15 +177,17 @@ The console is built on a token-authenticated HTTP API you can use directly:
 
 ### External agents over MCP (`POST /mcp`)
 
-Any agent ccteam does not manage (your own script, a CLI running elsewhere) can call the daemon's MCP endpoint directly with a **ccteam web token** and get the same eight tools a managed session has:
+Any agent ccteam does not manage (your own script, a hand-started CLI, an agent on another machine) can call the daemon's MCP endpoint directly with an **enrollment credential** and get the same eight tools a managed session has:
 
 ```
 POST http://<host>:7331/mcp
-Authorization: Bearer ccteam:<hex>
+Authorization: Bearer ccteam-enroll:<id>:<secret>
+Mcp-Session-Id: <the id the daemon returned at initialize>
 ```
 
-- The **admin token** (the one `ccteam status` prints) is the owner's front door, fleet-wide. A **per-user token** (issued under Settings → Users) resolves to that user: every tool is scoped to the user's own projects — `session_spawn` requires an explicit `project` and only accepts the user's own, `dispatch/collect/stop` authorize by the target sid's project, and `session_list`/`status` aggregate only visible projects.
-- Unknown and forbidden projects/sessions return the same error (anti-enumeration). Bearer-only: cookies and query tokens are never accepted.
+- **The credential says whose the config is; the daemon issues the identity.** `initialize` answers with an `Mcp-Session-Id`, and that id is what makes *this process* a caller of its own: it gets a real session row in the ledger (`managed_by: external`), so the sessions it spawns hang under it in the delegation tree instead of appearing as roots. Every later request must carry both the credential and the id — the id alone is not a credential, and a binding only resolves for the credential that opened it. A stale id answers `404` telling you to re-`initialize`; `DELETE /mcp` ends the binding when you are done.
+- **Two scopes.** Every `ccteam daemon start` writes a **user-scoped** credential into the vendor configs on that machine, so a hand-started Claude/Codex/Grok/OpenCode/Kimi already has the tools; because it names no project, such a caller must pass `project` explicitly on its first `session_*` call, and only its owner's projects are accepted. A **project-scoped** credential is what the console's copy button hands out (Settings → Access, or `POST /api/v1/projects/{slug}/enroll`): pinned to one workspace, safe to paste on another machine, listed and revocable afterwards. The secret is shown once, at mint time.
+- **Nothing is inferred.** No working directory, no peer address, no "most recent project": a caller with no basis for a project is refused and told which slugs it could name. Unknown and forbidden projects/sessions return the same error (anti-enumeration). Bearer-only: cookies and query tokens are never accepted, and a web console token — which authenticates `/api/v1/**` — is rejected here with a message naming the credential families this endpoint does take.
 
 ---
 
