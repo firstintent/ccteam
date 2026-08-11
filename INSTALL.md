@@ -15,7 +15,7 @@ ccteam is a resident daemon (IM gateway + web console + MCP) that drives the sto
   | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
   | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
   | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-  | Pi | `npm i -g @earendil-works/pi-coding-agent` | provider API key, checked with `pi auth check --provider <provider>` |
+  | Pi | [pi.dev](https://pi.dev/) | provider API key, checked with `pi auth check --provider <provider>` |
 
   Verify with `<bin> --version`; after install, `ccteam status` reports which vendors this machine has and whether each is authenticated.
 - For `make install`: **Rust + Node.js**. No toolchain? Use the prebuilt `install.sh` instead (see below).

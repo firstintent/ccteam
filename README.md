@@ -114,7 +114,7 @@ Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 > - **Grok Build** — install [Grok CLI](https://docs.x.ai/build/overview), then `grok login`
 > - **OpenCode** — install [OpenCode](https://opencode.ai), then `opencode auth login`
 > - **Kimi Code** — install [Kimi Code](https://moonshotai.github.io/kimi-code/), then `kimi login`
-> - **Pi** — `npm i -g @earendil-works/pi-coding-agent`, then set your provider key and check it with `pi auth check --provider <provider>`
+> - **Pi** — install [Pi](https://pi.dev/), then set your provider key and check it with `pi auth check --provider <provider>`
 >
 > Any one of them is enough to start. Afterwards `ccteam status` and **Settings → Hosts** report, per machine, which vendors are installed, their versions, and whether each is actually authenticated — sitting on `PATH` never counts as logged in.
 
