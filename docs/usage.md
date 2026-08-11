@@ -40,7 +40,7 @@ ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, and Pi CLI
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-| Pi | `npm i -g @earendil-works/pi-coding-agent` | provider API key, verified with `pi auth check --provider <provider>` |
+| Pi | [pi.dev](https://pi.dev/) | provider API key, verified with `pi auth check --provider <provider>` |
 
 **1 · Let an agent do it**
 

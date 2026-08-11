@@ -40,7 +40,7 @@ ccteam 调用你机器上**已装好并登录的** Claude Code / Codex / Grok Bu
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-| Pi | `npm i -g @earendil-works/pi-coding-agent` | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
+| Pi | [pi.dev](https://pi.dev/) | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
 
 **1 · 让 agent 装**
 
