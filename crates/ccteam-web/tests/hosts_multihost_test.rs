@@ -554,6 +554,22 @@ async fn gateway_create_on_offline_host_fails_clean() {
         ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
             unreachable!()
         }
+        async fn rebuild_tool_surface(
+            &self,
+            _h: &ThreadHandle,
+        ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+            // Test double: no tool face to rebuild.
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+                reason: "test double".to_string(),
+            })
+        }
+
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
+        }
+
         fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             Box::pin(stream::empty())
         }

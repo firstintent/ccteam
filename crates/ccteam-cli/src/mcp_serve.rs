@@ -1,310 +1,36 @@
-//! M2.5: `ccteam mcp-serve` — stdio MCP server.
+//! Vendor MCP registration + the daemon `mcp.sock` one-shot client.
 //!
-//! Exposes the ccteam control surface as MCP tools so the user's
-//! daily-driver Claude Code session (and the meta-agent session) can
-//! drive ccteam without shelling out to the CLI. Architecture and
-//! red lines:
+//! **There is no stdio MCP server any more.** Every managed session and every
+//! hand-started vendor session reaches ccteam over `POST /mcp` on the daemon's
+//! HTTP surface; the registration written here is what points them at it. The
+//! stdio server this module used to host existed for the era when the global
+//! vendor entry spawned `ccteam internal mcp-serve` as a child — one orphan
+//! child per session, a same-name double registration, and a JSON-RPC loop
+//! duplicating what the HTTP route already does. That entry point is deleted
+//! rather than deprecated: a command that still runs is a command a stale
+//! config will still invoke.
 //!
-//! - **Hand-rolled JSON-RPC 2.0** over stdio (line-delimited messages).
-//! - **No LLM in-process** (Symphony anti-pattern, tech-design §3.1).
-//! - Protocol core + tool schemas live in [`ccteam_im::mcp`] (v0.9 T3);
-//!   this module owns the **stdio loop**, client-side socket forwards
-//!   for stateful tools, and vendor MCP registration orchestration.
+//! What remains:
 //!
-//! Wire format: each side sends one JSON object per line, terminated
-//! by `\n`. Notifications (no `id`) get no reply. Errors follow the
-//! JSON-RPC 2.0 error object shape (interfaces §12).
-
-use std::time::{Duration, Instant};
+//! - **registration** — the per-vendor global entries (`install_*`), and the
+//!   idempotent repair pass the daemon runs at start
+//!   (`auto_register_vendor_mcp`). The writer itself lives in
+//!   [`ccteam_core::mcp_register`]; this module is the CLI-side orchestration.
+//! - **`mcp.sock` one-shot client** — [`forward_to_socket`], used by
+//!   `ccteam config` to hot-reload the running daemon.
+//! - **tool surface accessor** — [`tool_definitions`], for `doctor
+//!   --verify-mcp`.
 
 use anyhow::{anyhow, Context, Result};
-use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use ccteam_core::CcteamPaths;
-
-use crate::mcp_session_tools;
 
 /// Single source of truth for the registered tool surface — delegated to
 /// [`ccteam_im::mcp::tool_definitions`] (doctor `--verify-mcp` + tests).
 pub(crate) fn tool_definitions() -> Vec<Value> {
     ccteam_im::mcp::tool_definitions()
-}
-
-/// How often to poll for orphan / idle-timeout shutdown conditions.
-const MCP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Idle timeout for mcp-serve, **disabled by default** (`None`).
-///
-/// See module docs in git history / tech-design: connection-based liveness
-/// (EOF + PDEATHSIG + orphan check). `CCTEAM_MCP_IDLE_TIMEOUT_SECS=N` (N>0)
-/// is an opt-in backstop.
-fn mcp_idle_timeout() -> Option<Duration> {
-    std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map(Duration::from_secs)
-}
-
-#[cfg(unix)]
-fn current_ppid() -> i32 {
-    // SAFETY: getppid is always-safe; returns this process's parent PID.
-    unsafe { libc::getppid() as i32 }
-}
-#[cfg(not(unix))]
-fn current_ppid() -> i32 {
-    0
-}
-
-/// Run `ccteam mcp-serve`. Reads JSON-RPC requests one per line from
-/// stdin; writes responses one per line to stdout.
-///
-/// Exits via `std::process::exit(0)` on stdin EOF / signals / orphan /
-/// opt-in idle (see historical comments — runtime drop would hang on
-/// the blocking stdin reader).
-pub async fn run_mcp_serve(paths: CcteamPaths) -> Result<()> {
-    set_pdeathsig_sigterm();
-    let original_ppid = current_ppid();
-    let idle_timeout = mcp_idle_timeout();
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
-
-    let mut sigterm = signal_stream(SignalKind::terminate());
-    let mut sigint = signal_stream(SignalKind::interrupt());
-
-    let mut health_ticker = tokio::time::interval(MCP_HEALTH_CHECK_INTERVAL);
-    health_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    health_ticker.tick().await;
-
-    let mut last_activity = Instant::now();
-
-    loop {
-        let line = tokio::select! {
-            line = reader.next_line() => match line.context("read stdin from MCP client")? {
-                Some(l) => {
-                    last_activity = Instant::now();
-                    l
-                }
-                None => {
-                    tracing::info!("mcp-serve: stdin EOF; exiting");
-                    std::process::exit(0);
-                }
-            },
-            _ = signal_recv(&mut sigterm) => {
-                tracing::info!("mcp-serve: SIGTERM (parent exited or explicit stop); exiting");
-                std::process::exit(0);
-            }
-            _ = signal_recv(&mut sigint) => {
-                tracing::info!("mcp-serve: SIGINT; exiting");
-                std::process::exit(0);
-            }
-            _ = health_ticker.tick() => {
-                if should_exit_for_orphan(original_ppid) {
-                    tracing::info!(original_ppid, current_ppid = current_ppid(),
-                        "mcp-serve: parent reparented (orphan); exiting");
-                    std::process::exit(0);
-                }
-                if let Some(idle) = idle_timeout {
-                    if last_activity.elapsed() >= idle {
-                        tracing::info!(
-                            idle_secs = last_activity.elapsed().as_secs(),
-                            timeout_secs = idle.as_secs(),
-                            "mcp-serve: idle timeout reached (opt-in); exiting"
-                        );
-                        std::process::exit(0);
-                    }
-                }
-                continue;
-            }
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(err) => {
-                let err_obj = json_rpc_error(None, -32700, &format!("parse error: {err}"));
-                write_message(&mut stdout, &err_obj).await?;
-                continue;
-            }
-        };
-        let resp = handle_request(&paths, &req).await;
-        if let Some(response) = resp {
-            write_message(&mut stdout, &response).await?;
-        }
-    }
-}
-
-fn should_exit_for_orphan(original_ppid: i32) -> bool {
-    if original_ppid == 0 {
-        return false;
-    }
-    let now = current_ppid();
-    now != original_ppid || now == 1
-}
-
-#[cfg(target_os = "linux")]
-fn set_pdeathsig_sigterm() {
-    // SAFETY: prctl is a thin syscall wrapper; PR_SET_PDEATHSIG takes a signal.
-    unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_pdeathsig_sigterm() {}
-
-#[cfg(unix)]
-type SigStream = tokio::signal::unix::Signal;
-#[cfg(not(unix))]
-type SigStream = ();
-
-#[cfg(unix)]
-use tokio::signal::unix::SignalKind;
-#[cfg(not(unix))]
-struct SignalKind;
-#[cfg(not(unix))]
-impl SignalKind {
-    fn terminate() -> Self {
-        Self
-    }
-    fn interrupt() -> Self {
-        Self
-    }
-}
-
-#[cfg(unix)]
-fn signal_stream(kind: SignalKind) -> SigStream {
-    tokio::signal::unix::signal(kind).expect("install unix signal handler")
-}
-#[cfg(not(unix))]
-fn signal_stream(_: SignalKind) -> SigStream {}
-
-#[cfg(unix)]
-async fn signal_recv(s: &mut SigStream) {
-    let _ = s.recv().await;
-}
-#[cfg(not(unix))]
-async fn signal_recv(_: &mut SigStream) {
-    std::future::pending::<()>().await;
-}
-
-/// Stdio JSON-RPC dispatch: forward stateful tools to the daemon socket,
-/// everything else → [`ccteam_im::mcp::handle_request`].
-pub(crate) async fn handle_request(paths: &CcteamPaths, req: &Value) -> Option<Value> {
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    if method == "tools/call" {
-        let name = req
-            .pointer("/params/name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
-        if name == "chat_send_file" || mcp_session_tools::is_session_tool(name) {
-            let id = req.get("id").cloned()?;
-            let params = req.get("params").cloned().unwrap_or(json!({}));
-            let result = match call_tool_forward(paths, &params).await {
-                Ok(content) => json!({ "content": content, "isError": false }),
-                Err(err) => json!({
-                    "content": [{ "type": "text", "text": format!("{err:#}") }],
-                    "isError": true,
-                }),
-            };
-            return Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
-        }
-        // v0.10 T1 — `status` becomes daemon-aware: forward to the daemon so
-        // the caller gets the vendor panel + routing notes (scoped to its
-        // project). On ANY miss (no daemon reachable / no identity) fall
-        // THROUGH to the local base status below — status always succeeds.
-        // The bare-name beacon alias rides the exact same path (pure alias).
-        if name == "status" || name == ccteam_im::mcp::STATUS_BEACON_TOOL_NAME {
-            let args = req
-                .pointer("/params/arguments")
-                .cloned()
-                .unwrap_or(json!({}));
-            if let Some(body) = mcp_session_tools::forward_status(paths, &args).await {
-                let id = req.get("id").cloned()?;
-                return Some(json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{ "type": "text", "text": body }],
-                        "isError": false,
-                    },
-                }));
-            }
-        }
-    }
-    ccteam_im::mcp::handle_request(paths, req).await
-}
-
-/// Stdio-only: forward `chat_send_file` + `session_*` to the daemon.
-async fn call_tool_forward(paths: &CcteamPaths, params: &Value) -> Result<Vec<Value>> {
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("tools/call missing `name`"))?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    match name {
-        "chat_send_file" => forward_chat_send_file(paths, &args).await,
-        other => {
-            if let Some(body) = mcp_session_tools::dispatch(paths, other, &args).await? {
-                return Ok(text_content(body));
-            }
-            Err(anyhow!("unknown tool: {other}"))
-        }
-    }
-}
-
-/// V0.8.4 P2b — forward a `chat_send_file` call to the daemon's `mcp.sock`.
-async fn forward_chat_send_file(paths: &CcteamPaths, args: &Value) -> Result<Vec<Value>> {
-    let slug = std::env::var("CCTEAM_CHAT_SLUG").unwrap_or_default();
-    let role = std::env::var("CCTEAM_CHAT_ROLE").unwrap_or_default();
-    if slug.is_empty() || role.is_empty() {
-        return Ok(text_content(
-            "chat_send_file: not in a ccteam chat session (CCTEAM_CHAT_SLUG/ROLE unset)"
-                .to_string(),
-        ));
-    }
-    let sid = std::env::var("CCTEAM_CHAT_SID").unwrap_or_default();
-    let mut fwd_args = args.clone();
-    if let Some(obj) = fwd_args.as_object_mut() {
-        obj.insert("slug".to_string(), json!(slug));
-        obj.insert("role".to_string(), json!(role));
-        obj.insert("_caller_sid".to_string(), json!(sid));
-    }
-    let req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": { "name": "chat_send_file", "arguments": fwd_args },
-    });
-    let socket = ccteam_core::daemon_socket_path(paths);
-    match forward_to_socket(&socket, &req).await {
-        Ok(resp) => forward_outcome(&resp),
-        Err(err) => Ok(text_content(format!(
-            "chat_send_file failed: daemon mcp.sock unreachable ({err})"
-        ))),
-    }
-}
-
-/// Map the daemon's tools/call response into the stdio tool result,
-/// **propagating `isError`**.
-pub(crate) fn forward_outcome(resp: &Value) -> Result<Vec<Value>> {
-    let text = resp
-        .pointer("/result/content/0/text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("chat_send_file: delivered")
-        .to_string();
-    if resp
-        .pointer("/result/isError")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(anyhow!(text));
-    }
-    Ok(text_content(text))
 }
 
 /// Open a one-shot connection to the daemon `mcp.sock`, send one
@@ -333,52 +59,46 @@ pub(crate) async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -
     Err(anyhow!("mcp.sock forwarding is unix-only"))
 }
 
-fn text_content(body: String) -> Vec<Value> {
-    vec![json!({ "type": "text", "text": body })]
-}
-
-fn json_rpc_error(id: Option<Value>, code: i32, message: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    })
-}
-
-async fn write_message(stdout: &mut tokio::io::Stdout, msg: &Value) -> Result<()> {
-    let mut line = serde_json::to_string(msg).context("serialize MCP message")?;
-    line.push('\n');
-    stdout
-        .write_all(line.as_bytes())
-        .await
-        .context("write MCP message to stdout")?;
-    stdout.flush().await.context("flush MCP stdout")?;
-    Ok(())
+/// What every global vendor registration carries: the machine-user ENROLLMENT
+/// credential (`ccteam-enroll:<id>:<secret>`), owned by this machine's admin web
+/// identity — the same `user:web-api` tag `identity::owner_tag` stamps on
+/// anything that console creates, so a hand-started vendor session and the web
+/// console are one principal instead of two.
+///
+/// It replaces the admin web token, which a vendor's global config turned into a
+/// machine-wide SHARED identity: every hand-started `claude`/`codex`/`grok`
+/// authenticated as the same caller, so none could be a delegation parent and
+/// none had a project of its own. `ensure_user_credential` is idempotent per
+/// owner, so the five writes below — and every later daemon restart — see one
+/// stable value; minting per call would rewrite five config files on every
+/// start.
+fn enroll_bearer(paths: &CcteamPaths) -> Result<String> {
+    let owner = ccteam_core::identity::owner_tag(ccteam_core::identity::ADMIN_WEB_ID, true);
+    Ok(ccteam_core::enroll::ensure_user_credential(paths, &owner)?.bearer())
 }
 
 /// `ccteam config` — register the ccteam MCP server in `~/.claude.json`.
 pub fn install_mcp_into(
     claude_json: &std::path::Path,
     mcp_http_url: &str,
-    admin_token: &str,
+    bearer: &str,
 ) -> Result<()> {
-    ccteam_core::mcp_register::install_mcp_into(claude_json, mcp_http_url, admin_token)
+    ccteam_core::mcp_register::install_mcp_into(claude_json, mcp_http_url, bearer)
 }
 
 /// Production path for Claude MCP install: like every other vendor, the global
 /// `~/.claude.json` entry points at the daemon's HTTP `/mcp` endpoint and
-/// authenticates with the admin web token, so a plain `claude` main session can
-/// orchestrate. ccteam-managed Claude sessions override the same-named entry via
-/// `--mcp-config` with their per-session bearer.
+/// carries the machine-user enrollment credential ([`enroll_bearer`]), so a
+/// plain `claude` main session is a first-class caller. ccteam-managed Claude
+/// sessions override the same-named entry via `--mcp-config` with their
+/// per-session bearer.
 pub fn install_mcp() -> Result<std::path::PathBuf> {
     let claude_json = ccteam_core::projects::resolve_claude_json_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
-    install_mcp_into(&claude_json, &mcp_http_url, &admin_token)?;
+    let bearer = enroll_bearer(&paths)?;
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
+    install_mcp_into(&claude_json, &mcp_http_url, &bearer)?;
     Ok(claude_json)
 }
 
@@ -386,14 +106,14 @@ pub fn install_mcp() -> Result<std::path::PathBuf> {
 pub fn install_codex_mcp_into(
     config_toml: &std::path::Path,
     mcp_http_url: &str,
-    admin_token: &str,
+    bearer: &str,
 ) -> Result<()> {
-    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, mcp_http_url, admin_token)
+    ccteam_core::mcp_register::install_codex_mcp_into(config_toml, mcp_http_url, bearer)
 }
 
 /// Production path for Codex MCP install. Unlike Claude's historical global
-/// stdio entry, Codex uses the daemon's HTTP MCP endpoint. The global entry is
-/// authenticated with the admin web token; ccteam-managed Codex threads
+/// stdio entry, Codex uses the daemon's HTTP MCP endpoint. The global entry
+/// carries the machine-user enrollment credential; ccteam-managed Codex threads
 /// override that header with their per-session bearer.
 pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     let codex_home = std::env::var_os("CODEX_HOME")
@@ -402,23 +122,25 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
         .ok_or_else(|| anyhow!("cannot resolve CODEX_HOME or ~/.codex (no home dir)"))?;
     let config_toml = codex_home.join("config.toml");
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
-    install_codex_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
+    let bearer = enroll_bearer(&paths)?;
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
+    install_codex_mcp_into(&config_toml, &mcp_http_url, &bearer)?;
     Ok(config_toml)
 }
 
 /// Production path for Grok CLI MCP install (v0.9.3 vendor symmetry): the
-/// global `~/.grok/config.toml` entry authenticates with the admin web token
-/// so a plain `grok` main session can orchestrate; ccteam-managed grok
-/// sessions keep their ACP-injected per-session principal (same-name dedup,
-/// injected server wins — real-machine verified).
+/// global `~/.grok/config.toml` entry carries the machine-user enrollment
+/// credential so a plain `grok` main session is a first-class caller;
+/// ccteam-managed grok sessions keep their ACP-injected per-session principal
+/// (same-name dedup, injected server wins — real-machine verified).
 pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
     let config_toml = ccteam_core::mcp_register::resolve_grok_config_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
-    ccteam_core::mcp_register::install_grok_mcp_into(&config_toml, &mcp_http_url, &admin_token)?;
+    let bearer = enroll_bearer(&paths)?;
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
+    ccteam_core::mcp_register::install_grok_mcp_into(&config_toml, &mcp_http_url, &bearer)?;
     Ok(config_toml)
 }
 
@@ -428,27 +150,25 @@ pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
 pub fn install_opencode_mcp() -> Result<std::path::PathBuf> {
     let opencode_json = ccteam_core::mcp_register::resolve_opencode_config_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
-    ccteam_core::mcp_register::install_opencode_mcp_into(
-        &opencode_json,
-        &mcp_http_url,
-        &admin_token,
-    )?;
+    let bearer = enroll_bearer(&paths)?;
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
+    ccteam_core::mcp_register::install_opencode_mcp_into(&opencode_json, &mcp_http_url, &bearer)?;
     Ok(opencode_json)
 }
 
 /// Production path for Kimi Code MCP install (vendor symmetry): the global
-/// `$KIMI_CODE_HOME/mcp.json` entry authenticates with the admin web token so
-/// a plain `kimi` main session can orchestrate; ccteam-managed kimi sessions
-/// keep their ACP-injected per-session principal (same-name dedup posture as
-/// grok/opencode).
+/// `$KIMI_CODE_HOME/mcp.json` entry carries the machine-user enrollment
+/// credential so a plain `kimi` main session is a first-class caller;
+/// ccteam-managed kimi sessions keep their ACP-injected per-session principal
+/// (same-name dedup posture as grok/opencode).
 pub fn install_kimi_mcp() -> Result<std::path::PathBuf> {
     let mcp_json = ccteam_core::mcp_register::resolve_kimi_config_path()?;
     let paths = CcteamPaths::from_env()?;
-    let admin_token = ccteam_web::token::generate_or_load_token(&paths.web_token_path())?;
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&paths.root.join("run"));
-    ccteam_core::mcp_register::install_kimi_mcp_into(&mcp_json, &mcp_http_url, &admin_token)?;
+    let bearer = enroll_bearer(&paths)?;
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run"));
+    ccteam_core::mcp_register::install_kimi_mcp_into(&mcp_json, &mcp_http_url, &bearer)?;
     Ok(mcp_json)
 }
 
@@ -516,6 +236,7 @@ fn vendor_config_path(vendor: &str) -> Result<std::path::PathBuf> {
 mod tests {
     use super::*;
     use ccteam_im::mcp::MCP_PROTOCOL_VERSION;
+    use serde_json::json;
 
     /// Exact set of MCP tool names (8 tools; `screenshot` culled and the
     /// bare-name status beacon alias added 2026-07-26).
@@ -561,11 +282,16 @@ mod tests {
         }
     }
 
+    /// The bearer these seams forward is an ENROLLMENT credential, not the
+    /// admin web token — the global config is a shared file, so what it carries
+    /// must identify whose it is and grant nothing by itself.
+    const ENROLL_BEARER: &str = "ccteam-enroll:deadbeefdeadbeef:s3cret";
+
     #[test]
-    fn install_mcp_into_writes_http_url_and_admin_header() {
+    fn install_mcp_into_writes_http_url_and_enroll_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", "admin-token").unwrap();
+        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", ENROLL_BEARER).unwrap();
         let body = std::fs::read_to_string(&claude_json).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         let entry = &v["mcpServers"]["ccteam"];
@@ -573,7 +299,7 @@ mod tests {
         assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
         assert_eq!(
             entry["headers"]["Authorization"],
-            "Bearer ccteam:admin-token"
+            format!("Bearer {ENROLL_BEARER}")
         );
         // Vendor symmetry: no global registration spawns an `mcp-serve` child.
         assert!(entry.get("command").is_none());
@@ -589,7 +315,7 @@ mod tests {
             r#"{"userID": "rob", "mcpServers": {"playwright": {"command": "npx"}}}"#,
         )
         .unwrap();
-        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "tok").unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
         assert_eq!(v["userID"], "rob");
@@ -601,10 +327,10 @@ mod tests {
     }
 
     #[test]
-    fn install_codex_mcp_into_writes_http_url_and_admin_header() {
+    fn install_codex_mcp_into_writes_http_url_and_enroll_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
-        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "admin-token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", ENROLL_BEARER).unwrap();
         let body = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&body).unwrap();
         assert_eq!(
@@ -615,7 +341,7 @@ mod tests {
             v["mcp_servers"]["ccteam"]["http_headers"]["Authorization"]
                 .as_str()
                 .unwrap(),
-            "Bearer ccteam:admin-token"
+            format!("Bearer {ENROLL_BEARER}")
         );
         assert!(v["mcp_servers"]["ccteam"].get("command").is_none());
     }
@@ -629,7 +355,7 @@ mod tests {
             "model = \"gpt-5\"\n\n[mcp_servers.foo]\ncommand = \"foo-server\"\nargs = [\"--flag\"]\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "tok").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(v["model"].as_str().unwrap(), "gpt-5");
@@ -656,7 +382,7 @@ mod tests {
             "[mcp_servers.ccteam]\ncommand = \"/old/bin/ccteam\"\nargs = [\"mcp-serve\"]\n\n[mcp_servers.playwright]\ncommand = \"npx\"\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "new-token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let first = std::fs::read_to_string(&config_toml).unwrap();
         let v: toml::Value = toml::from_str(&first).unwrap();
         assert_eq!(
@@ -669,7 +395,7 @@ mod tests {
             v["mcp_servers"]["playwright"]["command"].as_str().unwrap(),
             "npx"
         );
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "new-token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         let second = std::fs::read_to_string(&config_toml).unwrap();
         assert_eq!(first, second);
     }
@@ -679,7 +405,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
         assert!(!config_toml.exists());
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "tok").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", ENROLL_BEARER).unwrap();
         assert!(config_toml.exists());
         let v: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
@@ -687,15 +413,6 @@ mod tests {
             v["mcp_servers"]["ccteam"]["url"].as_str().unwrap(),
             "http://localhost:7331/mcp"
         );
-    }
-
-    #[test]
-    fn json_rpc_error_includes_id_and_envelope() {
-        let e = json_rpc_error(Some(json!(7)), -32601, "method not found: foo");
-        assert_eq!(e["jsonrpc"], "2.0");
-        assert_eq!(e["id"], 7);
-        assert_eq!(e["error"]["code"], -32601);
-        assert!(e["error"]["message"].as_str().unwrap().contains("foo"));
     }
 
     #[tokio::test]
@@ -711,7 +428,7 @@ mod tests {
             "method": "initialize",
             "params": {}
         });
-        let resp = handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
@@ -766,17 +483,6 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[test]
-    fn forward_outcome_propagates_is_error() {
-        let ok =
-            json!({"result": {"content": [{"type":"text","text":"delivered"}], "isError": false}});
-        assert!(forward_outcome(&ok).is_ok());
-
-        let err = json!({"result": {"content": [{"type":"text","text":"chat_send_file: file not found: /x"}], "isError": true}});
-        let e = forward_outcome(&err).unwrap_err();
-        assert!(e.to_string().contains("file not found"), "got: {e}");
-    }
-
     #[tokio::test]
     async fn handle_tools_list_returns_full_tool_set() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -790,7 +496,7 @@ mod tests {
             "method": "tools/list",
             "params": {}
         });
-        let resp = handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 8);
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -840,7 +546,7 @@ mod tests {
                 "arguments": { "slug": "no-such-slug-xyz", "lines": 5 }
             }
         });
-        let resp = handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -861,7 +567,7 @@ mod tests {
             "method": "notifications/initialized",
             "params": {}
         });
-        assert!(handle_request(&paths, &req).await.is_none());
+        assert!(ccteam_im::mcp::handle_request(&paths, &req).await.is_none());
     }
 
     #[tokio::test]
@@ -877,7 +583,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "status", "arguments": {} }
         });
-        let resp = handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(parsed["projects"].as_array().unwrap().len(), 0);
@@ -896,7 +602,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "ccteam__no_such_tool", "arguments": {} }
         });
-        let resp = handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], true);
     }
 
@@ -913,7 +619,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "status", "arguments": {} }
         });
-        let resp = handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
@@ -921,42 +627,5 @@ mod tests {
             parsed["daemon"]["status"], "unreachable",
             "status must annotate daemon health when daemon is down"
         );
-    }
-
-    #[test]
-    fn should_exit_for_orphan_returns_true_on_ppid_change() {
-        assert!(should_exit_for_orphan(12345));
-    }
-
-    #[test]
-    fn should_exit_for_orphan_is_noop_when_original_ppid_zero() {
-        assert!(!should_exit_for_orphan(0));
-    }
-
-    #[test]
-    fn should_exit_for_orphan_returns_false_when_ppid_unchanged() {
-        let ppid = current_ppid();
-        if ppid == 0 {
-            return;
-        }
-        if ppid == 1 {
-            assert!(should_exit_for_orphan(ppid));
-        } else {
-            assert!(!should_exit_for_orphan(ppid));
-        }
-    }
-
-    #[test]
-    fn mcp_idle_timeout_opt_in_only_default_disabled() {
-        let prev = std::env::var("CCTEAM_MCP_IDLE_TIMEOUT_SECS").ok();
-        std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "7");
-        assert_eq!(mcp_idle_timeout(), Some(Duration::from_secs(7)));
-        std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", "0");
-        assert_eq!(mcp_idle_timeout(), None);
-        std::env::remove_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS");
-        assert_eq!(mcp_idle_timeout(), None);
-        if let Some(v) = prev {
-            std::env::set_var("CCTEAM_MCP_IDLE_TIMEOUT_SECS", v);
-        }
     }
 }

@@ -441,14 +441,25 @@ fn claude_spawn_argv_base(input: ClaudeTuiSpecInput<'_>) -> Vec<String> {
 /// Attach the curated per-session `--mcp-config` (HTTP + this session's
 /// `ccteam-sid:<sid>:<secret>` bearer) the gateway wrote before spawn.
 ///
-/// Why the terminal path needs it: the global `~/.claude.json` entry is HTTP
-/// with the *admin* bearer, so a pane that inherited only that would call
-/// `session_*` as admin and lose its own principal — no delegation parent edge.
-/// `--mcp-config` is claude's highest-precedence manual scope, so the
-/// same-named `ccteam` entry here overrides the global one.
+/// Why the terminal path needs it: the global `~/.claude.json` entry carries a
+/// machine-user ENROLLMENT credential, which says whose config it is and nothing
+/// about which process is speaking. A pane that inherited only that would be
+/// served as an enrolled client of this user — the daemon would issue it its own
+/// `Mcp-Session-Id` node — instead of as itself, so its own principal never
+/// reaches `/mcp`: its children mount under that node rather than under this
+/// session (no delegation parent edge), and under the daemon-written user-scoped
+/// credential every `session_*` call fails closed for having no project.
 ///
-/// Deliberately NOT paired with `--strict-mcp-config` (unlike stream-json): a
-/// terminal session is a human-facing TUI and must keep the user's other
+/// **UNVERIFIED ASSUMPTION:** that a same-named `ccteam` entry in
+/// `--mcp-config` (claude's manual scope) WINS the merge against the global one.
+/// No test and no real-machine probe pins it; if claude ever resolves the other
+/// way, the pane silently gets the identity described above and the only
+/// evidence is a missing edge in the delegation tree (or a "no project" refusal).
+/// The stream-json path does not depend on the assumption — it passes
+/// `--strict-mcp-config`, so the global entry is not in scope at all.
+///
+/// Deliberately NOT paired with `--strict-mcp-config` here (unlike stream-json):
+/// a terminal session is a human-facing TUI and must keep the user's other
 /// ambient MCP servers. Absent file ⇒ no flag (claude errors on a missing
 /// config path), which is also the pre-spawn / secret-less case.
 fn push_mcp_config_arg(argv: &mut Vec<String>, cwd: &Path, sid: &str) {
@@ -1004,6 +1015,26 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         Box::pin(futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|ev| (ev, rx))
         }))
+    }
+
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // The pane path tails a transcript from a persisted cursor and spawns
+        // that tail loop inside `events()`. Calling it twice would fork a
+        // second tail over the same jsonl and double every answer, so the
+        // stream is one-shot — and the terminal protocol is frozen
+        // (维护-only), so it stays that way.
+        crate::EventAttachment::OneShot
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "the pane's claude read its MCP config at process start and the terminal \
+             protocol has no control channel — `/new` rebuilds the tool face"
+                .to_string(),
+        })
     }
 
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
@@ -1806,15 +1837,14 @@ mod tests {
     fn terminal_argv_attaches_session_mcp_config_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
-        let path = crate::execution::mcp_config::write_session_mcp_config(
-            cwd,
-            &crate::execution::mcp_config::CuratedMcpInput {
-                sid: "s7",
-                secret: "sek",
-                http_url: Some("http://127.0.0.1:7331/mcp"),
-            },
+        let endpoint = crate::execution::mcp_config::SessionMcpEndpoint::at(
+            "http://127.0.0.1:7331/mcp",
+            "s7",
+            "sek",
         )
         .unwrap();
+        let path =
+            crate::execution::mcp_config::write_session_mcp_config(cwd, "s7", &endpoint).unwrap();
 
         for spec in [
             spec_for_new(test_spec_input("dev", "slug", "s7", cwd, "sid-1")),

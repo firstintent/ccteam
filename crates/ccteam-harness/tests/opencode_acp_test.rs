@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ccteam_harness::execution::opencode_acp::spawn_spec::{build_argv, OpencodeSpawnInput};
+use ccteam_harness::execution::opencode_acp::spawn_spec::{
+    build_argv, permission_env, OpencodeSpawnInput,
+};
 use ccteam_harness::{
     write_session_meta, AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter,
     OpencodeAcpAdapter, PermissionMode, SessionMeta, SessionOrigin, SessionProtocol, SpawnCtx,
@@ -70,11 +72,26 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
 
 #[test]
 fn spawn_spec_is_acp_only_no_pty_flags() {
-    let argv = build_argv("opencode", &OpencodeSpawnInput::default());
+    // `opencode acp` accepts no permission flag at all — a `--auto` shipped
+    // here once and killed every managed spawn (exit 1 before `initialize`,
+    // surfacing as "jsonrpc peer closed"). The permission posture rides the
+    // `OPENCODE_PERMISSION` env instead: opencode's own sub-sessions
+    // (`task` / `@explore`) resolve permissions INTERNALLY, so an
+    // `external_directory` ask from one never reaches the ACP wire for the
+    // in-band auto-allow to answer — the parent's `task` then hangs forever.
+    let argv = build_argv("opencode");
     assert_eq!(argv, vec!["opencode", "acp"]);
     assert!(!argv
         .iter()
         .any(|a| a.contains("tmux") || a.contains("rmux")));
+
+    let skip = permission_env(&OpencodeSpawnInput::default());
+    assert_eq!(skip.len(), 1, "skip auto-approves at the process level");
+    assert_eq!(skip[0].0, "OPENCODE_PERMISSION");
+    let hitl = permission_env(&OpencodeSpawnInput {
+        permission_mode: ccteam_harness::PermissionMode::Hitl,
+    });
+    assert!(hitl.is_empty(), "hitl never auto-approves");
 }
 
 #[tokio::test]
@@ -244,6 +261,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let project = tmp.path();
     let sid = "s-resume";
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Opencode,
@@ -253,6 +271,7 @@ async fn resume_prefers_session_resume_no_replay() {
         owner: "user:test".into(),
         vendor_uuid: "ses_fake_opencode_0017cafe".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -335,6 +354,7 @@ async fn resume_carries_mcp_servers() {
     }
 
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Opencode,
@@ -344,6 +364,7 @@ async fn resume_carries_mcp_servers() {
         owner: "user:test".into(),
         vendor_uuid: "ses_fake_opencode_0017cafe".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),

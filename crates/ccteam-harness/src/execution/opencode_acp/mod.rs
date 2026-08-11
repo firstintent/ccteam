@@ -34,7 +34,7 @@ use crate::{
     ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
-use spawn_spec::{build_argv, opencode_bin, OpencodeSpawnInput};
+use spawn_spec::{build_argv, opencode_bin, permission_env, OpencodeSpawnInput};
 
 /// Max wait for any late usage_update / chunk after prompt response.
 const FINALIZE_BARRIER: std::time::Duration = std::time::Duration::from_millis(750);
@@ -438,7 +438,19 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         }
         // MVP roleless: ignore role (no persona injection).
         let bin = opencode_bin();
-        let argv = build_argv(&bin, &OpencodeSpawnInput::default());
+        let argv = build_argv(&bin);
+        // Child-only env: the process-level permission posture (`opencode
+        // acp` takes no flag for it — see `spawn_spec::permission_env`) plus
+        // CCTEAM_CHAT_SID, the session's self-description; without the
+        // explicit set the child inherits whatever stale value the daemon's
+        // own environment chain carried.
+        let mut envs = permission_env(&OpencodeSpawnInput {
+            permission_mode: ctx.permission_mode,
+        });
+        envs.push((
+            crate::execution::claude_common::CHAT_SID_ENV.to_string(),
+            ctx.sid.clone(),
+        ));
         let program = argv[0].clone();
         let args: Vec<String> = argv.into_iter().skip(1).collect();
         let cwd = if ctx.cwd.as_os_str().is_empty() {
@@ -449,6 +461,13 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         let inbound = Self::inbound_policy(ctx.permission_mode);
         // v0.8.24 C1 — best-effort ccteam MCP inject into session/new.
         // Failure to load MCP must not block the prompt path (empty vec).
+        // Same open door as grok: this OFFERS the principal against a
+        // same-named machine-credential entry in opencode's own global config,
+        // and no flag makes it win (opencode's own merge does replace on a
+        // same-name key, so it is believed fine — unverified at runtime).
+        // Identity does not ride on the offer: `spawn_for_session` records the
+        // child pid and `/mcp` re-binds by process provenance; the daemon
+        // still measures the outcome. See `mcp_config`'s module doc.
         let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         let prior_uuid = read_session_meta(&ctx.project_dir, &ctx.sid)
@@ -465,12 +484,11 @@ impl HarnessAdapter for OpencodeAcpAdapter {
         let try_resume = prior_uuid.clone();
         let (transport, session_id, info) = match try_resume {
             Some(uuid) => {
-                let transport =
-                    AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
-                        .await
-                        .map_err(|e| {
-                            HarnessError::SpawnFailed(format!("spawn opencode acp: {e}"))
-                        })?;
+                let transport = AcpTransport::spawn_for_session(
+                    &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                )
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("spawn opencode acp: {e}")))?;
                 let transport = Arc::new(transport);
                 match Self::handshake_and_resume(&transport, &cwd, &uuid, mcp_servers.clone()).await
                 {
@@ -481,14 +499,15 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                             "opencode resume/load failed; falling back to session/new"
                         );
                         let _ = transport.shutdown().await;
-                        let transport =
-                            AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
-                                .await
-                                .map_err(|e| {
-                                    HarnessError::SpawnFailed(format!(
-                                        "spawn opencode after resume fail: {e}"
-                                    ))
-                                })?;
+                        let transport = AcpTransport::spawn_for_session(
+                            &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                        )
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SpawnFailed(format!(
+                                "spawn opencode after resume fail: {e}"
+                            ))
+                        })?;
                         let transport = Arc::new(transport);
                         let (sid, info) =
                             Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
@@ -497,12 +516,11 @@ impl HarnessAdapter for OpencodeAcpAdapter {
                 }
             }
             None => {
-                let transport =
-                    AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
-                        .await
-                        .map_err(|e| {
-                            HarnessError::SpawnFailed(format!("spawn opencode acp: {e}"))
-                        })?;
+                let transport = AcpTransport::spawn_for_session(
+                    &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                )
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("spawn opencode acp: {e}")))?;
                 let transport = Arc::new(transport);
                 let (sid, info) =
                     Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
@@ -600,6 +618,24 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             }
         })
         .boxed()
+    }
+
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // The ACP child owns a broadcast channel; `events()` looks the live
+        // session up and subscribes to it, so a rebuild picks up the current
+        // child and replays nothing.
+        crate::EventAttachment::Rebuildable
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "ACP carries `mcpServers` only on `session/new` / `session/load`; there is \
+             no mid-session re-apply — `/new` rebuilds the tool face"
+                .to_string(),
+        })
     }
 
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {

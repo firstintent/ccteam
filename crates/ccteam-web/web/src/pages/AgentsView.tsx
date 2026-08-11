@@ -75,6 +75,19 @@ function modelEffortLabel(node: AgentNode): string {
   return [node.model?.trim(), node.effort?.trim()].filter(Boolean).join(" · ") || "—";
 }
 
+/** The cost cell: vendor-reported USD when priced, else the raw token ledger
+ *  (`1.2m tok`) — the honest magnitude for vendors with no USD price table —
+ *  else an em-dash. Never a fake `$0.00`. */
+function costCell(node: { cost_usd?: number | null; tokens_total?: number | null }): string {
+  if (node.cost_usd != null) return `$${node.cost_usd.toFixed(4)}`;
+  if (node.tokens_total != null && node.tokens_total > 0) {
+    return `${Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 })
+      .format(node.tokens_total)
+      .toLowerCase()} tok`;
+  }
+  return "—";
+}
+
 /** Project-grouped, collapsible delegation tree. Component state contains
  *  only collapsed sids, so the initial render stays deterministic and SSR-safe.
  *  `hosts` = every host in the graph; the per-row host badge renders only
@@ -186,7 +199,7 @@ export function AgentsTree({
                   {showHost ? <span className="agents-tree-host mono">{n.host}</span> : null}
                   <span className={treeDotClass(n, pulsing)} aria-hidden="true" />
                   <span className="agents-tree-active">{relativeTime(lang, n.last_active)}</span>
-                  <span className="agents-tree-cost mono">{n.cost_usd != null ? `$${n.cost_usd.toFixed(4)}` : "—"}</span>
+                  <span className="agents-tree-cost mono">{costCell(n)}</span>
                   <span className="agents-tree-turns mono" title={t("teamColTurns")}>{n.turn_count}t</span>
                 </span>
                 <Link
@@ -334,7 +347,7 @@ export function AgentsPanel({
           {t("depth")}: {node.depth}
         </span>
         <span>
-          {t("cost")}: {node.cost_usd != null ? `$${node.cost_usd.toFixed(4)}` : "—"}
+          {t("cost")}: {costCell(node)}
         </span>
         <span>{relativeTime(lang, node.last_active)}</span>
       </div>

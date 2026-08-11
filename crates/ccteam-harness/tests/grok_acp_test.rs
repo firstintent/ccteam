@@ -456,6 +456,7 @@ async fn load_resume_filters_is_replay() {
     let sid = "s-resume";
     // Seed meta as if a prior session existed with known ACP sessionId.
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Grok,
@@ -465,6 +466,7 @@ async fn load_resume_filters_is_replay() {
         owner: "user:test".into(),
         vendor_uuid: "019f4547-0000-7000-8000-00000000cafe".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -743,6 +745,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     // Phase B — cold resume via session/load (meta carries the vendor_uuid).
     let sid_load = "s-load-mcp";
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid_load.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Grok,
@@ -752,6 +755,7 @@ async fn session_new_and_load_carry_mcp_servers() {
         owner: "user:test".into(),
         vendor_uuid: "019f4547-0000-7000-8000-00000000cafe".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -801,6 +805,91 @@ async fn session_new_and_load_carry_mcp_servers() {
     match prior_dump {
         Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_MCP_DUMP", v) },
         None => unsafe { std::env::remove_var("CCTEAM_ACP_MCP_DUMP") },
+    }
+    clear_fake();
+}
+
+/// "Non-empty `mcpServers`" is NOT the property that matters — WHICH credential
+/// the entry carries is. grok also loads a same-named `ccteam` server from its
+/// own global config carrying the machine ENROLLMENT credential, and grok 1.0.0
+/// was measured winning that collision (see
+/// `ccteam_harness::execution::mcp_config`'s module doc: the ACP door is open
+/// and no vendor lever closes it). So the least ccteam owes the session is to
+/// offer the RIGHT credential: this pins the wire entry byte-for-byte to the
+/// shared ACP projection for this sid's principal — same server name (the
+/// `mcp__ccteam__*` tool-name contract), ACP's `headers[]` array shape, and an
+/// `Authorization` naming THIS session rather than the machine.
+#[tokio::test]
+#[serial]
+async fn session_new_offers_this_sessions_principal_verbatim() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let dump = tmp.path().join("acp_mcp_dump.tsv");
+    let prior_dump = std::env::var_os("CCTEAM_ACP_MCP_DUMP");
+    let prior_url = std::env::var_os("CCTEAM_MCP_HTTP_URL");
+    unsafe {
+        std::env::set_var("CCTEAM_ACP_MCP_DUMP", &dump);
+        // Pin the endpoint so the expectation does not depend on this host's
+        // daemon bind record.
+        std::env::set_var("CCTEAM_MCP_HTTP_URL", "http://127.0.0.1:7399/mcp");
+    }
+
+    let adapter = GrokAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &SpawnCtx {
+                slug: "demo".into(),
+                sid: "s77".into(),
+                cwd: tmp.path().to_path_buf(),
+                project_dir: tmp.path().to_path_buf(),
+                extra_args: vec![],
+                model_id: None,
+                effort: None,
+                permission_mode: PermissionMode::Skip,
+                secret: "sekret77".into(),
+                remote: None,
+            },
+        )
+        .await
+        .expect("fresh start");
+    adapter.close_thread(&handle).await.ok();
+
+    let recorded = std::fs::read_to_string(&dump).unwrap_or_default();
+    let body = recorded
+        .lines()
+        .find(|l| l.starts_with("session/new\t"))
+        .and_then(|l| l.split('\t').nth(2))
+        .unwrap_or_default()
+        .to_string();
+    let on_wire: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("session/new mcpServers not recorded ({e}): {recorded:?}"));
+
+    let expected = serde_json::Value::Array(
+        ccteam_harness::execution::mcp_config::acp_mcp_servers_http("s77", "sekret77"),
+    );
+    assert_eq!(
+        on_wire, expected,
+        "grok must offer the shared ACP projection unchanged, not a hand-rolled entry"
+    );
+    // Spelled out, because these three are the properties an "improvement" is
+    // most likely to quietly drop.
+    assert_eq!(on_wire[0]["name"], "ccteam");
+    assert_eq!(on_wire[0]["headers"][0]["name"], "Authorization");
+    assert_eq!(
+        on_wire[0]["headers"][0]["value"], "Bearer ccteam-sid:s77:sekret77",
+        "the offered credential must name THIS session, never the machine"
+    );
+
+    match prior_dump {
+        Some(v) => unsafe { std::env::set_var("CCTEAM_ACP_MCP_DUMP", v) },
+        None => unsafe { std::env::remove_var("CCTEAM_ACP_MCP_DUMP") },
+    }
+    match prior_url {
+        Some(v) => unsafe { std::env::set_var("CCTEAM_MCP_HTTP_URL", v) },
+        None => unsafe { std::env::remove_var("CCTEAM_MCP_HTTP_URL") },
     }
     clear_fake();
 }

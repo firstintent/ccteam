@@ -79,6 +79,7 @@ fn write_one_tracked_session(root: &std::path::Path) {
     ccteam_harness::write_session_meta(
         &project_dir,
         &ccteam_harness::SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".to_string(),
             slug: "outside".to_string(),
             vendor: ccteam_harness::AgentVendor::Claude,
@@ -88,6 +89,7 @@ fn write_one_tracked_session(root: &std::path::Path) {
             owner: "user:outside-chat".to_string(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".to_string(),
             created_at: now.clone(),

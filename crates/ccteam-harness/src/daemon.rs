@@ -123,8 +123,7 @@ fn is_ephemeral_socket(socket_path: &Path) -> bool {
 /// detaches us with `setsid` and the production daemon is *meant* to outlive
 /// its launcher, so the kernel parent-death signal is the wrong tool here.
 /// Only ever called for ephemeral daemons (see [`is_ephemeral_socket`]).
-/// Mirrors the proven orphan-poll in ccteam-cli's mcp-serve. No-op on
-/// non-Unix (no `getppid`).
+/// No-op on non-Unix (no `getppid`).
 #[cfg(unix)]
 fn spawn_orphan_reaper() {
     // SAFETY: getppid() is a thin, always-safe syscall wrapper taking no args.

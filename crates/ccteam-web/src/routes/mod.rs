@@ -30,6 +30,12 @@ pub mod capabilities;
 // successor to the flat `capabilities` probe; shares `hosts::probe_bin`.
 pub mod chat_ws;
 pub mod dashboard;
+// Enrollment credentials for hand-started / EXTERNAL agents: the console's
+// one-click "copy an MCP config another machine can paste" surface
+// (`GET`/`POST /api/v1/enroll` + `DELETE /api/v1/enroll/{id}`). Merged into the
+// `/api/v1` OpenApiRouter (see `openapi::build_api_v1`), so it rides the same
+// auth gate as every other resource route.
+pub mod enroll;
 pub mod evolution;
 pub mod health;
 pub mod hosts;
@@ -80,8 +86,9 @@ pub mod status;
 pub mod session_pane;
 // v0.8.18 档1 — per-user web tenant management (web-first user CRUD; admin-gated).
 pub mod users;
-// v0.9 T4 — streamable HTTP MCP (`POST /mcp`). Self-gated (admin bearer OR
-// session principal); mounted OUTSIDE auth_layer in `lib::router_with_state`.
+// v0.9 T4 — streamable HTTP MCP (`POST /mcp`). Self-gated (session principal OR
+// enrollment credential — no web-token family, no admin tier); mounted OUTSIDE
+// auth_layer in `lib::router_with_state`.
 pub mod mcp;
 pub mod mcp_servers;
 
@@ -112,8 +119,8 @@ pub fn stateful_router() -> Router<AppState> {
         .merge(pty_ws::router())
     // NOTE: `mcp::router()` (`POST /mcp`) is deliberately NOT merged here — it
     // mounts OUTSIDE auth_layer in `lib::router_with_state` because it
-    // authenticates itself (admin bearer OR session principal
-    // `ccteam-sid:<sid>:<secret>`, which auth_layer does not understand).
+    // authenticates itself (`ccteam-sid:<sid>:<secret>` or
+    // `ccteam-enroll:<id>:<secret>`, neither of which auth_layer understands).
 }
 
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`

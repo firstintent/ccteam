@@ -23,7 +23,9 @@
 #   * Uninstall (stops the daemon, removes any legacy unit + the binary;
 #     keeps ~/.ccteam):  curl -sSL .../install.sh | sh -s -- --uninstall
 #   * Windows is not supported — run ccteam under WSL2 and use the
-#     linux-x64 binary (tmux + inotify + POSIX signals are foundational).
+#     linux-x64 binary (POSIX signals, unix sockets and filesystem
+#     watches are foundational; tmux is not — the default session
+#     protocol needs no PTY).
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh

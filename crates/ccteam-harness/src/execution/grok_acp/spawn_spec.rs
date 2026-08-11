@@ -37,13 +37,12 @@ pub fn grok_bin() -> String {
 /// Child-only env for managed grok spawns.
 ///
 /// `GROK_CLAUDE_MCPS_ENABLED=false` disables Grok's Claude MCP compat scan
-/// (`[compat.claude] mcps`, vendor default on): ccteam keeps a global stdio
-/// `ccteam internal mcp-serve` entry in `~/.claude.json` for plain Claude
-/// main sessions, and Grok would import it on top of the ACP-injected HTTP
-/// server — one orphan `mcp-serve` child per session plus a same-name double
-/// registration whose winner (admin stdio vs session-principal HTTP) depends
-/// on the grok version. Managed sessions get their tool face via ACP
-/// `mcpServers`, so the scan is pure downside here; the global Claude
+/// (`[compat.claude] mcps`, vendor default on): ccteam keeps a global `ccteam`
+/// entry in `~/.claude.json` for plain Claude main sessions, and Grok would
+/// import it on top of the ACP-injected server — a same-name double
+/// registration whose winner (the global entry's identity vs this session's
+/// principal) is not ours to decide. Managed sessions get their tool face via
+/// ACP `mcpServers`, so the scan is pure downside here; the global Claude
 /// registration itself stays (Claude main-session fallback).
 pub fn build_envs() -> Vec<(String, String)> {
     vec![("GROK_CLAUDE_MCPS_ENABLED".into(), "false".into())]

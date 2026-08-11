@@ -13,18 +13,36 @@
 //! temp dir without touching the real `~/.claude.json` / `~/.codex`.
 //!
 //! **One transport for all five vendors: Streamable HTTP against the daemon's
-//! `POST /mcp`, authenticated with the admin web token.** No global
-//! registration spawns a `ccteam internal mcp-serve` stdio child any more —
-//! the shapes differ only in each vendor's config dialect (Claude/Kimi
-//! `mcpServers` JSON, Codex/Grok `[mcp_servers]` TOML, OpenCode `mcp` JSON)
-//! and in the header key (`headers` vs Codex's `http_headers`). A global entry
-//! serves a **plain main session** with Admin semantics; ccteam-managed
-//! sessions override the same-named entry with their per-session
-//! `ccteam-sid:<sid>:<secret>` principal (see
+//! `POST /mcp`, carrying an ENROLLMENT credential
+//! ([`crate::enroll`]).** No registration spawns a stdio child: the `internal
+//! mcp-serve` command that served that shape is deleted, and a legacy
+//! `command`/`args` entry left in a user's config reads as NOT registered so
+//! the repair pass replaces it. The shapes differ only in each vendor's config
+//! dialect (Claude/Kimi `mcpServers` JSON, Codex/Grok `[mcp_servers]` TOML,
+//! OpenCode `mcp` JSON) and in the header key (`headers` vs Codex's
+//! `http_headers`).
+//!
+//! What the entry's bearer is FOR: a vendor's global config is one static file
+//! shared by every process that vendor ever starts, so anything durable in it
+//! is a machine-wide SHARED identity. It used to be the admin web token, which
+//! made every hand-started `claude`/`codex`/`grok` the same caller — none could
+//! be a delegation parent and none had a project of its own. The enrollment
+//! credential says only WHOSE config this is and grants nothing by itself; the
+//! per-process identity is issued by the daemon at `initialize` time. A legacy
+//! `Bearer ccteam:<token>` entry therefore reads as NOT registered
+//! ([`is_current_bearer`]) so the daemon's idempotent repair pass replaces it,
+//! exactly as it does a legacy stdio entry. ccteam-managed sessions never rely
+//! on this file at all: they override the same-named entry with their
+//! per-session `ccteam-sid:<sid>:<secret>` principal (see
 //! `ccteam_harness::execution::mcp_config`).
 //!
-//! Every config written here embeds the admin bearer, so every writer chmods
-//! its file to 0600.
+//! The URL every writer registers comes from the ONE resolution chain in
+//! `ccteam_harness::execution::mcp_config` (`resolve_mcp_http_url`) — the same
+//! chain a managed session's own endpoint resolves through, so a non-default
+//! `--web-bind` cannot leave global config and managed sessions disagreeing.
+//!
+//! Every config written here embeds a credential, so every writer chmods its
+//! file to 0600.
 //!
 //! v0.8.18 柱1 — moved here from `ccteam-cli::mcp_serve` (which now
 //! re-exports) so the web host page can register MCP without depending on
@@ -36,60 +54,48 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
-/// Filename under `~/.ccteam/run/` where a starting daemon records the MCP URL
-/// its own web bind resolves to.
-const DAEMON_MCP_URL_FILE: &str = "mcp-url";
-
-/// Record the MCP URL implied by the daemon's actual web bind, so registration
-/// paths that run OUT OF BAND (`ccteam config mcp`, doctor) target the port the
-/// daemon really listens on instead of guessing the default.
-///
-/// Called at daemon start, before auto-registration. Best-effort by contract:
-/// the caller logs and continues, since a stale/missing record only costs the
-/// default guess. A non-parsing bind is `Ok(())` with nothing written — the
-/// startup path reports that error properly a few lines later.
-pub fn record_daemon_mcp_url(run_dir: &Path, web_bind: &str) -> Result<()> {
-    let Some(url) = mcp_url_from_bind(web_bind) else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
-    atomic_write(&run_dir.join(DAEMON_MCP_URL_FILE), url.as_bytes())
+/// The `Authorization` value every dialect writes. One home for the wire form
+/// so five writers cannot drift from the one predicate that reads it back.
+fn authorization_value(bearer: &str) -> String {
+    format!("Bearer {bearer}")
 }
 
-/// Resolve the MCP URL to register: explicit operator override
-/// (`CCTEAM_MCP_HTTP_URL` / `CCTEAM_WEB_URL`) → the running daemon's recorded
-/// bind → the default-bind fallback.
-///
-/// This is what makes an HTTP registration correct on a non-default
-/// `--web-bind`. The old stdio entry was port-agnostic (the child dialled the
-/// unix socket), so without this the move to HTTP would break exactly the users
-/// who bind somewhere else.
-pub fn resolve_mcp_http_url(run_dir: &Path) -> String {
-    if let Some(url) = ccteam_harness::execution::mcp_config::mcp_http_url_from_env() {
-        return url;
-    }
-    if let Ok(body) = std::fs::read_to_string(run_dir.join(DAEMON_MCP_URL_FILE)) {
-        let trimmed = body.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    ccteam_harness::execution::mcp_config::FALLBACK_MCP_HTTP_URL.to_string()
+/// Whether an existing entry's `Authorization` carries the CURRENT credential
+/// family. Anything else — most importantly the legacy `Bearer ccteam:<admin
+/// web token>` — reads as false, which makes the daemon's idempotent repair
+/// pass rewrite the entry on next start. Same mechanism the legacy stdio
+/// `command` entry uses, and the reason no migration code is needed.
+fn is_current_bearer(value: &str) -> bool {
+    value
+        .strip_prefix("Bearer ")
+        .and_then(crate::enroll::parse_enroll_bearer)
+        .is_some()
 }
 
-/// `<bind>` → the loopback URL a vendor on this host should dial. A wildcard
-/// bind (`0.0.0.0` / `[::]`) is not a destination, so it maps to loopback on the
-/// same port; a concrete address is kept as-is. `None` when unparseable.
-fn mcp_url_from_bind(web_bind: &str) -> Option<String> {
-    let addr: std::net::SocketAddr = web_bind.trim().parse().ok()?;
-    let port = addr.port();
-    if addr.ip().is_unspecified() {
-        return Some(format!("http://127.0.0.1:{port}/mcp"));
+/// Validate what every writer is about to persist, before any file is touched.
+///
+/// The bearer must be one [`is_current_bearer`] accepts, or the writer would
+/// produce an entry its own predicate reads as NOT registered — and the daemon
+/// would then rewrite that file on every single start, forever, with nothing in
+/// the logs to explain the churn. Failing the call names the mistake instead.
+fn checked_pair<'a>(mcp_http_url: &'a str, bearer: &'a str) -> Result<(&'a str, &'a str)> {
+    let url = mcp_http_url.trim();
+    if url.is_empty() {
+        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
     }
-    Some(match addr.ip() {
-        std::net::IpAddr::V4(v4) => format!("http://{v4}:{port}/mcp"),
-        std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{port}/mcp"),
-    })
+    let bearer = bearer.trim();
+    if bearer.is_empty() {
+        anyhow::bail!("ccteam MCP enrollment bearer must not be empty");
+    }
+    if !is_current_bearer(&authorization_value(bearer)) {
+        anyhow::bail!(
+            "ccteam MCP registration needs an enrollment bearer \
+             ({}<id>:<secret>) — a vendor's global config is shared by every \
+             process that vendor starts, so it must not carry the admin web token",
+            crate::enroll::ENROLL_BEARER_PREFIX
+        );
+    }
+    Ok((url, bearer))
 }
 
 /// Register the ccteam MCP server in Claude's `~/.claude.json` as an
@@ -105,15 +111,8 @@ fn mcp_url_from_bind(web_bind: &str) -> Option<String> {
 /// The whole `ccteam` table is REPLACED so a legacy stdio `command` / `args` /
 /// `env` cannot survive alongside `url` — Claude's config schema validates
 /// per transport, and a mixed entry fails the server outright.
-pub fn install_mcp_into(claude_json: &Path, mcp_http_url: &str, admin_token: &str) -> Result<()> {
-    let url = mcp_http_url.trim();
-    if url.is_empty() {
-        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
-    }
-    let token = admin_token.trim();
-    if token.is_empty() {
-        anyhow::bail!("ccteam admin web token must not be empty");
-    }
+pub fn install_mcp_into(claude_json: &Path, mcp_http_url: &str, bearer: &str) -> Result<()> {
+    let (url, bearer) = checked_pair(mcp_http_url, bearer)?;
     let mut root = if claude_json.exists() {
         let bytes = std::fs::read(claude_json)
             .with_context(|| format!("read {}", claude_json.display()))?;
@@ -143,7 +142,7 @@ pub fn install_mcp_into(claude_json: &Path, mcp_http_url: &str, admin_token: &st
         json!({
             "type": "http",
             "url": url,
-            "headers": { "Authorization": format!("Bearer ccteam:{token}") },
+            "headers": { "Authorization": authorization_value(bearer) },
         }),
     );
 
@@ -163,27 +162,16 @@ pub fn install_mcp_into(claude_json: &Path, mcp_http_url: &str, admin_token: &st
 ///
 /// MERGE, never clobber: every other top-level key and every other
 /// `[mcp_servers.*]` entry is preserved; only `mcp_servers.ccteam` is
-/// set/replaced. The admin token is the bare value stored in
-/// `~/.ccteam/secrets/web-token`; this writer adds the `ccteam:` wire prefix
-/// and `Bearer` scheme. Parent dir + file are created if absent. Idempotent.
+/// set/replaced. `bearer` is the complete credential value (this writer only
+/// adds the `Bearer` scheme). Parent dir + file are created if absent.
+/// Idempotent.
 ///
 /// The global entry intentionally uses the same HTTP transport as Codex's
 /// per-thread override. Codex 0.144.3 deep-merges those tables, so retaining a
 /// legacy global `command` while a thread adds `url` creates an invalid mixed
 /// transport and rejects `thread/start`.
-pub fn install_codex_mcp_into(
-    config_toml: &Path,
-    mcp_http_url: &str,
-    admin_token: &str,
-) -> Result<()> {
-    let url = mcp_http_url.trim();
-    if url.is_empty() {
-        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
-    }
-    let token = admin_token.trim();
-    if token.is_empty() {
-        anyhow::bail!("ccteam admin web token must not be empty");
-    }
+pub fn install_codex_mcp_into(config_toml: &Path, mcp_http_url: &str, bearer: &str) -> Result<()> {
+    let (url, bearer) = checked_pair(mcp_http_url, bearer)?;
 
     // Parse the existing config (or start empty). A non-table / unparseable
     // root is treated as "start fresh" rather than failing the install,
@@ -220,7 +208,7 @@ pub fn install_codex_mcp_into(
     let mut headers = toml::Table::new();
     headers.insert(
         "Authorization".to_string(),
-        toml::Value::String(format!("Bearer ccteam:{token}")),
+        toml::Value::String(authorization_value(bearer)),
     );
     entry.insert("http_headers".to_string(), toml::Value::Table(headers));
     servers.insert(
@@ -230,7 +218,7 @@ pub fn install_codex_mcp_into(
 
     let body = toml::to_string_pretty(&root).context("serialize codex config.toml")?;
     atomic_write(config_toml, body.as_bytes())?;
-    // This table now carries the admin bearer. Keep Codex's config private
+    // This table now carries a credential. Keep Codex's config private
     // even when the caller's umask would otherwise create a world-readable
     // replacement during the atomic rewrite.
     #[cfg(unix)]
@@ -248,26 +236,15 @@ pub fn install_codex_mcp_into(
 /// `headers`, Codex's is `http_headers`).
 ///
 /// MERGE, never clobber + idempotent, mirroring [`install_codex_mcp_into`].
-/// The global entry carries the admin bearer, so any plain `grok` main
+/// The global entry carries the enrollment bearer, so any plain `grok` main
 /// session can orchestrate (v0.9.3 vendor symmetry). ccteam-managed grok
 /// sessions ALSO receive a same-named ACP-injected server with their
 /// per-session principal; real-machine probe (grok 0.2.x, 2026-07-15): grok
 /// connects both, dedups same-named tools, and `tools/call` lands on the
 /// ACP-injected (session) server — so the delegation parent edge survives the
 /// global entry.
-pub fn install_grok_mcp_into(
-    config_toml: &Path,
-    mcp_http_url: &str,
-    admin_token: &str,
-) -> Result<()> {
-    let url = mcp_http_url.trim();
-    if url.is_empty() {
-        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
-    }
-    let token = admin_token.trim();
-    if token.is_empty() {
-        anyhow::bail!("ccteam admin web token must not be empty");
-    }
+pub fn install_grok_mcp_into(config_toml: &Path, mcp_http_url: &str, bearer: &str) -> Result<()> {
+    let (url, bearer) = checked_pair(mcp_http_url, bearer)?;
 
     let mut root: toml::Table = if config_toml.exists() {
         let body = std::fs::read_to_string(config_toml)
@@ -299,7 +276,7 @@ pub fn install_grok_mcp_into(
     let mut headers = toml::Table::new();
     headers.insert(
         "Authorization".to_string(),
-        toml::Value::String(format!("Bearer ccteam:{token}")),
+        toml::Value::String(authorization_value(bearer)),
     );
     entry.insert("headers".to_string(), toml::Value::Table(headers));
     servers.insert(
@@ -325,22 +302,15 @@ pub fn install_grok_mcp_into(
 /// the separate core-v2 path, not the shipped CLI).
 ///
 /// MERGE, never clobber + idempotent: only `mcp.ccteam` is set; every other
-/// key survives. Admin bearer inside → 0600. ccteam-managed OpenCode sessions
+/// key survives. Credential inside → 0600. ccteam-managed OpenCode sessions
 /// override this by name at runtime (`MCP.add` replaces the same-named config
 /// entry with the ACP-injected per-session principal).
 pub fn install_opencode_mcp_into(
     opencode_json: &Path,
     mcp_http_url: &str,
-    admin_token: &str,
+    bearer: &str,
 ) -> Result<()> {
-    let url = mcp_http_url.trim();
-    if url.is_empty() {
-        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
-    }
-    let token = admin_token.trim();
-    if token.is_empty() {
-        anyhow::bail!("ccteam admin web token must not be empty");
-    }
+    let (url, bearer) = checked_pair(mcp_http_url, bearer)?;
 
     let mut root = if opencode_json.exists() {
         let bytes = std::fs::read(opencode_json)
@@ -373,7 +343,7 @@ pub fn install_opencode_mcp_into(
             "type": "remote",
             "url": url,
             "enabled": true,
-            "headers": { "Authorization": format!("Bearer ccteam:{token}") },
+            "headers": { "Authorization": authorization_value(bearer) },
         }),
     );
 
@@ -396,18 +366,11 @@ pub fn install_opencode_mcp_into(
 /// ACP `mcpServers` parameter's name/value array shape here.
 ///
 /// MERGE, never clobber + idempotent: only `mcpServers.ccteam` is set; every
-/// other key survives. Admin bearer inside → 0600. ccteam-managed kimi
+/// other key survives. Credential inside → 0600. ccteam-managed kimi
 /// sessions ALSO receive a same-named ACP-injected server with their
 /// per-session principal (same dedup-by-name posture as grok/opencode).
-pub fn install_kimi_mcp_into(mcp_json: &Path, mcp_http_url: &str, admin_token: &str) -> Result<()> {
-    let url = mcp_http_url.trim();
-    if url.is_empty() {
-        anyhow::bail!("ccteam MCP HTTP URL must not be empty");
-    }
-    let token = admin_token.trim();
-    if token.is_empty() {
-        anyhow::bail!("ccteam admin web token must not be empty");
-    }
+pub fn install_kimi_mcp_into(mcp_json: &Path, mcp_http_url: &str, bearer: &str) -> Result<()> {
+    let (url, bearer) = checked_pair(mcp_http_url, bearer)?;
 
     let mut root = if mcp_json.exists() {
         let bytes =
@@ -438,7 +401,7 @@ pub fn install_kimi_mcp_into(mcp_json: &Path, mcp_http_url: &str, admin_token: &
         crate::CCTEAM_MCP_SERVER_KEY.into(),
         json!({
             "url": url,
-            "headers": { "Authorization": format!("Bearer ccteam:{token}") },
+            "headers": { "Authorization": authorization_value(bearer) },
         }),
     );
 
@@ -453,8 +416,9 @@ pub fn install_kimi_mcp_into(mcp_json: &Path, mcp_http_url: &str, admin_token: &
     Ok(())
 }
 
-/// Whether Kimi's `mcp.json` carries the ccteam HTTP MCP entry. Best-effort;
-/// missing/junk file reads as `false`.
+/// Whether Kimi's `mcp.json` carries the ccteam HTTP MCP entry with a current
+/// ([`is_current_bearer`]) credential. Best-effort; missing/junk file reads as
+/// `false`.
 pub fn kimi_mcp_registered(mcp_json: &Path) -> bool {
     let Ok(bytes) = std::fs::read(mcp_json) else {
         return false;
@@ -476,7 +440,7 @@ pub fn kimi_mcp_registered(mcp_json: &Path) -> bool {
         && entry
             .pointer("/headers/Authorization")
             .and_then(Value::as_str)
-            .is_some_and(|v| v.starts_with("Bearer ccteam:"))
+            .is_some_and(is_current_bearer)
 }
 
 /// Resolve Kimi Code CLI's user MCP config: `$KIMI_CODE_HOME/mcp.json`
@@ -491,7 +455,8 @@ pub fn resolve_kimi_config_path() -> Result<PathBuf> {
 }
 
 /// Whether Grok's `config.toml` carries the current HTTP form of
-/// `[mcp_servers.ccteam]`. Best-effort; missing/junk file reads as `false`.
+/// `[mcp_servers.ccteam]` with a current ([`is_current_bearer`]) credential.
+/// Best-effort; missing/junk file reads as `false`.
 pub fn grok_mcp_registered(config_toml: &Path) -> bool {
     let Ok(body) = std::fs::read_to_string(config_toml) else {
         return false;
@@ -516,11 +481,12 @@ pub fn grok_mcp_registered(config_toml: &Path) -> bool {
             .and_then(toml::Value::as_table)
             .and_then(|headers| headers.get("Authorization"))
             .and_then(toml::Value::as_str)
-            .is_some_and(|value| value.starts_with("Bearer ccteam:"))
+            .is_some_and(is_current_bearer)
 }
 
 /// Whether OpenCode's global `opencode.json` carries the ccteam remote MCP
-/// entry. Best-effort; missing/junk file reads as `false`.
+/// entry with a current ([`is_current_bearer`]) credential. Best-effort;
+/// missing/junk file reads as `false`.
 pub fn opencode_mcp_registered(opencode_json: &Path) -> bool {
     let Ok(bytes) = std::fs::read(opencode_json) else {
         return false;
@@ -542,7 +508,7 @@ pub fn opencode_mcp_registered(opencode_json: &Path) -> bool {
         && entry
             .pointer("/headers/Authorization")
             .and_then(Value::as_str)
-            .is_some_and(|v| v.starts_with("Bearer ccteam:"))
+            .is_some_and(is_current_bearer)
 }
 
 /// Resolve Grok CLI's user config: `~/.grok/config.toml`.
@@ -565,11 +531,12 @@ pub fn resolve_opencode_config_path() -> Result<PathBuf> {
 }
 
 /// Whether `~/.claude.json` carries the current HTTP form of
-/// `mcpServers.ccteam`. A legacy stdio entry deliberately reads as `false` so
-/// doctor / host readiness asks the operator to rerun `ccteam config mcp` and
-/// the daemon's auto-registration replaces the old shape, instead of declaring
-/// a `mcp-serve`-child entry ready. Best-effort: a missing / unreadable / junk
-/// file reads as `false`. Read-only — never writes.
+/// `mcpServers.ccteam` with a current ([`is_current_bearer`]) credential. A
+/// legacy stdio entry — and equally a legacy admin-token bearer — deliberately
+/// reads as `false` so doctor / host readiness asks the operator to rerun
+/// `ccteam config mcp` and the daemon's auto-registration replaces the old
+/// shape, instead of declaring a `mcp-serve`-child entry ready. Best-effort: a
+/// missing / unreadable / junk file reads as `false`. Read-only — never writes.
 pub fn claude_mcp_registered(claude_json: &Path) -> bool {
     let Ok(bytes) = std::fs::read(claude_json) else {
         return false;
@@ -591,15 +558,16 @@ pub fn claude_mcp_registered(claude_json: &Path) -> bool {
         && entry
             .pointer("/headers/Authorization")
             .and_then(Value::as_str)
-            .is_some_and(|v| v.starts_with("Bearer ccteam:"))
+            .is_some_and(is_current_bearer)
         && entry.get("command").is_none()
 }
 
 /// Whether Codex's `config.toml` carries the current HTTP form of
-/// `[mcp_servers.ccteam]`. A legacy stdio entry deliberately reads as `false`
-/// so doctor/host readiness asks the operator to rerun `ccteam config mcp` and
-/// removes the `mcp-serve` child instead of declaring the old shape ready.
-/// Best-effort: a missing / unreadable / junk file reads as `false`.
+/// `[mcp_servers.ccteam]` with a current ([`is_current_bearer`]) credential. A
+/// legacy stdio entry — and equally a legacy admin-token bearer — deliberately
+/// reads as `false` so doctor/host readiness asks the operator to rerun `ccteam
+/// config mcp` and removes the `mcp-serve` child instead of declaring the old
+/// shape ready. Best-effort: a missing / unreadable / junk file reads as `false`.
 pub fn codex_mcp_registered(config_toml: &Path) -> bool {
     let Ok(body) = std::fs::read_to_string(config_toml) else {
         return false;
@@ -624,7 +592,7 @@ pub fn codex_mcp_registered(config_toml: &Path) -> bool {
             .and_then(toml::Value::as_table)
             .and_then(|headers| headers.get("Authorization"))
             .and_then(toml::Value::as_str)
-            .is_some_and(|value| value.starts_with("Bearer ccteam:"))
+            .is_some_and(is_current_bearer)
         && !entry.contains_key("command")
 }
 
@@ -667,72 +635,50 @@ fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn mcp_url_from_bind_maps_wildcard_to_loopback_and_keeps_concrete() {
-        // A wildcard bind is not a destination — a vendor on this host must
-        // dial loopback on the SAME port (the whole point: non-default ports).
-        assert_eq!(
-            mcp_url_from_bind("0.0.0.0:8080").as_deref(),
-            Some("http://127.0.0.1:8080/mcp")
-        );
-        assert_eq!(
-            mcp_url_from_bind("[::]:9000").as_deref(),
-            Some("http://127.0.0.1:9000/mcp")
-        );
-        assert_eq!(
-            mcp_url_from_bind("127.0.0.1:7331").as_deref(),
-            Some("http://127.0.0.1:7331/mcp")
-        );
-        assert_eq!(
-            mcp_url_from_bind("192.168.1.5:7331").as_deref(),
-            Some("http://192.168.1.5:7331/mcp")
-        );
-        assert_eq!(
-            mcp_url_from_bind("[::1]:7331").as_deref(),
-            Some("http://[::1]:7331/mcp")
-        );
-        // Unparseable → None, so startup writes nothing and reports the bind
-        // error through its own path.
-        assert!(mcp_url_from_bind("not-an-addr").is_none());
-        assert!(mcp_url_from_bind("").is_none());
+    /// The wire form production hands these writers: a machine-user
+    /// ENROLLMENT bearer. The `_into` seams never mint one, so the tests state
+    /// it literally rather than reaching into `~/.ccteam`.
+    fn enroll(secret: &str) -> String {
+        format!(
+            "{}deadbeefdeadbeef:{secret}",
+            crate::enroll::ENROLL_BEARER_PREFIX
+        )
+    }
+
+    /// What every pre-enrollment config still carries: the machine-wide SHARED
+    /// admin web token. Every predicate must read this as NOT registered.
+    fn legacy_admin_bearer(token: &str) -> String {
+        format!("Bearer ccteam:{token}")
     }
 
     #[test]
-    fn resolve_mcp_http_url_prefers_recorded_bind_over_default() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let run_dir = tmp.path().join("run");
-        // Nothing recorded yet → default-bind fallback.
-        assert_eq!(
-            resolve_mcp_http_url(&run_dir),
-            ccteam_harness::execution::mcp_config::FALLBACK_MCP_HTTP_URL
-        );
-        // A daemon on a custom port records it; registration follows.
-        record_daemon_mcp_url(&run_dir, "0.0.0.0:8080").unwrap();
-        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:8080/mcp");
-        // Re-record on restart (idempotent, last write wins).
-        record_daemon_mcp_url(&run_dir, "0.0.0.0:9100").unwrap();
-        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
-        // An unparseable bind leaves the previous record intact.
-        record_daemon_mcp_url(&run_dir, "bogus").unwrap();
-        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
-    }
-
-    #[test]
-    fn install_mcp_into_writes_http_url_and_admin_header() {
+    fn install_mcp_into_writes_http_url_and_enroll_header() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", "admin-secret").unwrap();
+        install_mcp_into(&claude_json, "http://127.0.0.1:7331/mcp", &enroll("s3cret")).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
         let entry = &v["mcpServers"]["ccteam"];
         assert_eq!(entry["type"], "http");
         assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
         assert_eq!(
             entry["headers"]["Authorization"],
-            "Bearer ccteam:admin-secret"
+            format!("Bearer {}", enroll("s3cret"))
         );
         // No stdio child: the global entry never spawns `internal mcp-serve`.
         assert!(entry.get("command").is_none());
         assert!(entry.get("args").is_none());
+    }
+
+    /// The predicate is what decides whether the daemon repairs an entry, so
+    /// it must accept exactly the family the writers produce.
+    #[test]
+    fn only_the_enrollment_family_reads_as_a_current_bearer() {
+        assert!(is_current_bearer(&format!("Bearer {}", enroll("s"))));
+        assert!(!is_current_bearer(&legacy_admin_bearer("deadbeef")));
+        assert!(!is_current_bearer("Bearer ccteam-sid:s1:secret"));
+        assert!(!is_current_bearer(&enroll("s")), "scheme is mandatory");
+        assert!(!is_current_bearer("Bearer ccteam-enroll:not-hex:s"));
+        assert!(!is_current_bearer(""));
     }
 
     #[test]
@@ -744,7 +690,7 @@ mod tests {
             r#"{"projects":{"a":1},"mcpServers":{"other":{"command":"x"}}}"#,
         )
         .unwrap();
-        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "tok").unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", &enroll("tok")).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
         assert_eq!(v["projects"]["a"], 1);
         assert_eq!(v["mcpServers"]["other"]["command"], "x");
@@ -767,13 +713,43 @@ mod tests {
             !claude_mcp_registered(&claude_json),
             "legacy stdio shape must read as NOT registered so it gets repaired"
         );
-        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "fresh").unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", &enroll("fresh")).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
         let entry = &v["mcpServers"]["ccteam"];
         assert_eq!(entry["url"], "http://localhost:7331/mcp");
         assert!(entry.get("command").is_none());
         assert!(entry.get("args").is_none());
         assert!(entry.get("env").is_none());
+        assert!(claude_mcp_registered(&claude_json));
+    }
+
+    /// The upgrade path off the shared machine identity: an entry that still
+    /// carries the admin web token reads as NOT registered, so the daemon's
+    /// repair pass rewrites it. No migration code — replace in place.
+    #[test]
+    fn install_mcp_into_replaces_a_legacy_admin_token_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_json = tmp.path().join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            json!({"mcpServers": {"ccteam": {
+                "type": "http",
+                "url": "http://localhost:7331/mcp",
+                "headers": {"Authorization": legacy_admin_bearer("deadbeefcafe")},
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            !claude_mcp_registered(&claude_json),
+            "the shared admin-token entry must read as NOT registered"
+        );
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", &enroll("fresh")).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["ccteam"]["headers"]["Authorization"],
+            format!("Bearer {}", enroll("fresh"))
+        );
         assert!(claude_mcp_registered(&claude_json));
     }
 
@@ -784,7 +760,7 @@ mod tests {
         assert!(!claude_mcp_registered(&claude_json), "missing file → false");
         std::fs::write(&claude_json, r#"{"mcpServers":{"other":{}}}"#).unwrap();
         assert!(!claude_mcp_registered(&claude_json), "no ccteam → false");
-        install_mcp_into(&claude_json, "http://localhost/mcp", "t").unwrap();
+        install_mcp_into(&claude_json, "http://localhost/mcp", &enroll("t")).unwrap();
         assert!(claude_mcp_registered(&claude_json), "after install → true");
     }
 
@@ -792,8 +768,8 @@ mod tests {
     fn install_mcp_into_is_idempotent_and_rejects_missing_credentials() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join("nested").join(".claude.json");
-        install_mcp_into(&claude_json, "http://localhost:7331/mcp", "a").unwrap();
-        install_mcp_into(&claude_json, "http://localhost:7444/mcp", "b").unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7331/mcp", &enroll("a")).unwrap();
+        install_mcp_into(&claude_json, "http://localhost:7444/mcp", &enroll("b")).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&claude_json).unwrap()).unwrap();
         assert_eq!(
             v["mcpServers"]["ccteam"]["url"],
@@ -801,12 +777,54 @@ mod tests {
         );
         assert_eq!(
             v["mcpServers"]["ccteam"]["headers"]["Authorization"],
-            "Bearer ccteam:b"
+            format!("Bearer {}", enroll("b"))
         );
         let absent = tmp.path().join("absent.json");
-        assert!(install_mcp_into(&absent, "", "t").is_err());
+        assert!(install_mcp_into(&absent, "", &enroll("t")).is_err());
         assert!(install_mcp_into(&absent, "http://x/mcp", " ").is_err());
         assert!(!absent.exists());
+    }
+
+    /// A writer must never persist a bearer its own predicate rejects: that
+    /// entry would be repaired on every daemon start, forever, silently.
+    #[test]
+    fn writers_refuse_a_bearer_their_predicate_would_reject() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let url = "http://localhost:7331/mcp";
+        let stale = "ccteam:deadbeefcafe";
+        for (name, result) in [
+            (
+                "claude",
+                install_mcp_into(&tmp.path().join("c.json"), url, stale),
+            ),
+            (
+                "codex",
+                install_codex_mcp_into(&tmp.path().join("cx.toml"), url, stale),
+            ),
+            (
+                "grok",
+                install_grok_mcp_into(&tmp.path().join("g.toml"), url, stale),
+            ),
+            (
+                "opencode",
+                install_opencode_mcp_into(&tmp.path().join("o.json"), url, stale),
+            ),
+            (
+                "kimi",
+                install_kimi_mcp_into(&tmp.path().join("k.json"), url, stale),
+            ),
+        ] {
+            let err = result.expect_err(&format!("{name} accepted the admin-token form"));
+            assert!(
+                err.to_string()
+                    .contains(crate::enroll::ENROLL_BEARER_PREFIX),
+                "{name} error must name the expected family: {err}"
+            );
+        }
+        // Nothing was written on the way out.
+        for file in ["c.json", "cx.toml", "g.toml", "o.json", "k.json"] {
+            assert!(!tmp.path().join(file).exists(), "{file} was created");
+        }
     }
 
     #[cfg(unix)]
@@ -815,7 +833,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
         let claude_json = tmp.path().join(".claude.json");
-        install_mcp_into(&claude_json, "http://localhost/mcp", "s").unwrap();
+        install_mcp_into(&claude_json, "http://localhost/mcp", &enroll("s")).unwrap();
         assert_eq!(
             std::fs::metadata(&claude_json)
                 .unwrap()
@@ -835,7 +853,8 @@ mod tests {
             "model = \"o3\"\n[mcp_servers.other]\ncommand = \"x\"\n",
         )
         .unwrap();
-        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "admin-secret").unwrap();
+        install_codex_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", &enroll("s3cret"))
+            .unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(root["model"].as_str(), Some("o3"));
@@ -846,7 +865,7 @@ mod tests {
         );
         assert_eq!(
             root["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].as_str(),
-            Some("Bearer ccteam:admin-secret")
+            Some(format!("Bearer {}", enroll("s3cret")).as_str())
         );
         assert!(root["mcp_servers"]["ccteam"].get("command").is_none());
     }
@@ -855,13 +874,13 @@ mod tests {
     fn install_codex_mcp_into_is_idempotent_and_creates_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("nested").join(".codex").join("config.toml");
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "token-a").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", &enroll("a")).unwrap();
         assert!(!codex_mcp_registered(
             &config_toml.with_file_name("absent.toml")
         ));
         assert!(codex_mcp_registered(&config_toml), "after install → true");
         // Second install must not error or duplicate.
-        install_codex_mcp_into(&config_toml, "http://localhost:7444/mcp", "token-b").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7444/mcp", &enroll("b")).unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(
@@ -871,7 +890,7 @@ mod tests {
         );
         assert_eq!(
             root["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].as_str(),
-            Some("Bearer ccteam:token-b")
+            Some(format!("Bearer {}", enroll("b")).as_str())
         );
     }
 
@@ -885,7 +904,28 @@ mod tests {
         )
         .unwrap();
         assert!(!codex_mcp_registered(&config_toml));
-        install_codex_mcp_into(&config_toml, "http://localhost/mcp", "token").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost/mcp", &enroll("t")).unwrap();
+        assert!(codex_mcp_registered(&config_toml));
+    }
+
+    /// Same replace-in-place upgrade as Claude's, in Codex's dialect (the
+    /// header key differs: `http_headers`, not `headers`).
+    #[test]
+    fn codex_mcp_registered_rejects_a_legacy_admin_token_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_toml = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_toml,
+            format!(
+                "[mcp_servers.ccteam]\nurl = \"http://localhost:7331/mcp\"\n\
+                 [mcp_servers.ccteam.http_headers]\nAuthorization = \"{}\"\n",
+                legacy_admin_bearer("deadbeefcafe")
+            ),
+        )
+        .unwrap();
+        assert!(!codex_mcp_registered(&config_toml));
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", &enroll("fresh"))
+            .unwrap();
         assert!(codex_mcp_registered(&config_toml));
     }
 
@@ -899,7 +939,8 @@ mod tests {
         )
         .unwrap();
 
-        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", "fresh").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost:7331/mcp", &enroll("fresh"))
+            .unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         let entry = root["mcp_servers"]["ccteam"].as_table().unwrap();
@@ -916,7 +957,7 @@ mod tests {
     fn install_codex_mcp_into_rejects_missing_http_credentials() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
-        assert!(install_codex_mcp_into(&config_toml, "", "token").is_err());
+        assert!(install_codex_mcp_into(&config_toml, "", &enroll("t")).is_err());
         assert!(install_codex_mcp_into(&config_toml, "http://localhost/mcp", " ").is_err());
         assert!(!config_toml.exists());
     }
@@ -930,7 +971,7 @@ mod tests {
             "[cli]\nuse_leader = true\n[mcp_servers.other]\nurl = \"http://x/mcp\"\n",
         )
         .unwrap();
-        install_grok_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", "tok").unwrap();
+        install_grok_mcp_into(&config_toml, "http://127.0.0.1:7331/mcp", &enroll("tok")).unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(root["cli"]["use_leader"].as_bool(), Some(true));
@@ -944,7 +985,7 @@ mod tests {
         // Grok's key is `headers` (Codex's is `http_headers`).
         assert_eq!(
             entry["headers"]["Authorization"].as_str(),
-            Some("Bearer ccteam:tok")
+            Some(format!("Bearer {}", enroll("tok")).as_str())
         );
         assert!(!entry.contains_key("http_headers"));
         assert!(grok_mcp_registered(&config_toml));
@@ -955,8 +996,8 @@ mod tests {
     fn install_grok_mcp_into_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join(".grok").join("config.toml");
-        install_grok_mcp_into(&config_toml, "http://localhost:7331/mcp", "a").unwrap();
-        install_grok_mcp_into(&config_toml, "http://localhost:7444/mcp", "b").unwrap();
+        install_grok_mcp_into(&config_toml, "http://localhost:7331/mcp", &enroll("a")).unwrap();
+        install_grok_mcp_into(&config_toml, "http://localhost:7444/mcp", &enroll("b")).unwrap();
         let root: toml::Table =
             toml::from_str(&std::fs::read_to_string(&config_toml).unwrap()).unwrap();
         assert_eq!(
@@ -965,7 +1006,7 @@ mod tests {
         );
         assert_eq!(
             root["mcp_servers"]["ccteam"]["headers"]["Authorization"].as_str(),
-            Some("Bearer ccteam:b")
+            Some(format!("Bearer {}", enroll("b")).as_str())
         );
     }
 
@@ -978,7 +1019,8 @@ mod tests {
             r#"{"$schema":"https://opencode.ai/config.json","model":"x/y","mcp":{"other":{"type":"local","command":["x"]}}}"#,
         )
         .unwrap();
-        install_opencode_mcp_into(&opencode_json, "http://127.0.0.1:7331/mcp", "tok").unwrap();
+        install_opencode_mcp_into(&opencode_json, "http://127.0.0.1:7331/mcp", &enroll("tok"))
+            .unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&opencode_json).unwrap()).unwrap();
         assert_eq!(v["model"], "x/y");
         assert_eq!(v["mcp"]["other"]["type"], "local");
@@ -987,7 +1029,10 @@ mod tests {
         assert_eq!(entry["type"], "remote");
         assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
         assert_eq!(entry["enabled"], true);
-        assert_eq!(entry["headers"]["Authorization"], "Bearer ccteam:tok");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            format!("Bearer {}", enroll("tok"))
+        );
         assert!(v["mcp"].get("servers").is_none());
         assert!(opencode_mcp_registered(&opencode_json));
         assert!(!opencode_mcp_registered(&tmp.path().join("absent.json")));
@@ -1001,13 +1046,15 @@ mod tests {
             .join("nested")
             .join("opencode")
             .join("opencode.json");
-        install_opencode_mcp_into(&opencode_json, "http://localhost:7331/mcp", "a").unwrap();
-        install_opencode_mcp_into(&opencode_json, "http://localhost:7444/mcp", "b").unwrap();
+        install_opencode_mcp_into(&opencode_json, "http://localhost:7331/mcp", &enroll("a"))
+            .unwrap();
+        install_opencode_mcp_into(&opencode_json, "http://localhost:7444/mcp", &enroll("b"))
+            .unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&opencode_json).unwrap()).unwrap();
         assert_eq!(v["mcp"]["ccteam"]["url"], "http://localhost:7444/mcp");
         assert_eq!(
             v["mcp"]["ccteam"]["headers"]["Authorization"],
-            "Bearer ccteam:b"
+            format!("Bearer {}", enroll("b"))
         );
     }
 
@@ -1017,13 +1064,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
         let grok = tmp.path().join("config.toml");
-        install_grok_mcp_into(&grok, "http://localhost/mcp", "s").unwrap();
+        install_grok_mcp_into(&grok, "http://localhost/mcp", &enroll("s")).unwrap();
         assert_eq!(
             std::fs::metadata(&grok).unwrap().permissions().mode() & 0o777,
             0o600
         );
         let oc = tmp.path().join("opencode.json");
-        install_opencode_mcp_into(&oc, "http://localhost/mcp", "s").unwrap();
+        install_opencode_mcp_into(&oc, "http://localhost/mcp", &enroll("s")).unwrap();
         assert_eq!(
             std::fs::metadata(&oc).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1033,9 +1080,9 @@ mod tests {
     #[test]
     fn grok_and_opencode_installs_reject_missing_credentials() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(install_grok_mcp_into(&tmp.path().join("g.toml"), "", "t").is_err());
+        assert!(install_grok_mcp_into(&tmp.path().join("g.toml"), "", &enroll("t")).is_err());
         assert!(install_grok_mcp_into(&tmp.path().join("g.toml"), "http://x/mcp", " ").is_err());
-        assert!(install_opencode_mcp_into(&tmp.path().join("o.json"), "", "t").is_err());
+        assert!(install_opencode_mcp_into(&tmp.path().join("o.json"), "", &enroll("t")).is_err());
         assert!(
             install_opencode_mcp_into(&tmp.path().join("o.json"), "http://x/mcp", " ").is_err()
         );
@@ -1050,14 +1097,17 @@ mod tests {
             r#"{"mcpServers":{"filesystem":{"command":"npx","args":["-y","fs"]}}}"#,
         )
         .unwrap();
-        install_kimi_mcp_into(&mcp_json, "http://127.0.0.1:7331/mcp", "tok").unwrap();
+        install_kimi_mcp_into(&mcp_json, "http://127.0.0.1:7331/mcp", &enroll("tok")).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
         // Sibling server survives (merge, never clobber).
         assert_eq!(v["mcpServers"]["filesystem"]["command"], "npx");
         let entry = &v["mcpServers"]["ccteam"];
         assert_eq!(entry["url"], "http://127.0.0.1:7331/mcp");
         // File-schema headers are a MAP (never the ACP name/value array).
-        assert_eq!(entry["headers"]["Authorization"], "Bearer ccteam:tok");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            format!("Bearer {}", enroll("tok"))
+        );
         assert!(entry.get("command").is_none());
         assert!(kimi_mcp_registered(&mcp_json));
         assert!(!kimi_mcp_registered(&tmp.path().join("absent.json")));
@@ -1067,8 +1117,8 @@ mod tests {
     fn install_kimi_mcp_into_is_idempotent_and_creates_missing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mcp_json = tmp.path().join("nested").join("kimi").join("mcp.json");
-        install_kimi_mcp_into(&mcp_json, "http://localhost:7331/mcp", "a").unwrap();
-        install_kimi_mcp_into(&mcp_json, "http://localhost:7444/mcp", "b").unwrap();
+        install_kimi_mcp_into(&mcp_json, "http://localhost:7331/mcp", &enroll("a")).unwrap();
+        install_kimi_mcp_into(&mcp_json, "http://localhost:7444/mcp", &enroll("b")).unwrap();
         let v: Value = serde_json::from_slice(&std::fs::read(&mcp_json).unwrap()).unwrap();
         assert_eq!(
             v["mcpServers"]["ccteam"]["url"],
@@ -1076,7 +1126,7 @@ mod tests {
         );
         assert_eq!(
             v["mcpServers"]["ccteam"]["headers"]["Authorization"],
-            "Bearer ccteam:b"
+            format!("Bearer {}", enroll("b"))
         );
     }
 
@@ -1086,7 +1136,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
         let mcp_json = tmp.path().join("mcp.json");
-        install_kimi_mcp_into(&mcp_json, "http://localhost/mcp", "s").unwrap();
+        install_kimi_mcp_into(&mcp_json, "http://localhost/mcp", &enroll("s")).unwrap();
         assert_eq!(
             std::fs::metadata(&mcp_json).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1096,8 +1146,59 @@ mod tests {
     #[test]
     fn kimi_install_rejects_missing_credentials() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(install_kimi_mcp_into(&tmp.path().join("k.json"), "", "t").is_err());
+        assert!(install_kimi_mcp_into(&tmp.path().join("k.json"), "", &enroll("t")).is_err());
         assert!(install_kimi_mcp_into(&tmp.path().join("k.json"), "http://x/mcp", " ").is_err());
+    }
+
+    /// The legacy admin-token entry must read as NOT registered in EVERY
+    /// dialect, or an un-upgraded vendor keeps the shared machine identity
+    /// while the others move on.
+    #[test]
+    fn every_dialect_rejects_the_legacy_admin_token_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let legacy = legacy_admin_bearer("deadbeefcafe");
+
+        let grok = tmp.path().join("grok.toml");
+        std::fs::write(
+            &grok,
+            format!(
+                "[mcp_servers.ccteam]\nurl = \"http://x/mcp\"\nenabled = true\n\
+                 [mcp_servers.ccteam.headers]\nAuthorization = \"{legacy}\"\n"
+            ),
+        )
+        .unwrap();
+        assert!(!grok_mcp_registered(&grok));
+        install_grok_mcp_into(&grok, "http://x/mcp", &enroll("fresh")).unwrap();
+        assert!(grok_mcp_registered(&grok));
+
+        let opencode = tmp.path().join("opencode.json");
+        std::fs::write(
+            &opencode,
+            json!({"mcp": {"ccteam": {
+                "type": "remote",
+                "url": "http://x/mcp",
+                "headers": {"Authorization": legacy},
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!opencode_mcp_registered(&opencode));
+        install_opencode_mcp_into(&opencode, "http://x/mcp", &enroll("fresh")).unwrap();
+        assert!(opencode_mcp_registered(&opencode));
+
+        let kimi = tmp.path().join("mcp.json");
+        std::fs::write(
+            &kimi,
+            json!({"mcpServers": {"ccteam": {
+                "url": "http://x/mcp",
+                "headers": {"Authorization": legacy},
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        assert!(!kimi_mcp_registered(&kimi));
+        install_kimi_mcp_into(&kimi, "http://x/mcp", &enroll("fresh")).unwrap();
+        assert!(kimi_mcp_registered(&kimi));
     }
 
     #[cfg(unix)]
@@ -1107,7 +1208,7 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let config_toml = tmp.path().join("config.toml");
-        install_codex_mcp_into(&config_toml, "http://localhost/mcp", "secret").unwrap();
+        install_codex_mcp_into(&config_toml, "http://localhost/mcp", &enroll("s3cret")).unwrap();
         assert_eq!(
             std::fs::metadata(&config_toml)
                 .unwrap()

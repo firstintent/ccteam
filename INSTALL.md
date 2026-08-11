@@ -2,11 +2,22 @@
 
 > **Agents:** if you were asked to "install https://github.com/firstintent/ccteam", follow this file top to bottom. Do the **Install** step, then relay the **Finish in the web console** step to the user. Do not improvise other commands.
 
-ccteam is a resident daemon (IM gateway + web console + MCP) that drives the stock Claude Code / Codex / Grok / OpenCode / Kimi CLIs. You install it once, start it in the background, then finish setup in the web console.
+ccteam is a resident daemon (IM gateway + web console + MCP) that drives the stock Claude Code / Codex / Grok / OpenCode / Kimi / Pi CLIs. You install it once, start it in the background, then finish setup in the web console.
 
 ## Prerequisites
 
-- **Claude Code** installed and logged in — `claude --version`. (Codex / Grok / OpenCode / Kimi are optional — only needed to run those vendors.)
+- **At least one coding CLI installed and signed in** — ccteam is the bridge, not the agent, so a vendor that is missing (or installed but not logged in) cannot host a session:
+
+  | Vendor | Install | Sign in |
+  |---|---|---|
+  | Claude Code | [docs.claude.com/en/docs/claude-code](https://docs.claude.com/en/docs/claude-code) | `claude auth login` |
+  | Codex | [github.com/openai/codex](https://github.com/openai/codex) | `codex login` |
+  | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
+  | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
+  | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+  | Pi | `npm i -g @earendil-works/pi-coding-agent` | provider API key, checked with `pi auth check --provider <provider>` |
+
+  Verify with `<bin> --version`; after install, `ccteam status` reports which vendors this machine has and whether each is authenticated.
 - For `make install`: **Rust + Node.js**. No toolchain? Use the prebuilt `install.sh` instead (see below).
 
 ## Install

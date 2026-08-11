@@ -114,6 +114,13 @@ while True:
                   "request_id":rid,"response":{}}})
         continue
     n += 1
+    # Real claude emits `system:init` on the FIRST user turn (not at spawn),
+    # and that line is where it reports each MCP server's connection status.
+    # `FAKE_SJ_INIT_MCP_FAILED=1` reproduces a child that came up while the
+    # daemon's `/mcp` was not listening yet: alive, working, and toolless.
+    if n == 1 and os.environ.get("FAKE_SJ_INIT_MCP_FAILED") == "1":
+        emit({"type":"system","subtype":"init","session_id":sid,
+              "mcp_servers":[{"name":"ccteam","status":"failed"}]})
     if os.environ.get("FAKE_SJ_DIE_MID_TURN") == "1":
         # Emit an assistant block (turn now in flight) then die WITHOUT a
         # result — the in-flight-loss fault.
@@ -184,6 +191,8 @@ fn setup(tmp: &Path) -> PathBuf {
     // — one real failure masqueraded as a second, unrelated "flaky" one.
     // Every fault switch belongs here so each test starts from a clean slate.
     std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
+    std::env::remove_var("FAKE_SJ_INIT_MCP_FAILED");
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
     fake
 }
 
@@ -279,6 +288,109 @@ async fn spawn_init_and_turn_emits_answer() {
     let _ = completed;
     assert_eq!(answer.as_deref(), Some("ok"), "expected the fake's answer");
 
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// A session whose ccteam MCP server failed to connect is alive, answering,
+/// and toolless — and no vendor retries a failed MCP server on its own. The
+/// adapter must heal it from the session's OWN `system:init` report, using the
+/// `mcp_reconnect` control request (the same action the TUI's `/mcp` performs).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn dead_tool_face_at_init_is_reported_not_silently_reconnected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let ctl_log = tmp.path().join("ctl.log");
+    std::env::set_var("FAKE_SJ_CTL_LOG", &ctl_log);
+    std::env::set_var("FAKE_SJ_INIT_MCP_FAILED", "1");
+    let adapter = ClaudeStreamJsonAdapter::new();
+
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+
+    // Give the status tap the same bounded moment the old auto-heal had, then
+    // assert nothing was sent. A dead tool face is reported, never "healed" by
+    // an in-place reconnect: that reconnect attaches the machine's global
+    // `ccteam` entry, so the session would trade "no tools" for "someone
+    // else's identity" — wrong parent, wrong project, nothing visibly broken.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !std::fs::read_to_string(&ctl_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.trim() == "mcp_reconnect"),
+        "a dead tool face must NOT be auto-reconnected; control log: {:?}",
+        std::fs::read_to_string(&ctl_log).unwrap_or_default()
+    );
+
+    std::env::remove_var("FAKE_SJ_INIT_MCP_FAILED");
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
+    adapter.close_thread(&handle).await.unwrap();
+}
+
+/// …and the on-demand path (what IM `/mcp` drives) answers the same way: it
+/// states that only a respawn reapplies the curated config, and sends no
+/// control request at all.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn rebuild_tool_surface_refuses_in_place_and_sends_no_reconnect() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let ctl_log = tmp.path().join("ctl.log");
+    std::env::set_var("FAKE_SJ_CTL_LOG", &ctl_log);
+    let adapter = ClaudeStreamJsonAdapter::new();
+
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    let outcome = adapter
+        .rebuild_tool_surface(&handle)
+        .await
+        .expect("declaring a limitation is an answer, not an error");
+    // "Claims an in-place rebuild" is unrepresentable since the `Rebuilt`
+    // variant was deleted (no vendor has a producer), so this destructure is
+    // irrefutable and the remaining question is whether the reason is usable.
+    let ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason } = outcome;
+    assert!(
+        reason.contains("/new"),
+        "say what restores the tool face: {reason:?}"
+    );
+    assert!(
+        reason.contains("principal") || reason.contains("credential"),
+        "say WHY an in-place reconnect is refused: {reason:?}"
+    );
+    // The control request must NOT be sent. Measured on a real machine: it makes
+    // the vendor re-resolve its server list without honouring
+    // `--strict-mcp-config`, attach the global same-named `ccteam` entry, and
+    // route every later `tools/call` there — so the session spends the rest of
+    // its life calling with the MACHINE's credential instead of its own.
+    assert!(
+        !std::fs::read_to_string(&ctl_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.trim() == "mcp_reconnect"),
+        "an in-place reconnect swaps this session's identity and must never be sent"
+    );
+
+    std::env::remove_var("FAKE_SJ_CTL_LOG");
     adapter.close_thread(&handle).await.unwrap();
 }
 

@@ -322,6 +322,67 @@ impl SessionProtocol {
     }
 }
 
+/// What an ended [`HarnessAdapter::events`] stream means for the session
+/// underneath it.
+///
+/// A session's identity is persistent (red line: `sid` is monotone and
+/// survives daemon restarts), and the WRITE path already treats attachment as
+/// a rebuildable resource — codex re-dials its shared app-server and
+/// `thread/resume`s the thread onto the new connection; a dead stream-json
+/// child is resumed by sid. The READ path has to be symmetric, or replacing a
+/// transport under a live session silently blinds every reader while the
+/// session keeps working (the 2026-08-09 incident: a codex app-server respawn
+/// left one session "working" on every panel for 2.5 hours while each of its
+/// turns died upstream).
+///
+/// Declared by the ADAPTER, not by [`SessionProtocol`]: the adapter is what
+/// owns the transport (codex drives its app-server whatever protocol string a
+/// session happens to carry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventAttachment {
+    /// [`HarnessAdapter::events`] may be called again for the same
+    /// [`ThreadHandle`]: it attaches to whatever transport currently carries
+    /// the session (a re-dialed shared connection, a respawned child, a
+    /// reconnected satellite link). An ended stream is an *attachment* fact,
+    /// never a session fact.
+    ///
+    /// Requires the stream to be **subscription-based** — a rebuild must not
+    /// replay history, or every re-attach doubles the session's answers.
+    Rebuildable,
+    /// The stream is bound to something that cannot be re-attached without a
+    /// user-visible cost (or the run it describes is simply over). Its end is
+    /// final.
+    OneShot,
+}
+
+/// What [`HarnessAdapter::rebuild_tool_surface`] can report about a session's
+/// ccteam tool face.
+///
+/// A managed session talks back to ccteam over its own MCP client
+/// (`POST /mcp`, per-session principal). That client is established when the
+/// vendor process starts, and every vendor treats a dead MCP server as
+/// terminal until something tells it to reconnect — so a daemon restart, or a
+/// child that started a moment before the endpoint was listening, leaves a
+/// perfectly live session with no ccteam tools and no way to notice.
+///
+/// **No vendor can reapply its MCP config to a LIVE session**, so there is one
+/// honest answer and the type carries only that one. Claude's in-place
+/// `mcp_reconnect` was the last candidate and was withdrawn after measurement:
+/// it makes the vendor re-resolve its server list from the machine's global
+/// config and silently replaces the session's own `(sid, secret)` principal
+/// with the machine credential (see
+/// `execution::claude_stream_json::ClaudeStreamJsonAdapter::rebuild_tool_surface`).
+/// A vendor that ever gains a real in-place rebuild adds its own variant back;
+/// until then "rebuilt" is not an outcome an adapter can claim by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolSurfaceRebuild {
+    /// The endpoint reached the child once, at spawn (baked into an env var, a
+    /// config file read at startup, or a session-creation RPC parameter), and
+    /// the protocol has no way to re-apply it. `reason` is user-facing: it
+    /// says what would restore the tool face.
+    RespawnRequired { reason: String },
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -1219,7 +1280,46 @@ pub trait HarnessAdapter: Send + Sync {
     /// Non-terminal observability notifications (token usage, plan,
     /// rate-limits) MUST NOT be yielded here — they are mirrored to
     /// `progress.jsonl` out of band and queried via [`thread_status`].
+    ///
+    /// **Attachment contract (2026-08-09):** this method is *not* a one-shot
+    /// snapshot taken at spawn. It MAY be called again for the same handle
+    /// and MUST attach to whatever transport carries the session **now** —
+    /// re-subscribe to the current connection, look the live child up again —
+    /// without replaying history. An ended stream therefore means "this
+    /// attachment ended", never "the session ended"; whether the consumer may
+    /// rebuild it is declared by [`event_attachment`](Self::event_attachment),
+    /// and the gateway pump is the single place that acts on it.
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent>;
+
+    /// Whether a consumer may rebuild this adapter's inbound attachment by
+    /// calling [`events`](Self::events) again — see [`EventAttachment`].
+    ///
+    /// **No default impl**, for the same reason
+    /// [`submit_turn_routed`](Self::submit_turn_routed) has none: a new vendor
+    /// must state whether its event stream survives a transport swap, because
+    /// guessing wrong fails SILENTLY — the session keeps working while every
+    /// reader goes blind.
+    fn event_attachment(&self) -> EventAttachment;
+
+    /// Report on this session's **tool face** — the vendor's own MCP client
+    /// pointed at the daemon's `POST /mcp`. See [`ToolSurfaceRebuild`]: no
+    /// vendor can reapply its MCP config to a live session, so every adapter
+    /// answers with what WOULD restore it.
+    ///
+    /// The outbound counterpart of [`event_attachment`](Self::event_attachment):
+    /// ccteam reaches INTO a session through `events()`, and the session
+    /// reaches BACK through this connection. Both die the same way (the daemon
+    /// that carries them restarts) and both used to fail the same way —
+    /// silently, with the session still alive and apparently fine.
+    ///
+    /// **No default impl**: the answer is a per-vendor `reason` a user can act
+    /// on, and a default would hand every new vendor somebody else's sentence.
+    /// Still async and still fallible — the adapter may have to reach the live
+    /// session to tell "not rebuildable" apart from "not there at all".
+    async fn rebuild_tool_surface(
+        &self,
+        h: &ThreadHandle,
+    ) -> Result<ToolSurfaceRebuild, HarnessError>;
 
     /// Resume an already-existing thread by persistent id (e.g. Claude
     /// session-id, Codex thread id). Bg adapters return

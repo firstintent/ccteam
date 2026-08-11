@@ -60,6 +60,18 @@ pub struct AppState {
     /// coupling is a direct crate dep (`ccteam-web -> ccteam-im`), acyclic
     /// because `ccteam-im` does not depend on `ccteam-web`.
     pub gateway: Option<Arc<Mutex<ccteam_im::gateway::Gateway>>>,
+    /// The `(sid, secret)` registry, held DIRECTLY rather than reached through
+    /// `gateway`: verifying a managed session's principal must not queue behind
+    /// whatever else holds the gateway lock — including a spawn that is at that
+    /// very moment waiting for the vendor to finish this call.
+    pub session_principals: Option<Arc<ccteam_im::principals::SessionPrincipals>>,
+    /// `Mcp-Session-Id` bindings — one identity per hand-started vendor PROCESS
+    /// (see `crate::routes::mcp`). Always present, like the rings below: it is
+    /// pure in-memory state the `/mcp` front door owns, and a daemon restart has
+    /// already ended every conversation it described. The idle sweep that reaps
+    /// it is spawned alongside the gateway in [`Self::with_gateway`], because
+    /// closing a node needs one.
+    pub native_bindings: Arc<ccteam_im::native_bindings::NativeBindings>,
     /// v0.8.8 F4 — IM credentials file path the `config/im/*` handlers
     /// read + write. Defaults to `ccteam_im::credentials::default_path()`
     /// (`~/.ccteam/im/credentials.json`); integration tests override it via
@@ -151,6 +163,8 @@ impl AppState {
             chat_backlog: Arc::new(Mutex::new(Vec::new())),
             chat_conns: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
+            session_principals: None,
+            native_bindings: Arc::new(ccteam_im::native_bindings::NativeBindings::new()),
             creds_path: Arc::new(ccteam_im::credentials::default_path()),
             im_poll: Arc::new(Mutex::new(None)),
             session_ring: Arc::new(crate::ring::SessionEventRing::new()),
@@ -199,7 +213,21 @@ impl AppState {
     /// independently recording the same events into the ring under
     /// different seqs — harmless in practice (nothing production does this)
     /// but not something to do casually.
-    pub fn with_gateway(mut self, gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>) -> Self {
+    pub fn with_gateway(
+        mut self,
+        gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>,
+        principals: Arc<ccteam_im::principals::SessionPrincipals>,
+    ) -> Self {
+        self.session_principals = Some(Arc::clone(&principals));
+        // v0.10 — reap the `Mcp-Session-Id` bindings of hand-started clients that
+        // went away without saying so (most of them: only codex and grok were
+        // observed sending `DELETE`). Same one-task-per-`with_gateway` discipline
+        // as the feeders below.
+        crate::routes::mcp::spawn_binding_reaper(
+            Arc::clone(&gateway),
+            principals,
+            Arc::clone(&self.native_bindings),
+        );
         crate::ring::spawn_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.session_ring));
         // v0.9.0 W4 — the team view's global feeder, spawned alongside the
         // per-sid one (same composition-root call, same "one feeder per
@@ -207,6 +235,14 @@ impl AppState {
         crate::ring::spawn_global_ring_feeder(Arc::clone(&gateway), Arc::clone(&self.global_ring));
         self.gateway = Some(gateway);
         self
+    }
+
+    /// [`Self::with_gateway`] for a caller that still OWNS the gateway — it
+    /// takes the principal registry off it before wrapping, so the two can
+    /// never be wired from different gateways.
+    pub fn with_gateway_owned(self, gateway: ccteam_im::gateway::Gateway) -> Self {
+        let principals = gateway.principals();
+        self.with_gateway(Arc::new(Mutex::new(gateway)), principals)
     }
 
     /// v0.8.8 F4 — point the `config/im/*` handlers at a non-default

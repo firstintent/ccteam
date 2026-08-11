@@ -2,8 +2,10 @@
 //!
 //! Owns the live gateway / pending registry / event sink needed for
 //! `interaction/ask`, `permission/ask`, `chat_send_file`, `session_*`, and
-//! `ccteam/reload`. The thin socket (or future HTTP) loop only does
-//! read-line → [`McpDispatch::dispatch`] → write-line.
+//! `ccteam/reload`. Both transports on top stay thin: the local `mcp.sock` loop
+//! does read-line → [`McpDispatch::dispatch`] → write-line, and ccteam-web's
+//! `POST /mcp` resolves the caller's credential, then calls
+//! [`McpDispatch::dispatch_as`] with the tier it proved.
 
 use std::sync::Arc;
 
@@ -45,19 +47,39 @@ pub struct McpDispatch {
 /// authenticate (v0.9 T4 review fix).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum McpCaller {
-    /// mcp.sock / stdio-forwarder path: `session_*` authenticates via the
-    /// env-injected `_caller_role`/`_caller_secret` args (cto gate); the
+    /// A caller that speaks for ONE session: `session_*` authenticates by the
+    /// `(sid, secret)` principal carried in the `_caller_*` args, and the
     /// internal-bus methods (`interaction/ask`, `permission/ask`) are served.
+    ///
+    /// Every `POST /mcp` caller lands here — a managed session under its own
+    /// principal, or a hand-started client under the ledger node the daemon
+    /// minted for its enrollment binding at `initialize` — as does an mcp.sock
+    /// line that presents no admin token.
     Ambient,
-    /// HTTP `/mcp` behind a verified admin bearer — the owner's front door.
-    /// `session_*` skips the cto role/secret gate (that gate exists to stop
-    /// non-privileged *sessions*, not the authenticated owner); the
-    /// internal-bus methods are NOT exposed (in-band/daemon-internal
-    /// responsibility, not front-door API).
+    /// The local `mcp.sock` caller that presented the admin web token
+    /// (`_caller_admin_token`, promoted by `McpDispatch::promote_local_admin`):
+    /// reading that 0600 file proves same-uid, so `session_*` skips the
+    /// per-session principal gate and names its target with an explicit
+    /// `project`; the internal-bus methods are NOT exposed (in-band /
+    /// daemon-internal responsibility, not an operator API).
+    ///
+    /// **Not reachable over HTTP.** `POST /mcp` resolves only a session
+    /// principal or an enrollment credential and strips `_caller_admin_token`:
+    /// a durable credential a static vendor config can carry cannot say which
+    /// process is speaking, so the data plane's admin tier was deleted rather
+    /// than narrowed. Nothing ccteam ships injects the arg any more either (the
+    /// stdio forwarder that did is gone), so in practice this tier is reached
+    /// only by a same-uid local client that reads the token and writes to the
+    /// socket itself.
     Admin,
-    /// HTTP `/mcp` behind a verified per-user tenant web bearer. This is a
-    /// human/root caller like Admin, but every project/sid operation is scoped
-    /// to projects owned by `user:<user_id>`.
+    /// A per-user tenant: a human/root caller like Admin, but every project/sid
+    /// operation is scoped to projects owned by `user:<user_id>`.
+    ///
+    /// **No production producer.** It existed for a tenant web bearer at
+    /// `POST /mcp`, which that route no longer accepts — a tenant's external
+    /// agent enrolls instead, and the credential's owner carries the same
+    /// scoping into an Ambient node. The variant survives as the tenant-scoping
+    /// arm the tests drive directly.
     User {
         /// Stable tenant identity id resolved from the bearer registry.
         user_id: String,
@@ -72,25 +94,31 @@ impl McpCaller {
         }
     }
 
+    /// True for the tiers that are not one session speaking for itself (Admin /
+    /// User). The name is historical — neither is an HTTP door any more — but
+    /// the distinction it draws is the one the internal-bus refusal needs.
     fn is_front_door(&self) -> bool {
         !matches!(self, Self::Ambient)
     }
 }
 
 impl McpDispatch {
-    /// Dispatch one JSON-RPC request on the ambient (mcp.sock / stdio) path.
+    /// Dispatch one JSON-RPC request arriving on the local `mcp.sock` path.
     /// Wire-compatible with the historical `handle_mcp_socket_connection`.
     ///
-    /// v0.9.1 main-session fallback: a LOCAL caller may present the admin web
-    /// token (`_caller_admin_token` in the tool arguments — injected by the
-    /// stdio forwarder when its env carries no `(sid, secret)` principal, i.e.
-    /// the user's daily-driver Claude/Codex session that ccteam did not
-    /// spawn). A matching token promotes the call to [`McpCaller::Admin`] —
-    /// the same trust the HTTP `/mcp` admin bearer grants; the token file is
-    /// `0600` under `~/.ccteam/secrets/`, so presenting it proves same-user
-    /// file access, exactly like running the `ccteam` CLI. A missing or
-    /// wrong token leaves the call on the fail-closed Ambient path. The arg
-    /// is stripped either way so nothing downstream ever sees it.
+    /// A LOCAL caller may present the admin web token (`_caller_admin_token` in
+    /// the tool arguments). A matching token promotes the call to
+    /// [`McpCaller::Admin`]; the token file is `0600` under
+    /// `~/.ccteam/secrets/`, so presenting it proves same-user file access,
+    /// exactly like running the `ccteam` CLI. A missing or wrong token leaves
+    /// the call on the fail-closed Ambient path. The arg is stripped either way
+    /// so nothing downstream ever sees it.
+    ///
+    /// This socket is now the ONLY way that tier is reached: the stdio forwarder
+    /// that used to inject the arg for a hand-started session is deleted, and
+    /// `POST /mcp` has no admin tier to promote into (a hand-started session
+    /// enrolls and gets a real principal instead). What survives here is the
+    /// same-uid trust the socket already implies, not a route ccteam drives.
     pub async fn dispatch(&self, req: Value) -> Option<Value> {
         let (req, caller) = self.promote_local_admin(req);
         self.dispatch_as(req, caller).await
@@ -119,6 +147,35 @@ impl McpDispatch {
         }
     }
 
+    /// Is this Ambient caller an EXTERNAL ledger node rather than a session
+    /// ccteam spawned?
+    ///
+    /// The internal bus (`interaction/ask` / `permission/ask`) is refused for
+    /// the front-door tiers, which used to be the same thing as "not one of
+    /// ccteam's own sessions". Enrollment broke that equivalence: a
+    /// hand-started agent now arrives Ambient too, holding a principal ccteam
+    /// minted for its node. Legitimate for `session_*` — that is the whole
+    /// point of enrolling — but the ask bus is how ccteam's OWN sessions get a
+    /// human in front of a blocked tool call, and an outside process should not
+    /// be able to raise a prompt in the operator's IM that is indistinguishable
+    /// from one.
+    ///
+    /// Read from the LEDGER, not from the tier, so any future caller class that
+    /// arrives with an external node's sid is covered without another patch.
+    async fn caller_is_external_node(&self, req: &Value) -> bool {
+        let Some(sid) = req
+            .pointer("/params/arguments/_caller_sid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return false;
+        };
+        let Some(gateway) = self.gateway.as_ref() else {
+            return false;
+        };
+        gateway.lock().await.is_external_node(sid)
+    }
+
     /// Dispatch one JSON-RPC request as `caller`. Order matches the historical
     /// `handle_mcp_socket_connection` intercept chain exactly:
     /// `interaction/ask` → `permission/ask` → `chat_send_file` →
@@ -131,7 +188,7 @@ impl McpDispatch {
             strip_untrusted_caller_args(&mut req);
         }
         if is_interaction_ask_call(&req) {
-            if caller.is_front_door() {
+            if caller.is_front_door() || self.caller_is_external_node(&req).await {
                 return Some(internal_bus_not_exposed(&req));
             }
             Some(
@@ -144,7 +201,7 @@ impl McpDispatch {
                 .await,
             )
         } else if is_permission_ask_call(&req) {
-            if caller.is_front_door() {
+            if caller.is_front_door() || self.caller_is_external_node(&req).await {
                 return Some(internal_bus_not_exposed(&req));
             }
             Some(
@@ -386,9 +443,14 @@ fn permission_prompt_timeout_secs() -> u64 {
 }
 
 /// JSON-RPC `-32601` for the internal-bus methods (`interaction/ask`,
-/// `permission/ask`) on the HTTP front door: those are in-band / daemon-
-/// internal (mcp.sock) responsibilities, deliberately not front-door API
+/// `permission/ask`) on the Admin / User tiers: those are in-band /
+/// daemon-internal responsibilities, deliberately not an operator API
 /// (tech-design v0.9 §1.1 — HITL stays on vendor-native channels).
+///
+/// Scope note: the gate is the caller TIER, not the transport. Since `POST /mcp`
+/// resolves every caller to Ambient, an HTTP caller — a managed session or an
+/// enrolled client — reaches these methods; what is refused is the local
+/// admin-token promotion (and the test-only tenant tier).
 fn internal_bus_not_exposed(req: &serde_json::Value) -> serde_json::Value {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -1351,12 +1413,13 @@ fn is_status_call(req: &serde_json::Value) -> bool {
 
 /// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
 /// vendor panel + routing notes appended for the caller's project's bound
-/// host. Ambient (session principal) is scoped to its OWN project — any
-/// self-reported `project`/`_caller_slug` is ignored (the panel would
-/// otherwise leak another project's host). Admin (HTTP `/mcp`, or the local
-/// main-session admin token) may name a `project`, else defaults to the
-/// cwd-resolved slug the forwarder injected (like `session_spawn`). The
-/// vendor panel probes + reads fs, so it runs off the async runtime.
+/// host. Ambient (session principal, which is every `POST /mcp` caller) is
+/// scoped to its OWN project — any self-reported `project`/`_caller_slug` is
+/// ignored (the panel would otherwise leak another project's host). Admin (the
+/// local mcp.sock admin-token tier) may name a `project`, else falls back to a
+/// supplied `_caller_slug` (like `session_spawn`; nothing ccteam ships injects
+/// one now that the stdio forwarder is gone). The vendor panel probes + reads
+/// fs, so it runs off the async runtime.
 async fn execute_status(
     req: &serde_json::Value,
     gateway: Option<&GatewayHandle>,
@@ -1530,9 +1593,11 @@ async fn execute_session_tool_with_paths(
     // closed. We then OVERWRITE the identity args from CallerCtx so nothing
     // downstream trusts a caller-supplied `_caller_slug`/`_caller_sid`/role.
     //
-    // `McpCaller::Admin` (HTTP `/mcp`, admin bearer already verified at the
-    // transport layer) skips the principal gate: it names its target with an
-    // explicit `project` arg (fleet-wide, same as the web admin Identity).
+    // `McpCaller::Admin` (the local mcp.sock caller whose admin web token was
+    // already verified against the 0600 file) skips the principal gate: it names
+    // its target with an explicit `project` arg (fleet-wide, same as the web
+    // admin Identity). No HTTP caller arrives on this arm — `POST /mcp` has no
+    // admin tier.
     match &caller {
         McpCaller::Ambient => {
             let caller_sid = args
@@ -1680,6 +1745,14 @@ async fn authorize_user_session_tool(
                 gateway
                     .session_resolve(sid)
                     .map(|resolved| resolved.project)
+                    // An enrolled hand-started client is a ledger row without a
+                    // live-map row, so the live map alone cannot answer "whose
+                    // project is this sid in". This gate decides VISIBILITY only
+                    // — a tenant who can see the node in `session_list` must
+                    // reach the honest not-driveable refusal instead of
+                    // "session not found", while a node in someone else's
+                    // project stays indistinguishable from an unknown sid.
+                    .or_else(|| gateway.external_node(sid).map(|meta| meta.slug))
             };
             if project
                 .as_deref()
@@ -1738,13 +1811,101 @@ async fn run_session_tool(
 /// its `s{n}` id + vendor resume key + host. v0.9.0 W1 (F1/G1): the caller is
 /// authenticated by its `(sid, secret)` PRINCIPAL (see [`execute_session_tool`]),
 /// so `_caller_slug` here is the SERVER's view of the caller's project — an
-/// Ambient caller can only spawn into that project. Admin (HTTP front door)
-/// names the target with an explicit `project` (fleet-wide).
+/// Ambient caller can only spawn into that project. Admin (the local mcp.sock
+/// admin-token tier) names the target with an explicit `project` (fleet-wide).
 ///
 /// MCP facets are `{role?, vendor?, model?, effort?, permission_mode?, title?}`.
 /// `role` empty/absent = roleless (bare vendor reads the project
 /// CLAUDE.md/AGENTS.md). `title` is metadata/ledger only — NEVER concatenated
 /// into any prompt.
+/// **Which session is this call coming FROM** — the one answer every
+/// lineage-carrying feature reads (delegation parent, depth guardrails, the
+/// dispatcher stamped on a first task, the `caller_sid` echo).
+///
+/// Deliberately separate from the authentication TIER. The two were conflated:
+/// `McpCaller::Admin => None` read "authenticated as admin" as "is not a
+/// session", so a plain local agent that ccteam already mirrors in the ledger
+/// spawned children that mounted as ROOTS — the topology lost an edge that
+/// exists. Each lineage feature derived itself from the tier independently,
+/// which is why fixing one of them would not have fixed the others.
+///
+/// Sources, strongest first:
+///
+/// 1. **Verified principal** (`Ambient`) — cryptographic, server-resolved. This
+///    is how a hand-started client gets its edge now: it enrolls, the daemon
+///    mints it a ledger node at `initialize`, and it calls as that node.
+/// 2. **Declared and validated** (`Admin`) — the local mcp.sock admin-token
+///    caller holds no per-session principal and carries no process context to
+///    infer one from, so it may NAME its own sid. Same-uid is already this
+///    path's trust boundary (an admin caller can spawn and stop anything), so
+///    declaring a parent adds no authority — but it is checked against the
+///    ledger, never taken on faith: an unknown sid is a loud error rather than
+///    a silent root.
+/// 3. **Never** for a tenant (`User`): their `_caller_*` args are stripped
+///    upstream, and a declaration must not smuggle identity back in.
+async fn resolve_call_origin(
+    caller: &McpCaller,
+    args: &Value,
+    gateway: Option<&std::sync::Arc<tokio::sync::Mutex<crate::gateway::Gateway>>>,
+) -> Result<Option<crate::gateway::DelegationParent>, String> {
+    match caller {
+        McpCaller::Ambient => {
+            let caller_sid = args
+                .get("_caller_sid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if caller_sid.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(crate::gateway::DelegationParent {
+                sid: caller_sid,
+                depth: args
+                    .get("_caller_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                role: args
+                    .get("_caller_role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }))
+        }
+        McpCaller::Admin => {
+            let Some(declared) = args
+                .get("parent_sid")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                // Nothing declared → a root spawn, as before: the admin front
+                // door IS rootless when a human drives it.
+                return Ok(None);
+            };
+            let Some(gateway) = gateway else {
+                return Err(format!(
+                    "session_spawn: parent_sid `{declared}` cannot be validated (no live gateway)"
+                ));
+            };
+            let view = {
+                let gw = gateway.lock().await;
+                gw.session_views().into_iter().find(|v| v.sid == declared)
+            };
+            let Some(view) = view else {
+                return Err(format!(
+                    "session_spawn: parent_sid `{declared}` is not a live session — run session_list to find your own sid, or omit parent_sid for a root spawn"
+                ));
+            };
+            Ok(Some(crate::gateway::DelegationParent {
+                sid: view.sid,
+                depth: view.delegation_depth,
+                role: view.role,
+            }))
+        }
+        McpCaller::User { .. } => Ok(None),
+    }
+}
+
 async fn run_session_spawn_at(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
@@ -1809,7 +1970,7 @@ async fn run_session_spawn_at(
     }
     // Resolve only after validating the request facets: falling through to
     // scratch is a side effect and malformed spawns must not create projects.
-    let project_resolution = resolve_spawn_project(args, gateway, &caller, paths).await?;
+    let project_resolution = resolve_spawn_project(args, &caller, paths)?;
     let project = project_resolution.slug.clone();
     // v0.9.1 delegation-ergonomics — optional FIRST task: spawn+dispatch in one
     // call (the dominant flow; saves the second round-trip and closes the
@@ -1850,45 +2011,24 @@ async fn run_session_spawn_at(
         .map(String::from);
     // v0.9.0 W2 (F2/F5) — the delegation parent. Ambient = the caller's
     // server-resolved principal (sid/depth/role, injected in `execute_session_tool`
-    // from CallerCtx — never caller-supplied). Admin (HTTP front door) = a
-    // human/root spawn (no parent, unrestricted). Guardrails apply only when a
-    // real parent is present.
-    let parent = match &caller {
-        McpCaller::Ambient => {
-            let caller_sid = args
-                .get("_caller_sid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if caller_sid.is_empty() {
-                None
-            } else {
-                Some(crate::gateway::DelegationParent {
-                    sid: caller_sid,
-                    depth: args
-                        .get("_caller_depth")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32,
-                    role: args
-                        .get("_caller_role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                })
-            }
-        }
-        McpCaller::Admin | McpCaller::User { .. } => None,
-    };
+    // from CallerCtx — never caller-supplied). Admin (the local mcp.sock
+    // admin-token tier) = a human/root spawn unless it declares a `parent_sid`.
+    // Guardrails apply only when a real parent is present.
+    let parent = resolve_call_origin(&caller, args, Some(gateway)).await?;
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
     // v0.9.2 — surface WHO spawned this child so a rootless spawn is
-    // self-explanatory: the admin front door is a root spawn BY DESIGN, an
+    // self-explanatory: an undeclared admin caller is a root spawn BY DESIGN, an
     // ambient caller is the delegation parent. This is the diagnostic for the
     // "my agent's children lost their parent edge" class of misconfiguration
-    // (e.g. the agent's calls silently riding an admin-authenticated server).
+    // (today: an agent whose vendor loaded the global config instead of its own,
+    // so its calls ride an enrolled client's node rather than its principal).
     let caller_label = match (&caller, parent.as_ref()) {
-        (McpCaller::Admin, _) => "admin".to_string(),
+        // Echo the RESOLVED origin, not just the tier: a caller that declared
+        // itself can see what ccteam actually attributed the child to.
+        (McpCaller::Admin, Some(p)) => format!("admin:{}", p.sid),
+        (McpCaller::Admin, None) => "admin".to_string(),
         (McpCaller::Ambient, Some(p)) => format!("ambient:{}", p.sid),
         (McpCaller::Ambient, None) => "ambient".to_string(),
         (McpCaller::User { user_id }, _) => format!("user:{user_id}"),
@@ -2052,9 +2192,6 @@ async fn run_session_spawn_at(
     if let Some(t) = &title {
         body["title"] = serde_json::json!(t);
     }
-    if project_resolution.scratch {
-        body["note"] = serde_json::json!(SCRATCH_PROJECT_NOTE);
-    }
     // v0.9.1 — dispatch the optional first task through the SAME submit path
     // session_dispatch uses; its outcome (turn_id / status / inline result /
     // hint) merges into the spawn body so one call returns everything. The
@@ -2102,18 +2239,26 @@ async fn run_session_spawn(
 struct SpawnProjectResolution {
     slug: String,
     source: &'static str,
-    scratch: bool,
 }
 
-const SCRATCH_PROJECT_NOTE: &str = "spawned into the shared default project — pass `project` to target a specific workspace; `status` lists slugs";
-
-/// Resolve the MCP spawn project. Admin callers use the owner-pinned ladder:
-/// explicit project, caller cwd, sole catalog project, configured default,
-/// then lazily provisioned scratch. Ambient principals and tenants retain
-/// their existing identity-scoped behavior.
-async fn resolve_spawn_project(
+/// Resolve the MCP spawn project. Every rung must NAME the project the caller
+/// is actually bound to — explicit argument, the caller's own cwd, or the sole
+/// registered project (zero ambiguity). A caller with none of those is
+/// REFUSED and told which slugs exist.
+///
+/// There is deliberately no "daemon default" or lazily-provisioned scratch
+/// rung. Falling back to a project the caller never named is the same defect
+/// as the chat-side `current_project_for` fallback that was removed on
+/// 2026-07-28: it lands somebody else's agent — and its turns, cost and files
+/// — in a workspace they were never granted. This entry point was the one the
+/// sweep missed, and it fires exactly when identity is already degraded (an
+/// HTTP caller carries no cwd), so the two defects compounded: a session whose
+/// principal did not arrive spawned children into a shared workspace and
+/// reported success.
+///
+/// Ambient principals and tenants keep their identity-scoped behavior.
+fn resolve_spawn_project(
     args: &serde_json::Value,
-    gateway: &GatewayHandle,
     caller: &McpCaller,
     paths: Option<&CcteamPaths>,
 ) -> std::result::Result<SpawnProjectResolution, String> {
@@ -2129,7 +2274,6 @@ async fn resolve_spawn_project(
             slug: arg("_caller_slug")
                 .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
             source: "principal",
-            scratch: false,
         }),
         McpCaller::User { .. } => Ok(SpawnProjectResolution {
             slug: arg("project").ok_or_else(|| {
@@ -2143,117 +2287,32 @@ async fn resolve_spawn_project(
                 Some("sole") => "sole",
                 _ => "explicit",
             },
-            scratch: false,
         }),
         McpCaller::Admin => {
             if let Some(slug) = arg("project") {
                 return Ok(SpawnProjectResolution {
                     slug,
                     source: "explicit",
-                    scratch: false,
                 });
             }
             if let Some(slug) = arg("_caller_slug") {
                 return Ok(SpawnProjectResolution {
                     slug,
                     source: "cwd",
-                    scratch: false,
                 });
             }
             if let Some(slug) = sole_registered_project(paths) {
                 return Ok(SpawnProjectResolution {
                     slug,
                     source: "sole",
-                    scratch: false,
                 });
             }
-            let Some(paths) = paths else {
-                return Err(format!(
-                    "session_spawn: missing `project`{}",
-                    admin_project_catalog_hint(paths)
-                ));
-            };
-            let config = ccteam_core::load_ccteam_config(&paths.root)
-                .map_err(|err| format!("session_spawn: load project catalog: {err}"))?;
-            if let Some(slug) = config.default_project.as_deref().and_then(|configured| {
-                config
-                    .projects
-                    .iter()
-                    .any(|entry| entry.slug == configured)
-                    .then(|| configured.to_string())
-            }) {
-                return Ok(SpawnProjectResolution {
-                    slug,
-                    source: "configured",
-                    scratch: false,
-                });
-            }
-            provision_scratch_project(gateway, paths).await
+            Err(format!(
+                "session_spawn: missing `project` — name the workspace to spawn into{}",
+                admin_project_catalog_hint(paths)
+            ))
         }
     }
-}
-
-fn paths_refer_to_same_project(left: &std::path::Path, right: &std::path::Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
-}
-
-async fn provision_scratch_project(
-    gateway: &GatewayHandle,
-    paths: &CcteamPaths,
-) -> std::result::Result<SpawnProjectResolution, String> {
-    let scratch = paths.root.join("default_project");
-    // Serialize lookup + create + registration through the gateway lock so
-    // concurrent first spawns cannot mint two catalog entries for one path.
-    let mut gateway = gateway.lock().await;
-    let config = ccteam_core::load_ccteam_config(&paths.root)
-        .map_err(|err| format!("session_spawn: load project catalog: {err}"))?;
-    if let Some(existing) = config
-        .projects
-        .iter()
-        .find(|entry| paths_refer_to_same_project(&entry.path, &scratch))
-    {
-        gateway.register_project(existing.slug.clone(), existing.path.clone());
-        return Ok(SpawnProjectResolution {
-            slug: existing.slug.clone(),
-            source: "scratch",
-            scratch: true,
-        });
-    }
-
-    let slug = ccteam_core::pick_unused_project_slug(&paths.root, "default")
-        .map_err(|err| format!("session_spawn: choose scratch project slug: {err}"))?;
-    ccteam_core::bootstrap_project_at_dir(
-        paths,
-        &scratch,
-        &slug,
-        "(created by MCP session_spawn default)",
-        "dev",
-    )
-    .map_err(|err| format!("session_spawn: create scratch project: {err}"))?;
-    ccteam_core::scaffold_workflow_yaml(&scratch, false)
-        .map_err(|err| format!("session_spawn: create scratch workflow: {err}"))?;
-    ccteam_core::upsert_project_in_config(
-        &paths.root,
-        ccteam_core::ProjectEntry {
-            slug: slug.clone(),
-            path: scratch.clone(),
-            host: ccteam_core::LOCAL_HOST.to_string(),
-            remote_slug: None,
-            remote_path: None,
-            team: "dev".to_string(),
-            installed_at: chrono::Utc::now(),
-        },
-    )
-    .map_err(|err| format!("session_spawn: register scratch project: {err}"))?;
-    gateway.register_project(slug.clone(), scratch);
-    Ok(SpawnProjectResolution {
-        slug,
-        source: "scratch",
-        scratch: true,
-    })
 }
 
 /// MCP-DX-1 — enrich a spawn-create failure. An ADMIN caller naming an
@@ -2341,6 +2400,10 @@ async fn run_session_dispatch(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // Driveability before anything else: ccteam has no thread to submit into for
+    // an enrolled hand-started client, and every path below would call it
+    // unknown instead of saying so.
+    assert_target_is_driveable("session_dispatch", gateway, &sid).await?;
     let task = args
         .get("task")
         .and_then(|v| v.as_str())
@@ -2492,9 +2555,10 @@ fn parse_notify_mode(
 }
 
 /// The completion-notification route for one dispatch. A managed ambient
-/// caller has a parent session transport; admin/user front doors do not.
-/// `notify:off` is distinct from a missing route so it stays intentional and
-/// does not produce an operational warning.
+/// caller has a parent session transport; the admin/user tiers do not, and
+/// neither does an enrolled hand-started client (a real delegation parent that
+/// ccteam holds no thread for). `notify:off` is distinct from a missing route so
+/// it stays intentional and does not produce an operational warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionNotificationRoute {
     ParentSession,
@@ -2509,10 +2573,20 @@ struct InlineWaitWindow {
 }
 
 impl CompletionNotificationRoute {
-    fn resolve(caller_sid: &str, notify: ccteam_harness::NotifyMode) -> Self {
+    /// `parent_is_external`: the parent sid is an enrolled hand-started client.
+    /// MCP is client-dial-in, so ccteam has no conversation of its own to put a
+    /// completion turn into — the edge is real, the return transport is not.
+    /// That is exactly what `Unavailable` already means for the admin front
+    /// door, hence no new variant. An explicit `notify:off` still wins: an
+    /// intentional opt-out is not a missing channel.
+    fn resolve(
+        caller_sid: &str,
+        notify: ccteam_harness::NotifyMode,
+        parent_is_external: bool,
+    ) -> Self {
         if notify == ccteam_harness::NotifyMode::Off {
             Self::Disabled
-        } else if caller_sid.is_empty() {
+        } else if caller_sid.is_empty() || parent_is_external {
             Self::Unavailable
         } else {
             Self::ParentSession
@@ -2586,9 +2660,14 @@ async fn dispatch_task(
     title: Option<String>,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
-    let notification_route = CompletionNotificationRoute::resolve(caller_sid, notify);
-    let (turn_id, rx) = {
+    let (turn_id, rx, parent_is_external) = {
         let mut gw = gateway.lock().await;
+        // Whether a completion turn is deliverable is a property of the PARENT's
+        // ledger row, not of the caller's auth tier: a hand-started client dials
+        // in over MCP, so there is no thread to steer and no session to resume.
+        // Asked once, here, so the armed watch and the response fragment can
+        // never disagree about it.
+        let parent_is_external = is_delegation && gw.is_external_node(caller_sid);
         // Subscribe BEFORE submitting so a fast child can't answer before we
         // start listening (the wait races the child's own turn).
         let rx = if effective_wait_seconds > 0 {
@@ -2601,10 +2680,21 @@ async fn dispatch_task(
             .await
             .map_err(|e| format!("{tool} failed: {e}"))?;
         if is_delegation {
+            // The watch is armed either way — the completion edge belongs in the
+            // ledger (`delegation_completed` fires off the mirror, whatever the
+            // notify mode). An external parent gets it with notifications OFF:
+            // left on, the first completion would submit into a session ccteam
+            // must never re-spawn, fail, and drop the watch — silently ending
+            // that child's completion accounting for every later turn.
+            let watch_notify = if parent_is_external {
+                ccteam_harness::NotifyMode::Off
+            } else {
+                notify
+            };
             gw.arm_delegation_watch(
                 sid,
                 caller_sid,
-                notify,
+                watch_notify,
                 title.clone(),
                 Some(turn_id.clone()),
             );
@@ -2622,14 +2712,17 @@ async fn dispatch_task(
                 );
             }
         }
-        (turn_id, rx)
+        (turn_id, rx, parent_is_external)
     };
+    let notification_route =
+        CompletionNotificationRoute::resolve(caller_sid, notify, parent_is_external);
     if notification_route == CompletionNotificationRoute::Unavailable {
         tracing::warn!(
             tool,
             child_sid = %sid,
             turn_id = %turn_id,
             notify = notify.as_str(),
+            parent_is_external,
             "ccteam MCP completion notification unavailable: caller has no managed parent session; poll session_collect"
         );
     }
@@ -3040,12 +3133,19 @@ fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (u
     (total_chars, truncated)
 }
 
-/// v0.9.1 — honest per-sid activity for the MCP surfaces: classify the
-/// session's progress stream the SAME way the web session list does
-/// (`ccteam_core::stall`, → `working|idle|stale|stuck`), so a polling parent
-/// can tell "child still thinking" from "turn done" without scraping
-/// anything. Best-effort: any read miss degrades to `None` (field omitted).
-fn classify_session_activity(slug: &str, sid: &str) -> Option<String> {
+/// v0.9.1 — honest per-sid activity for the MCP surfaces: the SAME resolver the
+/// web session list and IM `/status` use (`ccteam_core::stall`, →
+/// `working|idle|stale|stuck`), so a polling parent can tell "child still
+/// thinking" from "turn done" without scraping anything. `live` is the child's
+/// in-flight turn as the daemon sees it, snapshotted under the gateway lock by
+/// the caller — a mid-turn child reads `working` even if its project's progress
+/// stream is unreadable. Best-effort: any read miss degrades to `None` (field
+/// omitted).
+fn classify_session_activity(
+    slug: &str,
+    sid: &str,
+    live: Option<ccteam_core::stall::LiveTurn>,
+) -> Option<String> {
     let paths = ccteam_core::CcteamPaths::from_env().ok()?;
     let silent_seconds = ccteam_core::collect_projects(&paths)
         .ok()?
@@ -3054,10 +3154,11 @@ fn classify_session_activity(slug: &str, sid: &str) -> Option<String> {
         .map(|p| p.stall_silent_seconds)?;
     let events =
         ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
-    let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+    let activity = ccteam_core::stall::classify_session_activity(
         &events,
         sid,
         silent_seconds,
+        live,
         chrono::Utc::now(),
     );
     Some(activity.status.activity.to_string())
@@ -3072,6 +3173,10 @@ async fn run_session_collect(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // Same gate as dispatch/stop: ccteam mirrors no transcript for a client it
+    // never spawned, so the honest answer is what the session is — not an empty
+    // page or an "unknown session" from the resolve below.
+    assert_target_is_driveable("session_collect", gateway, &sid).await?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
     let n = args
         .get("n")
@@ -3083,10 +3188,11 @@ async fn run_session_collect(
     // R-M3 — only collect from sessions in the caller's own project.
     assert_caller_owns_session("session_collect", args, gateway, &sid, &caller).await?;
 
-    // Resolve under the lock (sync), then DROP the guard before the fs read.
-    let resolved = {
+    // Resolve under the lock (sync) — with the child's in-flight turn, which is
+    // a cheap in-memory peek — then DROP the guard before the fs read.
+    let (resolved, live) = {
         let gw = gateway.lock().await;
-        gw.session_resolve(&sid)
+        (gw.session_resolve(&sid), gw.live_turn_for(&sid))
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
     // A collectable session is one the gateway still tracks → "live" (the same
@@ -3152,10 +3258,10 @@ async fn run_session_collect(
     if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
         body["model"] = serde_json::json!(model);
     }
-    // v0.9.1 — honest per-sid activity (same classifier the web session list
+    // v0.9.1 — honest per-sid activity (same resolver the web session list
     // uses): `working` = the child is mid-turn (keep polling), `idle` = the
     // turn is done. Best-effort: a read miss just omits the field.
-    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid) {
+    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid, live) {
         body["activity"] = serde_json::json!(activity);
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
@@ -3217,6 +3323,21 @@ async fn run_session_list_at(
                 .filter_map(|project| project.as_str().map(str::to_string))
                 .collect()
         });
+    // WHICH row is the caller. `current` cannot answer that — it means "the
+    // active session of some chat", a fact about the fleet's routing that has
+    // nothing to do with who is asking — and a caller that read it as "me"
+    // spent a debugging round treating another session's tool calls as its own
+    // identity being used by someone else (measured 2026-08-10, same title on
+    // both rows). The caller's sid is server-resolved (`_caller_sid`, written
+    // from the verified principal in `execute_session_tool`), so it covers a
+    // managed session and an enrolled client's ledger node alike. An
+    // admin/local/tenant-token caller is not a session and has no sid: nothing
+    // is marked rather than guessed.
+    let caller_sid = args
+        .get("_caller_sid")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|sid| !sid.is_empty());
     let filter_project = args
         .get("project")
         .and_then(|v| v.as_str())
@@ -3241,11 +3362,15 @@ async fn run_session_list_at(
         .map(|n| (n as usize).clamp(1, 500))
         .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
 
-    let views = {
+    // Both halves of the activity answer come from under ONE lock hold, and
+    // both are cheap in-memory reads — the progress files are read below, after
+    // the guard drops (a fleet's streams are far too big to read under the
+    // gateway mutex).
+    let (views, live_turns) = {
         let gw = gateway.lock().await;
-        gw.session_views()
+        (gw.session_views(), gw.live_turns())
     };
-    // v0.9.1 — honest activity per row (same classifier as the web session
+    // v0.9.1 — honest activity per row (same resolver as the web session
     // list): one progress read per DISTINCT project, not per session.
     let mut activity_ctx: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
         std::collections::HashMap::new();
@@ -3275,10 +3400,16 @@ async fn run_session_list_at(
         .iter()
         .map(|v| {
             let activity = activity_ctx.get(&v.project).map(|(events, silent)| {
-                ccteam_core::stall::classify_progress_activity_for_sid(events, &v.sid, *silent, now)
-                    .status
-                    .activity
-                    .to_string()
+                ccteam_core::stall::classify_session_activity(
+                    events,
+                    &v.sid,
+                    *silent,
+                    live_turns.get(&v.sid).copied(),
+                    now,
+                )
+                .status
+                .activity
+                .to_string()
             });
             (v, activity)
         })
@@ -3315,6 +3446,12 @@ async fn run_session_list_at(
                 row.insert("role".into(), serde_json::json!(v.role));
             }
             row.insert("vendor".into(), serde_json::json!(v.vendor));
+            // The caller's OWN row (see `caller_sid`). Named nothing like
+            // `current` on purpose: the two answer different questions, and
+            // reading one as the other is the failure this ends.
+            if caller_sid == Some(v.sid.as_str()) {
+                row.insert("is_self".into(), serde_json::json!(true));
+            }
             if v.current {
                 row.insert("current".into(), serde_json::json!(true));
             }
@@ -3416,6 +3553,10 @@ async fn run_session_stop(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
+    // Ahead of both scope checks: a hand-started client's process belongs to its
+    // operator, and the descendant walk below would otherwise reject it as "not
+    // a descendant" — true, but not the reason.
+    assert_target_is_driveable("session_stop", gateway, &sid).await?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
     assert_caller_owns_session("session_stop", args, gateway, &sid, &caller).await?;
@@ -3478,6 +3619,27 @@ fn arg_session_sid(args: &serde_json::Value) -> std::result::Result<String, Stri
         .ok_or_else(|| "missing required `sid`".to_string())
 }
 
+/// Refuse a sid-addressed DRIVE on a hand-started client's ledger node.
+///
+/// Every driving tool calls this the moment it has its target, ahead of its own
+/// resolution: an external node deliberately has no row in the live map (that
+/// map is the set of sessions ccteam holds a thread for), so `session_resolve`
+/// (dispatch/collect) and the descendant walk (stop) would report a session the
+/// caller can SEE in `session_list` as unknown — a correct refusal that reads as
+/// a ccteam bug. One shared message
+/// ([`crate::external_nodes::not_driveable_error`]) says what the session IS: a
+/// process its own operator drives, usable as a delegation parent.
+async fn assert_target_is_driveable(
+    tool: &str,
+    gateway: &GatewayHandle,
+    sid: &str,
+) -> std::result::Result<(), String> {
+    if gateway.lock().await.is_external_node(sid) {
+        return Err(crate::external_nodes::not_driveable_error(tool, sid));
+    }
+    Ok(())
+}
+
 /// v0.8.7 review-fix (R-M3) — project-scope a sid-addressed `session_*` call:
 /// the caller may only dispatch/collect/stop a session that runs in the
 /// caller's OWN bound project (`_caller_slug`). Resolves the sid under the
@@ -3493,9 +3655,9 @@ async fn assert_caller_owns_session(
     sid: &str,
     caller: &McpCaller,
 ) -> std::result::Result<(), String> {
-    // v0.9 T4 review fix — the HTTP front door's verified admin operates
-    // fleet-wide (same semantics as the web admin Identity): no ambient slug
-    // to bind to. Unknown sids still fail inside the op itself.
+    // v0.9 T4 review fix — the verified admin (local mcp.sock admin token)
+    // operates fleet-wide (same semantics as the web admin Identity): no ambient
+    // slug to bind to. Unknown sids still fail inside the op itself.
     let resolved = {
         let gw = gateway.lock().await;
         gw.session_resolve(sid)
@@ -3935,9 +4097,10 @@ mod session_tool_tests {
         std::fs::write(secrets.join("web-token"), format!("{token}\n")).unwrap();
     }
 
-    // v0.9.1 — main-session fallback: the LOCAL socket promotes a caller
-    // presenting the admin web token to Admin semantics, and strips the
-    // token arg either way.
+    // The LOCAL socket promotes a caller presenting the admin web token to
+    // Admin semantics, and strips the token arg either way. This is the only
+    // remaining door into that tier — the hand-started-session fallback it was
+    // built for now enrolls and calls as a real principal instead.
     #[test]
     fn promote_local_admin_upgrades_on_matching_token_and_strips_arg() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4113,6 +4276,22 @@ mod session_tool_tests {
                 .await
                 .map(ccteam_harness::TurnSubmission::started)
         }
+        async fn rebuild_tool_surface(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> Result<ccteam_harness::ToolSurfaceRebuild, ccteam_harness::HarnessError> {
+            // Test double: no tool face to rebuild.
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+                reason: "test double".to_string(),
+            })
+        }
+
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
+        }
+
         fn events(
             &self,
             h: &ccteam_harness::ThreadHandle,
@@ -4514,9 +4693,10 @@ mod session_tool_tests {
         );
     }
 
-    /// v0.9 T4 — the HTTP front door's verified admin skips the principal gate
-    /// entirely: NO `_caller_*` args, straight to the op (which then reports
-    /// gateway-down here — proving the gate was bypassed, not that it denied).
+    /// v0.9 T4 — the verified admin tier (local mcp.sock admin token) skips the
+    /// principal gate entirely: NO `_caller_*` args, straight to the op (which
+    /// then reports gateway-down here — proving the gate was bypassed, not that
+    /// it denied).
     #[tokio::test]
     async fn execute_session_tool_admin_bypasses_gate_reports_gateway_down() {
         let req = call("session_list", json!({}));
@@ -4630,7 +4810,74 @@ mod session_tool_tests {
         .unwrap();
 
         assert_eq!(meta.owner, "user:ualice");
-        assert!(meta.parent_sid.is_none(), "admin spawn remains a root");
+        assert!(
+            meta.parent_sid.is_none(),
+            "an admin spawn that declares NO origin stays a root"
+        );
+
+        // …but an admin-tier caller that names itself gets the edge. It is
+        // anonymous to the bridge (no per-session principal, and a socket line
+        // carries no process context), so the declaration is the only signal —
+        // validated against the ledger, never taken on faith.
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_spawn",
+                json!({
+                    "project": "alice",
+                    "vendor": "claude",
+                    "parent_sid": sid,
+                }),
+            ),
+            Some(&gateway),
+            McpCaller::Admin,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let body: serde_json::Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(body["parent_sid"].as_str(), Some(sid), "{body}");
+        assert_eq!(body["delegation_depth"].as_u64(), Some(1), "{body}");
+        assert_eq!(
+            body["caller"].as_str(),
+            Some(format!("admin:{sid}").as_str()),
+            "the response echoes the resolved origin: {body}"
+        );
+        let child_meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alice"),
+            body["sid"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            child_meta.parent_sid.as_deref(),
+            Some(sid),
+            "the ledger carries the edge, so the tree mounts"
+        );
+
+        // An unknown sid is a LOUD error, never a silent root.
+        let response = execute_session_tool_with_paths(
+            &call(
+                "session_spawn",
+                json!({
+                    "project": "alice",
+                    "vendor": "claude",
+                    "parent_sid": "s404",
+                }),
+            ),
+            Some(&gateway),
+            McpCaller::Admin,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a live session"),
+            "{response}"
+        );
     }
 
     #[tokio::test]
@@ -4913,10 +5160,13 @@ mod session_tool_tests {
         assert!(err.contains("demo"), "{err}");
     }
 
-    /// MCP-DX-3 — invalid configured defaults skip to scratch; first use
-    /// provisions a real project and later uses reuse it by catalog path.
+    /// A caller that names no project and has no cwd is REFUSED, even when a
+    /// `default_project` is configured and a shared `default_project` dir is
+    /// available. Landing an unnamed caller in a workspace it was never
+    /// granted is the defect, not a convenience: nothing may be created and
+    /// the error must name the real slugs so the caller can pick one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admin_spawn_invalid_config_falls_back_to_scratch_and_reuses_path() {
+    async fn admin_spawn_without_project_basis_is_refused_and_creates_nothing() {
         ccteam_core::tool_surface::disable_tool_surface_bootstrap_for_tests();
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
@@ -4924,39 +5174,31 @@ mod session_tool_tests {
             projects_root: tmp.path().join("projects"),
         };
         let alpha = seed_owned_project(&paths, "alpha", "user:web-api");
-        let default = seed_owned_project(&paths, "default", "user:web-api");
+        let beta = seed_owned_project(&paths, "beta", "user:web-api");
         let config_path = ccteam_core::ccteam_config_path(&paths.root);
         let mut yaml = std::fs::read_to_string(&config_path).unwrap();
-        yaml.push_str("default_project: missing\n");
+        yaml.push_str("default_project: beta\n");
         std::fs::write(&config_path, yaml).unwrap();
         let (gw, _principal) = dispatch_gateway(false, 0, &alpha).await;
-        gw.lock().await.register_project("default", default);
+        gw.lock().await.register_project("beta", beta);
 
-        let mut bodies = Vec::new();
-        for _ in 0..2 {
-            bodies.push(parse(
-                &run_session_spawn_at(
-                    &json!({"vendor": "claude"}),
-                    &gw,
-                    McpCaller::Admin,
-                    Some(&paths),
-                )
-                .await
-                .unwrap(),
-            ));
-        }
-        assert_eq!(bodies[0]["project_source"], "scratch", "{:?}", bodies[0]);
-        assert_eq!(bodies[1]["project_source"], "scratch", "{:?}", bodies[1]);
-        assert_eq!(bodies[0]["project"], bodies[1]["project"]);
-        assert!(bodies.iter().all(|body| body.get("note").is_some()));
+        let err = run_session_spawn_at(
+            &json!({"vendor": "claude"}),
+            &gw,
+            McpCaller::Admin,
+            Some(&paths),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("missing `project`"), "{err}");
+        assert!(err.contains("alpha"), "error names the catalog: {err}");
+        assert!(err.contains("beta"), "error names the catalog: {err}");
+        // The configured default was NOT silently used, and no scratch
+        // workspace was provisioned as a side effect of a refused spawn.
         let scratch = paths.root.join("default_project");
-        assert!(CcteamPaths::project_state_in(&scratch).is_file());
-        assert!(scratch.join(".ccteam/workflow.yaml").is_file());
+        assert!(!scratch.exists(), "no scratch project provisioned");
         let cfg = ccteam_core::load_ccteam_config(&paths.root).unwrap();
-        let at_path: Vec<_> = cfg.projects.iter().filter(|p| p.path == scratch).collect();
-        assert_eq!(at_path.len(), 1, "scratch path registered once: {cfg:?}");
-        assert_eq!(at_path[0].slug, bodies[0]["project"].as_str().unwrap());
-        assert_eq!(at_path[0].slug, "default2");
+        assert_eq!(cfg.projects.len(), 2, "catalog untouched: {cfg:?}");
     }
 
     /// MCP-DX-2 — with exactly ONE registered project, an admin spawn that
@@ -4990,7 +5232,7 @@ mod session_tool_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admin_spawn_project_source_covers_explicit_cwd_principal_and_configured() {
+    async fn admin_spawn_project_source_covers_explicit_cwd_and_principal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CcteamPaths {
             root: tmp.path().join("home"),
@@ -4998,10 +5240,6 @@ mod session_tool_tests {
         };
         let alpha = seed_owned_project(&paths, "alpha", "user:web-api");
         let beta = seed_owned_project(&paths, "beta", "user:web-api");
-        let config_path = ccteam_core::ccteam_config_path(&paths.root);
-        let mut yaml = std::fs::read_to_string(&config_path).unwrap();
-        yaml.push_str("default_project: beta\n");
-        std::fs::write(&config_path, yaml).unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, &alpha).await;
         gw.lock().await.register_project("beta", beta);
 
@@ -5023,12 +5261,6 @@ mod session_tool_tests {
                 McpCaller::Ambient,
                 "principal",
                 "alpha",
-            ),
-            (
-                json!({"vendor":"claude"}),
-                McpCaller::Admin,
-                "configured",
-                "beta",
             ),
         ] {
             let body = parse(
@@ -5740,6 +5972,110 @@ mod session_tool_tests {
             .await
             .unwrap_err();
         assert!(err.contains("invalid `activity` filter"), "{err}");
+    }
+
+    /// A listing that never says which row is the CALLER makes every caller
+    /// guess, and the nearest-looking field (`current`) answers a different
+    /// question — "the active session of some chat". Measured 2026-08-10: a
+    /// caller took the `current` row for itself, and since that other session
+    /// ran the same prompt (same title), read its tool calls as its own
+    /// identity being used by somebody else. `is_self` follows the caller's
+    /// server-resolved principal; `current` follows the fleet's routing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_marks_the_calling_session_not_the_current_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let mut children = Vec::new();
+        for _ in 0..2 {
+            let spawned = parse(
+                &run_session_spawn(
+                    &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                    &gw,
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap(),
+            );
+            children.push(spawned["sid"].as_str().unwrap().to_string());
+        }
+
+        let marked = |list: &serde_json::Value| -> Vec<String> {
+            list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row.get("is_self") == Some(&json!(true)))
+                .map(|row| row["sid"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // The principal asks: exactly its own row is marked.
+        let as_principal = parse(
+            &run_session_list(&ambient(&principal, "alpha", json!({})), &gw)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            marked(&as_principal),
+            vec![principal.clone()],
+            "exactly the caller's row is marked: {as_principal}"
+        );
+
+        // The incident's exact shape: a DIFFERENT session is `current`, and
+        // being `current` marks nothing.
+        let current_rows: Vec<&serde_json::Value> = as_principal["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row.get("current") == Some(&json!(true)))
+            .collect();
+        let foreign_current = current_rows
+            .iter()
+            .find(|row| row["sid"] != json!(principal.as_str()))
+            .expect("a session other than the caller is some chat's current one");
+        assert!(
+            foreign_current.get("is_self").is_none(),
+            "`current` never marks the caller: {foreign_current}"
+        );
+
+        // The marker follows the CALLER, not the fleet: same gateway, same
+        // rows, a child asking sees the mark move onto its own row.
+        let as_child = parse(
+            &run_session_list(&ambient(&children[0], "alpha", json!({})), &gw)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            marked(&as_child),
+            vec![children[0].clone()],
+            "the mark is the caller's, not a property of the row: {as_child}"
+        );
+    }
+
+    /// An admin / local caller is not a session: it has no sid, so no row is
+    /// its own. Marking the nearest candidate would be a guess, and a guessed
+    /// identity is exactly the failure this field exists to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_marks_nothing_when_the_caller_has_no_sid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        run_session_spawn(
+            &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+
+        for args in [json!({}), json!({ "_caller_sid": "" })] {
+            let list = parse(&run_session_list(&args, &gw).await.unwrap());
+            let rows = list["sessions"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "both sessions listed: {list}");
+            assert!(
+                rows.iter().all(|row| row.get("is_self").is_none()),
+                "a sid-less caller owns no row: {list}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6460,5 +6796,346 @@ mod session_tool_tests {
         );
         drop(locked);
         let _ = waiter.await;
+    }
+
+    // ========================================================================
+    // External ledger nodes: a hand-started client that enrolled over `POST
+    // /mcp` is a delegation PARENT ccteam holds no thread for. It can be
+    // spawned FROM and never driven.
+    // ========================================================================
+
+    /// The enrollment a hand-started client gets over `POST /mcp` (a real sid +
+    /// `meta.json`, deliberately no live-map row).
+    async fn enroll_external_node(gateway: &GatewayHandle, slug: &str) -> String {
+        gateway
+            .lock()
+            .await
+            .register_external_node(slug, "user:web-api", "codex/0.144.3")
+            .unwrap()
+    }
+
+    /// The ask bus is for ccteam's OWN sessions. Enrollment made "Ambient" stop
+    /// meaning that — a hand-started agent now arrives Ambient too — so the
+    /// refusal reads the ledger instead of the tier. Without this, an outside
+    /// process could raise a prompt in the operator's IM indistinguishable from
+    /// one a managed session raised on a blocked tool call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ask_bus_refuses_an_external_node_but_serves_a_managed_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+        let dispatch = McpDispatch {
+            paths: CcteamPaths {
+                root: tmp.path().to_path_buf(),
+                projects_root: tmp.path().join("projects"),
+            },
+            sink: None,
+            pending: None,
+            gateway: Some(std::sync::Arc::clone(&gw)),
+        };
+
+        for method in ["interaction/ask", "permission/ask"] {
+            let from_node = dispatch
+                .dispatch_as(
+                    json!({"jsonrpc":"2.0","id":1,"method":method,
+                           "params":{"arguments":{"_caller_sid": node}}}),
+                    McpCaller::Ambient,
+                )
+                .await
+                .expect("a request gets a response");
+            assert!(
+                from_node["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("not available on this transport")),
+                "{method} from an external node must be refused: {from_node}"
+            );
+
+            // A managed session's own principal still reaches the bus — the
+            // refusal must narrow to the new caller class, not close the door
+            // HITL depends on.
+            let from_managed = dispatch
+                .dispatch_as(
+                    json!({"jsonrpc":"2.0","id":2,"method":method,
+                           "params":{"arguments":{"_caller_sid": principal}}}),
+                    McpCaller::Ambient,
+                )
+                .await
+                .expect("a request gets a response");
+            let refused = from_managed["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not available on this transport"));
+            assert!(!refused, "{method} from a managed session: {from_managed}");
+        }
+    }
+
+    /// All three driving tools refuse an external sid with the ONE shared
+    /// message, and it says what the session IS. "not found" would be a claim
+    /// the caller can immediately disprove — the sid is right there in
+    /// `session_list` — so it would read as a ccteam bug instead of an answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driving_tools_refuse_an_external_node_by_saying_what_it_is() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+
+        // The premise of the whole requirement: the caller can see it.
+        let listed = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert!(
+            listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["sid"] == json!(node)),
+            "the node is visible in session_list: {listed}"
+        );
+
+        let dispatch = run_session_dispatch(
+            &ambient(&principal, "alpha", json!({ "sid": node, "task": "do it" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        let collect = run_session_collect(
+            &ambient(&principal, "alpha", json!({ "sid": node })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        let stop = run_session_stop(
+            &ambient(&principal, "alpha", json!({ "sid": node })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        for (tool, message) in [
+            ("session_dispatch", &dispatch),
+            ("session_collect", &collect),
+            ("session_stop", &stop),
+        ] {
+            assert_eq!(
+                message,
+                &crate::external_nodes::not_driveable_error(tool, &node),
+                "{tool}: one shared refusal, named per tool"
+            );
+            assert!(
+                message.contains("delegation parent"),
+                "{tool}: says what it can still do: {message}"
+            );
+            assert!(!message.contains("not found"), "{tool}: {message}");
+            assert!(!message.contains("unknown session"), "{tool}: {message}");
+        }
+
+        // The ledger row is the reason, not the caller's auth tier.
+        let admin = run_session_dispatch(
+            &json!({ "sid": node, "task": "do it" }),
+            &gw,
+            McpCaller::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            admin,
+            crate::external_nodes::not_driveable_error("session_dispatch", &node)
+        );
+        // A refused stop is a no-op: the node keeps its place in the ledger.
+        assert!(gw.lock().await.is_external_node(&node));
+    }
+
+    /// The point of minting the node: a child spawned by a hand-started agent
+    /// hangs UNDER it instead of mounting as a root. An admin-tier caller (what
+    /// such a client authenticates as) declares its enrolled sid, which is
+    /// validated against `session_views()` — external rows included. The
+    /// guardrails then behave: a non-live parent is a legitimate depth-0 root
+    /// whose LIVE children are what the fan-out ceiling counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_declaring_an_external_parent_nests_the_child_at_depth_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+
+        let child = parse(
+            &run_session_spawn(
+                &json!({ "project": "alpha", "vendor": "claude", "parent_sid": node }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(child["parent_sid"], json!(node), "{child}");
+        assert_eq!(child["delegation_depth"], json!(1), "{child}");
+        assert_eq!(
+            child["caller"],
+            json!(format!("admin:{node}")),
+            "the echo names the resolved origin: {child}"
+        );
+
+        // Fan-out is counted from the live map, keyed on the parent sid — the
+        // node's own absence from that map contributes nothing, so the ceiling
+        // is enforced rather than silently passed.
+        gw.lock()
+            .await
+            .set_delegation_config(ccteam_core::DelegationConfig {
+                max_depth: 2,
+                max_children: 1,
+                max_delegated: 50,
+            });
+        let denied = run_session_spawn(
+            &json!({ "project": "alpha", "vendor": "claude", "parent_sid": node }),
+            &gw,
+            McpCaller::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert!(denied.contains("fan-out limit reached"), "{denied}");
+        assert!(denied.contains("already has 1 active children"), "{denied}");
+
+        // Acceptance comes from the ledger, never from faith in the declaration.
+        let unknown = run_session_spawn(
+            &json!({ "project": "alpha", "vendor": "claude", "parent_sid": "s999999" }),
+            &gw,
+            McpCaller::Admin,
+        )
+        .await
+        .unwrap_err();
+        assert!(unknown.contains("not a live session"), "{unknown}");
+    }
+
+    /// Honest notifications. MCP is client-dial-in: ccteam cannot inject a
+    /// completion turn into a hand-started agent's conversation, so a task
+    /// delegated from an external parent must SAY the notification will not
+    /// come. Both sides are asserted — the distinction is the contract, not
+    /// either half on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_is_notify_deliverable_only_under_a_managed_parent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let node = enroll_external_node(&gw, "alpha").await;
+
+        let external = parse(
+            &run_session_spawn(
+                &json!({
+                    "project": "alpha",
+                    "vendor": "claude",
+                    "parent_sid": node,
+                    "task": "review the diff"
+                }),
+                &gw,
+                McpCaller::Admin,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            external["parent_sid"],
+            json!(node),
+            "the delegation edge is real: {external}"
+        );
+        assert_eq!(external["notify_deliverable"], json!(false), "{external}");
+        let hint = external["hint"].as_str().unwrap();
+        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        assert!(!hint.contains("you will be notified"), "{hint}");
+        // The armed watch agrees with the answer we just gave: the edge stays
+        // watched (so the child's completion keeps hitting the ledger) with no
+        // impossible delivery armed on it.
+        let watch =
+            ccteam_harness::read_delegation_watch(tmp.path(), external["sid"].as_str().unwrap())
+                .expect("the delegation edge is still watched");
+        assert_eq!(watch.parent_sid, node);
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Off, "{watch:?}");
+
+        // A managed parent has a transport, and keeps it.
+        let managed = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "vendor": "claude", "task": "review the diff" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(managed["notify_deliverable"], json!(true), "{managed}");
+        assert!(
+            managed["hint"]
+                .as_str()
+                .unwrap()
+                .contains("you will be notified"),
+            "{managed}"
+        );
+        let watch =
+            ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(watch.parent_sid, principal);
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+    }
+
+    /// The refusal sits BEHIND the ACL, not in front of it: a tenant who can see
+    /// the node reaches the honest message (the sid→project resolver knows both
+    /// indexes), while another tenant's node stays indistinguishable from an
+    /// unknown sid.
+    #[tokio::test]
+    async fn tenant_gets_the_refusal_only_for_a_node_in_its_own_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let (own, foreign) = {
+            let mut gw = gateway.lock().await;
+            (
+                gw.register_external_node("alice", "user:ualice", "codex/0.144.3")
+                    .unwrap(),
+                gw.register_external_node("bob", "user:ubob", "codex/0.144.3")
+                    .unwrap(),
+            )
+        };
+        let caller = McpCaller::User {
+            user_id: "ualice".into(),
+        };
+        for tool in ["session_dispatch", "session_collect", "session_stop"] {
+            let invoke = |sid: &str| {
+                let mut args = json!({ "sid": sid });
+                if tool == "session_dispatch" {
+                    args["task"] = json!("do not leak");
+                }
+                call(tool, args)
+            };
+            let mine = execute_session_tool_with_paths(
+                &invoke(&own),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            assert_eq!(mine["result"]["isError"], true, "{tool}: {mine}");
+            assert_eq!(
+                mine["result"]["content"][0]["text"],
+                json!(crate::external_nodes::not_driveable_error(tool, &own)),
+                "{tool}: {mine}"
+            );
+            let theirs = execute_session_tool_with_paths(
+                &invoke(&foreign),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            let unknown = execute_session_tool_with_paths(
+                &invoke("s999999"),
+                Some(&gateway),
+                caller.clone(),
+                &paths,
+            )
+            .await;
+            assert_eq!(
+                theirs["result"]["content"][0]["text"], unknown["result"]["content"][0]["text"],
+                "{tool}: another tenant's node must stay indistinguishable from an unknown sid"
+            );
+        }
     }
 }

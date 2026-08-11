@@ -4,77 +4,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::State;
-use axum::http::HeaderMap;
-use axum::routing::post;
-use axum::{Json, Router};
 use ccteam_harness::{
     AgentSpecBrief, ApprovalIR, ApprovalRisk, HarnessAdapter, PermissionMode, PiApprovalDecision,
     PiDialogKind, PiDialogRequest, PiDialogResponse, PiInteractionResolver, PiRoleDocument,
     PiRpcAdapter, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::Value;
 use serial_test::serial;
 use tokio::sync::Notify;
 
-#[derive(Clone, Default)]
-struct McpCapture {
-    calls: Arc<Mutex<Vec<McpCall>>>,
-}
-
-#[derive(Clone)]
-struct McpCall {
-    authorization: Option<String>,
-    method: String,
-    params: Value,
-}
-
-async fn fake_mcp(
-    State(capture): State<McpCapture>,
-    headers: HeaderMap,
-    Json(request): Json<Value>,
-) -> Json<Value> {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let method = request["method"].as_str().unwrap_or("missing").to_string();
-    capture.calls.lock().unwrap().push(McpCall {
-        authorization,
-        method: method.clone(),
-        params: request.get("params").cloned().unwrap_or(Value::Null),
-    });
-    let id = request.get("id").cloned().unwrap_or(Value::Null);
-    let result = match method.as_str() {
-        "initialize" => {
-            json!({"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fake-ccteam","version":"test"}})
-        }
-        "tools/list" => json!({"tools":[
-            {"name":"status","description":"Status","inputSchema":{"type":"object","properties":{}}},
-            {"name":"grok_claude_codex_kimi","description":"Discovery","inputSchema":{"type":"object","properties":{}}},
-            {"name":"chat_send_file","description":"Send file","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_spawn","description":"Spawn","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_dispatch","description":"Dispatch","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_collect","description":"Collect","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_list","description":"List","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_stop","description":"Stop","inputSchema":{"type":"object","properties":{}}}
-        ]}),
-        "tools/call" => json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
-        _ => Value::Null,
-    };
-    Json(json!({"jsonrpc":"2.0","id":id,"result":result}))
-}
-
-async fn start_fake_mcp(capture: McpCapture) -> (tokio::task::JoinHandle<()>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = Router::new()
-        .route("/mcp", post(fake_mcp))
-        .with_state(capture);
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (server, format!("http://{addr}/mcp"))
-}
+#[path = "support/fake_mcp.rs"]
+mod fake_mcp;
+use fake_mcp::{start_fake_mcp, McpCapture};
 
 fn role_reader() -> ccteam_harness::PiRoleReader {
     Arc::new(|_project_dir: &Path, _role: &str| Ok(None::<PiRoleDocument>))

@@ -235,6 +235,11 @@ fn spawn_status_tap(
         // (the user can `/effort` mid-session), and skipped entirely once the
         // level is known, so a settled session pays nothing.
         let mut effort_probed_this_turn = false;
+        // One self-heal per session: `system:init` repeats (`/clear`, compact),
+        // and a vendor that cannot reconnect must not be asked once per init
+        // for the rest of the session. An on-demand rebuild
+        // (`rebuild_tool_surface`) stays available either way.
+        let tool_face_healed = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
                 _ = transport.wait_closed() => return,
@@ -370,7 +375,39 @@ fn spawn_status_tap(
                     // v0.8.20 `/status` — reflect claude's subagent/workflow task
                     // lifecycle into the running-task list (the authoritative
                     // running-subagent source; ccteam mirrors, never folds/counts).
-                    Ok(Outbound::System(sys)) => reflect_task_event(&running_tasks, &sys),
+                    Ok(Outbound::System(sys)) => {
+                        reflect_task_event(&running_tasks, &sys);
+                        // …and the session's own report of its TOOL FACE. A
+                        // child that started while the daemon's `/mcp` was not
+                        // yet listening (a restart respawns children within
+                        // seconds of binding) comes up with the ccteam server
+                        // dead and stays that way for its whole life: claude
+                        // never retries a failed MCP server on its own. Heal it
+                        // from the report rather than waiting for a human to
+                        // notice the tools are missing.
+                        if let Some(dead) = dead_ccteam_tool_face(&sys) {
+                            if !tool_face_healed.swap(true, Ordering::SeqCst) {
+                                // Deliberately NOT healed by an in-place
+                                // reconnect any more. That reconnect re-resolves
+                                // the vendor's server list without honouring
+                                // `--strict-mcp-config`, so it would attach the
+                                // global same-named entry and this session would
+                                // spend the rest of its life calling with the
+                                // MACHINE's credential instead of its own —
+                                // wrong parent, wrong project scope, and nothing
+                                // visibly broken (see `rebuild_tool_surface`).
+                                // A session with no tools is a smaller problem
+                                // than a session wearing someone else's
+                                // identity, and this says so where an operator
+                                // will read it.
+                                tracing::warn!(
+                                    session = %sid,
+                                    status = %dead,
+                                    "stream-json: ccteam tool face was not connected at init and is NOT auto-reconnected (that would swap this session's principal for the machine credential) — send `/new` to restore it"
+                                );
+                            }
+                        }
+                    }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -516,6 +553,24 @@ fn reflect_task_event(running_tasks: &StdMutex<TaskTracker>, sys: &protocol::Sys
         }
         _ => {}
     }
+}
+
+/// The ccteam entry of a `system:init` MCP report, when it is NOT connected —
+/// returns the status string it reported (for the log line). `None` for every
+/// other system subtype, and for a healthy tool face.
+///
+/// Reads the entry by name rather than assuming the single-server shape: the
+/// terminal protocol keeps the user's ambient servers, so "the only entry" is
+/// not a safe stand-in for "ccteam's entry".
+fn dead_ccteam_tool_face(sys: &protocol::SystemMsg) -> Option<String> {
+    if sys.subtype != "init" {
+        return None;
+    }
+    sys.mcp_servers
+        .iter()
+        .find(|server| server.name == crate::execution::mcp_config::CCTEAM_MCP_SERVER_NAME)
+        .filter(|server| !server.is_connected())
+        .map(|server| server.status.clone())
 }
 
 /// Query claude's REAL context accounting via the `get_context_usage`
@@ -1054,17 +1109,23 @@ impl ClaudeStreamJsonAdapter {
                 exec_spec.env.insert(k.clone(), v.clone());
             }
         }
-        if ship_mcp {
-            let daemon_url_mcp = format!(
-                "{}/mcp",
-                crate::execution::remote_exec::ExecSpec::DAEMON_URL_TOKEN
-            );
-            let input = crate::execution::mcp_config::CuratedMcpInput {
-                sid: &ctx.sid,
-                secret: &ctx.secret,
-                http_url: Some(&daemon_url_mcp),
-            };
-            let body = crate::execution::mcp_config::build_curated_mcp_json(&input);
+        // Same endpoint semantics as a local spawn; only the URL differs — a
+        // token the satellite substitutes with its own daemon_url, so the main
+        // daemon never has to guess its LAN-reachable address.
+        let endpoint = ship_mcp
+            .then(|| {
+                crate::execution::mcp_config::SessionMcpEndpoint::at(
+                    &format!(
+                        "{}/mcp",
+                        crate::execution::remote_exec::ExecSpec::DAEMON_URL_TOKEN
+                    ),
+                    &ctx.sid,
+                    &ctx.secret,
+                )
+            })
+            .flatten();
+        if let Some(endpoint) = endpoint {
+            let body = crate::execution::mcp_config::project_claude_mcp_json(&endpoint);
             match serde_json::to_string_pretty(&body) {
                 Ok(content) => exec_spec
                     .files
@@ -1502,6 +1563,55 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         }))
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // `events()` looks the sid's live transport up again and subscribes to
+        // its broadcast — future events only. A respawned child (dead-child
+        // resume) or a reconnected satellite link is therefore observable
+        // again without the consumer knowing which of the two happened.
+        crate::EventAttachment::Rebuildable
+    }
+
+    /// **This protocol cannot rebuild its tool face in place, and trying was
+    /// worse than saying so.**
+    ///
+    /// `mcp_reconnect` looked like the perfect fit — the same control request
+    /// the TUI's `/mcp` → Reconnect item performs. Measured on this machine
+    /// (two rival servers both registered as `ccteam`, one via `--mcp-config`
+    /// and one in the vendor's global config): before the reconnect every
+    /// phase, `tools/call` included, went to the CURATED entry. After it, the
+    /// vendor re-resolved its server list WITHOUT honouring
+    /// `--strict-mcp-config`, connected the global same-named entry, and routed
+    /// every subsequent `tools/call` there.
+    ///
+    /// So an in-place reconnect silently replaces the session's own
+    /// `(sid, secret)` principal with whatever credential the machine's global
+    /// config carries. That is not a degraded tool face, it is a different
+    /// caller: children mount under the wrong parent, the project scope is not
+    /// the session's own, and nothing in the session looks broken. It was the
+    /// cause of the long-unexplained "a managed session's calls arrive as
+    /// admin" behaviour — ccteam was doing it to itself, once per session, at
+    /// first activation.
+    ///
+    /// A respawn re-reads the curated `--mcp-config`, so it is the only honest
+    /// answer here.
+    async fn rebuild_tool_surface(
+        &self,
+        h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        // Still resolve the session: "not live" is a different answer from
+        // "live, but not rebuildable", and the caller prints them differently.
+        let _live = self.lookup(&h.identity).ok_or_else(|| {
+            HarnessError::Io(format!("stream-json session {} is not live", h.identity))
+        })?;
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "claude's in-place MCP reconnect re-resolves servers from the vendor's \
+                     global config, which would replace this session's own principal with the \
+                     machine credential (measured). Send `/new` to restore the tool face with \
+                     this session's identity intact."
+                .to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         // A live session for this uuid (idle wake within one daemon
         // lifetime) → hand back a handle pointing at it. Otherwise we
@@ -1882,12 +1992,12 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 
 #[cfg(test)]
 mod effort_tests {
-    use super::protocol::SystemMsg;
+    use super::protocol::{McpServerStatus, SystemMsg};
     use super::{
-        claude_model_options, is_model_placeholder, normalize_effort, parse_latest_goal_status,
-        persisted_session_model, preserve_1m_tag, reflect_task_event, set_effort_level,
-        split_model_effort, task_outlives_turn, write_status_file, ClaudeModelOption, TaskTracker,
-        EFFORT_LEVELS,
+        claude_model_options, dead_ccteam_tool_face, is_model_placeholder, normalize_effort,
+        parse_latest_goal_status, persisted_session_model, preserve_1m_tag, reflect_task_event,
+        set_effort_level, split_model_effort, task_outlives_turn, write_status_file,
+        ClaudeModelOption, TaskTracker, EFFORT_LEVELS,
     };
     use crate::ThreadStatus;
     use std::sync::Mutex;
@@ -1955,6 +2065,50 @@ mod effort_tests {
     /// (never folds): `task_started` adds, a terminal `task_updated`/
     /// `task_notification` removes, duplicates are idempotent, non-task system
     /// lines are ignored.
+    fn init_with_mcp(servers: &[(&str, &str)]) -> SystemMsg {
+        let mut sys = SystemMsg {
+            subtype: "init".into(),
+            ..Default::default()
+        };
+        sys.mcp_servers = servers
+            .iter()
+            .map(|(name, status)| McpServerStatus {
+                name: (*name).to_string(),
+                status: (*status).to_string(),
+            })
+            .collect();
+        sys
+    }
+
+    #[test]
+    fn dead_tool_face_is_read_by_name_and_only_connected_is_healthy() {
+        // The failure this exists for: the child came up before the daemon was
+        // listening, so it is alive with no ccteam tools, forever.
+        assert_eq!(
+            dead_ccteam_tool_face(&init_with_mcp(&[("ccteam", "failed")])),
+            Some("failed".to_string())
+        );
+        // Healthy stays untouched — a rebuild would drop working tools.
+        assert!(dead_ccteam_tool_face(&init_with_mcp(&[("ccteam", "connected")])).is_none());
+        // An unrecognized future status is NOT waved through: unusable until
+        // proven otherwise is the only safe reading.
+        assert_eq!(
+            dead_ccteam_tool_face(&init_with_mcp(&[("ccteam", "quiesced")])),
+            Some("quiesced".to_string())
+        );
+        // Somebody else's broken server is not ours to reconnect (the terminal
+        // protocol keeps the user's ambient servers alongside ccteam's).
+        assert!(dead_ccteam_tool_face(&init_with_mcp(&[
+            ("playwright", "failed"),
+            ("ccteam", "connected"),
+        ]))
+        .is_none());
+        // Only `init` carries the report; no other subtype may be read as one.
+        let mut not_init = init_with_mcp(&[("ccteam", "failed")]);
+        not_init.subtype = "commands_changed".into();
+        assert!(dead_ccteam_tool_face(&not_init).is_none());
+    }
+
     #[test]
     fn reflect_task_event_mirrors_claude_task_lifecycle() {
         let tasks = Mutex::new(TaskTracker::default());

@@ -22,6 +22,10 @@ export interface AgentNode {
   parent_sid?: string | null;
   depth: number;
   cost_usd?: number | null;
+  /** Raw token ledger — present even for vendors with no USD price table
+   *  (grok/codex/opencode/kimi), so a row can show an honest magnitude when
+   *  `cost_usd` cannot exist. */
+  tokens_total?: number | null;
   title?: string | null;
   last_active: string;
   turn_count: number;

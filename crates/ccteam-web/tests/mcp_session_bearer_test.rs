@@ -31,27 +31,18 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
     }
 }
 
-fn seed_web_token(paths: &CcteamPaths, hex: &str) {
-    let path = paths.web_token_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(&path, hex).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms).unwrap();
-    }
-}
-
 /// A fake harness that records each spawned session's per-session secret, so a
 /// test can construct a real `ccteam-sid:<sid>:<secret>` bearer.
 #[derive(Clone)]
 struct SecretRecordingAdapter {
     vendor: AgentVendor,
     secrets: Arc<StdMutex<HashMap<String, String>>>,
+    /// Stands in for a vendor that uses its principal DURING the spawn
+    /// (OpenCode's `session/new`, Pi's bridge `session_start`): filled by the
+    /// test once the gateway exists, read inside `start_thread`.
+    principals: Arc<StdMutex<Option<Arc<ccteam_im::principals::SessionPrincipals>>>>,
+    /// What that mid-spawn verification returned.
+    verified_during_spawn: Arc<StdMutex<Option<bool>>>,
 }
 
 #[async_trait::async_trait]
@@ -71,6 +62,12 @@ impl HarnessAdapter for SecretRecordingAdapter {
             .lock()
             .unwrap()
             .insert(ctx.sid.clone(), ctx.secret.clone());
+        // The vendor's tool-face handshake, at the only moment that matters.
+        let registry = self.principals.lock().unwrap().clone();
+        if let Some(registry) = registry {
+            let ok = registry.verify(&ctx.sid, &ctx.secret).is_some();
+            *self.verified_during_spawn.lock().unwrap() = Some(ok);
+        }
         Ok(ThreadHandle {
             vendor: self.vendor,
             mode: ExecutionMode::Chat,
@@ -96,6 +93,22 @@ impl HarnessAdapter for SecretRecordingAdapter {
             .await
             .map(ccteam_harness::TurnSubmission::started)
     }
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+        // Test double: no tool face to rebuild.
+        Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+            reason: "test double".to_string(),
+        })
+    }
+
+    fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+        // Scripted test stream: one-shot. Re-attaching would replay
+        // the script, which is exactly what `Rebuildable` forbids.
+        ccteam_harness::EventAttachment::OneShot
+    }
+
     fn events(&self, _h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
         Box::pin(stream::empty())
     }
@@ -178,13 +191,20 @@ async fn state_with_one_session(paths: CcteamPaths, auth: AuthState) -> (AppStat
     std::fs::create_dir_all(&project_dir).unwrap();
     let secrets: Arc<StdMutex<HashMap<String, String>>> = Arc::new(StdMutex::new(HashMap::new()));
     let secrets_f = Arc::clone(&secrets);
+    let principals_cell: Arc<StdMutex<Option<Arc<ccteam_im::principals::SessionPrincipals>>>> =
+        Arc::new(StdMutex::new(None));
+    let verified: Arc<StdMutex<Option<bool>>> = Arc::new(StdMutex::new(None));
+    let (principals_f, verified_f) = (Arc::clone(&principals_cell), Arc::clone(&verified));
     let factory = Arc::new(move |vendor, _protocol| {
         Arc::new(SecretRecordingAdapter {
             vendor,
             secrets: Arc::clone(&secrets_f),
+            principals: Arc::clone(&principals_f),
+            verified_during_spawn: Arc::clone(&verified_f),
         }) as Arc<dyn HarnessAdapter + Send + Sync>
     });
     let mut gateway = ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir);
+    *principals_cell.lock().unwrap() = Some(gateway.principals());
     let sid = gateway
         .create_session_api(
             "demo".into(),
@@ -202,9 +222,80 @@ async fn state_with_one_session(paths: CcteamPaths, auth: AuthState) -> (AppStat
         .cloned()
         .expect("adapter recorded the session secret");
     assert_eq!(secret.len(), 32, "the minted secret is 128-bit hex");
-    let app =
-        AppState::with_auth(paths, auth).with_gateway(Arc::new(tokio::sync::Mutex::new(gateway)));
+    // THE regression this registry exists for: OpenCode dials `/mcp` inside
+    // `session/new` and Pi's bridge blocks `session_start` on `initialize` +
+    // `tools/list`. When the principal was only registered at apply, that
+    // handshake 401'd and OpenCode burned a 30s startup timeout on every
+    // managed spawn.
+    assert_eq!(
+        *verified.lock().unwrap(),
+        Some(true),
+        "the session principal must verify WHILE the vendor is spawning"
+    );
+    let app = AppState::with_auth(paths, auth).with_gateway_owned(gateway);
     (app, sid, secret)
+}
+
+/// A vendor uses its principal DURING spawn — OpenCode dials `/mcp` inside
+/// `session/new`, Pi's bridge blocks `session_start` on `initialize` +
+/// `tools/list`. Before the principal registry, that authenticated against a
+/// session that was not in the live map yet, so it 401'd and OpenCode burned
+/// its 30s MCP startup timeout on EVERY managed spawn.
+///
+/// A reserved principal must therefore be able to DISCOVER its tool face — and
+/// nothing more, because the session it belongs to does not exist yet.
+#[tokio::test]
+async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let (app, _sid, _secret) = state_with_one_session(paths, AuthState::disabled()).await;
+    // A sid that is mid-spawn: reserved, never applied.
+    let principals = app
+        .session_principals
+        .as_ref()
+        .expect("the registry travels with the gateway")
+        .clone();
+    principals.reserve("s99", "spawning-secret", "demo", "reviewer", 0);
+    let addr = spawn_server(app).await;
+    let bearer = "ccteam-sid:s99:spawning-secret".to_string();
+
+    // Discovery: what the vendor's handshake actually needs.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "a spawning session must not be 401'd");
+    let body: Value = resp.json().await.unwrap();
+    let tools = body["result"]["tools"]
+        .as_array()
+        .expect("tools/list answers a spawning principal");
+    assert!(!tools.is_empty(), "the tool face must be discoverable");
+
+    // Authority: withheld until the session is real.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+               "params":{"name":"session_list","arguments":{}}}),
+    )
+    .await;
+    let body: Value = resp.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("still starting"),
+        "a session that does not exist yet must not be able to act: {body}"
+    );
+
+    // …and a wrong secret is still just 401, spawning or not.
+    let resp = post_mcp(
+        addr,
+        "ccteam-sid:s99:wrong",
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 401);
 }
 
 /// The full sid-bearer round-trip: session_list + session_spawn (with the slug
@@ -213,7 +304,6 @@ async fn state_with_one_session(paths: CcteamPaths, auth: AuthState) -> (AppStat
 async fn session_bearer_round_trip_list_and_spawn() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let bearer = format!("ccteam-sid:{sid}:{secret}");
@@ -275,13 +365,13 @@ async fn session_bearer_round_trip_list_and_spawn() {
 /// `ccteam:<hex>` and 401'd `ccteam-sid:...` before the handler ran — managed
 /// sessions lost their Ambient identity, their calls fell back to
 /// admin-authenticated servers, and every A2A spawn came out rootless
-/// (`parent_sid: null`). Also pins the Admin semantics: the owner front door
-/// stays a root spawn.
+/// (`parent_sid: null`). Also pins that the fallback it fell back TO is gone:
+/// the live web token — the one this very `AuthState` accepts for `/api/v1/**` —
+/// is refused here, so there is no longer a tier a lost identity can land on.
 #[tokio::test]
 async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) =
         state_with_one_session(paths, AuthState::enabled(TOKEN_HEX.into())).await;
     let addr = spawn_server(app).await;
@@ -323,7 +413,10 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     assert_eq!(spawned["delegation_depth"], 1, "got: {text}");
     assert_eq!(spawned["caller"], format!("ambient:{sid}"), "got: {text}");
 
-    // Admin front door (web token) stays a ROOT spawn — semantics unchanged.
+    // The VALID web token — the same one `AuthState::enabled` accepts on every
+    // `/api/v1` route — buys nothing here. It used to be an owner front door that
+    // spawned rootlessly into any project it named; that tier is deleted, because
+    // a credential shared by every process of a vendor cannot say who is calling.
     let resp = post_mcp(
         addr,
         &format!("ccteam:{TOKEN_HEX}"),
@@ -331,18 +424,11 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
                "params":{"name":"session_spawn","arguments":{"vendor":"claude","project":"demo"}}}),
     )
     .await;
-    assert_eq!(resp.status(), 200, "admin bearer must pass /mcp");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["result"]["isError"], false, "admin spawn: {body}");
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    let spawned: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(spawned["ok"], true);
-    assert!(
-        spawned["parent_sid"].is_null(),
-        "admin spawn stays a root spawn, got: {text}"
+    assert_eq!(
+        resp.status(),
+        401,
+        "the web-token family is not an MCP credential"
     );
-    assert_eq!(spawned["delegation_depth"], 0, "got: {text}");
-    assert_eq!(spawned["caller"], "admin", "got: {text}");
 
     // Garbage bearers of BOTH families are still rejected.
     let resp = post_mcp(
@@ -361,6 +447,50 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     assert_eq!(resp.status(), 401, "bad session bearer → 401");
 }
 
+/// The `parent_sid` declaration survives the family cull — and stays a
+/// declaration.
+///
+/// It exists for a caller that holds no per-session principal (the local
+/// `mcp.sock` fallback, where same-uid file access is already the trust
+/// boundary): it may NAME its own sid so the ledger keeps an edge that really
+/// exists, and the daemon validates that name against the live set. Kept per
+/// owner decision. What it must never become is a second identity source — a
+/// caller that DOES hold a principal is answered by the principal, so a declared
+/// parent from a session bearer is ignored rather than honoured. Otherwise any
+/// managed session could mount its children anywhere in somebody else's tree by
+/// asking.
+#[tokio::test]
+async fn a_declared_parent_sid_never_overrides_a_verified_session_principal() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
+    let addr = spawn_server(app).await;
+    let bearer = format!("ccteam-sid:{sid}:{secret}");
+
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+               "params":{"name":"session_spawn",
+                         "arguments":{"vendor":"claude","parent_sid":"s404"}}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // Not an error: the declaration is inert on this path, not rejected — the
+    // caller's verified identity simply answers the question first.
+    assert_eq!(body["result"]["isError"], false, "spawn: {body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let spawned: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        spawned["parent_sid"],
+        sid.as_str(),
+        "the verified principal is the parent, never the declared sid: {text}"
+    );
+    assert_eq!(spawned["delegation_depth"], 1, "got: {text}");
+    assert_eq!(spawned["caller"], format!("ambient:{sid}"), "got: {text}");
+}
+
 /// Deterministic fake-Codex acceptance: build the exact
 /// `thread/start.config.mcp_servers.ccteam` HTTP entry, then use its URL and
 /// Authorization header against the real `/mcp` route. This composes the
@@ -370,14 +500,13 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
 async fn codex_http_thread_config_passes_session_principal_gate() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let url = format!("http://{addr}/mcp");
 
-    let config =
-        ccteam_harness::execution::mcp_config::codex_thread_mcp_config_at(&sid, &secret, &url)
-            .expect("live session principal produces a Codex thread override");
+    let config = ccteam_harness::execution::mcp_config::SessionMcpEndpoint::at(&url, &sid, &secret)
+        .map(|ep| ccteam_harness::execution::mcp_config::project_codex_thread_config(&ep))
+        .expect("live session principal produces a Codex thread override");
     let server = &config["mcp_servers"]["ccteam"];
     assert_eq!(server["url"], url);
     assert!(server.get("command").is_none(), "Codex MCP must be HTTP");
@@ -413,7 +542,8 @@ async fn codex_http_thread_config_passes_session_principal_gate() {
 /// a per-thread session override, then asks Codex itself to call
 /// `session_spawn` through `/mcp`. The project is intentionally omitted: only
 /// a successfully authenticated session principal can derive `demo`
-/// server-side, so accidentally retaining the global admin bearer fails.
+/// server-side, so a call that rode the global entry's enrollment credential
+/// instead of the per-thread principal fails.
 ///
 /// Run explicitly on a machine with Codex 0.144.x:
 /// `cargo test -p ccteam-web --test mcp_session_bearer_test \
@@ -431,7 +561,6 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
 
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let url = format!("http://{addr}/mcp");
@@ -441,10 +570,23 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
     // thread/start fail with `url is not supported for stdio`.
     let codex_home = tmp.path().join("codex-home");
     let config_toml = codex_home.join("config.toml");
-    ccteam_core::mcp_register::install_codex_mcp_into(&config_toml, &url, TOKEN_HEX).unwrap();
+    // The global entry's IDENTITY is irrelevant here — what this test needs is
+    // that it is HTTP, so Codex's deep merge of global + per-thread tables does
+    // not reject a mixed transport. It still has to be a credential the writer
+    // accepts, so mint a throwaway enrollment one under the temp root.
+    let global_bearer = ccteam_core::enroll::mint_in(
+        tmp.path(),
+        ccteam_core::enroll::EnrollScope::User,
+        "user:web-api",
+        None,
+    )
+    .unwrap()
+    .bearer();
+    ccteam_core::mcp_register::install_codex_mcp_into(&config_toml, &url, &global_bearer).unwrap();
 
     let thread_config =
-        ccteam_harness::execution::mcp_config::codex_thread_mcp_config_at(&sid, &secret, &url)
+        ccteam_harness::execution::mcp_config::SessionMcpEndpoint::at(&url, &sid, &secret)
+            .map(|ep| ccteam_harness::execution::mcp_config::project_codex_thread_config(&ep))
             .unwrap();
     let mut child = Command::new("codex")
         .args(["app-server", "--listen", "stdio://"])
@@ -542,7 +684,6 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
 async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, _secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
 
@@ -571,7 +712,6 @@ async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
 async fn session_bearer_denied_after_stop() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    seed_web_token(&paths, TOKEN_HEX);
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let gw = app.gateway.clone().expect("gateway attached");
     let addr = spawn_server(app).await;

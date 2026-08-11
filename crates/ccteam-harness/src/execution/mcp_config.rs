@@ -1,29 +1,121 @@
-//! Curated per-session MCP config for Claude stream-json (v0.8.24 C1 / v0.9-W2).
+//! The ccteam MCP endpoint a managed session talks to: **one semantics, four
+//! vendor dialects**.
 //!
-//! Spawn writes `<project>/.ccteam/chat/<sid>/mcp.json` with **only** the
-//! ccteam MCP server, then `build_argv` passes `--mcp-config <path>`. The
-//! stream-json path also passes `--strict-mcp-config` so ambient user MCP
-//! servers are not inherited (avoids the historical self-referential init
-//! deadlock); the terminal path omits it and relies on `--mcp-config` winning
-//! the same-name merge (claude's scope order puts `--mcp-config` above user
-//! scope), keeping the user's other ambient servers.
+//! Every managed session needs exactly two facts to reach the daemon's
+//! `POST /mcp`: the **URL** and its own **principal** bearer
+//! (`ccteam-sid:<sid>:<secret>`). Those two facts are
+//! [`SessionMcpEndpoint`], resolved **once** by [`SessionMcpEndpoint::resolve`]
+//! — env override → the bind the running daemon recorded → default-bind
+//! fallback. Everything downstream is a **pure projection** into the vendor's
+//! own dialect:
 //!
-//! **One wire form: HTTP.** `type:"http"` against daemon `POST /mcp` with the
-//! session bearer `ccteam-sid:<sid>:<secret>`. This is the same transport the
-//! global per-vendor registration uses (`ccteam_core::mcp_register`, admin
-//! bearer); a managed session's config just overrides the same-named entry
-//! with its own principal. Nothing spawns a `ccteam internal mcp-serve` stdio
-//! child any more — that binary stays only as a manually-wired escape hatch.
+//! | vendor | `tool_surface` | projection |
+//! |---|---|---|
+//! | Claude | `NativeMcpConfig` | [`project_claude_mcp_json`] → `.ccteam/chat/<sid>/mcp.json` + `--mcp-config` |
+//! | Codex | `NativeMcpConfig` | [`project_codex_thread_config`] → `thread/start` `config.mcp_servers` |
+//! | Grok / OpenCode / Kimi | `NativeMcpConfig` | [`project_acp_mcp_servers`] → ACP `session/new` `mcpServers[]` |
+//! | Pi | `ManagedSessionBridge` | [`project_bridge_child_env`] → child env the ccteam bridge extension reads |
+//!
+//! **A projection never decides whether there is an endpoint.** It takes an
+//! already-resolved [`SessionMcpEndpoint`], so "did this session get a tool
+//! face?" is answered in exactly one place (the principal: empty sid/secret →
+//! `None`) instead of once per adapter. Pi's child env is a dialect like any
+//! other — it is NOT "whatever the daemon happened to inherit"; a bridge
+//! vendor that inherits its endpoint from the parent process breaks on a
+//! healthy default daemon, because `ccteam start` exports nothing.
+//!
+//! **One wire form: HTTP.** `type:"http"` against daemon `POST /mcp`. This is
+//! the same transport the global per-vendor registration uses
+//! (`ccteam_core::mcp_register`), but never the same credential: a vendor's
+//! global config is one static file shared by every process that vendor starts,
+//! so it carries only a machine-user ENROLLMENT credential (`ccteam_core::enroll`)
+//! that says whose config it is and grants nothing by itself. A managed session
+//! aims to override that same-named entry with its own `(sid, secret)`
+//! principal, which is the only credential that says WHICH session is calling.
+//! There is no stdio transport at all any more — the `internal mcp-serve`
+//! command that hosted it is deleted, so nothing can fall back to a per-session
+//! child process.
+//!
+//! ## Whether the override WINS is the vendor's call, and one door is open
+//!
+//! Both entries are named `ccteam` — they must be, because the server name is
+//! the tool-name prefix every agent-facing contract is written against
+//! (`mcp__ccteam__*`; grok's own `ccteam__session_list`). So on every dialect
+//! the projection below is a same-name collision with the machine credential,
+//! and who wins is decided by the vendor, not by ccteam:
+//!
+//! | dialect | what makes the session principal win |
+//! |---|---|
+//! | Claude stream-json | **enforced** — `--strict-mcp-config` means the curated file is the ONLY source (also avoids the historical self-referential init deadlock) |
+//! | Claude terminal | `--mcp-config` wins the same-name merge, keeping the user's other ambient servers |
+//! | Codex | per-thread `config.mcp_servers` deep-merges over the global entry; real-machine verified (0.144.3) |
+//! | Grok / OpenCode / Kimi (ACP) | **nothing** — see below |
+//! | Pi (bridge) | the child env IS the only source; there is no global pi config to collide with |
+//!
+//! **The ACP door is open, and no vendor lever closes it.** `session/new`'s
+//! `mcpServers[]` is the only thing carrying a session's principal on that
+//! path, and there is no ACP analogue of `--strict-mcp-config`. Measured on
+//! this machine (2026-08-10) against grok 1.0.0: a managed grok session's
+//! `tools/call` authenticated as the machine ENROLLMENT credential, grok's own
+//! session log showing exactly one `ccteam` server with `source:"local"`
+//! (`~/.grok/config.toml`) — i.e. the injected entry lost. Everything that
+//! could plausibly close it was checked and does not: `grok`/`grok agent`/
+//! `grok mcp --help` and grok's bundled `07-mcp-servers.md` have no strict flag;
+//! `GROK_{CLAUDE,CURSOR,CODEX}_MCPS_ENABLED` / `[compat.*] mcps` only turn off
+//! COMPAT sources (`~/.claude.json`, `~/.cursor/mcp.json`, `.mcp.json`), never
+//! grok's own `[mcp_servers]`; `disabled_mcp_servers` and
+//! `[mcp_servers.<n>].enabled=false` are persistent user-config writes that
+//! would disarm a hand-started grok too (and are outside ccteam's vendor-config
+//! footprint); `mcpInheritance` is subagent-scoped; and `--plugin-dir` — the
+//! lever v0.9.13 used to SHADOW ambient plugin MCP servers — was measured
+//! LOSING this collision to `config.toml`, so that precedent does not transfer.
+//! OpenCode and Kimi share this projection and have no lever either, though
+//! both vendors' own merge code takes the caller's entry on a same-name key
+//! (kimi `mergeCallerMcpServers`, opencode `MCP.add` replacing + closing the
+//! previous client), so they are believed unaffected — UNVERIFIED at runtime.
+//!
+//! Because no vendor lever closes the door, ccteam stopped fighting on the
+//! vendor's terrain: **the daemon wins server-side, by provenance**. Every ACP
+//! spawn records its child pid ([`super::vendor_pids`], via
+//! `AcpTransport::spawn_for_session`, BEFORE the first handshake byte), and
+//! `POST /mcp` resolves a loopback peer carrying the machine enrollment
+//! credential back to the managed session whose process subtree it belongs to
+//! — then serves it as that session's own principal. Whichever `ccteam` entry
+//! the vendor loaded, the identity is the session's. The projection below
+//! still OFFERS the principal (a vendor that honours it needs no provenance),
+//! and the outcome is still measured per session
+//! (`ccteam_im::gateway::Gateway::assert_principal_reached_the_session` — a
+//! provenance attach records first use too, so the warning only fires when
+//! BOTH the credential and provenance failed to reach the session, e.g. a
+//! non-linux host). Renaming the server would also have closed the door and is
+//! deliberately rejected: it would churn every `mcp__ccteam__*` tool name.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use super::fs_atomic::atomic_write_durable;
 use super::turns_mirror::chat_dir;
 
 /// Filename under `.ccteam/chat/<sid>/`.
 pub const MCP_CONFIG_FILENAME: &str = "mcp.json";
+
+/// Filename under `~/.ccteam/run/` where a starting daemon records the MCP URL
+/// its own web bind resolves to.
+pub const DAEMON_MCP_URL_FILE: &str = "mcp-url";
+
+/// Last-resort daemon MCP URL, matching `daemon_cli::DEFAULT_WEB_BIND`'s port.
+/// Only correct when the daemon runs on the default bind — every production
+/// path goes through [`resolve_mcp_http_url`], which also honours the bind the
+/// running daemon actually recorded.
+pub const FALLBACK_MCP_HTTP_URL: &str = "http://127.0.0.1:7331/mcp";
+
+/// Child-env keys of the `ManagedSessionBridge` dialect (see
+/// [`project_bridge_child_env`]). The ccteam bridge extension hard-fails on
+/// load when either is missing, so both are mandatory, never best-effort.
+pub const BRIDGE_MCP_URL_ENV: &str = "CCTEAM_MCP_HTTP_URL";
+pub const BRIDGE_MCP_BEARER_ENV: &str = "CCTEAM_MCP_BEARER";
 
 /// Resolve the path for a session's curated mcp config.
 pub fn session_mcp_config_path(project_dir: &Path, sid: &str) -> PathBuf {
@@ -35,17 +127,14 @@ pub fn session_mcp_bearer(sid: &str, secret: &str) -> String {
     format!("ccteam-sid:{sid}:{secret}")
 }
 
-/// Last-resort daemon MCP URL, matching `daemon_cli::DEFAULT_WEB_BIND`'s port.
-/// Only correct when the daemon runs on the default bind — prefer
-/// `ccteam_core::mcp_register::resolve_mcp_http_url`, which also honours the
-/// bind the running daemon actually recorded.
-pub const FALLBACK_MCP_HTTP_URL: &str = "http://127.0.0.1:7331/mcp";
+// =====================================================================
+// Resolution — ONE chain, shared by managed spawn and global registration
+// =====================================================================
 
 /// Explicit operator override of the daemon MCP URL, if any:
 /// `CCTEAM_MCP_HTTP_URL` (full URL) or `CCTEAM_WEB_URL` (base + `/mcp`).
-/// `None` when neither is set — the caller decides what to fall back to.
-pub fn mcp_http_url_from_env() -> Option<String> {
-    if let Ok(u) = std::env::var("CCTEAM_MCP_HTTP_URL") {
+fn mcp_http_url_from_env() -> Option<String> {
+    if let Ok(u) = std::env::var(BRIDGE_MCP_URL_ENV) {
         let t = u.trim();
         if !t.is_empty() {
             return Some(t.to_string());
@@ -60,86 +149,157 @@ pub fn mcp_http_url_from_env() -> Option<String> {
     None
 }
 
-/// Default daemon MCP HTTP URL: operator override, else the default-bind
-/// fallback. Used where no `CcteamPaths` is in scope (session spawn, whose
-/// config the daemon itself writes).
-pub fn default_mcp_http_url() -> String {
-    mcp_http_url_from_env().unwrap_or_else(|| FALLBACK_MCP_HTTP_URL.to_string())
+/// Record the MCP URL implied by the daemon's actual web bind, so every reader
+/// — managed session spawn, out-of-band registration (`ccteam config mcp`,
+/// doctor), the hosts page — targets the port the daemon really listens on
+/// instead of guessing the default.
+///
+/// Called at daemon start, before auto-registration. Best-effort by contract:
+/// the caller logs and continues, since a stale/missing record only costs the
+/// default guess. A non-parsing bind is `Ok(())` with nothing written — the
+/// startup path reports that error properly a few lines later.
+pub fn record_daemon_mcp_url(run_dir: &Path, web_bind: &str) -> Result<()> {
+    let Some(url) = mcp_url_from_bind(web_bind) else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    atomic_write_durable(&run_dir.join(DAEMON_MCP_URL_FILE), url.as_bytes())
 }
 
-/// Inputs for a curated session MCP config.
-#[derive(Debug, Clone)]
-pub struct CuratedMcpInput<'a> {
-    pub sid: &'a str,
-    pub secret: &'a str,
-    /// Full MCP HTTP URL. `None` / empty → [`default_mcp_http_url`].
-    pub http_url: Option<&'a str>,
+/// Resolve the daemon MCP URL: explicit operator override
+/// (`CCTEAM_MCP_HTTP_URL` / `CCTEAM_WEB_URL`) → the running daemon's recorded
+/// bind → the default-bind fallback.
+///
+/// This is what makes both an HTTP registration and a managed session correct
+/// on a non-default `--web-bind`. The old stdio entry was port-agnostic (the
+/// child dialled the unix socket), so without this the move to HTTP would break
+/// exactly the users who bind somewhere else.
+pub fn resolve_mcp_http_url(run_dir: &Path) -> String {
+    if let Some(url) = mcp_http_url_from_env() {
+        return url;
+    }
+    if let Ok(body) = std::fs::read_to_string(run_dir.join(DAEMON_MCP_URL_FILE)) {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    FALLBACK_MCP_HTTP_URL.to_string()
 }
 
-/// Build the JSON body for `--mcp-config` (object with `mcpServers`).
-pub fn build_curated_mcp_json(input: &CuratedMcpInput<'_>) -> Value {
-    let url = input
-        .http_url
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(default_mcp_http_url);
-    let bearer = session_mcp_bearer(input.sid, input.secret);
+/// `<ccteam root>/run` — where the daemon records its bind. `None` only when
+/// neither `CCTEAM_HOME` nor a home directory can be resolved.
+pub fn daemon_run_dir() -> Option<PathBuf> {
+    crate::adapter::ccteam_root_from_env().map(|root| root.join("run"))
+}
+
+/// [`resolve_mcp_http_url`] against the ambient ccteam root. Used where no
+/// explicit run dir is in scope — i.e. session spawn, which the daemon itself
+/// performs. Prefer the `run_dir`-taking form when the caller already holds
+/// `CcteamPaths`.
+pub fn daemon_mcp_http_url() -> String {
+    match daemon_run_dir() {
+        Some(run_dir) => resolve_mcp_http_url(&run_dir),
+        None => mcp_http_url_from_env().unwrap_or_else(|| FALLBACK_MCP_HTTP_URL.to_string()),
+    }
+}
+
+/// `<bind>` → the loopback URL a vendor on this host should dial. A wildcard
+/// bind (`0.0.0.0` / `[::]`) is not a destination, so it maps to loopback on the
+/// same port; a concrete address is kept as-is. `None` when unparseable.
+fn mcp_url_from_bind(web_bind: &str) -> Option<String> {
+    let addr: std::net::SocketAddr = web_bind.trim().parse().ok()?;
+    let port = addr.port();
+    if addr.ip().is_unspecified() {
+        return Some(format!("http://127.0.0.1:{port}/mcp"));
+    }
+    Some(match addr.ip() {
+        std::net::IpAddr::V4(v4) => format!("http://{v4}:{port}/mcp"),
+        std::net::IpAddr::V6(v6) => format!("http://[{v6}]:{port}/mcp"),
+    })
+}
+
+// =====================================================================
+// The single semantic type
+// =====================================================================
+
+/// What a managed session needs to reach the ccteam MCP face, independent of
+/// any vendor dialect. Both fields are non-empty by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMcpEndpoint {
+    url: String,
+    bearer: String,
+}
+
+impl SessionMcpEndpoint {
+    /// Endpoint at an EXPLICIT url. `None` when the session has no principal
+    /// (empty sid/secret) or the url is blank — a session without a principal
+    /// gets no tool face rather than an unauthenticated one.
+    ///
+    /// Used by the satellite path, whose url is the
+    /// [`crate::execution::remote_exec::ExecSpec::DAEMON_URL_TOKEN`]
+    /// placeholder the satellite substitutes on arrival, and by tests that pin
+    /// a port.
+    pub fn at(url: &str, sid: &str, secret: &str) -> Option<Self> {
+        let url = url.trim();
+        if url.is_empty() || sid.is_empty() || secret.is_empty() {
+            return None;
+        }
+        Some(Self {
+            url: url.to_string(),
+            bearer: session_mcp_bearer(sid, secret),
+        })
+    }
+
+    /// Endpoint for a session spawned by a daemon whose run dir is known.
+    pub fn resolve_in(run_dir: &Path, sid: &str, secret: &str) -> Option<Self> {
+        Self::at(&resolve_mcp_http_url(run_dir), sid, secret)
+    }
+
+    /// Endpoint for a session spawned by THIS daemon — the production entry
+    /// point for every adapter.
+    pub fn resolve(sid: &str, secret: &str) -> Option<Self> {
+        Self::at(&daemon_mcp_http_url(), sid, secret)
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn bearer(&self) -> &str {
+        &self.bearer
+    }
+
+    fn authorization(&self) -> String {
+        format!("Bearer {}", self.bearer)
+    }
+}
+
+/// The name every dialect registers ccteam's MCP server under. It is what a
+/// vendor calls the server back by — Claude's `mcp_reconnect` control request
+/// takes exactly this string — so the projections below and any code that asks
+/// a vendor about its ccteam tool face read it from one place.
+/// `session_mcp_projections_use_the_shared_server_name` holds the `json!`
+/// literals (macro object keys must be literals) to this constant.
+pub const CCTEAM_MCP_SERVER_NAME: &str = "ccteam";
+
+// =====================================================================
+// Dialect projections — pure functions of the endpoint
+// =====================================================================
+
+/// Claude `--mcp-config` body (object with `mcpServers`).
+pub fn project_claude_mcp_json(ep: &SessionMcpEndpoint) -> Value {
     json!({
         "mcpServers": {
             "ccteam": {
                 "type": "http",
-                "url": url,
+                "url": ep.url(),
                 "headers": {
-                    "Authorization": format!("Bearer {bearer}"),
+                    "Authorization": ep.authorization(),
                 }
             }
         }
     })
-}
-
-/// Write curated mcp.json under the session chat dir. Returns the path.
-pub fn write_session_mcp_config(
-    project_dir: &Path,
-    input: &CuratedMcpInput<'_>,
-) -> Result<PathBuf> {
-    let path = session_mcp_config_path(project_dir, input.sid);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let body = serde_json::to_string_pretty(&build_curated_mcp_json(input))?;
-    // Atomic-ish: write tmp then rename (same dir).
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
-    Ok(path)
-}
-
-/// Best-effort ACP `mcpServers` array entry (the ccteam MCP over HTTP),
-/// **shared by both ACP vendors** (OpenCode + Grok) on `session/new`,
-/// `session/resume`, and `session/load`. Empty vec when sid/secret missing
-/// (caller still gets a valid session, just without the in-agent tool face).
-///
-/// ACP (OpenCode 1.17.x / Grok 0.2.x) validates MCP entries strictly:
-/// `headers` must be an **array** of `{name, value}` (not a map). Wrong shape
-/// → jsonrpc -32602 Invalid params on `session/new` (smoke 2026-07-11).
-pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
-    if sid.is_empty() || secret.is_empty() {
-        return Vec::new();
-    }
-    let url = default_mcp_http_url();
-    let bearer = session_mcp_bearer(sid, secret);
-    vec![json!({
-        "name": "ccteam",
-        "type": "http",
-        "url": url,
-        "headers": [
-            {
-                "name": "Authorization",
-                "value": format!("Bearer {bearer}"),
-            }
-        ]
-    })]
 }
 
 /// Codex `thread/start` / `thread/resume` `config` override injecting the
@@ -150,51 +310,124 @@ pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
 /// The global Codex entry must also be HTTP. Codex deep-merges a per-thread
 /// server override with the same-named global entry; a legacy global stdio
 /// `command` plus this `url` is rejected as a mixed transport. With both sides
-/// HTTP, the per-thread Authorization value replaces the global admin bearer
-/// and carries this session's `(sid, secret)` principal directly to `/mcp`.
-/// No per-thread `ccteam internal mcp-serve` child is spawned.
-///
-/// `None` when sid/secret is empty (fall through to the daemon's global HTTP
-/// config, authenticated as admin) — never an empty override that strips tools.
-pub fn codex_thread_mcp_config(sid: &str, secret: &str) -> Option<Value> {
-    let url = default_mcp_http_url();
-    codex_thread_mcp_config_at(sid, secret, &url)
-}
-
-/// Explicit-URL seam for deterministic integration tests and non-default
-/// daemon binds. Production callers normally use [`codex_thread_mcp_config`].
-pub fn codex_thread_mcp_config_at(sid: &str, secret: &str, http_url: &str) -> Option<Value> {
-    if sid.is_empty() || secret.is_empty() {
-        return None;
-    }
-    let url = http_url.trim();
-    if url.is_empty() {
-        return None;
-    }
-    let bearer = session_mcp_bearer(sid, secret);
-    Some(json!({
+/// HTTP, the per-thread Authorization value replaces the global entry's
+/// enrollment credential (which names only whose machine-user config it is) and
+/// carries this session's `(sid, secret)` principal directly to `/mcp` — the
+/// difference between "some process of this user" and "this session". No
+/// per-thread child process is spawned; there is no stdio server to spawn one of.
+pub fn project_codex_thread_config(ep: &SessionMcpEndpoint) -> Value {
+    json!({
         "mcp_servers": {
             "ccteam": {
-                "url": url,
+                "url": ep.url(),
                 "http_headers": {
-                    "Authorization": format!("Bearer {bearer}"),
+                    "Authorization": ep.authorization(),
                 },
             }
         }
-    }))
+    })
+}
+
+/// ACP `mcpServers` array entry, **shared by all three ACP vendors** (Grok +
+/// OpenCode + Kimi) on `session/new`, `session/resume`, and `session/load`.
+///
+/// ACP (OpenCode 1.17.x / Grok 0.2.x) validates MCP entries strictly:
+/// `headers` must be an **array** of `{name, value}` (not a map). Wrong shape
+/// → jsonrpc -32602 Invalid params on `session/new` (smoke 2026-07-11).
+///
+/// This entry is the ONLY carrier of a session's principal on the ACP path,
+/// and the vendor decides whether it beats the same-named machine-credential
+/// entry in its own global config — see the module doc's "the ACP door is
+/// open" section. One projection, so a fourth ACP vendor inherits exactly one
+/// known-open door rather than adding a new one.
+pub fn project_acp_mcp_servers(ep: &SessionMcpEndpoint) -> Vec<Value> {
+    vec![json!({
+        "name": "ccteam",
+        "type": "http",
+        "url": ep.url(),
+        "headers": [
+            {
+                "name": "Authorization",
+                "value": ep.authorization(),
+            }
+        ]
+    })]
+}
+
+/// `ManagedSessionBridge` dialect: the child env the ccteam-owned bridge
+/// extension reads at load time. A bridge vendor has no native MCP config
+/// surface, so these two keys ARE its `mcp.json` — mandatory, resolved from the
+/// same endpoint as every other vendor, never inherited from the parent
+/// process.
+pub fn project_bridge_child_env(ep: &SessionMcpEndpoint) -> Vec<(String, String)> {
+    vec![
+        (BRIDGE_MCP_URL_ENV.to_string(), ep.url().to_string()),
+        (BRIDGE_MCP_BEARER_ENV.to_string(), ep.bearer().to_string()),
+    ]
+}
+
+// =====================================================================
+// Adapter-facing composites (resolve + project)
+// =====================================================================
+
+/// Write the Claude dialect under the session chat dir. Returns the path.
+pub fn write_session_mcp_config(
+    project_dir: &Path,
+    sid: &str,
+    ep: &SessionMcpEndpoint,
+) -> Result<PathBuf> {
+    let path = session_mcp_config_path(project_dir, sid);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(&project_claude_mcp_json(ep))?;
+    // Atomic-ish: write tmp then rename (same dir).
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+    Ok(path)
+}
+
+/// ACP `mcpServers` for this session. Empty vec when sid/secret is missing
+/// (caller still gets a valid session, just without the in-agent tool face).
+///
+/// Non-empty here means "the principal was OFFERED", never "the principal is
+/// what the session calls with" — the vendor still owns the same-name
+/// collision. The daemon measures the difference
+/// (`assert_principal_reached_the_session`); see the module doc.
+pub fn acp_mcp_servers_http(sid: &str, secret: &str) -> Vec<Value> {
+    SessionMcpEndpoint::resolve(sid, secret)
+        .map(|ep| project_acp_mcp_servers(&ep))
+        .unwrap_or_default()
+}
+
+/// Codex per-thread `config` for this session. `None` when sid/secret is empty
+/// — fall through to the daemon's global HTTP config, i.e. served as an enrolled
+/// client of this machine-user rather than as this session — never an empty
+/// override that strips tools.
+pub fn codex_thread_mcp_config(sid: &str, secret: &str) -> Option<Value> {
+    SessionMcpEndpoint::resolve(sid, secret).map(|ep| project_codex_thread_config(&ep))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ep(url: &str, sid: &str, secret: &str) -> SessionMcpEndpoint {
+        SessionMcpEndpoint::at(url, sid, secret).expect("non-empty principal + url")
+    }
+
+    #[test]
+    fn endpoint_requires_a_principal_and_a_url() {
+        assert!(SessionMcpEndpoint::at("http://127.0.0.1:7331/mcp", "s1", "sek").is_some());
+        assert!(SessionMcpEndpoint::at("http://127.0.0.1:7331/mcp", "", "sek").is_none());
+        assert!(SessionMcpEndpoint::at("http://127.0.0.1:7331/mcp", "s1", "").is_none());
+        assert!(SessionMcpEndpoint::at("  ", "s1", "sek").is_none());
+    }
+
     #[test]
     fn http_form_has_type_url_and_session_bearer() {
-        let v = build_curated_mcp_json(&CuratedMcpInput {
-            sid: "s3",
-            secret: "sekret",
-            http_url: Some("http://127.0.0.1:7331/mcp"),
-        });
+        let v = project_claude_mcp_json(&ep("http://127.0.0.1:7331/mcp", "s3", "sekret"));
         let srv = &v["mcpServers"]["ccteam"];
         assert_eq!(srv["type"], "http");
         assert_eq!(srv["url"], "http://127.0.0.1:7331/mcp");
@@ -204,36 +437,45 @@ mod tests {
         );
     }
 
+    /// The projections' `json!` object keys must be literals, so this holds
+    /// all four of them to [`CCTEAM_MCP_SERVER_NAME`] — the string a vendor is
+    /// asked to reconnect BY (Claude's `mcp_reconnect{serverName}`). If a
+    /// dialect ever renamed its entry, the rebuild would silently target a
+    /// server that does not exist.
+    #[test]
+    fn session_mcp_projections_use_the_shared_server_name() {
+        let ep = ep("http://127.0.0.1:7331/mcp", "s1", "abc");
+        assert!(project_claude_mcp_json(&ep)["mcpServers"][CCTEAM_MCP_SERVER_NAME].is_object());
+        assert!(
+            project_codex_thread_config(&ep)["mcp_servers"][CCTEAM_MCP_SERVER_NAME].is_object()
+        );
+        let acp = project_acp_mcp_servers(&ep);
+        assert_eq!(acp[0]["name"], CCTEAM_MCP_SERVER_NAME);
+        let env = project_bridge_child_env(&ep);
+        assert!(
+            env.iter().any(|(k, _)| k == BRIDGE_MCP_URL_ENV),
+            "bridge dialect must still deliver the url: {env:?}"
+        );
+    }
+
     #[test]
     fn curated_config_never_emits_a_stdio_child() {
         // One wire form. A stdio `command`/`args`/`env` entry would re-open the
         // self-referential init path the HTTP move closed.
-        let v = build_curated_mcp_json(&CuratedMcpInput {
-            sid: "s1",
-            secret: "abc",
-            http_url: None,
-        });
+        let v = project_claude_mcp_json(&ep("http://127.0.0.1:7331/mcp", "s1", "abc"));
         let srv = &v["mcpServers"]["ccteam"];
         assert_eq!(srv["type"], "http");
         assert!(srv.get("command").is_none());
         assert!(srv.get("args").is_none());
         assert!(srv.get("env").is_none());
-        // Empty/absent url falls back to the daemon default, never to stdio.
-        assert!(srv["url"].as_str().is_some_and(|u| u.ends_with("/mcp")));
     }
 
     #[test]
     fn write_session_mcp_config_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_session_mcp_config(
-            tmp.path(),
-            &CuratedMcpInput {
-                sid: "s9",
-                secret: "x",
-                http_url: Some("http://127.0.0.1:9/mcp"),
-            },
-        )
-        .unwrap();
+        let path =
+            write_session_mcp_config(tmp.path(), "s9", &ep("http://127.0.0.1:9/mcp", "s9", "x"))
+                .unwrap();
         assert!(path.exists());
         assert!(path.ends_with("mcp.json"));
         let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -247,21 +489,21 @@ mod tests {
 
     #[test]
     fn acp_mcp_headers_are_name_value_array() {
-        let v = acp_mcp_servers_http("s3", "sekret");
+        let v = project_acp_mcp_servers(&ep("http://127.0.0.1:7331/mcp", "s3", "sekret"));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0]["name"], "ccteam");
         assert_eq!(v[0]["type"], "http");
         assert!(v[0]["headers"].is_array(), "ACP requires headers[]");
         assert_eq!(v[0]["headers"][0]["name"], "Authorization");
         assert_eq!(v[0]["headers"][0]["value"], "Bearer ccteam-sid:s3:sekret");
+        // No principal → no tool face (composite, not the projection).
         assert!(acp_mcp_servers_http("", "x").is_empty());
         assert!(acp_mcp_servers_http("s1", "").is_empty());
     }
 
     #[test]
     fn codex_thread_config_snake_case_http_with_session_bearer() {
-        let v = codex_thread_mcp_config_at("s7", "sek", "http://127.0.0.1:7331/mcp")
-            .expect("non-empty principal -> Some config");
+        let v = project_codex_thread_config(&ep("http://127.0.0.1:7331/mcp", "s7", "sek"));
         // Codex config.toml schema: snake_case `mcp_servers`, HTTP fields are
         // `url` + `http_headers` (not Claude's `type` + `headers`).
         let srv = &v["mcp_servers"]["ccteam"];
@@ -273,9 +515,85 @@ mod tests {
         assert!(srv.get("command").is_none());
         assert!(srv.get("args").is_none());
         assert!(srv.get("env").is_none());
-        // Empty secret / sid / URL -> None (global HTTP config remains).
-        assert!(codex_thread_mcp_config_at("s7", "", "http://localhost/mcp").is_none());
-        assert!(codex_thread_mcp_config_at("", "sek", "http://localhost/mcp").is_none());
-        assert!(codex_thread_mcp_config_at("s7", "sek", " ").is_none());
+        // Empty secret / sid -> None (global HTTP config remains).
+        assert!(codex_thread_mcp_config("s7", "").is_none());
+        assert!(codex_thread_mcp_config("", "sek").is_none());
+    }
+
+    #[test]
+    fn bridge_env_carries_the_same_endpoint_as_every_other_dialect() {
+        let endpoint = ep("http://127.0.0.1:9100/mcp", "s5", "sek");
+        let env = project_bridge_child_env(&endpoint);
+        let get = |key: &str| {
+            env.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default()
+        };
+        assert_eq!(get(BRIDGE_MCP_URL_ENV), "http://127.0.0.1:9100/mcp");
+        assert_eq!(get(BRIDGE_MCP_BEARER_ENV), "ccteam-sid:s5:sek");
+        // Same url the native dialects carry — the bridge is a dialect, not a
+        // second endpoint.
+        assert_eq!(
+            project_claude_mcp_json(&endpoint)["mcpServers"]["ccteam"]["url"],
+            get(BRIDGE_MCP_URL_ENV)
+        );
+    }
+
+    #[test]
+    fn mcp_url_from_bind_maps_wildcard_to_loopback_and_keeps_concrete() {
+        // A wildcard bind is not a destination — a vendor on this host must
+        // dial loopback on the SAME port (the whole point: non-default ports).
+        assert_eq!(
+            mcp_url_from_bind("0.0.0.0:8080").as_deref(),
+            Some("http://127.0.0.1:8080/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("[::]:9000").as_deref(),
+            Some("http://127.0.0.1:9000/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("127.0.0.1:9099").as_deref(),
+            Some("http://127.0.0.1:9099/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("192.168.1.5:7331").as_deref(),
+            Some("http://192.168.1.5:7331/mcp")
+        );
+        assert_eq!(
+            mcp_url_from_bind("[::1]:7331").as_deref(),
+            Some("http://[::1]:7331/mcp")
+        );
+        // Unparseable → None, so startup writes nothing and reports the bind
+        // error through its own path.
+        assert!(mcp_url_from_bind("not-an-addr").is_none());
+        assert!(mcp_url_from_bind("").is_none());
+    }
+
+    /// The chain that used to be split in two: managed spawn read env-only
+    /// while global registration read the recorded bind, so a non-default
+    /// `--web-bind` gave a correct global config and a session pointing at
+    /// 7331. One chain now serves both.
+    #[test]
+    fn resolve_prefers_recorded_bind_over_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        // Nothing recorded yet → default-bind fallback.
+        assert_eq!(resolve_mcp_http_url(&run_dir), FALLBACK_MCP_HTTP_URL);
+        // A daemon on a custom port records it; every reader follows.
+        record_daemon_mcp_url(&run_dir, "0.0.0.0:8080").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:8080/mcp");
+        assert_eq!(
+            SessionMcpEndpoint::resolve_in(&run_dir, "s1", "sek")
+                .unwrap()
+                .url(),
+            "http://127.0.0.1:8080/mcp"
+        );
+        // Re-record on restart (idempotent, last write wins).
+        record_daemon_mcp_url(&run_dir, "0.0.0.0:9100").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
+        // An unparseable bind leaves the previous record intact.
+        record_daemon_mcp_url(&run_dir, "bogus").unwrap();
+        assert_eq!(resolve_mcp_http_url(&run_dir), "http://127.0.0.1:9100/mcp");
     }
 }

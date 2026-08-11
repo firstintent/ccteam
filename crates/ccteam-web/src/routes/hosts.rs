@@ -522,10 +522,11 @@ pub(crate) async fn handle_register_mcp(
         }
     };
 
-    let token_path = app.paths.web_token_path();
-    let mcp_http_url = ccteam_core::mcp_register::resolve_mcp_http_url(&app.paths.root.join("run"));
+    let paths = app.paths.clone();
+    let mcp_http_url =
+        ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&app.paths.root.join("run"));
     let result = tokio::task::spawn_blocking(move || {
-        register_mcp_blocking(want.as_deref(), &token_path, &mcp_http_url)
+        register_mcp_blocking(want.as_deref(), &paths, &mcp_http_url)
     })
     .await;
     match result {
@@ -555,43 +556,50 @@ pub(crate) async fn handle_register_mcp(
 
 /// Do the (blocking) MCP registration for the requested vendor(s). Returns a
 /// `vendor → written-config-path` map. `want = None` registers every vendor.
+///
+/// The bearer is the machine-user ENROLLMENT credential, resolved once for the
+/// whole batch. A vendor's global config is shared by every process that vendor
+/// ever starts, so it must not carry the admin web token: that made every
+/// hand-started agent the same caller, which is why their children mounted as
+/// roots. `ensure_user_credential` is idempotent, so re-registering does not
+/// invalidate the configs already written.
 fn register_mcp_blocking(
     want: Option<&str>,
-    admin_token_path: &std::path::Path,
+    paths: &ccteam_core::CcteamPaths,
     mcp_http_url: &str,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     let mut written = std::collections::BTreeMap::new();
     let do_vendor = |v: &str| want.is_none() || want == Some(v);
+    let bearer = ccteam_core::enroll::ensure_user_credential(
+        paths,
+        &ccteam_core::identity::owner_tag(ccteam_core::identity::ADMIN_WEB_ID, true),
+    )?
+    .bearer();
 
     if do_vendor("claude") {
-        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::projects::resolve_claude_json_path()?;
-        ccteam_core::mcp_register::install_mcp_into(&path, mcp_http_url, &admin_token)?;
+        ccteam_core::mcp_register::install_mcp_into(&path, mcp_http_url, &bearer)?;
         written.insert("claude".to_string(), path.display().to_string());
     }
     if do_vendor("codex") {
-        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::mcp_register::resolve_codex_config_path()?;
-        ccteam_core::mcp_register::install_codex_mcp_into(&path, mcp_http_url, &admin_token)?;
+        ccteam_core::mcp_register::install_codex_mcp_into(&path, mcp_http_url, &bearer)?;
         written.insert("codex".to_string(), path.display().to_string());
     }
     // v0.9.3 vendor symmetry — any vendor's main session can orchestrate.
     if do_vendor("grok") {
-        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::mcp_register::resolve_grok_config_path()?;
-        ccteam_core::mcp_register::install_grok_mcp_into(&path, mcp_http_url, &admin_token)?;
+        ccteam_core::mcp_register::install_grok_mcp_into(&path, mcp_http_url, &bearer)?;
         written.insert("grok".to_string(), path.display().to_string());
     }
     if do_vendor("opencode") {
-        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::mcp_register::resolve_opencode_config_path()?;
-        ccteam_core::mcp_register::install_opencode_mcp_into(&path, mcp_http_url, &admin_token)?;
+        ccteam_core::mcp_register::install_opencode_mcp_into(&path, mcp_http_url, &bearer)?;
         written.insert("opencode".to_string(), path.display().to_string());
     }
     if do_vendor("kimi") {
-        let admin_token = crate::token::generate_or_load_token(admin_token_path)?;
         let path = ccteam_core::mcp_register::resolve_kimi_config_path()?;
-        ccteam_core::mcp_register::install_kimi_mcp_into(&path, mcp_http_url, &admin_token)?;
+        ccteam_core::mcp_register::install_kimi_mcp_into(&path, mcp_http_url, &bearer)?;
         written.insert("kimi".to_string(), path.display().to_string());
     }
     Ok(written)

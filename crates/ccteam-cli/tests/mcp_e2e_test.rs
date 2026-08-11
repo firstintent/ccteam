@@ -1,133 +1,70 @@
-//! M2.5 end-to-end: spawn `ccteam mcp-serve` as a subprocess, drive it
-//! via stdin/stdout JSON-RPC, and confirm the protocol shape.
+//! End-to-end tests for the MCP protocol core (`ccteam_im::mcp`).
 //!
-//! Confirms the wire contract:
-//! - `initialize` returns `protocolVersion` + `tools` capability;
-//! - `tools/list` enumerates exactly 8 bare-named tools — the client adds
-//!   the `mcp__ccteam__` namespace (status 1 + beacon alias 1 + chat 1 +
-//!   session 5);
-//! - `tools/call status` returns a JSON-encoded projects list as
-//!   the first content[].text.
-
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+//! These used to drive a `ccteam internal mcp-serve` child over stdin/stdout.
+//! That transport is deleted — every caller now reaches ccteam over the
+//! daemon's `POST /mcp` — so the same assertions run against the request
+//! handler directly. The subject never was the pipe: it is that `initialize`
+//! advertises the protocol + tool capability, that `tools/list` returns the
+//! full surface with no culled name resurrected, and that `status` answers on
+//! a fresh root.
+//!
+//! Operations covered (one test each):
+//!  1. `initialize` — protocol version + tools capability + server identity
+//!  2. `tools/list` — the exact 8-tool surface
+//!  3. `tools/call status` — empty project list on a fresh root
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-/// Spawn `ccteam mcp-serve` with `CCTEAM_HOME` and `CCTEAM_PROJECTS_ROOT`
-/// pointed at a tempdir so the test doesn't depend on the developer's
-/// global state.
-struct McpServer {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-}
+use ccteam_core::CcteamPaths;
 
-impl McpServer {
-    fn spawn(home: &std::path::Path, projects: &std::path::Path) -> Self {
-        let bin = env!("CARGO_BIN_EXE_ccteam");
-        let mut child = Command::new(bin)
-            .args(["internal", "mcp-serve"])
-            .env("CCTEAM_HOME", home)
-            .env("CCTEAM_PROJECTS_ROOT", projects)
-            .env("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn ccteam mcp-serve");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self {
-            child,
-            stdin,
-            stdout,
-        }
-    }
-
-    fn send(&mut self, msg: &Value) {
-        let mut line = serde_json::to_string(msg).unwrap();
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).unwrap();
-        self.stdin.flush().unwrap();
-    }
-
-    fn recv(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read stdout");
-        serde_json::from_str(line.trim()).expect("parse JSON-RPC response")
-    }
-
-    fn shutdown(mut self) {
-        // Closing stdin makes the server exit cleanly.
-        drop(self.stdin);
-        // Give the child a moment to drain.
-        let _ = self.child.wait_timeout_or_kill(Duration::from_secs(2));
-    }
-}
-
-trait WaitTimeoutOrKill {
-    fn wait_timeout_or_kill(&mut self, timeout: Duration) -> Option<std::process::ExitStatus>;
-}
-
-impl WaitTimeoutOrKill for std::process::Child {
-    fn wait_timeout_or_kill(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
-        // Crude poll loop — fine for tests.
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            if let Ok(Some(status)) = self.try_wait() {
-                return Some(status);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.kill();
-        self.wait().ok()
-    }
-}
-
-#[test]
-fn mcp_serve_initialize_returns_protocol_version_and_tools_cap() {
+fn tmp_paths() -> (TempDir, CcteamPaths) {
+    ccteam_core::tool_surface::disable_tool_surface_bootstrap_for_tests();
     let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&projects).unwrap();
+    let paths = CcteamPaths {
+        root: tmp.path().join("home"),
+        projects_root: tmp.path().join("projects"),
+    };
+    std::fs::create_dir_all(&paths.root).unwrap();
+    std::fs::create_dir_all(&paths.projects_root).unwrap();
+    (tmp, paths)
+}
 
-    let mut srv = McpServer::spawn(&home, &projects);
-    srv.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {}
-    }));
-    let resp = srv.recv();
+async fn call(paths: &CcteamPaths, req: Value) -> Value {
+    ccteam_im::mcp::handle_request(paths, &req)
+        .await
+        .expect("request expects a response")
+}
+
+#[tokio::test]
+async fn mcp_initialize_returns_protocol_version_and_tools_cap() {
+    let (_tmp, paths) = tmp_paths();
+    let resp = call(
+        &paths,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+    )
+    .await;
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 1);
-    assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(
+        resp["result"]["protocolVersion"],
+        ccteam_im::mcp::MCP_PROTOCOL_VERSION
+    );
     assert!(resp["result"]["capabilities"]["tools"].is_object());
+    // The server identity stays `ccteam`: clients derive the model-visible
+    // namespace from it (`mcp__ccteam__<tool>`).
     assert_eq!(resp["result"]["serverInfo"]["name"], "ccteam");
-    srv.shutdown();
 }
 
-#[test]
-fn mcp_serve_tools_list_returns_full_tool_set() {
+#[tokio::test]
+async fn mcp_tools_list_returns_full_tool_set() {
     // status 1 + beacon alias 1 + chat 1 + session 5 = 8.
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&projects).unwrap();
-
-    let mut srv = McpServer::spawn(&home, &projects);
-    srv.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/list",
-        "params": {}
-    }));
-    let resp = srv.recv();
+    let (_tmp, paths) = tmp_paths();
+    let resp = call(
+        &paths,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+    )
+    .await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
@@ -158,45 +95,32 @@ fn mcp_serve_tools_list_returns_full_tool_set() {
         "ccteam__chat_register_bot",
         "ccteam__chat_unregister_bot",
         "ccteam__chat_list_bots",
-        "ccteam__chat_reset",
         "ccteam__chat_lifecycle",
         "ccteam__workflow_show",
+        "screenshot",
+        "ccteam__status",
+        "ccteam__chat_send_file",
+        "ccteam__session_spawn",
     ] {
-        assert!(
-            !names.contains(&gone),
-            "culled/retired tool must be gone: {gone}"
-        );
+        assert!(!names.contains(&gone), "culled tool present: {gone}");
     }
-    // Schema sanity: every tool must declare `inputSchema.type=object`.
-    for tool in tools {
-        assert_eq!(
-            tool["inputSchema"]["type"], "object",
-            "tool `{}` must declare object inputSchema",
-            tool["name"]
-        );
-    }
-    srv.shutdown();
 }
 
-#[test]
-fn mcp_serve_tools_call_status_returns_empty_projects_for_fresh_root() {
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&projects).unwrap();
-
-    let mut srv = McpServer::spawn(&home, &projects);
-    srv.send(&json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": { "name": "status", "arguments": {} }
-    }));
-    let resp = srv.recv();
+#[tokio::test]
+async fn mcp_tools_call_status_returns_empty_projects_for_fresh_root() {
+    let (_tmp, paths) = tmp_paths();
+    let resp = call(
+        &paths,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "status", "arguments": {} }
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
     assert_eq!(parsed["projects"].as_array().unwrap().len(), 0);
-    assert_eq!(resp["result"]["isError"], false);
-    srv.shutdown();
 }

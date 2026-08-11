@@ -15,7 +15,6 @@ mod update;
 // v0.8.7 W1 — `session_*` tools (agent scheduling). Stdio side
 // forwards to the daemon over mcp.sock; the daemon-side handler
 // (`ccteam_im::mcp::McpDispatch`) holds the gateway + enforces the cto gate.
-mod mcp_session_tools;
 mod mcp_tool_groups;
 mod web_chat_bridge;
 // Bare `ccteam doctor` readiness checkup: one consolidated row per vendor,
@@ -685,11 +684,6 @@ enum InternalCommand {
         #[command(subcommand)]
         cmd: HookCommand,
     },
-    /// Run the ccteam MCP server (stdio JSON-RPC). Wired into
-    /// `~/.claude.json` `mcpServers.ccteam` by `ccteam config` (the
-    /// "register the ccteam MCP server" menu item / `config mcp`) so
-    /// daily-driver claude sessions see the ccteam tool surface.
-    McpServe,
     /// Best-effort registration of ccteam's MCP server for installed vendors.
     #[command(hide = true)]
     RegisterMcp {
@@ -1303,7 +1297,6 @@ fn run_skill(cmd: SkillCommand) -> Result<()> {
 fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
         InternalCommand::Hook { cmd } => run_hook(cmd),
-        InternalCommand::McpServe => run_mcp_serve(),
         InternalCommand::RegisterMcp { json } => run_internal_register_mcp(json),
         InternalCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
         InternalCommand::Peek { slug, sid } => run_internal_peek(&slug, sid.as_deref()),
@@ -1400,21 +1393,6 @@ fn run_experience(cmd: ExperienceCommand) -> Result<()> {
             Ok(())
         }
     }
-}
-
-fn run_mcp_serve() -> Result<()> {
-    // V0.6.5 F165 — stdio MCP server: stdout is reserved for line-
-    // delimited JSON-RPC frames, so tracing must go to stderr (otherwise
-    // the first `tools/list` reply is preceded by an `info!` log line
-    // and the client's JSON parser blows up). See `init_tracing_stderr`
-    // doc comment + `docs/interfaces.md` §12.
-    init_tracing_stderr();
-    let paths = CcteamPaths::from_env()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for mcp-serve")?;
-    runtime.block_on(mcp_serve::run_mcp_serve(paths))
 }
 
 /// V0.8 rmux W6 — `ccteam mux <subcommand>` dispatch.
@@ -1642,9 +1620,10 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     // `ccteam config mcp` — targets the port we actually listen on. The old
     // stdio entry was port-agnostic; an HTTP one is not, so guessing the default
     // here would break exactly the operators who bind somewhere else.
-    if let Err(err) =
-        ccteam_core::mcp_register::record_daemon_mcp_url(&paths.root.join("run"), &web.bind)
-    {
+    if let Err(err) = ccteam_harness::execution::mcp_config::record_daemon_mcp_url(
+        &paths.root.join("run"),
+        &web.bind,
+    ) {
         tracing::warn!(error = %err, bind = %web.bind, "could not record the daemon MCP URL; vendor registration falls back to the default bind");
     }
 
@@ -1873,6 +1852,14 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             // factory so HTTP session endpoints drive the same session map the
             // daemon owns.
             let web_gateway = shared_gateway.clone();
+            // The `(sid, secret)` registry travels beside the gateway handle,
+            // taken here (async context) because `/mcp` must verify a managed
+            // session's principal WITHOUT the gateway lock — see
+            // `ccteam_im::principals`.
+            let web_principals = match web_gateway.as_ref() {
+                Some(gw) => Some(gw.lock().await.principals()),
+                None => None,
+            };
             // v0.9 T4 — same sink/pending the mcp.sock handler gets, so
             // `POST /mcp` can drive session_* / chat_send_file / HITL.
             let web_mcp_sink = gw_event_tx.clone();
@@ -1886,8 +1873,8 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         if let Some((inbound, outbound, backlog, conns)) = web_bridge {
                             state = state.with_chat_bridge(inbound, outbound, backlog, conns);
                         }
-                        if let Some(gw) = web_gateway {
-                            state = state.with_gateway(gw);
+                        if let (Some(gw), Some(principals)) = (web_gateway, web_principals) {
+                            state = state.with_gateway(gw, principals);
                         }
                         state = state.with_mcp(web_mcp_sink, web_mcp_pending);
                         state = state.with_host_hub(web_host_hub);
@@ -2708,30 +2695,6 @@ fn init_tracing() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ccteam_core=info")),
         )
-        .try_init();
-}
-
-/// V0.6.5 F165 — tracing init for the stdio MCP server.
-///
-/// `ccteam mcp-serve` speaks line-delimited JSON-RPC over stdin/stdout
-/// (`docs/interfaces.md` §12). The default [`init_tracing`] writer is
-/// stdout, which collides with the JSON-RPC frame channel — the very
-/// first `tools/list` reply can be preceded by a `tracing::info!` log
-/// line, breaking strict JSON-per-line parsers. Pin the fmt layer to
-/// stderr for this subcommand so stdout is reserved for protocol
-/// frames; operators still see tracing output via `2>` redirection or
-/// the controlling terminal.
-///
-/// Scope: stdio MCP server ONLY. Daemon mode (`ccteam start`) and the
-/// web surface (`ccteam web`) keep stdout writes because their stdout
-/// is the human / journalctl readout, not a wire protocol.
-fn init_tracing_stderr() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ccteam_core=info")),
-        )
-        .with_writer(std::io::stderr)
         .try_init();
 }
 

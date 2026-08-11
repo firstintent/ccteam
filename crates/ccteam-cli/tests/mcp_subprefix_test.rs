@@ -1,132 +1,62 @@
-//! Integration tests for the MCP tool naming surface.
+//! Wire-name invariants for the MCP tool surface.
 //!
-//! Each test spawns a real `ccteam mcp-serve` subprocess and drives it
-//! via stdin/stdout JSON-RPC:
+//! Names are the part of the protocol an agent actually sees, so they are
+//! locked here: bare `<group>_<rest>` (never `ccteam__`-prefixed, which would
+//! render as the double `mcp__ccteam__ccteam__session_spawn`), the two
+//! prefix-less admin singletons, and no culled or pre-rename name resurrected.
 //!
-//! - server name still `ccteam` (V0.5 muscle memory preserved)
-//! - every tool carries a group sub-prefix (`chat_` / `session_`) OR
-//!   is a prefix-less admin tool (`status` + its bare-name beacon alias)
-//! - V0.5 unprefixed names (`ccteam__ls`, …) and culled v0.9 tools are
-//!   GONE from `tools/list` — no compat alias preserved
-
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+//! These used to shell out to a stdio `mcp-serve` child for `tools/list`; that
+//! transport is deleted, so the listing comes from the protocol core.
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-struct McpServer {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-}
+use ccteam_core::CcteamPaths;
 
-impl McpServer {
-    fn spawn(home: &std::path::Path, projects: &std::path::Path) -> Self {
-        let bin = env!("CARGO_BIN_EXE_ccteam");
-        let mut child = Command::new(bin)
-            .args(["internal", "mcp-serve"])
-            .env("CCTEAM_HOME", home)
-            .env("CCTEAM_PROJECTS_ROOT", projects)
-            .env("CCTEAM_DISABLE_TOOL_SURFACE_BOOTSTRAP", "1")
-            // Make sure parent CCTEAM_DISABLE_TOOLS doesn't leak into
-            // the "happy path" tests below.
-            .env_remove("CCTEAM_DISABLE_TOOLS")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn ccteam mcp-serve");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self {
-            child,
-            stdin,
-            stdout,
-        }
-    }
-
-    fn send(&mut self, msg: &Value) {
-        let mut line = serde_json::to_string(msg).unwrap();
-        line.push('\n');
-        self.stdin.write_all(line.as_bytes()).unwrap();
-        self.stdin.flush().unwrap();
-    }
-
-    fn recv(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read stdout");
-        serde_json::from_str(line.trim()).expect("parse JSON-RPC response")
-    }
-
-    fn shutdown(mut self) {
-        drop(self.stdin);
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-    }
-}
-
-fn tmp_paths() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+fn tmp_paths() -> (TempDir, CcteamPaths) {
+    ccteam_core::tool_surface::disable_tool_surface_bootstrap_for_tests();
     let tmp = TempDir::new().unwrap();
-    let home = tmp.path().join("home");
-    let projects = tmp.path().join("projects");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::create_dir_all(&projects).unwrap();
-    (tmp, home, projects)
+    let paths = CcteamPaths {
+        root: tmp.path().join("home"),
+        projects_root: tmp.path().join("projects"),
+    };
+    std::fs::create_dir_all(&paths.root).unwrap();
+    std::fs::create_dir_all(&paths.projects_root).unwrap();
+    (tmp, paths)
 }
 
-fn list_tool_names() -> Vec<String> {
-    let (_tmp, home, projects) = tmp_paths();
-    let mut srv = McpServer::spawn(&home, &projects);
-    srv.send(&json!({
-        "jsonrpc": "2.0", "id": 1,
-        "method": "tools/list", "params": {}
-    }));
-    let resp = srv.recv();
-    let names = resp["result"]["tools"]
+async fn list_tool_names() -> Vec<String> {
+    let (_tmp, paths) = tmp_paths();
+    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+    let resp = ccteam_im::mcp::handle_request(&paths, &req)
+        .await
+        .expect("tools/list expects a response");
+    resp["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    srv.shutdown();
-    names
+        .collect()
 }
 
-#[test]
-fn server_name_stays_ccteam_for_v05_muscle_memory() {
+#[tokio::test]
+async fn server_name_stays_ccteam_for_v05_muscle_memory() {
     // The SERVER identity in `initialize` stays `ccteam` so users'
-    // `~/.claude.json` `mcpServers.ccteam` entries continue to work
-    // without rename; the client derives the model-visible namespace
-    // from it (`mcp__ccteam__<tool>`).
-    let (_tmp, home, projects) = tmp_paths();
-    let mut srv = McpServer::spawn(&home, &projects);
-    srv.send(&json!({
-        "jsonrpc": "2.0", "id": 1,
-        "method": "initialize", "params": {}
-    }));
-    let resp = srv.recv();
+    // `mcpServers.ccteam` entries keep working without a rename; the client
+    // derives the model-visible namespace from it (`mcp__ccteam__<tool>`).
+    let (_tmp, paths) = tmp_paths();
+    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    let resp = ccteam_im::mcp::handle_request(&paths, &req)
+        .await
+        .expect("initialize expects a response");
     assert_eq!(resp["result"]["serverInfo"]["name"], "ccteam");
-    srv.shutdown();
 }
 
-#[test]
-fn every_tool_carries_group_subprefix_or_is_singleton() {
-    let names = list_tool_names();
+#[tokio::test]
+async fn every_tool_carries_group_subprefix_or_is_singleton() {
+    let names = list_tool_names().await;
     assert!(!names.is_empty(), "tools/list returned empty");
     for n in &names {
-        // Wire names are BARE `<group>_<rest>` (or the prefix-less admin
-        // tools: `status` + its bare-name beacon alias). The MCP client namespaces
-        // by server key, so Claude Code shows `mcp__ccteam__session_spawn`
-        // — a baked-in `ccteam__` prefix would render as the double
-        // `mcp__ccteam__ccteam__session_spawn`.
         assert!(
             !n.starts_with("ccteam__"),
             "tool name {n:?} must not embed the server prefix (client namespaces by server key)"
@@ -144,11 +74,10 @@ fn every_tool_carries_group_subprefix_or_is_singleton() {
     }
 }
 
-#[test]
-fn legacy_v05_unprefixed_names_are_gone() {
-    // No compat shim. V0.5 names must NOT survive alongside the
-    // renamed V0.6 names.
-    let names = list_tool_names();
+#[tokio::test]
+async fn legacy_v05_unprefixed_names_are_gone() {
+    // No compat shim. V0.5 names must NOT survive alongside the renamed ones.
+    let names = list_tool_names().await;
     for legacy in [
         "ccteam__ls",
         "ccteam__show",
@@ -177,45 +106,57 @@ fn legacy_v05_unprefixed_names_are_gone() {
         "ccteam__chat_list_bots",
         // 2026-07-26 cull: tmux-era pane screenshot (web route stays).
         "screenshot",
-        // v0.9.1 rename: prefixed wire names dropped (client namespaces
-        // by server key; the old form double-prefixed for the model).
+        // v0.9.1 rename: prefixed wire names dropped (the client namespaces by
+        // server key, so the old form double-prefixed for the model).
         "ccteam__status",
-        "ccteam__screenshot",
         "ccteam__chat_send_file",
         "ccteam__session_spawn",
-        "ccteam__session_dispatch",
-        "ccteam__session_collect",
         "ccteam__session_list",
-        "ccteam__session_stop",
     ] {
         assert!(
             !names.contains(&legacy.to_string()),
-            "legacy/culled name {legacy:?} must NOT be in tools/list (no compat shim)",
+            "legacy tool name {legacy:?} must not be listed"
         );
     }
 }
 
-#[test]
-fn status_and_session_tools_dispatch_through_server() {
-    // Spot-check remaining surface: status (local) + session_list
-    // (forwards to daemon — may error without daemon, but must land
-    // as a tools/call result shape rather than a transport failure).
-    let names = list_tool_names();
+#[tokio::test]
+async fn status_keeps_singleton_name_in_listing() {
+    // `status` (v0.9 T1 rename of `admin_ls`) and its bare-name beacon alias
+    // are the prefix-less admin tools.
+    let names = list_tool_names().await;
+    assert!(
+        names.contains(&"status".to_string()),
+        "status must survive without sub-prefix"
+    );
+    assert!(
+        names.contains(&"grok_claude_codex_kimi".to_string()),
+        "the bare-name beacon alias must be listed"
+    );
+    assert!(
+        !names.contains(&"screenshot".to_string()),
+        "screenshot was culled 2026-07-26 and must not resurface"
+    );
+}
+
+#[tokio::test]
+async fn status_and_session_tools_dispatch_as_tool_results() {
+    // Spot-check the remaining surface: the tools exist, and `status` lands as
+    // a tools/call RESULT rather than a transport-shaped failure.
+    let names = list_tool_names().await;
     assert!(names.contains(&"status".to_string()));
     assert!(names.contains(&"session_list".to_string()));
     assert!(names.contains(&"chat_send_file".to_string()));
 
-    let (_tmp, home, projects) = tmp_paths();
-    let mut srv = McpServer::spawn(&home, &projects);
-    srv.send(&json!({
+    let (_tmp, paths) = tmp_paths();
+    let req = json!({
         "jsonrpc": "2.0", "id": 2,
         "method": "tools/call",
-        "params": {
-            "name": "status",
-            "arguments": {}
-        }
-    }));
-    let resp = srv.recv();
+        "params": { "name": "status", "arguments": {} }
+    });
+    let resp: Value = ccteam_im::mcp::handle_request(&paths, &req)
+        .await
+        .expect("tools/call expects a response");
     assert_eq!(
         resp["result"]["isError"], false,
         "status should land as result, not isError"
@@ -226,26 +167,5 @@ fn status_and_session_tools_dispatch_through_server() {
     assert!(
         text.contains("projects"),
         "status body should carry projects array; got: {text}"
-    );
-    srv.shutdown();
-}
-
-#[test]
-fn status_keeps_singleton_name_in_listing() {
-    // `status` (v0.9 T1 rename of `admin_ls`) and its bare-name beacon
-    // alias are the prefix-less admin tools.
-    let names = list_tool_names();
-    assert!(
-        names.contains(&"status".to_string()),
-        "status must survive without sub-prefix"
-    );
-    assert!(
-        names.contains(&"grok_claude_codex_kimi".to_string()),
-        "the bare-name beacon alias must be listed"
-    );
-    // Sanity: the culled screenshot singleton stays gone.
-    assert!(
-        !names.contains(&"screenshot".to_string()),
-        "screenshot was culled 2026-07-26 and must not resurface"
     );
 }

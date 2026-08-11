@@ -29,7 +29,18 @@
 
 ### 1. 安装
 
-ccteam 调用你机器上**已装好并登录的** Claude Code(必需)/ Codex(可选),自己不打包它们。
+ccteam 调用你机器上**已装好并登录的** Claude Code / Codex / Grok Build / OpenCode / Kimi Code / Pi,自己不打包它们。
+
+**先装好并登录其中至少一个** —— 没装、或装了但没登录的 vendor,在那台机器上起不了会话:
+
+| Vendor | 安装 | 登录 |
+|---|---|---|
+| Claude Code | [docs.claude.com/en/docs/claude-code](https://docs.claude.com/en/docs/claude-code) | `claude auth login` |
+| Codex | [github.com/openai/codex](https://github.com/openai/codex) | `codex login` |
+| Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
+| OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
+| Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+| Pi | `npm i -g @earendil-works/pi-coding-agent` | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
 
 **1 · 让 agent 装**
 
@@ -44,7 +55,7 @@ git clone https://github.com/firstintent/ccteam && cd ccteam
 make install
 ```
 
-**3 · 一键脚本** —— 预编译二进制,无需工具链(linux + macOS arm/x64,Windows 走 WSL2;同样会问装 systemd):
+**3 · 一键脚本** —— 预编译二进制,无需工具链(linux + macOS arm/x64,Windows 走 WSL2):
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
@@ -68,7 +79,18 @@ pi --version        # 可选,用 Pi 会话才需要(0.83.0 及以上)
 
 ### 2. 服务
 
-`make install` 已经把服务起好了:唯一的常驻进程(Web 控制台 + IM 网关 + 标准资源 API + MCP)在 Linux 由 systemd `--user` 托管、在 macOS 由 launchd agent 托管 —— 开机/登录自启、崩溃自动重启、退出登录也不死。两个平台都用 `make daemon-status` / `daemon-logs` / `daemon-restart` / `daemon-stop` 管理(macOS 日志在 `~/.ccteam/daemon.log`)。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除服务和二进制,但保留 `~/.ccteam`。没有任何 supervisor 的环境用 `ccteam start` 前台跑。
+`make install`(以及一键脚本检测到升级时)已经用 **`ccteam daemon start`** 把服务起好了:唯一的常驻进程(Web 控制台 + IM 网关 + 标准资源 API + MCP socket),用 `setsid` 脱离终端,关掉 shell、断开 SSH 都不死。Linux / macOS / WSL **同一套机制** —— **systemd 与 launchd unit 已于 v0.9.7 整体退役**:
+
+```bash
+ccteam daemon status     # pid · ready · 运行中版本 vs 二进制版本(脚本用 --json)
+ccteam daemon logs -f    # 跟踪 ~/.ccteam/daemon.log
+ccteam daemon restart    # 优雅 SIGTERM 停 + 重新脱离(也可 `make daemon-restart`)
+ccteam daemon stop       # 优雅停;会话下次启动按 sid 恢复
+```
+
+诚实的取舍:没有 OS supervisor,就**没有崩溃自动重启、也不开机自启** —— 重启机器后再跑一次 `ccteam daemon start`(`ccteam status` / `ccteam doctor` 一眼看出 daemon 没起;想要开机自启,自己加一行 `@reboot ccteam daemon start` cron)。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除二进制,但保留 `~/.ccteam`。完全不脱离(开发 / 容器 / 你自己的 supervisor `ExecStart`)则用 `ccteam start` 前台跑。
+
+**从 v0.9.7 之前的安装升级(systemd/launchd)**:重跑一次安装器或 `ccteam daemon start` 即可 —— 一次性接管会停用并删除旧的 ccteam service unit,再把 daemon 自管地拉起来;你自己手写的 unit 一动不动(ccteam 会把那个实例报成「非托管」且不去停它)。
 
 `make install` 结束时(或随时 `ccteam status`)会打印 Web 控制台地址,形如:
 
@@ -88,7 +110,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过。**Pi 刻意不在这张表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。**Pi 刻意不在这张表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
 ### 创建项目
 
@@ -148,15 +170,17 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 外部 Agent 直连 MCP(`POST /mcp`)
 
-任何不由 ccteam 托管的 agent(你自己写的脚本、别处跑的 CLI)都可以拿 **ccteam web token** 直接调 daemon 的 MCP 端点,得到与托管会话相同的 8 个工具:
+任何不由 ccteam 托管的 agent(你自己写的脚本、手起的 CLI、别的机器上的 agent)都可以拿 **enrollment 凭据**直接调 daemon 的 MCP 端点,得到与托管会话相同的 8 个工具:
 
 ```
 POST http://<host>:7331/mcp
-Authorization: Bearer ccteam:<hex>
+Authorization: Bearer ccteam-enroll:<id>:<secret>
+Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 ```
 
-- **admin token**(`ccteam status` 输出的那枚)= owner 前门,fleet 级;**per-user token**(Settings → 用户 里签发)= 该用户身份,所有工具收窄到其自有项目:`session_spawn` 必须显式传 `project` 且只能是自己的项目,`dispatch/collect/stop` 按目标 sid 的归属项目做 ACL,`session_list`/`status` 只聚合可见项目。
-- 无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数。
+- **凭据只说明「这份配置是谁的」,身份由 daemon 在 `initialize` 时签发**:响应里的 `Mcp-Session-Id` 让**这个进程**成为一个独立 caller —— 它在账本里有自己的会话行(`managed_by: external`),它 spawn 的会话真的挂在它下面,而不是变成一堆根节点。之后每个请求必须同时带凭据与该 id(id 本身不是凭据,且 binding 只对开它的那枚凭据生效);id 过期返回 `404` 提示重新 `initialize`,用完可 `DELETE /mcp` 关闭。
+- **两种作用域**:每次 `ccteam daemon start` 会把一枚**用户域**凭据写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;它不钉项目,故首个 `session_*` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
+- **不做任何推断**:不看工作目录、不看来源地址、没有「最近用过的项目」—— 没有依据就直接拒绝,并告诉你可以点名哪些 slug。无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数;web 控制台令牌(那是 `/api/v1/**` 的凭据)在这里会被 401 拒绝并说明本端点认哪两族凭据。
 
 ---
 
@@ -383,7 +407,7 @@ systemctl --user restart ccteam    # 或 make daemon-restart(先重编译再重�
 状态文件速查(`~/.ccteam` 按职责分组:`secrets/` 凭证、`state/` daemon 写的、`cache/` 可删、`run/` 套接字):
 
 ```bash
-journalctl --user -u ccteam -n 120               # daemon 日志(systemd journal;或 make daemon-logs)
+ccteam daemon logs -n 120                        # daemon 日志(~/.ccteam/daemon.log;或 make daemon-logs)
 cat ~/.ccteam/config.yaml                        # 项目登记(slug → 路径)
 cat ~/.ccteam/state/gateway/routing.json         # 网关路由(每个 chat 的当前项目/会话 + live 集)
 cat ~/.ccteam/state/sessions/next-sid            # 单调 sid 计数(永不复用)

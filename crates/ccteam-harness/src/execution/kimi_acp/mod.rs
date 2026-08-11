@@ -497,6 +497,14 @@ impl HarnessAdapter for KimiAcpAdapter {
         // project AGENTS.md natively (no prompt injection).
         let bin = kimi_bin();
         let argv = build_argv(&bin, &KimiSpawnInput::default());
+        // Child-only env: CCTEAM_CHAT_SID is the session's self-description —
+        // without the explicit set the child inherits whatever stale value the
+        // daemon's own environment chain carried, and an agent that reads
+        // `env` mis-identifies itself.
+        let envs = vec![(
+            crate::execution::claude_common::CHAT_SID_ENV.to_string(),
+            ctx.sid.clone(),
+        )];
         let program = argv[0].clone();
         let args: Vec<String> = argv.into_iter().skip(1).collect();
         let cwd = if ctx.cwd.as_os_str().is_empty() {
@@ -509,6 +517,14 @@ impl HarnessAdapter for KimiAcpAdapter {
         // identically to session/new and session/resume|load. Empty when
         // sid/secret missing; failure to inject must not block the prompt
         // path (empty vec).
+        //
+        // Same open door as grok: this OFFERS the principal against a
+        // same-named machine-credential entry in `$KIMI_CODE_HOME/mcp.json`,
+        // and no flag makes it win (kimi's own `mergeCallerMcpServers` spreads
+        // the caller last, so it is believed fine — unverified at runtime).
+        // Identity does not ride on the offer: `spawn_for_session` records the
+        // child pid and `/mcp` re-binds by process provenance; the daemon
+        // still measures the outcome. See `mcp_config`'s module doc.
         let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         // Cold-resume ladder: if meta.json already has a Kimi ACP sessionId
@@ -528,10 +544,11 @@ impl HarnessAdapter for KimiAcpAdapter {
         let try_resume = prior_uuid.clone();
         let (transport, session_id, info) = match try_resume {
             Some(uuid) => {
-                let transport =
-                    AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
-                        .await
-                        .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
+                let transport = AcpTransport::spawn_for_session(
+                    &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                )
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
                 let transport = Arc::new(transport);
                 match Self::handshake_and_resume(&transport, &cwd, &uuid, mcp_servers.clone()).await
                 {
@@ -542,14 +559,13 @@ impl HarnessAdapter for KimiAcpAdapter {
                             "kimi resume/load failed; falling back to session/new"
                         );
                         let _ = transport.shutdown().await;
-                        let transport =
-                            AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
-                                .await
-                                .map_err(|e| {
-                                    HarnessError::SpawnFailed(format!(
-                                        "spawn kimi after resume fail: {e}"
-                                    ))
-                                })?;
+                        let transport = AcpTransport::spawn_for_session(
+                            &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                        )
+                        .await
+                        .map_err(|e| {
+                            HarnessError::SpawnFailed(format!("spawn kimi after resume fail: {e}"))
+                        })?;
                         let transport = Arc::new(transport);
                         let (sid, info) =
                             Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
@@ -558,10 +574,11 @@ impl HarnessAdapter for KimiAcpAdapter {
                 }
             }
             None => {
-                let transport =
-                    AcpTransport::spawn_command_with_policy(&program, &args, &cwd, inbound)
-                        .await
-                        .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
+                let transport = AcpTransport::spawn_for_session(
+                    &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                )
+                .await
+                .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
                 let transport = Arc::new(transport);
                 let (sid, info) =
                     Self::handshake_and_new(&transport, &cwd, mcp_servers.clone()).await?;
@@ -669,6 +686,24 @@ impl HarnessAdapter for KimiAcpAdapter {
             }
         })
         .boxed()
+    }
+
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // The ACP child owns a broadcast channel; `events()` looks the live
+        // session up and subscribes to it, so a rebuild picks up the current
+        // child and replays nothing.
+        crate::EventAttachment::Rebuildable
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "ACP carries `mcpServers` only on `session/new` / `session/load`; there is \
+             no mid-session re-apply — `/new` rebuilds the tool face"
+                .to_string(),
+        })
     }
 
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {

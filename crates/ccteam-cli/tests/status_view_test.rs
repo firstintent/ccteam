@@ -78,6 +78,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
                       mode: ccteam_harness::PermissionMode| {
         let now = "2026-01-01T00:00:00Z".to_string();
         let meta = ccteam_harness::SessionMeta {
+            managed_by: Default::default(),
             sid: sid.to_string(),
             slug: slug.to_string(),
             vendor,
@@ -87,6 +88,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
             owner: "telegram:c1".to_string(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".to_string(),
             created_at: now.clone(),

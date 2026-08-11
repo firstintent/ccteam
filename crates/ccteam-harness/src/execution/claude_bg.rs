@@ -294,6 +294,21 @@ impl HarnessAdapter for ClaudeBgAdapter {
         Box::pin(stream::empty())
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // Backgrounded one-shot job: no live transport to re-attach to (state
+        // is polled from the job file), so the stream's end is final.
+        crate::EventAttachment::OneShot
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "one-shot background job — the next job dials the endpoint fresh".to_string(),
+        })
+    }
+
     async fn resume_thread(&self, _persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         Err(HarnessError::NotImplemented {
             reason: "claude --bg is single-turn fresh-context every spawn (red line R3 \

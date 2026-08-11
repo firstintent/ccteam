@@ -519,6 +519,22 @@ impl HarnessAdapter for CodexExecAdapter {
         Box::pin(s)
     }
 
+    fn event_attachment(&self) -> crate::EventAttachment {
+        // One-shot batch execution: the stream describes a single `codex exec`
+        // run, and its end IS that run finishing. There is nothing to re-attach
+        // to.
+        crate::EventAttachment::OneShot
+    }
+
+    async fn rebuild_tool_surface(
+        &self,
+        _h: &ThreadHandle,
+    ) -> Result<crate::ToolSurfaceRebuild, HarnessError> {
+        Ok(crate::ToolSurfaceRebuild::RespawnRequired {
+            reason: "one-shot `codex exec` run — the next run dials the endpoint fresh".to_string(),
+        })
+    }
+
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         if persistent_id.is_empty() {
             return Err(HarnessError::SpawnFailed(

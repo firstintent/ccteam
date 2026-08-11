@@ -166,16 +166,20 @@ pub(crate) async fn handle_list_sessions(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    // session_views() is sync after the lock — no `.await` is held under it.
-    let mut views = {
+    // session_views() + live_turns() are sync after the lock (and both cheap,
+    // in-memory) — no `.await` and no file read is held under it.
+    let (mut views, live_turns) = {
         let guard = gw.lock().await;
-        guard
-            .session_views()
-            .into_iter()
-            .filter(|v| v.project == slug)
-            .collect::<Vec<_>>()
+        (
+            guard
+                .session_views()
+                .into_iter()
+                .filter(|v| v.project == slug)
+                .collect::<Vec<_>>(),
+            guard.live_turns(),
+        )
     };
-    apply_progress_activity_status(&app.paths, &slug, &mut views);
+    apply_progress_activity_status(&app.paths, &slug, &mut views, &live_turns);
     Json(views).into_response()
 }
 
@@ -219,15 +223,31 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
     }
 }
 
+/// Replace the gateway's cheap `"live"` hint with the real activity
+/// (`working|idle|stale|stuck`) through the SHARED resolver — the same
+/// `ccteam_core::stall::classify_session_activity` IM `/status` and MCP
+/// `session_list` answer through, so the SPA rail and a phone's `/status` card
+/// can never tell the user different things about one session.
+///
+/// `live_turns` is the daemon's in-flight-turn snapshot, taken under the same
+/// lock that produced `views` (cheap, no I/O) — the file read then happens here,
+/// off the lock. It is what keeps a mid-turn session honest when its project's
+/// progress stream cannot be read.
+///
+/// A project the catalog can't price for staleness no longer bails out (that
+/// left every row saying `"live"`, i.e. green, on a surface whose whole job is
+/// to say what a session is doing): fall back to `0` silent seconds, the same
+/// fallback the IM side uses.
 fn apply_progress_activity_status(
     paths: &ccteam_core::CcteamPaths,
     slug: &str,
     views: &mut [SessionView],
+    live_turns: &std::collections::HashMap<String, ccteam_core::stall::LiveTurn>,
 ) {
     if views.is_empty() {
         return;
     }
-    let Some(silent_seconds) = ccteam_core::collect_projects(paths)
+    let silent_seconds = ccteam_core::collect_projects(paths)
         .ok()
         .and_then(|projects| {
             projects
@@ -235,17 +255,16 @@ fn apply_progress_activity_status(
                 .find(|project| project.state.slug == slug)
                 .map(|project| project.stall_silent_seconds)
         })
-    else {
-        return;
-    };
+        .unwrap_or(0);
     let events =
         ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
     let now = chrono::Utc::now();
     for view in views {
-        let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+        let activity = ccteam_core::stall::classify_session_activity(
             &events,
             &view.sid,
             silent_seconds,
+            live_turns.get(&view.sid).copied(),
             now,
         );
         view.last_activity_seconds = activity.last_activity_seconds;
@@ -464,10 +483,12 @@ pub(crate) async fn handle_session_history(
         return no_gateway();
     };
     // Resolve sid → sid + project_dir under the lock (also our 404 gate),
-    // then drop the guard before touching the filesystem.
+    // then drop the guard before touching the filesystem. Live OR stopped: a
+    // stopped session's transcript outlives the live map by design, and this
+    // endpoint is what the team panel's 最近对话 reads for exactly those rows.
     let resolved = {
         let guard = gw.lock().await;
-        guard.session_resolve(&sid)
+        guard.session_resolve_any(&sid)
     };
     let Some(resolved) = resolved else {
         return unknown_session(&sid);
@@ -2396,12 +2417,97 @@ mod tests {
         assert!(approval_token(&bare).is_none());
     }
 
+    /// No session is mid-turn as far as the daemon knows — the file verdict
+    /// stands alone (what a daemonless reader sees too).
+    fn no_live_turns() -> std::collections::HashMap<String, ccteam_core::stall::LiveTurn> {
+        std::collections::HashMap::new()
+    }
+
+    fn one_live_turn(
+        sid: &str,
+        live: ccteam_core::stall::LiveTurn,
+    ) -> std::collections::HashMap<String, ccteam_core::stall::LiveTurn> {
+        std::collections::HashMap::from([(sid.to_string(), live)])
+    }
+
+    fn view(sid: &str) -> SessionView {
+        SessionView {
+            driveable: true,
+            sid: sid.into(),
+            project: "demo".into(),
+            role: "cto".into(),
+            vendor: "claude".into(),
+            permission_mode: "skip".into(),
+            protocol: "stream-json".into(),
+            host: "local".into(),
+            current: true,
+            status: "live".into(),
+            last_activity_seconds: None,
+            created_at: String::new(),
+            last_active: String::new(),
+            title: None,
+            turn_count: 0,
+            cost_usd: None,
+            tokens_total: None,
+            model: None,
+            waiting_approval: false,
+            parent_sid: None,
+            delegation_depth: 0,
+        }
+    }
+
+    /// The reported bug, from the web end: a session whose turn is in flight
+    /// must not read `idle` just because the project's progress stream told the
+    /// reader nothing (unreadable / rotated / no event for this sid yet). Green
+    /// here is what made the SPA rail and IM `/status` disagree.
+    #[test]
+    fn live_turn_keeps_a_mid_turn_session_honest_when_the_stream_says_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        write_project_state(&paths, "demo");
+        let mut views = vec![view("s1")];
+
+        // No progress stream at all → the file verdict is a bare "idle".
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        assert_eq!(views[0].status, "idle");
+
+        views[0].status = "live".into();
+        apply_progress_activity_status(
+            &paths,
+            "demo",
+            &mut views,
+            &one_live_turn(
+                "s1",
+                ccteam_core::stall::LiveTurn {
+                    silent_seconds: 3,
+                    elapsed_seconds: 42,
+                    stuck_after_seconds: 300,
+                },
+            ),
+        );
+        assert_eq!(views[0].status, "working");
+        assert_eq!(views[0].last_activity_seconds, None);
+    }
+
+    /// A project missing from the catalog used to short-circuit the whole
+    /// replacement, leaving the gateway's `"live"` hint — a green dot on a
+    /// surface whose job is to say what the session is doing.
+    #[test]
+    fn unknown_project_still_reports_a_real_activity_not_live() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = test_paths(tmp.path());
+        let mut views = vec![view("s1")];
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        assert_eq!(views[0].status, "idle");
+    }
+
     #[test]
     fn progress_activity_status_uses_core_file_backed_classifier() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
         let mut views = vec![SessionView {
+            driveable: true,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2430,7 +2536,7 @@ mod tests {
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &stale_completed)
             .unwrap();
-        apply_progress_activity_status(&paths, "demo", &mut views);
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
         assert!(views[0].last_activity_seconds.is_some());
 
@@ -2440,7 +2546,7 @@ mod tests {
             "ts": chrono::Utc::now().to_rfc3339(),
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &timeout).unwrap();
-        apply_progress_activity_status(&paths, "demo", &mut views);
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "stuck");
     }
 
@@ -2451,6 +2557,7 @@ mod tests {
         write_project_state(&paths, "demo");
         let mut views = vec![
             SessionView {
+                driveable: true,
                 sid: "s1".into(),
                 project: "demo".into(),
                 role: "cto".into(),
@@ -2473,6 +2580,7 @@ mod tests {
                 delegation_depth: 0,
             },
             SessionView {
+                driveable: true,
                 sid: "s2".into(),
                 project: "demo".into(),
                 role: "qa".into(),
@@ -2516,7 +2624,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views);
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
         assert!(views[0].last_activity_seconds.unwrap() >= 60);
         assert_eq!(views[1].status, "stuck");
@@ -2529,6 +2637,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
         let mut views = vec![SessionView {
+            driveable: true,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2561,7 +2670,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views);
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "working");
         assert_eq!(views[0].last_activity_seconds, None);
     }
@@ -2572,6 +2681,7 @@ mod tests {
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
         let mut views = vec![SessionView {
+            driveable: true,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2606,7 +2716,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views);
+        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "stale");
         assert!(
             views[0].last_activity_seconds.unwrap() >= ccteam_core::stall::STALL_WARN_SECONDS - 1
@@ -2755,6 +2865,22 @@ mod tests {
         ) -> Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError> {
             unimplemented!("not exercised by these tests")
         }
+        async fn rebuild_tool_surface(
+            &self,
+            _h: &ccteam_harness::ThreadHandle,
+        ) -> Result<ccteam_harness::ToolSurfaceRebuild, ccteam_harness::HarnessError> {
+            // Test double: no tool face to rebuild.
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+                reason: "test double".to_string(),
+            })
+        }
+
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
+        }
+
         fn events(
             &self,
             _h: &ccteam_harness::ThreadHandle,
@@ -2803,7 +2929,7 @@ mod tests {
             "demo",
             paths.projects_root.join("demo"),
         );
-        AppState::new(paths).with_gateway(std::sync::Arc::new(tokio::sync::Mutex::new(gateway)))
+        AppState::new(paths).with_gateway_owned(gateway)
     }
 
     #[tokio::test]

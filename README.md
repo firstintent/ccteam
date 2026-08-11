@@ -90,7 +90,7 @@ Register a satellite with a join token (Settings → Access) — it dials out to
 
 ---
 
-Under all four modes are the same **eight MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents a ccteam web token over `POST /mcp` — a per-user token scopes every tool to that user's own projects:
+Under all four modes are the same **eight MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
 
 ```text
 session_spawn · session_dispatch · session_collect · session_list · session_stop
@@ -105,6 +105,18 @@ The daemon routes and records — at-least-once notifications across restarts, i
 ## Install
 
 Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
+
+> [!IMPORTANT]
+> **Bring your own coding CLI — install and sign into at least one before you start.** ccteam is the bridge, not the agent: it spawns the vendor CLIs already on the machine a project is bound to, so a vendor that is missing (or installed but not logged in) cannot host a session.
+>
+> - **Claude Code** — install [Claude Code](https://docs.claude.com/en/docs/claude-code), then `claude auth login`
+> - **Codex** — install [Codex CLI](https://github.com/openai/codex), then `codex login`
+> - **Grok Build** — install [Grok CLI](https://docs.x.ai/build/overview), then `grok login`
+> - **OpenCode** — install [OpenCode](https://opencode.ai), then `opencode auth login`
+> - **Kimi Code** — install [Kimi Code](https://moonshotai.github.io/kimi-code/), then `kimi login`
+> - **Pi** — `npm i -g @earendil-works/pi-coding-agent`, then set your provider key and check it with `pi auth check --provider <provider>`
+>
+> Any one of them is enough to start. Afterwards `ccteam status` and **Settings → Hosts** report, per machine, which vendors are installed, their versions, and whether each is actually authenticated — sitting on `PATH` never counts as logged in.
 
 **1 · One-click script**
 
@@ -138,7 +150,7 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
-- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents, satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
+- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents (a credential scoped to one project, rendered as the real config each vendor expects, listed and revocable afterwards — the secret is shown once, never again), satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
 - **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. Pi is the exception by design: it gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
 

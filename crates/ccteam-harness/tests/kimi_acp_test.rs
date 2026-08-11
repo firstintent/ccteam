@@ -318,6 +318,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let project = tmp.path();
     let sid = "s-resume";
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Kimi,
@@ -327,6 +328,7 @@ async fn resume_prefers_session_resume_no_replay() {
         owner: "user:test".into(),
         vendor_uuid: "01JYQX7A9D2E3F4G5H6J7K8M9N".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -408,6 +410,7 @@ async fn resume_carries_mcp_servers() {
     }
 
     let meta = SessionMeta {
+        managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Kimi,
@@ -417,6 +420,7 @@ async fn resume_carries_mcp_servers() {
         owner: "user:test".into(),
         vendor_uuid: "01JYQX7A9D2E3F4G5H6J7K8M9N".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: chrono::Utc::now().to_rfc3339(),

@@ -28,6 +28,7 @@ pub mod session_status;
 pub mod transcript_tail;
 pub mod turns_mirror;
 pub mod typed_events;
+pub mod vendor_pids;
 pub mod vendor_title;
 
 pub use claude_bg::ClaudeBgAdapter;

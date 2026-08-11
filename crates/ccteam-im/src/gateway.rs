@@ -19,10 +19,10 @@ use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
     format_tokens, list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
     write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
-    Directive, DirectiveOutcome, ExternalClaudeSession, HarnessAdapter, HarnessError,
-    PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
-    TitleSync, TurnDisposition, TurnInput, TurnRouting,
+    Directive, DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter,
+    HarnessError, PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin,
+    SessionProtocol, SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
+    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -153,13 +153,25 @@ struct GatewaySession {
     /// every terminal canonical boundary. `/status` reads it to know whether a turn
     /// is in flight (→ 🔵 working, showing `now - start`) or the session is
     /// idle (`None` → 🟢). Shared (`Arc<Mutex>`) so the detached pump clears
-    /// the same cell the submit path set. PULL-only signal — nothing acts on it
-    /// except the `/status` render.
+    /// the same cell the submit path set. PULL-only signal — read ONLY through
+    /// [`Gateway::live_turn`] (which every activity surface goes through), and
+    /// nothing acts on it: it decides no control flow, only what a reader is
+    /// told the session is doing.
     turn_started_at: Arc<std::sync::Mutex<Option<Instant>>>,
     /// v0.9 T5 — set when a user turn is mirrored while a prior turn is still
     /// in flight (mid-turn steer). Cleared on the terminal boundary after the
     /// experience writer reads it. Shared with `mirror_user_turn` + pump.
     steered_this_turn: Arc<AtomicBool>,
+    /// Whether this session's ccteam TOOL FACE has been rebuilt since the
+    /// current daemon started — see [`Gateway::prime_tool_surface`].
+    ///
+    /// Starts `false` for EVERY session, including one this daemon just
+    /// spawned: whether a given child predates the current endpoint is not
+    /// something the gateway can tell (a satellite may hold a child across a
+    /// main-daemon restart, and a local child can start in the seconds before
+    /// the web bind is listening), and the cost of assuming the worst is one
+    /// control request per session per daemon lifetime.
+    tool_face_primed: Arc<AtomicBool>,
     /// v0.8.19 — timestamp of the most recent pump event for this session
     /// (set next to the `activity_events` tick, on EVERY event). `/status`
     /// derives the 🔴 stuck state the same way the turn-timeout watchdog does:
@@ -346,6 +358,23 @@ pub struct Gateway {
     /// stream (v0.8.10 routing-isolation fix).
     current_session: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
     sessions: BTreeMap<String, GatewaySession>,
+    /// Ledger nodes for hand-started clients that enrolled over `POST /mcp`
+    /// (`sid → meta`, `managed_by: external`; see [`crate::external_nodes`]).
+    ///
+    /// Deliberately NOT rows in `sessions`: that map is the set of sessions
+    /// ccteam holds a thread for, so every driveable surface (dispatch, steer,
+    /// capacity eviction, budget, tool-face prime, event pump) stays correct
+    /// without checking anything — an external client simply is not in the
+    /// collection they iterate. The unification happens one level up, in the
+    /// LEDGER: same sid namespace, same `meta.json`, same tree ([`SessionView`]
+    /// carries `driveable` so a consumer can tell the two apart).
+    ///
+    /// In-memory by nature: an entry stands for a live client PROCESS, and a
+    /// daemon restart already ended every one of those. Cold start therefore
+    /// starts empty while each `meta.json` stays on disk as audit — see
+    /// [`Self::recover_routing_from_meta`], which excludes them from the
+    /// rebuild set rather than resurrecting a process that is gone.
+    external_nodes: BTreeMap<String, SessionMeta>,
     templates: Vec<GatewayRouteTemplate>,
     next_session: u64,
     next_scheduled: u64,
@@ -391,6 +420,12 @@ pub struct Gateway {
     /// the inbound hot path (see [`SpawnClaims`]); deliberately its own lock,
     /// never held under the gateway's own mutex for longer than a map lookup.
     spawn_claims: Arc<SpawnClaims>,
+    /// The `(sid, secret)` authority behind every managed session's tool face
+    /// — see [`crate::principals`]. Separate from `sessions` because a
+    /// principal has to work BEFORE its session is live (the vendor uses it
+    /// during spawn) and has to be verifiable WITHOUT this gateway's lock (the
+    /// vendor's `/mcp` call happens while a spawn path may be holding it).
+    principals: Arc<crate::principals::SessionPrincipals>,
     /// v0.8.24 Track D — optional satellite agent proxy for remote-host
     /// stdio spawn. `None` ⇒ production [`crate::remote_host::HttpRemoteHostProxy`].
     remote_host_proxy: Option<std::sync::Arc<dyn crate::remote_host::RemoteHostProxy>>,
@@ -826,6 +861,21 @@ pub struct SessionView {
     /// v0.9.0 W2 (F2/F5) — delegation depth (root = 0). `#[serde(default)]`.
     #[serde(default)]
     pub delegation_depth: u32,
+    /// Whether ccteam holds this session's thread and can therefore send it
+    /// work (dispatch / steer / stop). `true` for every managed session;
+    /// `false` for a hand-started client that enrolled over `POST /mcp` — it is
+    /// a real ledger node and a real delegation parent, but its own operator
+    /// drives it (see [`crate::external_nodes`]). Consumers must gate every
+    /// drive affordance on this rather than on "is it in the list".
+    /// `#[serde(default = "…")]` reads back `true` for a payload written before
+    /// the field existed, where every row was a managed session.
+    #[serde(default = "session_view_driveable_default")]
+    pub driveable: bool,
+}
+
+/// Pre-`driveable` payloads only ever described managed sessions.
+fn session_view_driveable_default() -> bool {
+    true
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -1268,6 +1318,12 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
         in_menu: true,
     },
     GatewayCommandSpec {
+        name: "/mcp",
+        arg_hint: None,
+        help: "check this session's ccteam tool face (and what restores it)",
+        in_menu: false,
+    },
+    GatewayCommandSpec {
         name: "/inbox",
         arg_hint: Some("[<time> <text>|cancel <dN>]"),
         help: "list, schedule, or cancel delayed user messages",
@@ -1454,6 +1510,7 @@ impl Gateway {
             current_project: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
+            external_nodes: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
             next_scheduled: 0,
@@ -1469,6 +1526,7 @@ impl Gateway {
             config: None,
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
+            principals: Arc::new(crate::principals::SessionPrincipals::new()),
             remote_host_proxy: None,
             local_vendor_availability_override: None,
             delegations: std::collections::HashMap::new(),
@@ -1635,6 +1693,18 @@ impl Gateway {
         meta: &SessionMeta,
         reply_to: &ChatKey,
     ) -> Result<MetaRebuildPlan> {
+        // Every rebuild path funnels through here (cold-start restore, `/use`
+        // resume, external adopt), so the "ccteam never drives an external
+        // node" line is drawn once: a rebuild would spawn a NEW vendor process
+        // wearing a hand-started agent's sid and identity. A takeover is a real
+        // transition — flip `managed_by` first, then rebuild.
+        if meta.managed_by == ccteam_harness::execution::session_meta::ManagedBy::External {
+            anyhow::bail!(
+                "session {} is a hand-started agent that enrolled with ccteam (external); \
+                 ccteam holds no thread for it and cannot re-spawn one in its place",
+                meta.sid
+            );
+        }
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         let model_id = meta
@@ -1652,6 +1722,16 @@ impl Gateway {
         } else {
             meta.role.clone()
         };
+        // Same contract as a fresh plan: the secret has to verify while the
+        // vendor is spawning, not only once the rebuilt session is applied.
+        let rebuild_secret = ccteam_core::session_secret::mint();
+        self.principals.reserve(
+            &meta.sid,
+            &rebuild_secret,
+            slug,
+            &meta.role,
+            meta.delegation_depth,
+        );
         Ok(MetaRebuildPlan {
             sid: meta.sid.clone(),
             slug: slug.to_string(),
@@ -1667,7 +1747,7 @@ impl Gateway {
             handle,
             model_id,
             effort: meta.effort.clone(),
-            secret: ccteam_core::session_secret::mint(),
+            secret: rebuild_secret,
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
@@ -1704,21 +1784,24 @@ impl Gateway {
         // and LOSE all ccteam MCP tools (it could no longer delegate).
         // ACP/codex pass mcpServers inline with the current secret each resume,
         // so this file rewrite is the one gap. Best-effort (mirrors fresh path).
-        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
-        {
-            let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
-                sid: &plan.sid,
-                secret: &plan.secret,
-                http_url: None,
-            };
-            if let Err(e) =
-                ccteam_harness::execution::mcp_config::write_session_mcp_config(&plan.cwd, &input)
+        // `resolve` IS the principal check (no sid/secret -> no tool face), so
+        // this path no longer repeats it.
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) {
+            if let Some(endpoint) =
+                ccteam_harness::execution::mcp_config::SessionMcpEndpoint::resolve(
+                    &plan.sid,
+                    &plan.secret,
+                )
             {
-                tracing::warn!(
-                    sid = %plan.sid,
-                    error = %e,
-                    "curated mcp.json rewrite on resume failed; session continues without MCP"
-                );
+                if let Err(e) = ccteam_harness::execution::mcp_config::write_session_mcp_config(
+                    &plan.cwd, &plan.sid, &endpoint,
+                ) {
+                    tracing::warn!(
+                        sid = %plan.sid,
+                        error = %e,
+                        "curated mcp.json rewrite on resume failed; session continues without MCP"
+                    );
+                }
             }
         }
         plan.adapter
@@ -1753,6 +1836,14 @@ impl Gateway {
         let sid = plan.sid.clone();
         let excluded = self.live_capacity_exclusions(&sid, plan.parent_sid.as_deref());
         self.ensure_live_capacity(&excluded).await;
+        // Rebuilt session is live: full authority, same secret.
+        self.principals.promote(
+            &sid,
+            &plan.secret,
+            &plan.slug,
+            &plan.role,
+            plan.delegation_depth,
+        );
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -1774,6 +1865,7 @@ impl Gateway {
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
+                tool_face_primed: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -1801,7 +1893,13 @@ impl Gateway {
         reply_to: ChatKey,
     ) -> Result<()> {
         let plan = self.plan_session_rebuild(slug, cwd, meta, &reply_to)?;
-        let thread = Self::spawn_for_plan(&plan).await?;
+        let thread = match Self::spawn_for_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.forget_principal(&plan.sid);
+                return Err(err.into());
+            }
+        };
         self.apply_rebuilt_session(plan, thread, reply_to).await;
         Ok(())
     }
@@ -1914,6 +2012,7 @@ impl Gateway {
                         .await;
                 }
                 Err(err) => {
+                    gateway.lock().await.forget_principal(&plan.sid);
                     tracing::warn!(
                         session = %plan.sid,
                         error = %err,
@@ -2126,7 +2225,7 @@ impl Gateway {
     /// submitted turn text is wrapped in a `<channel …>` tag naming each
     /// file's on-disk path, so the agent `Read`s it — the load-bearing
     /// Read convention is taught by the daemon's MCP server instructions
-    /// (`ccteam mcp-serve` `initialize`).
+    /// (the `initialize` response, on whichever transport the session holds).
     // v0.8.5 D3 added the `selection` arg (inbound option click); the
     // per-field inbound signature is the established shape (same as the
     // daemon's `deliver_progress`), so allow the arg count.
@@ -2360,7 +2459,13 @@ impl Gateway {
             };
             if let EnsureSessionOutcome::Spawn(plan) = outcome {
                 // The slow part — deliberately NO gateway lock held here.
-                let thread = Self::spawn_for_new_session_plan(&plan).await?;
+                let thread = match Self::spawn_for_new_session_plan(&plan).await {
+                    Ok(thread) => thread,
+                    Err(err) => {
+                        gateway.lock().await.forget_principal(&plan.id);
+                        return Err(err.into());
+                    }
+                };
                 let sid = {
                     let mut g = gateway.lock().await;
                     let outcome = g.apply_new_session(*plan, thread, None).await?;
@@ -2619,6 +2724,7 @@ impl Gateway {
                 }
             }
             "/status" => Ok(Some(self.render_status(chat).await)),
+            "/mcp" => self.rebuild_tool_surface(chat).await.map(Some),
             "/projects" => {
                 // Button-capable channel (Telegram) → a text header + one inline
                 // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
@@ -3137,7 +3243,13 @@ impl Gateway {
         match self.plan_ensure_current_session(chat)? {
             EnsureSessionOutcome::AlreadyHasSession => Ok(()),
             EnsureSessionOutcome::Spawn(plan) => {
-                let thread = Self::spawn_for_new_session_plan(&plan).await?;
+                let thread = match Self::spawn_for_new_session_plan(&plan).await {
+                    Ok(thread) => thread,
+                    Err(err) => {
+                        self.forget_principal(&plan.id);
+                        return Err(err.into());
+                    }
+                };
                 let outcome = self.apply_new_session(*plan, thread, None).await?;
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
@@ -3381,7 +3493,13 @@ impl Gateway {
             tuning,
         )?;
         plan.remote = host_target.remote;
-        let thread = Self::spawn_for_new_session_plan(&plan).await?;
+        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.forget_principal(&plan.id);
+                return Err(err.into());
+            }
+        };
         let outcome = self.apply_new_session(plan, thread, None).await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
         Ok(outcome)
@@ -3471,6 +3589,13 @@ impl Gateway {
         // in-pane stdio forwarder can authenticate `session_*` calls against
         // this session's stored secret instead of a spoofable plaintext role.
         let secret = ccteam_core::session_secret::mint();
+        // The vendor is handed this secret as part of the spawn and USES it
+        // before the spawn returns (OpenCode dials `/mcp` inside `session/new`;
+        // Pi's bridge blocks `session_start` on `initialize` + `tools/list`).
+        // Registering it only at apply made those handshakes authenticate
+        // against a session that did not exist yet — a 401 the vendor answers
+        // by burning its 30s MCP startup timeout, on EVERY managed spawn.
+        self.principals.reserve(&id, &secret, &project, &role, 0);
         let adapter = (self.adapter_factory)(vendor, protocol);
         // Ownership is decided HERE, the one sync core every fresh spawn funnels
         // through (IM `/new` → `start_session`, REST `POST …/sessions` →
@@ -3537,21 +3662,22 @@ impl Gateway {
         // well-known (chat/<sid>/mcp.json); the adapter attaches --mcp-config
         // when the file exists. Best-effort: spawn still proceeds if write fails
         // (session runs without in-agent ccteam tools).
-        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) && !plan.secret.is_empty()
-        {
-            let input = ccteam_harness::execution::mcp_config::CuratedMcpInput {
-                sid: &plan.id,
-                secret: &plan.secret,
-                http_url: None,
-            };
-            if let Err(e) =
-                ccteam_harness::execution::mcp_config::write_session_mcp_config(&plan.cwd, &input)
+        if claude_session_mcp_config_applies(plan.vendor, plan.protocol) {
+            if let Some(endpoint) =
+                ccteam_harness::execution::mcp_config::SessionMcpEndpoint::resolve(
+                    &plan.id,
+                    &plan.secret,
+                )
             {
-                tracing::warn!(
-                    sid = %plan.id,
-                    error = %e,
-                    "curated mcp.json write failed; session continues without MCP"
-                );
+                if let Err(e) = ccteam_harness::execution::mcp_config::write_session_mcp_config(
+                    &plan.cwd, &plan.id, &endpoint,
+                ) {
+                    tracing::warn!(
+                        sid = %plan.id,
+                        error = %e,
+                        "curated mcp.json write failed; session continues without MCP"
+                    );
+                }
             }
         }
         plan.adapter
@@ -3621,6 +3747,10 @@ impl Gateway {
         let owner_channel = reply_to.channel.clone();
         let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
         self.ensure_live_capacity(&excluded).await;
+        // The session is live: the same secret now carries full authority
+        // (`Spawning` only ever allowed tool-face discovery).
+        self.principals
+            .promote(&id, &secret, &project, &role, delegation_depth);
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -3644,6 +3774,7 @@ impl Gateway {
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
+                tool_face_primed: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -3690,6 +3821,7 @@ impl Gateway {
                 }
             });
             let meta = SessionMeta {
+                managed_by: Default::default(),
                 sid: id.clone(),
                 slug: meta_project.clone(),
                 vendor,
@@ -3699,6 +3831,7 @@ impl Gateway {
                 owner: owner_tag,
                 vendor_uuid: meta_vendor_uuid,
                 model: model_id,
+                observed_model: None,
                 effort: effort_meta,
                 host: host.clone(),
                 created_at: now.clone(),
@@ -3886,6 +4019,7 @@ impl Gateway {
                 pending_reaction: Arc::new(std::sync::Mutex::new(None)),
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
+                tool_face_primed: Arc::new(AtomicBool::new(false)),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -4036,6 +4170,11 @@ impl Gateway {
             // and PROGRESS (one live, edited status message per turn).
             let progress_on = progress_enabled();
             let throttle = progress_throttle();
+            // The session's INBOUND attachment. Deliberately re-acquired, not
+            // snapshotted once: `events()` attaches to the transport that
+            // carries the session NOW (see `HarnessAdapter::events`), and the
+            // state machine below rebuilds it whenever a stream ends.
+            let attachment = session.adapter.event_attachment();
             let mut events = session.adapter.events(&session.thread);
             let mut seq: u64 = 0; // answer sequence → message ids
             let mut epoch: u64 = 0; // status epoch → one per turn
@@ -4065,17 +4204,28 @@ impl Gateway {
             // per-session pump's own `tokio::select!` loop (one fewer task per
             // turn; the pump already lives for the session's whole lifetime).
             // `watch_timeout == 0` disables it entirely (matches the pre-fold
-            // early return). `stream_ended` tracks whether the adapter's own
-            // event stream has terminated (child exited): once it has, the
-            // `events.next()` branch is permanently disabled (a `select!`
-            // guard, not a `break`) so this loop doesn't hot-spin re-polling
-            // an exhausted stream, but the watchdog keeps ticking (mirrors the
+            // early return). The `events.next()` branch is gated on `streaming`
+            // (a `select!` guard, not a `break`) so the loop never hot-spins on
+            // an exhausted stream, while the watchdog keeps ticking (mirrors the
             // pre-fold design, where the watchdog task was fully independent
             // of the pump's own stream lifecycle — a dead/hung child still
             // gets the heads-up).
             let watch_timeout = gateway_turn_timeout_duration();
             let watch_poll = watch_timeout.min(std::time::Duration::from_secs(10));
-            let mut stream_ended = false;
+            // ---- inbound attachment state (2026-08-09) ----
+            // `events` holds a pollable stream.
+            let mut streaming = true;
+            // No further attachment is possible (a one-shot stream that ended).
+            let mut closed = false;
+            // Set the moment a vendor stream ends and cleared by the first
+            // event that proves a rebuilt attachment: `(detached_at, attempts)`.
+            // While it is `Some` the session is BLIND, and an `Error` arriving
+            // on the unproven stream is an attach diagnostic (a failed re-dial),
+            // not a turn outcome.
+            let mut detached: Option<(Instant, u32)> = None;
+            // `events` holds the synthetic detach report rather than a vendor
+            // attachment — its end must not be read as a second detach.
+            let mut reporting = false;
             let mut watch_tracked_turn: Option<String> = None;
             let mut watch_idle = std::time::Duration::ZERO;
             let mut watch_last_activity: u64 = 0;
@@ -4117,17 +4267,156 @@ impl Gateway {
                         tokio::time::sleep(watch_poll).await;
                     }
                 };
+                // Re-attach timer, armed only while the session is detached and
+                // a rebuild is still possible. Backoff is per attempt so a
+                // vendor that is genuinely down is retried at a 60s floor
+                // forever rather than given up on: the session outlives any one
+                // transport, so the pump keeps offering to re-attach for as
+                // long as the session is live.
+                let reattach_tick = async {
+                    match detached {
+                        Some((_, attempts)) if !streaming && !closed => {
+                            tokio::time::sleep(reattach_backoff(attempts)).await;
+                        }
+                        _ => std::future::pending::<()>().await,
+                    }
+                };
 
                 tokio::select! {
                     biased;
-                    maybe = events.next(), if !stream_ended => {
+                    maybe = events.next(), if streaming => {
                         let Some(evt) = maybe else {
-                            stream_ended = true;
-                            if watch_timeout.is_zero() {
-                                break;
+                            streaming = false;
+                            if reporting {
+                                // The synthetic detach report drained; the
+                                // re-attach schedule below owns what happens next.
+                                reporting = false;
+                                continue;
+                            }
+                            if attachment == EventAttachment::OneShot {
+                                // Nothing to rebuild (terminal protocol tails a
+                                // transcript from a cursor; a second tail loop
+                                // would double every answer). Keep the watchdog
+                                // ticking, exactly as before.
+                                closed = true;
+                                if watch_timeout.is_zero() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // A vendor stream ended. That is an ATTACHMENT fact,
+                            // never a session fact — the sid is still live and
+                            // the write path (resume-by-sid / re-dial) already
+                            // rebuilds itself. Record the blind window, tell the
+                            // truth about any turn it swallowed, and rebuild.
+                            if detached.is_none() {
+                                detached = Some((Instant::now(), 0));
+                                if let Some(ppath) = progress_path.as_ref() {
+                                    let ev = ccteam_core::progress::build_session_stream_detached_event(
+                                        &session.role,
+                                        &session_id,
+                                        &session.project,
+                                        "stream_ended",
+                                    );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "pump: failed to record session_stream_detached"
+                                        );
+                                    }
+                                }
+                                tracing::warn!(
+                                    session = %session_id,
+                                    vendor = ?pump_vendor,
+                                    "pump: inbound event stream detached — re-attaching"
+                                );
+                                // A turn that was in flight died with the
+                                // transport carrying it: whatever completion it
+                                // had is on the far side of a connection that no
+                                // longer exists. Feed the loss through the SAME
+                                // path a vendor-reported failure takes (one
+                                // terminal ledger row, one turns.jsonl `failed`
+                                // record, one parent notification, one IM
+                                // message) instead of leaving the session
+                                // "working" forever.
+                                let open_turn = session
+                                    .turn_started_at
+                                    .lock()
+                                    .map(|g| g.is_some())
+                                    .unwrap_or(false);
+                                if open_turn {
+                                    let turn_id = session
+                                        .watched_turn
+                                        .lock()
+                                        .ok()
+                                        .and_then(|g| g.as_ref().map(|(id, _)| id.clone()))
+                                        .or_else(|| {
+                                            heartbeat_turn.as_ref().map(|(id, _)| id.clone())
+                                        })
+                                        .unwrap_or_default();
+                                    events = Box::pin(futures::stream::once(async move {
+                                        ThreadEvent::Error(ccteam_harness::ThreadErrorEvent {
+                                            kind: "stream_detached".to_string(),
+                                            message: detached_turn_message(&turn_id),
+                                        })
+                                    }));
+                                    reporting = true;
+                                    streaming = true;
+                                }
                             }
                             continue;
                         };
+                        // First event on a rebuilt attachment — but only a
+                        // non-`Error` one proves it. A failed re-dial surfaces as
+                        // a single `Error` followed by the stream ending again,
+                        // so forwarding it would put one message per retry in
+                        // the chat. Nothing is lost by holding it back: if a
+                        // turn was open, the detach above ALREADY reported and
+                        // closed it, and if none was, a connect diagnostic is
+                        // not a turn boundary. An adapter's own in-flight-loss
+                        // signal arrives on the PROVEN attachment (before its
+                        // stream ends), so it is never the event suppressed here.
+                        if detached.is_some() && !reporting {
+                            if let ThreadEvent::Error(err) = &evt {
+                                tracing::warn!(
+                                    session = %session_id,
+                                    kind = %err.kind,
+                                    error = %err.message,
+                                    "pump: re-attach attempt failed"
+                                );
+                                continue;
+                            }
+                            if let Some((since, attempts)) = detached.take() {
+                                let gap_ms = since.elapsed().as_millis() as u64;
+                                if let Some(ppath) = progress_path.as_ref() {
+                                    let ev = ccteam_core::progress::build_session_stream_reattached_event(
+                                        &session.role,
+                                        &session_id,
+                                        &session.project,
+                                        gap_ms,
+                                        attempts,
+                                    );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "pump: failed to record session_stream_reattached"
+                                        );
+                                    }
+                                }
+                                tracing::info!(
+                                    session = %session_id,
+                                    gap_ms,
+                                    attempts,
+                                    "pump: inbound event stream re-attached"
+                                );
+                            }
+                        }
                         // Liveness tick: ANY event (assistant delta, tool-use,
                         // progress, turn-completed) means the turn is doing work,
                         // so the turn-timeout watchdog resets its idle clock. Only
@@ -4552,6 +4841,21 @@ impl Gateway {
                                         "stream-json pump: failed to mirror chat_turn_completed"
                                     );
                                 }
+                                // Fold the row just appended into meta.json NOW.
+                                // The other refresh rides the ANSWER mirror, which
+                                // precedes this event — so a one-turn session has
+                                // no later answer to piggyback on, and its
+                                // cost/tokens/observed_model stayed blank forever
+                                // (the team view's empty 模型/成本 columns for
+                                // every quick probe).
+                                if let Some(dir) = project_dir.as_ref() {
+                                    refresh_session_activity_meta(
+                                        dir,
+                                        &session_id,
+                                        session.vendor,
+                                        progress_path.as_deref(),
+                                    );
+                                }
                             }
                         }
                         if let Some(text) = async_event_text(&evt) {
@@ -4831,6 +5135,18 @@ impl Gateway {
                             break;
                         }
                     }
+                    _ = reattach_tick, if !streaming && !closed && detached.is_some() => {
+                        // Rebuild against the CURRENT transport. `events()` is
+                        // subscription-based on every rebuildable protocol, so
+                        // this replays nothing; if the transport is still gone
+                        // the new stream simply ends again and the backoff
+                        // widens.
+                        if let Some((_, attempts)) = detached.as_mut() {
+                            *attempts = attempts.saturating_add(1);
+                        }
+                        events = session.adapter.events(&session.thread);
+                        streaming = true;
+                    }
                     _ = watchdog_tick => {
                         // Snapshot + release immediately (never hold this
                         // std::sync::Mutex across an .await).
@@ -4977,6 +5293,14 @@ impl Gateway {
             .projects
             .values()
             .flat_map(|dir| list_session_metas(dir))
+            // An external node's `meta.json` describes a process ccteam never
+            // started and whose client died with the daemon. There is nothing to
+            // rebuild: spawning a vendor in its place would mint a managed
+            // thread wearing another agent's identity. The meta stays as audit;
+            // the client re-enrolls (a fresh `initialize`) if it comes back.
+            .filter(|meta| {
+                meta.managed_by != ccteam_harness::execution::session_meta::ManagedBy::External
+            })
             .map(|meta| meta.sid)
             .collect();
     }
@@ -6096,6 +6420,10 @@ impl Gateway {
         // assistant side, so without this the user's message is lost on a
         // history reseed / session switch).
         let user_text = payload.clone();
+        // The session is about to do work under THIS daemon for the first
+        // time — rebuild its tool face before the turn rather than discover
+        // it is gone from the agent's failed tool call.
+        self.prime_tool_surface(session_id).await;
         // Submit with reactive resume-and-retry: a turn is idempotent on a
         // `ThreadDied` (the child exited before the line was delivered), so on
         // that signal resume-by-sid and retry EXACTLY once — closing the
@@ -6447,6 +6775,170 @@ impl Gateway {
             free_text: None,
         };
         self.apply_pending(chat, p, selection).await
+    }
+
+    /// Ask about a session's ccteam tool face the FIRST time it is activated
+    /// under this daemon — once per session per daemon lifetime, then never
+    /// again (the flag is on the session, which does not outlive the daemon's
+    /// live map).
+    ///
+    /// This is the automatic half of the tool-face contract, and it exists
+    /// because the manual half cannot serve the sessions that need it most: a
+    /// child session is driven by its PARENT agent, so there is nobody to type
+    /// `/mcp` into it, and a child whose MCP client died is not visibly broken
+    /// — it works normally right up until it tries to delegate.
+    ///
+    /// What it can DO about a dead one is state it. No vendor reapplies its MCP
+    /// config to a live session (see [`ccteam_harness::ToolSurfaceRebuild`]), so
+    /// the adapter answers with what WOULD restore the face and this probe logs
+    /// that next to [`Self::assert_principal_reached_the_session`] — together,
+    /// the diagnostic pair for "this session's tools are not its own".
+    ///
+    /// "First activation" rather than "endpoint came back" on purpose. Which
+    /// children predate the current endpoint is not knowable from the gateway
+    /// (a satellite may hold one across a main-daemon restart; a local one can
+    /// start in the seconds before the web bind is listening), and a blanket
+    /// broadcast at daemon start would probe every healthy client for nothing.
+    /// Asking at the moment the session first does work costs one adapter call,
+    /// at the point where a stale tool face is about to matter.
+    ///
+    /// Never fails a turn: an answer that errors or times out is logged and
+    /// the turn proceeds — a session with a doubtful tool face is still a
+    /// session that can answer.
+    async fn prime_tool_surface(&self, session_id: &str) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        if session.tool_face_primed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let adapter = Arc::clone(&session.adapter);
+        let thread = session.thread.clone();
+        let sid = session_id.to_string();
+        match tokio::time::timeout(
+            TOOL_FACE_PRIME_TIMEOUT,
+            adapter.rebuild_tool_surface(&thread),
+        )
+        .await
+        {
+            Ok(Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason })) => {
+                tracing::debug!(session = %sid, %reason, "ccteam-im: tool face cannot be rebuilt in place");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(session = %sid, error = %err, "ccteam-im: tool-face probe failed; the turn proceeds");
+            }
+            Err(_) => {
+                tracing::warn!(session = %sid, "ccteam-im: tool-face probe timed out; the turn proceeds");
+            }
+        }
+        self.assert_principal_reached_the_session(&sid);
+    }
+
+    /// Did the session actually CALL with the credential ccteam minted for it?
+    ///
+    /// By first activation a healthy session has already spent its principal on
+    /// `initialize` + `tools/list`, so a principal with no recorded use means
+    /// the tool face it is holding authenticated as somebody else — in
+    /// practice a same-named `ccteam` entry from the host's global vendor
+    /// config. Nothing about the session looks broken when that happens: the
+    /// tools work, and only the consequences are visible (children mount as
+    /// roots, project scope is not the session's own, completion
+    /// notifications have nowhere to go).
+    ///
+    /// **This is a measurement, not a belt-and-braces check.** The override a
+    /// managed session relies on is only ENFORCED where the vendor gives ccteam
+    /// a lever for it (Claude `--strict-mcp-config`; Codex's per-thread
+    /// `config.mcp_servers`). On the ACP path no such lever exists, so the
+    /// daemon wins server-side instead: `/mcp` re-binds a loopback caller to
+    /// the managed session whose process subtree it belongs to
+    /// (`ccteam_harness::execution::vendor_pids`), and a successful provenance
+    /// attach records first use exactly like a presented credential. What is
+    /// verified here is therefore the UNION of both paths — a warning means
+    /// neither the minted credential nor provenance ever reached the session
+    /// (a non-linux daemon host, or a vendor whose MCP client never dialed
+    /// in). See `ccteam_harness::execution::mcp_config`'s module doc for the
+    /// per-dialect evidence.
+    ///
+    /// Loud, never fatal: a warn plus the same `SessionLifecycle` signal family
+    /// eviction uses ([`Self::emit_session_evicted`]), so the condition shows up
+    /// on the web event stream instead of only in a log nobody tails. It stays
+    /// broadcast-only (IM has no `SessionLifecycle` representation), so a
+    /// degraded identity never turns into chat noise in the parent's thread. A
+    /// session with a doubtful identity is still a session that can answer, and
+    /// a spawn is never failed on a diagnostic.
+    ///
+    /// Not yet durable: a `progress.jsonl` twin needs a new kind in
+    /// `harness/progress_bridge`, the schema's single authority, which this
+    /// change deliberately does not touch.
+    fn assert_principal_reached_the_session(&self, sid: &str) {
+        if self.principals.was_used(sid) {
+            return;
+        }
+        let (slug, vendor) = match self.sessions.get(sid) {
+            Some(session) => (session.project.clone(), session.vendor),
+            // Gone from the live map between the probe and here: still worth
+            // saying, just without the coordinates.
+            None => (String::new(), AgentVendor::Claude),
+        };
+        tracing::warn!(
+            session = %sid,
+            %slug,
+            vendor = %vendor_str(vendor),
+            "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); neither the credential ccteam handed this session nor `/mcp` process provenance ever reached it (vendor kept a same-named `ccteam` entry AND the peer could not be resolved to this session's process tree — non-linux daemon host, or its MCP client never dialed in)"
+        );
+        self.emit_user_signal(GatewayEvent {
+            id: format!("principal-unused-{sid}"),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!(
+                "{sid}: ccteam tools are running as this machine, not as this session"
+            ),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: "identity_degraded".to_string(),
+                reason: format!(
+                    "the {} session never presented its own principal: its vendor served the ccteam tool face from its global config, so children mount as roots and its project scope is not its own",
+                    vendor_str(vendor)
+                ),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+            slug: (!slug.is_empty()).then_some(slug),
+        });
+    }
+
+    /// `/mcp` — ask about the current session's ccteam TOOL FACE.
+    ///
+    /// The outbound twin of the pump's inbound re-attach: ccteam reaches into a
+    /// session through its event stream, and the session reaches back through
+    /// its own MCP client aimed at daemon `POST /mcp`. Restarting the daemon
+    /// kills that client, and no vendor retries a failed MCP server on its own,
+    /// so a live session can sit there fully functional with no ccteam tools.
+    ///
+    /// Unlike the inbound half, this one cannot be repaired in place: no vendor
+    /// reapplies its MCP config to a live session, and the one that looked like
+    /// it could (claude stream-json's `mcp_reconnect`) was measured swapping the
+    /// session's own principal for the machine credential. So the receipt names
+    /// what WOULD restore the face — normally `/new` — instead of pretending to
+    /// have done it. See [`ccteam_harness::ToolSurfaceRebuild`].
+    async fn rebuild_tool_surface(&self, chat: &ChatKey) -> Result<String> {
+        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+            return Ok("当前没有会话可重连;先 /new 或 /use <sid>".to_string());
+        };
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Ok(format!(
+                "会话 {session_id} 不在活跃列表里;/sessions 查看现有会话"
+            ));
+        };
+        let adapter = Arc::clone(&session.adapter);
+        let thread = session.thread.clone();
+        match adapter.rebuild_tool_surface(&thread).await {
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired { reason }) => {
+                Ok(format!("🔌 {session_id} 无法原地重连:{reason}"))
+            }
+            Err(err) => Ok(format!("🔌 {session_id} 查询工具面失败:{err}")),
+        }
     }
 
     /// Resolve a numeric short-reply (1-based) against the current session's
@@ -7200,9 +7692,64 @@ impl Gateway {
             .and_then(|m| m.title)
     }
 
-    /// Classify live sessions from the same file-backed progress truth and
-    /// with the same `working|idle|stale|stuck` semantics as MCP
-    /// `session_list`. Reads each distinct project's progress stream once.
+    /// The daemon's own in-flight turn state for one session — [`LiveTurn`]
+    /// when a turn is open right now, `None` when the session is between
+    /// turns. Pure in-memory peeks (no I/O, no adapter round-trip), so callers
+    /// can snapshot it under the gateway lock and do the file read after
+    /// releasing it.
+    ///
+    /// The ONE place the `turn_started_at` / `last_event_at` pair is turned
+    /// into a verdict: `/status`'s own header line and every activity surface
+    /// (child rows, MCP, web) read it through here, so no surface can invent a
+    /// second definition of "is this session mid-turn".
+    fn live_turn(
+        &self,
+        session: &GatewaySession,
+        now: Instant,
+    ) -> Option<ccteam_core::stall::LiveTurn> {
+        let started = session.turn_started_at.lock().ok().and_then(|g| *g)?;
+        let last_event = session.last_event_at.lock().ok().and_then(|g| *g);
+        // Silence is measured within THIS turn: `last_event_at` is written only
+        // by the pump, so a freshly submitted turn still carries the PREVIOUS
+        // turn's last event and would open minutes-silent. Clamp to the turn's
+        // own start.
+        let baseline = last_event.map_or(started, |ev| ev.max(started));
+        let mut stuck_after = gateway_turn_timeout_duration();
+        if stuck_after.is_zero() {
+            // Watchdog disabled → keep a fixed threshold so STUCK still works.
+            stuck_after = std::time::Duration::from_secs(300);
+        }
+        Some(ccteam_core::stall::LiveTurn {
+            silent_seconds: now.saturating_duration_since(baseline).as_secs(),
+            elapsed_seconds: now.saturating_duration_since(started).as_secs(),
+            stuck_after_seconds: stuck_after.as_secs(),
+        })
+    }
+
+    /// In-flight turns for every tracked session, keyed by sid. The out-of-crate
+    /// half of [`Gateway::live_turn`]: web / MCP grab this under the same lock
+    /// that hands them `session_views()`, then classify after dropping it.
+    pub fn live_turns(&self) -> std::collections::HashMap<String, ccteam_core::stall::LiveTurn> {
+        let now = Instant::now();
+        self.sessions
+            .values()
+            .filter_map(|s| self.live_turn(s, now).map(|live| (s.id.clone(), live)))
+            .collect()
+    }
+
+    /// One session's in-flight turn by sid — [`Gateway::live_turns`] for callers
+    /// that classify a single session (MCP `session_collect`).
+    pub fn live_turn_for(&self, sid: &str) -> Option<ccteam_core::stall::LiveTurn> {
+        self.sessions
+            .get(sid)
+            .and_then(|s| self.live_turn(s, Instant::now()))
+    }
+
+    /// Classify live sessions through the shared resolver
+    /// (`ccteam_core::stall::classify_session_activity`) — file-backed progress
+    /// truth folded with the daemon's in-flight turns, the same
+    /// `working|idle|stale|stuck` vocabulary MCP `session_list` and the web
+    /// session list report. Reads each distinct project's progress stream once.
     fn session_activity_snapshot(
         &self,
         sessions: &[&GatewaySession],
@@ -7239,16 +7786,18 @@ impl Gateway {
                 });
         }
         let now = chrono::Utc::now();
+        let mono = Instant::now();
         sessions
             .iter()
             .map(|session| {
                 let (events, silent) = project_events
                     .get(&session.project)
                     .expect("every requested project was classified");
-                let activity = ccteam_core::stall::classify_progress_activity_for_sid(
+                let activity = ccteam_core::stall::classify_session_activity(
                     events,
                     &session.id,
                     *silent,
+                    self.live_turn(session, mono),
                     now,
                 )
                 .status
@@ -7267,17 +7816,15 @@ impl Gateway {
     /// [`render_sessions`]; pure rendering (no side effects, no push, no
     /// mutation) — it only renders when the user types `/status`.
     ///
-    /// State derivation (mirrors the turn-timeout watchdog's own "silent for a
-    /// full idle window = stalled" definition, so 🔴 here means exactly what the
-    /// watchdog would flag):
-    /// - `turn_started_at == None` ⇒ 🟢 **idle**.
-    /// - in flight, last event recent (< idle window) ⇒ 🔵 **working** (show
-    ///   `now - start`).
-    /// - in flight, last event stale (≥ idle window) ⇒ 🔴 **STUCK** (show the
-    ///   silent duration).
-    ///
-    /// When the watchdog window is disabled (`CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS
-    /// == 0`), fall back to a fixed 300s stuck threshold so 🔴 still works.
+    /// State derivation = [`Gateway::live_turn`] — the same in-flight verdict
+    /// the child rows, MCP `session_list` and the web session list are given
+    /// (no turn ⇒ 🟢 **idle** · in flight ⇒ 🔵 **working** with `now - start` ·
+    /// in flight and silent for a full watchdog window ⇒ 🔴 **STUCK** with the
+    /// silent duration, exactly what the watchdog itself would flag). This line
+    /// adds one refinement it alone can afford: a BLOCKING subagent is an
+    /// authoritative "still working" straight from the vendor, so it upgrades
+    /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
+    /// which a fleet listing does not pay).
     async fn render_status(&self, chat: &ChatKey) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
@@ -7349,34 +7896,25 @@ impl Gateway {
         // Same vocabulary as the harness turn-end eviction
         // (`RunningTask::outlives_turn`).
         let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
-        let mut stuck_after = gateway_turn_timeout_duration();
-        if stuck_after.is_zero() {
-            stuck_after = std::time::Duration::from_secs(300);
-        }
-        let now = Instant::now();
-        let started = s.turn_started_at.lock().ok().and_then(|g| *g);
-        let last_event = s.last_event_at.lock().ok().and_then(|g| *g);
-        // Silence is measured within THIS turn: `last_event_at` is written only
-        // by the pump, so a freshly submitted turn still carries the PREVIOUS
-        // turn's last event and would open minutes-silent (🔴 STUCK) until its
-        // first event streams back. Clamp the baseline to the turn's own start.
-        let silent_for = started.map(|t| {
-            let baseline = last_event.map_or(t, |ev| ev.max(t));
-            now.saturating_duration_since(baseline)
-        });
-        let (state, detail) = match (started, silent_for) {
-            (None, _) => ("🟢", "idle".to_string()),
+        // Same in-flight verdict the child rows / MCP / web get
+        // ([`Gateway::live_turn`]) — this line only dresses it with durations.
+        let live = self.live_turn(s, Instant::now());
+        let (state, detail) = match live {
+            None => ("🟢", "idle".to_string()),
             // Running subagents ⇒ definitively working (overrides silence).
-            (Some(t), _) if turn_scoped_running => (
-                "🔵",
-                format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+            Some(l) if l.is_stuck() && !turn_scoped_running => (
+                "🔴",
+                format!(
+                    "STUCK {} silent",
+                    humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
+                ),
             ),
-            (Some(_), Some(silent)) if silent >= stuck_after => {
-                ("🔴", format!("STUCK {} silent", humanize_dur(silent)))
-            }
-            (Some(t), _) => (
+            Some(l) => (
                 "🔵",
-                format!("working {}", humanize_dur(now.saturating_duration_since(t))),
+                format!(
+                    "working {}",
+                    humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
+                ),
             ),
         };
 
@@ -7647,7 +8185,12 @@ impl Gateway {
                 let turn_count = meta.as_ref().map(|m| m.turn_count).unwrap_or(0);
                 let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
                 let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
-                let model = meta.as_ref().and_then(|m| m.model.clone());
+                // The requested pick wins when present; the vendor-reported
+                // model fills the gap (an A2A child spawned on the vendor
+                // default would otherwise never show one).
+                let model = meta
+                    .as_ref()
+                    .and_then(|m| m.model.clone().or_else(|| m.observed_model.clone()));
                 // v0.8.23 review item 9 — best-effort (never blocks): a
                 // `try_lock` failure (rare, momentary registry contention)
                 // just reports "not waiting" for this one snapshot rather
@@ -7682,15 +8225,95 @@ impl Gateway {
                     waiting_approval,
                     parent_sid: s.parent_sid.clone(),
                     delegation_depth: s.delegation_depth,
+                    // Every row of the live map is by definition a session
+                    // ccteam holds a thread for.
+                    driveable: true,
                 }
             })
             .collect();
+        // THE merge point for external ledger nodes: every consumer of
+        // `session_views()` (web agents graph, `/status`, projects, the REST
+        // session list, MCP `session_list` + its parent validation) sees a
+        // hand-started client because it is merged HERE and nowhere else — so a
+        // new consumer inherits it instead of having to remember a second map.
+        views.extend(self.external_nodes.values().map(external_node_view));
         views.sort_by(|a, b| {
             b.last_active
                 .cmp(&a.last_active)
                 .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
         });
         views
+    }
+
+    // ── external ledger nodes (hand-started clients) ──────────────────────────
+
+    /// Mint the ledger node for a hand-started client that just enrolled over
+    /// `POST /mcp`: a real sid, a real `meta.json`, a real place in the
+    /// delegation tree — and deliberately no row in the live map. Returns the
+    /// sid, which the caller binds to the client's `Mcp-Session-Id`
+    /// ([`crate::native_bindings::NativeBindings::attach_session`]).
+    ///
+    /// This is what stops a hand-started agent's `session_spawn` children from
+    /// mounting as ROOTS: they now have a parent that exists in the ledger.
+    /// `owner` is the enrollment credential's identity (never self-reported) and
+    /// `slug` must already be a registered project — execution location is a
+    /// project property, so an unknown slug is an error, not a default.
+    pub fn register_external_node(
+        &mut self,
+        slug: &str,
+        owner: &str,
+        client: &str,
+    ) -> Result<String> {
+        self.ensure_project_loaded(slug);
+        // Resolve the project BEFORE the counter bump so a rejected enrollment
+        // doesn't burn an `s{n}`.
+        let cwd = self
+            .projects
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {slug}"))?;
+        self.next_session += 1;
+        // Make the counter durable BEFORE the sid is used (a later failure then
+        // leaves a harmless gap, never a reused sid — red line: monotonic).
+        self.persist_next_sid()?;
+        let sid = format!("s{}", self.next_session);
+        let meta = crate::external_nodes::external_node_meta(
+            &sid,
+            slug,
+            owner,
+            client,
+            crate::external_nodes::vendor_from_client(client),
+        );
+        // Same durable write the managed path uses: one `meta.json` shape means
+        // a later takeover is a field flip, not a data migration.
+        write_session_meta(&cwd, &meta)?;
+        self.external_nodes.insert(sid.clone(), meta);
+        Ok(sid)
+    }
+
+    /// The ledger node for `sid`, or `None` when `sid` is not an enrolled
+    /// hand-started client (unknown, or a managed session).
+    pub fn external_node(&self, sid: &str) -> Option<SessionMeta> {
+        self.external_nodes.get(sid).cloned()
+    }
+
+    /// Whether `sid` is an enrolled hand-started client — i.e. a visible
+    /// session that ccteam must refuse to drive
+    /// ([`crate::external_nodes::not_driveable_error`]).
+    pub fn is_external_node(&self, sid: &str) -> bool {
+        self.external_nodes.contains_key(sid)
+    }
+
+    /// Retire an external node: the client's MCP `DELETE`, or the idle sweep
+    /// that reaps the far more common case of a client that just exited.
+    /// Returns whether it was still indexed (so a second close is a no-op, not
+    /// an error).
+    ///
+    /// The `meta.json` deliberately STAYS on disk — exactly like a stopped
+    /// managed session's — so the delegation history of whatever it spawned
+    /// keeps resolving to a real node.
+    pub fn close_external_node(&mut self, sid: &str) -> bool {
+        self.external_nodes.remove(sid).is_some()
     }
 
     // ── v0.8.21 history / resume / external-import ────────────────────────────
@@ -7817,6 +8440,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
+            managed_by: Default::default(),
             sid: sid.clone(),
             slug: slug.to_string(),
             vendor: AgentVendor::Claude,
@@ -7826,6 +8450,7 @@ impl Gateway {
             owner: owner_tag,
             vendor_uuid: vendor_uuid.to_string(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".to_string(),
             created_at: now.clone(),
@@ -7918,6 +8543,27 @@ impl Gateway {
         })
     }
 
+    /// Like [`Self::session_resolve`], but a STOPPED session answers too — from
+    /// its on-disk `meta.json`, exactly the fallback [`Self::project_slug_for_sid`]
+    /// already grants the ACL gate. For READ-ONLY surfaces (the history endpoint):
+    /// a transcript outlives the live map by design (`session_stop` never purges
+    /// `turns.jsonl`), so "stopped" must not read as "never existed". Drive
+    /// surfaces (dispatch/steer/pane) keep the live-only resolver — a thread you
+    /// can write to is exactly what a stopped session does not have.
+    pub fn session_resolve_any(&self, sid: &str) -> Option<SessionResolve> {
+        if let Some(live) = self.session_resolve(sid) {
+            return Some(live);
+        }
+        let (slug, project_dir, meta) = self.find_meta_for_sid(sid).ok()?;
+        Some(SessionResolve {
+            sid: meta.sid.clone(),
+            role: meta.role.clone(),
+            vendor: vendor_str(meta.vendor).to_string(),
+            project: slug,
+            project_dir,
+        })
+    }
+
     /// Resolve a sid to its `(adapter, thread)` so the caller can query
     /// [`HarnessAdapter::thread_status`] (model + context-window usage for the
     /// web statusline bar) **after dropping the gateway lock**. Returns clones
@@ -7952,19 +8598,38 @@ impl Gateway {
     /// defense-in-depth, NOT a hard boundary. Real isolation = per-agent OS
     /// user / sandbox (deferred). See `ccteam_core::session_secret`.
     pub fn verify_session_principal(&self, sid: &str, presented_secret: &str) -> Option<CallerCtx> {
-        if presented_secret.is_empty() {
-            return None;
-        }
-        let s = self.sessions.get(sid)?;
-        if s.secret.is_empty() || !ccteam_core::session_secret::ct_eq(&s.secret, presented_secret) {
+        // Reads the principal REGISTRY, not the live map: a session's secret
+        // is valid from the moment it is minted (the vendor uses it during
+        // spawn), and only a live principal may invoke tools.
+        let matched = self.principals.verify(sid, presented_secret)?;
+        if !crate::principals::may_invoke_tools(matched.state) {
             return None;
         }
         Some(CallerCtx {
-            sid: s.id.clone(),
-            slug: s.project.clone(),
-            role: s.role.clone(),
-            depth: s.delegation_depth,
+            sid: matched.sid,
+            slug: matched.slug,
+            role: matched.role,
+            depth: matched.depth,
         })
+    }
+
+    /// A spawn that never became a session takes its credential with it. The
+    /// `Spawning` state already withholds every authority except listing the
+    /// tool face, so a leak is untidy rather than dangerous — but a secret for
+    /// a session that does not exist has no reason to keep verifying.
+    fn forget_principal(&self, sid: &str) {
+        self.principals.forget(sid);
+    }
+
+    /// Handle to the `(sid, secret)` registry, so a front door can verify a
+    /// principal WITHOUT taking this gateway's lock. That independence is
+    /// load-bearing, not an optimization: a spawn path may hold the gateway
+    /// lock while the vendor it is spawning calls `/mcp` to build its tool
+    /// face, and sharing one lock across both ends deadlocks the spawn (Pi,
+    /// 2026-08-09: `/new` held the lock, the bridge's `fetch` waited for it,
+    /// the child never read stdin, 30s timeout).
+    pub fn principals(&self) -> Arc<crate::principals::SessionPrincipals> {
+        Arc::clone(&self.principals)
     }
 
     /// v0.8.8 F1 — confirm a HITL-firing `sid` maps to a live tracked session,
@@ -8535,7 +9200,13 @@ impl Gateway {
         plan.delegation_depth = child_depth;
         plan.title = title.clone();
         let child_sid = plan.id.clone();
-        let thread = Self::spawn_for_new_session_plan(&plan).await?;
+        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.forget_principal(&plan.id);
+                return Err(err.into());
+            }
+        };
         let outcome = self
             .apply_new_session(plan, thread, Some("session_spawn"))
             .await?;
@@ -9113,6 +9784,9 @@ impl Gateway {
             .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
+        // The secret dies with the session — before the close, so a racing
+        // `/mcp` call from the dying child cannot slip through behind it.
+        self.principals.forget(sid);
         // Abort the pump before closing so no stale pump keeps draining the
         // retired transcript (mirrors switch_current_role).
         if let Some(pump) = self.event_pumps.remove(sid) {
@@ -9280,16 +9954,68 @@ fn vendor_str(v: AgentVendor) -> &'static str {
     }
 }
 
+/// Project one external ledger node into the shared [`SessionView`] shape, so
+/// a hand-started client reads as the session it is on every surface that lists
+/// sessions.
+///
+/// Everything comes from its `meta.json` (the one ledger shape), and whatever
+/// ccteam cannot observe is left absent rather than invented: no cost/token
+/// fabrication, no `waiting_approval` (ccteam relays no permission request for
+/// a thread it does not hold), no role (nothing was projected onto this
+/// process), and `status` is never `working` — the only liveness ccteam has is
+/// when the client last spoke to `/mcp`, mirrored into `last_active`, so the row
+/// says `idle` and puts the honest silence in `last_activity_seconds`.
+fn external_node_view(meta: &SessionMeta) -> SessionView {
+    let silent_seconds = chrono::DateTime::parse_from_rfc3339(&meta.last_active)
+        .ok()
+        .map(|ts| {
+            (chrono::Utc::now() - ts.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        });
+    SessionView {
+        sid: meta.sid.clone(),
+        project: meta.slug.clone(),
+        role: String::new(),
+        vendor: vendor_str(meta.vendor).to_string(),
+        permission_mode: meta.permission_mode.as_str().to_string(),
+        protocol: meta.protocol.as_str().to_string(),
+        host: if meta.host.is_empty() {
+            "local".to_string()
+        } else {
+            meta.host.clone()
+        },
+        // `current` means "the focused session of some routed chat"; ccteam
+        // routes no chat to a client it cannot submit a turn to.
+        current: false,
+        status: "idle".to_string(),
+        last_activity_seconds: silent_seconds,
+        created_at: meta.created_at.clone(),
+        last_active: meta.last_active.clone(),
+        title: meta.title.clone(),
+        turn_count: meta.turn_count,
+        cost_usd: meta.cost_usd,
+        tokens_total: meta.tokens_total,
+        model: meta.model.clone(),
+        waiting_approval: false,
+        parent_sid: meta.parent_sid.clone(),
+        delegation_depth: meta.delegation_depth,
+        driveable: false,
+    }
+}
+
 /// Whether a session gets the curated per-session `mcp.json` (HTTP + its own
 /// `ccteam-sid:<sid>:<secret>` bearer) that both Claude spawn paths attach with
 /// `--mcp-config`.
 ///
 /// Claude only: codex and the ACP vendors pass their MCP server inline on every
 /// `thread/start` / `session/new`, so they need no file. BOTH Claude protocols
-/// qualify — the global `~/.claude.json` entry is HTTP with the *admin* bearer,
-/// so without this file a managed session would authenticate as admin and lose
-/// its own principal (no delegation parent edge). The single fresh-spawn and
-/// single rebuild call site share this predicate so the two can't drift.
+/// qualify — the global `~/.claude.json` entry is HTTP with a machine-user
+/// ENROLLMENT credential, which identifies the config's owner and not the caller,
+/// so without this file a managed session would be served as an enrolled client
+/// of this user instead of as itself and lose its own principal (no delegation
+/// parent edge). The single fresh-spawn and single rebuild call site share this
+/// predicate so the two can't drift.
 fn claude_session_mcp_config_applies(vendor: AgentVendor, protocol: SessionProtocol) -> bool {
     vendor == AgentVendor::Claude
         && matches!(
@@ -9407,9 +10133,12 @@ fn refresh_session_activity_meta(
         .map(|turns| turns.len() as u64)
         .unwrap_or(meta.turn_count);
     if let Some(path) = progress_path {
-        let (cost_usd, tokens_total) = session_cost_and_tokens(path, sid, vendor);
+        let (cost_usd, tokens_total, observed_model) = session_cost_and_tokens(path, sid, vendor);
         meta.cost_usd = cost_usd;
         meta.tokens_total = tokens_total;
+        if observed_model.is_some() {
+            meta.observed_model = observed_model;
+        }
     }
     let _ = write_session_meta(project_dir, &meta);
 }
@@ -9430,15 +10159,19 @@ fn session_cost_and_tokens(
     progress_path: &Path,
     sid: &str,
     vendor: AgentVendor,
-) -> (Option<f64>, Option<u64>) {
+) -> (Option<f64>, Option<u64>, Option<String>) {
     let Ok(events) = ccteam_core::progress::read_all_events(progress_path) else {
-        return (None, None);
+        return (None, None, None);
     };
     let cost_vendor = vendor.cost_vendor();
     let mut total = 0.0_f64;
     let mut priced = 0usize;
     let mut tokens = 0u64;
     let mut counted = 0usize;
+    // The LAST non-empty model tag wins — same events, one extra fact: the
+    // canonical model the vendor itself stamped on the turn, which is what
+    // `SessionMeta::observed_model` durably shows after the session stops.
+    let mut observed_model: Option<String> = None;
     for ev in &events {
         if ev.get("event").and_then(|v| v.as_str())
             != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
@@ -9447,6 +10180,14 @@ fn session_cost_and_tokens(
         }
         if ev.get("sid").and_then(|v| v.as_str()) != Some(sid) {
             continue;
+        }
+        if let Some(m) = ev
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            observed_model = Some(m.to_string());
         }
         let Some(usage) = ev
             .get("usage")
@@ -9467,6 +10208,7 @@ fn session_cost_and_tokens(
     (
         (priced > 0).then_some(total),
         (counted > 0).then_some(tokens),
+        observed_model,
     )
 }
 
@@ -9671,6 +10413,39 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         self.abort_event_pumps();
     }
+}
+
+/// How long the pump waits before rebuilding a detached inbound attachment:
+/// 250ms, 500ms, 1s … capped at 60s. The first wait is short because the
+/// common case (a shared connection swapped out under an idle session) heals
+/// in milliseconds, and the blind window is exactly the cost. Capping rather
+/// than giving up is the other half: a session outlives any single transport,
+/// so while the session is live the pump keeps offering to re-attach, and a
+/// vendor that comes back after an outage becomes observable again without the
+/// user doing anything.
+fn reattach_backoff(attempts: u32) -> std::time::Duration {
+    const BASE_MS: u64 = 250;
+    const CEILING: std::time::Duration = std::time::Duration::from_secs(60);
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << attempts.min(10))).min(CEILING)
+}
+
+/// The one message a turn gets when its transport disappeared underneath it.
+/// Deliberately routed through the ordinary vendor-failure path (see the
+/// pump's stream-end arm), so a swallowed turn produces the same ledger row,
+/// `turns.jsonl` record and parent notification a vendor-reported failure
+/// would — 兜底不写进账本、不通知父会话,就等于没有兜底.
+fn detached_turn_message(turn_id: &str) -> String {
+    let turn = if turn_id.is_empty() {
+        String::new()
+    } else {
+        format!(" {turn_id}")
+    };
+    format!(
+        "⚠️ The inbound event stream dropped while turn{turn} was running — the transport \
+         carrying it was replaced or its child exited, so this turn can no longer be observed \
+         and is recorded as failed. ccteam re-attaches automatically (its side effects, if any, \
+         are already on disk); resend the task if it produced nothing."
+    )
 }
 
 /// v0.8.x (concurrency review §4.1 P2) — the ONE-SHOT "turn went silent"
@@ -10231,6 +11006,11 @@ fn gateway_reply_wait_duration() -> std::time::Duration {
         .unwrap_or(DEFAULT_MS);
     std::time::Duration::from_millis(ms)
 }
+
+/// Ceiling on the first-activation tool-face rebuild. Short on purpose: it
+/// sits in front of a user's turn, and a vendor that cannot answer a control
+/// request this quickly has a bigger problem than a stale MCP client.
+const TOOL_FACE_PRIME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn gateway_submit_timeout_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5_000;
@@ -11062,6 +11842,291 @@ mod tests {
         ));
     }
 
+    // ── external ledger nodes (hand-started clients) ──────────────────────────
+
+    /// A roleless managed session in project `alpha` — the foil every external
+    /// node assertion below is measured against.
+    async fn spawn_managed(gateway: &mut Gateway) -> String {
+        gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+    }
+
+    /// A hand-started client joins ONE sid namespace: its node cannot collide
+    /// with a managed spawn before or after it, and it lands a real `meta.json`
+    /// marked external (which is what makes it a delegation parent instead of an
+    /// anonymous caller whose children mount as roots).
+    #[tokio::test]
+    async fn external_node_gets_its_own_monotonic_sid_and_ledger_row() {
+        use ccteam_harness::execution::session_meta::{session_meta_path, ManagedBy};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let before = spawn_managed(&mut gateway).await;
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        let after = spawn_managed(&mut gateway).await;
+        assert_eq!(
+            [before.as_str(), node.as_str(), after.as_str()],
+            ["s1", "s2", "s3"],
+            "one monotonic namespace shared with managed spawns"
+        );
+
+        let meta = read_session_meta(tmp.path(), &node).unwrap();
+        assert_eq!(meta.managed_by, ManagedBy::External);
+        assert!(!meta.managed_by.is_driveable());
+        assert_eq!(meta.slug, "alpha");
+        assert_eq!(
+            meta.owner, "user:web-api",
+            "identity comes from the credential"
+        );
+        assert_eq!(meta.vendor, AgentVendor::Codex, "vendor from clientInfo");
+        assert!(meta.vendor_uuid.is_empty(), "no native session id is known");
+        let raw = std::fs::read_to_string(session_meta_path(tmp.path(), &node)).unwrap();
+        assert!(raw.contains("\"managed_by\": \"external\""), "{raw}");
+
+        // The whole point: a ledger row WITHOUT a live-map row.
+        assert!(!gateway.is_session_live(&node));
+        assert!(gateway.is_external_node(&node));
+        assert!(!gateway.is_external_node(&before));
+        assert_eq!(gateway.external_node(&node).map(|m| m.sid), Some(node));
+        assert!(gateway.external_node(&before).is_none());
+
+        // An unregistered project is refused, and refusal burns no sid.
+        assert!(gateway
+            .register_external_node("nope", "user:web-api", "codex")
+            .is_err());
+        assert_eq!(spawn_managed(&mut gateway).await, "s4");
+    }
+
+    /// `driveable` is the one bit every consumer gates drive affordances on:
+    /// true for a managed session, false for a client whose own operator drives
+    /// it. The external row invents nothing it cannot observe.
+    #[tokio::test]
+    async fn session_views_marks_only_managed_sessions_driveable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let managed = spawn_managed(&mut gateway).await;
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+
+        let views = gateway.session_views();
+        assert_eq!(views.len(), 2, "one listing, both kinds of session");
+        let m = views.iter().find(|v| v.sid == managed).unwrap();
+        assert!(m.driveable);
+        assert_eq!(m.status, "live");
+        let n = views.iter().find(|v| v.sid == node).unwrap();
+        assert!(!n.driveable);
+        assert_eq!(n.project, "alpha");
+        assert_eq!(n.vendor, "codex");
+        assert!(n.role.is_empty(), "ccteam projected no role onto it");
+        assert!(!n.current, "ccteam routes no chat to it");
+        assert_eq!(n.status, "idle", "never claims to be working");
+        assert_eq!(n.title.as_deref(), Some("codex/0.144.3"));
+        assert!(!n.last_active.is_empty());
+        assert!(
+            n.last_activity_seconds.is_some(),
+            "recency is derived from meta.last_active"
+        );
+        assert_eq!(
+            (n.cost_usd, n.tokens_total, n.turn_count, n.waiting_approval),
+            (None, None, 0, false),
+            "no cost, token, turn or approval fabrication"
+        );
+
+        // A payload written before the field existed described a managed
+        // session, so it must read back driveable.
+        let legacy: SessionView = serde_json::from_str(
+            r#"{"sid":"s9","project":"alpha","role":"","vendor":"claude","current":true,"status":"live"}"#,
+        )
+        .unwrap();
+        assert!(legacy.driveable);
+    }
+
+    /// The reason external nodes exist: a child spawned BY a hand-started agent
+    /// hangs under it instead of mounting as a root. `session_list`'s tree is
+    /// built purely from `parent_sid` over `session_views()`, and roots are rows
+    /// whose parent is absent from the set — so both rows being present with the
+    /// right linkage is exactly the tree property.
+    #[tokio::test]
+    async fn a_managed_child_stays_under_its_external_parent_in_session_views() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let parent = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        let child = spawn_managed(&mut gateway).await;
+        // The lineage `session_spawn` records for a delegated child.
+        {
+            let session = gateway.sessions.get_mut(&child).unwrap();
+            session.parent_sid = Some(parent.clone());
+            session.delegation_depth = 1;
+        }
+
+        let views = gateway.session_views();
+        let p = views.iter().find(|v| v.sid == parent).unwrap();
+        assert!(p.parent_sid.is_none(), "the node itself is a root");
+        assert!(!p.driveable);
+        let c = views.iter().find(|v| v.sid == child).unwrap();
+        assert_eq!(c.parent_sid.as_deref(), Some(parent.as_str()));
+        assert_eq!(c.delegation_depth, 1);
+        assert!(c.driveable);
+        let sids: HashSet<&str> = views.iter().map(|v| v.sid.as_str()).collect();
+        assert!(
+            sids.contains(parent.as_str()),
+            "the child's parent is IN the set, so the tree nests it instead of \
+             rooting it: {sids:?}"
+        );
+    }
+
+    /// `DELETE` / idle sweep retires the node from the index only. Its
+    /// `meta.json` stays, exactly like a stopped managed session's, so the
+    /// delegation history of whatever it spawned still resolves.
+    #[tokio::test]
+    async fn close_external_node_removes_it_from_views_and_is_idempotent() {
+        use ccteam_harness::execution::session_meta::ManagedBy;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        assert!(gateway.session_views().iter().any(|v| v.sid == node));
+
+        assert!(gateway.close_external_node(&node));
+        assert!(!gateway.session_views().iter().any(|v| v.sid == node));
+        assert!(!gateway.is_external_node(&node));
+        assert!(gateway.external_node(&node).is_none());
+        assert!(
+            !gateway.close_external_node(&node),
+            "a second close is a no-op, not an error"
+        );
+
+        assert_eq!(
+            read_session_meta(tmp.path(), &node).unwrap().managed_by,
+            ManagedBy::External,
+            "the ledger row survives the process"
+        );
+        assert_eq!(
+            gateway.project_slug_for_sid(&node).as_deref(),
+            Some("alpha"),
+            "a retired node still resolves to its project (ACL + audit)"
+        );
+    }
+
+    /// An external node is not a capacity subject in either direction: it never
+    /// occupies a `max_live` slot (ccteam holds no thread) and is never picked
+    /// for eviction (there is nothing to stop). Both follow from it not being in
+    /// `sessions` — this is the fence for anyone tempted to merge the two maps.
+    #[tokio::test]
+    async fn an_external_node_is_never_a_capacity_eviction_candidate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 1 });
+
+        let node = gateway
+            .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+            .unwrap();
+        let first = spawn_managed(&mut gateway).await;
+        assert_eq!(
+            gateway.sessions.len(),
+            1,
+            "the node did not consume the single live slot"
+        );
+        assert!(gateway.is_external_node(&node));
+
+        // The next admission must take the managed session, never the node.
+        let second = spawn_managed(&mut gateway).await;
+        assert!(!gateway.sessions.contains_key(&first));
+        assert!(gateway.sessions.contains_key(&second));
+        assert!(
+            gateway.is_external_node(&node),
+            "an external node is never an eviction candidate"
+        );
+        assert_eq!(gateway.session_views().len(), 2, "node + admitted session");
+
+        // The parent-chain protection walks straight through a non-live parent:
+        // the external sid is listed (harmless — it is no candidate) and the
+        // walk stops there instead of hunting it in `sessions`.
+        assert_eq!(
+            gateway.live_capacity_exclusions(&second, Some(&node)),
+            vec![second.clone(), node.clone()]
+        );
+    }
+
+    /// A cold start must not resurrect a hand-started client: its process died
+    /// with the daemon, so its `meta.json` is audit, not a rebuild instruction —
+    /// re-spawning a vendor in its place would mint a managed thread wearing
+    /// another agent's sid. Covers both entries at once: the meta scan (the only
+    /// restore source that can see external rows — `routing.json.live_sids`
+    /// never held one) and the on-demand `/use` resume.
+    #[tokio::test]
+    async fn cold_start_and_resume_never_rebuild_an_external_node() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let managed;
+        let node;
+        {
+            // No persistence here on purpose: leaving routing.json absent is
+            // what routes the restart through the meta.json recovery scan.
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            managed = spawn_managed(&mut gateway).await;
+            node = gateway
+                .register_external_node("alpha", "user:web-api", "codex/0.144.3")
+                .unwrap();
+        }
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake, "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        assert_eq!(
+            restarted.restore_pending,
+            vec![managed.clone()],
+            "only the managed session is rebuildable"
+        );
+        restarted.resume_restored_sessions().await;
+        assert!(restarted.is_session_live(&managed));
+        assert!(
+            !restarted.is_external_node(&node),
+            "the external index starts empty; the client re-enrolls if it returns"
+        );
+        assert!(!restarted.session_views().iter().any(|v| v.sid == node));
+        assert!(
+            read_session_meta(&project_dir, &node).is_ok(),
+            "the ledger row stays on disk as audit"
+        );
+
+        // Same line at the on-demand entry (`plan_session_rebuild` is the shared
+        // choke point for every rebuild path).
+        let err = restarted
+            .resume_stopped_session(&node, "web:web-api:web-api", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("external"), "got: {err}");
+        assert!(!restarted.is_session_live(&node), "nothing was spawned");
+    }
+
     /// Seed a `.claude/agents/<role>.md` under `project_dir` so the `/role`
     /// existence check (`ccteam_core::read_role`) resolves it. Minimal frontmatter
     /// is enough; the gateway only checks the file exists, not its contents.
@@ -11306,6 +12371,54 @@ mod tests {
         let sink = gw.event_sink.clone().expect("sink wired");
         assert!(sink.send(fake_event(Some("s7"))));
         assert_eq!(sub.recv().await.unwrap().sid.as_deref(), Some("s7"));
+    }
+
+    /// A managed session whose own principal never authenticated is running its
+    /// ccteam tools as the MACHINE (measured on grok 1.0.0: the vendor serves
+    /// the same-named `ccteam` entry from its own global config and no vendor
+    /// lever closes that door — see
+    /// `ccteam_harness::execution::mcp_config`'s module doc). Nothing about such
+    /// a session looks broken, so the ONLY way an operator learns is if ccteam
+    /// says it: a log line plus the `SessionLifecycle` signal the web event
+    /// stream already renders. A healthy session must stay silent, or the signal
+    /// is noise nobody reads.
+    #[tokio::test]
+    async fn principal_never_used_raises_an_operator_visible_signal() {
+        let adapter: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(FakeAdapter::default());
+        let mut gw = Gateway::new(adapter, "demo", std::env::temp_dir());
+        let mut sub = gw.subscribe_events();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(tx);
+
+        // Minted but never presented — the defect's exact shape.
+        gw.principals.reserve("s41", "sekret", "demo", "", 0);
+        gw.assert_principal_reached_the_session("s41");
+        let ev = sub
+            .try_recv()
+            .expect("a degraded identity must be broadcast");
+        assert_eq!(ev.sid.as_deref(), Some("s41"));
+        match &ev.kind {
+            GatewayEventKind::SessionLifecycle { state, reason } => {
+                assert_eq!(state, "identity_degraded");
+                assert!(
+                    reason.contains("principal"),
+                    "the reason must name the cause, got: {reason}"
+                );
+            }
+            other => panic!("expected SessionLifecycle, got {other:?}"),
+        }
+
+        // Once the session HAS authenticated with its own credential there is
+        // nothing to report, on this call or any later one.
+        assert!(
+            gw.principals.verify("s41", "sekret").is_some(),
+            "verify records first use"
+        );
+        gw.assert_principal_reached_the_session("s41");
+        assert!(
+            sub.try_recv().is_err(),
+            "a healthy principal must emit nothing"
+        );
     }
 
     /// v0.8.24 A-U3 — an explicit `SpawnTuning` (composer model + effort)
@@ -11814,6 +12927,22 @@ mod tests {
                 TurnDisposition::Injected => ccteam_harness::TurnSubmission::injected(turn_id),
                 TurnDisposition::Queued => ccteam_harness::TurnSubmission::queued(turn_id),
             })
+        }
+
+        async fn rebuild_tool_surface(
+            &self,
+            _h: &ThreadHandle,
+        ) -> Result<ccteam_harness::ToolSurfaceRebuild, HarnessError> {
+            // Test double: no tool face to rebuild.
+            Ok(ccteam_harness::ToolSurfaceRebuild::RespawnRequired {
+                reason: "test double".to_string(),
+            })
+        }
+
+        fn event_attachment(&self) -> ccteam_harness::EventAttachment {
+            // Scripted test stream: one-shot. Re-attaching would replay
+            // the script, which is exactly what `Rebuildable` forbids.
+            ccteam_harness::EventAttachment::OneShot
         }
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -14719,6 +15848,12 @@ mod tests {
         let meta = meta.expect("failed terminal event must refresh token/cost meta");
         assert_eq!(meta.tokens_total, Some(1_500));
         assert_eq!(meta.cost_usd, Some(0.42));
+        assert_eq!(
+            meta.observed_model.as_deref(),
+            Some("vendor-reported-model"),
+            "the vendor-stamped turn model must survive into meta.json — it is what \
+             the team view shows for this session after it leaves the live map"
+        );
     }
 
     /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
@@ -16534,6 +17669,115 @@ mod tests {
         );
     }
 
+    /// The 2026-08-08 report, from the IM end: `/status` showed every child
+    /// `🟢 idle` while the web console showed the same sessions working. Two
+    /// independent causes, both of which turned "the reader learned nothing"
+    /// into a confident green, and both fixed below the surfaces so the peer
+    /// ends cannot diverge again:
+    /// (1) one torn line (an interrupted append left a partial multi-byte
+    ///     character) failed the WHOLE progress read, and a read error degrades
+    ///     to "no events" everywhere;
+    /// (2) with no events for a sid, the classifier claimed `idle` — even for a
+    ///     session the daemon has an OPEN TURN for.
+    #[tokio::test]
+    async fn gateway_status_child_stays_working_when_the_stream_is_torn_or_silent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.enable_project_creation(paths.clone());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let child = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "researcher".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "s1".into(),
+                    depth: 0,
+                    role: "reviewer".into(),
+                }),
+                Some("delegated investigation".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        // (1) The child's turn IS in the stream — followed by a torn append.
+        let stream = paths.progress_jsonl("alpha");
+        ccteam_core::progress::append_event(
+            &stream,
+            &ccteam_core::progress::build_chat_turn_user_prompt_event(
+                "researcher",
+                &child,
+                "child-turn",
+                "investigate",
+            ),
+        )
+        .unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&stream)
+                .unwrap();
+            // `\xef` opens a 3-byte sequence that never completes.
+            f.write_all(b"{\"event\":\"note\",\"text\":\"\xef").unwrap();
+            f.write_all(b"{\"event\":\"PreToolUse\",\"tool\":\"Bash\"}\n")
+                .unwrap();
+        }
+        let torn = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            torn[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            "a torn line elsewhere in the stream must not blind the child row: {torn:?}"
+        );
+
+        // (2) Now the stream tells the reader NOTHING about the child (rotated,
+        // unreadable, or simply not yet written) — but the daemon holds an open
+        // turn for it. That turn is the honest answer.
+        std::fs::write(&stream, b"").unwrap();
+        {
+            let now = Instant::now();
+            let s = gateway.sessions.get(&child).expect("child session");
+            *s.turn_started_at.lock().unwrap() = Some(now);
+            *s.last_event_at.lock().unwrap() = Some(now);
+        }
+        let silent = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            silent[0].contains(&format!("· {child} · claude · 🟡 working ·")),
+            "an in-flight turn outranks a stream that says nothing: {silent:?}"
+        );
+
+        // …and with no open turn, an uninformative stream still reads idle: the
+        // fold only ever adds work, it never invents it.
+        {
+            let s = gateway.sessions.get(&child).expect("child session");
+            *s.turn_started_at.lock().unwrap() = None;
+        }
+        let idle = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            idle[0].contains(&format!("· {child} · claude · 🟢 idle ·")),
+            "no open turn ⇒ the file verdict stands: {idle:?}"
+        );
+    }
+
     #[tokio::test]
     async fn gateway_status_without_children_keeps_existing_card() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -17228,6 +18472,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -17237,6 +18482,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -17301,6 +18547,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            managed_by: Default::default(),
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -17310,6 +18557,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),

@@ -33,13 +33,17 @@ fn install_mcp_writes_to_claude_config_home_when_set() {
     // don't pollute the developer's real home dir.
     let fake_home = tmp.path().join("fake-home");
     std::fs::create_dir_all(&fake_home).unwrap();
+    // CLAUDE.md isolation rule: pinning HOME alone is not enough — CCTEAM_HOME
+    // wins in root resolution, so the credential this write mints must be
+    // steered into the sandbox too.
+    let ccteam_home = tmp.path().join("ccteam-home");
 
     let bin = env!("CARGO_BIN_EXE_ccteam");
     let out = Command::new(bin)
         .args(["config", "mcp"])
         .env("CLAUDE_CONFIG_HOME", &claude_dir)
         .env("HOME", &fake_home)
-        .env("CCTEAM_HOME", tmp.path().join("ccteam-home"))
+        .env("CCTEAM_HOME", &ccteam_home)
         .output()
         .expect("spawn ccteam config mcp");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -78,5 +82,19 @@ fn install_mcp_writes_to_claude_config_home_when_set() {
         parsed["mcpServers"]["ccteam"].is_object(),
         "expected mcpServers.ccteam in {}; got: {body}",
         expected_json.display(),
+    );
+
+    // What the entry carries is the machine-user ENROLLMENT credential from the
+    // sandboxed home — never the admin web token, which in a shared config file
+    // makes every hand-started vendor process the same caller.
+    let cred = ccteam_core::enroll::list_in(&ccteam_home)
+        .into_iter()
+        .next()
+        .expect("config mcp must mint the machine-user credential");
+    assert_eq!(cred.owner, "user:web-api");
+    assert_eq!(
+        parsed["mcpServers"]["ccteam"]["headers"]["Authorization"],
+        format!("Bearer {}", cred.bearer()),
+        "entry must carry the enrollment bearer; got: {body}"
     );
 }

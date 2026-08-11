@@ -159,6 +159,14 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         // v0.9.0 W4 — team visualization: graph snapshot + global SSE.
         ("GET", "/api/v1/agents/graph"),
         ("GET", "/api/v1/agents/events"),
+        // Enrollment credentials for external / hand-started agents (mint +
+        // ready-to-paste vendor snippets, redacted list, revoke). The
+        // project-scoped mint sits under `/projects/{slug}/` on purpose: that
+        // path shape is what `auth::project_acl_layer` gates.
+        ("GET", "/api/v1/enroll"),
+        ("POST", "/api/v1/enroll"),
+        ("POST", "/api/v1/projects/{slug}/enroll"),
+        ("DELETE", "/api/v1/enroll/{id}"),
     ]
     .into_iter()
     .collect()

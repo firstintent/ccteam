@@ -35,10 +35,11 @@ use crate::gateway::CallerCtx;
 ///   project (`ctx.slug`). Any self-reported `project_arg`/`caller_slug_arg`
 ///   is ignored — this is the security property that a session principal can
 ///   never query another project's host. A missing/failed principal → `Err`.
-/// - **Admin** (HTTP `/mcp` or the local main-session token): the explicit
-///   `project_arg`, else the cwd-resolved `caller_slug_arg` the forwarder
-///   injected, else `None` (fleet caller with no bound project → the panel
-///   falls back to the local host with a note).
+/// - **Admin** (the local mcp.sock admin-token tier — never an HTTP caller):
+///   the explicit `project_arg`, else a supplied `caller_slug_arg` (nothing
+///   ccteam ships injects one since the stdio forwarder was deleted), else
+///   `None` (fleet caller with no bound project → the panel falls back to the
+///   local host with a note).
 pub(crate) fn resolve_status_project(
     caller: McpCaller,
     project_arg: Option<&str>,

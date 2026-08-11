@@ -95,6 +95,10 @@ pub mod queries;
 pub mod roles;
 // v0.8.7 review-fix (R-M1) — per-session cto-gate secret (mint + ct_eq).
 pub mod session_secret;
+// Enrollment credentials — the "whose is this" pointer a vendor's global MCP
+// config carries, in place of a machine-wide shared identity. Per-process
+// identity is issued at `initialize` (see ccteam-web's `/mcp` binding).
+pub mod enroll;
 pub mod silence_classifier;
 pub mod skill;
 // V0.6.0 F115 — spawn-brief template renderer

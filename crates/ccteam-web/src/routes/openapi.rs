@@ -114,9 +114,13 @@ async fn serve_scalar_js() -> impl IntoResponse {
         description = "The `/api/v1` resource surface: capabilities, projects, roles, \
                        sessions (+ turn / events / stop), and workflow panels. \
                        Auth: the same web-token gate as every other `/api/v1` route \
-                       (`Authorization: Bearer ccteam:<hex>` or the `ccteam_token` cookie). \
+                       (`Authorization: Bearer ccteam:<hex>` or the `ccteam_token` cookie) — \
+                       a web token authenticates THIS surface only. \
                        Also available (not REST / not in this spec): `POST /mcp` — \
-                       streamable HTTP MCP (authenticated caller bearer required).",
+                       streamable HTTP MCP, which takes neither of the above: a managed \
+                       session's own `ccteam-sid:<sid>:<secret>`, or an enrolled client's \
+                       `ccteam-enroll:<id>:<secret>` plus the `Mcp-Session-Id` issued at \
+                       `initialize`.",
         version = env!("CARGO_PKG_VERSION"),
     ),
     tags(
@@ -133,6 +137,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "workflow", description = "Workflow dashboard panels (artifacts / cost / jobs)"),
         (name = "auth", description = "Web-token introspection"),
         (name = "config", description = "IM credential configuration (masked read; never echoes secrets)"),
+        (name = "enroll", description = "Enrollment credentials for hand-started / external agents: mint a scoped credential + its ready-to-paste per-vendor MCP config, list (secrets redacted), revoke"),
         (name = "marketplace", description = "ccteam-hub plugin catalog (browse / body preview / per-project install)"),
         (name = "agents", description = "v0.9.0 W4 — team visualization: cross-session graph snapshot + global SSE"),
     ),
@@ -278,6 +283,17 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::marketplace::handle_marketplace_body))
         .routes(routes!(super::marketplace::handle_project_marketplace))
         .routes(routes!(super::marketplace::handle_project_marketplace_install))
+        // Enrollment credentials for external / hand-started agents. GET list
+        // (redacted) + the USER-scoped mint share `/api/v1/enroll`; DELETE
+        // revokes one. The PROJECT-scoped mint deliberately lives under
+        // `/api/v1/projects/{slug}/...` so `auth::project_acl_layer` gates it by
+        // path shape instead of a hand-written check in the handler.
+        .routes(routes!(
+            super::enroll::handle_list_enrollments,
+            super::enroll::handle_mint_enrollment
+        ))
+        .routes(routes!(super::enroll::handle_mint_project_enrollment))
+        .routes(routes!(super::enroll::handle_revoke_enrollment))
         // v0.9.0 W4 — team visualization graph snapshot + global SSE.
         .routes(routes!(super::agents::handle_agents_graph))
         .routes(routes!(super::agents::handle_agents_events))

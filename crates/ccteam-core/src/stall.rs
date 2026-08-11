@@ -171,11 +171,94 @@ pub fn classify_progress_stall(
     }
 }
 
+/// A turn the DAEMON knows is in flight right now for one session — its own
+/// pending state, cheap to read (no I/O) and available only to a caller that
+/// holds the live session map.
+///
+/// This is not a second source of truth: `progress.jsonl` stays the state SoT,
+/// and this only says "the writer has an open turn it has not closed yet".
+/// It matters because the file can go quiet on a reader for reasons that have
+/// nothing to do with the session — a torn line, a rotated stream, an
+/// unreadable path — and every one of those reads as `idle`, which is a lie
+/// about a session that is mid-turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveTurn {
+    /// Seconds since the in-flight turn's most recent event (clamped to the
+    /// turn's own start, so a freshly submitted turn is never born silent).
+    pub silent_seconds: u64,
+    /// Seconds since the turn was submitted — display only (`working 3m`).
+    pub elapsed_seconds: u64,
+    /// The watchdog's idle window: silence at or past it is the same STUCK the
+    /// turn-timeout watchdog would flag.
+    pub stuck_after_seconds: u64,
+}
+
+impl LiveTurn {
+    /// Silent for a full watchdog window ⇒ the watchdog's own STUCK verdict.
+    pub fn is_stuck(&self) -> bool {
+        self.silent_seconds >= self.stuck_after_seconds
+    }
+}
+
+/// **The one session-activity resolver.** Every live surface — IM `/status`,
+/// MCP `session_list` / `session_collect`, the web session list feeding the
+/// SPA rail — answers "what is this session doing" through here, so the two
+/// user-facing ends cannot disagree by construction. Surfaces with no live
+/// view (`ccteam status` and other daemonless readers) pass `live: None` and
+/// get the pure file verdict.
+///
+/// The fold is MONOTONE — an in-flight turn can only report MORE work than the
+/// file did, never silence work the file reported:
+/// - file says STUCK (the watchdog wrote it) ⇒ stays STUCK.
+/// - a turn is in flight ⇒ `working`, or `stuck` once it has been silent for a
+///   full watchdog window (the same definition the watchdog applies).
+/// - no turn in flight ⇒ the file verdict stands; the daemon having no open
+///   turn is itself evidence the session is not mid-turn.
+pub fn classify_session_activity(
+    events: &[Value],
+    sid: &str,
+    fallback_silent_seconds: u64,
+    live: Option<LiveTurn>,
+    now: DateTime<Utc>,
+) -> ProgressActivityStatus {
+    let base = classify_progress_activity_for_sid(events, sid, fallback_silent_seconds, now);
+    let Some(live) = live else {
+        return base;
+    };
+    if base.status.activity == "stuck" {
+        return base;
+    }
+    if live.is_stuck() {
+        return ProgressActivityStatus {
+            status: ProgressStallStatus {
+                level: "stuck",
+                verdict: "STUCK",
+                activity: "stuck",
+            },
+            event_age_seconds: base.event_age_seconds,
+            last_activity_seconds: Some(live.silent_seconds),
+        };
+    }
+    ProgressActivityStatus {
+        status: ProgressStallStatus {
+            level: "ok",
+            verdict: "OK",
+            activity: "working",
+        },
+        event_age_seconds: base.event_age_seconds,
+        // An active turn hides the ever-growing age, same as the file path.
+        last_activity_seconds: None,
+    }
+}
+
 /// Select and classify the read-side activity for one gateway session id.
 ///
 /// The project-level fallback is only the file's global tail event when that
 /// tail has no `sid`/`session_id`, matching the old `last_event` fallback
 /// without letting one session's tail event bleed into its siblings.
+///
+/// File-only: a caller that can see the daemon's in-flight turns wants
+/// [`classify_session_activity`] instead.
 pub fn classify_progress_activity_for_sid(
     events: &[Value],
     sid: &str,
@@ -284,6 +367,80 @@ mod tests {
         assert_eq!(status.level, "warn");
         assert_eq!(status.verdict, "warn");
         assert_eq!(status.activity, "stale");
+    }
+
+    fn live(silent_seconds: u64) -> LiveTurn {
+        LiveTurn {
+            silent_seconds,
+            elapsed_seconds: silent_seconds + 1,
+            stuck_after_seconds: 300,
+        }
+    }
+
+    /// The bug this resolver exists for: an in-flight turn must outrank a file
+    /// that says nothing about the session (unreadable stream, rotated log, no
+    /// event for this sid yet). Without the fold, "no evidence" minted a
+    /// confident `idle` — a session hard at work reported green on every
+    /// surface.
+    #[test]
+    fn live_turn_outranks_an_uninformative_stream() {
+        let now = Utc::now();
+        assert_eq!(
+            classify_session_activity(&[], "s1", 0, None, now)
+                .status
+                .activity,
+            "idle",
+            "no live view (daemonless reader) keeps the file verdict"
+        );
+        let working = classify_session_activity(&[], "s1", 0, Some(live(3)), now);
+        assert_eq!(working.status.activity, "working");
+        // An active turn hides the ever-growing age, same as the file path.
+        assert_eq!(working.last_activity_seconds, None);
+    }
+
+    /// The fold is monotone — it only ever reports MORE work than the file did.
+    #[test]
+    fn live_turn_never_silences_the_file_verdict() {
+        let now = Utc::now();
+        // A completed turn 20 min ago + an in-flight turn = a NEW turn started
+        // after that boundary; the daemon's open turn wins.
+        let idle_tail = vec![serde_json::json!({
+            "event": progress::CHAT_TURN_COMPLETED,
+            "sid": "s1",
+            "ts": (now - chrono::Duration::minutes(20)).to_rfc3339(),
+        })];
+        assert_eq!(
+            classify_session_activity(&idle_tail, "s1", 0, Some(live(5)), now)
+                .status
+                .activity,
+            "working"
+        );
+        // The watchdog's own STUCK verdict is file-backed and never downgraded.
+        let stuck_tail = vec![serde_json::json!({
+            "event": progress::CHAT_TURN_TIMEOUT,
+            "sid": "s1",
+            "stuck": true,
+            "ts": now.to_rfc3339(),
+        })];
+        assert_eq!(
+            classify_session_activity(&stuck_tail, "s1", 0, Some(live(1)), now)
+                .status
+                .activity,
+            "stuck"
+        );
+    }
+
+    /// Silence past the watchdog window is the watchdog's definition of stuck,
+    /// so the shared resolver reaches the same verdict `/status` shows.
+    #[test]
+    fn live_turn_silent_a_full_window_reads_stuck() {
+        let now = Utc::now();
+        let status = classify_session_activity(&[], "s1", 0, Some(live(300)), now);
+        assert_eq!(status.status.activity, "stuck");
+        assert_eq!(status.status.verdict, "STUCK");
+        assert_eq!(status.last_activity_seconds, Some(300));
+        assert!(!live(299).is_stuck());
+        assert!(live(300).is_stuck());
     }
 
     #[test]

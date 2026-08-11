@@ -2983,7 +2983,7 @@ async fn start_thread_injects_per_thread_mcp_config_with_identity() {
     let srv = &start["params"]["config"]["mcp_servers"]["ccteam"];
     assert_eq!(
         srv["url"],
-        ccteam_harness::execution::mcp_config::default_mcp_http_url(),
+        ccteam_harness::execution::mcp_config::daemon_mcp_http_url(),
         "per-thread config must target the daemon HTTP MCP endpoint: {start}"
     );
     assert_eq!(
@@ -3038,6 +3038,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
     // Simulate the "before the restart" state: a prior codex session whose
     // vendor_uuid is persisted in meta.json (what apply_new_session writes).
     let meta = ccteam_harness::SessionMeta {
+        managed_by: Default::default(),
         sid: "codex-r1".into(),
         slug: "demo".into(),
         vendor: AgentVendor::Codex,
@@ -3047,6 +3048,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         owner: "user:web-api".into(),
         vendor_uuid: "t-prior".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: String::new(),
