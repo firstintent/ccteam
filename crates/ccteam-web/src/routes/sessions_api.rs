@@ -483,10 +483,12 @@ pub(crate) async fn handle_session_history(
         return no_gateway();
     };
     // Resolve sid → sid + project_dir under the lock (also our 404 gate),
-    // then drop the guard before touching the filesystem.
+    // then drop the guard before touching the filesystem. Live OR stopped: a
+    // stopped session's transcript outlives the live map by design, and this
+    // endpoint is what the team panel's 最近对话 reads for exactly those rows.
     let resolved = {
         let guard = gw.lock().await;
-        guard.session_resolve(&sid)
+        guard.session_resolve_any(&sid)
     };
     let Some(resolved) = resolved else {
         return unknown_session(&sid);

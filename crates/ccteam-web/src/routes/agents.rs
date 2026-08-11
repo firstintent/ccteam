@@ -68,12 +68,14 @@ pub struct AgentNode {
     pub slug: String,
     pub role: String,
     pub vendor: String,
-    /// The model the session is running RIGHT NOW — for `"live"` nodes only,
-    /// read from the same per-session statusline source as
-    /// `GET /api/v1/sessions/{sid}/status` (`thread_status`, so mid-session
-    /// model switches are reflected). `null` for idle nodes (nothing live to
-    /// report — the spawn-time `meta.json` model override is deliberately not
-    /// echoed) and for live sessions with no statusline yet.
+    /// The session's model: for `"live"` nodes the statusline truth (the same
+    /// per-session source as `GET /api/v1/sessions/{sid}/status`, so
+    /// mid-session model switches are reflected), else the durable
+    /// `meta.json` facts — the requested spawn pick, or failing that the
+    /// model the VENDOR last stamped on a completed turn
+    /// (`SessionMeta::observed_model`, refreshed by the per-turn meta write).
+    /// `null` only when nothing was ever requested OR reported — e.g. an
+    /// external enrolled node ccteam never ran a thread for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// The reasoning-effort level that model runs at (`low`/`medium`/`high`/
@@ -90,6 +92,12 @@ pub struct AgentNode {
     pub depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// Raw token ledger, present even for vendors with no USD price table
+    /// (grok/codex/opencode/kimi) — the honest magnitude signal when
+    /// `cost_usd` cannot exist, same contract as the session list's
+    /// `tokens_total`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub last_active: String,
@@ -198,13 +206,19 @@ pub(crate) fn build_agents_graph(
                 slug: slug.clone(),
                 role: m.role.clone(),
                 vendor: ccteam_im::delegation::vendor_key(m.vendor).to_string(),
-                model: live.and_then(|s| s.model.clone()),
-                effort: live.and_then(|s| s.effort.clone()),
+                model: live
+                    .and_then(|s| s.model.clone())
+                    .or_else(|| m.model.clone())
+                    .or_else(|| m.observed_model.clone()),
+                effort: live
+                    .and_then(|s| s.effort.clone())
+                    .or_else(|| m.effort.clone()),
                 host,
                 status: status.to_string(),
                 parent_sid: m.parent_sid.clone(),
                 depth: m.delegation_depth,
                 cost_usd: m.cost_usd,
+                tokens_total: m.tokens_total,
                 title: m.title.clone(),
                 last_active: m.last_active.clone(),
                 turn_count: m.turn_count,
@@ -473,6 +487,7 @@ mod tests {
             owner: "user:web".to_string(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),

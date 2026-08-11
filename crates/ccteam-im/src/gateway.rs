@@ -3831,6 +3831,7 @@ impl Gateway {
                 owner: owner_tag,
                 vendor_uuid: meta_vendor_uuid,
                 model: model_id,
+                observed_model: None,
                 effort: effort_meta,
                 host: host.clone(),
                 created_at: now.clone(),
@@ -8169,7 +8170,12 @@ impl Gateway {
                 let turn_count = meta.as_ref().map(|m| m.turn_count).unwrap_or(0);
                 let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
                 let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
-                let model = meta.as_ref().and_then(|m| m.model.clone());
+                // The requested pick wins when present; the vendor-reported
+                // model fills the gap (an A2A child spawned on the vendor
+                // default would otherwise never show one).
+                let model = meta
+                    .as_ref()
+                    .and_then(|m| m.model.clone().or_else(|| m.observed_model.clone()));
                 // v0.8.23 review item 9 — best-effort (never blocks): a
                 // `try_lock` failure (rare, momentary registry contention)
                 // just reports "not waiting" for this one snapshot rather
@@ -8429,6 +8435,7 @@ impl Gateway {
             owner: owner_tag,
             vendor_uuid: vendor_uuid.to_string(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".to_string(),
             created_at: now.clone(),
@@ -8517,6 +8524,27 @@ impl Gateway {
             role: session.role.clone(),
             vendor: vendor_str(session.vendor).to_string(),
             project: session.project.clone(),
+            project_dir,
+        })
+    }
+
+    /// Like [`Self::session_resolve`], but a STOPPED session answers too — from
+    /// its on-disk `meta.json`, exactly the fallback [`Self::project_slug_for_sid`]
+    /// already grants the ACL gate. For READ-ONLY surfaces (the history endpoint):
+    /// a transcript outlives the live map by design (`session_stop` never purges
+    /// `turns.jsonl`), so "stopped" must not read as "never existed". Drive
+    /// surfaces (dispatch/steer/pane) keep the live-only resolver — a thread you
+    /// can write to is exactly what a stopped session does not have.
+    pub fn session_resolve_any(&self, sid: &str) -> Option<SessionResolve> {
+        if let Some(live) = self.session_resolve(sid) {
+            return Some(live);
+        }
+        let (slug, project_dir, meta) = self.find_meta_for_sid(sid).ok()?;
+        Some(SessionResolve {
+            sid: meta.sid.clone(),
+            role: meta.role.clone(),
+            vendor: vendor_str(meta.vendor).to_string(),
+            project: slug,
             project_dir,
         })
     }
@@ -10090,9 +10118,12 @@ fn refresh_session_activity_meta(
         .map(|turns| turns.len() as u64)
         .unwrap_or(meta.turn_count);
     if let Some(path) = progress_path {
-        let (cost_usd, tokens_total) = session_cost_and_tokens(path, sid, vendor);
+        let (cost_usd, tokens_total, observed_model) = session_cost_and_tokens(path, sid, vendor);
         meta.cost_usd = cost_usd;
         meta.tokens_total = tokens_total;
+        if observed_model.is_some() {
+            meta.observed_model = observed_model;
+        }
     }
     let _ = write_session_meta(project_dir, &meta);
 }
@@ -10113,15 +10144,19 @@ fn session_cost_and_tokens(
     progress_path: &Path,
     sid: &str,
     vendor: AgentVendor,
-) -> (Option<f64>, Option<u64>) {
+) -> (Option<f64>, Option<u64>, Option<String>) {
     let Ok(events) = ccteam_core::progress::read_all_events(progress_path) else {
-        return (None, None);
+        return (None, None, None);
     };
     let cost_vendor = vendor.cost_vendor();
     let mut total = 0.0_f64;
     let mut priced = 0usize;
     let mut tokens = 0u64;
     let mut counted = 0usize;
+    // The LAST non-empty model tag wins — same events, one extra fact: the
+    // canonical model the vendor itself stamped on the turn, which is what
+    // `SessionMeta::observed_model` durably shows after the session stops.
+    let mut observed_model: Option<String> = None;
     for ev in &events {
         if ev.get("event").and_then(|v| v.as_str())
             != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
@@ -10130,6 +10165,14 @@ fn session_cost_and_tokens(
         }
         if ev.get("sid").and_then(|v| v.as_str()) != Some(sid) {
             continue;
+        }
+        if let Some(m) = ev
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            observed_model = Some(m.to_string());
         }
         let Some(usage) = ev
             .get("usage")
@@ -10150,6 +10193,7 @@ fn session_cost_and_tokens(
     (
         (priced > 0).then_some(total),
         (counted > 0).then_some(tokens),
+        observed_model,
     )
 }
 
@@ -18417,6 +18461,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -18491,6 +18536,7 @@ mod tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),

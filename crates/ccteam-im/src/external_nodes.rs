@@ -68,6 +68,7 @@ pub fn external_node_meta(
         owner: owner.to_string(),
         vendor_uuid: String::new(),
         model: None,
+        observed_model: None,
         effort: None,
         host: ccteam_core::LOCAL_HOST.to_string(),
         created_at: now.clone(),

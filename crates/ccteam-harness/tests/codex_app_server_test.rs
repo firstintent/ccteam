@@ -3048,6 +3048,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         owner: "user:web-api".into(),
         vendor_uuid: "t-prior".into(),
         model: None,
+        observed_model: None,
         effort: None,
         host: "local".into(),
         created_at: String::new(),

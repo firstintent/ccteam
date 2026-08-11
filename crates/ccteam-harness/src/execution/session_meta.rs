@@ -165,6 +165,15 @@ pub struct SessionMeta {
     /// always passed back to the vendor verbatim on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The canonical model the VENDOR reported for this session's most recent
+    /// completed turn (off its `chat_turn_completed` accounting, refreshed by
+    /// the same per-turn meta write as `turn_count`/`cost_usd`). Display-only
+    /// and NEVER replayed to the vendor: [`Self::model`] is what the user
+    /// asked for, this is what actually ran — the fact that survives a stop,
+    /// so an A2A child spawned on the vendor default still has a model to
+    /// show after it leaves the live map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
     /// Reasoning effort requested when the session was spawned, same contract
     /// as [`Self::model`]: opaque, `None` = vendor default, replayed verbatim
     /// on every re-spawn.
@@ -499,6 +508,7 @@ mod title_tests {
             owner: "user:web-api".into(),
             vendor_uuid: String::new(),
             model: None,
+            observed_model: None,
             effort: None,
             host: "local".into(),
             created_at: "2026-01-01T00:00:00Z".into(),

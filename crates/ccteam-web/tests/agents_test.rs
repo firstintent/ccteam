@@ -222,9 +222,15 @@ async fn spawn_delegated_child_in(
 
 /// Persist a `meta.json` for a sid the gateway does NOT track — an idle
 /// (stopped/evicted) session the graph must still list — optionally carrying
-/// a spawn-time `model` override, which the graph must NOT echo as a live
-/// model.
-fn idle_meta(project_dir: &std::path::Path, sid: &str, model: Option<&str>) {
+/// a spawn-time `model` pick and/or the vendor-reported `observed_model`,
+/// which the graph now echoes durably (requested pick first, observed as the
+/// fallback) so a stopped session keeps a model to show.
+fn idle_meta(
+    project_dir: &std::path::Path,
+    sid: &str,
+    model: Option<&str>,
+    observed_model: Option<&str>,
+) {
     let m = ccteam_harness::SessionMeta {
         managed_by: Default::default(),
         sid: sid.to_string(),
@@ -236,6 +242,7 @@ fn idle_meta(project_dir: &std::path::Path, sid: &str, model: Option<&str>) {
         owner: "user:web".to_string(),
         vendor_uuid: String::new(),
         model: model.map(str::to_string),
+        observed_model: observed_model.map(str::to_string),
         effort: None,
         host: String::new(),
         created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -407,16 +414,21 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
 /// its session runs right now, read through the SAME statusline source as
 /// `GET /sessions/{sid}/status` (this file's `FakeAdapter` reports
 /// `agents-test-model` / `high` from `thread_status`). An idle
-/// (persisted-only) node stays `null` even though its `meta.json` carries a
-/// spawn-time `model` override — nothing live to report.
+/// (persisted-only) node falls back to its durable `meta.json` facts — the
+/// requested pick when there was one, else the vendor-reported
+/// `observed_model` — so a stopped A2A child spawned on the vendor default
+/// still shows what it actually ran (2026-08-11: the team view's 模型 column
+/// used to go blank the moment a session left the live map).
 #[tokio::test]
-async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
+async fn agents_graph_joins_live_session_model_and_falls_back_durably_for_idle() {
     let tmp = tempfile::TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let project_dir = register_project(&paths, "demo", None);
 
     let (gateway, child_sid) = spawn_delegated_child(project_dir.clone()).await;
-    idle_meta(&project_dir, "s9", Some("spawn-time-override"));
+    idle_meta(&project_dir, "s9", Some("spawn-time-pick"), None);
+    idle_meta(&project_dir, "s10", None, Some("vendor-reported-model"));
+    idle_meta(&project_dir, "s11", None, None);
 
     let gw = Arc::new(tokio::sync::Mutex::new(gateway));
     let state = AppState::with_auth(paths, AuthState::enabled(ADMIN_HEX.into()))
@@ -450,15 +462,27 @@ async fn agents_graph_joins_live_session_model_and_leaves_idle_null() {
         Value::String("high".to_string()),
         "live node carries the statusline effort: {body}"
     );
-    let idle = node("s9");
-    assert_eq!(idle["status"], Value::String("idle".to_string()));
+    let picked = node("s9");
+    assert_eq!(picked["status"], Value::String("idle".to_string()));
+    assert_eq!(
+        picked["model"],
+        Value::String("spawn-time-pick".to_string()),
+        "idle node shows the requested spawn pick durably: {body}"
+    );
+    let observed = node("s10");
+    assert_eq!(
+        observed["model"],
+        Value::String("vendor-reported-model".to_string()),
+        "with no explicit pick, the vendor-reported model fills the gap: {body}"
+    );
+    let bare = node("s11");
     assert!(
-        idle["model"].is_null(),
-        "idle node must not echo the spawn-time meta model: {body}"
+        bare["model"].is_null(),
+        "nothing requested and nothing reported stays honestly null: {body}"
     );
     assert!(
-        idle["effort"].is_null(),
-        "idle node has no live effort to report: {body}"
+        bare["effort"].is_null(),
+        "no requested effort to fall back to: {body}"
     );
 }
 
