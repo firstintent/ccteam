@@ -4841,6 +4841,21 @@ impl Gateway {
                                         "stream-json pump: failed to mirror chat_turn_completed"
                                     );
                                 }
+                                // Fold the row just appended into meta.json NOW.
+                                // The other refresh rides the ANSWER mirror, which
+                                // precedes this event — so a one-turn session has
+                                // no later answer to piggyback on, and its
+                                // cost/tokens/observed_model stayed blank forever
+                                // (the team view's empty 模型/成本 columns for
+                                // every quick probe).
+                                if let Some(dir) = project_dir.as_ref() {
+                                    refresh_session_activity_meta(
+                                        dir,
+                                        &session_id,
+                                        session.vendor,
+                                        progress_path.as_deref(),
+                                    );
+                                }
                             }
                         }
                         if let Some(text) = async_event_text(&evt) {
@@ -15833,6 +15848,12 @@ mod tests {
         let meta = meta.expect("failed terminal event must refresh token/cost meta");
         assert_eq!(meta.tokens_total, Some(1_500));
         assert_eq!(meta.cost_usd, Some(0.42));
+        assert_eq!(
+            meta.observed_model.as_deref(),
+            Some("vendor-reported-model"),
+            "the vendor-stamped turn model must survive into meta.json — it is what \
+             the team view shows for this session after it leaves the live map"
+        );
     }
 
     /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
