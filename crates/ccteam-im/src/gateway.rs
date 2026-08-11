@@ -6832,14 +6832,16 @@ impl Gateway {
     /// **This is a measurement, not a belt-and-braces check.** The override a
     /// managed session relies on is only ENFORCED where the vendor gives ccteam
     /// a lever for it (Claude `--strict-mcp-config`; Codex's per-thread
-    /// `config.mcp_servers`). On the ACP path there is no such lever on any of
-    /// the three vendors, and grok 1.0.0 was measured resolving the same-name
-    /// collision in favour of its OWN `~/.grok/config.toml` entry — so a
-    /// managed grok session runs its tools as the machine. See
-    /// `ccteam_harness::execution::mcp_config`'s module doc for the per-dialect
-    /// evidence. That is exactly why the outcome is verified here instead of
-    /// assumed: this is the one place that knows both which credential ccteam
-    /// minted and whether anything ever presented it.
+    /// `config.mcp_servers`). On the ACP path no such lever exists, so the
+    /// daemon wins server-side instead: `/mcp` re-binds a loopback caller to
+    /// the managed session whose process subtree it belongs to
+    /// (`ccteam_harness::execution::vendor_pids`), and a successful provenance
+    /// attach records first use exactly like a presented credential. What is
+    /// verified here is therefore the UNION of both paths — a warning means
+    /// neither the minted credential nor provenance ever reached the session
+    /// (a non-linux daemon host, or a vendor whose MCP client never dialed
+    /// in). See `ccteam_harness::execution::mcp_config`'s module doc for the
+    /// per-dialect evidence.
     ///
     /// Loud, never fatal: a warn plus the same `SessionLifecycle` signal family
     /// eviction uses ([`Self::emit_session_evicted`]), so the condition shows up
@@ -6866,7 +6868,7 @@ impl Gateway {
             session = %sid,
             %slug,
             vendor = %vendor_str(vendor),
-            "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); the vendor loaded a same-named `ccteam` MCP entry from its own global config instead of the one ccteam handed this session"
+            "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); neither the credential ccteam handed this session nor `/mcp` process provenance ever reached it (vendor kept a same-named `ccteam` entry AND the peer could not be resolved to this session's process tree — non-linux daemon host, or its MCP client never dialed in)"
         );
         self.emit_user_signal(GatewayEvent {
             id: format!("principal-unused-{sid}"),

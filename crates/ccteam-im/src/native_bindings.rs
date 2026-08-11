@@ -63,6 +63,13 @@ pub struct NativeBinding {
     /// exactly when [`Self::sid`] is `Some` (both are set by
     /// [`NativeBindings::attach_session`]).
     principal_secret: String,
+    /// Whether [`Self::sid`] is a node this binding MINTED (an external ledger
+    /// row whose principal dies with the binding), as opposed to a MANAGED
+    /// session it was provenance-attached to. Closing a binding must only ever
+    /// retire what the binding created: an idle sweep that forgot a live
+    /// managed session's principal would cut that session's tool face off
+    /// mid-life, which is precisely the failure provenance attach repairs.
+    node_owned: bool,
     /// `clientInfo` from `initialize` (`name/version`), for the console listing.
     pub client: String,
     /// When `initialize` issued this binding.
@@ -103,6 +110,7 @@ impl std::fmt::Debug for NativeBinding {
                     "<redacted>"
                 },
             )
+            .field("node_owned", &self.node_owned)
             .field("client", &self.client)
             .field("created_at", &self.created_at)
             .field("last_seen_at", &self.last_seen_at)
@@ -150,6 +158,7 @@ impl NativeBindings {
             project,
             sid: None,
             principal_secret: String::new(),
+            node_owned: false,
             client: client.to_string(),
             created_at: now,
             last_seen_at: now,
@@ -206,6 +215,11 @@ impl NativeBindings {
     /// its secret is a node nothing can speak for
     /// ([`NativeBinding::principal`]).
     ///
+    /// `owned` says whose life the sid shares: `true` for a node this binding
+    /// MINTED (retired when the binding ends), `false` for a MANAGED session a
+    /// provenance attach merely pointed at (the session outlives the binding
+    /// and [`Self::close`] must not touch its principal).
+    ///
     /// Attaches ONCE, and returns the principal actually in force. A binding that
     /// already has a node keeps it: two tool calls a client fired in parallel can
     /// both see a nodeless binding and both mint one, and overwriting would leave
@@ -217,12 +231,14 @@ impl NativeBindings {
         mcp_session_id: &str,
         sid: &str,
         secret: &str,
+        owned: bool,
     ) -> Option<(String, String)> {
         let mut map = self.inner.write().ok()?;
         let binding = map.get_mut(mcp_session_id)?;
         if binding.principal().is_none() {
             binding.sid = Some(sid.to_string());
             binding.principal_secret = secret.to_string();
+            binding.node_owned = owned;
         }
         binding
             .principal()
@@ -230,10 +246,13 @@ impl NativeBindings {
     }
 
     /// End a binding (client `DELETE`, or a sweep). Returns the node sid it
-    /// held, so the caller can close that out too.
+    /// held — only when the binding OWNED that node; a provenance-attached
+    /// managed session outlives its binding, so there is nothing to retire.
     pub fn close(&self, mcp_session_id: &str) -> Option<String> {
         let mut map = self.inner.write().ok()?;
-        map.remove(mcp_session_id).and_then(|b| b.sid)
+        map.remove(mcp_session_id)
+            .filter(|b| b.node_owned)
+            .and_then(|b| b.sid)
     }
 
     /// Every live binding, newest first — for the console and `status`.
@@ -263,6 +282,9 @@ impl NativeBindings {
                 .collect();
             for id in stale {
                 if let Some(binding) = map.remove(&id) {
+                    if !binding.node_owned {
+                        continue;
+                    }
                     if let Some(sid) = binding.sid {
                         closed.push(sid);
                     }
@@ -334,7 +356,7 @@ mod tests {
             "no node yet ⇒ nothing to authenticate as"
         );
         assert_eq!(
-            reg.attach_session(&id, "s42", "sek"),
+            reg.attach_session(&id, "s42", "sek", true),
             Some(("s42".to_string(), "sek".to_string())),
             "the attach reports the principal in force"
         );
@@ -355,11 +377,11 @@ mod tests {
         let reg = NativeBindings::new();
         let id = reg.open("e1", "user:web-api", None, "claude/2.1");
         assert_eq!(
-            reg.attach_session(&id, "s10", "sek-a").unwrap().0,
+            reg.attach_session(&id, "s10", "sek-a", true).unwrap().0,
             "s10",
             "the first attach wins"
         );
-        let lost = reg.attach_session(&id, "s11", "sek-b").unwrap();
+        let lost = reg.attach_session(&id, "s11", "sek-b", true).unwrap();
         assert_eq!(
             lost,
             ("s10".to_string(), "sek-a".to_string()),
@@ -367,8 +389,42 @@ mod tests {
         );
         assert_eq!(reg.resolve(&id, "e1").unwrap().sid.as_deref(), Some("s10"));
         assert!(
-            reg.attach_session("ms_unknown", "s12", "sek").is_none(),
+            reg.attach_session("ms_unknown", "s12", "sek", true)
+                .is_none(),
             "a binding that vanished mid-flight attaches nothing"
+        );
+    }
+
+    /// A provenance attach points a binding at a MANAGED session. That session
+    /// outlives the binding, so ending the binding (DELETE or sweep) must
+    /// return nothing to retire — forgetting a live session's principal would
+    /// cut its tool face off mid-life.
+    #[test]
+    fn an_unowned_attach_is_never_retired_by_close_or_sweep() {
+        let reg = NativeBindings::new();
+        let id = reg.open("e1", "user:web-api", None, "grok-shell/1.0");
+        assert_eq!(
+            reg.attach_session(&id, "s556", "sek", false),
+            Some(("s556".to_string(), "sek".to_string()))
+        );
+        assert_eq!(
+            reg.close(&id),
+            None,
+            "closing must not surrender a managed session for retirement"
+        );
+
+        let swept = reg.open("e1", "user:web-api", None, "grok-shell/1.0");
+        let _ = reg.attach_session(&swept, "s557", "sek", false);
+        if let Ok(mut map) = reg.inner.write() {
+            map.get_mut(&swept).unwrap().last_seen_at = Utc::now() - chrono::Duration::hours(3);
+        }
+        assert!(
+            reg.sweep_idle(chrono::Duration::minutes(30)).is_empty(),
+            "the sweep drops the binding but retires nothing"
+        );
+        assert!(
+            reg.resolve(&swept, "e1").is_none(),
+            "binding itself is gone"
         );
     }
 
@@ -378,7 +434,7 @@ mod tests {
     fn a_debug_dump_never_carries_the_node_secret() {
         let reg = NativeBindings::new();
         let id = reg.open("e1", "user:web-api", Some("alpha".into()), "codex/0.144");
-        let _ = reg.attach_session(&id, "s42", "topsecretvalue");
+        let _ = reg.attach_session(&id, "s42", "topsecretvalue", true);
         let dump = format!("{:?}", reg.resolve(&id, "e1").unwrap());
         assert!(!dump.contains("topsecretvalue"), "secret leaked: {dump}");
         assert!(dump.contains("<redacted>"), "{dump}");
@@ -390,7 +446,7 @@ mod tests {
         let reg = NativeBindings::new();
         let live = reg.open("e1", "user:web-api", None, "codex/0.144");
         let stale = reg.open("e1", "user:web-api", None, "codex/0.144");
-        let _ = reg.attach_session(&stale, "s7", "sek");
+        let _ = reg.attach_session(&stale, "s7", "sek", true);
         // Age the stale one past the cutoff.
         if let Ok(mut map) = reg.inner.write() {
             map.get_mut(&stale).unwrap().last_seen_at = Utc::now() - chrono::Duration::hours(2);

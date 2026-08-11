@@ -543,8 +543,15 @@ impl HarnessAdapter for GrokAcpAdapter {
         let args: Vec<String> = argv.into_iter().skip(1).collect();
         // Child-only env: kill Grok's Claude MCP compat scan so the managed
         // session doesn't import ccteam's global `ccteam` entry on top of the
-        // ACP-injected server (see `spawn_spec::build_envs`).
-        let envs = build_envs();
+        // ACP-injected server (see `spawn_spec::build_envs`). CCTEAM_CHAT_SID
+        // is the session's self-description — without it the child inherits
+        // whatever stale value the daemon's own environment chain carried, and
+        // an agent that reads `env` mis-identifies itself.
+        let mut envs = build_envs();
+        envs.push((
+            crate::execution::claude_common::CHAT_SID_ENV.to_string(),
+            ctx.sid.clone(),
+        ));
         let cwd = if ctx.cwd.as_os_str().is_empty() {
             ctx.project_dir.clone()
         } else {
@@ -555,13 +562,16 @@ impl HarnessAdapter for GrokAcpAdapter {
         // helper). Empty when sid/secret missing (roleless still gets tools;
         // secret is the gate). `ctx.secret` was previously dropped.
         //
-        // OFFERING the principal is all this can do. grok also loads a
+        // OFFERING the principal is all this line can do. grok also loads a
         // same-named `ccteam` entry from `~/.grok/config.toml` carrying the
         // MACHINE credential, and grok 1.0.0 was measured resolving that
         // collision in its own favour — no CLI flag, env var, config key or ACP
         // field closes that door (evidence + everything ruled out:
-        // `mcp_config`'s module doc). The daemon therefore verifies the outcome
-        // per session rather than trusting this line.
+        // `mcp_config`'s module doc). Which is why identity does NOT ride on
+        // this offer: `spawn_for_session` records the child pid first, and
+        // `/mcp` re-binds whatever credential grok presents back to this
+        // session by process provenance. The daemon still verifies the outcome
+        // per session rather than trusting either path.
         let mcp_servers = crate::execution::mcp_config::acp_mcp_servers_http(&ctx.sid, &ctx.secret);
 
         // Cold-resume ladder: if meta.json already has a Grok ACP sessionId
@@ -581,12 +591,13 @@ impl HarnessAdapter for GrokAcpAdapter {
         let try_load = prior_uuid.clone();
         let (transport, session_id, info) = match try_load {
             Some(uuid) => {
-                let transport = AcpTransport::spawn_command_full(
+                let transport = AcpTransport::spawn_for_session(
                     &program,
                     &args,
                     &cwd,
                     &envs,
                     InboundPolicy::DefaultDecline,
+                    &ctx.sid,
                 )
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;
@@ -599,12 +610,13 @@ impl HarnessAdapter for GrokAcpAdapter {
                             "grok session/load failed; falling back to session/new"
                         );
                         let _ = transport.shutdown().await;
-                        let transport = AcpTransport::spawn_command_full(
+                        let transport = AcpTransport::spawn_for_session(
                             &program,
                             &args,
                             &cwd,
                             &envs,
                             InboundPolicy::DefaultDecline,
+                            &ctx.sid,
                         )
                         .await
                         .map_err(|e| {
@@ -618,12 +630,13 @@ impl HarnessAdapter for GrokAcpAdapter {
                 }
             }
             None => {
-                let transport = AcpTransport::spawn_command_full(
+                let transport = AcpTransport::spawn_for_session(
                     &program,
                     &args,
                     &cwd,
                     &envs,
                     InboundPolicy::DefaultDecline,
+                    &ctx.sid,
                 )
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;

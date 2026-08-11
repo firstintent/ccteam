@@ -160,6 +160,41 @@ impl SessionPrincipals {
             .unwrap_or(false)
     }
 
+    /// Record first use WITHOUT a wire verification — for the one caller that
+    /// proves identity another way: a provenance attach (`/mcp` bound a native
+    /// binding to this session because the connecting process is the session's
+    /// own vendor child). The session's tool face reached it, which is exactly
+    /// the fact [`Self::was_used`] exists to record; leaving it unset would
+    /// fire the identity-degraded warning for a session whose identity was
+    /// just repaired.
+    pub fn mark_used(&self, sid: &str) {
+        if sid.is_empty() {
+            return;
+        }
+        if let Ok(mut used) = self.used.write() {
+            used.insert(sid.to_string());
+        }
+    }
+
+    /// The `(secret, slug)` the daemon needs to bind a native binding to this
+    /// managed session when PROCESS PROVENANCE proves the caller is the
+    /// session's own vendor process (`ccteam_harness::execution::vendor_pids`).
+    ///
+    /// The secret never crosses the wire on this path — it moves from one
+    /// daemon-internal registry (here) to another (the binding), the same trip
+    /// it makes when a scope-pinned enrollment mints a ledger node. `None` for
+    /// an unknown or already-forgotten sid, which is what makes pid reuse
+    /// harmless: a recycled pid can only attach to a session that is still
+    /// alive to be attached to.
+    pub fn credential_for_managed_attach(&self, sid: &str) -> Option<(String, String)> {
+        let map = self.inner.read().ok()?;
+        let principal = map.get(sid)?;
+        if principal.secret.is_empty() {
+            return None;
+        }
+        Some((principal.secret.clone(), principal.slug.clone()))
+    }
+
     /// Resolve `(sid, secret)` to an identity. Constant-time secret compare;
     /// an unknown sid and a wrong secret are indistinguishable to the caller.
     ///
@@ -287,6 +322,28 @@ mod tests {
         // A sid that ends and is reused must not inherit the old verdict.
         reg.forget("s1");
         assert!(!reg.was_used("s1"));
+    }
+
+    /// A provenance attach proves the tool face reached the session without a
+    /// wire verification — it must count as use, and it must be able to read
+    /// the credential it re-binds.
+    #[test]
+    fn provenance_attach_reads_the_credential_and_counts_as_use() {
+        let reg = SessionPrincipals::new();
+        reg.promote("s5", "sek", "alpha", "", 0);
+        assert_eq!(
+            reg.credential_for_managed_attach("s5"),
+            Some(("sek".to_string(), "alpha".to_string()))
+        );
+        assert!(!reg.was_used("s5"));
+        reg.mark_used("s5");
+        assert!(reg.was_used("s5"));
+
+        // Forgotten (stopped) session: nothing to attach to — pid reuse
+        // cannot resurrect authority.
+        reg.forget("s5");
+        assert!(reg.credential_for_managed_attach("s5").is_none());
+        assert!(!reg.was_used("s5"), "use dies with the principal");
     }
 
     /// A `/role` switch mints a fresh secret for an existing sid. The old one

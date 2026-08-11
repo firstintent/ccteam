@@ -206,6 +206,33 @@ impl AcpTransport {
         ))
     }
 
+    /// Spawn for a MANAGED session: [`Self::spawn_command_full`] plus the
+    /// child pid recorded in [`crate::execution::vendor_pids`] BEFORE any
+    /// handshake I/O. The vendor dials `/mcp` from inside `session/new`, so a
+    /// pid recorded after the handshake returns misses the very `initialize`
+    /// provenance auth exists to identify — this constructor makes the
+    /// ordering impossible to get wrong at a call site.
+    pub async fn spawn_for_session(
+        program: &str,
+        args: &[String],
+        cwd: &std::path::Path,
+        envs: &[(String, String)],
+        inbound: InboundPolicy,
+        sid: &str,
+    ) -> Result<Self> {
+        let transport = Self::spawn_command_full(program, args, cwd, envs, inbound).await?;
+        crate::execution::vendor_pids::record(sid, transport.pid());
+        Ok(transport)
+    }
+
+    /// The child's OS pid, while the transport still holds it.
+    pub fn pid(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|child| child.id()))
+    }
+
     /// Build around arbitrary halves (tests use duplex).
     pub fn from_halves<R, W>(reader: R, writer: W, child: Option<Child>) -> Self
     where

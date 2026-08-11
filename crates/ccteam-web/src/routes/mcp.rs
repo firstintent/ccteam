@@ -78,8 +78,10 @@
 
 use std::sync::Arc;
 
+use std::net::SocketAddr;
+
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -134,6 +136,7 @@ async fn no_sse_stream() -> Response {
 /// `POST /mcp` — body = one JSON-RPC 2.0 message.
 async fn handle_post(
     State(app): State<AppState>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -168,7 +171,7 @@ async fn handle_post(
         // `initialize`, resolve it on everything after), so it takes the request
         // rather than just a caller tier.
         McpAuth::Enroll { credential } => {
-            handle_enroll_post(&app, &credential, &headers, req).await
+            handle_enroll_post(&app, &credential, &headers, req, peer).await
         }
         // Session bearer `ccteam-sid:<sid>:<secret>` → Ambient path with the FULL
         // caller identity injected (_caller_sid/_caller_secret/_caller_role/
@@ -423,6 +426,32 @@ fn inject_session_caller(req: &mut Value, sid: &str, role: &str, secret: &str, s
     }
 }
 
+/// The connecting peer's address, when the serving stack was built with
+/// `into_make_service_with_connect_info` (the production `serve()` path is).
+/// A router mounted without it — unit tests, embedded uses — yields `None`,
+/// and provenance is simply skipped: absence of the fact must degrade to the
+/// enrollment ladder, never to a 500 on every `/mcp` request.
+struct PeerAddr(Option<SocketAddr>);
+
+impl<S> axum::extract::FromRequestParts<S> for PeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
+
 /// Chomp `Bearer ` → the wire token (`ccteam:<hex>`).
 fn parse_bearer_value(value: &str) -> Option<&str> {
     let rest = value.strip_prefix("Bearer ")?;
@@ -450,12 +479,26 @@ async fn handle_enroll_post(
     credential: &EnrollCredential,
     headers: &HeaderMap,
     mut req: Value,
+    peer: Option<SocketAddr>,
 ) -> Response {
     if req.get("method").and_then(Value::as_str) == Some("initialize") {
-        return open_binding(app, credential, req).await;
+        return open_binding(app, credential, req, peer).await;
     }
     let Some(binding) = resolve_binding(app, credential, headers) else {
         return no_such_mcp_session(&req);
+    };
+    // Provenance retry for a binding still on the ladder: the eager attempt at
+    // `initialize` can miss (pid recorded a beat late, `/proc` transiently
+    // unreadable), and an unbound binding is the only state worth re-checking.
+    let binding = if binding.principal().is_none()
+        && try_provenance_attach(app, peer, credential, &binding.mcp_session_id).await
+    {
+        match resolve_binding(app, credential, headers) {
+            Some(rebound) => rebound,
+            None => return no_such_mcp_session(&req),
+        }
+    } else {
+        binding
     };
     // Rung 2 of the project ladder, resolved BEFORE the identity is read: a
     // `session_*` call that NAMES a project may turn a nodeless binding into a
@@ -466,13 +509,43 @@ async fn handle_enroll_post(
         Err(refusal) => return refusal,
     };
     match binding.principal() {
-        // The binding has a ledger node, so this call IS that node: inject its
-        // identity exactly as a managed session's and let the EXISTING Ambient
-        // path do the rest (principal gate, project clamp, delegation parent).
+        // The binding speaks for a session — a node it minted, or a managed
+        // session provenance attached. Verify against the live registry on
+        // every call: slug/role are the PRINCIPAL's (a provenance target's
+        // project is the session's own, not the credential's), a spawning
+        // session is held to discovery-only exactly like the session-bearer
+        // path, and a principal that stopped verifying means the session
+        // behind it ended — the binding is stale, and the transport's own
+        // re-initialize signal is the recovery.
         Some((sid, secret)) => {
+            let verified = app
+                .session_principals
+                .as_ref()
+                .and_then(|principals| principals.verify(sid, secret));
+            let Some(matched) = verified else {
+                close_binding(app, &binding.mcp_session_id).await;
+                return no_such_mcp_session(&req);
+            };
+            if !ccteam_im::principals::may_invoke_tools(matched.state) && is_tool_call(&req) {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": req.get("id").cloned().unwrap_or(Value::Null),
+                        "error": {
+                            "code": -32000,
+                            "message": format!(
+                                "session {sid} is still starting: its tool face can be listed but not called yet"
+                            ),
+                        },
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+            }
             log_tier_call(&format!("session:{sid}"), &req);
-            let slug = binding.project.as_deref().unwrap_or_default();
-            inject_session_caller(&mut req, sid, "", secret, slug);
+            inject_session_caller(&mut req, sid, &matched.role, secret, &matched.slug);
             dispatch_json_rpc(app, req, ccteam_im::mcp::McpCaller::Ambient).await
         }
         None => {
@@ -491,7 +564,12 @@ async fn handle_enroll_post(
 /// be created, the client gets an id, so its later calls arrive with something
 /// resolvable and are refused with a REASON instead of being indistinguishable
 /// from a client that never initialized.
-async fn open_binding(app: &AppState, credential: &EnrollCredential, req: Value) -> Response {
+async fn open_binding(
+    app: &AppState,
+    credential: &EnrollCredential,
+    req: Value,
+    peer: Option<SocketAddr>,
+) -> Response {
     let client = client_label(&req);
     let id = app.native_bindings.open(
         &credential.id,
@@ -499,7 +577,14 @@ async fn open_binding(app: &AppState, credential: &EnrollCredential, req: Value)
         credential.scope.project().map(str::to_string),
         &client,
     );
-    if let Some(slug) = credential.scope.project() {
+    // Provenance first: when the connecting process IS a managed session's
+    // own, the binding is that session and nothing may mint a second identity
+    // for it — that second identity is exactly the ghost node the measured
+    // grok collision used to leave behind.
+    let attached = try_provenance_attach(app, peer, credential, &id).await;
+    if attached {
+        // fall through to answer `initialize` with the id
+    } else if let Some(slug) = credential.scope.project() {
         match mint_ledger_node(app, credential, slug, &client).await {
             Ok((sid, secret)) => {
                 // The secret never leaves this process: the client authenticates
@@ -507,7 +592,7 @@ async fn open_binding(app: &AppState, credential: &EnrollCredential, req: Value)
                 // internally with the principal it minted here. Nothing else can
                 // hold this id yet (it was issued three statements ago), so the
                 // attach cannot lose a race and the in-force principal is ours.
-                let _ = app.native_bindings.attach_session(&id, &sid, &secret);
+                let _ = app.native_bindings.attach_session(&id, &sid, &secret, true);
                 tracing::info!(
                     enroll = %credential.id, mcp_session = %id, sid = %sid,
                     project = %slug, %client,
@@ -528,6 +613,69 @@ async fn open_binding(app: &AppState, credential: &EnrollCredential, req: Value)
             .insert(HeaderName::from_static(MCP_SESSION_ID), value);
     }
     response
+}
+
+/// Bind an enrolled binding to the MANAGED session whose process subtree the
+/// connecting peer belongs to — identity by provenance.
+///
+/// The ACP dialect gives ccteam no lever to make a vendor prefer the
+/// per-session MCP entry it was handed over a same-named machine-credential
+/// entry in the vendor's own global config (measured: grok 1.0.0 resolves the
+/// collision toward its config — `ccteam_harness::execution::mcp_config`).
+/// The daemon SPAWNED that process, though. So when a loopback peer
+/// authenticating with an enrollment credential turns out to be a managed
+/// session's vendor process (or its descendant —
+/// [`ccteam_harness::execution::vendor_pids`], recorded before the first
+/// handshake byte, resolved through `/proc`), the binding is attached to that
+/// session's own principal and the vendor's config choice stops deciding
+/// identity. No ghost node is minted, children mount under the real session,
+/// and the identity-degraded warning has nothing to say.
+///
+/// Refusals are quiet and fail open to the enrollment ladder: a non-loopback
+/// peer, a non-linux host, a hand-started process, a stopped session — and a
+/// credential PINNED to a different project, because an operator who scoped a
+/// snippet said something and provenance must not overrule it into another
+/// workspace.
+async fn try_provenance_attach(
+    app: &AppState,
+    peer: Option<SocketAddr>,
+    credential: &EnrollCredential,
+    mcp_session_id: &str,
+) -> bool {
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !peer.ip().is_loopback() {
+        return false;
+    }
+    let Some(principals) = app.session_principals.as_ref() else {
+        return false;
+    };
+    let Some(sid) = ccteam_harness::execution::vendor_pids::owner_of_local_peer(peer.port()) else {
+        return false;
+    };
+    let Some((secret, slug)) = principals.credential_for_managed_attach(&sid) else {
+        return false;
+    };
+    if let Err(err) = app.native_bindings.bind_project(mcp_session_id, &slug) {
+        tracing::warn!(
+            mcp_session = %mcp_session_id, %sid, session_project = %slug, reason = %err,
+            "POST /mcp: peer is a managed session's process but this credential is pinned elsewhere — leaving the binding on the enrollment ladder"
+        );
+        return false;
+    }
+    let in_force = app
+        .native_bindings
+        .attach_session(mcp_session_id, &sid, &secret, false);
+    let attached = in_force.as_ref().map(|(held, _)| held.as_str()) == Some(sid.as_str());
+    if attached {
+        principals.mark_used(&sid);
+        tracing::info!(
+            enroll = %credential.id, mcp_session = %mcp_session_id, %sid, project = %slug,
+            "POST /mcp: peer process is a managed session's own — binding attached to the session's principal, whichever config entry its vendor loaded"
+        );
+    }
+    attached
 }
 
 /// Rung 2 of the project ladder: **the caller names its workspace.**
@@ -592,7 +740,7 @@ async fn bind_named_project(
     // children may already hang off.
     let in_force = app
         .native_bindings
-        .attach_session(&binding.mcp_session_id, &sid, &secret);
+        .attach_session(&binding.mcp_session_id, &sid, &secret, true);
     if in_force.as_ref().map(|(held, _)| held.as_str()) != Some(sid.as_str()) {
         retire_node(
             app.gateway.as_ref(),

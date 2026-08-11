@@ -74,12 +74,21 @@
 //! (kimi `mergeCallerMcpServers`, opencode `MCP.add` replacing + closing the
 //! previous client), so they are believed unaffected — UNVERIFIED at runtime.
 //!
-//! Because that cannot be fixed here, it is not assumed here either: the daemon
-//! MEASURES the outcome per session and says so loudly
+//! Because no vendor lever closes the door, ccteam stopped fighting on the
+//! vendor's terrain: **the daemon wins server-side, by provenance**. Every ACP
+//! spawn records its child pid ([`super::vendor_pids`], via
+//! `AcpTransport::spawn_for_session`, BEFORE the first handshake byte), and
+//! `POST /mcp` resolves a loopback peer carrying the machine enrollment
+//! credential back to the managed session whose process subtree it belongs to
+//! — then serves it as that session's own principal. Whichever `ccteam` entry
+//! the vendor loaded, the identity is the session's. The projection below
+//! still OFFERS the principal (a vendor that honours it needs no provenance),
+//! and the outcome is still measured per session
 //! (`ccteam_im::gateway::Gateway::assert_principal_reached_the_session` — a
-//! principal with no recorded first use means the tool face authenticated as
-//! somebody else). Renaming the server would close the door and is deliberately
-//! rejected: it would churn every `mcp__ccteam__*` tool name.
+//! provenance attach records first use too, so the warning only fires when
+//! BOTH the credential and provenance failed to reach the session, e.g. a
+//! non-linux host). Renaming the server would also have closed the door and is
+//! deliberately rejected: it would churn every `mcp__ccteam__*` tool name.
 
 use std::path::{Path, PathBuf};
 

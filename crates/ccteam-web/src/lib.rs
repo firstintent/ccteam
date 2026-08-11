@@ -260,10 +260,17 @@ where
 
     let state = build_state(paths, auth_state);
     let app = router_with_state(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("axum serve loop terminated with error")?;
+    // `connect_info` carries the TCP peer into request extensions — the fact
+    // `/mcp` provenance auth resolves a loopback caller's process from. A
+    // router served without it (tests, embedded uses) still works; provenance
+    // is simply skipped there.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("axum serve loop terminated with error")?;
     Ok(())
 }
 
