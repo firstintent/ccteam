@@ -27,7 +27,6 @@ const EMPTY_PATCH_YAML: &str = "[]\n";
 const CLIENT_SCOPE: &str = "@ccteam";
 const CLIENT_PACKAGE: &str = "dsh-client";
 const CCTEAM_CLIENT_ROW_ID: &str = "ccteam-client";
-const CCTEAM_CLIENT_SETTINGS_NS: &str = "ccteam-client";
 
 #[derive(Debug, Clone)]
 pub struct MaterializedDshProfile {
@@ -352,8 +351,25 @@ fn profile_patch_yaml(spec: &ProfileSpec<'_>) -> Result<String, HarnessError> {
         );
     }
 
+    // An OVERRIDE patch, not an `insert` one. `@ccteam/dsh-client` is already
+    // listed in the profile's `dsh.profile.bundles`, and that bundle's own
+    // patch layer inserts the `ccteam-client` row — inserting it a second time
+    // here makes Cordis abort the whole boot with
+    // `duplicate loader entry id: ccteam-client`.
+    //
+    // dsh-app-boot's patch semantics (applyPatches): a patch carrying `insert`
+    // inserts entries, while a patch with an `id` and NO `insert` looks the
+    // existing entry up and copies its remaining keys onto it as overrides.
+    // `name` is checked against the target and the patch is skipped on a
+    // mismatch, so passing it keeps this honest rather than silently patching
+    // some other plugin's row.
+    //
+    // `config` is the row's own plugin config — it reaches `apply(ctx, config)`
+    // verbatim and is the `base` layer of the plugin's settings namespace, so
+    // its keys are FLAT (`daemonUrl` / `enrollment`). Nesting them under the
+    // namespace name would leave `config.enrollment` undefined and the tenant
+    // instance silently unenrolled.
     let patch = serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping({
-        let mut insert = serde_yaml::Mapping::new();
         let mut row = serde_yaml::Mapping::new();
         row.insert(
             serde_yaml::Value::String("id".to_string()),
@@ -363,22 +379,11 @@ fn profile_patch_yaml(spec: &ProfileSpec<'_>) -> Result<String, HarnessError> {
             serde_yaml::Value::String("name".to_string()),
             serde_yaml::Value::String(CCTEAM_CLIENT_BUNDLE.to_string()),
         );
-        if !config.is_empty() {
-            let mut plugin_config = serde_yaml::Mapping::new();
-            plugin_config.insert(
-                serde_yaml::Value::String(CCTEAM_CLIENT_SETTINGS_NS.to_string()),
-                serde_yaml::Value::Mapping(config),
-            );
-            row.insert(
-                serde_yaml::Value::String("config".to_string()),
-                serde_yaml::Value::Mapping(plugin_config),
-            );
-        }
-        insert.insert(
-            serde_yaml::Value::String("insert".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(row)]),
+        row.insert(
+            serde_yaml::Value::String("config".to_string()),
+            serde_yaml::Value::Mapping(config),
         );
-        insert
+        row
     })]);
     serde_yaml::to_string(&patch)
         .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile patch: {e}")))
@@ -544,10 +549,49 @@ mod tests {
             ])
         );
         let patch_raw = fs::read_to_string(out.profile_dir.join("cordis.patch.yml")).unwrap();
-        assert!(patch_raw.contains("ccteam-enroll:abc:secret"));
-        assert!(patch_raw.contains("daemonUrl"));
         assert!(!package_raw.contains("host"));
         assert!(!patch_raw.contains("host:"));
+
+        // Structure, not substrings. Two ways this file can be well-formed on
+        // its face yet break the tenant instance, both of which a `contains`
+        // assertion sails straight past:
+        //
+        //   1. An `insert:` wrapper. The bundle list above already pulls in
+        //      `@ccteam/dsh-client`, whose own patch layer inserts the
+        //      `ccteam-client` row; inserting it again makes Cordis abort the
+        //      boot with `duplicate loader entry id` (the instance dies before
+        //      readiness and the user just sees "DSH web exited").
+        //   2. A `config` nested under the settings-namespace name. The row's
+        //      config reaches `apply(ctx, config)` verbatim, so the keys must
+        //      be flat — nested, `config.enrollment` is undefined and the
+        //      tenant instance comes up silently unenrolled.
+        let patch: serde_yaml::Value = serde_yaml::from_str(&patch_raw).unwrap();
+        let rows = patch.as_sequence().expect("patch is a sequence");
+        assert_eq!(rows.len(), 1, "one patch row: {patch_raw}");
+        let row = &rows[0];
+        assert!(
+            row.get("insert").is_none(),
+            "must OVERRIDE the bundle-inserted row, never insert a duplicate: {patch_raw}"
+        );
+        assert_eq!(row["id"], serde_yaml::Value::String("ccteam-client".into()));
+        assert_eq!(
+            row["name"],
+            serde_yaml::Value::String("@ccteam/dsh-client".into()),
+            "name guards against patching some other plugin's row"
+        );
+        let config = row["config"].as_mapping().expect("flat plugin config");
+        assert_eq!(
+            config["enrollment"],
+            serde_yaml::Value::String("ccteam-enroll:abc:secret".into())
+        );
+        assert_eq!(
+            config["daemonUrl"],
+            serde_yaml::Value::String("http://127.0.0.1:7331".into())
+        );
+        assert!(
+            config.get("ccteam-client").is_none(),
+            "config keys are flat, not nested under the namespace: {patch_raw}"
+        );
     }
 
     #[test]

@@ -546,9 +546,85 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
     }
 }
 
+/// Restores `crypto.randomUUID` when the browser withheld it.
+///
+/// `crypto.randomUUID` is a **secure-context-only** API. Native `dsh web`
+/// binds loopback, and `http://127.0.0.1` *is* a secure context, so upstream
+/// calls it freely — `dsh-client-connection` mints the id of every single
+/// `/api` RPC with it. Reaching that same UI through this companion port over
+/// plain HTTP on a LAN address is NOT a secure context, so the property is
+/// simply absent and every RPC throws `crypto.randomUUID is not a function`
+/// before it is sent: no workspace list, no provider catalog, no chat.
+///
+/// ccteam is what moved the UI off loopback, so ccteam restores the platform
+/// API it took away. `crypto.getRandomValues` stays available in insecure
+/// contexts, so this is a real RFC 4122 v4 UUID — no downgrade to `Math.random`
+/// — and it no-ops when the real thing is present (HTTPS, or a browser on the
+/// daemon host), which keeps it inert on the paths that never needed it.
+const CRYPTO_RANDOM_UUID_POLYFILL: &str = r#"<script>(function(){var c=window.crypto;if(!c||typeof c.getRandomValues!=="function")return;if(typeof c.randomUUID==="function")return;var h=[];for(var i=0;i<256;i++)h.push((i+256).toString(16).slice(1));Object.defineProperty(c,"randomUUID",{configurable:true,writable:true,value:function(){var b=new Uint8Array(16);c.getRandomValues(b);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;return h[b[0]]+h[b[1]]+h[b[2]]+h[b[3]]+"-"+h[b[4]]+h[b[5]]+"-"+h[b[6]]+h[b[7]]+"-"+h[b[8]]+h[b[9]]+"-"+h[b[10]]+h[b[11]]+h[b[12]]+h[b[13]]+h[b[14]]+h[b[15]]}})})();</script>"#;
+
+/// Splice the polyfill in as the first thing inside `<head>` so it runs before
+/// the boot script and every client plugin module. Returns `None` when there
+/// is no head to open, leaving the body untouched rather than guessing.
+fn inject_polyfill(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let head = lower.find("<head")?;
+    let open_end = lower[head..].find('>')? + head + 1;
+    let mut out = String::with_capacity(html.len() + CRYPTO_RANDOM_UUID_POLYFILL.len());
+    out.push_str(&html[..open_end]);
+    out.push_str(CRYPTO_RANDOM_UUID_POLYFILL);
+    out.push_str(&html[open_end..]);
+    Some(out)
+}
+
+fn is_html_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/html"))
+}
+
 async fn response_from_reqwest(resp: reqwest::Response) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
+
+    // HTML is buffered (documents are small) so the polyfill can be spliced
+    // in; everything else — assets, RPC payloads, downloads — keeps streaming
+    // untouched. `accept-encoding` is stripped on the way out (see
+    // `should_strip_request_header`), so the body here is always identity and
+    // splicing can never corrupt a compressed stream.
+    if is_html_response(&headers) {
+        match resp.bytes().await {
+            Ok(bytes) => {
+                let body = match std::str::from_utf8(&bytes) {
+                    Ok(html) => match inject_polyfill(html) {
+                        Some(patched) => Body::from(patched),
+                        None => Body::from(bytes),
+                    },
+                    // Not UTF-8 → not something to splice; pass it through.
+                    Err(_) => Body::from(bytes),
+                };
+                let mut out = Response::builder().status(status);
+                if let Some(out_headers) = out.headers_mut() {
+                    for (name, value) in headers.iter() {
+                        // CONTENT_LENGTH is dropped: the spliced body is
+                        // longer than the origin advertised, and a stale
+                        // length truncates the document in the browser.
+                        if !is_hop_by_hop(name) && name != header::CONTENT_LENGTH {
+                            out_headers.append(name, value.clone());
+                        }
+                    }
+                }
+                return out.body(body).unwrap_or_else(|err| {
+                    (StatusCode::BAD_GATEWAY, err.to_string()).into_response()
+                });
+            }
+            Err(err) => {
+                return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
+            }
+        }
+    }
+
     let stream = resp.bytes_stream().map_err(std::io::Error::other);
     let mut out = Response::builder().status(status);
     if let Some(out_headers) = out.headers_mut() {
@@ -587,6 +663,11 @@ fn should_strip_request_header(name: &HeaderName) -> bool {
     is_hop_by_hop(name)
         || name == header::COOKIE
         || name == header::AUTHORIZATION
+        // This hop is loopback, so compression buys nothing — and dropping it
+        // guarantees the HTML that comes back is identity-encoded, which is
+        // what lets `response_from_reqwest` splice the secure-context polyfill
+        // into it without ever risking a corrupted compressed stream.
+        || name == header::ACCEPT_ENCODING
         || name.as_str().starts_with("sec-fetch-")
 }
 
@@ -895,5 +976,48 @@ mod tests {
         )));
         assert!(should_strip_request_header(&header::CONNECTION));
         assert!(!should_strip_request_header(&header::CONTENT_TYPE));
+    }
+
+    /// Compression must stay off on the loopback hop: the polyfill splice
+    /// assumes an identity-encoded body, and a gzipped document spliced as
+    /// text would reach the browser corrupted.
+    #[test]
+    fn accept_encoding_is_stripped_so_html_comes_back_spliceable() {
+        assert!(should_strip_request_header(&header::ACCEPT_ENCODING));
+    }
+
+    #[test]
+    fn polyfill_lands_before_the_boot_script_and_module_imports() {
+        let html = "<!doctype html>\n<html lang=\"zh-CN\">\n  <head><script>window.__DSH_BOOT__ = {}</script>\n<script type=\"module\" src=\"/assets/index.js\"></script></head>\n<body></body></html>";
+        let patched = inject_polyfill(html).expect("head present");
+        let at = patched.find("randomUUID").expect("polyfill present");
+        // Ordering is the whole point: DSH mints RPC ids from the very first
+        // client module, so a polyfill placed after them is a polyfill that
+        // never ran in time.
+        assert!(at < patched.find("__DSH_BOOT__").unwrap());
+        assert!(at < patched.find("/assets/index.js").unwrap());
+        assert!(patched.starts_with("<!doctype html>"));
+    }
+
+    #[test]
+    fn polyfill_injection_is_inert_without_a_head() {
+        assert!(inject_polyfill("{\"json\":true}").is_none());
+        assert!(inject_polyfill("plain text").is_none());
+    }
+
+    #[test]
+    fn only_html_responses_are_buffered_for_injection() {
+        let html_type = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::CONTENT_TYPE, HeaderValue::from_static(v));
+            is_html_response(&h)
+        };
+        assert!(html_type("text/html; charset=utf-8"));
+        assert!(html_type("text/html"));
+        // Assets and RPC payloads must keep streaming untouched.
+        assert!(!html_type("application/json"));
+        assert!(!html_type("text/javascript"));
+        assert!(!html_type("application/octet-stream"));
+        assert!(!is_html_response(&HeaderMap::new()));
     }
 }
