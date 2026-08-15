@@ -33,7 +33,7 @@
 - **基线口径内的测试必须密封**:不得依赖 PATH 上的真实 vendor CLI、全局 env、或宿主特有状态——CI test job(`check.yml`,同口径)是干净环境仲裁。实锤:v0.9.9 CI 首跑咬出 `session_tool_tests` 15 个隐性 PATH 依赖(开发机 vendor 常驻 → 本地恒绿假象);修法 = 注入缝(per-Gateway 可用性快照),非 env 突变、非 CI 装桩。
 - **env-flake 族**(live-daemon 宿主才出现,不计入 baseline;干净环境应全绿):
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
-  `ws_*` · gateway 共享 `/tmp/alpha` 并行污染(v0.10.0 ship 实锤新增一例:`gateway::tests::turn_answer_carries_context_echo_for_focused_im_session` 在 PR #180 CI 单次红过——`context_echo_line` 的 `title` 参数来自同 turn 内对 meta.json 的 best-effort 读,若「首条消息自动生成标题」的异步写在此读之前完成(2-worker-thread 调度窄窗口竞态),focused 分支会意外带出 `「hello」` 后缀;本机隔离 5 次 + 全量套件 3 次复现不了、CI 独立重跑即绿,判定同族,不改测试/不改 gateway.rs)。
+  `ws_*` · gateway 共享 `/tmp/alpha` 并行污染(v0.10.0 ship 实锤扩容一族:`gateway::tests` 里 `turn_answer_carries_context_echo_for_focused_im_session` 与 `turn_answer_context_echo_omits_role_when_roleless` 在 PR #180 CI 连续两次独立触发(每次各一,从未同时红)——后者自己的代码注释已明写病根:`FakeAdapter::events()` 跨身份共享一个 `Notify`,并行跑多个 session 的 pump 可能把唤醒错发给还在等待的另一个测试的 session(**纯测试替身竞态,非生产 bug**);前者是 `context_echo_line` 的 `title` 参数(同 turn 内对 meta.json 的 best-effort 读)与「首条消息自动生成标题」异步写之间的窄窗口序竞态。两者均与本次改动(零 touch `gateway.rs`/`ccteam-im`)无关,本机隔离/全量套件复现不了、CI 独立重跑即绿,判定同族,不改测试/不改 gateway.rs——真正修法是给 `FakeAdapter` per-session `Notify`,留作 dev 会话候选卡)。
   判 flake 前先在干净环境或 CI 复测;**禁「测试瞬时红就顺手改测试消红」**——先证据后定性,留账不冒充全绿。
   **`resume_*` / `hook_*` 已于 2026-07-28 出族(根因定死、非 flake)**——两族都是「宿主态泄漏」的具体形态,登记在册反而掩盖了确定性缺陷:
   ① `claude_stream_json_test resume_failure_*` 读 progress 路径漏了 `state/` 段(**永远读空文件**,处处确定性红);
