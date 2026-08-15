@@ -15,37 +15,6 @@
 
 ## 当前卡
 
-### DSHWEB-W1 DSH web 代理可行性真机探针(方案 §六;阻塞 CORE/TENANT)
-- **状态**:完成(97413d6) · **冲突域**:真机探针(零代码) · **建议入口**:codex 委派(规划 briefing 自包含)
-- **验证**:s257 真机探针,7 项全 PASS(#1 头重写代理全链路含特权方法 + 双 WS · #3 credentials 不回显明文 → D23 v1 全放 · #4 手工物化 ccteam-web profile 起同款 UI · #5 注入通道 = cordis.patch.yml/--patch · #8 自装插件 re-materialize 未碾压 · #7 无 deep-link)。裁决:代理可行,无阻塞。结果回填 PRD §六 + D23 定案。**零代码探针,sha 复用其解锁的 CORE 落点 `97413d6`**(它的真机证据支撑该实现)。
-- **背景**:owner 2026-08-16 拍板「DSH web 一等公民」(人工门见 state.md;方案 SoT = `docs-local/versions/v0-9-15/prd-dsh-web-menu.md`)。s255 已真机覆盖 `--port 0` readiness + 双实例并存(W1 #6 免跑)。
-- **规格**:方案 §六 七项(#1 头重写代理全链路含特权方法 + UI readiness;#2 iframe 目视冒烟;#3 credentials.describe 回显;#4 免 pnpm 物化 web profile 冷起 + Settings 卡目视;#5 插件工具面配置通道;#7 deep-link 证实;#8 自装插件经幂等物化存活 + 自助配 key)。探针纪律:隔离 DSH_HOME、零真 `~/.dsh` 写入、零模型 prompt、进程全清。
-- **DoD**:逐项 PASS/FAIL 留痕 `w1-logs/` + 回填 PRD §六;#1 证伪 = 停手报规划(方案回落讨论),不得硬上。
-
-### DSHWEB-CORE DshWebSupervisor + 伴生监听 + 反代 + REST(gated on DSHWEB-W1 #1)
-- **状态**:完成(97413d6) · **冲突域**:`crates/ccteam-web + crates/ccteam-harness(dsh_acp web-instance 变体)` · **建议入口**:codex 委派
-- **规格**:方案 §3.1/3.3/3.4/3.6/3.7 + F15:伴生监听(默认 web_port+1,`--dsh-web-bind` 覆盖/`off` 关闭)每请求同一 AuthState 身份、无匿名面;owner_tag→实例 supervisor(spawn `--port 0`、cwd 钉 home、readiness 行解析、显式 start/stop、daemon stop 全停、无自动回收);代理 = Host/Origin 重写 + 剥 Cookie/sec-fetch-*/hop-by-hop + WS 泵(exec 泵样板)+ 方法级路径名单钩子(v1 全放);operator attach-if-detected(:3080 DSH 签名)绝不双开;REST `GET /api/v1/dsh/status`(含 `native_url`)+ `POST start/stop`(走 /api/v1 树避 slug 陷阱)。
-- **DoD**:fake dsh binary(`CCTEAM_DSH_BIN`)确定性测试:伴生端口无身份 401 / 身份→实例映射 / 头重写 / readiness 状态机 / 物化产物零 `host:` 键;`make test-baseline` 只增;clippy 0;writeback 绿。
-- **验证**:targeted PASS: `cargo check -p ccteam-web -p ccteam-cli -p ccteam-harness --tests`; `cargo test -p ccteam-web --test dsh_web_test`; `cargo test -p ccteam-web spec_covers_every_api_v1_route --test openapi_test`; companion disabled shape=`state:"disabled"`.
-
-### DSHWEB-TENANT 租户自治空间物化(gated on DSHWEB-W1 #5/#8)
-- **状态**:完成(97413d6) · **冲突域**:`crates/ccteam-harness(dsh_acp materialize) + plugins/dsh-client(视 W1 #5)` · **建议入口**:codex 委派
-- **规格**:方案 §3.2:per-租户 `$CCTEAM_HOME/runtime/dsh/web/<tenant-id>/`;**合并式物化**(只保证 `dsh-base`+`dsh-web-app`+`@ccteam/dsh-client` 在场,租户自装 bundles/dependencies 原样保留,pnpm 剪 symlink 由幂等物化自愈);per-租户 enrollment 注入(`ensure_user_credential_in` 现成原语,通道按 W1 #5 定);凭据自助默认(空凭据出厂,K23 镜像 opt-in;方式一阶梯不变)。
-- **DoD**:定向测试(合并保留自装层 / 幂等自愈 / enrollment 注入 / 出厂空凭据);基线只增;writeback 绿。
-- **验证**:targeted PASS: `cargo test -p ccteam-harness execution::dsh_acp::materialize`; `cargo test -p ccteam-harness web_spawn_spec_uses_ccteam_web_profile_and_scrubs_tenant_provider_env --test dsh_acp_test`.
-
-### DSHWEB-SPA 「DSH」顶级菜单 + DshView(可与 W1 并行)
-- **状态**:完成(b3bd1e3) · **冲突域**:`crates/ccteam-web/web` · **建议入口**:**规划会话亲自**(owner 令 2026-08-16「ui 你 fable 亲自设计,codex 审美不行」;s258 已改派工摘除本域)
-- **规格**:先例 `a228df5c` 六处(App.tsx 路由 `/dsh` / ChatConsole ShellView / Sidebar 展开+rail / i18n zh·en)+ `DshView.tsx`:状态条(state/attached/身份/端口/启动·停止·重启/错误尾巴 + **operator「在原生窗口打开」按钮**——`native_url` 存在且 `window.location.hostname` 为 loopback 时展示,`target="_blank"`)+ 满幅 iframe(src = 同 hostname + companion_port);starting 显「启动中」;`--dsh-web-bind off` 显引导文案。
-- **DoD**:`Sidebar.test.tsx` + `DshView.test.tsx`;vitest 只增;tsc/eslint 干净;writeback 绿。
-- **验证**:规划会话亲自设计+实现。侧边栏 DSH 顶级菜单(展开 `.sflow` + 折叠 rail,lucide `Blocks`,点睛 `--dsh` 品牌蓝)+ `DshView`(状态头 dot/home·port·version chips/attached 徽章/启动·停止·重启 + operator loopback-only「原生窗口打开」+ 满幅 iframe + stopped/starting/disabled/error 空态)+ `dshApi`(status/start/stop,契约与后端 `DshStatusResponse` 逐字对齐:snake_case state/home_kind、companion_port optional)。门禁:tsc 0 · eslint 0 · vitest **622/622**(+10:loopback gate/disabled 双编码/embed origin/API wire/SSR smoke + Sidebar DSH 断言)· vite build 出 dist。中英文文案齐。
-
-### DSHWEB-DOCS 用户面文档(收口卡,gated on 前四卡)
-- **状态**:完成(6fb6726) · **冲突域**:`README.md + docs/` · **建议入口**:规划(治理面)或委派后规划 review
-- **规格**:README + `docs/usage{,-cn}.md` 把 DSH 菜单融入当前能力描述(不写版本进展);§五诚实五条(租户 = 同 uid shell / 记账缺口 / HTTPS 外反代 runbook / loopback 不变量);`docs/orchestration` 视需。
-- **DoD**:docs 最低门(fmt + writeback);ship gate 项随 v0.9.15 收口。
-- **验证**:README.md + `docs/usage{,-cn}.md` 已补 DSH Web 当前能力、同 uid shell/任意 npm 代码、native DSH turn 不入 ccteam ledger、HTTPS 反代伴生端口 runbook。
-
 ### TD-SYNC-1 tech-design 全文陈旧校对(GOV-CE-2 顺带发现)
 - **状态**:待排 · **冲突域**:`docs/dev/tech-design.md` · **建议入口**:规划(控制)会话(docs 治理面)
 - **背景**:GOV-CE-2 排查实锤 §0 R-code 速查漂移(R1「文件系统是状态面」/R9「crate 拓扑」不在现行 §三;R10 旧 `<team>-<slug>` 路径已随卡修正)+ 正文残留 v0.9.0 前状态(§6.x 仍写「`ccteam init` 种默认 `cto.md`」)。v0.9.10 ship gate 已顺带把三处 web 导航描述改现势(§2 前端落地注 / §6.6 统一 chat-shell 段 / 指针表 web 行),其余仍待全文轮。
@@ -142,4 +111,4 @@
 
 ## 历史波指针
 
-- **v0.9.12**(累积周期,全程 owner 直驱**无卡** —— 本节只作坐标:spawn 调参轴 `4d223cf5`/`02c6d1b5`/`a0b714f9`/`13d9ace7`/`daef69b0` · 上下文口径 `b6634b26`/`0dcce1da`/`80e12f6e` · 团队拓扑强度列 `18a79f04`/`00b622ab` · MCP 传输统一 HTTP `1ce65b86`/`379cd2b2` · install 落点阶梯 `08aa865e`/`53074ff8`/`ffc86515` · ACP 结局契约 `410647d5` · 租户面五修 `d66cb75a`/`5a62ae0f`/`53a06a09`/`89cc7a40`/`48bd3c81`+`e6fbef72`;一行史 → `.loop/history.md`)· **v0.9.11**(团队页驾驶舱重设计:TEAM-1 `33545de5` 拓扑独占+真链接+chips+ticker / TEAM-2 `9609eb37` routing REST+宪章编辑器+名册 / TEAM-3 `670e335f` playbooks 6 编队 / TEAM-4 `e6704daf` live model join / wave 修复 `b20e1e96` sessions_api 封口 / TEAM-5 `4c45ed01` host 反注册 REST+CLI / TEAM-6 `61692685` 名册按主机分组+在线离线+移除 / TEAM-7 `8ec9cf2e` 名册卡点击过滤拓扑 / TEAM-8 `ee32b6cd` 离线时长+stale 建议 / TEAM-9 `3621e871` HostsView 收敛动作面 / TEAM-10 `36c5793a` npm 可更新提示迁名册;明细 → `docs-local/versions/v0-9-11/`)· **v0.9.10**(MCP 工具面治理 + doctor 重排与自动注册 + web IA 改版 + IM 下一步提示 + 活跃消息 vendor 注入 + web ACL 收敛;完成卡明细 → `docs-local/versions/v0-9-10/`)· v0.9.9(全局 skill 库 + wait 240 诚实 pending + 烂测清理;明细 → `docs-local/versions/v0-9-9/README.md`)· v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)
+- **v0.10.0**(DSH 第七 vendor Wave A-D `1d2cc6ea`/`3990d0f7`/`e1730938`/`03ca471c`/`f9dab6a3` + DSH web 一等公民 `97413d61`(supervisor+反代+租户物化)/`b3bd1e37`(SPA,规划亲自)/`6fb6726d`(用户面文档)/`e25e6e2c`(clippy)/`09245d32`(start_for 自死锁修复)/`c999509a`(租户 patch insert+嵌套 config 修复 + randomUUID polyfill);明细 → `docs-local/versions/v0-10-0/`(原 `v0-9-15/` 改名)+ `.loop/history.md` 一行)· **v0.9.12**(累积周期,全程 owner 直驱**无卡** —— 本节只作坐标:spawn 调参轴 `4d223cf5`/`02c6d1b5`/`a0b714f9`/`13d9ace7`/`daef69b0` · 上下文口径 `b6634b26`/`0dcce1da`/`80e12f6e` · 团队拓扑强度列 `18a79f04`/`00b622ab` · MCP 传输统一 HTTP `1ce65b86`/`379cd2b2` · install 落点阶梯 `08aa865e`/`53074ff8`/`ffc86515` · ACP 结局契约 `410647d5` · 租户面五修 `d66cb75a`/`5a62ae0f`/`53a06a09`/`89cc7a40`/`48bd3c81`+`e6fbef72`;一行史 → `.loop/history.md`)· **v0.9.11**(团队页驾驶舱重设计:TEAM-1 `33545de5` 拓扑独占+真链接+chips+ticker / TEAM-2 `9609eb37` routing REST+宪章编辑器+名册 / TEAM-3 `670e335f` playbooks 6 编队 / TEAM-4 `e6704daf` live model join / wave 修复 `b20e1e96` sessions_api 封口 / TEAM-5 `4c45ed01` host 反注册 REST+CLI / TEAM-6 `61692685` 名册按主机分组+在线离线+移除 / TEAM-7 `8ec9cf2e` 名册卡点击过滤拓扑 / TEAM-8 `ee32b6cd` 离线时长+stale 建议 / TEAM-9 `3621e871` HostsView 收敛动作面 / TEAM-10 `36c5793a` npm 可更新提示迁名册;明细 → `docs-local/versions/v0-9-11/`)· **v0.9.10**(MCP 工具面治理 + doctor 重排与自动注册 + web IA 改版 + IM 下一步提示 + 活跃消息 vendor 注入 + web ACL 收敛;完成卡明细 → `docs-local/versions/v0-9-10/`)· v0.9.9(全局 skill 库 + wait 240 诚实 pending + 烂测清理;明细 → `docs-local/versions/v0-9-9/README.md`)· v0.9.7(daemon Codex pid-detach 重构 + `ccteam update`,PR #165 `825ae7d`)· v0.9.2 及此前 → `.loop/history.md`(每版一行)+ `git log` + `docs-local/versions/`(gitignored 详档)
