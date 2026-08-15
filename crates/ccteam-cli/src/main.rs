@@ -128,6 +128,11 @@ enum Command {
         /// loopback (auth then disabled).
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
+        /// DSH web companion reverse-proxy bind address. Omit to use
+        /// `--web-bind`'s port + 1; pass `off` to disable the companion
+        /// listener while keeping `/api/v1/dsh/status` available.
+        #[arg(long, value_name = "ADDR|off")]
+        dsh_web_bind: Option<String>,
         /// Disable token auth on the embedded web. DANGEROUS on
         /// non-loopback bind — prints a 5-second warning before
         /// listening.
@@ -322,6 +327,10 @@ enum DaemonCommand {
         /// `ccteam start`.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
+        /// DSH web companion bind forwarded to the detached `ccteam start`.
+        /// Omit to use `--web-bind`'s port + 1; pass `off` to disable.
+        #[arg(long, value_name = "ADDR|off")]
+        dsh_web_bind: Option<String>,
         /// Emit exactly one machine-readable JSON line on stdout
         /// (human prose moves to stderr).
         #[arg(long, default_value_t = false)]
@@ -347,6 +356,10 @@ enum DaemonCommand {
         /// `ccteam start`.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
+        /// DSH web companion bind forwarded to the detached `ccteam start`.
+        /// Omit to use `--web-bind`'s port + 1; pass `off` to disable.
+        #[arg(long, value_name = "ADDR|off")]
+        dsh_web_bind: Option<String>,
         /// Emit exactly one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -736,6 +749,10 @@ enum InternalCommand {
         /// unless `--no-auth`.
         #[arg(long, default_value = "0.0.0.0:7331")]
         bind: String,
+        /// DSH web companion bind. Omit to use `--bind`'s port + 1; pass
+        /// `off` to disable.
+        #[arg(long, value_name = "ADDR|off")]
+        dsh_web_bind: Option<String>,
         /// Disable token auth on write endpoints. DANGEROUS on
         /// non-loopback bind — prints a 5-second warning before
         /// listening.
@@ -903,6 +920,7 @@ fn main() -> Result<()> {
             no_web,
             no_imd,
             web_bind,
+            dsh_web_bind,
             web_no_auth,
             web_token_file,
             no_clipboard,
@@ -910,6 +928,7 @@ fn main() -> Result<()> {
             StartWebOpts {
                 disabled: no_web,
                 bind: web_bind,
+                dsh_bind: dsh_web_bind,
                 no_auth: web_no_auth,
                 token_file: web_token_file,
                 no_clipboard,
@@ -922,13 +941,17 @@ fn main() -> Result<()> {
         // (the trigger-file channel is retired).
         Command::Stop => daemon_cli::run_daemon_stop(false, false),
         Command::Daemon { cmd } => match cmd {
-            DaemonCommand::Start { web_bind, json } => {
-                daemon_cli::run_daemon_start(&web_bind, json)
-            }
+            DaemonCommand::Start {
+                web_bind,
+                dsh_web_bind,
+                json,
+            } => daemon_cli::run_daemon_start(&web_bind, dsh_web_bind.as_deref(), json),
             DaemonCommand::Stop { force, json } => daemon_cli::run_daemon_stop(force, json),
-            DaemonCommand::Restart { web_bind, json } => {
-                daemon_cli::run_daemon_restart(&web_bind, json)
-            }
+            DaemonCommand::Restart {
+                web_bind,
+                dsh_web_bind,
+                json,
+            } => daemon_cli::run_daemon_restart(&web_bind, dsh_web_bind.as_deref(), json),
             DaemonCommand::Status { json } => daemon_cli::run_daemon_status(json),
             DaemonCommand::Logs { n, follow, json } => daemon_cli::run_daemon_logs(n, follow, json),
         },
@@ -1304,12 +1327,14 @@ fn run_internal(cmd: InternalCommand) -> Result<()> {
         InternalCommand::Mux { cmd } => run_mux(cmd),
         InternalCommand::Web {
             bind,
+            dsh_web_bind,
             no_auth,
             token_file,
         } => {
             init_tracing();
             commands::run_web(commands::WebOptions {
                 bind,
+                dsh_bind: dsh_web_bind,
                 no_auth,
                 token_file,
             })
@@ -1567,6 +1592,7 @@ fn parse_hook_stdin_json() -> Result<serde_json::Value> {
 struct StartWebOpts {
     disabled: bool,
     bind: String,
+    dsh_bind: Option<String>,
     no_auth: bool,
     token_file: Option<PathBuf>,
     /// V0.4.6 F88 — when true, skip the clipboard probe in
@@ -2336,12 +2362,32 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         .bind
         .parse()
         .with_context(|| format!("--web-bind {} is not a valid socket address", web.bind))?;
+    let dsh_web_bind = parse_dsh_web_bind(&bind, web.dsh_bind.as_deref())?;
     Ok(ccteam_web::ServeOpts {
         bind,
         no_auth: web.no_auth,
         token_file: web.token_file.clone(),
+        dsh_web_bind,
         no_auth_grace_secs: Some(5),
     })
+}
+
+fn parse_dsh_web_bind(
+    web_bind: &std::net::SocketAddr,
+    raw: Option<&str>,
+) -> Result<Option<std::net::SocketAddr>> {
+    match raw {
+        Some(value) if value.eq_ignore_ascii_case("off") => Ok(None),
+        Some(value) => value.parse().map(Some).with_context(|| {
+            format!("--dsh-web-bind {value} is not a valid socket address or `off`")
+        }),
+        None => {
+            let port = web_bind.port().checked_add(1).context(
+                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
+            )?;
+            Ok(Some(std::net::SocketAddr::new(web_bind.ip(), port)))
+        }
+    }
 }
 
 fn run_status() -> Result<()> {

@@ -362,6 +362,7 @@ fn vendor_from_str(vendor: &str) -> ccteam_cost::Vendor {
         "opencode" => ccteam_cost::Vendor::Opencode,
         "kimi" => ccteam_cost::Vendor::Kimi,
         "pi" => ccteam_cost::Vendor::Pi,
+        "dsh" => ccteam_cost::Vendor::Dsh,
         _ => ccteam_cost::Vendor::Claude,
     }
 }
@@ -410,6 +411,7 @@ mod tests {
         assert_eq!(vendor_from_str("grok"), ccteam_cost::Vendor::Grok);
         assert_eq!(vendor_from_str("opencode"), ccteam_cost::Vendor::Opencode);
         assert_eq!(vendor_from_str("pi"), ccteam_cost::Vendor::Pi);
+        assert_eq!(vendor_from_str("dsh"), ccteam_cost::Vendor::Dsh);
         assert_eq!(vendor_from_str("weird"), ccteam_cost::Vendor::Claude);
     }
 

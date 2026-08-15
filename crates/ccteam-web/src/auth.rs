@@ -60,7 +60,7 @@ use std::path::Path;
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderValue, Method, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -332,6 +332,40 @@ pub fn resolve_identity(bare: &str, admin_hex: &str, tenants_path: &Path) -> Opt
     TenantRegistry::load(tenants_path)
         .by_token(bare)
         .map(|t| Identity::tenant(t.id.clone()))
+}
+
+/// Resolve a web request's cookie/Bearer credentials without the SPA login
+/// query shim and without public-shell bypasses. Used by the DSH companion
+/// port, whose entire surface is a reverse proxy into a local DSH process and
+/// must therefore fail closed on anonymous requests.
+pub fn resolve_strict_web_identity(
+    auth: &AuthState,
+    ccteam_root: &Path,
+    headers: &HeaderMap,
+    jar: &CookieJar,
+) -> Result<Option<Identity>, &'static str> {
+    if !auth.enabled {
+        return Ok(Some(Identity::admin()));
+    }
+    let Some(expected) = auth.current_token() else {
+        return Err("auth misconfigured");
+    };
+    let tenants = ccteam_root.join("secrets").join("users");
+    if let Some(cookie_val) = cookie_token(jar) {
+        if let Some(id) = resolve_identity(cookie_val, &expected, &tenants) {
+            return Ok(Some(id));
+        }
+    }
+    if let Some(h) = headers.get(header::AUTHORIZATION) {
+        if let Some(presented) = parse_bearer(h) {
+            if let Some(bare) = bare_hex(presented) {
+                if let Some(id) = resolve_identity(bare, &expected, &tenants) {
+                    return Ok(Some(id));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// v0.8.24 Track D — resolve a join-token or satellite agent-token to a

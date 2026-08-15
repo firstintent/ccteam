@@ -191,6 +191,17 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
             false,
             check_vendor_auth_pi,
         )),
+        ReportRow::visible(check_agent(
+            "dsh",
+            ccteam_harness::DSH_BIN_ENV,
+            // Falls back to a cached `npx` copy when bare `dsh` isn't on
+            // PATH — DSH's own quickstart (`npx @deepseek-ai/dsh …`) never
+            // puts one there. Same resolver the status/hosts panel and the
+            // actual spawn path use, so doctor never disagrees with them.
+            &ccteam_harness::resolve_dsh_default_bin(),
+            false,
+            check_vendor_auth_dsh,
+        )),
     ];
 
     let daemon_probe = ccteam_core::daemon::probe_daemon(paths);
@@ -305,6 +316,20 @@ struct BinaryCheck {
 struct AuthCheck {
     ok: Option<bool>,
     login_hint: &'static str,
+    /// Overrides the generic "auth ok" detail text when `ok == Some(true)`.
+    /// DSH has two Pass sources (env vs mirrored vendor credentials, K23/D13)
+    /// that must read differently, not just "auth ok" either way.
+    ok_detail: Option<&'static str>,
+}
+
+impl AuthCheck {
+    const fn simple(ok: Option<bool>, login_hint: &'static str) -> Self {
+        Self {
+            ok,
+            login_hint,
+            ok_detail: None,
+        }
+    }
 }
 
 struct McpCheck {
@@ -329,7 +354,7 @@ fn check_agent(
     let mut status = binary.status.worst(mcp.status);
     let mut details = vec![binary.detail];
     match auth.ok {
-        Some(true) => details.push("auth ok".to_string()),
+        Some(true) => details.push(auth.ok_detail.unwrap_or("auth ok").to_string()),
         Some(false) => {
             status = status.worst(CheckStatus::Warn);
             details.push(format!("auth missing — {}", auth.login_hint));
@@ -406,10 +431,7 @@ fn check_vendor_auth_claude() -> AuthCheck {
     let ok = home.as_ref().is_some_and(|h| {
         h.join(".credentials.json").exists() || h.join("credentials.json").exists()
     }) || std::env::var("ANTHROPIC_API_KEY").is_ok();
-    AuthCheck {
-        ok: Some(ok),
-        login_hint: "run `claude auth login` or set ANTHROPIC_API_KEY",
-    }
+    AuthCheck::simple(Some(ok), "run `claude auth login` or set ANTHROPIC_API_KEY")
 }
 
 // Daemon-start MCP auto-registration creates the vendor config files, so those
@@ -420,10 +442,7 @@ fn check_vendor_auth_codex() -> AuthCheck {
         .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
     let ok = home.as_ref().is_some_and(|h| h.join("auth.json").exists())
         || std::env::var("OPENAI_API_KEY").is_ok();
-    AuthCheck {
-        ok: Some(ok),
-        login_hint: "run `codex login` or set OPENAI_API_KEY",
-    }
+    AuthCheck::simple(Some(ok), "run `codex login` or set OPENAI_API_KEY")
 }
 
 fn check_vendor_auth_grok() -> AuthCheck {
@@ -432,10 +451,7 @@ fn check_vendor_auth_grok() -> AuthCheck {
             home.join(".config/grok").exists()
                 || dir_contains_entry_other_than(&home.join(".grok"), "config.toml")
         });
-    AuthCheck {
-        ok: ok.then_some(true),
-        login_hint: "",
-    }
+    AuthCheck::simple(ok.then_some(true), "")
 }
 
 fn check_vendor_auth_opencode() -> AuthCheck {
@@ -445,10 +461,7 @@ fn check_vendor_auth_opencode() -> AuthCheck {
                 || home.join(".opencode").exists()
                 || dir_contains_entry_other_than(&home.join(".config/opencode"), "opencode.json")
         });
-    AuthCheck {
-        ok: ok.then_some(true),
-        login_hint: "",
-    }
+    AuthCheck::simple(ok.then_some(true), "")
 }
 
 fn dir_contains_entry_other_than(dir: &std::path::Path, excluded: &str) -> bool {
@@ -467,19 +480,43 @@ fn check_vendor_auth_kimi() -> AuthCheck {
         || kimi_home
             .as_ref()
             .is_some_and(|h| h.join("credentials").exists() || h.join("oauth").exists());
-    AuthCheck {
-        ok: Some(ok),
-        login_hint: "run `kimi login` or set MOONSHOT_API_KEY",
-    }
+    AuthCheck::simple(Some(ok), "run `kimi login` or set MOONSHOT_API_KEY")
 }
 
 fn check_vendor_auth_pi() -> AuthCheck {
     // Pi may use any configured provider. The RPC feature handshake is the
     // authoritative model/auth verdict when a managed session starts.
-    AuthCheck {
-        ok: None,
-        login_hint: "",
+    AuthCheck::simple(None, "")
+}
+
+/// v0.9.15 K23/D13 — two Pass sources, checked in order: explicit env wins
+/// (matches DSH's own resolution order), else a mirrorable
+/// `~/.dsh/.credentials.yaml` counts (the real spawn-time credential mirror,
+/// K17/K23 — `check_vendor_mcp`'s bridge short-circuit skips the generic
+/// vendor-config probe for a `ManagedSessionBridge` vendor, so this is the
+/// only auth signal `dsh`'s doctor row gets). Neither present → Fail with
+/// both fixes named (matches the two-hint convention above).
+fn check_vendor_auth_dsh() -> AuthCheck {
+    if std::env::var("DEEPSEEK_API_KEY").is_ok() {
+        return AuthCheck {
+            ok: Some(true),
+            login_hint: "",
+            ok_detail: Some("auth ok (source: env)"),
+        };
     }
+    let mirrored =
+        dirs::home_dir().is_some_and(|home| home.join(".dsh").join(".credentials.yaml").exists());
+    if mirrored {
+        return AuthCheck {
+            ok: Some(true),
+            login_hint: "",
+            ok_detail: Some("auth ok (source: dsh credentials, mirrored at spawn)"),
+        };
+    }
+    AuthCheck::simple(
+        Some(false),
+        "export DEEPSEEK_API_KEY, or run `dsh web` once to write ~/.dsh/.credentials.yaml",
+    )
 }
 
 fn check_vendor_mcp(vendor: &str) -> McpCheck {

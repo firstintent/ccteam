@@ -76,6 +76,7 @@ tracing.workspace = true
 # from `tokio::sync::broadcast::Receiver` to `futures::Stream`.
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
 
 # V0.3 M5.0 — pinned per docs/versions/v0-3/prd.md §3.2.2.
 # V0.3.2 F56 — enable `ws` feature so `axum::extract::ws::WebSocketUpgrade`
@@ -144,7 +145,6 @@ nix = { version = "0.29", default-features = false, features = ["signal", "fs"] 
 [dev-dependencies]
 tempfile = "3"
 async-trait.workspace = true
-reqwest = { workspace = true, features = ["json", "stream", "cookies"] }
 # (sha2 moved to [dependencies] for the routing-charter endpoints; the
 # marketplace test fixture keeps using it from there.)
 # V0.3 M5.2 — SSE integration tests need to read the streaming body

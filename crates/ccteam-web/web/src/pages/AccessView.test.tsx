@@ -110,7 +110,7 @@ describe("AccessView", () => {
     expect(snippet).toContain("/api/v1/projects/<project-slug>/sessions");
     expect(snippet).toContain("/api/v1/sessions/s42/turn");
     expect(snippet).toContain("/api/v1/sessions/s42/events");
-    expect(snippet).toContain("claude|codex|grok|opencode|kimi|pi");
+    expect(snippet).toContain("claude|codex|grok|opencode|kimi|pi|dsh");
   });
 
   it("renders a compact tenant row with its copy-login-link action", () => {

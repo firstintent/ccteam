@@ -11,6 +11,7 @@
 
 import { useEffect, useState } from "react";
 import {
+  Blocks,
   ChevronDown,
   ChevronRight,
   ChevronsLeft,
@@ -172,6 +173,7 @@ export function Sidebar({
   flowActive,
   settingsActive,
   teamActive = false,
+  dshActive = false,
   userName,
   userInitial,
   avatarColor,
@@ -183,6 +185,7 @@ export function Sidebar({
   onOpenFlow,
   onOpenSettings,
   onOpenTeam,
+  onOpenDsh,
   onOpenRow,
   onStopRow,
   onRenameRow,
@@ -203,6 +206,8 @@ export function Sidebar({
   settingsActive: boolean;
   /** v0.9.0 W4 — whether the 团队/Team route is the active view. */
   teamActive?: boolean;
+  /** v0.9.15 — whether the DSH embedded page is the active view. */
+  dshActive?: boolean;
   userName: string;
   userInitial: string;
   avatarColor?: string;
@@ -214,6 +219,8 @@ export function Sidebar({
   onOpenFlow: () => void;
   onOpenSettings: () => void;
   onOpenTeam?: () => void;
+  /** v0.9.15 — open the DSH embedded page. */
+  onOpenDsh?: () => void;
   onOpenRow: (row: RailRow) => void;
   onStopRow: (row: RailRow) => void;
   /** Rename a row's session (live or stopped) — double-click a row, or use
@@ -334,6 +341,17 @@ export function Sidebar({
         >
           <Users />
           <span>{t("team")}</span>
+          <ChevronRight className="chev" />
+        </button>
+
+        <button
+          type="button"
+          className={`sflow ${dshActive ? "active" : ""}`}
+          onClick={onOpenDsh}
+          data-testid="side-dsh"
+        >
+          <Blocks />
+          <span>{t("dsh")}</span>
           <ChevronRight className="chev" />
         </button>
 
@@ -628,6 +646,16 @@ export function Sidebar({
           data-testid="side-team-rail"
         >
           <Users />
+        </button>
+        <button
+          type="button"
+          className="rail-btn"
+          onClick={onOpenDsh}
+          title={t("dsh")}
+          aria-label={t("dsh")}
+          data-testid="side-dsh-rail"
+        >
+          <Blocks />
         </button>
         {/* 会话区空白:点击展开 */}
         <div

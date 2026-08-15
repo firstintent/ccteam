@@ -142,6 +142,15 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         default_bin: "pi",
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
     },
+    AgentProbeSpec {
+        vendor: "dsh",
+        harness_id: "dsh",
+        bin_env: ccteam_harness::DSH_BIN_ENV,
+        // The product CLI (`dsh --profile ccteam`), not a demo/dev binary —
+        // v0.9.15 K5/§5.2.
+        default_bin: "dsh",
+        tool_surface: ToolSurfaceMode::ManagedSessionBridge,
+    },
 ];
 
 impl AgentProbeSpec {
@@ -150,40 +159,76 @@ impl AgentProbeSpec {
         AGENT_PROBE_SPECS.iter().find(|s| s.vendor == vendor)
     }
 
+    /// Explains the `Pass`-with-no-config-file state a `ManagedSessionBridge`
+    /// vendor always reports: unlike the five `NativeMcpConfig` vendors,
+    /// there is no global config entry to point at, by design (Pi has no
+    /// MCP seam at all; DSH's official ACP demo hard-rejects a non-empty
+    /// `mcpServers`) — so this leads with *why* before the caveat, instead
+    /// of reading like a warning bolted onto an otherwise-green row.
     pub fn tool_surface_notice(&self) -> Option<String> {
-        (self.tool_surface == ToolSurfaceMode::ManagedSessionBridge).then(|| {
-            let mut chars = self.vendor.chars();
-            let display = chars
-                .next()
-                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                .unwrap_or_default();
-            format!(
-                "Managed {display} sessions get the ccteam bridge; a plain `{}` started in a shell does not.",
-                self.default_bin
-            )
-        })
+        if self.tool_surface != ToolSurfaceMode::ManagedSessionBridge {
+            return None;
+        }
+        // DSH's tool face is a Cordis plugin, not a ccteam-owned bridge
+        // extension (K2/K3) — the notice says so, and names the exact
+        // install command instead of just the package (a plain-vendor DSH
+        // session CAN unlock the tools; a plain-vendor Pi session cannot).
+        if self.vendor == "dsh" {
+            return Some(
+                "DSH has no ccteam-writable config file: managed sessions get the ccteam \
+                 plugin automatically; a `dsh` you start yourself does not, until you run \
+                 `dsh plugin --profile web add @ccteam/dsh-client`."
+                    .to_string(),
+            );
+        }
+        let mut chars = self.vendor.chars();
+        let display = chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default();
+        Some(format!(
+            "{display} has no ccteam-writable config file: managed sessions get the ccteam \
+             bridge automatically; a `{}` you start yourself does not, with no install step \
+             to add it.",
+            self.default_bin
+        ))
     }
 }
 
 /// Resolve a vendor's binary path: the `CCTEAM_*_BIN` override, else the
-/// `PATH` name. The single resolver every probe call site shares.
+/// `PATH` name — **except `dsh`**, which additionally falls back to a
+/// cached `npx` copy (`ccteam_harness::resolve_dsh_default_bin` — DSH's own
+/// resolution logic lives with its adapter; this crate already depends on
+/// `ccteam-harness` for real, so it consumes rather than re-implements it).
+/// The single resolver every probe call site shares.
 pub fn resolve_bin(spec: &AgentProbeSpec) -> String {
-    std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string())
+    std::env::var(spec.bin_env).unwrap_or_else(|_| {
+        if spec.vendor == "dsh" {
+            ccteam_harness::resolve_dsh_default_bin()
+        } else {
+            spec.default_bin.to_string()
+        }
+    })
 }
 
 /// Whether a vendor binary is resolvable without executing it.
 ///
 /// An explicit `CCTEAM_*_BIN` override is authoritative and counts when that
 /// path exists. Otherwise the default binary name is scanned on `PATH`; Unix
-/// candidates must be regular files with at least one executable bit.
+/// candidates must be regular files with at least one executable bit. `dsh`
+/// additionally counts a cached `npx` copy
+/// (`ccteam_harness::find_cached_dsh_bin`).
 pub fn bin_resolvable(spec: &AgentProbeSpec) -> bool {
     if let Some(path) = std::env::var_os(spec.bin_env) {
         return path_is_executable(std::path::Path::new(&path));
     }
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| path_is_executable(&dir.join(spec.default_bin)))
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| path_is_executable(&dir.join(spec.default_bin)))
+    });
+    if on_path {
+        return true;
+    }
+    spec.vendor == "dsh" && ccteam_harness::find_cached_dsh_bin().is_some()
 }
 
 fn path_is_executable(path: &std::path::Path) -> bool {
@@ -1088,11 +1133,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_probe_specs_covers_six_vendors() {
+    fn agent_probe_specs_covers_seven_vendors() {
         let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
         );
     }
 
@@ -1105,6 +1150,19 @@ mod tests {
         assert_eq!(by("claude").harness_id, "claude-code");
         assert_eq!(by("pi").harness_id, "pi");
         assert_eq!(by("pi").tool_surface, ToolSurfaceMode::ManagedSessionBridge);
+        assert_eq!(by("dsh").harness_id, "dsh");
+        assert_eq!(
+            by("dsh").tool_surface,
+            ToolSurfaceMode::ManagedSessionBridge
+        );
+        assert_eq!(
+            by("dsh").tool_surface_notice().as_deref(),
+            Some(
+                "DSH has no ccteam-writable config file: managed sessions get the ccteam \
+                 plugin automatically; a `dsh` you start yourself does not, until you run \
+                 `dsh plugin --profile web add @ccteam/dsh-client`."
+            )
+        );
         for spec in AGENT_PROBE_SPECS {
             match spec.tool_surface {
                 ToolSurfaceMode::NativeMcpConfig => {
@@ -1126,7 +1184,9 @@ mod tests {
         assert_eq!(
             future.tool_surface_notice().as_deref(),
             Some(
-                "Managed Future sessions get the ccteam bridge; a plain `future` started in a shell does not."
+                "Future has no ccteam-writable config file: managed sessions get the ccteam \
+                 bridge automatically; a `future` you start yourself does not, with no install \
+                 step to add it."
             )
         );
         assert!(AgentProbeSpec::by_vendor("gemini").is_none());
@@ -1170,7 +1230,7 @@ mod tests {
         let vendors: Vec<&str> = avail.iter().map(|a| a.vendor).collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
         );
         // harness_id is carried through from the spec.
         assert_eq!(avail[0].harness_id, "claude-code");

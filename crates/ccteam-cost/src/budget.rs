@@ -46,6 +46,8 @@ pub struct Budgets {
     pub kimi: BudgetCap,
     #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
     pub pi: BudgetCap,
+    #[serde(default, skip_serializing_if = "BudgetCap::is_empty")]
+    pub dsh: BudgetCap,
 }
 
 /// One vendor's cost + spawn caps.
@@ -79,6 +81,7 @@ impl Budgets {
             Vendor::Opencode => &self.opencode,
             Vendor::Kimi => &self.kimi,
             Vendor::Pi => &self.pi,
+            Vendor::Dsh => &self.dsh,
         }
     }
 
@@ -230,6 +233,7 @@ mod vendor_wire {
             Vendor::Opencode => "opencode",
             Vendor::Kimi => "kimi",
             Vendor::Pi => "pi",
+            Vendor::Dsh => "dsh",
         })
     }
 
@@ -245,6 +249,7 @@ mod vendor_wire {
             "opencode" => Ok(Vendor::Opencode),
             "kimi" => Ok(Vendor::Kimi),
             "pi" => Ok(Vendor::Pi),
+            "dsh" => Ok(Vendor::Dsh),
             other => Err(D::Error::custom(format!("unknown vendor {other:?}"))),
         }
     }
@@ -279,6 +284,21 @@ mod tests {
         assert_eq!(budgets.pi.max_cost_usd_per_24h, Some(3.5));
         assert_eq!(budgets.pi.max_agent_spawns_per_hour, Some(7));
         assert_eq!(budgets.aggregated_cost_cap_24h(), Some(3.5));
+        let round_trip = serde_json::to_string(&budgets).unwrap();
+        let decoded: Budgets = serde_json::from_str(&round_trip).unwrap();
+        assert_eq!(decoded, budgets);
+    }
+
+    #[test]
+    fn dsh_budget_round_trips_and_participates_in_aggregate() {
+        let budgets: Budgets = serde_json::from_str(
+            r#"{"dsh":{"max_cost_usd_per_24h":1.5,"max_agent_spawns_per_hour":4}}"#,
+        )
+        .unwrap();
+        assert_eq!(budgets.dsh.max_cost_usd_per_24h, Some(1.5));
+        assert_eq!(budgets.dsh.max_agent_spawns_per_hour, Some(4));
+        assert_eq!(budgets.cap_for(Vendor::Dsh).max_cost_usd_per_24h, Some(1.5));
+        assert_eq!(budgets.aggregated_cost_cap_24h(), Some(1.5));
         let round_trip = serde_json::to_string(&budgets).unwrap();
         let decoded: Budgets = serde_json::from_str(&round_trip).unwrap();
         assert_eq!(decoded, budgets);
@@ -346,6 +366,21 @@ mod tests {
         assert!(body.contains("\"vendor\":\"codex\""));
         let back: AdviseBudgetLedger = serde_json::from_str(&body).unwrap();
         assert_eq!(back.samples[0].vendor, Vendor::Codex);
+    }
+
+    #[test]
+    fn advise_budget_ledger_roundtrips_dsh_vendor_wire() {
+        let ledger = AdviseBudgetLedger {
+            samples: vec![BudgetSample {
+                vendor: Vendor::Dsh,
+                usd: 0.0,
+                ts: Utc::now(),
+            }],
+        };
+        let body = serde_json::to_string(&ledger).unwrap();
+        assert!(body.contains("\"vendor\":\"dsh\""));
+        let back: AdviseBudgetLedger = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.samples[0].vendor, Vendor::Dsh);
     }
 
     #[test]

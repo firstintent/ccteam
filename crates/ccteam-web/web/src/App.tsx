@@ -54,6 +54,8 @@ export default function App() {
         <Route path="/settings/:tab" element={<ChatConsole />} />
         {/* v0.9.0 W4 — 团队/Team view; backend data is identity-filtered. */}
         <Route path="/agents" element={<ChatConsole />} />
+        {/* v0.9.15 — DSH (DeepSeek Harness) embedded page; per-tenant instance. */}
+        <Route path="/dsh" element={<ChatConsole />} />
         {/* legacy flat routes → the new IA */}
         <Route path="/settings/market" element={<Navigate to="/flow/market" replace />} />
         <Route path="/marketplace" element={<Navigate to="/flow/market" replace />} />

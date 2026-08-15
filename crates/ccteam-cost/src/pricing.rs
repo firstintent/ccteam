@@ -76,6 +76,9 @@ pub enum Vendor {
     Kimi,
     /// Pi RPC — no static table; cost is vendor-reported USD only.
     Pi,
+    /// DSH ACP (DeepSeek Harness) — v1 reports raw token counts with no USD
+    /// figure; no static table (`table_for` always `None`).
+    Dsh,
 }
 
 impl Vendor {
@@ -87,6 +90,7 @@ impl Vendor {
         Vendor::Opencode,
         Vendor::Kimi,
         Vendor::Pi,
+        Vendor::Dsh,
     ];
 }
 
@@ -178,6 +182,8 @@ fn table_for(vendor: Vendor) -> Option<&'static PricingTable> {
         Vendor::Opencode | Vendor::Pi => None,
         // Kimi: ACP `session/update` carries no usage/cost at all — no table.
         Vendor::Kimi => None,
+        // DSH v1: raw token counts only, no USD — no table (K14).
+        Vendor::Dsh => None,
     }
 }
 
@@ -191,7 +197,10 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
         }
         // Reported zero: honest "—" for reported-cost-only vendors; others
         // may still estimate from their static table.
-        if matches!(vendor, Vendor::Opencode | Vendor::Kimi | Vendor::Pi) {
+        if matches!(
+            vendor,
+            Vendor::Opencode | Vendor::Kimi | Vendor::Pi | Vendor::Dsh
+        ) {
             return None;
         }
     }
@@ -209,7 +218,10 @@ pub fn resolve_turn_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str)
 /// suffix (so `claude-opus-4-8[1m]` resolves to `claude-opus-4-8`).
 /// OpenCode and Pi always return `None` (no table).
 pub fn estimate_cost(usage: &UnifiedTokenUsage, vendor: Vendor, model: &str) -> Option<f64> {
-    if matches!(vendor, Vendor::Opencode | Vendor::Kimi | Vendor::Pi) {
+    if matches!(
+        vendor,
+        Vendor::Opencode | Vendor::Kimi | Vendor::Pi | Vendor::Dsh
+    ) {
         return None;
     }
     let prices = resolve(vendor, model)?;
@@ -423,6 +435,21 @@ mod tests {
             cost.is_none(),
             "unknown codex model must be None, got {cost:?}"
         );
+    }
+
+    #[test]
+    fn dsh_never_prices_from_a_table_v1_reports_tokens_only() {
+        // K14: v1 has no USD figure — `table_for` is `None`, so both
+        // `estimate_cost` and `resolve_turn_cost` must answer `None`
+        // (rendered "—"), never a fabricated $0.00, even with real usage.
+        let usage = UnifiedTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert!(estimate_cost(&usage, Vendor::Dsh, "deepseek-v4").is_none());
+        assert!(resolve_turn_cost(&usage, Vendor::Dsh, "deepseek-v4").is_none());
+        assert!(table_for(Vendor::Dsh).is_none());
     }
 
     #[test]

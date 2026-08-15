@@ -100,10 +100,11 @@ describe("Sidebar SSR structure", () => {
         // Second workspace so the WS_SHOW row cap never folds this row away.
         row({ sid: "s5", vendor: "kimi", project: "demo2" }),
         row({ sid: "s6", vendor: "pi", project: "demo2" }),
+        row({ sid: "s7", vendor: "dsh", project: "demo2" }),
       ],
       { projects: ["demo", "demo2"] },
     );
-    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi", "pi"]) {
+    for (const vendor of ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]) {
       expect(html).toContain(`data-vendor="${vendor}"`);
       expect(html).toContain(`chip ${vendor} vendor-chip`);
     }
@@ -186,6 +187,14 @@ describe("Sidebar SSR structure", () => {
     expect(html).toContain("团队");
     // Active state reflected on the expanded button.
     expect(html).toMatch(/class="sflow active"[^>]*data-testid="side-team"/);
+  });
+
+  it("always shows the DSH nav entry (expanded + rail) and reflects its active route", () => {
+    const html = renderSidebar([], { dshActive: true });
+    expect(html).toContain('data-testid="side-dsh"');
+    expect(html).toContain('data-testid="side-dsh-rail"');
+    expect(html).toContain("DSH");
+    expect(html).toMatch(/class="sflow active"[^>]*data-testid="side-dsh"/);
   });
 
   it("every workspace header carries the ⋯ menu button (closed by default)", () => {

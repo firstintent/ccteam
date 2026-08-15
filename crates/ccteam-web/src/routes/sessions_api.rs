@@ -130,8 +130,9 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor, String> {
         "opencode" => Ok(AgentVendor::Opencode),
         "kimi" => Ok(AgentVendor::Kimi),
         "pi" => Ok(AgentVendor::Pi),
+        "dsh" => Ok(AgentVendor::Dsh),
         other => Err(format!(
-            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi|pi)"
+            "unknown vendor: {other} (expected claude|codex|grok|opencode|kimi|pi|dsh)"
         )),
     }
 }
@@ -401,7 +402,9 @@ pub(crate) async fn handle_create_session(
         Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
     };
     let protocol = match vendor {
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi => SessionProtocol::Acp,
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi | AgentVendor::Dsh => {
+            SessionProtocol::Acp
+        }
         AgentVendor::Pi => SessionProtocol::StreamJson,
         AgentVendor::Claude | AgentVendor::Codex => protocol,
     };
@@ -2048,6 +2051,7 @@ mod tests {
         assert_eq!(parse_vendor("grok").unwrap(), AgentVendor::Grok);
         assert_eq!(parse_vendor("opencode").unwrap(), AgentVendor::Opencode);
         assert_eq!(parse_vendor("pi").unwrap(), AgentVendor::Pi);
+        assert_eq!(parse_vendor("dsh").unwrap(), AgentVendor::Dsh);
         assert_eq!(parse_vendor("  CLAUDE ").unwrap(), AgentVendor::Claude);
     }
 

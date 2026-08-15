@@ -87,6 +87,10 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("PUT", "/api/v1/users/{id}/im"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
+        // v0.9.15 DSHWEB — DSH web companion lifecycle.
+        ("GET", "/api/v1/dsh/status"),
+        ("POST", "/api/v1/dsh/start"),
+        ("POST", "/api/v1/dsh/stop"),
         // v0.8.18 档1 — caller identity (SPA branches admin-only surfaces).
         ("GET", "/api/v1/me"),
         // v0.8.24 — admin self-serve web-token rotation.

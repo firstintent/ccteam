@@ -1753,6 +1753,7 @@ fn truncate(s: &str, n: usize) -> &str {
 #[derive(Debug, Clone)]
 pub struct WebOptions {
     pub bind: String,
+    pub dsh_bind: Option<String>,
     pub no_auth: bool,
     pub token_file: Option<std::path::PathBuf>,
 }
@@ -1768,10 +1769,25 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
         .bind
         .parse()
         .with_context(|| format!("parse --bind `{}` as SocketAddr", opts.bind))?;
+    let dsh_web_bind = match opts.dsh_bind.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("off") => None,
+        Some(value) => Some(
+            value
+                .parse()
+                .with_context(|| format!("parse --dsh-web-bind `{value}` as SocketAddr"))?,
+        ),
+        None => Some(SocketAddr::new(
+            bind.ip(),
+            bind.port()
+                .checked_add(1)
+                .context("derive --dsh-web-bind from --bind port")?,
+        )),
+    };
     let serve_opts = ccteam_web::ServeOpts {
         bind,
         no_auth: opts.no_auth,
         token_file: opts.token_file,
+        dsh_web_bind,
         // Production CLI path keeps the 5 s Ctrl-C window so an
         // operator who passes `--no-auth` on a non-loopback bind has
         // a chance to abort before the LAN-RCE surface goes live.

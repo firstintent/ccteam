@@ -17,11 +17,12 @@ afterEach(() => {
 });
 
 describe("npmPackageForVendor", () => {
-  it("maps the four npm-distributed vendors and leaves kimi unknown", () => {
+  it("maps the npm-distributed vendors and leaves kimi unknown", () => {
     expect(npmPackageForVendor("claude")).toBe("@anthropic-ai/claude-code");
     expect(npmPackageForVendor("codex")).toBe("@openai/codex");
     expect(npmPackageForVendor("grok")).toBe("@xai-official/grok");
     expect(npmPackageForVendor("opencode")).toBe("opencode-ai");
+    expect(npmPackageForVendor("dsh")).toBe("@deepseek-ai/dsh");
     expect(npmPackageForVendor("kimi")).toBeNull();
     expect(npmPackageForVendor("unknown")).toBeNull();
   });

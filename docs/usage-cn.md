@@ -1,6 +1,6 @@
 # ccteam 使用手册
 
-**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书或浏览器里统一指挥。**
+**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi、DSH 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书或浏览器里统一指挥。**
 
 你装一次、起一个常驻进程,之后所有日常操作都在三个入口里完成,**推荐程度从高到低**:
 
@@ -29,17 +29,18 @@
 
 ### 1. 安装
 
-ccteam 调用你机器上**已装好并登录的** Claude Code / Codex / Grok Build / OpenCode / Kimi Code / Pi,自己不打包它们。
+ccteam 调用你机器上**已装好并完成认证的** Claude Code / Codex / Grok Build / OpenCode / Kimi Code / DSH / Pi,自己不打包它们。
 
-**先装好并登录其中至少一个** —— 没装、或装了但没登录的 vendor,在那台机器上起不了会话:
+**先装好并认证其中至少一个** —— 没装、或装了但没认证的 vendor,在那台机器上起不了会话:
 
-| Vendor | 安装 | 登录 |
+| Vendor | 安装 | 认证 |
 |---|---|---|
 | Claude Code | [docs.claude.com/en/docs/claude-code](https://docs.claude.com/en/docs/claude-code) | `claude auth login` |
 | Codex | [github.com/openai/codex](https://github.com/openai/codex) | `codex login` |
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`;受管 DSH 会话可读 daemon 环境里的 `DEEPSEEK_API_KEY`,DSH Web 空间也可直接在原生 Settings → Models 里配置 |
 | Pi | [pi.dev](https://pi.dev/) | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
 
 **1 · 让 agent 装**
@@ -65,11 +66,12 @@ curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh |
 
 ```bash
 ccteam --version
-claude --version   # 必需,需要时按提示登录
+claude --version   # 可选,用 Claude 会话才需要
 codex --version    # 可选,用 Codex 会话才需要
 grok --version     # 可选,用 Grok Build 会话才需要
 opencode --version  # 可选,用 OpenCode 会话才需要
 kimi --version      # 可选,用 Kimi Code 会话才需要(先 `kimi login`)
+dsh --version       # 可选,用 DSH 会话才需要(0.1.0-rc.6 或以上)
 pi --version        # 可选,用 Pi 会话才需要(0.83.0 及以上)
 ```
 
@@ -106,11 +108,27 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / 插件市场 / MCP / 自进化(只读)。**设置**含 运维总览(daemon 健康 + 主机接入/注册动作面;全队观察面在团队页)/ 接入(外部 Agent MCP 配置、开发者 REST API、卫星加入、IM 凭据 —— 管理员管全局 bot,普通用户配自己的 bot;用户登录链接仍仅管理员)/ 通用 / 账号(人人可自助重置 token);仅「管理员(用户管理)」为管理员专属。主题**默认浅色**(可切深色)。
 
-> **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。
+> **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。DSH Web 走伴生监听,默认是 web 端口 + 1;用 `--dsh-web-bind <addr:port>` 指定,或 `--dsh-web-bind off` 关闭(此时 `/api/v1/dsh/status` 仍会返回 `disabled`)。
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有已安装 vendor** 的配置——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——任何 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。**Pi 刻意不在这张表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
+
+**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 会自动为该会话物化一份 ccteam 托管的隔离 DSH profile,不写你的 `~/.dsh`,同 sid 可冷恢复,token 用量会入账。从 ccteam 打开的 DSH Web 空间会带上 `@ccteam/dsh-client`;如果你在 ccteam 外部自己打开 DSH Web,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再到 DSH Settings 粘贴 daemon URL(默认 `http://127.0.0.1:7331`)和 **Settings → Access** 里复制的 enrollment 凭据。连上后,这个 DSH 会话拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
+
+**Pi 也刻意不在 config-writer 表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要给可写配置的 vendor 手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+
+### DSH Web
+
+**DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
+
+- **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程;否则 ccteam 自己在临时 loopback 端口启动。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
+- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件 symlink 每次启动自愈。出厂不复制 owner 的模型凭据;用户在 DSH 原生 Settings → Models 里填自己的 key。
+- **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;从 DSH 通过 ccteam 插件委派出去的工作照常入账。
+- **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。
+- **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
+
+如果 ccteam 前面有 HTTPS 反代,**伴生端口也必须一起反代**。DSH Web 没有 base-path 支持,所以用第二个 HTTPS 端口或子域;只反代 `:7331` 会让 iframe 继续加载明文 HTTP,浏览器按 mixed-content 拒绝。
 
 ### 创建项目
 
@@ -118,10 +136,10 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 开会话、切换、对话
 
-- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode / Kimi / Pi)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode·Kimi / Pi 自己的 RPC)、模型与思考强度、spawn 前 HITL 开关。两个菜单都按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 干脆不显示强度菜单,留在**默认**则什么都不发、由 vendor 自己定。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless。建好回句柄 `s<N>`。
+- **新建会话**:选 vendor(Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi)与协议(stream-json / terminal 仅 Claude 管理员 / ACP=Grok·OpenCode·Kimi·DSH / Pi 自己的 RPC)、模型与思考强度、spawn 前 HITL 开关。两个菜单都按**所选 vendor 自己最近一次握手自报的目录**渲染(`GET /api/v1/models`)——列的是它自己的模型 id 和它自己的档位;没有强度轴的 vendor 干脆不显示强度菜单,留在**默认**则什么都不发、由 vendor 自己定。**执行主机 = 项目绑定的主机**(会话跟项目走,不再按会话选);每行会话带厂商标记。角色列表来自项目 `.claude/agents/`,spawn 时可选,留空即 roleless;Grok / OpenCode / Kimi / DSH 当前只支持 roleless。建好回句柄 `s<N>`。
 - **每个会话**有 **Chat | 终端** 两个标签页。Chat 里助手消息按 Markdown 渲染(标题/列表/表格/代码块,代码块一键复制);输入框 **Enter 发送、Shift+Enter 换行**,发送中可一键停止。
 - **独立会话页**:`/app/chat/s/<sid>`(`<sid>` 与各入口的 `s1`/`s2` 同一命名空间)是某个会话的干净视图 —— 自己的历史、按会话过滤的实时事件,不与别的会话混流。
-- **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放。
+- **终端标签页**:逐字节保真地镜像会话屏幕(ANSI / 光标 / 对齐都对)。当前只对 Claude 会话开放;Codex / Grok / OpenCode / Kimi / DSH / Pi 都是 chat-only。
 - **历史会话与恢复**:会话列表下点「更多历史 (N) ▸」展开已**停止但未销毁**的会话(灰显)。点任意一个即从磁盘 `meta.json` **冷恢复**(cold-resume) —— 停止的会话、甚至 daemon 重启前的会话都不丢,随时可恢复(手机上 `/use <sid>` 同样能恢复)。「+ 导入历史会话」对话框还能发现你在 ccteam 之外用原生 `claude` 跑过的会话(按工作目录内容匹配),一键**收编**成普通 ccteam 会话,对话原文保留。
 - **定时发送**:点输入框旁的**时钟**进入定时模式 → 填写「再过 **N 分钟** / **N 小时**」(或点快捷 `+15m` / `+30m` / `+1h` / `+2h`),也可选一个**本机时钟**上的绝对时间——界面会统一换算成相对延迟,浏览器时区与 daemon 时区不会打架;下方预览预计本机发送时刻 → 写正文 → 发送。排队条在**输入框上方**,按发送时间排序,点 **×** 取消。到点后正文作为**普通用户消息**进入该会话。定时模式**不能**带附件/技能。上限:每会话最多 20 条 pending,最远约 **7 天**。失败条目会标红并保留 24 小时。
 
@@ -158,7 +176,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 ### Status / 成本
 
 - **Status** 页:daemon 健康、会话 live/idle 数、每条会话的成本、今日成本/预算(也是顶栏成本药丸的来源)。
-- 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表)。
+- 成本按 vendor 分别记账。Claude/Codex/Grok 有价表时用表计价;**OpenCode 只认自报 USD**(无上报或 0 显示「—」,绝不套用他家价表);**DSH 会上报原始 token,但暂时没有 USD 价表**。
 
 ### 标准资源 API(给集成方)
 
@@ -179,7 +197,7 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 ```
 
 - **凭据只说明「这份配置是谁的」,身份由 daemon 在 `initialize` 时签发**:响应里的 `Mcp-Session-Id` 让**这个进程**成为一个独立 caller —— 它在账本里有自己的会话行(`managed_by: external`),它 spawn 的会话真的挂在它下面,而不是变成一堆根节点。之后每个请求必须同时带凭据与该 id(id 本身不是凭据,且 binding 只对开它的那枚凭据生效);id 过期返回 `404` 提示重新 `initialize`,用完可 `DELETE /mcp` 关闭。
-- **两种作用域**:每次 `ccteam daemon start` 会把一枚**用户域**凭据写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;它不钉项目,故首个 `session_*` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
+- **两种作用域**:每次 `ccteam daemon start` 会把一枚**用户域**凭据写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;DSH 在 `@ccteam/dsh-client` 插件连上粘贴的 enrollment 凭据后走同一套身份模型。用户域凭据不钉项目,故首个 `session_*` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
 - **不做任何推断**:不看工作目录、不看来源地址、没有「最近用过的项目」—— 没有依据就直接拒绝,并告诉你可以点名哪些 slug。无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数;web 控制台令牌(那是 `/api/v1/**` 的凭据)在这里会被 401 拒绝并说明本端点认哪两族凭据。
 
 ---
@@ -238,9 +256,10 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 # 会话
 /new [vendor] [role] [hitl] [model=<id>] [effort=<level>]
                            新建会话 → 回一个句柄 s<N>
-                             · vendor = claude(默认)| codex | grok | opencode | kimi | pi
+                             · vendor = claude(默认)| codex | grok | opencode | kimi | dsh | pi
                              · 省略 role = 裸 claude(自读项目 CLAUDE.md);写 role 则绑定该角色
-                             · grok / opencode / kimi = 无角色 ACP 会话(忽略 role 参数)
+                             · grok / opencode / kimi / dsh = 无角色 ACP 会话(忽略 role 参数)
+                             · dsh = 只在本机跑;支持冷恢复和 token 记账
                              · pi = 只在本机跑;支持角色
                              · 尾加 hitl = 工具在 IM 里逐个批准(默认 skip = 直接跑)
                              · model= / effort=(或 m= / e=)顺序随意,原文透传给 vendor;
@@ -293,7 +312,7 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 
 ### 人工批准(HITL)
 
-默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Codex 会话自带 sandbox,忽略此模式。Grok 会话本版仅支持 `skip`(自动放行);IM 审批已规划但尚未接入。
+默认会话是「直接执行」(`skip`)。用 `/new <vendor> <role> hitl` 起一个需审批的会话:它跑非自动放行的工具前,会把「要跑什么」+ `[✅ 同意] [⛔ 拒绝]` 发到你 chat,点同意才执行,拒绝只挡这一次(不杀整个回合)。Claude / DSH / Pi 会话支持这条审批路;DSH 和 Pi 会把自己的 permission dialog 接到同一组同意/拒绝按钮上。Codex 会话自带 sandbox,忽略此模式。Grok / Kimi 当前仅支持 `skip`(自动放行);IM 审批已规划但尚未接入。
 
 ### 让任何会话派活
 
@@ -330,9 +349,10 @@ ccteam init --in /path/to/repo # 在别处初始化
 ccteam init --slug demo        # 覆盖自动推断的 slug
 ccteam init --owner user:u123  # 多用户:把项目归属给某租户
 ccteam config                  # 一次性配置:① 注册 MCP ② 配 IM bot ③ 偏好(交互菜单)
-ccteam config mcp              # 注册/刷新 ccteam MCP(五个 vendor 全写:Claude/Codex/Grok/OpenCode/Kimi;Pi 走受管会话 bridge、不写配置;无 TTY 用这个)
+ccteam config mcp              # 注册/刷新可写配置 vendor 的 ccteam MCP;DSH 走插件粘贴凭据,Pi 走受管会话 bridge
 ccteam start                   # 起常驻服务(见「开始之前」;加 & 后台跑)
 ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌)
+ccteam start --dsh-web-bind off          # 关闭 DSH Web 伴生监听
 ccteam start --no-web | --no-imd         # 只要网关 / 只要 web
 ccteam stop                    # 优雅停 daemon
 ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链接
@@ -421,7 +441,7 @@ cat <project>/.ccteam/progress.jsonl             # 项目业务事件(状态权�
 ```bash
 CCTEAM_HOME=~/.ccteam2          # 隔离一整套状态/配置/会话(配合 ccteam --home 跑多实例)
 CCTEAM_PROJECTS_ROOT=...        # 默认项目根(默认 ~/projects)
-CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_BIN=...
+CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_BIN=... CCTEAM_DSH_BIN=...
 # 覆盖 vendor CLI 路径
 ```
 
@@ -449,7 +469,7 @@ ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex
 - **远程新建**:web 控制台 → 新建项目 → 主机选择器选那台卫星 → 填它机器上的绝对路径,daemon 请卫星就地 bootstrap 并注册。
 - **接入既有 checkout**:在那台机器仓库里 `ccteam init`,然后主机页对上报的项目点「接入」。slug 撞名会得到独立 catalog slug(`demo` → `demo2`)——跨机 slug 相同不代表同一项目。
 
-远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。舰队容量:daemon 全局最多 50 个 live 会话(`sessions.max_live` 可配);超限时优雅挤停最久无活动的 idle 会话,被停会话可随时恢复。
+远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:daemon 全局最多 50 个 live 会话(`sessions.max_live` 可配);超限时优雅挤停最久无活动的 idle 会话,被停会话可随时恢复。
 
 ---
 

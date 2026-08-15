@@ -329,7 +329,10 @@ async fn get_models_reports_every_vendor_with_observed_and_fallback_rows() {
         .iter()
         .map(|e| e["vendor"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["claude", "codex", "grok", "opencode", "kimi", "pi"]);
+    assert_eq!(
+        names,
+        ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
+    );
     let kimi = vendors.iter().find(|e| e["vendor"] == "kimi").unwrap();
     assert_eq!(kimi["source"], "ACP session availableModels");
     assert!(

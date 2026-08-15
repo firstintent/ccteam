@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 const NOTIFICATION_BUFFER: usize = 512;
 const WRITER_BUFFER: usize = 64;
+const SCRUBBED_CHILD_ENV_KEYS: &[&str] = &["DSH_SYSTEM_PROMPT"];
 
 type Pending = HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>;
 
@@ -176,6 +177,9 @@ impl AcpTransport {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for key in SCRUBBED_CHILD_ENV_KEYS {
+            cmd.env_remove(key);
+        }
         for (key, value) in envs {
             cmd.env(key, value);
         }
