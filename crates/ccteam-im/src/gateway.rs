@@ -9951,6 +9951,7 @@ fn vendor_str(v: AgentVendor) -> &'static str {
         AgentVendor::Opencode => "opencode",
         AgentVendor::Kimi => "kimi",
         AgentVendor::Pi => "pi",
+        AgentVendor::Dsh => "dsh",
     }
 }
 
@@ -11395,6 +11396,7 @@ fn parse_vendor(raw: &str) -> Result<AgentVendor> {
         "opencode" => Ok(AgentVendor::Opencode),
         "kimi" => Ok(AgentVendor::Kimi),
         "pi" => Ok(AgentVendor::Pi),
+        "dsh" => Ok(AgentVendor::Dsh),
         other => Err(anyhow!("unknown vendor: {other}")),
     }
 }
@@ -11482,7 +11484,9 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
     // changes the outcome. Pi RPC is canonical stream-json at the gateway
     // boundary even though its child wire is Pi's own JSONL protocol.
     protocol = match vendor {
-        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi => SessionProtocol::Acp,
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi | AgentVendor::Dsh => {
+            SessionProtocol::Acp
+        }
         AgentVendor::Pi => SessionProtocol::StreamJson,
         AgentVendor::Claude | AgentVendor::Codex => protocol,
     };
@@ -11613,6 +11617,10 @@ mod tests {
         assert_eq!(
             parse_new("pi terminal").unwrap().protocol,
             SessionProtocol::StreamJson
+        );
+        assert_eq!(
+            parse_new("dsh terminal").unwrap().protocol,
+            SessionProtocol::Acp
         );
     }
 
@@ -19234,6 +19242,7 @@ mod tests {
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
                         AgentVendor::Pi => codex.clone(), // tests: no dedicated Pi fake
+                        AgentVendor::Dsh => codex.clone(), // tests: no dedicated Dsh fake
                     }
                 },
             )
@@ -19327,6 +19336,7 @@ mod tests {
                         AgentVendor::Opencode => codex.clone(),
                         AgentVendor::Kimi => codex.clone(),
                         AgentVendor::Pi => codex.clone(),
+                        AgentVendor::Dsh => codex.clone(),
                     }
                 },
             )

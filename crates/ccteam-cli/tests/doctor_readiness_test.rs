@@ -60,6 +60,8 @@ struct Sandbox {
     xdg_config_home: std::path::PathBuf,
     claude_bin: std::path::PathBuf,
     pi_bin: std::path::PathBuf,
+    dsh_bin: std::path::PathBuf,
+    dsh_home: std::path::PathBuf,
 }
 
 fn sandbox() -> Sandbox {
@@ -75,6 +77,11 @@ fn sandbox() -> Sandbox {
     let xdg_config_home = tmp.path().join("xdg-config");
     let claude_bin = write_fake_claude_bin(tmp.path());
     let pi_bin = write_fake_vendor_bin(tmp.path(), "fake-pi.sh", "0.83.0");
+    let dsh_bin = write_fake_vendor_bin(tmp.path(), "fake-dsh.sh", "dsh 0.1.0-rc.5");
+    // `fake_home` doubles as `$HOME` for `dirs::home_dir()`, so
+    // `~/.dsh/.credentials.yaml` resolves under it — never the developer's
+    // real `~/.dsh`.
+    let dsh_home = fake_home.join(".dsh");
     Sandbox {
         _tmp: tmp,
         claude_config_home,
@@ -86,6 +93,8 @@ fn sandbox() -> Sandbox {
         xdg_config_home,
         claude_bin,
         pi_bin,
+        dsh_bin,
+        dsh_home,
     }
 }
 
@@ -116,11 +125,13 @@ fn doctor_command(sb: &Sandbox) -> Command {
         )
         .env("CCTEAM_KIMI_BIN", sb._tmp.path().join("missing-kimi"))
         .env("CCTEAM_PI_BIN", &sb.pi_bin)
+        .env("CCTEAM_DSH_BIN", &sb.dsh_bin)
         .env("NO_COLOR", "1")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("XAI_API_KEY")
-        .env_remove("MOONSHOT_API_KEY");
+        .env_remove("MOONSHOT_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY");
     command
 }
 
@@ -144,6 +155,7 @@ fn bare_doctor_renders_the_readiness_contract() {
         "opencode",
         "kimi",
         "pi",
+        "dsh",
         "daemon",
         "version",
         "pricing",
@@ -162,9 +174,61 @@ fn bare_doctor_renders_the_readiness_contract() {
         stdout.contains(&pi_notice),
         "doctor must explain managed Pi versus plain shell Pi: {stdout}"
     );
+    let dsh_notice = ccteam_core::host_registry::AgentProbeSpec::by_vendor("dsh")
+        .and_then(ccteam_core::host_registry::AgentProbeSpec::tool_surface_notice)
+        .unwrap();
+    assert!(
+        stdout.contains(&dsh_notice),
+        "doctor must explain managed Dsh versus plain shell dsh: {stdout}"
+    );
+    assert!(
+        dsh_notice.contains("plugin") && !dsh_notice.contains("bridge"),
+        "dsh's notice must say plugin, not bridge (K3): {dsh_notice:?}"
+    );
     assert!(
         !stdout.contains("tmux"),
         "tmux is not a readiness dependency. stdout:\n{stdout}"
+    );
+}
+
+/// K23/D13 — the dsh auth check has two independent Pass sources, checked in
+/// order (env first), plus an honest two-hint Fail when neither is present.
+#[test]
+fn dsh_auth_check_reads_dual_credential_sources() {
+    let sb = sandbox();
+
+    // Neither source present → Fail with both fixes named.
+    let (stdout, code) = run_bare_doctor(&sb);
+    assert!(
+        agent_row(&stdout, "dsh").contains("auth missing"),
+        "no DEEPSEEK_API_KEY and no mirrored credentials must read as missing auth: {stdout}"
+    );
+    assert!(
+        agent_row(&stdout, "dsh").contains("DEEPSEEK_API_KEY")
+            && agent_row(&stdout, "dsh").contains("dsh web"),
+        "the Fail hint must name both fixes: {stdout}"
+    );
+    assert_eq!(code, 0, "vendor auth is advisory, never blocking");
+
+    // Mirrored `~/.dsh/.credentials.yaml` alone → Pass, source named.
+    std::fs::create_dir_all(&sb.dsh_home).unwrap();
+    std::fs::write(sb.dsh_home.join(".credentials.yaml"), "api_key: sk-test\n").unwrap();
+    let (stdout, _code) = run_bare_doctor(&sb);
+    assert!(
+        agent_row(&stdout, "dsh").contains("auth ok (source: dsh credentials, mirrored at spawn)"),
+        "mirrored credentials alone must Pass with their source named: {stdout}"
+    );
+
+    // Env wins even when the mirrored file is ALSO present (matches DSH's
+    // own resolution order — explicit env is never shadowed).
+    let out = doctor_command(&sb)
+        .env("DEEPSEEK_API_KEY", "sk-env-wins")
+        .output()
+        .expect("spawn ccteam doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        agent_row(&stdout, "dsh").contains("auth ok (source: env)"),
+        "env must win over a present mirrored file: {stdout}"
     );
 }
 

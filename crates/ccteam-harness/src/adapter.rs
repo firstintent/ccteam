@@ -125,6 +125,10 @@ pub enum AgentVendor {
     Opencode,
     Kimi,
     Pi,
+    /// DSH — DeepSeek Harness. ACP over a Cordis plugin (`@ccteam/dsh-client`);
+    /// v0.9.15 ships a minimal stub adapter (real handshake lands later this
+    /// cycle, see `execution/dsh_acp`).
+    Dsh,
 }
 
 /// Where ccteam may execute a vendor adapter. Declaring this beside
@@ -146,6 +150,7 @@ impl AgentVendor {
         AgentVendor::Opencode,
         AgentVendor::Kimi,
         AgentVendor::Pi,
+        AgentVendor::Dsh,
     ];
 
     pub fn cost_vendor(self) -> ccteam_cost::Vendor {
@@ -156,6 +161,7 @@ impl AgentVendor {
             AgentVendor::Opencode => ccteam_cost::Vendor::Opencode,
             AgentVendor::Kimi => ccteam_cost::Vendor::Kimi,
             AgentVendor::Pi => ccteam_cost::Vendor::Pi,
+            AgentVendor::Dsh => ccteam_cost::Vendor::Dsh,
         }
     }
 
@@ -168,6 +174,7 @@ impl AgentVendor {
             AgentVendor::Opencode => "opencode",
             AgentVendor::Kimi => "kimi",
             AgentVendor::Pi => "pi",
+            AgentVendor::Dsh => "dsh",
         }
     }
 
@@ -179,7 +186,7 @@ impl AgentVendor {
             | AgentVendor::Grok
             | AgentVendor::Opencode
             | AgentVendor::Kimi => HostExecutionScope::LocalOrSatellite,
-            AgentVendor::Pi => HostExecutionScope::LocalOnly,
+            AgentVendor::Pi | AgentVendor::Dsh => HostExecutionScope::LocalOnly,
         }
     }
 }
@@ -1598,6 +1605,7 @@ impl SessionHandle {
             AgentVendor::Opencode => "opencode",
             AgentVendor::Kimi => "kimi",
             AgentVendor::Pi => "pi",
+            AgentVendor::Dsh => "dsh",
         };
         let job_id = match h.vendor {
             AgentVendor::Claude if h.mode == ExecutionMode::Bg => Some(h.identity.clone()),

@@ -1250,7 +1250,7 @@ mod tests {
 
     #[test]
     fn probe_specs_declare_their_tool_surface_mode() {
-        assert_eq!(AGENT_PROBE_SPECS.len(), 6);
+        assert_eq!(AGENT_PROBE_SPECS.len(), 7);
         assert_eq!(
             AgentProbeSpec::by_vendor("pi").unwrap().tool_surface,
             ToolSurfaceMode::ManagedSessionBridge

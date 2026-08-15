@@ -201,7 +201,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "role": { "type": "string", "description": "Optional work-role (must exist as `.claude/agents/<role>.md`). Omit or pass \"\" for a roleless session (bare vendor reads the project CLAUDE.md/AGENTS.md)." },
                     "vendor": {
                         "type": "string",
-                        "enum": ["claude", "codex", "grok", "opencode", "kimi", "pi"],
+                        "enum": ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"],
                         "description": "Harness vendor (lowercase). Default claude."
                     },
                     "model": { "type": "string", "description": "Optional explicit model id, passed to the vendor verbatim; overrides the role's `model:` frontmatter. Omitted → vendor default. `status` lists each installed vendor's observed ids." },
@@ -671,7 +671,7 @@ mod tests {
             .collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
         );
 
         // v0.9.0 W1 (G1) — new facets are present.

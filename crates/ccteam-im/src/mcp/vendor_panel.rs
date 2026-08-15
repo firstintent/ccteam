@@ -464,6 +464,7 @@ fn vendor_cap(budgets: Option<&ccteam_cost::Budgets>, vendor: &str) -> Option<f6
         "opencode" => ccteam_cost::Vendor::Opencode,
         "kimi" => ccteam_cost::Vendor::Kimi,
         "pi" => ccteam_cost::Vendor::Pi,
+        "dsh" => ccteam_cost::Vendor::Dsh,
         _ => return None,
     };
     budgets.cap_for(v).max_cost_usd_per_24h

@@ -142,6 +142,15 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         default_bin: "pi",
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
     },
+    AgentProbeSpec {
+        vendor: "dsh",
+        harness_id: "dsh",
+        bin_env: ccteam_harness::DSH_BIN_ENV,
+        // The product CLI (`dsh --profile ccteam`), not a demo/dev binary —
+        // v0.9.15 K5/§5.2.
+        default_bin: "dsh",
+        tool_surface: ToolSurfaceMode::ManagedSessionBridge,
+    },
 ];
 
 impl AgentProbeSpec {
@@ -151,17 +160,29 @@ impl AgentProbeSpec {
     }
 
     pub fn tool_surface_notice(&self) -> Option<String> {
-        (self.tool_surface == ToolSurfaceMode::ManagedSessionBridge).then(|| {
-            let mut chars = self.vendor.chars();
-            let display = chars
-                .next()
-                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                .unwrap_or_default();
-            format!(
-                "Managed {display} sessions get the ccteam bridge; a plain `{}` started in a shell does not.",
-                self.default_bin
-            )
-        })
+        if self.tool_surface != ToolSurfaceMode::ManagedSessionBridge {
+            return None;
+        }
+        // DSH's tool face is a Cordis plugin, not a ccteam-owned bridge
+        // extension (K2/K3) — the notice says so and names the fix instead
+        // of reusing the generic "bridge" wording every other managed vendor
+        // gets.
+        if self.vendor == "dsh" {
+            return Some(
+                "Managed Dsh sessions get the ccteam plugin; a plain `dsh` started in a \
+                 shell does not until you add @ccteam/dsh-client."
+                    .to_string(),
+            );
+        }
+        let mut chars = self.vendor.chars();
+        let display = chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default();
+        Some(format!(
+            "Managed {display} sessions get the ccteam bridge; a plain `{}` started in a shell does not.",
+            self.default_bin
+        ))
     }
 }
 
@@ -1088,11 +1109,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_probe_specs_covers_six_vendors() {
+    fn agent_probe_specs_covers_seven_vendors() {
         let vendors: Vec<&str> = AGENT_PROBE_SPECS.iter().map(|s| s.vendor).collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
         );
     }
 
@@ -1105,6 +1126,18 @@ mod tests {
         assert_eq!(by("claude").harness_id, "claude-code");
         assert_eq!(by("pi").harness_id, "pi");
         assert_eq!(by("pi").tool_surface, ToolSurfaceMode::ManagedSessionBridge);
+        assert_eq!(by("dsh").harness_id, "dsh");
+        assert_eq!(
+            by("dsh").tool_surface,
+            ToolSurfaceMode::ManagedSessionBridge
+        );
+        assert_eq!(
+            by("dsh").tool_surface_notice().as_deref(),
+            Some(
+                "Managed Dsh sessions get the ccteam plugin; a plain `dsh` started in a \
+                 shell does not until you add @ccteam/dsh-client."
+            )
+        );
         for spec in AGENT_PROBE_SPECS {
             match spec.tool_surface {
                 ToolSurfaceMode::NativeMcpConfig => {
@@ -1170,7 +1203,7 @@ mod tests {
         let vendors: Vec<&str> = avail.iter().map(|a| a.vendor).collect();
         assert_eq!(
             vendors,
-            vec!["claude", "codex", "grok", "opencode", "kimi", "pi"]
+            vec!["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"]
         );
         // harness_id is carried through from the spec.
         assert_eq!(avail[0].harness_id, "claude-code");

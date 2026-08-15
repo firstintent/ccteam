@@ -407,6 +407,7 @@ fn vendor_label(v: crate::AgentVendor) -> &'static str {
         crate::AgentVendor::Opencode => "opencode",
         crate::AgentVendor::Kimi => "kimi",
         crate::AgentVendor::Pi => "pi",
+        crate::AgentVendor::Dsh => "dsh",
     }
 }
 

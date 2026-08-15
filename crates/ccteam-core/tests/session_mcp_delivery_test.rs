@@ -44,7 +44,7 @@ fn dialect_of(vendor: &str) -> Option<Dialect> {
         "claude" => Some(Dialect::ClaudeMcpJson),
         "codex" => Some(Dialect::CodexThreadConfig),
         "grok" | "opencode" | "kimi" => Some(Dialect::AcpMcpServers),
-        "pi" => Some(Dialect::BridgeChildEnv),
+        "pi" | "dsh" => Some(Dialect::BridgeChildEnv),
         _ => None,
     }
 }
