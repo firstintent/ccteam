@@ -223,18 +223,27 @@ impl DshWebSupervisor {
             return self.status_for(identity).await;
         }
         let key = identity.owner_tag();
-        {
+        let already_live = {
             let instances = self.instances.lock().await;
-            if matches!(
+            matches!(
                 instances.get(&key).map(|i| &i.state),
                 Some(
                     DshWebStatusState::Starting
                         | DshWebStatusState::Running
                         | DshWebStatusState::Attached
                 )
-            ) {
-                return self.status_for(identity).await;
-            }
+            )
+            // `instances` (the MutexGuard) drops HERE, at the end of this
+            // block — before `status_for` below tries to lock the same
+            // `tokio::sync::Mutex` again. Awaiting `status_for` while still
+            // holding the guard (the original bug) self-deadlocks: the task
+            // waits on a lock only it holds, and every later caller of
+            // `self.instances.lock()` — including every proxied request and
+            // every future `/status` poll — then hangs forever too, because
+            // the mutex is never non-reentrant and never releases.
+        };
+        if already_live {
+            return self.status_for(identity).await;
         }
 
         let kind = if identity.is_admin {
@@ -540,9 +549,7 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
 async fn response_from_reqwest(resp: reqwest::Response) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let stream = resp
-        .bytes_stream()
-        .map_err(std::io::Error::other);
+    let stream = resp.bytes_stream().map_err(std::io::Error::other);
     let mut out = Response::builder().status(status);
     if let Some(out_headers) = out.headers_mut() {
         for (name, value) in headers.iter() {
