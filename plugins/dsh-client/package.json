@@ -1,0 +1,39 @@
+{
+  "name": "@ccteam/dsh-client",
+  "version": "0.9.15-alpha.0",
+  "description": "ccteam client bundle for DeepSeek Harness",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint:scan": "bash scripts/no-persona-scan.sh",
+    "test": "npm run build && npm run lint:scan && vitest run",
+    "pack:check": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.4"
+  }
+}
