@@ -9,6 +9,7 @@ export interface DshAgents {
     }): Promise<DshAgentHandle>;
     resume(options: {
         resumeSessionId: string;
+        agentOptions?: unknown;
     }): Promise<DshAgentHandle>;
     get?(id: string): DshAgent | undefined;
 }
@@ -18,6 +19,12 @@ export interface DshAgentHandle {
 }
 export interface TransportContext {
     agents: DshAgents;
+    agentDefaultModel?: {
+        currentSelection(): {
+            provider?: string;
+            model?: string;
+        } | undefined;
+    };
     on?(event: string, handler: (...args: never[]) => unknown): () => void;
     effect?<T extends (() => void | Promise<void>) | void>(setup: () => T, label?: string): () => void;
     logger?: {
@@ -61,5 +68,6 @@ export declare class DshAcpServer {
     private notify;
     private write;
     private writeError;
+    private resolveAgentOptions;
 }
 //# sourceMappingURL=transport.d.ts.map

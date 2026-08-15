@@ -12,30 +12,54 @@ pub const DEFAULT_DSH_MODEL: &str = "deepseek-v4-flash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DshAgentOptions {
-    pub provider: String,
-    pub model: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 impl DshAgentOptions {
     pub fn new(model: Option<&str>) -> Self {
+        let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Self {
+                provider: None,
+                model: None,
+            };
+        };
+        if let Some((provider, model)) = model.split_once('/') {
+            let provider = provider.trim();
+            let model = model.trim();
+            if !provider.is_empty() && !model.is_empty() {
+                return Self {
+                    provider: Some(provider.to_string()),
+                    model: Some(model.to_string()),
+                };
+            }
+        }
         Self {
-            // DSH's agent-default-model is visible only inside the plugin. The
-            // Rust adapter must still send a pair, so use dsh-base's static
-            // default observed in W0 before user settings hot-load.
-            provider: DEFAULT_DSH_PROVIDER.to_string(),
-            model: model
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(DEFAULT_DSH_MODEL)
-                .to_string(),
+            provider: None,
+            model: Some(model.to_string()),
         }
     }
 
-    fn to_json(&self) -> Value {
-        json!({
-            "provider": self.provider,
-            "model": self.model,
-        })
+    fn to_json(&self) -> Option<Value> {
+        if self.provider.is_none() && self.model.is_none() {
+            return None;
+        }
+        let mut out = serde_json::Map::new();
+        if let Some(provider) = &self.provider {
+            out.insert("provider".to_string(), json!(provider));
+        }
+        if let Some(model) = &self.model {
+            out.insert("model".to_string(), json!(model));
+        }
+        Some(Value::Object(out))
+    }
+
+    pub fn requested_model_display(&self) -> Option<String> {
+        match (&self.provider, &self.model) {
+            (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+            (None, Some(model)) => Some(model.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -70,14 +94,12 @@ pub async fn session_new(
     cwd: &Path,
     agent_options: &DshAgentOptions,
 ) -> Result<(String, ModelInfo), HarnessError> {
+    let mut params = json!({ "cwd": cwd.to_string_lossy() });
+    if let Some(options) = agent_options.to_json() {
+        params["agentOptions"] = options;
+    }
     let result = transport
-        .call(
-            "session/new",
-            json!({
-                "cwd": cwd.to_string_lossy(),
-                "agentOptions": agent_options.to_json()
-            }),
-        )
+        .call("session/new", params)
         .await
         .map_err(|e| HarnessError::SpawnFailed(format!("dsh session/new failed: {e}")))?;
 
@@ -92,15 +114,15 @@ pub async fn session_load(
     session_id: &str,
     agent_options: &DshAgentOptions,
 ) -> Result<ModelInfo, HarnessError> {
+    let mut params = json!({
+        "sessionId": session_id,
+        "cwd": cwd.to_string_lossy(),
+    });
+    if let Some(options) = agent_options.to_json() {
+        params["agentOptions"] = options;
+    }
     let result = transport
-        .call(
-            "session/load",
-            json!({
-                "sessionId": session_id,
-                "cwd": cwd.to_string_lossy(),
-                "agentOptions": agent_options.to_json()
-            }),
-        )
+        .call("session/load", params)
         .await
         .map_err(|e| HarnessError::SpawnFailed(format!("dsh session/load failed: {e}")))?;
     Ok(pluck_model_info(&result))
@@ -140,13 +162,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_agent_options_are_explicit() {
+    fn default_agent_options_are_omitted_for_plugin_default_selection() {
         let opts = DshAgentOptions::new(None);
-        assert_eq!(opts.provider, "deepseek-official");
-        assert_eq!(opts.model, "deepseek-v4-flash");
+        assert_eq!(opts.to_json(), None);
+        assert_eq!(opts.requested_model_display(), None);
+
         let opts = DshAgentOptions::new(Some("deepseek-v4-pro"));
-        assert_eq!(opts.provider, "deepseek-official");
-        assert_eq!(opts.model, "deepseek-v4-pro");
+        assert_eq!(opts.to_json(), Some(json!({"model":"deepseek-v4-pro"})));
+        assert_eq!(
+            opts.requested_model_display(),
+            Some("deepseek-v4-pro".to_string())
+        );
+
+        let opts = DshAgentOptions::new(Some("aliyun/deepseek-v4-pro"));
+        assert_eq!(
+            opts.to_json(),
+            Some(json!({"provider":"aliyun","model":"deepseek-v4-pro"}))
+        );
+        assert_eq!(
+            opts.requested_model_display(),
+            Some("aliyun/deepseek-v4-pro".to_string())
+        );
     }
 
     #[test]

@@ -27,11 +27,13 @@
     "test": "npm run build && npm run lint:scan && vitest run",
     "pack:check": "npm pack --dry-run"
   },
-  "peerDependencies": {
+  "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
   },
+  "bundledDependencies": [
+    "@deepseek-ai/schemastery"
+  ],
   "devDependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^22.13.0",
     "typescript": "^5.7.3",
     "vitest": "^3.2.4"

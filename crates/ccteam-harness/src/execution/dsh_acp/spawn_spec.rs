@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
+use super::materialize::materialize_managed_profile;
 use crate::execution::mcp_config::{project_bridge_child_env, SessionMcpEndpoint};
 use crate::{ccteam_root_from_env, HarnessError, PermissionMode, SpawnCtx};
 
@@ -58,6 +59,7 @@ pub fn build_spawn_spec(
     std::fs::create_dir_all(&dsh_home).map_err(|e| {
         HarnessError::SpawnFailed(format!("create DSH_HOME {}: {e}", dsh_home.display()))
     })?;
+    materialize_managed_profile(&dsh_home)?;
     mirror_dsh_credentials_if_needed(&dsh_home)?;
 
     let mut env = vec![

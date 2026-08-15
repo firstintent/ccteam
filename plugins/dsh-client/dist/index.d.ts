@@ -20,6 +20,12 @@ export interface ApplyContext {
             get(): T;
         };
     };
+    agentDefaultModel?: {
+        currentSelection(): {
+            provider?: string;
+            model?: string;
+        } | undefined;
+    };
     on?(event: string, handler: (...args: never[]) => unknown): () => void;
     effect?<T extends (() => void | Promise<void>) | void>(setup: () => T, label?: string): () => void;
     logger?: {

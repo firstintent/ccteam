@@ -165,12 +165,35 @@ export class DshAcpServer {
         const body = requireRecord(params, 'session/new params');
         const cwd = requireString(body, 'cwd');
         const sessionId = randomUUID();
+        const agentOptions = this.resolveAgentOptions(body.agentOptions);
         let handle;
         try {
-            handle = await this.ctx.agents.create({
+            const request = {
                 sessionId,
                 meta: { cwd },
-                agentOptions: body.agentOptions,
+            };
+            if (agentOptions !== undefined)
+                request.agentOptions = agentOptions;
+            handle = await this.ctx.agents.create(request);
+        }
+        catch (error) {
+            throw errorToRpc(error);
+        }
+        this.sessions.set(sessionId, {
+            agent: handle.agent,
+            dispose: handle.dispose?.bind(handle),
+        });
+        return { sessionId, ...modelInfoFromAgentOptions(agentOptions) };
+    }
+    async loadSession(params) {
+        const body = requireRecord(params, 'session/load params');
+        const sessionId = requireString(body, 'sessionId');
+        const agentOptions = this.resolveAgentOptions(body.agentOptions);
+        let handle;
+        try {
+            handle = await this.ctx.agents.resume({
+                resumeSessionId: sessionId,
+                ...agentOptions === undefined ? {} : { agentOptions },
             });
         }
         catch (error) {
@@ -180,23 +203,7 @@ export class DshAcpServer {
             agent: handle.agent,
             dispose: handle.dispose?.bind(handle),
         });
-        return { sessionId };
-    }
-    async loadSession(params) {
-        const body = requireRecord(params, 'session/load params');
-        const sessionId = requireString(body, 'sessionId');
-        let handle;
-        try {
-            handle = await this.ctx.agents.resume({ resumeSessionId: sessionId });
-        }
-        catch (error) {
-            throw errorToRpc(error);
-        }
-        this.sessions.set(sessionId, {
-            agent: handle.agent,
-            dispose: handle.dispose?.bind(handle),
-        });
-        return { sessionId };
+        return { sessionId, ...modelInfoFromAgentOptions(agentOptions) };
     }
     async prompt(params) {
         const body = requireRecord(params, 'session/prompt params');
@@ -419,6 +426,40 @@ export class DshAcpServer {
             },
         });
     }
+    resolveAgentOptions(requested) {
+        const selection = this.ctx.agentDefaultModel?.currentSelection();
+        const selected = isModelSelection(selection) ? selection : undefined;
+        if (requested === undefined)
+            return selected;
+        if (!isRecord(requested))
+            return requested;
+        const merged = { ...requested };
+        if (stringField(merged, 'provider') === undefined && selected?.provider !== undefined) {
+            merged.provider = selected.provider;
+        }
+        if (stringField(merged, 'model') === undefined && selected?.model !== undefined) {
+            merged.model = selected.model;
+        }
+        return Object.keys(merged).length === 0 ? undefined : merged;
+    }
+}
+function isModelSelection(value) {
+    const body = asRecord(value);
+    return stringField(body, 'provider') !== undefined || stringField(body, 'model') !== undefined;
+}
+function modelInfoFromAgentOptions(agentOptions) {
+    const body = asRecord(agentOptions);
+    const provider = stringField(body, 'provider');
+    const model = stringField(body, 'model');
+    const modelId = provider !== undefined && model !== undefined ? `${provider}/${model}` : model;
+    if (modelId === undefined)
+        return {};
+    return {
+        models: {
+            currentModelId: modelId,
+            availableModels: [{ modelId, name: modelId }],
+        },
+    };
 }
 function acpPromptToText(prompt) {
     if (!Array.isArray(prompt))

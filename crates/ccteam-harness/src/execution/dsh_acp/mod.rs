@@ -4,6 +4,7 @@
 //! peer is ccteam's Cordis plugin, not the official DSH ACP demo.
 
 pub mod handshake;
+pub mod materialize;
 pub mod spawn_spec;
 
 use std::collections::HashMap;
@@ -29,7 +30,7 @@ use crate::{
     ThreadStatus, ToolSurfaceRebuild, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
-use handshake::{DshAgentOptions, DEFAULT_DSH_MODEL};
+use handshake::DshAgentOptions;
 use spawn_spec::{build_spawn_spec, purge_mirrored_credentials, verify_dsh_version};
 pub use spawn_spec::{dsh_bin, DSH_BIN_ENV};
 
@@ -148,10 +149,7 @@ impl DshAcpAdapter {
         requested_model: Option<String>,
     ) -> Arc<LiveSession> {
         let state = Arc::new(StdMutex::new(SessionTranslateState {
-            model: info
-                .model
-                .or(requested_model)
-                .or_else(|| Some(DEFAULT_DSH_MODEL.to_string())),
+            model: info.model.or(requested_model),
             window_tokens: info.window,
             effort: info.effort,
             ..Default::default()
@@ -408,7 +406,7 @@ impl HarnessAdapter for DshAcpAdapter {
             spawn.dsh_home,
             info,
             ctx.permission_mode,
-            Some(agent_options.model),
+            agent_options.requested_model_display(),
         );
         let mut handle = Self::make_handle(&live);
         if let Ok(st) = live.state.lock() {

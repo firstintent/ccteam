@@ -44,6 +44,9 @@ function makeTransportCtx() {
       }),
       resume: vi.fn(),
     },
+    agentDefaultModel: {
+      currentSelection: vi.fn(() => ({ provider: 'aliyun', model: 'deepseek-v4-pro' })),
+    },
     on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) => {
       handlers.set(event, handler)
       return vi.fn()
@@ -93,7 +96,7 @@ describe('DSH ACP transport', () => {
     expect(ctx.agents.create).toHaveBeenCalledWith({
       sessionId: newResult.result.sessionId,
       meta: { cwd: '/tmp/work' },
-      agentOptions: { model: 'deepseek-reasoner' },
+      agentOptions: { provider: 'aliyun', model: 'deepseek-reasoner' },
     })
 
     rpc.send({
@@ -155,5 +158,22 @@ describe('DSH ACP transport', () => {
         _meta: expect.objectContaining({ stopReason: 'max_tokens', inputTokens: 4, outputTokens: 2 }),
       }),
     }))
+  })
+
+  it('fills omitted agentOptions from DSH default model settings', async () => {
+    const rpc = makeRpcHarness()
+    const { ctx } = makeTransportCtx()
+    startDshTransport(ctx, { version: '1.2.3', input: rpc.input, output: rpc.output })
+
+    rpc.send({ jsonrpc: '2.0', id: 1, method: 'session/new', params: { cwd: '/tmp/work' } })
+    await rpc.waitFor(1)
+
+    const result = rpc.lines[0] as { result: { sessionId: string; models: { currentModelId: string } } }
+    expect(ctx.agents.create).toHaveBeenCalledWith({
+      sessionId: result.result.sessionId,
+      meta: { cwd: '/tmp/work' },
+      agentOptions: { provider: 'aliyun', model: 'deepseek-v4-pro' },
+    })
+    expect(result.result.models.currentModelId).toBe('aliyun/deepseek-v4-pro')
   })
 })

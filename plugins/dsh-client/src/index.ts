@@ -4,7 +4,7 @@ import { DEFAULT_DAEMON_URL, registerCcteamSettings, type CcteamSettings } from 
 import { shouldStartTransport, startDshTransport } from './transport.js'
 
 export const name = 'ccteam-client'
-export const inject = ['agents', 'tools', 'settings']
+export const inject = ['agents', 'tools', 'settings', 'agentDefaultModel']
 
 export interface Config extends Partial<CcteamSettings> {
   completionPollIntervalMs?: number
@@ -29,6 +29,9 @@ export interface ApplyContext {
   agents: unknown
   settings?: {
     register<T>(ns: string, schema: Schema<T>, options?: { applies?: 'live' | 'restart'; base?: Partial<T> }): { get(): T }
+  }
+  agentDefaultModel?: {
+    currentSelection(): { provider?: string; model?: string } | undefined
   }
   on?(event: string, handler: (...args: never[]) => unknown): () => void
   effect?<T extends (() => void | Promise<void>) | void>(setup: () => T, label?: string): () => void
@@ -57,7 +60,7 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
   const client = new CcteamMcpClient({
     daemonUrl: daemonUrl(),
     credential,
-    clientName: '@ccteam/dsh-client',
+    clientName: 'ccteam-dsh-client',
     clientVersion: PACKAGE_VERSION,
   })
   const notifier = new CcteamCompletionNotifier(client, {

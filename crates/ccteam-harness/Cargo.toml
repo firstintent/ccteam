@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
+flate2 = { workspace = true }
 notify = { workspace = true }
 regex = { workspace = true }
 # V0.8 W6 — hook_sink frames a typed `HookEvent` as length-prefixed
@@ -29,6 +30,7 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

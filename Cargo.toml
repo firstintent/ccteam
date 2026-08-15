@@ -105,6 +105,8 @@ getrandom = "0.2"
 # Already in the tree transitively via `rust-embed-utils` (ccteam-web);
 # pinned at the 0.10 line and consumed directly here.
 sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
 # HTTP client used by ccteam-web integration tests (lib + subprocess).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 

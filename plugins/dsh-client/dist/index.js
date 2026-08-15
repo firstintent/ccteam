@@ -3,7 +3,7 @@ import { CcteamCompletionNotifier, CcteamMcpClient, registerCcteamTools } from '
 import { DEFAULT_DAEMON_URL, registerCcteamSettings } from './settings.js';
 import { shouldStartTransport, startDshTransport } from './transport.js';
 export const name = 'ccteam-client';
-export const inject = ['agents', 'tools', 'settings'];
+export const inject = ['agents', 'tools', 'settings', 'agentDefaultModel'];
 export const Config = Schema.object({
     daemonUrl: Schema.string().default(DEFAULT_DAEMON_URL).description('ccteam daemon URL.'),
     enrollment: Schema.string().default('').role('secret').description('Enrollment credential from ccteam config.'),
@@ -32,7 +32,7 @@ export function apply(ctx, config = {}) {
     const client = new CcteamMcpClient({
         daemonUrl: daemonUrl(),
         credential,
-        clientName: '@ccteam/dsh-client',
+        clientName: 'ccteam-dsh-client',
         clientVersion: PACKAGE_VERSION,
     });
     const notifier = new CcteamCompletionNotifier(client, {
