@@ -40,7 +40,7 @@ ccteam 调用你机器上**已装好并完成认证的** Claude Code / Codex / G
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`;然后在 daemon 运行环境里 `export DEEPSEEK_API_KEY=...`,或继续使用你已配好的 DSH Web Settings(`ccteam doctor` 会报告命中了哪种凭据来源) |
+| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`;受管 DSH 会话可读 daemon 环境里的 `DEEPSEEK_API_KEY`,DSH Web 空间也可直接在原生 Settings → Models 里配置 |
 | Pi | [pi.dev](https://pi.dev/) | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
 
 **1 · 让 agent 装**
@@ -108,15 +108,26 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 打开 `ccteam start` 给出的链接即可。控制台是**无全宽顶栏**的聊天壳:**可折叠侧栏**(⌘K 搜索、新建会话、工作流、会话列表),成本和头像在侧栏底部。**工作流**含 Skills / Roles / 插件市场 / MCP / 自进化(只读)。**设置**含 运维总览(daemon 健康 + 主机接入/注册动作面;全队观察面在团队页)/ 接入(外部 Agent MCP 配置、开发者 REST API、卫星加入、IM 凭据 —— 管理员管全局 bot,普通用户配自己的 bot;用户登录链接仍仅管理员)/ 通用 / 账号(人人可自助重置 token);仅「管理员(用户管理)」为管理员专属。主题**默认浅色**(可切深色)。
 
-> **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。
+> **访问与安全**:默认绑 `0.0.0.0:7331`(局域网可访问)并用令牌鉴权,令牌存在 `~/.ccteam/secrets/web-token`。Web **无 TLS、明文传输**,请只在可信局域网用,**不要暴露公网**。要更严:`ccteam start --web-bind 127.0.0.1:7331` 只绑本机(此时免令牌),远程用 SSH 隧道。DSH Web 走伴生监听,默认是 web 端口 + 1;用 `--dsh-web-bind <addr:port>` 指定,或 `--dsh-web-bind off` 关闭(此时 `/api/v1/dsh/status` 仍会返回 `disabled`)。
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
 每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
 
-**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、web 里的 DSH 入口,或 MCP `session_spawn {vendor:"dsh", ...}` 会自动为该会话物化一份 ccteam 托管的隔离 DSH profile,不写你的 `~/.dsh`,同 sid 可冷恢复,token 用量会入账。若要从 DSH 自己的 Web UI 里反过来指挥 ccteam,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再到 DSH Settings 粘贴 daemon URL(默认 `http://127.0.0.1:7331`)和 **Settings → Access** 里复制的 enrollment 凭据。连上后,这个 DSH 会话拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
+**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 会自动为该会话物化一份 ccteam 托管的隔离 DSH profile,不写你的 `~/.dsh`,同 sid 可冷恢复,token 用量会入账。从 ccteam 打开的 DSH Web 空间会带上 `@ccteam/dsh-client`;如果你在 ccteam 外部自己打开 DSH Web,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再到 DSH Settings 粘贴 daemon URL(默认 `http://127.0.0.1:7331`)和 **Settings → Access** 里复制的 enrollment 凭据。连上后,这个 DSH 会话拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
 
 **Pi 也刻意不在 config-writer 表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要给可写配置的 vendor 手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
+
+### DSH Web
+
+**DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
+
+- **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程;否则 ccteam 自己在临时 loopback 端口启动。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
+- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件 symlink 每次启动自愈。出厂不复制 owner 的模型凭据;用户在 DSH 原生 Settings → Models 里填自己的 key。
+- **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;从 DSH 通过 ccteam 插件委派出去的工作照常入账。
+- **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。
+
+如果 ccteam 前面有 HTTPS 反代,**伴生端口也必须一起反代**。DSH Web 没有 base-path 支持,所以用第二个 HTTPS 端口或子域;只反代 `:7331` 会让 iframe 继续加载明文 HTTP,浏览器按 mixed-content 拒绝。
 
 ### 创建项目
 
@@ -340,6 +351,7 @@ ccteam config                  # 一次性配置:① 注册 MCP ② 配 IM bot �
 ccteam config mcp              # 注册/刷新可写配置 vendor 的 ccteam MCP;DSH 走插件粘贴凭据,Pi 走受管会话 bridge
 ccteam start                   # 起常驻服务(见「开始之前」;加 & 后台跑)
 ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌)
+ccteam start --dsh-web-bind off          # 关闭 DSH Web 伴生监听
 ccteam start --no-web | --no-imd         # 只要网关 / 只要 web
 ccteam stop                    # 优雅停 daemon
 ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链接

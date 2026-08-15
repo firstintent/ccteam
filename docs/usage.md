@@ -40,7 +40,7 @@ ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, DSH, and P
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`; then export `DEEPSEEK_API_KEY` where the daemon runs, or keep using your existing DSH Web Settings (`ccteam doctor` reports which source it found) |
+| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`; managed DSH sessions can read `DEEPSEEK_API_KEY`, and DSH Web spaces can be configured from native Settings → Models |
 | Pi | [pi.dev](https://pi.dev/) | provider API key, verified with `pi auth check --provider <provider>` |
 
 **1 · Let an agent do it**
@@ -110,15 +110,26 @@ Open that link to enter the console.
 
 Open the link printed by `ccteam start`. The console is a chat-style UI with a **collapsible sidebar** (search with ⌘K, New session, Workflow, session list) and **no full-width top bar**. Cost and the avatar menu live in the sidebar footer. **Workflow** covers Skills / Roles / Marketplace / MCP / Evolution (read-only). **Settings** has Ops overview (daemon health, plus a management card per host: its full vendor inventory — installed / version / readiness / whether the ccteam tools are registered — with register and import buttons offered only where the backend will actually accept the write, remediation hints verbatim, and that machine's reported projects with their adopt state; fleet observation lives on the Team page), Access (external-agent MCP config, developer REST API, satellite join, IM credentials — the admin manages the global bot, regular users configure their own; user login links stay admin-only), General, and Account (with self-serve token reset for every identity). Only the Users (admin) tab is admin-exclusive. Theme defaults to **light** (dark remains available).
 
-> **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind).
+> **Access and security:** by default the web server binds to `0.0.0.0:7331` and uses token auth. The token is stored at `~/.ccteam/secrets/web-token`. The web console has **no TLS** and transmits plaintext; use it only on a trusted LAN, and do not expose it to the public internet. For a stricter local-only mode: `ccteam start --web-bind 127.0.0.1:7331` (tokenless local bind). DSH Web uses a companion listener on the web port + 1 by default; use `--dsh-web-bind <addr:port>` to choose it or `--dsh-web-bind off` to disable it while keeping `/api/v1/dsh/status` readable.
 
 ### Register MCP (Automatic)
 
 Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor whose config ccteam may write** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of those vendors can orchestrate the team (`grok mcp doctor` verifies the Grok side). The entry carries a **user-scoped enrollment credential** — it says whose the config is and nothing more; the per-process identity is issued by the daemon when that vendor's session connects, so two agents started an hour apart from the same config are two callers with their own ledger rows. The write is idempotent and merge-only (your other MCP servers are untouched), vendors that are not installed are skipped, and an entry left over from an older ccteam (a `Bearer ccteam:<hex>` admin token, or a `command`-style stdio entry) reads as *not registered* and is replaced on the next start.
 
-**DSH is deliberately not on that config-writer list** because it has no equivalent global MCP file. Hiring DSH from ccteam needs no plugin installation: `/new dsh`, the DSH web chip, or `session_spawn {vendor:"dsh", ...}` materializes an isolated ccteam-owned DSH profile per session, leaves your own `~/.dsh` untouched, cold-resumes by sid, and tracks raw token usage. To let a DSH session you opened from DSH's own web UI orchestrate the team, run `dsh plugin --profile web add @ccteam/dsh-client`, then paste the daemon URL (default `http://127.0.0.1:7331`) and an enrollment credential from **Settings → Access** into DSH Settings. That DSH session gets the same eight tools; if it has not been bound to a ccteam project yet, its first tool call asks for a project slug and remembers it.
+**DSH is deliberately not on that config-writer list** because it has no equivalent global MCP file. Hiring DSH from ccteam needs no plugin installation: `/new dsh`, the DSH page, or `session_spawn {vendor:"dsh", ...}` materializes an isolated ccteam-owned DSH profile per session, leaves your own `~/.dsh` untouched, cold-resumes by sid, and tracks raw token usage. DSH Web spaces opened from ccteam come with the `@ccteam/dsh-client` plugin present; if you open DSH Web outside ccteam, run `dsh plugin --profile web add @ccteam/dsh-client`, then paste the daemon URL (default `http://127.0.0.1:7331`) and an enrollment credential from **Settings → Access** into DSH Settings. That DSH session gets the same eight tools; if it has not been bound to a ccteam project yet, its first tool call asks for a project slug and remembers it.
 
 **Pi is also deliberately not on the config-writer list**: its managed sessions receive the team tools through a ccteam-owned bridge extension loaded at spawn, so no Pi config of yours is ever written — and a `pi` you start by hand in a shell has no ccteam tools. To re-register the config-writable vendors manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
+
+### DSH Web
+
+The **DSH** page embeds native DeepSeek Harness Web through the companion listener. It uses the same ccteam login cookie as the rest of the console; the DSH process never receives the ccteam cookie or bearer token.
+
+- **Owner:** ccteam uses the real `~/.dsh` space. If a native `dsh web` is already running on `127.0.0.1:3080`, ccteam attaches to it instead of starting a second writer. If not, ccteam starts one on an ephemeral loopback port. A local browser can open the native URL directly; a LAN browser uses the ccteam proxy.
+- **Regular users:** each identity gets `$CCTEAM_HOME/runtime/dsh/web/<user>/` with the DSH base app and `@ccteam/dsh-client` present. The profile is merge-style: DSH plugins the user installs stay in place, and ccteam's plugin symlink self-heals on each start. The home ships with no copied owner credential; users add model keys through DSH's native Settings → Models flow.
+- **Ledger:** native DSH Web turns are not ccteam sessions, so they do not show up as `$0` or any other fake value in the ccteam ledger. Work delegated from DSH through the ccteam plugin is recorded normally.
+- **Trust boundary:** tenant DSH Web is same-OS-user isolation. DSH agents can run shell commands, and self-installed DSH plugins are arbitrary npm code with the same trust level as that OS account.
+
+When running ccteam behind HTTPS, proxy the DSH companion listener as well as the main web listener. DSH Web has no base-path support, so use a second HTTPS port or subdomain; proxying only `:7331` leaves the iframe on plain HTTP and browsers block it as mixed content.
 
 ### Create a Project
 
@@ -360,6 +371,7 @@ ccteam daemon status [--json]  # pid · ready · running-vs-binary version.
 ccteam daemon logs [-f] [-n N] # Tail/follow ~/.ccteam/daemon.log.
 ccteam start                   # Run in the FOREGROUND (dev / containers / your own supervisor).
 ccteam start --web-bind 127.0.0.1:7331   # Local-only bind, no token.
+ccteam start --dsh-web-bind off          # Disable the DSH Web companion listener.
 ccteam start --no-web | --no-imd         # Gateway only / web only.
 ccteam stop                    # Alias for `ccteam daemon stop`.
 ccteam update [--now] [--no-restart] [--json]   # Update in place, then restart onto the new binary.

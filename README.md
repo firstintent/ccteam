@@ -64,6 +64,7 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
 - a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
 - a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place
+- a DSH page that opens DeepSeek Harness Web inside ccteam: the daemon authenticates the request, starts or attaches the right local DSH web instance, and gives each logged-in user a separate DSH home
 - a cost pill with daily budget caps
 - a per-project ⋯ menu in the sidebar: start a session there, copy its path, or take the project out of ccteam (deregister + stop its live sessions — your directory and code are never touched)
 - marketplace and settings
@@ -115,7 +116,7 @@ Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 > - **Grok Build** — install [Grok CLI](https://docs.x.ai/build/overview), then `grok login`
 > - **OpenCode** — install [OpenCode](https://opencode.ai), then `opencode auth login`
 > - **Kimi Code** — install [Kimi Code](https://moonshotai.github.io/kimi-code/), then `kimi login`
-> - **DSH** — install [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) with `npm i -g @deepseek-ai/dsh`, then export `DEEPSEEK_API_KEY` where the daemon runs (already using DSH Web Settings? nothing extra to do)
+> - **DSH** — install [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) with `npm i -g @deepseek-ai/dsh`. Managed DSH sessions can use `DEEPSEEK_API_KEY`; DSH Web can also be configured from its native Settings → Models page.
 > - **Pi** — install [Pi](https://pi.dev/), then set your provider key and check it with `pi auth check --provider <provider>`
 >
 > Any one of them is enough to start. Afterwards `ccteam status` and **Settings → Hosts** report, per machine, which vendors are installed, their versions, and whether each is actually authenticated — sitting on `PATH` never counts as logged in.
@@ -155,6 +156,7 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 - **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents (a credential scoped to one project, rendered as the real config each vendor expects, or as plain text for plugin-backed flows such as DSH, listed and revocable afterwards — the secret is shown once, never again), satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
 - **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into the vendor CLIs with writable config (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. DSH uses its own plugin plus a pasted Access credential; Pi gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
+- **DSH** — open native DSH Web as a first-class console page. The owner sees the real `~/.dsh` space (ccteam attaches to a DSH Web already on `127.0.0.1:3080` when present); each regular user gets an isolated `$CCTEAM_HOME/runtime/dsh/web/<user>/` space with the ccteam client plugin preloaded. User-installed DSH plugins are preserved.
 
 <p align="center">
   <img src="docs/images/web-workflow-hub.png" width="1000" alt="Workflow hub — skills, roles, marketplace, MCP servers, and the per-project experience ledger: turn records with role and skill fingerprints" />
@@ -162,7 +164,9 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
   <sub><b>The workflow hub</b> — skills, personas, marketplace and MCP servers in one place, next to the project's experience ledger (turn records + role/skill fingerprints).</sub>
 </p>
 
-> The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. To bind a specific host/port (e.g. loopback only), pass `--web-bind` when you start it: `ccteam daemon start --web-bind 127.0.0.1:7331`.
+> The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. DSH Web uses a companion listener on the web port + 1 by default; override it with `--dsh-web-bind <addr:port>` or disable it with `--dsh-web-bind off`. If you put HTTPS in front of ccteam, proxy the companion listener too (usually a second HTTPS port or subdomain). Proxying only `:7331` makes the DSH iframe mixed-content fail, and DSH Web cannot be safely mounted under a path prefix.
+
+> DSH Web honesty: native DSH turns run inside DSH, not as ccteam sessions, so they do not appear in the ccteam cost ledger; work delegated through the ccteam DSH plugin is ledgered normally. Tenant DSH Web is same-OS-user isolation: DSH agents can run shell commands, and self-installed DSH plugins are arbitrary npm code with the same trust level as that user account.
 
 ## Chaining sessions
 
