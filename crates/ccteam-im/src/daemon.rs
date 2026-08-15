@@ -128,8 +128,7 @@ pub fn default_adapter_factory_with_stream_json_handle() -> (
         Arc::new(ccteam_harness::KimiAcpAdapter::new());
     let pi_rpc = Arc::new(PiRpcAdapter::new(pi_role_reader()));
     let pi: Arc<dyn HarnessAdapter + Send + Sync> = pi_rpc.clone();
-    // v0.9.15 P1/P2 — minimal stub (`start_thread` fails honestly); the real
-    // handshake lands in P3 (tech-design.md §5.4/§5.7).
+    // v0.9.15 P3 — DSH runs through ccteam's ACP Cordis plugin.
     let dsh: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(DshAcpAdapter::new());
     // Vendor-first factory (v0.8.23 §3.E + v0.8.24 OpenCode): protocol is
     // Claude-only for stream-json/terminal; Grok/OpenCode/Kimi/Dsh always ACP.
