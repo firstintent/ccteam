@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="ccteam mascot — a juggler bot keeping codex, grok and kimi in the air" />
   <h1>ccteam</h1>
-  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi…) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, or a browser tab.</b></p>
+  <p><b>ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, DSH…) into one team —<br/>any session can spawn, dispatch, and collect work from any vendor on any machine,<br/>while you steer it all from Telegram, Lark, or a browser tab.</b></p>
   <p>
     <a href="https://github.com/firstintent/ccteam/actions/workflows/check.yml"><img src="https://github.com/firstintent/ccteam/actions/workflows/check.yml/badge.svg" alt="CI" /></a>
     <img src="https://img.shields.io/badge/made%20with-Rust-b7410e" alt="Made with Rust" />
@@ -20,6 +20,7 @@ Each coding CLI is brilliant alone but works in isolation — one terminal, one 
 - **Codex** — grinds long jobs without wobbling
 - **Grok** — answers fastest
 - **Kimi** — bulk work on a tiny bill
+- **DSH** — plugin-native DeepSeek Harness sessions with cold resume
 - **Pi** — one CLI over many providers (`anthropic/…`, `openai/…`), on your own machine
 
 ccteam is the connective tissue they lack — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves *how* the team organizes itself to prompts you version.
@@ -107,13 +108,14 @@ The daemon routes and records — at-least-once notifications across restarts, i
 Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 
 > [!IMPORTANT]
-> **Bring your own coding CLI — install and sign into at least one before you start.** ccteam is the bridge, not the agent: it spawns the vendor CLIs already on the machine a project is bound to, so a vendor that is missing (or installed but not logged in) cannot host a session.
+> **Bring your own coding CLI — install and authenticate at least one before you start.** ccteam is the bridge, not the agent: it spawns the vendor CLIs already on the machine a project is bound to, so a vendor that is missing (or installed but not authenticated) cannot host a session.
 >
 > - **Claude Code** — install [Claude Code](https://docs.claude.com/en/docs/claude-code), then `claude auth login`
 > - **Codex** — install [Codex CLI](https://github.com/openai/codex), then `codex login`
 > - **Grok Build** — install [Grok CLI](https://docs.x.ai/build/overview), then `grok login`
 > - **OpenCode** — install [OpenCode](https://opencode.ai), then `opencode auth login`
 > - **Kimi Code** — install [Kimi Code](https://moonshotai.github.io/kimi-code/), then `kimi login`
+> - **DSH** — install [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) with `npm i -g @deepseek-ai/dsh`, then export `DEEPSEEK_API_KEY` where the daemon runs (already using DSH Web Settings? nothing extra to do)
 > - **Pi** — install [Pi](https://pi.dev/), then set your provider key and check it with `pi auth check --provider <provider>`
 >
 > Any one of them is enough to start. Afterwards `ccteam status` and **Settings → Hosts** report, per machine, which vendors are installed, their versions, and whether each is actually authenticated — sitting on `PATH` never counts as logged in.
@@ -150,8 +152,8 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
-- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents (a credential scoped to one project, rendered as the real config each vendor expects, listed and revocable afterwards — the secret is shown once, never again), satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
-- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into your vendor CLIs (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. Pi is the exception by design: it gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
+- **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents (a credential scoped to one project, rendered as the real config each vendor expects, or as plain text for plugin-backed flows such as DSH, listed and revocable afterwards — the secret is shown once, never again), satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
+- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into the vendor CLIs with writable config (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. DSH uses its own plugin plus a pasted Access credential; Pi gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
 
 <p align="center">
@@ -199,7 +201,7 @@ ccteam adds a team to your repo without taking it over:
 
 ## Why
 
-Six excellent coding CLIs shipped in two years, and each assumes it's alone. The result: you, alt-tabbing between vendors, re-pasting context, playing message bus. The fix isn't a framework on top — the vendors' harnesses are already great. It's the connective tissue they lack: identity, routing, delivery, cost, observability, across vendors and machines. That's ccteam — `cc` for the Claude Code it grew out of, `team` for what your agents become.
+Seven excellent coding CLIs shipped in two years, and each assumes it's alone. The result: you, alt-tabbing between vendors, re-pasting context, playing message bus. The fix isn't a framework on top — the vendors' harnesses are already great. It's the connective tissue they lack: identity, routing, delivery, cost, observability, across vendors and machines. That's ccteam — `cc` for the Claude Code it grew out of, `team` for what your agents become.
 
 It stays deliberately underneath:
 
@@ -234,4 +236,4 @@ Per project, delete `.ccteam/` and ccteam's section of `.claude/settings.local.j
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on **Claude Code**, driving **Codex**, **Grok**, **OpenCode**, **Kimi** and **Pi**.
+MIT — see [LICENSE](LICENSE). Built on **Claude Code**, driving **Codex**, **Grok**, **OpenCode**, **Kimi**, **DSH** and **Pi**.

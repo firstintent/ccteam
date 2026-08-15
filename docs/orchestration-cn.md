@@ -2,9 +2,9 @@
 
 > English version: [orchestration.md](orchestration.md)（同构英文版,附录含 skill 作者工具速查)
 
-**你不用记工具名——直接说就行。** 对你的会话说一句「这个重构交给 codex,完了汇报」,它就替你雇一个 codex 会话、盯着跑完、把「改了哪些文件、测试过没过」的结论拿回来给你审。**没有安装步骤**:ccteam 的 MCP server 自带使用说明,任何连上的会话天生就会带队。合上笔记本它也接着跑,每一跳都有账。
+**你不用记工具名——直接说就行。** 对你的会话说一句「这个重构交给 codex,完了汇报」,它就替你雇一个 codex 会话、盯着跑完、把「改了哪些文件、测试过没过」的结论拿回来给你审。会话连上以后**无需额外安装步骤**:ccteam 的 MCP server 自带使用说明,它天生就会带队。合上笔记本它也接着跑,每一跳都有账。
 
-这就是 Claude Code 里的 Task 工具——只不过被你指挥的「subagent」是一个完整的 vendor 会话:可以是 Codex、Grok、另一个 Claude,可以在另一台机器上,而且它做的每件事都记在账本里、随时能查。
+这就是 Claude Code 里的 Task 工具——只不过被你指挥的「subagent」是一个完整的 vendor 会话:可以是 Codex、Grok、DSH、另一个 Claude,可以在另一台机器上,而且它做的每件事都记在账本里、随时能查。
 
 ---
 
@@ -14,7 +14,7 @@
 |---|---|
 | **手机 / IM**(Telegram、飞书/Lark) | 直接发消息;说一句「也问问 codex 和 grok」,它自己把问题扇给几个 vendor,再把几份答案比出结论。从插件市场装 `team-brain` persona,一个会话就是你的参谋长 |
 | **Web 控制台** | 浏览器里开会话、看团队树、审 diff、看成本 |
-| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi / Pi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具,**零安装** |
+| **你日常的 coding agent 里** —— Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi(本文重点) | 用一句人话委派——任何连上 MCP 的会话天生认识这套团队工具 |
 
 人的完整入口手册见 [usage-cn.md](usage-cn.md)。本文讲第三种——**怎么在你日常的 AI 里,用一句话指挥一整个团队。**
 
@@ -125,17 +125,17 @@
 
 ## 8. 装一次
 
-编排本身**无需安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进**所有允许 ccteam 写配置的 vendor**——Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。唯一的例外是 Pi,且是刻意设计:ccteam 不写它任何配置,改为在自己 spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
+对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `session_spawn {vendor:"dsh", ...}`),ccteam 会自动物化隔离 profile 和插件;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
 
 - 本机 `ccteam start` 起着 daemon。
-- 你在一个**已注册的 ccteam 项目**目录里(会话从当前目录认出项目)。
-- 用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证)。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §9。)
+- 你有一个**已注册的 ccteam 项目**并知道它的 slug;可写配置的 CLI 会话也可以从工作目录识别项目。
+- 对可写配置的 vendor,用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证);对 DSH,用已连接 `@ccteam/dsh-client` 的 DSH Web UI。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §9。)
 
 ## 9. 出问题时(人话)
 
 | 现象 | 怎么回事 → 怎么办 |
 |---|---|
-| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;或 `ccteam status` 看 daemon 在不在。SDK 会话可直接调 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam-enroll:<id>:<secret>`(设置 → 接入 里签发,并带上 `initialize` 返回的 `Mcp-Session-Id`)——同一套工具,而且 caller 在账本里有自己的行,它 spawn 出来的是它的子会话而不是一堆根节点。 |
+| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;DSH 则安装 `@ccteam/dsh-client` 并在 DSH Settings 粘贴 Access 凭据。SDK 会话可直接调 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam-enroll:<id>:<secret>`(设置 → 接入 里签发,并带上 `initialize` 返回的 `Mcp-Session-Id`)——同一套工具,而且 caller 在账本里有自己的行,它 spawn 出来的是它的子会话而不是一堆根节点。 |
 | 「它半天没动静」 | 它在**干活(working)**,不是卡住。去干别的,一会儿回来看结论。 |
 | 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或把项目名说出来让会话带上 `project:"<slug>"`。 |
 | 「grok 用不了」 | 这台机器没装 grok CLI。`ccteam status` / capabilities 看这台机器实际有哪些 vendor。 |
@@ -147,11 +147,11 @@
 
 平时你不用报工具名——会话听懂人话自己调。但如果你在**写 persona / skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
-- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`/`pi`。**没有 `protocol` 参数**——wire 通道由 vendor 派生(claude/codex = stream-json;grok/opencode/kimi = acp;pi = 它自己的 RPC),传入就是硬错误,与 `host` 相同;`pi` 只在 daemon 本机跑:把它 spawn 进绑定卫星的项目会直接报错,绝不悄悄换台机器;`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话,或在 `initialize` 时完成注册的手起 agent;无论哪种,该 sid 就是子会话的 `parent_sid`)或 `admin:<sid>` / `admin`(本机 `mcp.sock` 逃生门,不点名自己的 sid 就是根 spawn)。期望有父边却看到光秃秃的 `admin`,说明这次调用没有带上 per-process 身份——走 HTTP 时即「跳过了 enrollment 握手」。
+- **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`/`dsh`/`pi`。**没有 `protocol` 参数**——wire 通道由 vendor 派生(claude/codex = stream-json;grok/opencode/kimi/dsh = acp;pi = 它自己的 RPC),传入就是硬错误,与 `host` 相同;`dsh` 和 `pi` 只在 daemon 本机跑:把它们 spawn 进绑定卫星的项目会直接报错,绝不悄悄换台机器;受管 DSH 会话同 sid 可冷恢复、token 会入账,且不需要你手动装插件。`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);grok/opencode/kimi/dsh 当前只支持 roleless,会忽略 role 参数。`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话,或在 `initialize` 时完成注册的手起 agent;无论哪种,该 sid 就是子会话的 `parent_sid`)或 `admin:<sid>` / `admin`(本机 `mcp.sock` 逃生门,不点名自己的 sid 就是根 spawn)。期望有父边却看到光秃秃的 `admin`,说明这次调用没有带上 per-process 身份——走 HTTP 时即「跳过了 enrollment 握手」。
 - **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?, notify?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。默认异步:**子会话一整个 vendor turn 干完、转 idle 时,只发一条完成通知**(话痨子会话的中途叙述不通知、只进账本);通知里明确写「已 idle、在等下一个 dispatch」——任务没真完,这就是你补派下一步的信号(「静默停摆」不再存在:idle 必有信号)。`notify` 选模式:`"final"`(默认)/`"all"`(每条消息都通知,调试用)/`"off"`(只记账本)。`wait_seconds`(≤600)阻塞到 turn 真正干完、返回**最终** `result_text`(中途叙述不会提前结束等待),超时返回 `pending`(子会话继续跑,绝不取消)。
-- **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本;并带累计账:`cost_usd`(有价表的 vendor)+ `tokens_total`(原始 token 数——只要 vendor 报 usage 就有,codex/grok/opencode/kimi 不再一片空白)。
+- **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本;并带累计账:`cost_usd`(有价表的 vendor)+ `tokens_total`(原始 token 数——只要 vendor 报 usage 就有,codex/grok/opencode/kimi/dsh 不再一片空白)。
 - **`session_list`** — 委派树(谁是谁的下属、忙闲、成本/token、`parent_sid`),按最近活跃排序。支持 `{project?, activity?, limit?}` 过滤(默认最多 30 行,截断时带 `truncated`/`total`;空字段省略),大船队不再灌爆你的上下文。web 团队视图渲染的是同一张图。
 - **`session_stop`** — 显式关掉一个 `sid`(状态留盘,可冷恢复)。ccteam 只有两个自动刹车:每日预算触顶拒新活、live 容量超限优雅挤停最闲的会话——**创建永不因容量失败**。
 - 另加 **`status`**(daemon 健康 + 会话 + 今日成本,外加 caller 项目绑定主机的厂商面板——各 vendor 安装/auth/预算、已装 vendor 的 spawn 配方、advisory 模型目录、原文透传的分工笔记;见 §6)、其裸名发现别名 **`grok_claude_codex_kimi`**(响应完全一致;专治只显示工具名的宿主搜不到 vendor 关键词),与 **`chat_send_file`**(把 daemon 文件系统上的文件发回你绑定的 chat)。
 
-**身份 & 信任(说实话):** ccteam 拉起的会话带 per-session `(sid, secret)`,只能操作自己项目;你自己手起的会话在**第一次调用时完成注册**:vendor 配置里的 enrollment 凭据说明「这份配置是谁的」,daemon 在 `initialize` 时给这个**进程**签发身份,于是它是账本里的一行真会话,它 spawn 的就是它的子会话;但它仍不是 ccteam 驱动的会话,完成通知没有落点(`notify_deliverable:false`)——短任务用 `wait_seconds`、否则轮询 `session_collect`。用户域凭据不钉项目,故首个调用请带 `project:"<slug>"`(第一次点名的项目就是本次会话的 workspace,ccteam 绝不从工作目录猜,且只接受你本人可见的项目)。per-session secret 是**单 OS 用户下的纵深防御,不是硬边界**——同 uid 进程终归能读到彼此的 env。它买到的是:agent 不会*误*跨项目、每个动作都归因到已认证的调用方。真隔离(per-agent OS 用户 / sandbox)当前刻意不做。
+**身份 & 信任(说实话):** ccteam 拉起的会话带 per-session `(sid, secret)`,只能操作自己项目;你自己手起的会话在**第一次调用时完成注册**:vendor 配置里、或 DSH 插件设置里的 enrollment 凭据说明「这份配置是谁的」,daemon 在 `initialize` 时给这个**进程**签发身份,于是它是账本里的一行真会话,它 spawn 的就是它的子会话。多数手起会话仍不是 ccteam 驱动的会话,完成通知没有落点(`notify_deliverable:false`)——短任务用 `wait_seconds`、否则轮询 `session_collect`;DSH 插件会话是例外,插件能把 follow-up 投回 DSH 对话里。用户域凭据不钉项目,故首个调用请带 `project:"<slug>"`(第一次点名的项目就是本次会话的 workspace,ccteam 绝不从工作目录猜,且只接受你本人可见的项目)。per-session secret 是**单 OS 用户下的纵深防御,不是硬边界**——同 uid 进程终归能读到彼此的 env。它买到的是:agent 不会*误*跨项目、每个动作都归因到已认证的调用方。真隔离(per-agent OS 用户 / sandbox)当前刻意不做。

@@ -1,6 +1,6 @@
 # ccteam User Manual
 
-**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, or a browser tab.**
+**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, DSH…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, or a browser tab.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 
@@ -29,17 +29,18 @@ These are the only terminal steps required. Afterward, the web console is the re
 
 ### 1. Install
 
-ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, and Pi CLIs already installed and logged in on your machine. It does not bundle them.
+ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, DSH, and Pi CLIs already installed and authenticated on your machine. It does not bundle them.
 
-**Install and sign into at least one of them first** — a vendor that is missing, or installed but not authenticated, cannot host a session on that machine:
+**Install and authenticate at least one of them first** — a vendor that is missing, or installed but not authenticated, cannot host a session on that machine:
 
-| Vendor | Install | Sign in |
+| Vendor | Install | Authenticate |
 |---|---|---|
 | Claude Code | [docs.claude.com/en/docs/claude-code](https://docs.claude.com/en/docs/claude-code) | `claude auth login` |
 | Codex | [github.com/openai/codex](https://github.com/openai/codex) | `codex login` |
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
+| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`; then export `DEEPSEEK_API_KEY` where the daemon runs, or keep using your existing DSH Web Settings (`ccteam doctor` reports which source it found) |
 | Pi | [pi.dev](https://pi.dev/) | provider API key, verified with `pi auth check --provider <provider>` |
 
 **1 · Let an agent do it**
@@ -65,11 +66,12 @@ Then verify:
 
 ```bash
 ccteam --version
-claude --version   # required; log in if prompted
+claude --version   # optional; only needed for Claude sessions
 codex --version    # optional; only needed for Codex sessions
 grok --version     # optional; only needed for Grok Build sessions
 opencode --version # optional; only needed for OpenCode sessions
 kimi --version     # optional; only needed for Kimi Code sessions (`kimi login` first)
+dsh --version      # optional; only needed for DSH sessions (0.1.0-rc.6 or newer)
 pi --version       # optional; only needed for Pi sessions (0.83.0 or newer)
 ```
 
@@ -112,7 +114,11 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 ### Register MCP (Automatic)
 
-Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of ANY vendor can orchestrate the team (`grok mcp doctor` verifies the Grok side). The entry carries a **user-scoped enrollment credential** — it says whose the config is and nothing more; the per-process identity is issued by the daemon when that vendor's session connects, so two agents started an hour apart from the same config are two callers with their own ledger rows. The write is idempotent and merge-only (your other MCP servers are untouched), vendors that are not installed are skipped, and an entry left over from an older ccteam (a `Bearer ccteam:<hex>` admin token, or a `command`-style stdio entry) reads as *not registered* and is replaced on the next start. **Pi is deliberately not on that list**: its managed sessions receive the team tools through a ccteam-owned bridge extension loaded at spawn, so no Pi config of yours is ever written — and a `pi` you start by hand in a shell has no ccteam tools. To re-register manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
+Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor whose config ccteam may write** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of those vendors can orchestrate the team (`grok mcp doctor` verifies the Grok side). The entry carries a **user-scoped enrollment credential** — it says whose the config is and nothing more; the per-process identity is issued by the daemon when that vendor's session connects, so two agents started an hour apart from the same config are two callers with their own ledger rows. The write is idempotent and merge-only (your other MCP servers are untouched), vendors that are not installed are skipped, and an entry left over from an older ccteam (a `Bearer ccteam:<hex>` admin token, or a `command`-style stdio entry) reads as *not registered* and is replaced on the next start.
+
+**DSH is deliberately not on that config-writer list** because it has no equivalent global MCP file. Hiring DSH from ccteam needs no plugin installation: `/new dsh`, the DSH web chip, or `session_spawn {vendor:"dsh", ...}` materializes an isolated ccteam-owned DSH profile per session, leaves your own `~/.dsh` untouched, cold-resumes by sid, and tracks raw token usage. To let a DSH session you opened from DSH's own web UI orchestrate the team, run `dsh plugin --profile web add @ccteam/dsh-client`, then paste the daemon URL (default `http://127.0.0.1:7331`) and an enrollment credential from **Settings → Access** into DSH Settings. That DSH session gets the same eight tools; if it has not been bound to a ccteam project yet, its first tool call asks for a project slug and remembers it.
+
+**Pi is also deliberately not on the config-writer list**: its managed sessions receive the team tools through a ccteam-owned bridge extension loaded at spawn, so no Pi config of yours is ever written — and a `pi` you start by hand in a shell has no ccteam tools. To re-register the config-writable vendors manually — say, after hand-editing a vendor config — use `ccteam config mcp` or the **Register ccteam MCP** button on the **Hosts** page, which also reports which vendors are installed, their versions, and readiness.
 
 ### Create a Project
 
@@ -122,10 +128,10 @@ Managing one afterwards happens where the project lives: hover its workspace hea
 
 ### Start, Switch, and Drive Sessions
 
-- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi / Pi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode and Kimi, Pi's own RPC for Pi), the model and reasoning effort, and HITL at spawn time. Both menus are built per vendor from what that vendor declared at its last handshake (`GET /api/v1/models`), so you pick from its own ids and its own levels — a vendor that has no effort axis shows no effort menu, and leaving either on **default** sends nothing and lets the vendor decide. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless. The session gets a handle like `s1`.
+- **New session:** choose a vendor (Claude / Codex / Grok / OpenCode / Kimi / DSH / Pi) and protocol (stream-json or terminal for Claude, ACP for Grok, OpenCode, Kimi and DSH, Pi's own RPC for Pi), the model and reasoning effort, and HITL at spawn time. Both menus are built per vendor from what that vendor declared at its last handshake (`GET /api/v1/models`), so you pick from its own ids and its own levels — a vendor that has no effort axis shows no effort menu, and leaving either on **default** sends nothing and lets the vendor decide. The execution host is the project's — sessions run wherever their project is bound, and every session row wears a vendor chip. Roles come from the project's `.claude/agents/` — pick one at spawn time or launch roleless; Grok, OpenCode, Kimi, and DSH are roleless-only today. The session gets a handle like `s1`.
 - **Each session** has **Chat | Terminal** tabs. Chat renders assistant output as Markdown, including headings, lists, tables, and code blocks with copy buttons. Press **Enter** to send, **Shift+Enter** for a newline, and stop an in-flight turn from the UI.
 - **Dedicated session page:** `/app/chat/s/<sid>` is a clean view for one session. It has that session's history and session-filtered live events, without mixing other sessions.
-- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, Kimi, and Pi are chat-only (Grok / OpenCode / Kimi run over ACP and Pi over its own RPC, with no terminal mirror).
+- **Terminal tab:** a byte-faithful mirror of the session screen, including ANSI, cursor, and alignment. Currently available for Claude sessions. Codex, Grok, OpenCode, Kimi, DSH, and Pi are chat-only (Grok / OpenCode / Kimi / DSH run over ACP and Pi over its own RPC, with no terminal mirror).
 - **History and resume:** click **More history (N)** under the session list to expand stopped-but-not-destroyed sessions. Click any row to cold-resume it from disk `meta.json`. Stopped sessions, sessions from before a daemon restart, and `/use <sid>` from mobile all resume the same way. **Import historical session** can find native Claude sessions started outside ccteam (matched by working directory) and adopt them into ccteam while keeping the transcript.
 - **Attach files and skills:** the composer's **＋** menu uploads files or photos (drag-and-drop and clipboard paste work too — attachments show as removable chips while they upload), and attaches skills from two sections: the **project's own skills** (`.agents/skills/`, with legacy `.claude/skills/` entities still read) and the user-level **global skill library** (`~/.ccteam/skills`, nested ids included; attaching is a per-message pointer and never copies anything into the project). Files and skills ride the message for **every vendor**: files land on disk and the turn carries their path for the agent to read (the same mechanism as sending a photo over Telegram); an attached skill adds a read-and-follow pointer to its `SKILL.md`, so it works even for vendors with no native skill loader. Files go to the project's `.ccteam/uploads/` (local-host projects; remote/satellite projects are politely rejected for now).
 - **Schedule a message:** tap the **clock** on the composer to enter schedule mode. Enter **how many minutes and/or hours** from now (or tap chips `+15m` / `+30m` / `+1h` / `+2h`), or pick a **local-clock** datetime — the UI converts everything to a relative delay so browser timezone and daemon timezone never disagree. A preview shows the expected local send time. Type the text and send — the message joins a **queue above the input**, sorted by send time; cancel with **×**. At fire time the text is a normal user turn into that session. Schedule mode does not carry file/skill attachments. Caps: 20 pending per session, farthest **7 days** ahead. Failed deliveries stay in the queue (marked failed) for 24 hours so you can dismiss them.
@@ -165,7 +171,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 ### Status and Cost
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.
-- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode and Pi use only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table); **Kimi always shows "—"** (its ACP wire carries no usage/cost). A turn that fails part-way is still billed by the vendor, so its tokens and cost land on the ledger like any other turn — a failure never reads as free.
+- Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode and Pi use only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table); **DSH reports raw tokens but has no USD price table yet**; **Kimi always shows "—"** (its ACP wire carries no usage/cost). A turn that fails part-way is still billed by the vendor, so its tokens and cost land on the ledger like any other turn — a failure never reads as free.
 
 ### Standard Resource API
 
@@ -186,7 +192,7 @@ Mcp-Session-Id: <the id the daemon returned at initialize>
 ```
 
 - **The credential says whose the config is; the daemon issues the identity.** `initialize` answers with an `Mcp-Session-Id`, and that id is what makes *this process* a caller of its own: it gets a real session row in the ledger (`managed_by: external`), so the sessions it spawns hang under it in the delegation tree instead of appearing as roots. Every later request must carry both the credential and the id — the id alone is not a credential, and a binding only resolves for the credential that opened it. A stale id answers `404` telling you to re-`initialize`; `DELETE /mcp` ends the binding when you are done.
-- **Two scopes.** Every `ccteam daemon start` writes a **user-scoped** credential into the vendor configs on that machine, so a hand-started Claude/Codex/Grok/OpenCode/Kimi already has the tools; because it names no project, such a caller must pass `project` explicitly on its first `session_*` call, and only its owner's projects are accepted. A **project-scoped** credential is what the console's copy button hands out (Settings → Access, or `POST /api/v1/projects/{slug}/enroll`): pinned to one workspace, safe to paste on another machine, listed and revocable afterwards. The secret is shown once, at mint time.
+- **Two scopes.** Every `ccteam daemon start` writes a **user-scoped** credential into the vendor configs on that machine, so a hand-started Claude/Codex/Grok/OpenCode/Kimi already has the tools; DSH gets the same identity model after its `@ccteam/dsh-client` plugin is connected with a pasted enrollment credential. Because a user-scoped credential names no project, such a caller must pass `project` explicitly on its first `session_*` call, and only its owner's projects are accepted. A **project-scoped** credential is what the console's copy button hands out (Settings → Access, or `POST /api/v1/projects/{slug}/enroll`): pinned to one workspace, safe to paste on another machine, listed and revocable afterwards. The secret is shown once, at mint time.
 - **Nothing is inferred.** No working directory, no peer address, no "most recent project": a caller with no basis for a project is refused and told which slugs it could name. Unknown and forbidden projects/sessions return the same error (anti-enumeration). Bearer-only: cookies and query tokens are never accepted, and a web console token — which authenticates `/api/v1/**` — is rejected here with a message naming the credential families this endpoint does take.
 
 ---
@@ -246,9 +252,10 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 # Sessions
 /new [vendor] [role] [hitl] [model=<id>] [effort=<level>]
                              Create a session and return handle s<N>.
-                             vendor = claude (default) | codex | grok | opencode | kimi | pi
+                             vendor = claude (default) | codex | grok | opencode | kimi | dsh | pi
                              omit role = bare Claude reading CLAUDE.md; provide role to bind it
-                             grok/opencode/kimi = roleless ACP session (role arg ignored)
+                             grok/opencode/kimi/dsh = roleless ACP session (role arg ignored)
+                             dsh = local-only session; cold resume and token usage are tracked
                              pi = local-only session; roles supported
                              add hitl = approve tools in IM; default skip runs directly
                              model= / effort= (or m= / e=) go to the vendor verbatim, in any
@@ -308,7 +315,7 @@ List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows 
 
 ### Human-in-the-Loop (HITL)
 
-Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Claude and Pi sessions both support this — Pi routes its own permission dialogs through the same approve / deny buttons, and its auto-allowed tools never prompt. Codex sessions have their own sandbox and ignore this mode. Grok and Kimi sessions currently run in `skip` (auto-approve) only; IM approval for them is planned but not yet wired.
+Sessions default to direct execution (`skip`). Start an approval-gated session with `/new <vendor> <role> hitl`. Before non-allowlisted tools run, ccteam sends the requested action plus approve / deny buttons. Approve runs the tool; deny blocks only that tool call and does not kill the turn. Claude, DSH, and Pi sessions support this — DSH and Pi route their own permission dialogs through the same approve / deny buttons, and their auto-allowed tools never prompt. Codex sessions have their own sandbox and ignore this mode. Grok and Kimi sessions currently run in `skip` (auto-approve) only; IM approval for them is planned but not yet wired.
 
 ### Let Any Session Dispatch Work
 
@@ -345,7 +352,7 @@ ccteam init --in /path/to/repo # Initialize elsewhere.
 ccteam init --slug demo        # Override inferred slug.
 ccteam init --owner user:u123  # Multi-user: assign project ownership.
 ccteam config                  # One-time setup: MCP, IM bot, preferences.
-ccteam config mcp              # Register/refresh ccteam MCP for all five vendors; useful without TTY.
+ccteam config mcp              # Register/refresh ccteam MCP for config-writable vendors; useful without TTY.
 ccteam daemon start            # Start the daemon in the background (setsid; idempotent).
 ccteam daemon stop [--force]   # Graceful stop; --force escalates to SIGKILL (daemon only).
 ccteam daemon restart          # Graceful stop + re-detach under one lock.
@@ -455,7 +462,7 @@ Environment variables:
 ```bash
 CCTEAM_HOME=~/.ccteam2          # Isolate a full state/config/session tree; pairs with ccteam --home.
 CCTEAM_PROJECTS_ROOT=...        # Default project root; default ~/projects.
-CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_BIN=...
+CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_BIN=... CCTEAM_DSH_BIN=...
 # Override vendor CLI paths (tests / non-PATH installs).
 ```
 
@@ -483,7 +490,7 @@ The satellite reports its agents and registered projects every ~25s over its con
 - **Create remotely:** web console → new project → pick the satellite in the host picker → absolute path on that machine. The daemon asks the satellite to bootstrap and register it in place.
 - **Import an existing checkout:** `ccteam init` in the repo on that machine, then hosts page → 接入/Import next to the reported project. Same-slug collisions get a distinct catalog slug (`demo` → `demo2`) — slug equality across machines is not project identity.
 
-Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn. Pi is local-only by design — its sessions always run in the daemon's own process, and a project bound to a satellite refuses a Pi spawn with a plain error rather than quietly running it somewhere else. Fleet capacity: at most 50 live sessions daemon-wide (configurable `sessions.max_live`); admitting one more gracefully stops the least-recently-active idle session, which stays resumable.
+Remote execution currently supports Claude stream-json sessions; the connection self-heals with backoff, and a dropped exec link resumes context via vendor `--resume` on the next spawn. Pi and DSH are local-only by design — their sessions run on the daemon's own machine, and a project bound to a satellite refuses those spawns with a plain error rather than quietly running them somewhere else. Fleet capacity: at most 50 live sessions daemon-wide (configurable `sessions.max_live`); admitting one more gracefully stops the least-recently-active idle session, which stays resumable.
 
 ---
 
