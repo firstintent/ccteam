@@ -542,7 +542,7 @@ async fn response_from_reqwest(resp: reqwest::Response) -> Response {
     let headers = resp.headers().clone();
     let stream = resp
         .bytes_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+        .map_err(std::io::Error::other);
     let mut out = Response::builder().status(status);
     if let Some(out_headers) = out.headers_mut() {
         for (name, value) in headers.iter() {
