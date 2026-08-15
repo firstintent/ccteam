@@ -32,7 +32,7 @@ use crate::{
 
 use handshake::DshAgentOptions;
 use spawn_spec::{build_spawn_spec, purge_mirrored_credentials, verify_dsh_version};
-pub use spawn_spec::{dsh_bin, DSH_BIN_ENV};
+pub use spawn_spec::{dsh_bin, find_cached_dsh_bin, resolve_dsh_default_bin, DSH_BIN_ENV};
 
 const FINALIZE_BARRIER: std::time::Duration = std::time::Duration::from_millis(750);
 const EVENT_BUFFER: usize = 256;

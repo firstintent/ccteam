@@ -31,9 +31,99 @@ const CREDENTIALS_FILE: &str = ".credentials.yaml";
 const SETTINGS_FILE: &str = "settings.yaml";
 
 /// Resolve the `dsh` binary path: `CCTEAM_DSH_BIN` override, else `dsh` on
-/// `PATH`. Mirrors the other adapter spawn-spec helpers.
+/// `PATH`, else a cached `npx` copy ([`resolve_dsh_default_bin`]). The same
+/// resolver the status/hosts/doctor probe panels use (`ccteam-core` and
+/// `ccteam-cli` both already depend on this crate — this is the one place
+/// that can own it without inverting the dependency graph), so "installed"
+/// and "spawns" never disagree.
 pub fn dsh_bin() -> String {
-    std::env::var(DSH_BIN_ENV).unwrap_or_else(|_| "dsh".to_string())
+    std::env::var(DSH_BIN_ENV).unwrap_or_else(|_| resolve_dsh_default_bin())
+}
+
+/// DSH's product CLI is commonly reached only through
+/// `npx @deepseek-ai/dsh …` — DSH's own documented quickstart — which never
+/// puts a binary on `PATH`: npx caches the resolved package under
+/// `~/.npm/_npx/<hash>/node_modules/.bin/dsh` and runs it transiently, once,
+/// from that cache directory. Plain-name `PATH` resolution correctly reports
+/// "not found" in that state even though a perfectly usable copy sits on
+/// disk — which reads to a user who already has `dsh web` running as "ccteam
+/// is broken", not as the accurate "no CLI on PATH".
+///
+/// This is **read-only discovery of something the user already caused to
+/// exist** by running `dsh` themselves at least once — no network call, no
+/// package fetch, no execution. It does not relax "ccteam never installs a
+/// CLI for you": nothing gets installed here, only found.
+///
+/// Returns the literal `"dsh"` (ordinary `PATH` resolution) when that
+/// already works, so the common global-install case is untouched; only
+/// falls back to a discovered absolute path when bare `"dsh"` is not on
+/// `PATH`.
+pub fn resolve_dsh_default_bin() -> String {
+    let home = dirs::home_dir();
+    let path_env = std::env::var_os("PATH");
+    resolve_dsh_default_bin_in(path_env.as_deref(), home.as_deref())
+}
+
+/// Scan `~/.npm/_npx/*/node_modules/.bin/dsh` for a cached copy of DSH's
+/// product CLI, picking the most recently modified match when several exist
+/// (npx keeps one cache directory per exact version range ever requested).
+pub fn find_cached_dsh_bin() -> Option<PathBuf> {
+    find_cached_dsh_bin_under(&dirs::home_dir()?)
+}
+
+const DSH_LITERAL: &str = "dsh";
+
+/// Parameterized core of [`resolve_dsh_default_bin`] — no global env/HOME
+/// reads, so it is deterministically testable without mutating process
+/// state (env-mutating tests are a repo-wide flake source; see AGENTS.md).
+fn resolve_dsh_default_bin_in(path_env: Option<&std::ffi::OsStr>, home: Option<&Path>) -> String {
+    if bin_on_path_in(path_env, DSH_LITERAL) {
+        return DSH_LITERAL.to_string();
+    }
+    home.and_then(find_cached_dsh_bin_under)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| DSH_LITERAL.to_string())
+}
+
+fn bin_on_path_in(path_env: Option<&std::ffi::OsStr>, name: &str) -> bool {
+    let Some(path) = path_env else {
+        return false;
+    };
+    std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+fn find_cached_dsh_bin_under(home: &Path) -> Option<PathBuf> {
+    let npx_root = home.join(".npm").join("_npx");
+    let entries = std::fs::read_dir(&npx_root).ok()?;
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let candidate = entry.path().join("node_modules").join(".bin").join("dsh");
+            is_executable_file(&candidate)
+                .then(|| std::fs::metadata(&candidate).ok()?.modified().ok())
+                .flatten()
+                .map(|modified| (modified, candidate))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -366,5 +456,85 @@ mod tests {
     fn demo_binary_name_is_rejected() {
         let err = reject_demo_bin("/tmp/deepseek-harness-acp").unwrap_err();
         assert!(err.to_string().contains("official DSH ACP demo"));
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\necho stub\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_bin_prefers_plain_path_resolution_when_dsh_is_on_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bindir");
+        make_executable(&bin_dir.join("dsh"));
+        let path_env = std::ffi::OsString::from(bin_dir.as_os_str());
+        // No npx cache at all — this only proves PATH wins when it resolves,
+        // not that the fallback is skipped (that's the next test).
+        assert_eq!(
+            resolve_dsh_default_bin_in(Some(&path_env), None),
+            DSH_LITERAL
+        );
+    }
+
+    #[test]
+    fn default_bin_falls_back_to_cached_npx_copy_when_absent_from_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cached = home
+            .join(".npm")
+            .join("_npx")
+            .join("somehash")
+            .join("node_modules")
+            .join(".bin")
+            .join("dsh");
+        make_executable(&cached);
+        // Empty PATH: bare "dsh" cannot resolve there.
+        let empty_path = std::ffi::OsString::from("");
+        let resolved = resolve_dsh_default_bin_in(Some(&empty_path), Some(&home));
+        assert_eq!(resolved, cached.to_string_lossy());
+    }
+
+    #[test]
+    fn default_bin_is_literal_dsh_when_neither_path_nor_npx_cache_has_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home"); // no .npm/_npx under it at all
+        let empty_path = std::ffi::OsString::from("");
+        assert_eq!(
+            resolve_dsh_default_bin_in(Some(&empty_path), Some(&home)),
+            DSH_LITERAL
+        );
+    }
+
+    #[test]
+    fn cached_npx_lookup_picks_the_most_recently_modified_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let older = home
+            .join(".npm")
+            .join("_npx")
+            .join("older-hash")
+            .join("node_modules")
+            .join(".bin")
+            .join("dsh");
+        let newer = home
+            .join(".npm")
+            .join("_npx")
+            .join("newer-hash")
+            .join("node_modules")
+            .join(".bin")
+            .join("dsh");
+        make_executable(&older);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        make_executable(&newer);
+        let found = find_cached_dsh_bin_under(&home).unwrap();
+        assert_eq!(found, newer);
     }
 }

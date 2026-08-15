@@ -194,7 +194,11 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
         ReportRow::visible(check_agent(
             "dsh",
             ccteam_harness::DSH_BIN_ENV,
-            "dsh",
+            // Falls back to a cached `npx` copy when bare `dsh` isn't on
+            // PATH — DSH's own quickstart (`npx @deepseek-ai/dsh …`) never
+            // puts one there. Same resolver the status/hosts panel and the
+            // actual spawn path use, so doctor never disagrees with them.
+            &ccteam_harness::resolve_dsh_default_bin(),
             false,
             check_vendor_auth_dsh,
         )),

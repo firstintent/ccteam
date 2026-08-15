@@ -187,24 +187,39 @@ impl AgentProbeSpec {
 }
 
 /// Resolve a vendor's binary path: the `CCTEAM_*_BIN` override, else the
-/// `PATH` name. The single resolver every probe call site shares.
+/// `PATH` name — **except `dsh`**, which additionally falls back to a
+/// cached `npx` copy (`ccteam_harness::resolve_dsh_default_bin` — DSH's own
+/// resolution logic lives with its adapter; this crate already depends on
+/// `ccteam-harness` for real, so it consumes rather than re-implements it).
+/// The single resolver every probe call site shares.
 pub fn resolve_bin(spec: &AgentProbeSpec) -> String {
-    std::env::var(spec.bin_env).unwrap_or_else(|_| spec.default_bin.to_string())
+    std::env::var(spec.bin_env).unwrap_or_else(|_| {
+        if spec.vendor == "dsh" {
+            ccteam_harness::resolve_dsh_default_bin()
+        } else {
+            spec.default_bin.to_string()
+        }
+    })
 }
 
 /// Whether a vendor binary is resolvable without executing it.
 ///
 /// An explicit `CCTEAM_*_BIN` override is authoritative and counts when that
 /// path exists. Otherwise the default binary name is scanned on `PATH`; Unix
-/// candidates must be regular files with at least one executable bit.
+/// candidates must be regular files with at least one executable bit. `dsh`
+/// additionally counts a cached `npx` copy
+/// (`ccteam_harness::find_cached_dsh_bin`).
 pub fn bin_resolvable(spec: &AgentProbeSpec) -> bool {
     if let Some(path) = std::env::var_os(spec.bin_env) {
         return path_is_executable(std::path::Path::new(&path));
     }
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| path_is_executable(&dir.join(spec.default_bin)))
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| path_is_executable(&dir.join(spec.default_bin)))
+    });
+    if on_path {
+        return true;
+    }
+    spec.vendor == "dsh" && ccteam_harness::find_cached_dsh_bin().is_some()
 }
 
 fn path_is_executable(path: &std::path::Path) -> bool {

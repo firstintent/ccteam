@@ -70,7 +70,9 @@ pub use execution::delegation::{
     read_delegation_watch, scan_delegation_watches, write_delegation_watch, DelegationWatch,
     NotifyMode,
 };
-pub use execution::dsh_acp::{DshAcpAdapter, DSH_ACP_ADAPTER_NAME, DSH_BIN_ENV};
+pub use execution::dsh_acp::{
+    find_cached_dsh_bin, resolve_dsh_default_bin, DshAcpAdapter, DSH_ACP_ADAPTER_NAME, DSH_BIN_ENV,
+};
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};
 pub use execution::host_channel::{
