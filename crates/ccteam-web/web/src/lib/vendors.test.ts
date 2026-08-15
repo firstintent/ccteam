@@ -57,8 +57,8 @@ const CATALOG: VendorCatalog = {
   },
 };
 
-describe("VENDORS registry (6-way)", () => {
-  it("lists exactly six distinct harnesses — never collapses Pi", () => {
+describe("VENDORS registry (7-way)", () => {
+  it("lists exactly seven distinct harnesses — never collapses Pi or DSH", () => {
     expect(VENDORS.map((v) => v.id)).toEqual([
       "claude",
       "codex",
@@ -66,14 +66,19 @@ describe("VENDORS registry (6-way)", () => {
       "opencode",
       "kimi",
       "pi",
+      "dsh",
     ]);
-    expect(new Set(VENDORS.map((v) => v.label)).size).toBe(6);
+    expect(new Set(VENDORS.map((v) => v.label)).size).toBe(7);
     expect(vendorSpec("pi").label).toBe("Pi");
+    expect(vendorSpec("dsh").label).toBe("DSH");
     const css = readFileSync(new URL("../index.css", import.meta.url), "utf8");
     const color = (vendor: string) => css.match(new RegExp(`--${vendor}:\\s*(#[0-9A-F]+)`, "i"))?.[1];
     const pi = color("pi");
+    const dsh = color("dsh");
     expect(pi).toBeTruthy();
+    expect(dsh).toBeTruthy();
     expect(["claude", "codex", "grok", "opencode", "kimi"].map(color)).not.toContain(pi);
+    expect(["claude", "codex", "grok", "opencode", "kimi", "pi"].map(color)).not.toContain(dsh);
   });
 
   it("claude offers stream-json (default) + terminal (frozen)", () => {
@@ -88,6 +93,7 @@ describe("VENDORS registry (6-way)", () => {
     expect(vendorSpec("grok").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("opencode").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("kimi").protocols.map((p) => p.wire)).toEqual(["acp"]);
+    expect(vendorSpec("dsh").protocols.map((p) => p.wire)).toEqual(["acp"]);
     expect(vendorSpec("pi").protocols).toEqual([
       { id: "stream-json", label: "stream-json", sub: "Pi RPC JSONL", wire: "stream-json" },
     ]);
@@ -149,7 +155,7 @@ describe("modelRowsFor (menu rows = default + what the vendor declared)", () => 
   });
 
   it("static fallback: the live-only catalogs offer the default alone (404 daemon)", () => {
-    for (const vendor of ["codex", "grok", "opencode", "kimi", "pi"] as const) {
+    for (const vendor of ["codex", "grok", "opencode", "kimi", "pi", "dsh"] as const) {
       expect(modelRowsFor(vendor)).toEqual([MODEL_DEFAULT]);
     }
   });
@@ -195,9 +201,10 @@ describe("effortRowsFor (there is NO global effort ladder)", () => {
     expect(effortRowsFor("grok")).toEqual(["", "low", "medium", "high"]);
   });
 
-  it("opencode declares no effort axis → the default row alone (composer hides the section)", () => {
+  it("opencode and DSH declare no static effort axis → the default row alone", () => {
     expect(effortRowsFor("opencode")).toEqual([""]);
     expect(effortRowsFor("opencode", CATALOG)).toEqual([""]);
+    expect(effortRowsFor("dsh")).toEqual([""]);
   });
 
   it("the live catalog supersedes the static set", () => {
@@ -288,7 +295,7 @@ describe("effortSwitchFor (create-form `effort` field — pass-through, no remap
     expect(effortSwitchFor(defaultDraft())).toBeNull();
   });
 
-  it("sends the vendor's own token verbatim for all five vendors", () => {
+  it("sends the vendor's own token verbatim for every vendor", () => {
     // The regression this replaces: the `wireEffort` default arm returned null
     // for grok/opencode/kimi, so their menu pick evaporated on the way out.
     expect(effortSwitchFor({ vendor: "claude", effort: "max" })).toBe("max");
@@ -300,6 +307,7 @@ describe("effortSwitchFor (create-form `effort` field — pass-through, no remap
         opencode: { models: [], efforts: ["high"] },
       }),
     ).toBe("high");
+    expect(effortSwitchFor({ vendor: "dsh", effort: "high" })).toBe("high");
   });
 
   it("passes explicit values through for adapter-side validation", () => {
@@ -364,7 +372,7 @@ describe("draft transitions (catalog is advisory, vendor changes are explicit)",
 });
 
 describe("dot / chip classes", () => {
-  it("emits prototype vendor classes for all six vendors", () => {
+  it("emits prototype vendor classes for all seven vendors", () => {
     expect(vendorDotClass("claude")).toBe("dot claude");
     expect(vendorDotClass("opencode")).toBe("dot opencode");
     expect(vendorDotClass("kimi")).toBe("dot kimi");
@@ -373,6 +381,8 @@ describe("dot / chip classes", () => {
     expect(vendorChipClass("kimi")).toBe("chip kimi");
     expect(vendorDotClass("pi")).toBe("dot pi");
     expect(vendorChipClass("pi")).toBe("chip pi");
+    expect(vendorDotClass("dsh")).toBe("dot dsh");
+    expect(vendorChipClass("dsh")).toBe("chip dsh");
   });
 
   it("maps live status to prototype dot states", () => {

@@ -77,7 +77,7 @@ pub(crate) const ROUTING_NOTES_MAX_CHARS: usize = 4000;
 /// Per-vendor caps keep the full status response within its one-screen budget.
 const CATALOG_IDS_PER_VENDOR: usize = 4;
 const CATALOG_ALIASES_PER_VENDOR: usize = 4;
-const CATALOG_VENDOR_LIMIT: usize = 6;
+const CATALOG_VENDOR_LIMIT: usize = 7;
 const CATALOG_TOKEN_CHARS: usize = 32;
 
 /// Vendors ccteam bundles a price table for (`anthropic`/`openai`/`xai`).
@@ -587,6 +587,9 @@ fn render_recipes(
             "kimi" => "session_spawn{vendor:\"kimi\", task:\"…\"}",
             "opencode" => "session_spawn{vendor:\"opencode\", task:\"…\"}",
             "pi" => "session_spawn{vendor:\"pi\", task:\"…\"} — managed local Pi RPC session with the ccteam bridge",
+            "dsh" => {
+                "session_spawn{vendor:\"dsh\", task:\"…\"} — DeepSeek Harness via managed spawn (automatic ccteam plugin; no user action needed). External DSH plugin: dsh plugin --profile web add @ccteam/dsh-client; has cold resume"
+            }
             _ => continue,
         };
         lines.push(format!("  {recipe}"));
@@ -848,6 +851,7 @@ mod tests {
             panel_row("grok", true),
             panel_row("kimi", false),
             panel_row("opencode", false),
+            panel_row("dsh", true),
         ]);
         assert!(out.contains("recipes (installed vendors):"), "{out}");
         assert!(
@@ -855,6 +859,12 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("session_spawn{vendor:\"claude\""), "{out}");
+        assert!(out.contains("session_spawn{vendor:\"dsh\""), "{out}");
+        assert!(
+            out.contains("dsh plugin --profile web add @ccteam/dsh-client"),
+            "{out}"
+        );
+        assert!(out.contains("has cold resume"), "{out}");
         assert!(!out.contains("vendor:\"codex\""), "{out}");
         assert!(!out.contains("vendor:\"kimi\""), "{out}");
         assert!(out.contains("session_collect{sid, tail:true}"), "{out}");

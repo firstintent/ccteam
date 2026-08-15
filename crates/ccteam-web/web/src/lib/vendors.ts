@@ -14,7 +14,7 @@
 
 import type { VendorCatalog } from "./modelsApi";
 
-export type VendorId = "claude" | "codex" | "grok" | "opencode" | "kimi" | "pi";
+export type VendorId = "claude" | "codex" | "grok" | "opencode" | "kimi" | "pi" | "dsh";
 
 /** One selectable wire protocol for a vendor. `wire` is the value POSTed to
  *  `POST /projects/{slug}/sessions` (`protocol` field); `label` is what the
@@ -121,6 +121,15 @@ export const VENDORS: VendorSpec[] = [
     protocols: [
       { id: "stream-json", label: "stream-json", sub: "Pi RPC JSONL", wire: "stream-json" },
     ],
+  },
+  {
+    id: "dsh",
+    label: "DSH",
+    // DSH reports model capability at runtime through the managed ACP/plugin
+    // path; the static entry exists only as an icon/label fallback.
+    models: [],
+    efforts: [],
+    protocols: [{ id: "acp", label: "acp", sub: "JSON-RPC stdio", wire: "acp" }],
   },
 ];
 

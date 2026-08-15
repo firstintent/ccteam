@@ -64,6 +64,16 @@ function VendorMark({ vendor }: { vendor: string }) {
           <path fill="currentColor" d="M2 3.2h12v2H11v8H8.9v-8H6.8v8H4.7v-8H2v-2z" />
         </svg>
       );
+    case "dsh":
+      // DeepSeek Harness: compact D mark, matching the icon-only chip pattern.
+      return (
+        <svg viewBox="0 0 16 16" aria-hidden className="vendor-ico">
+          <path
+            fill="currentColor"
+            d="M3 2h5.1C11 2 13 4.4 13 8s-2 6-4.9 6H3V2zm2.2 2.1v7.8H8c1.7 0 2.8-1.5 2.8-3.9S9.7 4.1 8 4.1H5.2z"
+          />
+        </svg>
+      );
     default:
       return (
         <svg viewBox="0 0 16 16" aria-hidden className="vendor-ico">

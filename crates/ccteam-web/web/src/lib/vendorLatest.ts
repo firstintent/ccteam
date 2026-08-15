@@ -16,6 +16,8 @@ export function npmPackageForVendor(vendor: string): string | null {
       return "@xai-official/grok";
     case "opencode":
       return "opencode-ai";
+    case "dsh":
+      return "@deepseek-ai/dsh";
     default:
       return null;
   }

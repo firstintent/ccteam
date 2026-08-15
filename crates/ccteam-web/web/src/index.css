@@ -59,6 +59,7 @@
   --color-vendor-grok: #8b5cf6;
   --color-vendor-opencode: #0284c7;
   --color-vendor-pi: #4f46e5;
+  --color-vendor-dsh: #2563eb;
 
   --color-accent-500: #0d9488;
   --color-accent-600: #0f766e;
@@ -124,6 +125,8 @@
   --kimi: #DB2777;
   /* pi — 6th vendor (indigo; distinct from Grok violet and OpenCode sky). */
   --pi: #4F46E5;
+  /* dsh — 7th vendor (blue; distinct from OpenCode sky and Pi indigo). */
+  --dsh: #2563EB;
   --radius-card: 12px;
   --radius-input: 18px;
   --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 6px 24px rgba(16,24,40,.06);
@@ -151,6 +154,7 @@ html.dark {
   --opencode: #38BDF8;
   --kimi: #F472B6;
   --pi: #818CF8;
+  --dsh: #60A5FA;
   --shadow-card: 0 1px 2px rgba(0,0,0,.4), 0 6px 24px rgba(0,0,0,.35);
   --shadow-menu: 0 4px 10px rgba(0,0,0,.5), 0 12px 32px rgba(0,0,0,.5);
   color-scheme: dark;
@@ -170,6 +174,7 @@ html.dark {
   --color-vendor-grok: var(--grok);
   --color-vendor-opencode: var(--opencode);
   --color-vendor-pi: var(--pi);
+  --color-vendor-dsh: var(--dsh);
   --color-surface-700: var(--border);
   --color-surface-800: var(--bg-soft);
   --color-surface-850: var(--bg-hover);
@@ -598,6 +603,7 @@ html.dark .sel-item.new { color: #67e8f9; }
 .dot.claude { background: var(--claude); } .dot.codex { background: var(--codex); } .dot.grok { background: var(--grok); }
 .dot.opencode { background: var(--opencode); } .dot.kimi { background: var(--kimi); }
 .dot.pi { background: var(--pi); }
+.dot.dsh { background: var(--dsh); }
 .dot.on { background: var(--green); } .dot.off { background: #C9CBD1; } .dot.busy { background: #F59E0B; }
 .dot.err { background: var(--red); }
 html.dark .dot.off { background: #4b4e57; }
@@ -638,6 +644,7 @@ html.dark .dot.off { background: #4b4e57; }
 .chip.opencode { color: var(--opencode); border-color: #0284c755; }
 .chip.kimi { color: var(--kimi); border-color: #db277755; }
 .chip.pi { color: var(--pi); border-color: #4f46e555; }
+.chip.dsh { color: var(--dsh); border-color: #2563eb55; }
 .chip.sid { color: var(--text-muted); }
 /* Icon-only vendor mark (replaces the text label). Fixed square so session
  * rows / cards don't burn horizontal space on "claude"/"opencode" strings. */
