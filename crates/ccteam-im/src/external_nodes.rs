@@ -25,7 +25,8 @@ use ccteam_harness::{AgentVendor, PermissionMode, SessionProtocol};
 /// Display-only for an external node: nothing is spawned or resumed off this,
 /// so an unrecognised client must not be forced into a wrong vendor — the
 /// caller keeps the raw string as the node's title instead. Observed names on
-/// this machine: `claude-code`, `codex`, `grok`, `opencode`, `kimi-code`.
+/// this machine: `claude-code`, `codex`, `grok`, `opencode`, `kimi-code`,
+/// `ccteam-dsh-client` / `dsh`.
 pub fn vendor_from_client(client_name: &str) -> Option<AgentVendor> {
     let name = client_name.trim().to_ascii_lowercase();
     // Match on the leading token so `codex-cli` / `claude-code-sdk` still land.
@@ -37,6 +38,7 @@ pub fn vendor_from_client(client_name: &str) -> Option<AgentVendor> {
         h if h.starts_with("opencode") => Some(AgentVendor::Opencode),
         h if h.starts_with("kimi") => Some(AgentVendor::Kimi),
         h if h.starts_with("pi") => Some(AgentVendor::Pi),
+        h if h.starts_with("dsh") || name.starts_with("ccteam-dsh") => Some(AgentVendor::Dsh),
         _ => None,
     }
 }
@@ -54,6 +56,13 @@ pub fn external_node_meta(
     vendor: Option<AgentVendor>,
 ) -> SessionMeta {
     let now = chrono::Utc::now().to_rfc3339();
+    let resolved_vendor = vendor.unwrap_or(AgentVendor::Claude);
+    let protocol = match resolved_vendor {
+        AgentVendor::Grok | AgentVendor::Opencode | AgentVendor::Kimi | AgentVendor::Dsh => {
+            SessionProtocol::Acp
+        }
+        AgentVendor::Claude | AgentVendor::Codex | AgentVendor::Pi => SessionProtocol::StreamJson,
+    };
     let mut meta = SessionMeta {
         managed_by: ManagedBy::External,
         sid: sid.to_string(),
@@ -61,8 +70,8 @@ pub fn external_node_meta(
         // Unrecognised clients are still real callers; Claude is the display
         // fallback and the raw name rides in the title so the listing never
         // silently misattributes one vendor's work to another.
-        vendor: vendor.unwrap_or(AgentVendor::Claude),
-        protocol: SessionProtocol::StreamJson,
+        vendor: resolved_vendor,
+        protocol,
         role: String::new(),
         permission_mode: PermissionMode::Skip,
         owner: owner.to_string(),
@@ -129,6 +138,7 @@ mod tests {
             ("opencode", AgentVendor::Opencode),
             ("kimi-code", AgentVendor::Kimi),
             ("pi", AgentVendor::Pi),
+            ("dsh", AgentVendor::Dsh),
         ] {
             assert_eq!(vendor_from_client(client), Some(want), "client {client}");
         }
@@ -139,6 +149,12 @@ mod tests {
             Some(AgentVendor::Claude)
         );
         assert_eq!(vendor_from_client("codex_cli"), Some(AgentVendor::Codex));
+        assert_eq!(vendor_from_client("dsh/0.1.0"), Some(AgentVendor::Dsh));
+        assert_eq!(vendor_from_client("dsh-client"), Some(AgentVendor::Dsh));
+        assert_eq!(
+            vendor_from_client("ccteam-dsh-client"),
+            Some(AgentVendor::Dsh)
+        );
     }
 
     #[test]
@@ -183,6 +199,19 @@ mod tests {
         assert!(meta.title.is_none(), "no fabricated label");
         assert_eq!(meta.vendor, AgentVendor::Claude, "display fallback");
         assert_eq!(meta.managed_by, ManagedBy::External);
+    }
+
+    #[test]
+    fn a_dsh_external_node_reports_acp_not_the_stream_json_fallback() {
+        let meta = external_node_meta(
+            "s99",
+            "alpha",
+            "user:web-api",
+            "dsh/0.1.0",
+            Some(AgentVendor::Dsh),
+        );
+        assert_eq!(meta.vendor, AgentVendor::Dsh);
+        assert_eq!(meta.protocol, SessionProtocol::Acp);
     }
 
     #[test]

@@ -1337,7 +1337,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[vendor] [role] [hitl] [model=<id>] [effort=<level>]"),
+        arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl] [model=<id>] [effort=<level>]"),
         help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
         in_menu: true,
     },
@@ -11414,7 +11414,7 @@ struct NewSessionArgs {
 /// The one-line `/new` syntax, echoed by every parse error so a chat user
 /// never has to leave the conversation to find the shape.
 const NEW_COMMAND_SYNTAX: &str =
-    "/new [vendor] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>]";
+    "/new [claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>]";
 
 /// Parse the tokens after `/new`.
 ///
@@ -11609,6 +11609,10 @@ mod tests {
         assert_eq!(roled.role, "reviewer");
         assert_eq!(roled.permission_mode, PermissionMode::Hitl);
 
+        let dsh = parse_new("dsh").unwrap();
+        assert_eq!(dsh.vendor, AgentVendor::Dsh);
+        assert_eq!(dsh.role, "", "bare /new dsh is roleless");
+
         // ACP vendors settle the protocol axis last, whatever was typed.
         assert_eq!(
             parse_new("grok terminal").unwrap().protocol,
@@ -11690,8 +11694,10 @@ mod tests {
             .find(|c| c.name == "/new")
             .expect("/new is a gateway command");
         let hint = spec.arg_hint.expect("/new takes args");
+        assert!(hint.contains("dsh"), "{hint}");
         assert!(hint.contains("model=<id>"), "{hint}");
         assert!(hint.contains("effort=<level>"), "{hint}");
+        assert!(NEW_COMMAND_SYNTAX.contains("dsh"), "{NEW_COMMAND_SYNTAX}");
     }
 
     #[test]
@@ -17395,7 +17401,7 @@ mod tests {
         > = Arc::new(|vendor, _| Arc::new(FakeAdapter::new(vendor)));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"] {
             gateway
                 .handle_text("mock", "chat-1", "alice", &format!("/new {vendor}"))
                 .await
@@ -17408,7 +17414,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi"] {
+        for vendor in ["claude", "codex", "grok", "opencode", "kimi", "pi", "dsh"] {
             assert!(listing.contains(&format!(" {vendor}")), "{listing}");
         }
     }
@@ -21466,7 +21472,7 @@ mod tests {
         // `events_notify` — a single shared fake's `notify_one` could wake the
         // wrong pump when two sessions (parent + child) run concurrently.
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
-            // `with_turn_boundary` mirrors every real adapter (all six emit
+            // `with_turn_boundary` mirrors every current adapter (all emit
             // `TurnCompleted`) — required since v0.9.5: the delegation
             // notification fires on the turn boundary, not per answer.
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())

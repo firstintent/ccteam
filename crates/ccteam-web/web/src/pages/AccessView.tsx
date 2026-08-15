@@ -39,7 +39,7 @@ const CODE_PRE_CLASS =
 export function externalRestSnippet(origin: string, token: string, lang: Lang): string {
   const t = makeT(lang);
   return `TOKEN='${token}'
-# 1) ${t("accessApiStepCreate")} (vendor: claude|codex|grok|opencode|kimi|pi) -> {"sid":"s42"}
+# 1) ${t("accessApiStepCreate")} (vendor: claude|codex|grok|opencode|kimi|pi|dsh) -> {"sid":"s42"}
 curl -sX POST ${origin}/api/v1/projects/<project-slug>/sessions \\
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \\
   -d '{"role":"","vendor":"claude"}'
