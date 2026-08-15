@@ -112,6 +112,11 @@ pub struct AppState {
     /// a standalone/default state gets its own (empty) hub — handlers work,
     /// spawns simply find no connected hosts.
     pub host_hub: Arc<ccteam_harness::HostChannelHub>,
+    /// v0.9.15 DSHWEB — per-identity DSH web instance supervisor plus the
+    /// reqwest client used by the companion-port byte proxy. These are not
+    /// agent sessions and never enter the gateway live map.
+    pub dsh_web: Arc<crate::dsh_web::DshWebSupervisor>,
+    pub dsh_proxy_client: reqwest::Client,
 }
 
 /// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
@@ -172,7 +177,14 @@ impl AppState {
             mcp_sink: None,
             mcp_pending: None,
             host_hub: Arc::new(ccteam_harness::HostChannelHub::default()),
+            dsh_web: Arc::new(crate::dsh_web::DshWebSupervisor::disabled()),
+            dsh_proxy_client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_dsh_web(mut self, supervisor: Arc<crate::dsh_web::DshWebSupervisor>) -> Self {
+        self.dsh_web = supervisor;
+        self
     }
 
     /// v0.9.0 reverse-connection — share the daemon's host-channel hub (the

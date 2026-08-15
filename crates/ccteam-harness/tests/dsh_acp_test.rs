@@ -11,9 +11,9 @@ use std::time::Duration;
 use ccteam_harness::execution::claude_common::CHAT_SID_ENV;
 use ccteam_harness::execution::dsh_acp::handshake::{DEFAULT_DSH_MODEL, DEFAULT_DSH_PROVIDER};
 use ccteam_harness::execution::dsh_acp::spawn_spec::{
-    build_spawn_spec, dsh_bin, DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV, DSH_APPROVAL_ENV,
-    DSH_HOME_ENV, DSH_PROFILE, DSH_SYSTEM_PROMPT_ENV, DSH_TELEMETRY_DISABLED_ENV,
-    DSH_TELEMETRY_MODE_ENV, DSH_TRANSPORT_ENV,
+    build_spawn_spec, build_web_spawn_spec, dsh_bin, DshWebSpawnOptions, DEEPSEEK_API_KEY_ENV,
+    DEEPSEEK_BASE_URL_ENV, DSH_APPROVAL_ENV, DSH_HOME_ENV, DSH_PROFILE, DSH_SYSTEM_PROMPT_ENV,
+    DSH_TELEMETRY_DISABLED_ENV, DSH_TELEMETRY_MODE_ENV, DSH_TRANSPORT_ENV, DSH_WEB_PROFILE,
 };
 use ccteam_harness::execution::mcp_config::{
     SessionMcpEndpoint, BRIDGE_MCP_BEARER_ENV, BRIDGE_MCP_URL_ENV,
@@ -254,6 +254,46 @@ fn spawn_spec_env_table_is_bridge_only_and_scrubbed() {
     );
     assert!(!env.contains_key(DSH_SYSTEM_PROMPT_ENV));
     assert!(!env.contains_key(DEEPSEEK_BASE_URL_ENV));
+}
+
+#[test]
+#[serial(dsh_env)]
+fn web_spawn_spec_uses_ccteam_web_profile_and_scrubs_tenant_provider_env() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    let dsh_home = tmp.path().join(".ccteam-home/runtime/dsh/web/alice");
+
+    let spec = build_web_spawn_spec(DshWebSpawnOptions {
+        dsh_home: dsh_home.clone(),
+        profile: DSH_WEB_PROFILE,
+        materialize_profile: true,
+        enrollment: Some("ccteam-enroll:abc:secret"),
+        daemon_url: Some("http://127.0.0.1:7331"),
+        scrub_provider_env: true,
+    })
+    .expect("web spawn spec");
+
+    assert_eq!(
+        spec.args,
+        vec![
+            "--profile".to_string(),
+            DSH_WEB_PROFILE.to_string(),
+            "--port".to_string(),
+            "0".to_string()
+        ]
+    );
+    assert_eq!(spec.cwd, dsh_home);
+    assert_eq!(spec.dsh_home, dsh_home);
+    assert!(spec.env_remove.contains(&DEEPSEEK_API_KEY_ENV.to_string()));
+    assert!(spec.env_remove.contains(&DEEPSEEK_BASE_URL_ENV.to_string()));
+    let env: BTreeMap<_, _> = spec.env.iter().cloned().collect();
+    assert_eq!(env[DSH_HOME_ENV], dsh_home.to_string_lossy());
+    assert!(!env.contains_key(DEEPSEEK_API_KEY_ENV));
+    assert!(dsh_home
+        .join("profiles")
+        .join(DSH_WEB_PROFILE)
+        .join("package.json")
+        .is_file());
 }
 
 #[tokio::test]

@@ -40,6 +40,7 @@ use tokio::net::TcpListener;
 pub mod auth;
 pub mod chat_protocol;
 pub mod decisions;
+pub mod dsh_web;
 pub mod pty;
 pub mod queries;
 // v0.8.22 P1 (review §3.1-3) — per-session SSE replay ring + live tap; see
@@ -77,6 +78,10 @@ pub struct ServeOpts {
     /// Custom path to read the auth token from. Default
     /// (`None`) means `~/.ccteam/web-token`.
     pub token_file: Option<PathBuf>,
+    /// Companion-port DSH web reverse proxy bind. `Some(addr)` starts the
+    /// second listener in this daemon process; `None` disables it and the REST
+    /// status reports `state: "disabled"`.
+    pub dsh_web_bind: Option<SocketAddr>,
     /// Test seam: how long to sleep (eprintln'ing the LAN-RCE warning
     /// banner first) when `no_auth = true` AND the bind is
     /// non-loopback. Production `serve()` callers pass `Some(5)` —
@@ -97,6 +102,11 @@ impl Default for ServeOpts {
                 .expect("hardcoded unspecified parses"),
             no_auth: false,
             token_file: None,
+            dsh_web_bind: Some(
+                "0.0.0.0:7332"
+                    .parse()
+                    .expect("hardcoded DSH web companion bind parses"),
+            ),
             no_auth_grace_secs: Some(5),
         }
     }
@@ -258,8 +268,55 @@ where
     println!("ccteam web listening on http://{local}");
     tracing::info!(addr = %local, auth_enabled = auth_state.enabled, "ccteam web bound");
 
-    let state = build_state(paths, auth_state);
-    let app = router_with_state(state);
+    let companion_listener = if let Some(bind) = opts.dsh_web_bind {
+        Some(
+            TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("bind {bind} for ccteam DSH web companion"))?,
+        )
+    } else {
+        None
+    };
+    let companion_local = companion_listener
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()
+        .context("read DSH web companion local_addr after bind")?;
+
+    let supervisor = std::sync::Arc::new(dsh_web::DshWebSupervisor::new(
+        dsh_web::DshWebRuntimeConfig {
+            enabled: companion_local.is_some(),
+            daemon_url: format!("http://127.0.0.1:{}", local.port()),
+            attach_url: None,
+        },
+    ));
+    if let Some(addr) = companion_local {
+        supervisor.set_companion_addr(addr);
+        println!("ccteam DSH web companion listening on http://{addr}");
+        tracing::info!(addr = %addr, "ccteam DSH web companion bound");
+    }
+
+    let state = build_state(paths, auth_state).with_dsh_web(std::sync::Arc::clone(&supervisor));
+    let app = router_with_state(state.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_task = tokio::spawn(async move {
+        shutdown.await;
+        let _ = shutdown_tx.send(true);
+    });
+    let companion_handle = companion_listener.map(|listener| {
+        let mut rx = shutdown_rx.clone();
+        let app = dsh_web::companion_router()
+            .with_state(state)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.changed().await;
+                })
+                .await
+        })
+    });
+    let mut main_rx = shutdown_rx.clone();
     // `connect_info` carries the TCP peer into request extensions — the fact
     // `/mcp` provenance auth resolves a loopback caller's process from. A
     // router served without it (tests, embedded uses) still works; provenance
@@ -268,9 +325,19 @@ where
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
+    .with_graceful_shutdown(async move {
+        let _ = main_rx.changed().await;
+    })
     .await
     .context("axum serve loop terminated with error")?;
+    let _ = shutdown_task.await;
+    if let Some(handle) = companion_handle {
+        handle
+            .await
+            .context("join DSH web companion listener task")?
+            .context("DSH web companion serve loop terminated with error")?;
+    }
+    supervisor.shutdown_all().await;
     Ok(())
 }
 
@@ -372,11 +439,13 @@ mod tests {
             bind: "127.0.0.1:7331".parse().unwrap(),
             no_auth: false,
             token_file: None,
+            dsh_web_bind: Some("127.0.0.1:7332".parse().unwrap()),
             no_auth_grace_secs: Some(5),
         };
         assert!(!opts.no_auth);
         assert!(opts.token_file.is_none());
         assert_eq!(opts.bind.port(), 7331);
+        assert_eq!(opts.dsh_web_bind.unwrap().port(), 7332);
         assert_eq!(opts.no_auth_grace_secs, Some(5));
         // V0.4.2: default bind is unspecified (0.0.0.0) so host
         // deployments reach the LAN by default. Auth-on stance is
@@ -386,6 +455,7 @@ mod tests {
         assert!(d.bind.ip().is_unspecified(), "default bind is 0.0.0.0");
         assert!(!d.bind.ip().is_loopback(), "default bind is not loopback");
         assert!(!d.no_auth, "default keeps auth on");
+        assert_eq!(d.dsh_web_bind.unwrap().port(), 7332);
         assert_eq!(d.no_auth_grace_secs, Some(5));
     }
 }

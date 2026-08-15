@@ -30,6 +30,7 @@ pub mod capabilities;
 // successor to the flat `capabilities` probe; shares `hosts::probe_bin`.
 pub mod chat_ws;
 pub mod dashboard;
+pub mod dsh;
 // Enrollment credentials for hand-started / EXTERNAL agents: the console's
 // one-click "copy an MCP config another machine can paste" surface
 // (`GET`/`POST /api/v1/enroll` + `DELETE /api/v1/enroll/{id}`). Merged into the

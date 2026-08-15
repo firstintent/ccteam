@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
 
-use super::materialize::materialize_managed_profile;
+use super::materialize::{materialize_managed_profile, materialize_web_profile, WEB_PROFILE};
 use crate::execution::mcp_config::{project_bridge_child_env, SessionMcpEndpoint};
 use crate::{ccteam_root_from_env, HarnessError, PermissionMode, SpawnCtx};
 
 pub const DSH_BIN_ENV: &str = "CCTEAM_DSH_BIN";
 pub const DSH_PROFILE: &str = "ccteam";
+pub const DSH_WEB_PROFILE: &str = WEB_PROFILE;
+pub const DSH_NATIVE_WEB_PROFILE: &str = "web";
 pub const DSH_TRANSPORT_ENV: &str = "CCTEAM_DSH_TRANSPORT";
 pub const DSH_APPROVAL_ENV: &str = "CCTEAM_DSH_APPROVAL";
 pub const DSH_HOME_ENV: &str = "DSH_HOME";
@@ -131,6 +133,7 @@ pub struct DshSpawnSpec {
     pub bin: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub env_remove: Vec<String>,
     pub cwd: PathBuf,
     /// Retained vendor-memory root. `close_thread` must not remove it.
     pub dsh_home: PathBuf,
@@ -186,8 +189,79 @@ pub fn build_spawn_spec(
         bin,
         args: vec!["--profile".to_string(), DSH_PROFILE.to_string()],
         env,
+        env_remove: Vec::new(),
         cwd,
         dsh_home,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct DshWebSpawnOptions<'a> {
+    pub dsh_home: PathBuf,
+    pub profile: &'a str,
+    pub materialize_profile: bool,
+    pub enrollment: Option<&'a str>,
+    pub daemon_url: Option<&'a str>,
+    pub scrub_provider_env: bool,
+}
+
+/// Build a `dsh web` child command for a ccteam-web companion instance.
+///
+/// Managed tenant instances use `profile = ccteam-web` and
+/// `materialize_profile = true`; the operator fallback uses the vendor-native
+/// `web` profile in the real `~/.dsh` so ccteam never writes profile/config
+/// files into that vendor-owned home.
+pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnSpec, HarnessError> {
+    let bin = dsh_bin();
+    reject_demo_bin(&bin)?;
+    std::fs::create_dir_all(&options.dsh_home).map_err(|e| {
+        HarnessError::SpawnFailed(format!(
+            "create DSH web home {}: {e}",
+            options.dsh_home.display()
+        ))
+    })?;
+    if options.materialize_profile {
+        materialize_web_profile(&options.dsh_home, options.enrollment, options.daemon_url)?;
+    }
+
+    let mut env = vec![
+        (
+            DSH_HOME_ENV.to_string(),
+            options.dsh_home.to_string_lossy().into_owned(),
+        ),
+        (DSH_TELEMETRY_DISABLED_ENV.to_string(), "1".to_string()),
+        (DSH_TELEMETRY_MODE_ENV.to_string(), "DISABLED".to_string()),
+    ];
+    let env_remove = if options.scrub_provider_env {
+        [DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        // Match native DSH behavior for the operator: a hand-set env key may
+        // intentionally override files in the real ~/.dsh.
+        for key in [DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    env.push((key.to_string(), value));
+                }
+            }
+        }
+        Vec::new()
+    };
+
+    Ok(DshSpawnSpec {
+        bin,
+        args: vec![
+            "--profile".to_string(),
+            options.profile.to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ],
+        env,
+        env_remove,
+        cwd: options.dsh_home.clone(),
+        dsh_home: options.dsh_home,
     })
 }
 

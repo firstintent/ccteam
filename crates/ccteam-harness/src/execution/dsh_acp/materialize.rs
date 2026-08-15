@@ -18,10 +18,16 @@ use tar::Archive;
 use crate::{ccteam_root_from_env, HarnessError};
 
 const CLIENT_TGZ: &[u8] = include_bytes!("assets/dsh-client.tgz");
-const PROFILE_PACKAGE_JSON: &str = "{\"name\":\"ccteam-profile\",\"private\":true,\"dsh\":{\"profile\":{\"bundles\":[\"@deepseek-ai/dsh-base\",\"@ccteam/dsh-client\"]}}}\n";
-const PROFILE_PATCH_YAML: &str = "[]\n";
+pub const MANAGED_PROFILE: &str = "ccteam";
+pub const WEB_PROFILE: &str = "ccteam-web";
+const DSH_BASE_BUNDLE: &str = "@deepseek-ai/dsh-base";
+const DSH_WEB_APP_BUNDLE: &str = "@deepseek-ai/dsh-web-app";
+const CCTEAM_CLIENT_BUNDLE: &str = "@ccteam/dsh-client";
+const EMPTY_PATCH_YAML: &str = "[]\n";
 const CLIENT_SCOPE: &str = "@ccteam";
 const CLIENT_PACKAGE: &str = "dsh-client";
+const CCTEAM_CLIENT_ROW_ID: &str = "ccteam-client";
+const CCTEAM_CLIENT_SETTINGS_NS: &str = "ccteam-client";
 
 #[derive(Debug, Clone)]
 pub struct MaterializedDshProfile {
@@ -33,6 +39,21 @@ pub struct MaterializedDshProfile {
 pub fn materialize_managed_profile(
     dsh_home: &Path,
 ) -> Result<MaterializedDshProfile, HarnessError> {
+    materialize_profile(dsh_home, ProfileSpec::managed())
+}
+
+pub fn materialize_web_profile(
+    dsh_home: &Path,
+    enrollment: Option<&str>,
+    daemon_url: Option<&str>,
+) -> Result<MaterializedDshProfile, HarnessError> {
+    materialize_profile(dsh_home, ProfileSpec::web(enrollment, daemon_url))
+}
+
+fn materialize_profile(
+    dsh_home: &Path,
+    spec: ProfileSpec<'_>,
+) -> Result<MaterializedDshProfile, HarnessError> {
     let root = ccteam_root_from_env()
         .ok_or_else(|| HarnessError::SpawnFailed("cannot resolve CCTEAM_HOME".into()))?;
     let root = if root.is_absolute() {
@@ -40,12 +61,13 @@ pub fn materialize_managed_profile(
     } else {
         std::env::current_dir()?.join(root)
     };
-    materialize_profile_in(&root, dsh_home)
+    materialize_profile_in(&root, dsh_home, spec)
 }
 
 pub fn materialize_profile_in(
     ccteam_root: &Path,
     dsh_home: &Path,
+    spec: ProfileSpec<'_>,
 ) -> Result<MaterializedDshProfile, HarnessError> {
     let cache_base = ccteam_root.join("runtime").join("dsh").join("client");
     fs::create_dir_all(&cache_base).map_err(|e| {
@@ -59,13 +81,41 @@ pub fn materialize_profile_in(
     let hash = client_tgz_sha256();
     let cache_dir = cache_base.join(&hash);
     let cache_rebuilt = ensure_client_cache(&cache_base, &cache_dir, &hash)?;
-    let profile_dir = materialize_profile_files(dsh_home, &cache_dir)?;
+    let profile_dir = materialize_profile_files(dsh_home, &cache_dir, &spec)?;
 
     Ok(MaterializedDshProfile {
         cache_dir,
         profile_dir,
         cache_rebuilt,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProfileSpec<'a> {
+    pub name: &'static str,
+    pub required_bundles: &'static [&'static str],
+    pub enrollment: Option<&'a str>,
+    pub daemon_url: Option<&'a str>,
+}
+
+impl<'a> ProfileSpec<'a> {
+    pub fn managed() -> Self {
+        Self {
+            name: MANAGED_PROFILE,
+            required_bundles: &[DSH_BASE_BUNDLE, CCTEAM_CLIENT_BUNDLE],
+            enrollment: None,
+            daemon_url: None,
+        }
+    }
+
+    pub fn web(enrollment: Option<&'a str>, daemon_url: Option<&'a str>) -> Self {
+        Self {
+            name: WEB_PROFILE,
+            required_bundles: &[DSH_BASE_BUNDLE, DSH_WEB_APP_BUNDLE, CCTEAM_CLIENT_BUNDLE],
+            enrollment,
+            daemon_url,
+        }
+    }
 }
 
 pub fn client_tgz_sha256() -> String {
@@ -188,20 +238,20 @@ fn strip_npm_package_prefix(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn materialize_profile_files(dsh_home: &Path, cache_dir: &Path) -> Result<PathBuf, HarnessError> {
-    let profile_dir = dsh_home.join("profiles").join("ccteam");
+fn materialize_profile_files(
+    dsh_home: &Path,
+    cache_dir: &Path,
+    spec: &ProfileSpec<'_>,
+) -> Result<PathBuf, HarnessError> {
+    let profile_dir = dsh_home.join("profiles").join(spec.name);
     fs::create_dir_all(&profile_dir).map_err(|e| {
         HarnessError::SpawnFailed(format!("create DSH profile {}: {e}", profile_dir.display()))
     })?;
 
-    write_if_changed(
-        &profile_dir.join("package.json"),
-        PROFILE_PACKAGE_JSON.as_bytes(),
-    )?;
-    write_if_changed(
-        &profile_dir.join("cordis.patch.yml"),
-        PROFILE_PATCH_YAML.as_bytes(),
-    )?;
+    let package_json = merged_profile_package_json(&profile_dir, spec)?;
+    write_if_changed(&profile_dir.join("package.json"), package_json.as_bytes())?;
+    let patch_yaml = profile_patch_yaml(spec)?;
+    write_if_changed(&profile_dir.join("cordis.patch.yml"), patch_yaml.as_bytes())?;
 
     let scope_dir = profile_dir.join("node_modules").join(CLIENT_SCOPE);
     fs::create_dir_all(&scope_dir).map_err(|e| {
@@ -213,6 +263,125 @@ fn materialize_profile_files(dsh_home: &Path, cache_dir: &Path) -> Result<PathBu
     let link = scope_dir.join(CLIENT_PACKAGE);
     ensure_symlink(&link, cache_dir)?;
     Ok(profile_dir)
+}
+
+fn merged_profile_package_json(
+    profile_dir: &Path,
+    spec: &ProfileSpec<'_>,
+) -> Result<String, HarnessError> {
+    let path = profile_dir.join("package.json");
+    let mut value = if path.exists() {
+        let raw = fs::read_to_string(&path).map_err(|e| {
+            HarnessError::SpawnFailed(format!("read DSH profile package {}: {e}", path.display()))
+        })?;
+        serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| {
+            HarnessError::SpawnFailed(format!("parse DSH profile package {}: {e}", path.display()))
+        })?
+    } else {
+        serde_json::json!({})
+    };
+
+    let obj = value.as_object_mut().ok_or_else(|| {
+        HarnessError::SpawnFailed(format!(
+            "DSH profile package {} must be a JSON object",
+            path.display()
+        ))
+    })?;
+    obj.entry("name".to_string()).or_insert_with(|| {
+        let name = if spec.name == MANAGED_PROFILE {
+            "ccteam-profile".to_string()
+        } else {
+            format!("ccteam-{name}-profile", name = spec.name)
+        };
+        serde_json::Value::String(name)
+    });
+    obj.insert("private".to_string(), serde_json::Value::Bool(true));
+
+    let dsh = obj
+        .entry("dsh".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !dsh.is_object() {
+        *dsh = serde_json::json!({});
+    }
+    let profile = dsh
+        .as_object_mut()
+        .expect("dsh coerced to object")
+        .entry("profile".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !profile.is_object() {
+        *profile = serde_json::json!({});
+    }
+    let bundles = profile
+        .as_object_mut()
+        .expect("profile coerced to object")
+        .entry("bundles".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !bundles.is_array() {
+        *bundles = serde_json::json!([]);
+    }
+    let bundles = bundles.as_array_mut().expect("bundles coerced to array");
+    for required in spec.required_bundles {
+        if !bundles.iter().any(|v| v.as_str() == Some(required)) {
+            bundles.push(serde_json::Value::String((*required).to_string()));
+        }
+    }
+
+    serde_json::to_string_pretty(&value)
+        .map(|mut body| {
+            body.push('\n');
+            body
+        })
+        .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile package: {e}")))
+}
+
+fn profile_patch_yaml(spec: &ProfileSpec<'_>) -> Result<String, HarnessError> {
+    if spec.enrollment.is_none() && spec.daemon_url.is_none() {
+        return Ok(EMPTY_PATCH_YAML.to_string());
+    }
+    let mut config = serde_yaml::Mapping::new();
+    if let Some(enrollment) = spec.enrollment {
+        config.insert(
+            serde_yaml::Value::String("enrollment".to_string()),
+            serde_yaml::Value::String(enrollment.to_string()),
+        );
+    }
+    if let Some(daemon_url) = spec.daemon_url {
+        config.insert(
+            serde_yaml::Value::String("daemonUrl".to_string()),
+            serde_yaml::Value::String(daemon_url.to_string()),
+        );
+    }
+
+    let patch = serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping({
+        let mut insert = serde_yaml::Mapping::new();
+        let mut row = serde_yaml::Mapping::new();
+        row.insert(
+            serde_yaml::Value::String("id".to_string()),
+            serde_yaml::Value::String(CCTEAM_CLIENT_ROW_ID.to_string()),
+        );
+        row.insert(
+            serde_yaml::Value::String("name".to_string()),
+            serde_yaml::Value::String(CCTEAM_CLIENT_BUNDLE.to_string()),
+        );
+        if !config.is_empty() {
+            let mut plugin_config = serde_yaml::Mapping::new();
+            plugin_config.insert(
+                serde_yaml::Value::String(CCTEAM_CLIENT_SETTINGS_NS.to_string()),
+                serde_yaml::Value::Mapping(config),
+            );
+            row.insert(
+                serde_yaml::Value::String("config".to_string()),
+                serde_yaml::Value::Mapping(plugin_config),
+            );
+        }
+        insert.insert(
+            serde_yaml::Value::String("insert".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(row)]),
+        );
+        insert
+    })]);
+    serde_yaml::to_string(&patch)
+        .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile patch: {e}")))
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
@@ -312,7 +481,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
 
-        let first = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let first =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         assert!(first.cache_rebuilt);
         assert_eq!(
             first.cache_dir.file_name().unwrap().to_string_lossy(),
@@ -320,7 +490,8 @@ mod tests {
         );
         assert!(first.cache_dir.join("package.json").is_file());
 
-        let second = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let second =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         assert!(!second.cache_rebuilt);
         assert_eq!(second.cache_dir, first.cache_dir);
     }
@@ -330,7 +501,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
 
-        let out = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let out =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         let package_json: serde_json::Value =
             serde_json::from_slice(&fs::read(out.profile_dir.join("package.json")).unwrap())
                 .unwrap();
@@ -342,8 +514,118 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(out.profile_dir.join("cordis.patch.yml")).unwrap(),
-            PROFILE_PATCH_YAML
+            EMPTY_PATCH_YAML
         );
+    }
+
+    #[test]
+    fn web_profile_contains_web_app_bundle_and_no_host_override() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+
+        let out = materialize_profile_in(
+            root.path(),
+            dsh_home.path(),
+            ProfileSpec::web(
+                Some("ccteam-enroll:abc:secret"),
+                Some("http://127.0.0.1:7331"),
+            ),
+        )
+        .unwrap();
+        let package_raw = fs::read_to_string(out.profile_dir.join("package.json")).unwrap();
+        let package_json: serde_json::Value = serde_json::from_str(&package_raw).unwrap();
+        assert_eq!(package_json["name"], "ccteam-ccteam-web-profile");
+        assert_eq!(
+            package_json["dsh"]["profile"]["bundles"],
+            serde_json::json!([
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "@ccteam/dsh-client"
+            ])
+        );
+        let patch_raw = fs::read_to_string(out.profile_dir.join("cordis.patch.yml")).unwrap();
+        assert!(patch_raw.contains("ccteam-enroll:abc:secret"));
+        assert!(patch_raw.contains("daemonUrl"));
+        assert!(!package_raw.contains("host"));
+        assert!(!patch_raw.contains("host:"));
+    }
+
+    #[test]
+    fn merge_preserves_self_installed_profile_layer() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join(WEB_PROFILE);
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "tenant-profile",
+                "private": false,
+                "dependencies": {
+                    "is-number": "7.0.0"
+                },
+                "dsh": {
+                    "profile": {
+                        "bundles": ["tenant-plugin"]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let out =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::web(None, None))
+                .unwrap();
+        let package_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.profile_dir.join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(package_json["name"], "tenant-profile");
+        assert_eq!(package_json["private"], true);
+        assert_eq!(package_json["dependencies"]["is-number"], "7.0.0");
+        assert_eq!(
+            package_json["dsh"]["profile"]["bundles"],
+            serde_json::json!([
+                "tenant-plugin",
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "@ccteam/dsh-client"
+            ])
+        );
+    }
+
+    #[test]
+    fn web_profile_factory_has_no_mirrored_operator_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+
+        materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::web(None, None)).unwrap();
+
+        assert!(!dsh_home.path().join(".credentials.yaml").exists());
+        assert!(!dsh_home.path().join("settings.yaml").exists());
+    }
+
+    #[test]
+    fn web_profile_symlink_self_heals() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let wrong_target = tempfile::tempdir().unwrap();
+
+        let first =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::web(None, None))
+                .unwrap();
+        let link = first
+            .profile_dir
+            .join("node_modules")
+            .join(CLIENT_SCOPE)
+            .join(CLIENT_PACKAGE);
+        remove_existing(&link).unwrap();
+        ensure_symlink(&link, wrong_target.path()).unwrap();
+
+        let second =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::web(None, None))
+                .unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), second.cache_dir);
     }
 
     #[test]
@@ -351,7 +633,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
 
-        let out = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let out =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         let link = out
             .profile_dir
             .join("node_modules")
@@ -369,14 +652,19 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
 
-        let first = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
-        let second = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let first =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
+        let second =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
 
         assert!(first.cache_rebuilt);
         assert!(!second.cache_rebuilt);
+        let package_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(first.profile_dir.join("package.json")).unwrap())
+                .unwrap();
         assert_eq!(
-            fs::read_to_string(first.profile_dir.join("package.json")).unwrap(),
-            PROFILE_PACKAGE_JSON
+            package_json["dsh"]["profile"]["bundles"],
+            serde_json::json!(["@deepseek-ai/dsh-base", "@ccteam/dsh-client"])
         );
         assert_eq!(
             fs::read_link(
@@ -396,11 +684,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
 
-        let first = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let first =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         fs::remove_dir_all(&first.cache_dir).unwrap();
         fs::create_dir_all(&first.cache_dir).unwrap();
 
-        let second = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let second =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         assert!(second.cache_rebuilt);
         assert!(second.cache_dir.join("package.json").is_file());
         assert!(second.cache_dir.join("dist").join("index.js").is_file());
@@ -421,7 +711,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
 
-        let out = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let out =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         let package_json: serde_json::Value =
             serde_json::from_slice(&fs::read(out.cache_dir.join("package.json")).unwrap()).unwrap();
         assert_eq!(package_json["name"], "@ccteam/dsh-client");
@@ -437,7 +728,8 @@ mod tests {
         let dsh_home = tempfile::tempdir().unwrap();
         let wrong_target = tempfile::tempdir().unwrap();
 
-        let first = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let first =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         let link = first
             .profile_dir
             .join("node_modules")
@@ -446,7 +738,8 @@ mod tests {
         remove_existing(&link).unwrap();
         ensure_symlink(&link, wrong_target.path()).unwrap();
 
-        let second = materialize_profile_in(root.path(), dsh_home.path()).unwrap();
+        let second =
+            materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::managed()).unwrap();
         assert_eq!(fs::read_link(&link).unwrap(), second.cache_dir);
     }
 

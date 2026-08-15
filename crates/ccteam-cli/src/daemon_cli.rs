@@ -30,6 +30,7 @@ pub const DAEMON_BIN_ENV: &str = "CCTEAM_DAEMON_BIN";
 /// and `ccteam update`'s upgrade-restart (which has no `--web-bind` of its
 /// own — same posture as `daemon restart`).
 pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:7331";
+pub const DEFAULT_DSH_WEB_BIND: &str = "0.0.0.0:7332";
 /// Hidden test hooks: shrink the ready-wait / stop-wait budgets so
 /// failure-path integration tests don't burn the production timeouts.
 const READY_TIMEOUT_ENV: &str = "CCTEAM_DAEMON_READY_TIMEOUT_MS";
@@ -87,17 +88,45 @@ fn spawn_program() -> Result<PathBuf> {
     ccteam_core::current_ccteam_bin().context("resolve daemon binary to detach")
 }
 
-fn start_spec(paths: &CcteamPaths, web_bind: &str) -> Result<dcore::DaemonStartSpec> {
+fn start_spec(
+    paths: &CcteamPaths,
+    web_bind: &str,
+    dsh_web_bind: Option<&str>,
+) -> Result<dcore::DaemonStartSpec> {
+    let dsh_web_bind = effective_dsh_web_bind(web_bind, dsh_web_bind)?;
     Ok(dcore::DaemonStartSpec {
         program: spawn_program()?,
         args: vec![
             "start".to_string(),
             "--web-bind".to_string(),
             web_bind.to_string(),
+            "--dsh-web-bind".to_string(),
+            dsh_web_bind,
         ],
         log_path: dcore::daemon_log_path(paths),
         ready_timeout: env_duration_ms(READY_TIMEOUT_ENV, dcore::START_READY_TIMEOUT),
     })
+}
+
+fn effective_dsh_web_bind(web_bind: &str, dsh_web_bind: Option<&str>) -> Result<String> {
+    match dsh_web_bind {
+        Some(value) if value.eq_ignore_ascii_case("off") => Ok("off".to_string()),
+        Some(value) => {
+            let _: std::net::SocketAddr = value.parse().with_context(|| {
+                format!("--dsh-web-bind {value} is not a valid socket address or `off`")
+            })?;
+            Ok(value.to_string())
+        }
+        None => {
+            let web: std::net::SocketAddr = web_bind
+                .parse()
+                .with_context(|| format!("--web-bind {web_bind} is not a valid socket address"))?;
+            let port = web.port().checked_add(1).context(
+                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
+            )?;
+            Ok(std::net::SocketAddr::new(web.ip(), port).to_string())
+        }
+    }
 }
 
 fn stop_tuning() -> dcore::StopTuning {
@@ -152,14 +181,14 @@ fn web_hint(web_bind: &str) -> String {
     )
 }
 
-pub fn run_daemon_start(web_bind: &str, json: bool) -> Result<()> {
+pub fn run_daemon_start(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     takeover_pre_step();
     let _lock = match dcore::acquire_operation_lock(&paths) {
         Ok(lock) => lock,
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     };
-    let spec = start_spec(&paths, web_bind)?;
+    let spec = start_spec(&paths, web_bind, dsh_web_bind)?;
     match dcore::start_managed(&paths, &spec) {
         Ok(dcore::StartVerdict::Started { pid, version }) => {
             let v = version.clone().unwrap_or_else(|| "unknown".into());
@@ -254,7 +283,11 @@ pub(crate) enum RestartOutcome {
 /// (`daemon start/restart` and `ccteam update` all do). Shared by
 /// [`run_daemon_restart`] and the `ccteam update` upgrade-restart contract
 /// so the lock/stop/start logic lives in exactly one place.
-pub(crate) fn restart_managed(paths: &CcteamPaths, web_bind: &str) -> Result<RestartOutcome> {
+pub(crate) fn restart_managed(
+    paths: &CcteamPaths,
+    web_bind: &str,
+    dsh_web_bind: Option<&str>,
+) -> Result<RestartOutcome> {
     // ONE lock across stop + start.
     let _lock = dcore::acquire_operation_lock(paths)?;
     let was_running = match dcore::stop_managed_with(paths, false, stop_tuning())? {
@@ -265,7 +298,7 @@ pub(crate) fn restart_managed(paths: &CcteamPaths, web_bind: &str) -> Result<Res
         }
         dcore::StopVerdict::TimedOut { pid } => return Ok(RestartOutcome::StopTimedOut { pid }),
     };
-    let spec = start_spec(paths, web_bind)?;
+    let spec = start_spec(paths, web_bind, dsh_web_bind)?;
     match dcore::start_managed(paths, &spec)? {
         dcore::StartVerdict::Started { pid, version } => Ok(if was_running {
             RestartOutcome::Restarted { pid, version }
@@ -298,12 +331,12 @@ fn emit_restart_started(
     );
 }
 
-pub fn run_daemon_restart(web_bind: &str, json: bool) -> Result<()> {
+pub fn run_daemon_restart(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     // Restart is the verb `make install` runs on upgraded dev boxes, so
     // it carries the same takeover pre-step as start.
     takeover_pre_step();
-    match restart_managed(&paths, web_bind) {
+    match restart_managed(&paths, web_bind, dsh_web_bind) {
         Ok(RestartOutcome::Restarted { pid, version }) => {
             emit_restart_started(json, "restarted", pid, version, web_bind);
         }

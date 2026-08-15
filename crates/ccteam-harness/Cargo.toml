@@ -29,6 +29,7 @@ regex = { workspace = true }
 # JSON over the ccteam-owned hook.sock (Option C).
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }

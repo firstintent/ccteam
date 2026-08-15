@@ -367,7 +367,13 @@ fn run_standalone_update(paths: &CcteamPaths, restart: RestartPlan, json: bool) 
                 now,
                 || dcore::probe_daemon(paths),
                 || wait_for_active_sessions_idle(paths),
-                || daemon_cli::restart_managed(paths, daemon_cli::DEFAULT_WEB_BIND),
+                || {
+                    daemon_cli::restart_managed(
+                        paths,
+                        daemon_cli::DEFAULT_WEB_BIND,
+                        Some(daemon_cli::DEFAULT_DSH_WEB_BIND),
+                    )
+                },
             );
             emit_restart_contract(json, &expected, status)
         }
