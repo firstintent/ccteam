@@ -26,6 +26,7 @@ import SessionView from "./SessionView";
 import WorkflowView from "./WorkflowView";
 import SettingsView from "./SettingsView";
 import AgentsView from "./AgentsView";
+import DshView from "./DshView";
 import { Sidebar, type RailRow } from "../components/Sidebar";
 import { deleteProject, fetchDashboard } from "../lib/dashboardApi";
 import {
@@ -45,7 +46,7 @@ import { useMe } from "../hooks/useMe";
 import { railSessionLabel, renameToastText } from "./railHelpers";
 import { mergeProjectSlugs } from "./projectList";
 
-type ShellView = "home" | "conv" | "flow" | "settings" | "agents";
+type ShellView = "home" | "conv" | "flow" | "settings" | "agents" | "dsh";
 
 // eslint-disable-next-line react-refresh/only-export-components -- pure helper co-located for unit tests.
 export function shellViewFor(pathname: string): ShellView {
@@ -54,6 +55,8 @@ export function shellViewFor(pathname: string): ShellView {
   if (pathname.startsWith("/settings")) return "settings";
   // v0.9.0 W4 — 团队/Team view; backend graph/SSE responses are identity-filtered.
   if (pathname.startsWith("/agents")) return "agents";
+  // v0.9.15 — DSH embedded page (per-identity instance via companion proxy).
+  if (pathname.startsWith("/dsh")) return "dsh";
   return "home";
 }
 
@@ -372,6 +375,7 @@ export default function ChatConsole() {
         flowActive={view === "flow"}
         settingsActive={view === "settings"}
         teamActive={view === "agents"}
+        dshActive={view === "dsh"}
         userName={displayName}
         userInitial={initial}
         avatarColor={settings.avatar}
@@ -390,6 +394,10 @@ export default function ChatConsole() {
         }}
         onOpenTeam={() => {
           navigate("/agents");
+          closeMobile();
+        }}
+        onOpenDsh={() => {
+          navigate("/dsh");
           closeMobile();
         }}
         onOpenRow={openRow}
@@ -440,6 +448,8 @@ export default function ChatConsole() {
           />
         ) : view === "agents" ? (
           <AgentsView lang={lang} />
+        ) : view === "dsh" ? (
+          <DshView lang={lang} />
         ) : (
           <HomeView
             lang={lang}

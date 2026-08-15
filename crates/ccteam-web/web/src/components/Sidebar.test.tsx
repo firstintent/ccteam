@@ -189,6 +189,14 @@ describe("Sidebar SSR structure", () => {
     expect(html).toMatch(/class="sflow active"[^>]*data-testid="side-team"/);
   });
 
+  it("always shows the DSH nav entry (expanded + rail) and reflects its active route", () => {
+    const html = renderSidebar([], { dshActive: true });
+    expect(html).toContain('data-testid="side-dsh"');
+    expect(html).toContain('data-testid="side-dsh-rail"');
+    expect(html).toContain("DSH");
+    expect(html).toMatch(/class="sflow active"[^>]*data-testid="side-dsh"/);
+  });
+
   it("every workspace header carries the ⋯ menu button (closed by default)", () => {
     const html = renderSidebar([row()], { onRemoveProject: async () => true });
     expect(html).toContain('data-testid="ws-menu-btn-demo"');
