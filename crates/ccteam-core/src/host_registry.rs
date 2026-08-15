@@ -159,18 +159,25 @@ impl AgentProbeSpec {
         AGENT_PROBE_SPECS.iter().find(|s| s.vendor == vendor)
     }
 
+    /// Explains the `Pass`-with-no-config-file state a `ManagedSessionBridge`
+    /// vendor always reports: unlike the five `NativeMcpConfig` vendors,
+    /// there is no global config entry to point at, by design (Pi has no
+    /// MCP seam at all; DSH's official ACP demo hard-rejects a non-empty
+    /// `mcpServers`) — so this leads with *why* before the caveat, instead
+    /// of reading like a warning bolted onto an otherwise-green row.
     pub fn tool_surface_notice(&self) -> Option<String> {
         if self.tool_surface != ToolSurfaceMode::ManagedSessionBridge {
             return None;
         }
         // DSH's tool face is a Cordis plugin, not a ccteam-owned bridge
-        // extension (K2/K3) — the notice says so and names the fix instead
-        // of reusing the generic "bridge" wording every other managed vendor
-        // gets.
+        // extension (K2/K3) — the notice says so, and names the exact
+        // install command instead of just the package (a plain-vendor DSH
+        // session CAN unlock the tools; a plain-vendor Pi session cannot).
         if self.vendor == "dsh" {
             return Some(
-                "Managed Dsh sessions get the ccteam plugin; a plain `dsh` started in a \
-                 shell does not until you add @ccteam/dsh-client."
+                "DSH has no ccteam-writable config file: managed sessions get the ccteam \
+                 plugin automatically; a `dsh` you start yourself does not, until you run \
+                 `dsh plugin --profile web add @ccteam/dsh-client`."
                     .to_string(),
             );
         }
@@ -180,7 +187,9 @@ impl AgentProbeSpec {
             .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
             .unwrap_or_default();
         Some(format!(
-            "Managed {display} sessions get the ccteam bridge; a plain `{}` started in a shell does not.",
+            "{display} has no ccteam-writable config file: managed sessions get the ccteam \
+             bridge automatically; a `{}` you start yourself does not, with no install step \
+             to add it.",
             self.default_bin
         ))
     }
@@ -1149,8 +1158,9 @@ mod tests {
         assert_eq!(
             by("dsh").tool_surface_notice().as_deref(),
             Some(
-                "Managed Dsh sessions get the ccteam plugin; a plain `dsh` started in a \
-                 shell does not until you add @ccteam/dsh-client."
+                "DSH has no ccteam-writable config file: managed sessions get the ccteam \
+                 plugin automatically; a `dsh` you start yourself does not, until you run \
+                 `dsh plugin --profile web add @ccteam/dsh-client`."
             )
         );
         for spec in AGENT_PROBE_SPECS {
@@ -1174,7 +1184,9 @@ mod tests {
         assert_eq!(
             future.tool_surface_notice().as_deref(),
             Some(
-                "Managed Future sessions get the ccteam bridge; a plain `future` started in a shell does not."
+                "Future has no ccteam-writable config file: managed sessions get the ccteam \
+                 bridge automatically; a `future` you start yourself does not, with no install \
+                 step to add it."
             )
         );
         assert!(AgentProbeSpec::by_vendor("gemini").is_none());
