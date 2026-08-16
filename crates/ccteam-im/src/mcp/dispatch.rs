@@ -2542,17 +2542,50 @@ async fn run_session_dispatch(
 
 /// v0.9.1 delegation-ergonomics — the shared submit half of a dispatch, used
 /// Parse the optional `notify` arg shared by `session_spawn`/`session_dispatch`:
-/// `"final"` (default — notify once the child's vendor turn completes and it
-/// goes idle) / `"all"` (every mirrored assistant message; debug firehose) /
-/// `"off"` (ledger-only). The pre-v0.9.5 boolean form still parses
-/// (`true`→final, `false`→off).
+/// `"final"` (default — notify once, when the dispatched task's vendor turn
+/// completes and the child goes idle) / `"all"` (every mirrored assistant
+/// message of that task; debug firehose) / `"off"` (ledger-only). The
+/// pre-v0.9.5 boolean form still parses (`true`→final, `false`→off). Carries
+/// whether the caller named the mode — see [`NotifyRequest`].
 fn parse_notify_mode(
     tool: &str,
     args: &serde_json::Value,
-) -> std::result::Result<ccteam_harness::NotifyMode, String> {
+) -> std::result::Result<NotifyRequest, String> {
     match args.get("notify") {
-        None | Some(serde_json::Value::Null) => Ok(ccteam_harness::NotifyMode::Final),
-        Some(v) => ccteam_harness::NotifyMode::parse_value(v).map_err(|e| format!("{tool}: {e}")),
+        None | Some(serde_json::Value::Null) => Ok(NotifyRequest::defaulted()),
+        Some(v) => ccteam_harness::NotifyMode::parse_value(v)
+            .map(NotifyRequest::explicit)
+            .map_err(|e| format!("{tool}: {e}")),
+    }
+}
+
+/// What a dispatch asked for on the `notify` axis: the mode, plus whether the
+/// caller ASKED for it or just took the default. The difference only matters
+/// for a target that is not one of the caller's own sessions (a handoff to a
+/// peer): there, a default is not a request, and defaulting a peer into a
+/// completion watch is how a one-off handoff became a standing subscription to
+/// someone else's conversation.
+#[derive(Debug, Clone, Copy)]
+struct NotifyRequest {
+    mode: ccteam_harness::NotifyMode,
+    explicit: bool,
+}
+
+impl NotifyRequest {
+    /// No `notify` arg — `final`, but only because nobody said otherwise.
+    const fn defaulted() -> Self {
+        Self {
+            mode: ccteam_harness::NotifyMode::Final,
+            explicit: false,
+        }
+    }
+
+    /// The caller named a mode.
+    const fn explicit(mode: ccteam_harness::NotifyMode) -> Self {
+        Self {
+            mode,
+            explicit: true,
+        }
     }
 }
 
@@ -2566,6 +2599,11 @@ enum CompletionNotificationRoute {
     ParentSession,
     Disabled,
     Unavailable,
+    /// v0.10.1 — the target is not one of the caller's own sessions and the
+    /// caller did not ask for a notification: a handoff, deliberately not
+    /// subscribed. Distinct from `Disabled` (which the caller chose) so the
+    /// hint can say what to do instead.
+    PeerUnsubscribed,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2583,13 +2621,16 @@ impl CompletionNotificationRoute {
     /// intentional opt-out is not a missing channel.
     fn resolve(
         caller_sid: &str,
-        notify: ccteam_harness::NotifyMode,
+        notify: NotifyRequest,
         parent_is_external: bool,
+        peer_unsubscribed: bool,
     ) -> Self {
-        if notify == ccteam_harness::NotifyMode::Off {
+        if notify.mode == ccteam_harness::NotifyMode::Off {
             Self::Disabled
         } else if caller_sid.is_empty() || parent_is_external {
             Self::Unavailable
+        } else if peer_unsubscribed {
+            Self::PeerUnsubscribed
         } else {
             Self::ParentSession
         }
@@ -2610,6 +2651,9 @@ impl CompletionNotificationRoute {
             Self::Unavailable => {
                 "the child runs asynchronously; this caller has no completion notification channel; poll session_collect{sid}."
             }
+            Self::PeerUnsubscribed => {
+                "the task was handed to a session you did not delegate, so no completion watch was armed; poll session_collect{sid}, or re-dispatch with notify:\"final\" to be told when that one task ends."
+            }
         }
     }
 
@@ -2623,6 +2667,9 @@ impl CompletionNotificationRoute {
             }
             Self::Unavailable => {
                 "still running; this caller has no completion notification channel; poll session_collect{sid}."
+            }
+            Self::PeerUnsubscribed => {
+                "still running; the target is not a session you delegated, so no completion notification will fire; poll session_collect{sid}."
             }
         }
     }
@@ -2645,7 +2692,8 @@ fn derive_title_from_task(task: &str) -> String {
 /// by BOTH `session_dispatch` and `session_spawn{task}` (one-call
 /// spawn+dispatch, the dominant delegation flow). Subscribe (if waiting) →
 /// submit the task as a verbatim user turn → arm the delegation watch (agent
-/// callers only; `caller_sid` empty = admin, no watch) → emit
+/// callers only; `caller_sid` empty = admin, no watch; a target the caller
+/// never delegated is ledger-only unless `notify` was explicit) → emit
 /// `delegation_dispatched` → optionally block inline for the child's answer.
 /// Returns the response FRAGMENT (`turn_id`/`status`/result fields/`hint`)
 /// the caller merges into its own body; `tool` prefixes error strings.
@@ -2658,11 +2706,11 @@ async fn dispatch_task(
     task: String,
     requested_wait_seconds: u64,
     effective_wait_seconds: u64,
-    notify: ccteam_harness::NotifyMode,
+    notify: NotifyRequest,
     title: Option<String>,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
-    let (turn_id, rx, parent_is_external) = {
+    let (turn_id, rx, parent_is_external, peer_unsubscribed) = {
         let mut gw = gateway.lock().await;
         // Whether a completion turn is deliverable is a property of the PARENT's
         // ledger row, not of the caller's auth tier: a hand-started client dials
@@ -2681,17 +2729,31 @@ async fn dispatch_task(
             .submit_to_sid(sid, task)
             .await
             .map_err(|e| format!("{tool} failed: {e}"))?;
+        // v0.10.1 — is the target one of the caller's OWN sessions? A dispatch
+        // to a session the caller never delegated is a HANDOFF: the target has
+        // its own parent, or is a root with its own human. `session_list` draws
+        // no edge for it (that tree is spawn lineage) and `session_stop` refuses
+        // it, so a watch armed here is an edge nobody can see or take down.
+        // Resolved AFTER the submit so a cold-resumed target is back in the live
+        // map by the time its lineage is read.
+        let peer_target = is_delegation && !gw.lineage_reaches(sid, caller_sid);
+        // The default is not a request: only an explicit `notify` subscribes the
+        // caller to a session it does not own.
+        let peer_unsubscribed = peer_target && !notify.explicit;
         if is_delegation {
             // The watch is armed either way — the completion edge belongs in the
             // ledger (`delegation_completed` fires off the mirror, whatever the
             // notify mode). An external parent gets it with notifications OFF:
             // left on, the first completion would submit into a session ccteam
             // must never re-spawn, fail, and drop the watch — silently ending
-            // that child's completion accounting for every later turn.
-            let watch_notify = if parent_is_external {
+            // that child's completion accounting for every later turn. A
+            // peer handoff gets the same treatment for the opposite reason: the
+            // edge is real and worth recording, the subscription was never asked
+            // for.
+            let watch_notify = if parent_is_external || peer_unsubscribed {
                 ccteam_harness::NotifyMode::Off
             } else {
-                notify
+                notify.mode
             };
             gw.arm_delegation_watch(
                 sid,
@@ -2714,18 +2776,30 @@ async fn dispatch_task(
                 );
             }
         }
-        (turn_id, rx, parent_is_external)
+        (turn_id, rx, parent_is_external, peer_unsubscribed)
     };
-    let notification_route =
-        CompletionNotificationRoute::resolve(caller_sid, notify, parent_is_external);
+    let notification_route = CompletionNotificationRoute::resolve(
+        caller_sid,
+        notify,
+        parent_is_external,
+        peer_unsubscribed,
+    );
     if notification_route == CompletionNotificationRoute::Unavailable {
         tracing::warn!(
             tool,
             child_sid = %sid,
             turn_id = %turn_id,
-            notify = notify.as_str(),
+            notify = notify.mode.as_str(),
             parent_is_external,
             "ccteam MCP completion notification unavailable: caller has no managed parent session; poll session_collect"
+        );
+    } else if notification_route == CompletionNotificationRoute::PeerUnsubscribed {
+        tracing::info!(
+            tool,
+            caller_sid,
+            child_sid = %sid,
+            turn_id = %turn_id,
+            "ccteam MCP handoff to a session the caller did not delegate: ledger-only, no completion watch armed"
         );
     }
 
@@ -2789,6 +2863,9 @@ fn pending_dispatch_response(
             CompletionNotificationRoute::Disabled => "notifications are disabled.",
             CompletionNotificationRoute::Unavailable => {
                 "this caller has no completion notification channel."
+            }
+            CompletionNotificationRoute::PeerUnsubscribed => {
+                "the target is not a session you delegated — no completion notification."
             }
         };
         response.insert(
@@ -4056,7 +4133,7 @@ mod session_tool_tests {
                 "slow task".to_string(),
                 600,
                 1,
-                ccteam_harness::NotifyMode::Final,
+                NotifyRequest::defaulted(),
                 None,
             )
             .await
@@ -5365,7 +5442,7 @@ mod session_tool_tests {
             "quick question".to_string(),
             6,
             6,
-            ccteam_harness::NotifyMode::Final,
+            NotifyRequest::defaulted(),
             None,
         )
         .await
@@ -7078,6 +7155,96 @@ mod session_tool_tests {
             ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
                 .unwrap();
         assert_eq!(watch.parent_sid, principal);
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+    }
+
+    /// v0.10.1 (issue #184) — a dispatch to a session the caller never
+    /// delegated is a HANDOFF, not a delegation: the target has its own parent,
+    /// or is a root with its own human. The default `notify` is a default, not a
+    /// request, so it must not subscribe the caller to a peer's conversation —
+    /// an edge `session_list` never draws and `session_stop` refuses to take
+    /// down. Naming `notify` explicitly still opts in (for exactly one task, per
+    /// the watch contract), and the caller's own children are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_to_a_peer_root_is_ledger_only_unless_notify_is_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        // An independent root in the same project — nobody's child.
+        let peer = {
+            let mut g = gw.lock().await;
+            g.create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+
+        let handoff = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": peer, "task": "take over the P0" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(handoff["notify_deliverable"], json!(false), "{handoff}");
+        let hint = handoff["hint"].as_str().unwrap();
+        assert!(hint.contains("did not delegate"), "{hint}");
+        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer)
+            .expect("the handoff edge is still recorded in the ledger");
+        assert_eq!(watch.parent_sid, principal);
+        assert_eq!(
+            watch.notify,
+            ccteam_harness::NotifyMode::Off,
+            "a peer handoff is ledger-only: {watch:?}"
+        );
+
+        // Explicit opt-in still arms the notification.
+        let explicit = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": peer, "task": "and tell me when it lands", "notify": "final" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(explicit["notify_deliverable"], json!(true), "{explicit}");
+        let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer).unwrap();
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+
+        // The caller's OWN child keeps the default notification.
+        let child = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "vendor": "claude", "task": "do the work" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(child["notify_deliverable"], json!(true), "{child}");
+        let watch =
+            ccteam_harness::read_delegation_watch(tmp.path(), child["sid"].as_str().unwrap())
+                .unwrap();
         assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
     }
 
