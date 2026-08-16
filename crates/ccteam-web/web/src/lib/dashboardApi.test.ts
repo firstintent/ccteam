@@ -46,6 +46,18 @@ describe("fetchDashboard", () => {
     expect(result).toEqual(rows);
   });
 
+  it("supports a silent abortable background refresh for the shared store", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, []));
+
+    await fetchDashboard({ signal: controller.signal, background: true });
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.signal).toBe(controller.signal);
+    expect(new Headers(init?.headers).get("X-Ccteam-Background")).toBe("1");
+  });
+
   it("throws UNAUTHENTICATED on 401", async () => {
     const fetchMock = vi.mocked(globalThis.fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse(401, { error: "x" }));

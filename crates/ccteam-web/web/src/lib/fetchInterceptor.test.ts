@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { classifyAuthError } from "./fetchInterceptor";
+import { classifyAuthError, requestIsBackground } from "./fetchInterceptor";
+import { BACKGROUND_REQUEST_HEADER } from "./backgroundRequest";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -53,5 +54,15 @@ describe("classifyAuthError", () => {
     await classifyAuthError(res);
     const body = await res.json();
     expect(body).toEqual({ error: "login_required" });
+  });
+});
+
+describe("background refresh classification", () => {
+  it("marks only explicit store-owned refreshes as background", () => {
+    expect(
+      requestIsBackground({ headers: { [BACKGROUND_REQUEST_HEADER]: "1" } }),
+    ).toBe(true);
+    expect(requestIsBackground({ headers: { Accept: "application/json" } })).toBe(false);
+    expect(requestIsBackground(undefined)).toBe(false);
   });
 });

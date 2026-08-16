@@ -16,6 +16,8 @@
 // roll-up endpoint exists; until then the dashboard shows team / kind +
 // badge / cost only.
 
+import { backgroundHeaders } from "./backgroundRequest";
+
 /** One row in the dashboard project list — matches the Rust `DashboardRow`
  *  struct's `Serialize` shape. See `docs/interfaces.md` §16.1. */
 export interface DashboardRow {
@@ -56,8 +58,16 @@ export interface DashboardRow {
  *  generic `Error` with the response status for any other non-2xx so
  *  the dashboard can surface a useful message. The network-failure
  *  branch (TypeError from fetch) propagates verbatim. */
-export async function fetchDashboard(): Promise<DashboardRow[]> {
-  const resp = await fetch("/api/v1/projects", { credentials: "same-origin" });
+export interface DashboardRequestOptions {
+  signal?: AbortSignal;
+  background?: boolean;
+}
+
+export async function fetchDashboard(options: DashboardRequestOptions = {}): Promise<DashboardRow[]> {
+  const init: RequestInit = { credentials: "same-origin" };
+  if (options.signal) init.signal = options.signal;
+  if (options.background) init.headers = backgroundHeaders();
+  const resp = await fetch("/api/v1/projects", init);
   if (resp.status === 401) {
     throw new Error("UNAUTHENTICATED");
   }

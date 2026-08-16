@@ -135,6 +135,11 @@ export default function SessionView({
   const foldedRef = useRef(0);
   const eventsRef = useRef(events);
   const historyRequestRef = useRef(0);
+  const [historyPage, setHistoryPage] = useState({
+    hasMore: false,
+    nextBefore: null as string | null,
+    loadingEarlier: false,
+  });
   useEffect(() => {
     eventsRef.current = events;
   }, [events]);
@@ -148,6 +153,11 @@ export default function SessionView({
         if (cancelled || request !== historyRequestRef.current) return;
         const seeded = historyToRows(h.events);
         if (seeded.length > 0) setRows(seeded);
+        setHistoryPage({
+          hasMore: h.has_more === true,
+          nextBefore: h.next_before ?? null,
+          loadingEarlier: false,
+        });
       })
       .catch(() => {
         /* best-effort — keep the localStorage rows (or empty) on error */
@@ -170,6 +180,11 @@ export default function SessionView({
         if (cancelled || request !== historyRequestRef.current) return;
         foldedRef.current = eventsRef.current.length;
         setRows(historyToRows(h.events));
+        setHistoryPage({
+          hasMore: h.has_more === true,
+          nextBefore: h.next_before ?? null,
+          loadingEarlier: false,
+        });
       })
       .catch(() => {
         /* best-effort — keep the current transcript on reseed failure */
@@ -178,6 +193,25 @@ export default function SessionView({
       cancelled = true;
     };
   }, [sid, connectionEpoch]);
+
+  const loadEarlier = useCallback(() => {
+    if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
+    const before = historyPage.nextBefore;
+    setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
+    getHistory(sid, { before })
+      .then((history) => {
+        const earlier = historyToRows(history.events);
+        if (earlier.length > 0) setRows((current) => [...earlier, ...current]);
+        setHistoryPage({
+          hasMore: history.has_more === true,
+          nextBefore: history.next_before ?? null,
+          loadingEarlier: false,
+        });
+      })
+      .catch(() => {
+        setHistoryPage((current) => ({ ...current, loadingEarlier: false }));
+      });
+  }, [sid, historyPage]);
 
   // ---- live SSE → append into this sid's transcript ------------------------
   useEffect(() => {
@@ -499,6 +533,23 @@ export default function SessionView({
               data-testid="chat-scroll"
             >
               <div className="chat-inner">
+                {historyPage.hasMore ? (
+                  <button
+                    type="button"
+                    className="btn ghost mini self-center"
+                    data-testid="load-earlier"
+                    disabled={historyPage.loadingEarlier}
+                    onClick={loadEarlier}
+                  >
+                    {historyPage.loadingEarlier
+                      ? lang === "en"
+                        ? "Loading…"
+                        : "加载中…"
+                      : lang === "en"
+                        ? "Load earlier"
+                        : "加载更早消息"}
+                  </button>
+                ) : null}
                 {rows.map((row) => {
                   if (row.kind === "approval") {
                     return (

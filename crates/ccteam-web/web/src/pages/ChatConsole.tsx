@@ -28,7 +28,7 @@ import SettingsView from "./SettingsView";
 import AgentsView from "./AgentsView";
 import DshView from "./DshView";
 import { Sidebar, type RailRow } from "../components/Sidebar";
-import { deleteProject, fetchDashboard } from "../lib/dashboardApi";
+import { deleteProject } from "../lib/dashboardApi";
 import {
   listHistorySessions,
   listSessions,
@@ -43,6 +43,8 @@ import { t, tStopped } from "../lib/i18n";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { useMe } from "../hooks/useMe";
+import { projectsStore, useProjectsStore } from "../hooks/useProjectsStore";
+import { createLifecycleReconciler, type LifecycleReconciler } from "../lib/lifecycleReconciler";
 import { railSessionLabel, renameToastText } from "./railHelpers";
 import { mergeProjectSlugs } from "./projectList";
 
@@ -98,81 +100,120 @@ export default function ChatConsole() {
   const { settings } = useWebSettings();
   const lang = settings.language;
   const { me } = useMe();
+  const { projects: projectRows } = useProjectsStore();
 
   // ---- cross-project session data (live + stopped history) -----------------
-  const [railSessions, setRailSessions] = useState<SessionSummary[]>([]);
+  const [sessionsByProject, setSessionsByProject] = useState<Record<string, SessionSummary[]>>({});
   const [historyByProject, setHistoryByProject] = useState<Record<string, HistorySessionView[]>>(
     {},
   );
-  const [registeredProjects, setRegisteredProjects] = useState<string[]>([]);
-  const [projectPaths, setProjectPaths] = useState<Record<string, string>>({});
-  const [projectHosts, setProjectHosts] = useState<Record<string, { host: string; online: boolean }>>({});
-  // v0.8.24 Q7 — read-only branch per project (absent = not a git repo).
-  const [projectBranches, setProjectBranches] = useState<Record<string, string>>({});
+  const registeredProjects = useMemo(() => (projectRows ?? []).map((project) => project.slug), [projectRows]);
+  const registeredProjectSet = useMemo(() => new Set(registeredProjects), [registeredProjects]);
+  const railSessions = useMemo(
+    () => registeredProjects.flatMap((slug) => sessionsByProject[slug] ?? []),
+    [registeredProjects, sessionsByProject],
+  );
+  const visibleHistoryByProject = useMemo(
+    () => Object.fromEntries(Object.entries(historyByProject).filter(([slug]) => registeredProjectSet.has(slug))),
+    [historyByProject, registeredProjectSet],
+  );
+  const projectPaths = useMemo(
+    () => Object.fromEntries((projectRows ?? []).map((project) => [project.slug, project.path])),
+    [projectRows],
+  );
+  const projectHosts = useMemo(
+    () =>
+      Object.fromEntries(
+        (projectRows ?? []).map((project) => [
+          project.slug,
+          { host: project.host || "local", online: project.host_online },
+        ]),
+      ),
+    [projectRows],
+  );
+  const projectBranches = useMemo(
+    () =>
+      Object.fromEntries(
+        (projectRows ?? [])
+          .filter((project) => project.current_branch)
+          .map((project) => [project.slug, project.current_branch as string]),
+      ),
+    [projectRows],
+  );
 
-  const refreshSessions = useCallback(async () => {
-    try {
-      const projects = await fetchDashboard();
-      const slugs = projects.map((p) => p.slug);
-      setRegisteredProjects(slugs);
-      setProjectPaths(Object.fromEntries(projects.map((p) => [p.slug, p.path])));
-      setProjectHosts(
-        Object.fromEntries(
-          projects.map((p) => [p.slug, { host: p.host || "local", online: p.host_online }]),
-        ),
-      );
-      setProjectBranches(
-        Object.fromEntries(
-          projects
-            .filter((p) => p.current_branch)
-            .map((p) => [p.slug, p.current_branch as string]),
-        ),
-      );
-      const lists = await Promise.all(
-        slugs.map((slug) => listSessions(slug).catch(() => [] as SessionSummary[])),
-      );
-      setRailSessions(lists.flat());
-      const historyLists = await Promise.all(
-        slugs.map((slug) =>
-          listHistorySessions(slug)
-            .then((rows) => [slug, rows.slice(0, HISTORY_PER_PROJECT)] as const)
-            .catch(() => [slug, [] as HistorySessionView[]] as const),
-        ),
-      );
-      setHistoryByProject(Object.fromEntries(historyLists));
-    } catch (e) {
-      if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-      // Best-effort: the shell renders with whatever resolved.
-    }
+  const sessionRequests = useRef(new Map<string, Promise<void>>());
+  const reconcileProject = useCallback((slug: string): Promise<void> => {
+    const current = sessionRequests.current.get(slug);
+    if (current) return current;
+    const request = Promise.allSettled([
+      listSessions(slug, { background: true }),
+      listHistorySessions(slug, { background: true }),
+    ])
+      .then(([live, history]) => {
+        if (live.status === "fulfilled") {
+          setSessionsByProject((previous) => ({ ...previous, [slug]: live.value }));
+        }
+        if (history.status === "fulfilled") {
+          setHistoryByProject((previous) => ({
+            ...previous,
+            [slug]: history.value.slice(0, HISTORY_PER_PROJECT),
+          }));
+        }
+        if (live.status === "rejected") throw live.reason;
+        if (history.status === "rejected") throw history.reason;
+      })
+      .finally(() => {
+        sessionRequests.current.delete(slug);
+      });
+    sessionRequests.current.set(slug, request);
+    return request;
   }, []);
+
+  const refreshSessions = useCallback(
+    () => Promise.allSettled(registeredProjects.map(reconcileProject)).then(() => undefined),
+    [registeredProjects, reconcileProject],
+  );
+
+  // A newly-visible project gets exactly one live/history pair. Existing rows
+  // are refreshed by lifecycle frames, not by every `/projects` refresh.
+  const initializedProjects = useRef(new Set<string>());
+  useEffect(() => {
+    for (const slug of initializedProjects.current) {
+      if (!registeredProjectSet.has(slug)) initializedProjects.current.delete(slug);
+    }
+    for (const slug of registeredProjects) {
+      if (initializedProjects.current.has(slug)) continue;
+      initializedProjects.current.add(slug);
+      queueMicrotask(() => void reconcileProject(slug).catch(() => {}));
+    }
+  }, [registeredProjects, registeredProjectSet, reconcileProject]);
 
   // Capacity eviction is out-of-band from the session the user is currently
   // viewing. Listen to the daemon-wide lifecycle stream so the live/history
   // rail refreshes immediately even when a different sid was evicted.
   const { events: globalEvents } = useAgentsEvents(true, "session_lifecycle");
-  const latestGlobalEvent = globalEvents[globalEvents.length - 1];
+  const lifecycleReconciler = useRef<LifecycleReconciler | null>(null);
   useEffect(() => {
-    if (latestGlobalEvent?.kind === "session_lifecycle") {
-      queueMicrotask(() => {
-        void refreshSessions();
-      });
-    }
-  }, [latestGlobalEvent, refreshSessions]);
-
-  useEffect(() => {
-    queueMicrotask(() => {
-      void refreshSessions();
-    });
-  }, [refreshSessions]);
-
-  // Pick up out-of-band projects/sessions (CLI `ccteam init`) on tab focus.
-  useEffect(() => {
-    const onFocus = () => {
-      void refreshSessions();
+    const reconciler = createLifecycleReconciler(reconcileProject);
+    lifecycleReconciler.current = reconciler;
+    return () => {
+      reconciler.stop();
+      if (lifecycleReconciler.current === reconciler) lifecycleReconciler.current = null;
     };
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
-  }, [refreshSessions]);
+  }, [reconcileProject]);
+
+  // React may batch many SSE frames into one render. Walk every newly-appended
+  // ring entry so a two-project burst cannot lose the earlier slug.
+  const lastLifecycleEvent = useRef<(typeof globalEvents)[number] | null>(null);
+  useEffect(() => {
+    const previous = lastLifecycleEvent.current;
+    const previousIndex = previous ? globalEvents.indexOf(previous) : -1;
+    const fresh = globalEvents.slice(previousIndex >= 0 ? previousIndex + 1 : 0);
+    for (const event of fresh) {
+      if (event.kind === "session_lifecycle") lifecycleReconciler.current?.enqueue(event.slug);
+    }
+    lastLifecycleEvent.current = globalEvents[globalEvents.length - 1] ?? previous;
+  }, [globalEvents]);
 
   const projects = useMemo(
     () => mergeProjectSlugs(registeredProjects, railSessions),
@@ -190,7 +231,7 @@ export default function ChatConsole() {
       model: undefined,
       status: s.status,
     }));
-    const hist: RailRow[] = Object.values(historyByProject)
+    const hist: RailRow[] = Object.values(visibleHistoryByProject)
       .flat()
       .filter((h) => !liveSids.has(h.sid))
       .map((h) => ({
@@ -202,7 +243,7 @@ export default function ChatConsole() {
         history: true,
       }));
     return [...live, ...hist];
-  }, [railSessions, historyByProject, liveSids]);
+  }, [railSessions, visibleHistoryByProject, liveSids]);
 
   // ---- sidebar chrome state -------------------------------------------------
   const [collapsed, setCollapsed] = useState(() => {
@@ -265,7 +306,7 @@ export default function ChatConsole() {
       if (row.history) {
         resumeSession(row.project, row.sid)
           .then(({ sid: newSid }) => {
-            void refreshSessions();
+            void reconcileProject(row.project).catch(() => {});
             navigate(`/chat/s/${encodeURIComponent(newSid)}`);
           })
           .catch((e) => {
@@ -276,22 +317,23 @@ export default function ChatConsole() {
       }
       closeMobile();
     },
-    [navigate, refreshSessions, closeMobile],
+    [navigate, reconcileProject, closeMobile],
   );
 
   const stopRow = useCallback(
-    (row: { sid: string }) => {
+    (row: { sid: string; project?: string }) => {
       apiStopSession(row.sid)
         .then(() => {
           toastBus.handler?.info(tStopped(lang, row.sid));
-          void refreshSessions();
+          if (row.project) void reconcileProject(row.project).catch(() => {});
+          else void refreshSessions();
           if (row.sid === sid) navigate("/");
         })
         .catch((e) => {
           toastBus.handler?.error(`Stop failed: ${e instanceof Error ? e.message : e}`);
         });
     },
-    [refreshSessions, lang, sid, navigate],
+    [refreshSessions, reconcileProject, lang, sid, navigate],
   );
 
   // One rename action for every surface that offers it (rail rows + the
@@ -305,14 +347,20 @@ export default function ChatConsole() {
         toastBus.handler?.info(renameToastText(lang, result));
         // Awaited (not fire-and-forget) so the caller's optimistic title only
         // clears once the rail carries the server's own cleaned title.
-        await refreshSessions();
+        const project =
+          railSessions.find((session) => session.sid === targetSid)?.project ??
+          Object.values(visibleHistoryByProject)
+            .flat()
+            .find((session) => session.sid === targetSid)?.slug;
+        if (project) await reconcileProject(project);
+        else await refreshSessions();
       } catch (e) {
         toastBus.handler?.error(
           `${t(lang, "renameFailed")}: ${e instanceof Error ? e.message : e}`,
         );
       }
     },
-    [refreshSessions, lang],
+    [railSessions, visibleHistoryByProject, reconcileProject, refreshSessions, lang],
   );
 
   const activeSession = useMemo(() => {
@@ -322,12 +370,12 @@ export default function ChatConsole() {
     // Not in the live list → fall back to the stopped/history row (when loaded)
     // so the head + composer reflect the session's real vendor/protocol instead
     // of the claude default. The next send cold-resumes it server-side.
-    for (const list of Object.values(historyByProject)) {
+    for (const list of Object.values(visibleHistoryByProject)) {
       const h = list.find((x) => x.sid === sid);
       if (h) return historyToSummary(h);
     }
     return null;
-  }, [railSessions, historyByProject, sid]);
+  }, [railSessions, visibleHistoryByProject, sid]);
 
   const displayName = (settings.displayName || "").trim() || me?.handle || "user";
   const initial = displayName.slice(0, 1).toUpperCase() || "C";
@@ -346,7 +394,7 @@ export default function ChatConsole() {
             ? `Removed ${slug} from ccteam (${stopped} live session${stopped === 1 ? "" : "s"} stopped) — files on disk untouched.`
             : `已从 ccteam 移除 ${slug}(停止 ${stopped} 个 live 会话)—— 磁盘文件未动。`,
         );
-        void refreshSessions();
+        projectsStore.refresh();
         return true;
       } catch (e) {
         if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
@@ -357,7 +405,7 @@ export default function ChatConsole() {
         return false;
       }
     },
-    [lang, refreshSessions],
+    [lang],
   );
 
   return (
@@ -459,6 +507,7 @@ export default function ChatConsole() {
             projectBranches={projectBranches}
             initialProject={homeProject}
             onLaunched={(newSid) => {
+              projectsStore.refresh();
               void refreshSessions();
               navigate(`/chat/s/${encodeURIComponent(newSid)}`);
             }}

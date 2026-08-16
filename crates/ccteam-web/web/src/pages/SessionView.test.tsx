@@ -255,6 +255,21 @@ function collectElementText(value: unknown): string[] {
   return [...ownContent, ...collectElementText(props.children)];
 }
 
+function findByTestId(value: unknown, testId: string): { props: Record<string, unknown> } | null {
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findByTestId(child, testId);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const props = (value as { props?: Record<string, unknown> }).props;
+  if (!props) return null;
+  if (props["data-testid"] === testId) return { props };
+  return findByTestId(props.children, testId);
+}
+
 describe("SessionView reconnect history reseed", () => {
   it("refetches authoritative history and restores an answer never delivered by SSE", async () => {
     const harness = createHookHarness();
@@ -331,6 +346,85 @@ describe("SessionView reconnect history reseed", () => {
       tree = renderReconnectView();
       expect(collectElementText(tree).filter((text) => text === "already-seen")).toHaveLength(1);
       expect(collectElementText(tree).filter((text) => text === "live-after-reseed")).toHaveLength(1);
+    } finally {
+      vi.doUnmock("react");
+      vi.doUnmock("../hooks/useSessionEvents");
+      vi.doUnmock("../lib/sessionsApi");
+      vi.resetModules();
+    }
+  });
+});
+
+describe("SessionView paged history", () => {
+  it("renders load-earlier, prepends the cursor page in order, then hides the affordance", async () => {
+    const harness = createHookHarness();
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t2", ts: "later", role: "cto", user: "new-user", assistant: "new-answer" },
+        ],
+        next_before: "cursor-1",
+        has_more: true,
+      })
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t1", ts: "earlier", role: "cto", user: "old-user", assistant: "old-answer" },
+        ],
+        next_before: null,
+        has_more: false,
+      });
+
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", () => ({
+      useSessionEvents: () => ({
+        events: [],
+        connected: true,
+        connectionEpoch: 1,
+        lastError: null,
+        gatewayUnavailable: false,
+      }),
+    }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: history,
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+    }));
+
+    try {
+      const PagedSessionView = (await import("./SessionView")).default;
+      const renderPagedView = () =>
+        harness.render(() => PagedSessionView({ sid: "s9", session: SESSION }));
+
+      renderPagedView();
+      await Promise.resolve();
+      let tree = renderPagedView();
+      const loadEarlier = findByTestId(tree, "load-earlier");
+      expect(loadEarlier).not.toBeNull();
+      expect(history).toHaveBeenNthCalledWith(1, "s9");
+
+      (loadEarlier?.props.onClick as () => void)();
+      await Promise.resolve();
+      await Promise.resolve();
+      tree = renderPagedView();
+
+      expect(history).toHaveBeenNthCalledWith(2, "s9", { before: "cursor-1" });
+      expect(findByTestId(tree, "load-earlier")).toBeNull();
+      const text = collectElementText(tree);
+      expect(text.indexOf("old-user")).toBeLessThan(text.indexOf("old-answer"));
+      expect(text.indexOf("old-answer")).toBeLessThan(text.indexOf("new-user"));
+      expect(text.indexOf("new-user")).toBeLessThan(text.indexOf("new-answer"));
     } finally {
       vi.doUnmock("react");
       vi.doUnmock("../hooks/useSessionEvents");

@@ -8,52 +8,14 @@
 // Theme tokens only (surface-*/brand-*/text-*/status-*). Carries the
 // `data-testid="cost-pill"` the shell relied on so layout is stable.
 
-import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getStatus, type StatusSnapshot } from "../lib/statusApi";
+import type { StatusSnapshot } from "../lib/statusApi";
 import { budgetSeverity, formatUsd } from "../lib/marketplaceFormat";
-
-/** Poll cadence for the pill — the aggregate is cheap + best-effort. */
-const COST_POLL_MS = 20000;
+import { useStatusStore } from "../hooks/useStatusStore";
 
 export default function CostPill() {
   const navigate = useNavigate();
-  const [snap, setSnap] = useState<StatusSnapshot | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const fetchOnce = () => {
-      getStatus()
-        .then((s) => {
-          if (!cancelled) setSnap(s);
-        })
-        .catch(() => {
-          // Silent: a transient status failure shouldn't toast or blank the
-          // pill. The 401 path is handled by the global gate; we keep the last
-          // good value (or the dim em-dash placeholder).
-        });
-    };
-
-    const schedule = () => {
-      timer = setTimeout(() => {
-        fetchOnce();
-        schedule();
-      }, COST_POLL_MS);
-    };
-
-    fetchOnce();
-    schedule();
-    const onFocus = () => fetchOnce();
-    window.addEventListener("focus", onFocus);
-
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-      window.removeEventListener("focus", onFocus);
-    };
-  }, []);
+  const { data: snap } = useStatusStore();
 
   return <CostPillButton snap={snap} onOpenStatus={() => navigate("/status")} />;
 }

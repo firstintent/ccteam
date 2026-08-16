@@ -106,12 +106,24 @@ describe("sessionsApi", () => {
     expect(await listSessions("empty")).toEqual([]);
   });
 
+  it("marks lifecycle reconciles as silent background reads", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, []));
+
+    await listSessions("dex-ui", { background: true });
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(new Headers(init?.headers).get("X-Ccteam-Background")).toBe("1");
+  });
+
   it("getHistory GETs /sessions/{sid} and returns {sid,events}", async () => {
     const history = {
       sid: "s1",
       events: [
         { turn_id: "t1", ts: "2026-06-06T00:00:00Z", role: "cto", user: "hi", assistant: "yo" },
       ],
+      next_before: null,
+      has_more: false,
     };
     const fetchMock = vi.mocked(globalThis.fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse(200, history));
@@ -121,6 +133,21 @@ describe("sessionsApi", () => {
       credentials: "same-origin",
     });
     expect(got.events[0].assistant).toBe("yo");
+    expect(got.has_more).toBe(false);
+  });
+
+  it("adds limit and an opaque before cursor only when paging history", async () => {
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, { sid: "s1", events: [], next_before: "older", has_more: true }),
+    );
+
+    await getHistory("s1", { limit: 25, before: "opaque/+ cursor" });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/sessions/s1?limit=25&before=opaque%2F%2B+cursor",
+      { headers: { Accept: "application/json" }, credentials: "same-origin" },
+    );
   });
 
   it("getSessionStatus GETs /sessions/{sid}/status and returns the payload", async () => {
