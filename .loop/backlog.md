@@ -16,22 +16,26 @@
 ## 当前卡
 
 ### PERF-V1-1 事件准入门(EventClass admission)★ W1
-- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-harness/src/execution(progress_bridge.rs + 新 event_class + codex_app_server.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **状态**:完成(11fc808) · **冲突域**:`crates/ccteam-harness/src/execution(progress_bridge.rs + 新 event_class + codex_app_server.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
 - **背景**:excore.jsonl 149MB 中 ~85% 为全 null `codex_rate_limit`(相邻间隔低至 27µs,发射点 1:1 翻译无去重无节流);修在唯一写权威 `progress_bridge::append_event`(core 只 re-export,全 daemon 内写者天然过门)= 通用防爆炸,非 per-vendor 补丁。规格 SoT = `docs-local/versions/v0-x-perf/perf-v1.md` §一(gitignored,briefing 已内嵌全文翻译)。
 - **规格**:`EventKind` 枚举 + `EventClass{Fact,LatestState,Telemetry}` 穷举分类住 progress_bridge 旁(新 kind 不写分类臂 = 编译错,AgentVendor enum-slam 同款);有状态门 = 进程全局态包在 `append_event` 内(零 call-site 改动,新写入点自动被覆盖):Fact 直通;LatestState 空/全 null 丢弃 + 语义哈希去重(排除 `ts` 等易变字段)+ per-(path,kind,scope) 最小间隔;Telemetry 不落盘只计数;未知字符串 kind = Fact 放行 + WARN + 计数;per-kind append/suppress rate+bytes 计数器(喂 V1-8/doctor);发射点 codex_app_server 全 null 先丢(保证性来自门)。零新后台定时器(全部检查发生在 append 时)。
 - **DoD**:同 LatestState kind 10k 相同快照落盘 ≤1 / 全 null = 0 / 值变恰 +1;枚举穷举测试锁分类义务;`chat_turn_running_long` per-sid ≥5min 间隔;未知 kind Fact 放行测试;基线只增(1896/0 起)、clippy 0、fmt 干净。
+- **验证**:2026-08-16 codex s431 交付 `11fc808`(EventKind 34 变体穷举 + reservation 门:admission 锁不覆盖 flock 写;DoD 测试全绿);规划 review 追加 `70e3b7d`(unknown kind WARN 每进程每 kind 一次,防 hook 事件族刷日志);合入后门禁见 W1 收口行。
 
 ### PERF-V1-2 Reader 统一(journal facade) W1
-- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-core/src + crates/ccteam-web/src(routes/api_v1.rs · routes/sessions_api.rs · queries.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **状态**:完成(5bdb1e5) · **冲突域**:`crates/ccteam-core/src + crates/ccteam-web/src(routes/api_v1.rs · routes/sessions_api.rs · queries.rs)+ 裁决追加 harness(journal.rs 新文件 · mod.rs 一行 · turns_mirror.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
 - **背景**:同一 SoT 三套坏行 reader 语义(`queries.rs read_tail_events` 整文件 UTF-8 失败→假空 badge;`api_v1.rs:606` 裸 read_to_string **硬 500 今天在发生**;`progress.rs last_event` 尾行不容错);`turns_mirror last_n_turns` 假尾读(全读后切片)。正确 8KB 反向原语已存在(`progress.rs read_last_line`)未被推广。
 - **规格**:core 新 journal facade 模块(泛 JSONL,progress 与 turns 共用):`last_valid` / `tail_valid(n)`(EOF 反向,I/O∝n)/ `scan_stream`(流式不物化)/ `read_delta(from_offset)`(供 W2 投影/断点);bytes 为基、坏行按条隔离、返回损坏计数;替换三家族 + turns 真反向尾读;`GET /sessions/{sid}` additive `limit`(默认 100)/`before` 分页;grep 门禁测试(web/im/core 无 facade 外 progress 直读,**先证有牙**);`fs_atomic::read_jsonl` 留 doctor/import。
 - **DoD**:torn fixture 上 badge/recent-events 复活、session 详情 500→200、尾部坏行 last_valid 容错;grep 门禁红→绿留痕;基线只增、clippy 0、fmt 干净。
+- **验证**:2026-08-16 codex s432 交付 `5bdb1e5`(中途正确停手申报依赖方向墙:turns_mirror 住 harness 且 core→harness;规划裁决 facade 落 `harness/execution/journal.rs`、core re-export,同 progress_bridge 模式,驳回新 crate 方案);grep 门禁红→绿实证(临时直读被抓 `progress.rs:68` 后还原);分页 additive(`limit` 默认 100/`before`/`next_before`/`has_more`);合入后门禁见 W1 收口行。
 
 ### PERF-V1-3 Runtime 多线程 + /status singleflight W1
-- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-cli/src/main.rs + crates/ccteam-web/src/routes/status.rs + core config(additive daemon.workers)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **状态**:完成(0bd1191) · **冲突域**:`crates/ccteam-cli/src/main.rs + crates/ccteam-web/src/routes/status.rs + core config(additive daemon.workers)` · **建议入口**:codex 委派(规划 briefing 自包含)
 - **背景**:daemon 实测单线程(`Threads: 1`),同步全量读独占唯一线程 → status 进行中 `/healthz` 0.7ms→4.7s 全站冻结;全仓零 `spawn_local`,切换无结构障碍。
 - **规格**:`run_start` `new_current_thread`→`new_multi_thread`(`daemon.workers` 配置默认 4,env `CCTEAM_DAEMON_WORKERS` 覆盖,workers=1 = 回退开关)+ `max_blocking_threads` 上限;`/status` 聚合 `spawn_blocking` + singleflight(并发合流一次计算,取消安全);**不碰 V1-1/V1-2 冲突域文件**。
 - **DoD**:singleflight 并发合流测试 + 「请求被取消后,后续 /status 仍秒回」结构断言(v0.10.0 死锁教训);全量 `make test` 先落盘再汇总 + gateway echo 竞态族复跑;基线只增、clippy 0、fmt 干净。
+- **验证**:2026-08-16 codex s433 交付 `0bd1191`(producer detached + watch channel,清 flight 与 publish 同一把 std 锁内原子,取消安全;全局聚合共享、ACL 过滤 per-caller 保持 global 语义;echo 竞态族 5 连绿;卡内全量 make test 2686/7,7 红全部 base 复现);合入后门禁见 W1 收口行。
+- **W1 收口(规划,合并序 V1-1→V1-2→V1-3 全 ff)**:`cargo fmt --all -- --check` PASS;`make check` clippy 0;`make test-baseline` 并行跑两轮各撞登记 `/tmp/alpha` 族(隔离双绿、s433 已 base 对照),序列化跑 **1916/0**(基线 1896→+20);`cargo test -p ccteam-web --no-fail-fast` **401/1**(唯一红 = 登记 pty env-flake `ws_last_client_disconnect_stops_pipe_pane`);writeback 绿。
 
 ### PERF-V1-4 StatusProjection + SessionCatalog(W2;依赖 V1-1 门 + V1-2 facade)
 - **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs + crates/ccteam-web/src(routes/status.rs · routes/api_v1.rs · routes/sessions_api.rs · queries.rs · delegation.rs)` · **建议入口**:codex 委派
