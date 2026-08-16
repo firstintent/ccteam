@@ -25,12 +25,12 @@ use axum::{
 use axum_extra::extract::CookieJar;
 use ccteam_core::enroll::ensure_user_credential_in;
 use ccteam_harness::{
-    build_web_spawn_spec, DshWebSpawnOptions, DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
+    build_web_spawn_spec, tenant_home_segment, DshWebSpawnOptions, DSH_NATIVE_WEB_PROFILE,
+    DSH_WEB_PROFILE,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -280,7 +280,8 @@ impl DshWebSupervisor {
         }
 
         let start_result = if identity.is_admin {
-            self.start_operator(home.clone(), tail.clone()).await
+            self.start_operator(app, identity, home.clone(), tail.clone())
+                .await
         } else {
             self.start_tenant(app, identity, home.clone(), tail.clone())
                 .await
@@ -373,7 +374,13 @@ impl DshWebSupervisor {
         );
     }
 
-    async fn start_operator(&self, home: PathBuf, tail: ErrorTail) -> Result<DshInstance> {
+    async fn start_operator(
+        &self,
+        app: &AppState,
+        identity: &Identity,
+        home: PathBuf,
+        tail: ErrorTail,
+    ) -> Result<DshInstance> {
         let attach_url = self
             .config
             .attach_url
@@ -398,12 +405,13 @@ impl DshWebSupervisor {
 
         let spawn_home = home.clone();
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: &identity.owner_tag(),
+            ccteam_home: app.paths.root.clone(),
             dsh_home: spawn_home,
             profile: DSH_NATIVE_WEB_PROFILE,
             materialize_profile: false,
             enrollment: None,
             daemon_url: None,
-            scrub_provider_env: false,
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -432,12 +440,13 @@ impl DshWebSupervisor {
         let credential = ensure_user_credential_in(&app.paths.root, &owner)
             .with_context(|| format!("ensure enrollment credential for {owner}"))?;
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: &owner,
+            ccteam_home: app.paths.root.clone(),
             dsh_home: home.clone(),
             profile: DSH_WEB_PROFILE,
             materialize_profile: true,
             enrollment: Some(&credential.bearer()),
             daemon_url: Some(&self.config.daemon_url),
-            scrub_provider_env: true,
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -887,22 +896,6 @@ fn dsh_home_for(app: &AppState, identity: &Identity) -> Result<PathBuf> {
             .join("web")
             .join(tenant_home_segment(&identity.id)))
     }
-}
-
-fn tenant_home_segment(id: &str) -> String {
-    if !id.is_empty()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return id.to_string();
-    }
-    let hash = Sha256::digest(id.as_bytes());
-    let suffix = hash[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    format!("tenant-{suffix}")
 }
 
 fn home_kind(identity: &Identity) -> DshHomeKind {

@@ -7,10 +7,14 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
-use super::materialize::{materialize_managed_profile, materialize_web_profile, WEB_PROFILE};
+use super::materialize::{
+    materialize_managed_profile, materialize_profile_in, ProfileSpec, WEB_PROFILE,
+};
 use crate::execution::mcp_config::{project_bridge_child_env, SessionMcpEndpoint};
 use crate::{ccteam_root_from_env, HarnessError, PermissionMode, SpawnCtx};
 
@@ -32,6 +36,14 @@ pub const MIN_DSH_VERSION: &str = "0.1.0-rc.6";
 const USER_DSH_DIR: &str = ".dsh";
 const CREDENTIALS_FILE: &str = ".credentials.yaml";
 const SETTINGS_FILE: &str = "settings.yaml";
+const SEED_MARKER_FILE: &str = ".ccteam-dsh-seed.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DshSeedMarker {
+    credentials_sha256: String,
+    settings_sha256: Option<String>,
+    seeded_at: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DshConfigSource {
@@ -284,12 +296,13 @@ pub fn build_spawn_spec(
 
 #[derive(Debug, Clone)]
 pub struct DshWebSpawnOptions<'a> {
+    pub owner_tag: &'a str,
+    pub ccteam_home: PathBuf,
     pub dsh_home: PathBuf,
     pub profile: &'a str,
     pub materialize_profile: bool,
     pub enrollment: Option<&'a str>,
     pub daemon_url: Option<&'a str>,
-    pub scrub_provider_env: bool,
 }
 
 /// Build a `dsh web` child command for a ccteam-web companion instance.
@@ -308,7 +321,16 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
         ))
     })?;
     if options.materialize_profile {
-        materialize_web_profile(&options.dsh_home, options.enrollment, options.daemon_url)?;
+        seed_or_refresh_tenant_web_config_home(
+            options.owner_tag,
+            &options.ccteam_home,
+            &options.dsh_home,
+        )?;
+        materialize_profile_in(
+            &options.ccteam_home,
+            &options.dsh_home,
+            ProfileSpec::web(options.enrollment, options.daemon_url),
+        )?;
     }
 
     let mut env = vec![
@@ -319,23 +341,13 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
         (DSH_TELEMETRY_DISABLED_ENV.to_string(), "1".to_string()),
         (DSH_TELEMETRY_MODE_ENV.to_string(), "DISABLED".to_string()),
     ];
-    let env_remove = if options.scrub_provider_env {
-        [DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-    } else {
-        // Match native DSH behavior for the operator: a hand-set env key may
-        // intentionally override files in the real ~/.dsh.
-        for key in [DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV] {
-            if let Ok(value) = std::env::var(key) {
-                if !value.trim().is_empty() {
-                    env.push((key.to_string(), value));
-                }
+    for key in [DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.trim().is_empty() {
+                env.push((key.to_string(), value));
             }
         }
-        Vec::new()
-    };
+    }
 
     Ok(DshSpawnSpec {
         bin,
@@ -346,9 +358,126 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
             "0".to_string(),
         ],
         env,
-        env_remove,
+        env_remove: Vec::new(),
         cwd: options.dsh_home.clone(),
         dsh_home: options.dsh_home,
+    })
+}
+
+fn seed_or_refresh_tenant_web_config_home(
+    owner_tag: &str,
+    ccteam_home: &Path,
+    dsh_home: &Path,
+) -> Result<(), HarnessError> {
+    if tenant_id_from_owner_tag(owner_tag).is_none() {
+        return Ok(());
+    }
+
+    let marker_path = dsh_home.join(SEED_MARKER_FILE);
+    if marker_path.exists() {
+        let mut marker = read_seed_marker(&marker_path)?;
+        if let DshConfigSource::OperatorHome(source_home) = operator_config_source() {
+            refresh_seeded_file(
+                &source_home.join(CREDENTIALS_FILE),
+                &dsh_home.join(CREDENTIALS_FILE),
+                &mut marker.credentials_sha256,
+            )?;
+            refresh_seeded_optional_file(
+                &source_home.join(SETTINGS_FILE),
+                &dsh_home.join(SETTINGS_FILE),
+                &mut marker.settings_sha256,
+            )?;
+            write_seed_marker(&marker_path, &marker)?;
+        }
+        return Ok(());
+    }
+
+    if dsh_home.join(CREDENTIALS_FILE).exists() || dsh_home.join(SETTINGS_FILE).exists() {
+        return Ok(());
+    }
+
+    if let DshConfigSource::OperatorHome(source_home) = dsh_config_source(owner_tag, ccteam_home) {
+        seed_tenant_web_config_home(&source_home, dsh_home, &marker_path)?;
+    }
+    Ok(())
+}
+
+fn seed_tenant_web_config_home(
+    source_home: &Path,
+    dsh_home: &Path,
+    marker_path: &Path,
+) -> Result<(), HarnessError> {
+    let credentials = source_home.join(CREDENTIALS_FILE);
+    if !credentials.exists() {
+        return Ok(());
+    }
+    let credentials_hash = copy_user_dsh_file(&credentials, &dsh_home.join(CREDENTIALS_FILE))?;
+    let settings = source_home.join(SETTINGS_FILE);
+    let settings_sha256 = if settings.exists() {
+        Some(copy_user_dsh_file(
+            &settings,
+            &dsh_home.join(SETTINGS_FILE),
+        )?)
+    } else {
+        None
+    };
+    write_seed_marker(
+        marker_path,
+        &DshSeedMarker {
+            credentials_sha256: credentials_hash,
+            settings_sha256,
+            seeded_at: Utc::now().to_rfc3339(),
+        },
+    )
+}
+
+fn refresh_seeded_file(
+    source: &Path,
+    target: &Path,
+    marker_sha: &mut String,
+) -> Result<(), HarnessError> {
+    let Ok(current) = std::fs::read(target) else {
+        return Ok(());
+    };
+    if sha256_hex(&current) != *marker_sha || !source.exists() {
+        return Ok(());
+    }
+    *marker_sha = copy_user_dsh_file(source, target)?;
+    Ok(())
+}
+
+fn refresh_seeded_optional_file(
+    source: &Path,
+    target: &Path,
+    marker_sha: &mut Option<String>,
+) -> Result<(), HarnessError> {
+    match (marker_sha.as_ref(), std::fs::read(target)) {
+        (Some(expected), Ok(current)) if sha256_hex(&current) == *expected && source.exists() => {
+            *marker_sha = Some(copy_user_dsh_file(source, target)?);
+        }
+        (None, Err(_)) if source.exists() => {
+            *marker_sha = Some(copy_user_dsh_file(source, target)?);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn read_seed_marker(path: &Path) -> Result<DshSeedMarker, HarnessError> {
+    let raw = std::fs::read(path).map_err(|e| {
+        HarnessError::SpawnFailed(format!("read DSH seed marker {}: {e}", path.display()))
+    })?;
+    let marker = serde_json::from_slice(&raw).map_err(|e| {
+        HarnessError::SpawnFailed(format!("parse DSH seed marker {}: {e}", path.display()))
+    })?;
+    Ok(marker)
+}
+
+fn write_seed_marker(path: &Path, marker: &DshSeedMarker) -> Result<(), HarnessError> {
+    let bytes = serde_json::to_vec(marker)
+        .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH seed marker: {e}")))?;
+    std::fs::write(path, bytes).map_err(|e| {
+        HarnessError::SpawnFailed(format!("write DSH seed marker {}: {e}", path.display()))
     })
 }
 
@@ -424,7 +553,7 @@ fn mirror_dsh_credentials_from_home(src_home: &Path, dsh_home: &Path) -> Result<
     Ok(())
 }
 
-fn copy_user_dsh_file(src: &Path, dst: &Path) -> Result<(), HarnessError> {
+fn copy_user_dsh_file(src: &Path, dst: &Path) -> Result<String, HarnessError> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| {
         HarnessError::SpawnFailed(format!("stat DSH credential source {}: {e}", src.display()))
     })?;
@@ -443,6 +572,7 @@ fn copy_user_dsh_file(src: &Path, dst: &Path) -> Result<(), HarnessError> {
     let bytes = std::fs::read(src).map_err(|e| {
         HarnessError::SpawnFailed(format!("read DSH credential source {}: {e}", src.display()))
     })?;
+    let hash = sha256_hex(&bytes);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| HarnessError::SpawnFailed(format!("create {}: {e}", parent.display())))?;
@@ -472,7 +602,11 @@ fn copy_user_dsh_file(src: &Path, dst: &Path) -> Result<(), HarnessError> {
             ))
         })?;
     }
-    Ok(())
+    Ok(hash)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn reject_demo_bin(bin: &str) -> Result<(), HarnessError> {
@@ -585,6 +719,46 @@ fn version_at_least(got: DshVersion, min: DshVersion) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    use serial_test::serial;
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .copied()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_config_pair(home: &Path, credentials: &[u8], settings: Option<&[u8]>) {
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(home.join(CREDENTIALS_FILE), credentials).unwrap();
+        if let Some(settings) = settings {
+            std::fs::write(home.join(SETTINGS_FILE), settings).unwrap();
+        }
+    }
 
     #[test]
     fn version_parser_accepts_rc_floor_and_newer_stable() {
@@ -693,5 +867,80 @@ mod tests {
         make_executable(&newer);
         let found = find_cached_dsh_bin_under(&home).unwrap();
         assert_eq!(found, newer);
+    }
+
+    #[test]
+    #[serial(dsh_config_env)]
+    fn config_source_prefers_tenant_home_with_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::capture(&["HOME", DEEPSEEK_API_KEY_ENV]);
+        let home = tmp.path().join("home");
+        let ccteam_home = tmp.path().join("ccteam-home");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+        }
+
+        let operator_home = home.join(USER_DSH_DIR);
+        write_config_pair(&operator_home, b"operator", Some(b"operator-settings"));
+        let tenant_home = ccteam_home
+            .join("runtime")
+            .join("dsh")
+            .join("web")
+            .join(tenant_home_segment("alice"));
+        write_config_pair(&tenant_home, b"tenant", None);
+
+        assert_eq!(
+            dsh_config_source("user:alice", &ccteam_home),
+            DshConfigSource::TenantHome(tenant_home)
+        );
+        assert_eq!(
+            dsh_config_source("user:bob", &ccteam_home),
+            DshConfigSource::OperatorHome(operator_home)
+        );
+    }
+
+    #[test]
+    #[serial(dsh_config_env)]
+    fn tenant_web_seed_refreshes_unmodified_files_from_operator_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::capture(&["HOME", DEEPSEEK_API_KEY_ENV]);
+        let home = tmp.path().join("home");
+        let ccteam_home = tmp.path().join("ccteam-home");
+        let operator_home = home.join(USER_DSH_DIR);
+        let tenant_home = ccteam_home
+            .join("runtime")
+            .join("dsh")
+            .join("web")
+            .join(tenant_home_segment("alice"));
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+        }
+        write_config_pair(&operator_home, b"creds-v1", Some(b"settings-v1"));
+
+        seed_or_refresh_tenant_web_config_home("user:alice", &ccteam_home, &tenant_home).unwrap();
+        assert_eq!(
+            std::fs::read(tenant_home.join(CREDENTIALS_FILE)).unwrap(),
+            b"creds-v1"
+        );
+        assert_eq!(
+            std::fs::read(tenant_home.join(SETTINGS_FILE)).unwrap(),
+            b"settings-v1"
+        );
+        let marker = read_seed_marker(&tenant_home.join(SEED_MARKER_FILE)).unwrap();
+        assert_eq!(marker.credentials_sha256, sha256_hex(b"creds-v1"));
+        assert_eq!(marker.settings_sha256, Some(sha256_hex(b"settings-v1")));
+
+        write_config_pair(&operator_home, b"creds-v2", Some(b"settings-v2"));
+        seed_or_refresh_tenant_web_config_home("user:alice", &ccteam_home, &tenant_home).unwrap();
+        assert_eq!(
+            std::fs::read(tenant_home.join(CREDENTIALS_FILE)).unwrap(),
+            b"creds-v2"
+        );
+        assert_eq!(
+            std::fs::read(tenant_home.join(SETTINGS_FILE)).unwrap(),
+            b"settings-v2"
+        );
     }
 }

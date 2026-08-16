@@ -639,17 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn web_profile_factory_has_no_mirrored_operator_credentials() {
-        let root = tempfile::tempdir().unwrap();
-        let dsh_home = tempfile::tempdir().unwrap();
-
-        materialize_profile_in(root.path(), dsh_home.path(), ProfileSpec::web(None, None)).unwrap();
-
-        assert!(!dsh_home.path().join(".credentials.yaml").exists());
-        assert!(!dsh_home.path().join("settings.yaml").exists());
-    }
-
-    #[test]
     fn web_profile_symlink_self_heals() {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();

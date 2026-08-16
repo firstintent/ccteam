@@ -27,6 +27,7 @@ use ccteam_harness::{
 use futures::StreamExt;
 use serde_json::Value;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const ENV_KEYS: &[&str] = &[
@@ -183,6 +184,18 @@ fn tenant_web_home(tmp: &TempDir, id: &str) -> PathBuf {
         .join("dsh")
         .join("web")
         .join(tenant_home_segment(id))
+}
+
+fn seed_marker_path(home: &Path) -> PathBuf {
+    home.join(".ccteam-dsh-seed.json")
+}
+
+fn file_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn read_seed_marker(home: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(seed_marker_path(home)).unwrap()).unwrap()
 }
 
 fn set_dump(path: &Path) {
@@ -385,18 +398,22 @@ fn spawn_spec_env_table_is_bridge_only_and_scrubbed() {
 
 #[test]
 #[serial(dsh_env)]
-fn web_spawn_spec_uses_ccteam_web_profile_and_scrubs_tenant_provider_env() {
+fn web_spawn_spec_uses_ccteam_web_profile_and_inherits_provider_env() {
     let tmp = TempDir::new().unwrap();
     let _guard = install_fake(&tmp);
     let dsh_home = tmp.path().join(".ccteam-home/runtime/dsh/web/alice");
+    unsafe {
+        std::env::set_var(DEEPSEEK_BASE_URL_ENV, "https://example.invalid");
+    }
 
     let spec = build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:alice",
+        ccteam_home: ccteam_home(&tmp),
         dsh_home: dsh_home.clone(),
         profile: DSH_WEB_PROFILE,
         materialize_profile: true,
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
-        scrub_provider_env: true,
     })
     .expect("web spawn spec");
 
@@ -411,16 +428,231 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_scrubs_tenant_provider_env() {
     );
     assert_eq!(spec.cwd, dsh_home);
     assert_eq!(spec.dsh_home, dsh_home);
-    assert!(spec.env_remove.contains(&DEEPSEEK_API_KEY_ENV.to_string()));
-    assert!(spec.env_remove.contains(&DEEPSEEK_BASE_URL_ENV.to_string()));
+    assert!(spec.env_remove.is_empty());
     let env: BTreeMap<_, _> = spec.env.iter().cloned().collect();
     assert_eq!(env[DSH_HOME_ENV], dsh_home.to_string_lossy());
-    assert!(!env.contains_key(DEEPSEEK_API_KEY_ENV));
+    assert_eq!(env[DEEPSEEK_API_KEY_ENV], "test-deepseek-key");
+    assert_eq!(env[DEEPSEEK_BASE_URL_ENV], "https://example.invalid");
     assert!(dsh_home
         .join("profiles")
         .join(DSH_WEB_PROFILE)
         .join("package.json")
         .is_file());
+}
+
+#[test]
+#[serial(dsh_env)]
+fn web_profile_factory_seeds_operator_credentials_and_marker_for_tenant_home() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"seed-creds",
+        Some(b"seed-settings"),
+    );
+    let dsh_home = tenant_web_home(&tmp, "alice");
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:alice",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_WEB_PROFILE,
+        materialize_profile: true,
+        enrollment: Some("ccteam-enroll:abc:secret"),
+        daemon_url: Some("http://127.0.0.1:7331"),
+    })
+    .expect("web spawn spec");
+
+    assert_eq!(
+        std::fs::read(dsh_home.join(".credentials.yaml")).unwrap(),
+        b"seed-creds"
+    );
+    assert_eq!(
+        std::fs::read(dsh_home.join("settings.yaml")).unwrap(),
+        b"seed-settings"
+    );
+    let marker = read_seed_marker(&dsh_home);
+    assert_eq!(
+        marker["credentials_sha256"].as_str(),
+        Some(file_sha256(b"seed-creds").as_str())
+    );
+    assert_eq!(
+        marker["settings_sha256"].as_str(),
+        Some(file_sha256(b"seed-settings").as_str())
+    );
+    assert!(marker["seeded_at"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+#[serial(dsh_env)]
+fn web_profile_factory_empty_without_source_writes_no_marker() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    let dsh_home = tenant_web_home(&tmp, "alice");
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:alice",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_WEB_PROFILE,
+        materialize_profile: true,
+        enrollment: Some("ccteam-enroll:abc:secret"),
+        daemon_url: Some("http://127.0.0.1:7331"),
+    })
+    .expect("web spawn spec");
+
+    assert!(!dsh_home.join(".credentials.yaml").exists());
+    assert!(!dsh_home.join("settings.yaml").exists());
+    assert!(!seed_marker_path(&dsh_home).exists());
+}
+
+#[test]
+#[serial(dsh_env)]
+fn web_profile_refreshes_seeded_files_that_tenant_did_not_touch() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"seed-creds-v1",
+        Some(b"seed-settings-v1"),
+    );
+    let dsh_home = tenant_web_home(&tmp, "alice");
+    let build = || {
+        build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: "user:alice",
+            ccteam_home: ccteam_home(&tmp),
+            dsh_home: dsh_home.clone(),
+            profile: DSH_WEB_PROFILE,
+            materialize_profile: true,
+            enrollment: Some("ccteam-enroll:abc:secret"),
+            daemon_url: Some("http://127.0.0.1:7331"),
+        })
+        .expect("web spawn spec");
+    };
+    build();
+
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"seed-creds-v2",
+        Some(b"seed-settings-v2"),
+    );
+    build();
+
+    assert_eq!(
+        std::fs::read(dsh_home.join(".credentials.yaml")).unwrap(),
+        b"seed-creds-v2"
+    );
+    assert_eq!(
+        std::fs::read(dsh_home.join("settings.yaml")).unwrap(),
+        b"seed-settings-v2"
+    );
+    let marker = read_seed_marker(&dsh_home);
+    assert_eq!(
+        marker["credentials_sha256"].as_str(),
+        Some(file_sha256(b"seed-creds-v2").as_str())
+    );
+    assert_eq!(
+        marker["settings_sha256"].as_str(),
+        Some(file_sha256(b"seed-settings-v2").as_str())
+    );
+}
+
+#[test]
+#[serial(dsh_env)]
+fn web_profile_keeps_tenant_modified_seeded_files() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"seed-creds-v1",
+        Some(b"seed-settings-v1"),
+    );
+    let dsh_home = tenant_web_home(&tmp, "alice");
+    let build = || {
+        build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: "user:alice",
+            ccteam_home: ccteam_home(&tmp),
+            dsh_home: dsh_home.clone(),
+            profile: DSH_WEB_PROFILE,
+            materialize_profile: true,
+            enrollment: Some("ccteam-enroll:abc:secret"),
+            daemon_url: Some("http://127.0.0.1:7331"),
+        })
+        .expect("web spawn spec");
+    };
+    build();
+
+    std::fs::write(dsh_home.join(".credentials.yaml"), b"tenant-creds").unwrap();
+    std::fs::write(dsh_home.join("settings.yaml"), b"tenant-settings").unwrap();
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"seed-creds-v2",
+        Some(b"seed-settings-v2"),
+    );
+    build();
+
+    assert_eq!(
+        std::fs::read(dsh_home.join(".credentials.yaml")).unwrap(),
+        b"tenant-creds"
+    );
+    assert_eq!(
+        std::fs::read(dsh_home.join("settings.yaml")).unwrap(),
+        b"tenant-settings"
+    );
+}
+
+#[test]
+#[serial(dsh_env)]
+fn web_profile_keeps_preexisting_files_without_marker() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"operator-creds",
+        Some(b"operator-settings"),
+    );
+    let dsh_home = tenant_web_home(&tmp, "alice");
+    write_config_pair(
+        &dsh_home,
+        b"preexisting-creds",
+        Some(b"preexisting-settings"),
+    );
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:alice",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_WEB_PROFILE,
+        materialize_profile: true,
+        enrollment: Some("ccteam-enroll:abc:secret"),
+        daemon_url: Some("http://127.0.0.1:7331"),
+    })
+    .expect("web spawn spec");
+
+    assert_eq!(
+        std::fs::read(dsh_home.join(".credentials.yaml")).unwrap(),
+        b"preexisting-creds"
+    );
+    assert_eq!(
+        std::fs::read(dsh_home.join("settings.yaml")).unwrap(),
+        b"preexisting-settings"
+    );
+    assert!(!seed_marker_path(&dsh_home).exists());
 }
 
 #[tokio::test]
