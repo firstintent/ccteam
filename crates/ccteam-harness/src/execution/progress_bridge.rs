@@ -410,7 +410,11 @@ fn append_event_at(
     let kind_name = raw_kind.unwrap_or("<unknown>");
     let unknown = known_kind.is_none();
 
-    if unknown {
+    // Warn once per unknown kind per process: hook-fallback kinds are
+    // legitimate high-volume facts, and a per-event warn would itself be
+    // the log-spam this gate exists to remove. The stats map gains an
+    // entry after the first record_* call, so its absence marks first sight.
+    if unknown && !admission_state().stats.contains_key(kind_name) {
         tracing::warn!(
             kind = kind_name,
             "progress admission: unknown event kind persisted as a fact"
