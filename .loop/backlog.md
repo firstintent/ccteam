@@ -44,7 +44,7 @@
 - **验证**:2026-08-16 codex s435 交付 `734eb7c`(单一摄取路 = byte cursor+`read_delta`,`fold_event` 全仓唯一调用点在 `catch_up_locked`;observer 缝仅持久化成功后触发,OnceLock 极小;零定时器;rotation 缩小即重置守卫;两条错注释改真;status 语义保持 global;IM/MCP/web 消费面 + budget gate 全切投影;序列化 im 全量 701/0);perf 数字的正式门禁归 V1-8(本卡以「无新数据零摄取字节」结构断言证 O(1))。
 
 ### PERF-V1-5 锁窄化(W3)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs + crates/ccteam-im/src(gateway.rs 委派通知器/emit_delegation_progress + mcp/dispatch.rs)` · **建议入口**:codex 委派
+- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs + crates/ccteam-im/src(gateway.rs 委派通知器/emit_delegation_progress + mcp/dispatch.rs)` · **建议入口**:codex 委派
 - **规格**:两阶段模式(短锁校验+resolve+置状态带 generation → 放锁慢活 → 短锁 generation 校验提交)扫全族:`handle_session_turn` 冷 resume+submit、`handle_create_session` spawn+挤停+fsync、MCP `session_spawn`/`session_dispatch`(A2A fan-out 去串行化)、external/import `~/.claude` 扫描出锁、委派通知器仅 boundary/批量抢锁、`emit_delegation_progress` flock append 出锁;`queue_timeout` 与 `vendor_timeout` 分开计量,HTTP 入口起算整体 deadline;5xx additive `error_code`;**承接自 V1-6 的后端半件**:status/projects snapshot 带 `version` 支持 304(V1-6 重切为纯 SPA,规划决定 2026-08-16)。
 - **DoD**:50 并发 turn + 冷 resume 风暴互不冻结;「5s 预算被排队吃掉」型 502 消失;generation 防 lock-gap 竞态(挤停/替换窗口旧结果必须丢弃);回归形如「重复动作 + 之后 status 仍秒回」;基线只增。
 
