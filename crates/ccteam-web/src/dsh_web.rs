@@ -34,6 +34,7 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
+use tower_http::compression::CompressionLayer;
 use utoipa::ToSchema;
 
 use crate::auth::Identity;
@@ -642,6 +643,11 @@ pub fn companion_router() -> Router<AppState> {
     Router::new()
         .route("/", any(handle_companion_request))
         .route("/{*path}", any(handle_companion_request))
+        // The origin hop deliberately stays identity-encoded so HTML can be
+        // spliced safely (see `should_strip_request_header`). Compression is
+        // applied only after that splice, on the outbound browser/WAN hop.
+        // CompressionLayer leaves WebSocket 101 upgrades untouched.
+        .layer(CompressionLayer::new().gzip(true).br(true))
 }
 
 /// Reap DSH processes stranded by daemon versions that predate PDEATHSIG.

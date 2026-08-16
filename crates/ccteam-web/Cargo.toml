@@ -89,6 +89,7 @@ axum = { workspace = true, features = ["ws"] }
 # the `tungstenite::Message` bridge type. Same 0.24 pin as ccteam-harness
 # (matches axum 0.8's internal tungstenite).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
 askama = { workspace = true }
 # Constant-time token comparison (M5.3 token auth). Pulled in now so
 # `ServeOpts` can carry the token-file knob without churning dep
@@ -156,3 +157,4 @@ async-trait.workspace = true
 # session_name collisions can't happen even on `cargo test -j N`.
 serial_test = "3"
 nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
+flate2.workspace = true

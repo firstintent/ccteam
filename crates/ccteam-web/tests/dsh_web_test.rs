@@ -1,12 +1,17 @@
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::response::IntoResponse;
+use axum::extract::ws::{Message as AxMessage, WebSocketUpgrade};
+use axum::http::{header, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ccteam_core::CcteamPaths;
 use ccteam_web::dsh_web::{DshWebRuntimeConfig, DshWebSupervisor};
 use ccteam_web::{dsh_web, router_with_state, AppState, AuthState};
+use flate2::read::GzDecoder;
+use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -79,6 +84,177 @@ async fn spawn_fake_attached_dsh() -> SocketAddr {
     let app =
         axum::Router::new().route("/", get(|| async { "dsh web fake origin".into_response() }));
     spawn_app(app).await
+}
+
+async fn spawn_fake_dsh_origin() -> SocketAddr {
+    let javascript = "window.__DSH_ASSET__ = true;".repeat(512);
+    let app = axum::Router::new()
+        .route(
+            "/",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    "<!doctype html><html><head><script src=\"/client.js\"></script></head><body>dsh web</body></html>",
+                )
+            }),
+        )
+        .route(
+            "/client.js",
+            get(move || {
+                let javascript = javascript.clone();
+                async move {
+                    (
+                        [(header::CONTENT_TYPE, "application/javascript")],
+                        javascript,
+                    )
+                }
+            }),
+        )
+        .route("/api/events.mux", get(echo_websocket))
+        .route("/api/events.host", get(echo_websocket));
+    spawn_app(app).await
+}
+
+async fn echo_websocket(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(|mut socket| async move {
+        while let Some(Ok(message)) = socket.next().await {
+            let should_close = matches!(message, AxMessage::Close(_));
+            if socket.send(message).await.is_err() || should_close {
+                break;
+            }
+        }
+    })
+}
+
+fn gunzip(bytes: &[u8]) -> String {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).unwrap();
+    decoded
+}
+
+async fn spawn_companion_for_origin(origin: SocketAddr) -> (SocketAddr, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let supervisor = Arc::new(DshWebSupervisor::new(DshWebRuntimeConfig {
+        enabled: true,
+        daemon_url: "http://127.0.0.1:7331".to_string(),
+        attach_url: Some(format!("http://{origin}")),
+    }));
+    let state = AppState::with_auth(paths, AuthState::disabled()).with_dsh_web(supervisor);
+    (
+        spawn_app(dsh_web::companion_router().with_state(state)).await,
+        tmp,
+    )
+}
+
+#[tokio::test]
+async fn companion_compresses_assets_after_splicing_html() {
+    let origin = spawn_fake_dsh_origin().await;
+    let (companion, _tmp) = spawn_companion_for_origin(origin).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let asset = client
+        .get(format!("http://{companion}/client.js"))
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(asset.headers()[header::CONTENT_ENCODING], "gzip");
+    let encoded_asset = asset.bytes().await.unwrap();
+    let decoded_asset = gunzip(&encoded_asset);
+    assert!(decoded_asset.contains("window.__DSH_ASSET__"));
+    assert!(encoded_asset.len() < decoded_asset.len());
+
+    let html = client
+        .get(format!("http://{companion}/"))
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(html.status(), StatusCode::OK);
+    assert_eq!(html.headers()[header::CONTENT_ENCODING], "gzip");
+    let decoded_html = gunzip(&html.bytes().await.unwrap());
+    assert!(decoded_html.contains("randomUUID"));
+    assert!(decoded_html.contains("<body>dsh web</body>"));
+}
+
+#[tokio::test]
+async fn companion_websocket_downlinks_upgrade_and_carry_frames_with_compression_enabled() {
+    let origin = spawn_fake_dsh_origin().await;
+    let (companion, _tmp) = spawn_companion_for_origin(origin).await;
+
+    for path in ["/api/events.mux", "/api/events.host"] {
+        let request = Request::builder()
+            .uri(format!("ws://{companion}{path}"))
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .header(header::HOST, companion.to_string())
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+
+        let payload = format!("frame-through-{path}");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        let echoed = tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("proxied websocket frame timed out")
+            .expect("proxied websocket closed")
+            .expect("proxied websocket returned an error");
+        assert_eq!(echoed.into_text().unwrap(), payload);
+        socket.close(None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn main_spa_javascript_is_compressed_for_the_browser_hop() {
+    let tmp = TempDir::new().unwrap();
+    let state = AppState::with_auth(fake_paths(tmp.path()), AuthState::disabled());
+    let addr = spawn_app(router_with_state(state)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    let index = client
+        .get(format!("http://{addr}/app/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let marker = "src=\"/app/";
+    let start = index.find(marker).expect("SPA script src") + marker.len();
+    let end = index[start..]
+        .find('"')
+        .expect("SPA script src closing quote")
+        + start;
+    let script_path = &index[start..end];
+
+    let script = client
+        .get(format!("http://{addr}/app/{script_path}"))
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(script.status(), StatusCode::OK);
+    assert_eq!(script.headers()[header::CONTENT_ENCODING], "gzip");
+    let compressed = script.bytes().await.unwrap();
+    let decoded = gunzip(&compressed);
+    assert!(
+        decoded.len() > 100_000,
+        "expected the real built SPA bundle"
+    );
+    assert!(compressed.len() < decoded.len());
 }
 
 /// Regression for a real production hang: `start_for`'s "already live" fast

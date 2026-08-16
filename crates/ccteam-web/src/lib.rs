@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use axum::{middleware::from_fn_with_state, Router};
 use ccteam_core::CcteamPaths;
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 
 pub mod auth;
 pub mod chat_protocol;
@@ -152,6 +153,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::stateless_router())
         .merge(mcp)
         .merge(stateful)
+        .layer(CompressionLayer::new().gzip(true).br(true))
 }
 
 /// Standalone `ccteam web` entry. Calls [`serve_with_shutdown`] with
