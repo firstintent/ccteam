@@ -15,6 +15,17 @@
 
 ## 当前卡
 
+### DSHCFG-1 DSH 配置单一解析器 + 租户家种子/跟随 + de-scrub(v0.10.1 主卡)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness(dsh_acp) + crates/ccteam-web(dsh_web) + crates/ccteam-im(SpawnCtx owner 装填)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **背景**:owner 实测「受管 DSH 会话开箱即用、DSH web 空间却空配置」= 两条 spawn 路径各自决定凭据的病根;PRD = `docs-local/versions/v0-10-1/prd.md`(已拍板:D26 turnkey 取代 D22 / D27 不做开关 / D28 refresh-if-unmodified)。
+- **规格**:PRD §三 —— `dsh_acp` 内单一解析器 `dsh_config_source(owner_tag)`(env → operator 家 → 租户 web 家(有凭据才算,二件套同源)→ 回落 operator → 全无拒绝);`SpawnCtx.owner` additive(meta `owner` 现成);`build_spawn_spec` 换源到解析器;web home 路径派生收敛进 harness(ccteam-web 删本地副本);租户家物化时种子二件套 + `.ccteam-dsh-seed.json`(sha256 标记,零解析)+ 实例启动 refresh-if-unmodified(无标记且文件存在 = 视为已修改,永不碾压);`build_web_spawn_spec` 撤 `scrub_provider_env` 整个字段(pre-v1.0 无 shim)。
+- **DoD**:解析器五臂穷举测试 · 种子/刷新/不碾压/混源必败/受管按 owner 取源(byte-compare)定向测试 · 翻转 `web_profile_factory_has_no_mirrored_operator_credentials` 为种子断言 · `make test-baseline` 只增(基线 1895/0)· clippy 0 · fmt 干净 · writeback 绿。
+
+### DSHCFG-DOCS v0.10.1 用户面文档
+- **状态**:待排 · **冲突域**:`README.md + docs/` · **建议入口**:codex 委派(同会话收尾)
+- **规格**:usage(EN/CN)DSH Web 节改写为当前能力:「出厂即用(跟随本机 DSH 登录);在 DSH Settings→Models 配自己的 key 后,该身份所有 DSH 会话(含 ccteam 里雇的)都用你的」+ PRD §五诚实三条融入;README 对应行同步。
+- **DoD**:docs 最低门(fmt + writeback);不写版本进展措辞。
+
 ### TD-SYNC-1 tech-design 全文陈旧校对(GOV-CE-2 顺带发现)
 - **状态**:待排 · **冲突域**:`docs/dev/tech-design.md` · **建议入口**:规划(控制)会话(docs 治理面)
 - **背景**:GOV-CE-2 排查实锤 §0 R-code 速查漂移(R1「文件系统是状态面」/R9「crate 拓扑」不在现行 §三;R10 旧 `<team>-<slug>` 路径已随卡修正)+ 正文残留 v0.9.0 前状态(§6.x 仍写「`ccteam init` 种默认 `cto.md`」)。v0.9.10 ship gate 已顺带把三处 web 导航描述改现势(§2 前端落地注 / §6.6 统一 chat-shell 段 / 指针表 web 行),其余仍待全文轮。
