@@ -1181,6 +1181,7 @@ struct ResumeDeadPlan {
     session_id: String,
     project: String,
     role: String,
+    owner: ChatKey,
     vendor: AgentVendor,
     protocol: SessionProtocol,
     /// v0.9.0 W3 (G10) — the session's host (from the live `GatewaySession`,
@@ -1812,6 +1813,7 @@ impl Gateway {
                 &SpawnCtx {
                     slug: plan.slug.clone(),
                     sid: plan.sid.clone(),
+                    owner: plan.owner.identity(),
                     cwd: plan.cwd.clone(),
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
@@ -3688,6 +3690,7 @@ impl Gateway {
                 &SpawnCtx {
                     slug: plan.project.clone(),
                     sid: plan.id.clone(),
+                    owner: plan.owner.identity(),
                     cwd: plan.cwd.clone(),
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
@@ -3987,6 +3990,7 @@ impl Gateway {
                 &role,
                 &project,
                 &sid,
+                &owner,
                 cwd,
                 model_id.clone(),
                 effort.clone(),
@@ -5989,6 +5993,7 @@ impl Gateway {
         }
         let project = s.project.clone();
         let role = s.role.clone();
+        let owner = s.owner.clone();
         let vendor = s.vendor;
         let protocol = s.protocol;
         let host = s.host.clone();
@@ -6022,6 +6027,7 @@ impl Gateway {
             session_id: session_id.to_string(),
             project,
             role,
+            owner,
             vendor,
             protocol,
             host,
@@ -6062,6 +6068,7 @@ impl Gateway {
                 &SpawnCtx {
                     slug: plan.project.clone(),
                     sid: plan.session_id.clone(),
+                    owner: plan.owner.identity(),
                     cwd: plan.cwd.clone(),
                     project_dir: plan.cwd.clone(),
                     extra_args: vec![],
@@ -6089,6 +6096,7 @@ impl Gateway {
             session_id,
             project,
             role,
+            owner: _,
             vendor,
             protocol,
             host: _,
@@ -6166,6 +6174,7 @@ impl Gateway {
         role: &str,
         slug: &str,
         sid: &str,
+        owner: &ChatKey,
         cwd: PathBuf,
         model_id: Option<String>,
         // Replayed from `meta.effort` — a re-spawn must not reset the axis the
@@ -6201,6 +6210,7 @@ impl Gateway {
                 &SpawnCtx {
                     slug: slug.to_string(),
                     sid: sid.to_string(),
+                    owner: owner.identity(),
                     cwd: cwd.clone(),
                     project_dir: cwd,
                     extra_args: vec![],

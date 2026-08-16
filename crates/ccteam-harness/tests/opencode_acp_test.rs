@@ -59,6 +59,7 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
         slug: "demo".into(),
         sid: sid.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -388,6 +389,7 @@ async fn resume_carries_mcp_servers() {
     let ctx = SpawnCtx {
         slug: "demo".into(),
         sid: sid.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],

@@ -1136,6 +1136,10 @@ pub struct ThreadErrorEvent {
 pub struct SpawnCtx {
     pub slug: String,
     pub sid: String,
+    /// Canonical owner tag for this session (`user:web-api`, `user:<id>`, or
+    /// the IM owner tag). Adapters that need identity-scoped local resources
+    /// consume this; other vendors ignore it.
+    pub owner: String,
     pub cwd: PathBuf,
     pub project_dir: PathBuf,
     pub extra_args: Vec<String>,

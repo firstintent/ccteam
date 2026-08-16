@@ -11,9 +11,10 @@ use std::time::Duration;
 use ccteam_harness::execution::claude_common::CHAT_SID_ENV;
 use ccteam_harness::execution::dsh_acp::handshake::{DEFAULT_DSH_MODEL, DEFAULT_DSH_PROVIDER};
 use ccteam_harness::execution::dsh_acp::spawn_spec::{
-    build_spawn_spec, build_web_spawn_spec, dsh_bin, DshWebSpawnOptions, DEEPSEEK_API_KEY_ENV,
-    DEEPSEEK_BASE_URL_ENV, DSH_APPROVAL_ENV, DSH_HOME_ENV, DSH_PROFILE, DSH_SYSTEM_PROMPT_ENV,
-    DSH_TELEMETRY_DISABLED_ENV, DSH_TELEMETRY_MODE_ENV, DSH_TRANSPORT_ENV, DSH_WEB_PROFILE,
+    build_spawn_spec, build_web_spawn_spec, dsh_bin, dsh_config_source, tenant_home_segment,
+    DshConfigSource, DshWebSpawnOptions, DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV,
+    DSH_APPROVAL_ENV, DSH_HOME_ENV, DSH_PROFILE, DSH_SYSTEM_PROMPT_ENV, DSH_TELEMETRY_DISABLED_ENV,
+    DSH_TELEMETRY_MODE_ENV, DSH_TRANSPORT_ENV, DSH_WEB_PROFILE,
 };
 use ccteam_harness::execution::mcp_config::{
     SessionMcpEndpoint, BRIDGE_MCP_BEARER_ENV, BRIDGE_MCP_URL_ENV,
@@ -115,6 +116,7 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
         slug: "demo".into(),
         sid: sid.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -159,6 +161,30 @@ fn write_meta(project: &Path, sid: &str, vendor_uuid: &str) {
     write_session_meta(project, &meta).unwrap();
 }
 
+fn write_config_pair(home: &Path, credentials: &[u8], settings: Option<&[u8]>) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(home.join(".credentials.yaml"), credentials).unwrap();
+    if let Some(settings) = settings {
+        std::fs::write(home.join("settings.yaml"), settings).unwrap();
+    }
+}
+
+fn operator_dsh_home(tmp: &TempDir) -> PathBuf {
+    tmp.path().join("home/.dsh")
+}
+
+fn ccteam_home(tmp: &TempDir) -> PathBuf {
+    tmp.path().join(".ccteam-home")
+}
+
+fn tenant_web_home(tmp: &TempDir, id: &str) -> PathBuf {
+    ccteam_home(tmp)
+        .join("runtime")
+        .join("dsh")
+        .join("web")
+        .join(tenant_home_segment(id))
+}
+
 fn set_dump(path: &Path) {
     unsafe {
         std::env::set_var("CCTEAM_DSH_ACP_DUMP", path);
@@ -191,6 +217,107 @@ fn env_override_wins() {
         std::env::set_var(DSH_BIN_ENV, "/opt/dsh/bin/dsh");
     }
     assert_eq!(dsh_bin(), "/opt/dsh/bin/dsh");
+}
+
+#[test]
+#[serial(dsh_env)]
+fn dsh_config_source_resolves_all_authorized_arms() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    let root = ccteam_home(&tmp);
+    let operator_home = operator_dsh_home(&tmp);
+
+    assert_eq!(
+        dsh_config_source("user:web-api", &root),
+        DshConfigSource::None
+    );
+
+    write_config_pair(&operator_home, b"operator-creds", None);
+    assert_eq!(
+        dsh_config_source("user:web-api", &root),
+        DshConfigSource::OperatorHome(operator_home.clone())
+    );
+    assert_eq!(
+        dsh_config_source("telegram:123", &root),
+        DshConfigSource::OperatorHome(operator_home.clone())
+    );
+    assert_eq!(
+        dsh_config_source("user:alice", &root),
+        DshConfigSource::OperatorHome(operator_home)
+    );
+
+    let alice_home = tenant_web_home(&tmp, "alice");
+    std::fs::create_dir_all(&alice_home).unwrap();
+    assert_eq!(
+        dsh_config_source("user:alice", &root),
+        DshConfigSource::OperatorHome(operator_dsh_home(&tmp))
+    );
+    write_config_pair(&alice_home, b"alice-creds", None);
+    assert_eq!(
+        dsh_config_source("user:alice", &root),
+        DshConfigSource::TenantHome(alice_home)
+    );
+
+    unsafe {
+        std::env::set_var(DEEPSEEK_API_KEY_ENV, "env-key");
+    }
+    assert_eq!(dsh_config_source("user:alice", &root), DshConfigSource::Env);
+}
+
+#[test]
+#[serial(dsh_env)]
+fn managed_spawn_mirrors_config_from_owner_source_without_mixing_settings() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = install_fake(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    write_config_pair(
+        &operator_dsh_home(&tmp),
+        b"operator-creds",
+        Some(b"operator-settings"),
+    );
+    let tenant_home = tenant_web_home(&tmp, "tenant-a");
+    write_config_pair(&tenant_home, b"tenant-creds", None);
+
+    let mut tenant_ctx = spawn_ctx(&tmp, "s-tenant-config");
+    tenant_ctx.owner = "user:tenant-a".into();
+    let tenant_mcp = SessionMcpEndpoint::at(
+        "http://127.0.0.1:7331/mcp",
+        &tenant_ctx.sid,
+        &tenant_ctx.secret,
+    )
+    .unwrap();
+    let tenant_spec = build_spawn_spec(&tenant_ctx, &tenant_mcp).expect("tenant spawn spec");
+    assert_eq!(
+        std::fs::read(tenant_spec.dsh_home.join(".credentials.yaml")).unwrap(),
+        b"tenant-creds"
+    );
+    assert!(
+        !tenant_spec.dsh_home.join("settings.yaml").exists(),
+        "tenant source with no settings must not pull operator settings"
+    );
+
+    let mut operator_ctx = spawn_ctx(&tmp, "s-operator-config");
+    operator_ctx.owner = "user:web-api".into();
+    let operator_mcp = SessionMcpEndpoint::at(
+        "http://127.0.0.1:7331/mcp",
+        &operator_ctx.sid,
+        &operator_ctx.secret,
+    )
+    .unwrap();
+    let operator_spec = build_spawn_spec(&operator_ctx, &operator_mcp).expect("operator spec");
+    assert_eq!(
+        std::fs::read(operator_spec.dsh_home.join(".credentials.yaml")).unwrap(),
+        b"operator-creds"
+    );
+    assert_eq!(
+        std::fs::read(operator_spec.dsh_home.join("settings.yaml")).unwrap(),
+        b"operator-settings"
+    );
 }
 
 #[test]

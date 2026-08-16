@@ -109,6 +109,7 @@ async fn via_mux_bg_spawn_routes_through_rmux_daemon() {
     let ctx = SpawnCtx {
         slug: "rmuxbg".into(),
         sid: "claude-rmux-1".into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec!["do the thing".into()],

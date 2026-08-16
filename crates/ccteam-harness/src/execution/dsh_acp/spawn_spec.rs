@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use super::materialize::{materialize_managed_profile, materialize_web_profile, WEB_PROFILE};
@@ -31,6 +32,91 @@ pub const MIN_DSH_VERSION: &str = "0.1.0-rc.6";
 const USER_DSH_DIR: &str = ".dsh";
 const CREDENTIALS_FILE: &str = ".credentials.yaml";
 const SETTINGS_FILE: &str = "settings.yaml";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DshConfigSource {
+    Env,
+    OperatorHome(PathBuf),
+    TenantHome(PathBuf),
+    None,
+}
+
+pub fn tenant_home_segment(id: &str) -> String {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return id.to_string();
+    }
+    let hash = Sha256::digest(id.as_bytes());
+    let suffix = hash[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    format!("tenant-{suffix}")
+}
+
+pub fn dsh_config_source(owner_tag: &str, ccteam_home: &Path) -> DshConfigSource {
+    if env_provider_key_is_set() {
+        return DshConfigSource::Env;
+    }
+
+    let Some(tenant_id) = tenant_id_from_owner_tag(owner_tag) else {
+        return operator_config_source();
+    };
+    let tenant_home = ccteam_home
+        .join("runtime")
+        .join("dsh")
+        .join("web")
+        .join(tenant_home_segment(tenant_id));
+    if tenant_home.is_dir() && tenant_home.join(CREDENTIALS_FILE).is_file() {
+        return DshConfigSource::TenantHome(tenant_home);
+    }
+    operator_config_source()
+}
+
+fn env_provider_key_is_set() -> bool {
+    std::env::var(DEEPSEEK_API_KEY_ENV)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn tenant_id_from_owner_tag(owner_tag: &str) -> Option<&str> {
+    match owner_tag.strip_prefix("user:") {
+        Some("web-api" | "") | None => None,
+        Some(id) => Some(id),
+    }
+}
+
+fn operator_config_source() -> DshConfigSource {
+    let Some(home) = dirs::home_dir() else {
+        return DshConfigSource::None;
+    };
+    let user_dsh = home.join(USER_DSH_DIR);
+    if user_dsh.join(CREDENTIALS_FILE).is_file() {
+        DshConfigSource::OperatorHome(user_dsh)
+    } else {
+        DshConfigSource::None
+    }
+}
+
+fn dsh_credentials_unavailable_error() -> HarnessError {
+    let Some(home) = dirs::home_dir() else {
+        return HarnessError::SpawnFailed(
+            "DSH credentials unavailable: DEEPSEEK_API_KEY is not set and HOME is unknown; \
+             set DEEPSEEK_API_KEY or run DSH login so ~/.dsh/.credentials.yaml exists"
+                .to_string(),
+        );
+    };
+    let credentials = home.join(USER_DSH_DIR).join(CREDENTIALS_FILE);
+    HarnessError::SpawnFailed(format!(
+        "DSH credentials unavailable: {DEEPSEEK_API_KEY_ENV} is not set and {} does not exist. \
+         Set {DEEPSEEK_API_KEY_ENV}, or copy/login credentials with DSH first so ccteam can mirror \
+         ~/.dsh/{{{CREDENTIALS_FILE},{SETTINGS_FILE}}} into managed DSH_HOME.",
+        credentials.display()
+    ))
+}
 
 /// Resolve the `dsh` binary path: `CCTEAM_DSH_BIN` override, else `dsh` on
 /// `PATH`, else a cached `npx` copy ([`resolve_dsh_default_bin`]). The same
@@ -148,12 +234,13 @@ pub fn build_spawn_spec(
     let bin = dsh_bin();
     reject_demo_bin(&bin)?;
     let cwd = project_cwd(ctx)?;
-    let dsh_home = dsh_home(ctx)?;
+    let ccteam_home = ccteam_root()?;
+    let dsh_home = dsh_home(ctx, &ccteam_home)?;
     std::fs::create_dir_all(&dsh_home).map_err(|e| {
         HarnessError::SpawnFailed(format!("create DSH_HOME {}: {e}", dsh_home.display()))
     })?;
     materialize_managed_profile(&dsh_home)?;
-    mirror_dsh_credentials_if_needed(&dsh_home)?;
+    mirror_dsh_credentials_if_needed(&dsh_home, &dsh_config_source(&ctx.owner, &ccteam_home))?;
 
     let mut env = vec![
         (
@@ -293,48 +380,44 @@ fn project_cwd(ctx: &SpawnCtx) -> Result<PathBuf, HarnessError> {
     }
 }
 
-fn dsh_home(ctx: &SpawnCtx) -> Result<PathBuf, HarnessError> {
+fn dsh_home(ctx: &SpawnCtx, ccteam_home: &Path) -> Result<PathBuf, HarnessError> {
     let sid = ctx.sid.trim();
     if sid.is_empty() {
         return Err(HarnessError::SpawnFailed(
             "DSH sessions need a non-empty ccteam sid for isolated DSH_HOME".into(),
         ));
     }
-    let root = ccteam_root_from_env().ok_or_else(|| {
+    Ok(ccteam_home.join("runtime").join("dsh").join(sid))
+}
+
+fn ccteam_root() -> Result<PathBuf, HarnessError> {
+    ccteam_root_from_env().ok_or_else(|| {
         HarnessError::SpawnFailed(
             "cannot resolve CCTEAM_HOME/HOME for managed DSH_HOME".to_string(),
         )
-    })?;
-    Ok(root.join("runtime").join("dsh").join(sid))
+    })
 }
 
-fn mirror_dsh_credentials_if_needed(dsh_home: &Path) -> Result<(), HarnessError> {
-    if std::env::var(DEEPSEEK_API_KEY_ENV)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Ok(());
+fn mirror_dsh_credentials_if_needed(
+    dsh_home: &Path,
+    source: &DshConfigSource,
+) -> Result<(), HarnessError> {
+    match source {
+        DshConfigSource::Env => Ok(()),
+        DshConfigSource::OperatorHome(home) | DshConfigSource::TenantHome(home) => {
+            mirror_dsh_credentials_from_home(home, dsh_home)
+        }
+        DshConfigSource::None => Err(dsh_credentials_unavailable_error()),
     }
+}
 
-    let home = dirs::home_dir().ok_or_else(|| {
-        HarnessError::SpawnFailed(
-            "DSH credentials unavailable: DEEPSEEK_API_KEY is not set and HOME is unknown; \
-             set DEEPSEEK_API_KEY or run DSH login so ~/.dsh/.credentials.yaml exists"
-                .to_string(),
-        )
-    })?;
-    let user_dsh = home.join(USER_DSH_DIR);
-    let credentials = user_dsh.join(CREDENTIALS_FILE);
+fn mirror_dsh_credentials_from_home(src_home: &Path, dsh_home: &Path) -> Result<(), HarnessError> {
+    let credentials = src_home.join(CREDENTIALS_FILE);
     if !credentials.exists() {
-        return Err(HarnessError::SpawnFailed(format!(
-            "DSH credentials unavailable: {DEEPSEEK_API_KEY_ENV} is not set and {} does not exist. \
-             Set {DEEPSEEK_API_KEY_ENV}, or copy/login credentials with DSH first so ccteam can mirror \
-             ~/.dsh/{{{CREDENTIALS_FILE},{SETTINGS_FILE}}} into managed DSH_HOME.",
-            credentials.display()
-        )));
+        return Err(dsh_credentials_unavailable_error());
     }
     copy_user_dsh_file(&credentials, &dsh_home.join(CREDENTIALS_FILE))?;
-    let settings = user_dsh.join(SETTINGS_FILE);
+    let settings = src_home.join(SETTINGS_FILE);
     if settings.exists() {
         copy_user_dsh_file(&settings, &dsh_home.join(SETTINGS_FILE))?;
     }

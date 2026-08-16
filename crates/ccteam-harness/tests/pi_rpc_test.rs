@@ -87,6 +87,7 @@ impl PiTestEnv {
         SpawnCtx {
             slug: "pi-test".to_string(),
             sid: sid.to_string(),
+            owner: "user:web-api".into(),
             cwd: self.project.path().to_path_buf(),
             project_dir: self.project.path().to_path_buf(),
             extra_args: Vec::new(),

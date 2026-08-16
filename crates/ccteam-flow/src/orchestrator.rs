@@ -1977,6 +1977,7 @@ impl Orchestrator {
         let ctx = SpawnCtx {
             slug: slug.to_string(),
             sid: sid.clone(),
+            owner: "user:web-api".into(),
             // V0.6.2 — `cwd` is the agent's `scope` subdirectory joined
             // onto the project root (or the root itself when `scope` is
             // unset). Scoping each spawn to the slice of the tree

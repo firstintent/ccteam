@@ -48,6 +48,7 @@ async fn spawn_time_effort_is_refused_rather_than_ignored() {
     let ctx = SpawnCtx {
         slug: "tui-effort".into(),
         sid: "s-effort".into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -95,6 +96,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
     let ctx = SpawnCtx {
         slug: slug.clone(),
         sid: sid.clone(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -144,6 +146,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
     let ctx = SpawnCtx {
         slug: slug.clone(),
         sid: sid.clone(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -208,6 +211,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
     let ctx = SpawnCtx {
         slug: slug.clone(),
         sid: sid.clone(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -492,6 +496,7 @@ async fn claude_directive_bare_model_passes_through_to_native_picker() {
     let ctx = SpawnCtx {
         slug: slug.clone(),
         sid: sid.clone(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],

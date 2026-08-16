@@ -33,8 +33,9 @@ use crate::{
 use handshake::DshAgentOptions;
 use spawn_spec::{build_spawn_spec, purge_mirrored_credentials, verify_dsh_version};
 pub use spawn_spec::{
-    build_web_spawn_spec, dsh_bin, find_cached_dsh_bin, resolve_dsh_default_bin,
-    DshWebSpawnOptions, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
+    build_web_spawn_spec, dsh_bin, dsh_config_source, find_cached_dsh_bin, resolve_dsh_default_bin,
+    tenant_home_segment, DshConfigSource, DshWebSpawnOptions, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE,
+    DSH_WEB_PROFILE,
 };
 
 const FINALIZE_BARRIER: std::time::Duration = std::time::Duration::from_millis(750);
