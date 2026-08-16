@@ -15,6 +15,49 @@
 
 ## 当前卡
 
+### PERF-V1-1 事件准入门(EventClass admission)★ W1
+- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-harness/src/execution(progress_bridge.rs + 新 event_class + codex_app_server.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **背景**:excore.jsonl 149MB 中 ~85% 为全 null `codex_rate_limit`(相邻间隔低至 27µs,发射点 1:1 翻译无去重无节流);修在唯一写权威 `progress_bridge::append_event`(core 只 re-export,全 daemon 内写者天然过门)= 通用防爆炸,非 per-vendor 补丁。规格 SoT = `docs-local/versions/v0-x-perf/perf-v1.md` §一(gitignored,briefing 已内嵌全文翻译)。
+- **规格**:`EventKind` 枚举 + `EventClass{Fact,LatestState,Telemetry}` 穷举分类住 progress_bridge 旁(新 kind 不写分类臂 = 编译错,AgentVendor enum-slam 同款);有状态门 = 进程全局态包在 `append_event` 内(零 call-site 改动,新写入点自动被覆盖):Fact 直通;LatestState 空/全 null 丢弃 + 语义哈希去重(排除 `ts` 等易变字段)+ per-(path,kind,scope) 最小间隔;Telemetry 不落盘只计数;未知字符串 kind = Fact 放行 + WARN + 计数;per-kind append/suppress rate+bytes 计数器(喂 V1-8/doctor);发射点 codex_app_server 全 null 先丢(保证性来自门)。零新后台定时器(全部检查发生在 append 时)。
+- **DoD**:同 LatestState kind 10k 相同快照落盘 ≤1 / 全 null = 0 / 值变恰 +1;枚举穷举测试锁分类义务;`chat_turn_running_long` per-sid ≥5min 间隔;未知 kind Fact 放行测试;基线只增(1896/0 起)、clippy 0、fmt 干净。
+
+### PERF-V1-2 Reader 统一(journal facade) W1
+- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-core/src + crates/ccteam-web/src(routes/api_v1.rs · routes/sessions_api.rs · queries.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **背景**:同一 SoT 三套坏行 reader 语义(`queries.rs read_tail_events` 整文件 UTF-8 失败→假空 badge;`api_v1.rs:606` 裸 read_to_string **硬 500 今天在发生**;`progress.rs last_event` 尾行不容错);`turns_mirror last_n_turns` 假尾读(全读后切片)。正确 8KB 反向原语已存在(`progress.rs read_last_line`)未被推广。
+- **规格**:core 新 journal facade 模块(泛 JSONL,progress 与 turns 共用):`last_valid` / `tail_valid(n)`(EOF 反向,I/O∝n)/ `scan_stream`(流式不物化)/ `read_delta(from_offset)`(供 W2 投影/断点);bytes 为基、坏行按条隔离、返回损坏计数;替换三家族 + turns 真反向尾读;`GET /sessions/{sid}` additive `limit`(默认 100)/`before` 分页;grep 门禁测试(web/im/core 无 facade 外 progress 直读,**先证有牙**);`fs_atomic::read_jsonl` 留 doctor/import。
+- **DoD**:torn fixture 上 badge/recent-events 复活、session 详情 500→200、尾部坏行 last_valid 容错;grep 门禁红→绿留痕;基线只增、clippy 0、fmt 干净。
+
+### PERF-V1-3 Runtime 多线程 + /status singleflight W1
+- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-cli/src/main.rs + crates/ccteam-web/src/routes/status.rs + core config(additive daemon.workers)` · **建议入口**:codex 委派(规划 briefing 自包含)
+- **背景**:daemon 实测单线程(`Threads: 1`),同步全量读独占唯一线程 → status 进行中 `/healthz` 0.7ms→4.7s 全站冻结;全仓零 `spawn_local`,切换无结构障碍。
+- **规格**:`run_start` `new_current_thread`→`new_multi_thread`(`daemon.workers` 配置默认 4,env `CCTEAM_DAEMON_WORKERS` 覆盖,workers=1 = 回退开关)+ `max_blocking_threads` 上限;`/status` 聚合 `spawn_blocking` + singleflight(并发合流一次计算,取消安全);**不碰 V1-1/V1-2 冲突域文件**。
+- **DoD**:singleflight 并发合流测试 + 「请求被取消后,后续 /status 仍秒回」结构断言(v0.10.0 死锁教训);全量 `make test` 先落盘再汇总 + gateway echo 竞态族复跑;基线只增、clippy 0、fmt 干净。
+
+### PERF-V1-4 StatusProjection + SessionCatalog(W2;依赖 V1-1 门 + V1-2 facade)
+- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs + crates/ccteam-web/src(routes/status.rs · routes/api_v1.rs · routes/sessions_api.rs · queries.rs · delegation.rs)` · **建议入口**:codex 委派
+- **规格**:per-slug 内存聚合(last_valid、200 条 tail ring、24h 分钟桶+per-vendor、lifetime cost、per-sid cost/last-activity、委派计数、已消费 byte offset);更新点 = 门放行处单点;启动 `spawn_blocking` 水合(就绪前 stale+`warming_up`);hook 直写 fallback 靠访问时 stat+`read_delta` 补漏;SessionCatalog sid→meta 内存索引,写路径同步失效,`session_views()` 纯内存(消灭锁内逐会话磁盘读;顺手改 `sessions_api.rs:170-171` 与 `status.rs:184` 两条与事实相反的注释);消费面切换 /status(三遍合一)/projects/项目详情/session activity/budget gate/fleet_delegations;**status 聚合语义维持 global**。
+- **DoD**:200MB fixture status p95<100ms 且与大小无关、每调用读量 <10MB;session list(50 live)p95<50ms 锁内零文件 I/O;基线只增。
+
+### PERF-V1-5 锁窄化(W3)
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs + crates/ccteam-im/src(gateway.rs 委派通知器/emit_delegation_progress + mcp/dispatch.rs)` · **建议入口**:codex 委派
+- **规格**:两阶段模式(短锁校验+resolve+置状态带 generation → 放锁慢活 → 短锁 generation 校验提交)扫全族:`handle_session_turn` 冷 resume+submit、`handle_create_session` spawn+挤停+fsync、MCP `session_spawn`/`session_dispatch`(A2A fan-out 去串行化)、external/import `~/.claude` 扫描出锁、委派通知器仅 boundary/批量抢锁、`emit_delegation_progress` flock append 出锁;`queue_timeout` 与 `vendor_timeout` 分开计量,HTTP 入口起算整体 deadline;5xx additive `error_code`。
+- **DoD**:50 并发 turn + 冷 resume 风暴互不冻结;「5s 预算被排队吃掉」型 502 消失;generation 防 lock-gap 竞态(挤停/替换窗口旧结果必须丢弃);回归形如「重复动作 + 之后 status 仍秒回」;基线只增。
+
+### PERF-V1-6 前端收敛(W3)
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/web(SPA)` · **建议入口**:codex 委派
+- **规格**:CostPill 与 StatusView 共用 status store(CostPill 现为可重叠定时链——修);5xx 指数退避+jitter;tab hidden 暂停;`session_lifecycle` 按 slug 增量 + 100-250ms debounce(消灭 `1+2N` 扇出);history 展开时分页(接 V1-2 limit/before);四 mount 视图共用 projects store;snapshot 带 `version` 支持 304。
+- **DoD**:lifecycle burst 每 debounce 窗口 ≤1 次 reconcile;vitest/tsc/eslint 绿。
+
+### PERF-V1-7 rotation + doctor(W4)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli/src/doctor.rs + harness(progress_bridge rollover)` · **建议入口**:codex 委派
+- **规格**:append 时体积检查(默认 64MB)→ 单级 rollover `<slug>.jsonl`→`<slug>.1.jsonl` + lifetime-cost checkpoint 小 json(投影水合 = checkpoint+活跃文件);doctor 增 progress 检查(体积、坏行数+offset、按字节 Top kinds、checkpoint 一致性);`--repair-progress` bytes 逐行 parse 原子重写先备份。零新定时器。
+- **DoD**:rollover 触发/恢复测试;doctor 检查+修复(先备份)测试;基线只增。
+
+### PERF-V1-8 观测与性能门禁(W4)
+- **状态**:待排 · **冲突域**:`.loop/verify + Makefile(perf-gate)+ web 层指标` · **建议入口**:codex 委派 + 规划收口(verify 登记归规划)
+- **规格**:per-route latency(>500ms WARN)、progress bytes read/records parsed/invalid lines、per-kind append rate/bytes、gateway lock wait/hold、blocking pool queue;测试时生成 fixture(~150-200MB/100 万行,中部 torn UTF-8+尾部坏行;50 live/380 stopped;单会话 1 万 turns),挂 env 开关/`make perf-gate`,普通 CI 不变慢;断言 §〇 数字(status p95<100ms 与大小无关、healthz p99<10ms、registry 锁持有 p99<5ms)。
+- **DoD**:perf-gate 目标数字全绿;`.loop/verify/README.md` 登记(规划执笔);基线只增。
+
 ### DSHCFG-1 DSH 配置单一解析器 + 租户家种子/跟随 + de-scrub(v0.10.1 主卡)
 - **状态**:完成(68c4bbd) · **冲突域**:`crates/ccteam-harness(dsh_acp) + crates/ccteam-web(dsh_web) + crates/ccteam-im(SpawnCtx owner 装填)` · **建议入口**:codex 委派(规划 briefing 自包含)
 - **背景**:owner 实测「受管 DSH 会话开箱即用、DSH web 空间却空配置」= 两条 spawn 路径各自决定凭据的病根;PRD = `docs-local/versions/v0-10-1/prd.md`(已拍板:D26 turnkey 取代 D22 / D27 不做开关 / D28 refresh-if-unmodified)。
