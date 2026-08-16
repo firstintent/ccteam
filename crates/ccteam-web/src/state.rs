@@ -23,6 +23,8 @@ use crate::pty::PtyRegistry;
 #[derive(Clone)]
 pub struct AppState {
     pub paths: Arc<CcteamPaths>,
+    /// Incremental progress-journal aggregate shared with the live gateway.
+    pub progress_projection: Arc<ccteam_im::progress_projection::ProgressProjection>,
     /// V0.3 M5.3 — auth gate state. Cloned per request, so the inner
     /// `Arc<AuthState>` keeps the token allocation shared. When
     /// `enabled = false` (loopback bind, or `--no-auth` opt-out) the
@@ -162,8 +164,11 @@ impl AppState {
 
     fn build(paths: CcteamPaths, auth: AuthState) -> Self {
         let (chat_outbound, _) = broadcast::channel(256);
+        let progress_projection =
+            ccteam_im::progress_projection::ProgressProjection::new(paths.clone());
         Self {
             paths: Arc::new(paths),
+            progress_projection,
             auth: Arc::new(auth),
             pty: PtyRegistry::new(),
             chat_inbound: None,
@@ -234,6 +239,13 @@ impl AppState {
         gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>,
         principals: Arc<ccteam_im::principals::SessionPrincipals>,
     ) -> Self {
+        if let Ok(guard) = gateway.try_lock() {
+            if let Some(projection) = guard.progress_projection() {
+                debug_assert!(Arc::ptr_eq(&self.progress_projection, &projection));
+                self.progress_projection = projection;
+            }
+        }
+        self.progress_projection.start_hydration();
         self.session_principals = Some(Arc::clone(&principals));
         // v0.10 — reap the `Mcp-Session-Id` bindings of hand-started clients that
         // went away without saying so (most of them: only codex and grok were

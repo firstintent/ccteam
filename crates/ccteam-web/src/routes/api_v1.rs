@@ -27,15 +27,15 @@ use axum::{
     Extension, Json,
 };
 use ccteam_core::{
-    cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
-    HarnessKind, ProjectState, TeamKind, WorkflowSummary,
+    cost_history_buckets, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket, HarnessKind,
+    ProjectState, TeamKind, WorkflowSummary,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::queries::{
-    events_to_rows, outbox_rows, recent_event_summary, slug_recent_events, DEFAULT_OUTBOX_LIMIT,
+    events_to_rows, outbox_rows, recent_event_summary, DEFAULT_OUTBOX_LIMIT,
     PROJECT_EVENT_DISPLAY_LIMIT, STATUS_EVENT_LIMIT,
 };
 use crate::state::AppState;
@@ -158,7 +158,8 @@ fn build_projects(
         if !identity.can_see_owner(s.state.owner.as_deref()) {
             continue;
         }
-        let events = slug_recent_events(&app.paths, &s.state.slug, STATUS_EVENT_LIMIT);
+        let projection = app.progress_projection.project_snapshot(&s.state.slug);
+        let events = projection.recent_events(STATUS_EVENT_LIMIT);
         let badge = status_badge(&s.state, &events, s.stall_silent_seconds);
         let last_event_label = match s.state.last_progress_event_at {
             Some(ts) => recent_event_summary(ts, s.stall_silent_seconds),
@@ -169,13 +170,7 @@ fn build_projects(
         // instead of the now-frozen `state.cost_used_usd`. A missing
         // progress file folds to 0.00 — same shape pre-F91 fresh
         // projects displayed.
-        let cost_total = cost_summary(
-            &s.state.slug,
-            &app.paths.progress_jsonl(&s.state.slug),
-            &app.paths,
-        )
-        .map(|c| c.cost_total_usd)
-        .unwrap_or(0.0);
+        let cost_total = projection.cost.cost_total_usd;
         let project_dir = app.paths.project_dir(&s.state.slug);
         let host = config
             .projects
@@ -475,7 +470,8 @@ pub(crate) async fn handle_project(
             .into_response();
     }
 
-    let status_events = slug_recent_events(&app.paths, &slug, STATUS_EVENT_LIMIT);
+    let projection = app.progress_projection.project_snapshot(&slug);
+    let status_events = projection.recent_events(STATUS_EVENT_LIMIT);
     let display_start = status_events
         .len()
         .saturating_sub(PROJECT_EVENT_DISPLAY_LIMIT);
@@ -495,7 +491,11 @@ pub(crate) async fn handle_project(
         }
     };
 
-    let workflow_summary = match ccteam_core::workflow_summary(&slug, &app.paths) {
+    let workflow_summary = match ccteam_core::workflow_summary_from_events(
+        &slug,
+        &app.paths,
+        &projection.workflow_events,
+    ) {
         Ok(s) => Some(s),
         Err(err) => {
             tracing::warn!(slug, error = %err, "workflow_summary build failed");
@@ -508,8 +508,7 @@ pub(crate) async fn handle_project(
     // line read `state.cost_used_usd`, which is now frozen.
     // V0.6.0 Wave 3 F112 — also surface `cost_24h_by_vendor` to drive
     // the SPA's per-vendor split and `/ccteam-advise` UI.
-    let cost =
-        cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths).unwrap_or_default();
+    let cost = projection.cost;
     let cost_total = cost.cost_total_usd;
     let cost_24h_by_vendor = cost.cost_24h_by_vendor.clone();
     let summary = ProjectSummary {

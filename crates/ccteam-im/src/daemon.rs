@@ -388,6 +388,9 @@ where
             &initial,
         )))
     });
+    if let Some(projection) = gateway.lock().await.progress_projection() {
+        projection.start_hydration();
+    }
     // Privilege is a NAMED chat, never "reached the bot": seed the operator
     // roster from the same credentials the channels above were built from.
     bind_operator_rosters(&mut *gateway.lock().await, &creds);

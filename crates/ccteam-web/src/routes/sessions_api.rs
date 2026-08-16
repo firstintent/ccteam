@@ -166,8 +166,8 @@ pub(crate) async fn handle_list_sessions(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    // session_views() + live_turns() are sync after the lock (and both cheap,
-    // in-memory) — no `.await` and no file read is held under it.
+    // session_views() is catalog-backed and live_turns() is process state:
+    // both are pure in-memory snapshots while the gateway lock is held.
     let (mut views, live_turns) = {
         let guard = gw.lock().await;
         (
@@ -179,7 +179,7 @@ pub(crate) async fn handle_list_sessions(
             guard.live_turns(),
         )
     };
-    apply_progress_activity_status(&app.paths, &slug, &mut views, &live_turns);
+    apply_progress_activity_status(&app.progress_projection, &slug, &mut views, &live_turns);
     Json(views).into_response()
 }
 
@@ -230,16 +230,15 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
 /// can never tell the user different things about one session.
 ///
 /// `live_turns` is the daemon's in-flight-turn snapshot, taken under the same
-/// lock that produced `views` (cheap, no I/O) — the file read then happens here,
-/// off the lock. It is what keeps a mid-turn session honest when its project's
-/// progress stream cannot be read.
+/// lock that produced `views`. Persisted activity comes from the incremental
+/// projection after the lock is released.
 ///
 /// A project the catalog can't price for staleness no longer bails out (that
 /// left every row saying `"live"`, i.e. green, on a surface whose whole job is
 /// to say what a session is doing): fall back to `0` silent seconds, the same
 /// fallback the IM side uses.
 fn apply_progress_activity_status(
-    paths: &ccteam_core::CcteamPaths,
+    projection: &ccteam_im::progress_projection::ProgressProjection,
     slug: &str,
     views: &mut [SessionView],
     live_turns: &std::collections::HashMap<String, ccteam_core::stall::LiveTurn>,
@@ -247,21 +246,15 @@ fn apply_progress_activity_status(
     if views.is_empty() {
         return;
     }
-    let silent_seconds = ccteam_core::collect_projects(paths)
-        .ok()
-        .and_then(|projects| {
-            projects
-                .into_iter()
-                .find(|project| project.state.slug == slug)
-                .map(|project| project.stall_silent_seconds)
-        })
+    let snapshot = projection.project_snapshot(slug);
+    let silent_seconds = snapshot
+        .last_valid
+        .as_ref()
+        .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, chrono::Utc::now()))
         .unwrap_or(0);
-    let events =
-        ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
     let now = chrono::Utc::now();
     for view in views {
-        let activity = ccteam_core::stall::classify_session_activity(
-            &events,
+        let activity = snapshot.session_activity(
             &view.sid,
             silent_seconds,
             live_turns.get(&view.sid).copied(),
@@ -2490,6 +2483,12 @@ mod tests {
         std::collections::HashMap::from([(sid.to_string(), live)])
     }
 
+    fn test_projection(
+        paths: &ccteam_core::CcteamPaths,
+    ) -> std::sync::Arc<ccteam_im::progress_projection::ProgressProjection> {
+        ccteam_im::progress_projection::ProgressProjection::new(paths.clone())
+    }
+
     fn view(sid: &str) -> SessionView {
         SessionView {
             driveable: true,
@@ -2525,15 +2524,16 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![view("s1")];
 
         // No progress stream at all → the file verdict is a bare "idle".
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
 
         views[0].status = "live".into();
         apply_progress_activity_status(
-            &paths,
+            &projection,
             "demo",
             &mut views,
             &one_live_turn(
@@ -2556,16 +2556,18 @@ mod tests {
     fn unknown_project_still_reports_a_real_activity_not_live() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
+        let projection = test_projection(&paths);
         let mut views = vec![view("s1")];
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
     }
 
     #[test]
-    fn progress_activity_status_uses_core_file_backed_classifier() {
+    fn progress_activity_status_uses_projection_backed_classifier() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
             sid: "s1".into(),
@@ -2596,7 +2598,7 @@ mod tests {
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &stale_completed)
             .unwrap();
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
         assert!(views[0].last_activity_seconds.is_some());
 
@@ -2606,7 +2608,7 @@ mod tests {
             "ts": chrono::Utc::now().to_rfc3339(),
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &timeout).unwrap();
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "stuck");
     }
 
@@ -2615,6 +2617,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![
             SessionView {
                 driveable: true,
@@ -2684,7 +2687,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
         assert!(views[0].last_activity_seconds.unwrap() >= 60);
         assert_eq!(views[1].status, "stuck");
@@ -2696,6 +2699,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
             sid: "s1".into(),
@@ -2730,7 +2734,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "working");
         assert_eq!(views[0].last_activity_seconds, None);
     }
@@ -2740,6 +2744,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
             sid: "s1".into(),
@@ -2776,7 +2781,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "stale");
         assert!(
             views[0].last_activity_seconds.unwrap() >= ccteam_core::stall::STALL_WARN_SECONDS - 1

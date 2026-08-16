@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
-use ccteam_core::{check_daemon_health, collect_projects, cost_summary, CcteamPaths, DaemonHealth};
+use ccteam_core::{check_daemon_health, collect_projects, CcteamPaths, DaemonHealth};
 
 use super::groups;
 
@@ -330,12 +330,12 @@ fn tool_ls_matching(
     mut visible: impl FnMut(&ccteam_core::ProjectState) -> bool,
 ) -> Result<String> {
     let projects = collect_projects(paths)?;
+    let projection = crate::progress_projection::ProgressProjection::new(paths.clone());
     let arr: Vec<Value> = projects
         .iter()
         .filter(|project| visible(&project.state))
         .map(|p| {
-            let cost = cost_summary(&p.state.slug, &paths.progress_jsonl(&p.state.slug), paths)
-                .unwrap_or_default();
+            let cost = projection.project_snapshot(&p.state.slug).cost;
             json!({
                 "slug": p.state.slug,
                 "cost_24h_usd": cost.cost_24h_usd,

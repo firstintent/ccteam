@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ccteam_root_from_env;
 
+type PersistObserver = dyn Fn(&Path) + Send + Sync + 'static;
+
+static PERSIST_OBSERVER: OnceLock<Box<PersistObserver>> = OnceLock::new();
+
 pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
 pub const CHAT_TURN_USER_PROMPT: &str = "chat_turn_user_prompt";
@@ -374,6 +378,13 @@ pub fn kind_stats() -> Vec<KindStat> {
     stats
 }
 
+/// Install the process-wide callback invoked after a progress row is durably
+/// appended. Returns `false` when another daemon component already installed
+/// the callback. One-shot CLI processes never call this function.
+pub fn set_persist_observer(observer: Box<PersistObserver>) -> bool {
+    PERSIST_OBSERVER.set(observer).is_ok()
+}
+
 pub fn hooks_script_from_env() -> Option<PathBuf> {
     ccteam_root_from_env().map(|root| root.join("hooks").join("hook.sh"))
 }
@@ -466,6 +477,9 @@ fn append_event_at(
     }
     result?;
     record_appended(kind_name, unknown, byte_count);
+    if let Some(observer) = PERSIST_OBSERVER.get() {
+        observer(path);
+    }
     Ok(())
 }
 

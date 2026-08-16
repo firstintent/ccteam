@@ -62,12 +62,14 @@ pub mod pending;
 pub mod pending_turns;
 pub mod principals;
 pub mod progress;
+pub mod progress_projection;
 pub mod rate_limit;
 // v0.8.24 Track D — multi-host remote spawn gate + satellite proxy seam.
 pub mod remote_host;
 pub mod router;
 pub mod sanitize;
 pub mod scheduled;
+mod session_catalog;
 pub mod three_layer_sec;
 pub mod transport;
 

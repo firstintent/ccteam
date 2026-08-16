@@ -3144,25 +3144,19 @@ fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (u
 /// stream is unreadable. Best-effort: any read miss degrades to `None` (field
 /// omitted).
 fn classify_session_activity(
+    projection: Option<&crate::progress_projection::ProgressProjection>,
     slug: &str,
     sid: &str,
     live: Option<ccteam_core::stall::LiveTurn>,
 ) -> Option<String> {
-    let paths = ccteam_core::CcteamPaths::from_env().ok()?;
-    let silent_seconds = ccteam_core::collect_projects(&paths)
-        .ok()?
-        .into_iter()
-        .find(|p| p.state.slug == slug)
-        .map(|p| p.stall_silent_seconds)?;
-    let events =
-        ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
-    let activity = ccteam_core::stall::classify_session_activity(
-        &events,
-        sid,
-        silent_seconds,
-        live,
-        chrono::Utc::now(),
-    );
+    let snapshot = projection?.project_snapshot(slug);
+    let now = chrono::Utc::now();
+    let silent_seconds = snapshot
+        .last_valid
+        .as_ref()
+        .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+        .unwrap_or(0);
+    let activity = snapshot.session_activity(sid, silent_seconds, live, now);
     Some(activity.status.activity.to_string())
 }
 
@@ -3192,9 +3186,13 @@ async fn run_session_collect(
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
-    let (resolved, live) = {
+    let (resolved, live, projection) = {
         let gw = gateway.lock().await;
-        (gw.session_resolve(&sid), gw.live_turn_for(&sid))
+        (
+            gw.session_resolve(&sid),
+            gw.live_turn_for(&sid),
+            gw.progress_projection(),
+        )
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
     // A collectable session is one the gateway still tracks → "live" (the same
@@ -3263,7 +3261,12 @@ async fn run_session_collect(
     // v0.9.1 — honest per-sid activity (same resolver the web session list
     // uses): `working` = the child is mid-turn (keep polling), `idle` = the
     // turn is done. Best-effort: a read miss just omits the field.
-    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid, live) {
+    if let Some(activity) = classify_session_activity(
+        projection.as_deref(),
+        &resolved.project,
+        &resolved.sid,
+        live,
+    ) {
         body["activity"] = serde_json::json!(activity);
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
@@ -3365,34 +3368,36 @@ async fn run_session_list_at(
         .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
 
     // Both halves of the activity answer come from under ONE lock hold, and
-    // both are cheap in-memory reads — the progress files are read below, after
-    // the guard drops (a fleet's streams are far too big to read under the
+    // both are cheap in-memory reads. Projection catch-ups happen below, after
+    // the guard drops (a fleet's streams are far too big to touch under the
     // gateway mutex).
-    let (views, live_turns) = {
+    let (views, live_turns, projection) = {
         let gw = gateway.lock().await;
-        (gw.session_views(), gw.live_turns())
+        (
+            gw.session_views(),
+            gw.live_turns(),
+            gw.progress_projection(),
+        )
     };
     // v0.9.1 — honest activity per row (same resolver as the web session
-    // list): one progress read per DISTINCT project, not per session.
-    let mut activity_ctx: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
-        std::collections::HashMap::new();
-    if let Some(paths) = paths {
-        if let Ok(projects) = ccteam_core::collect_projects(paths) {
-            for p in projects {
-                if caller_visible_projects
-                    .as_ref()
-                    .is_some_and(|visible| !visible.contains(&p.state.slug))
-                {
-                    continue;
-                }
-                if views.iter().any(|v| v.project == p.state.slug) {
-                    let events = ccteam_core::progress::read_all_events(
-                        &paths.progress_jsonl(&p.state.slug),
-                    )
-                    .unwrap_or_default();
-                    activity_ctx.insert(p.state.slug.clone(), (events, p.stall_silent_seconds));
-                }
+    // list): one incremental snapshot per DISTINCT project, not per session.
+    // Tests and daemonless callers may not have enabled the gateway projection;
+    // when explicit paths exist, construct the same byte-cursor reader locally.
+    let projection = projection.or_else(|| {
+        paths.map(|paths| crate::progress_projection::ProgressProjection::new(paths.clone()))
+    });
+    let mut activity_ctx = std::collections::HashMap::new();
+    if let Some(projection) = projection.as_ref() {
+        for view in &views {
+            if caller_visible_projects
+                .as_ref()
+                .is_some_and(|visible| !visible.contains(&view.project))
+            {
+                continue;
             }
+            activity_ctx
+                .entry(view.project.clone())
+                .or_insert_with(|| projection.project_snapshot(&view.project));
         }
     }
     let now = chrono::Utc::now();
@@ -3401,17 +3406,17 @@ async fn run_session_list_at(
     let classified: Vec<(&crate::gateway::SessionView, Option<String>)> = views
         .iter()
         .map(|v| {
-            let activity = activity_ctx.get(&v.project).map(|(events, silent)| {
-                ccteam_core::stall::classify_session_activity(
-                    events,
-                    &v.sid,
-                    *silent,
-                    live_turns.get(&v.sid).copied(),
-                    now,
-                )
-                .status
-                .activity
-                .to_string()
+            let activity = activity_ctx.get(&v.project).map(|snapshot| {
+                let silent = snapshot
+                    .last_valid
+                    .as_ref()
+                    .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+                    .unwrap_or(0);
+                snapshot
+                    .session_activity(&v.sid, silent, live_turns.get(&v.sid).copied(), now)
+                    .status
+                    .activity
+                    .to_string()
             });
             (v, activity)
         })
@@ -5355,7 +5360,10 @@ mod session_tool_tests {
             ccteam_harness::execution::session_meta::read_session_meta(tmp.path(), &child).unwrap();
         meta.cost_usd = Some(0.12);
         meta.tokens_total = Some(12_345);
-        ccteam_harness::execution::session_meta::write_session_meta(tmp.path(), &meta).unwrap();
+        gw.lock()
+            .await
+            .persist_session_meta(tmp.path(), &meta)
+            .unwrap();
 
         let frag = dispatch_task(
             &gw,

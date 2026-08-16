@@ -131,6 +131,10 @@ pub fn router() -> Result<Router> {
 /// `ccteam_token` cookie set via the URL shim (see
 /// `auth::auth_layer`).
 pub fn router_with_state(state: AppState) -> Router {
+    // Start only after composition has had a chance to replace the standalone
+    // projection with the gateway-owned Arc. This avoids hydrating the same
+    // large journals twice during daemon startup.
+    state.progress_projection.start_hydration();
     let stateful = routes::stateful_router()
         // v0.8.18 档1 — project-ownership ACL for every `/projects/{slug}/...`
         // route. Layered INSIDE `auth_layer` (which is added after it, so it

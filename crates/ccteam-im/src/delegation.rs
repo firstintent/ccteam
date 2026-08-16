@@ -3,11 +3,10 @@
 //!
 //! Holds: the pump → notifier signal, the bounded/TTL'd idempotency cache
 //! (in-memory only — honest: does NOT survive a restart), the completion
-//! notification text builder, and the trailing-24h cost / budget helpers the
-//! Ambient budget gate reads OFF the gateway lock (shared with the web
-//! `/status` route so there is one aggregation, `web → im`, never `im → web`).
+//! notification text builder, and the workflow budget-cap parser. Live spend
+//! and delegation counters come from the shared progress projection.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ccteam_core::CcteamPaths;
@@ -341,79 +340,7 @@ impl IdemCache {
     }
 }
 
-// ── cost / budget helpers (off-lock; shared with web /status) ────────────────
-
-/// Fleet-wide trailing-24h cost: total + per-vendor. The one aggregation the
-/// web `/status` route and the delegation budget gate share (both key off the
-/// `agent_done` events `ccteam_core::queries::cost_summary` owns).
-pub fn fleet_cost_24h(paths: &CcteamPaths) -> (f64, BTreeMap<String, f64>) {
-    let mut total = 0.0_f64;
-    let mut by_vendor: BTreeMap<String, f64> = BTreeMap::new();
-    for project in ccteam_core::queries::collect_projects(paths).unwrap_or_default() {
-        let slug = &project.state.slug;
-        let summary = ccteam_core::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
-            .unwrap_or_default();
-        total += summary.cost_24h_usd;
-        for (vendor, usd) in summary.cost_24h_by_vendor {
-            *by_vendor.entry(vendor).or_insert(0.0) += usd;
-        }
-    }
-    (total, by_vendor)
-}
-
-/// Fleet-wide delegation observability for `GET /status`:
-/// `(active_watches, notified_24h, denied_24h)`. Mirrors [`fleet_cost_24h`]'s
-/// per-project sweep so the web status route shares ONE aggregation
-/// (`web → im`, never `im → web`). `active_watches` = current on-disk
-/// `delegation.json` count (no window); the two counts filter the project
-/// `progress.jsonl` by event kind within the trailing 24h (a missing/unparseable
-/// `ts` counts as recent, matching `cost_summary`).
-pub fn fleet_delegations(paths: &CcteamPaths) -> (u32, u32, u32) {
-    use ccteam_harness::execution::progress_bridge::{DELEGATION_DENIED, DELEGATION_NOTIFIED};
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
-    let mut active = 0u32;
-    let mut notified = 0u32;
-    let mut denied = 0u32;
-    for project in ccteam_core::queries::collect_projects(paths).unwrap_or_default() {
-        let slug = &project.state.slug;
-        let dir = paths.project_dir(slug);
-        active += ccteam_harness::scan_delegation_watches(&dir).len() as u32;
-        for ev in
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default()
-        {
-            let kind = ev.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            if kind != DELEGATION_NOTIFIED && kind != DELEGATION_DENIED {
-                continue;
-            }
-            let recent = ev
-                .get("ts")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
-                .unwrap_or(true);
-            if !recent {
-                continue;
-            }
-            if kind == DELEGATION_NOTIFIED {
-                notified += 1;
-            } else {
-                denied += 1;
-            }
-        }
-    }
-    (active, notified, denied)
-}
-
-/// Trailing-24h cost for one vendor in one project (the budget gate's number).
-pub fn project_vendor_cost_24h(paths: &CcteamPaths, slug: &str, vendor: AgentVendor) -> f64 {
-    let summary = ccteam_core::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
-        .unwrap_or_default();
-    summary
-        .cost_24h_by_vendor
-        .get(vendor_key(vendor))
-        .copied()
-        .unwrap_or(0.0)
-}
+// ── budget helpers ──────────────────────────────────────────────────────────
 
 /// Per-vendor 24h cap from the project's `workflow.yaml::budgets_v060`, if any
 /// (same precedence as the web status route: nested `.ccteam/` first). `None`
@@ -437,16 +364,6 @@ pub fn project_vendor_budget_cap(
     view.budgets_v060
         .as_ref()
         .and_then(|b| b.cap_for(vendor_to_cost(vendor)).max_cost_usd_per_24h)
-}
-
-/// True when the vendor's trailing-24h project cost has reached its configured
-/// cap. No cap configured → `false` (never gates). grok/opencode/kimi have no
-/// price table (cost aggregates to 0) so the gate is naturally inert for them.
-pub fn budget_exceeded(paths: &CcteamPaths, slug: &str, vendor: AgentVendor) -> bool {
-    match project_vendor_budget_cap(paths, slug, vendor) {
-        Some(cap) => project_vendor_cost_24h(paths, slug, vendor) >= cap,
-        None => false,
-    }
 }
 
 // ── guardrail denial reasons ────────────────────────────────────────────────

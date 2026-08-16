@@ -17,13 +17,15 @@ use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
-    format_tokens, list_session_metas, parse_chat_session_name, read_session_meta, truncate_title,
-    write_session_meta, AccountUsage, AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection,
-    Directive, DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter,
-    HarnessError, PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin,
-    SessionProtocol, SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails,
-    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting,
+    format_tokens, list_session_metas, parse_chat_session_name, truncate_title, AccountUsage,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, Directive, DirectiveOutcome,
+    EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
+    ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol, SessionTitleTarget,
+    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TitleSync,
+    TurnDisposition, TurnInput, TurnRouting,
 };
+#[cfg(test)]
+use ccteam_harness::{read_session_meta, write_session_meta};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -358,6 +360,9 @@ pub struct Gateway {
     /// stream (v0.8.10 routing-isolation fix).
     current_session: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
     sessions: BTreeMap<String, GatewaySession>,
+    /// O(1) sid-to-meta index. All live-session reads stay off the filesystem;
+    /// stopped sessions pay one lazy scan on the first true miss only.
+    session_catalog: Arc<crate::session_catalog::SessionCatalog>,
     /// Ledger nodes for hand-started clients that enrolled over `POST /mcp`
     /// (`sid → meta`, `managed_by: external`; see [`crate::external_nodes`]).
     ///
@@ -409,6 +414,8 @@ pub struct Gateway {
     /// registered after daemon start without a restart — config.yaml is the
     /// source of truth, `projects` is just a cache. `None` in unit tests.
     config: Option<HotConfig<CcteamConfig>>,
+    /// Incremental progress reader shared with the web application state.
+    progress_projection: Option<Arc<crate::progress_projection::ProgressProjection>>,
     /// Signal to the daemon's IM-reload task that `credentials.json` changed
     /// and the credential-driven channel listeners should be rebuilt in place
     /// (no daemon restart, no agent-session restart). Wired by the daemon via
@@ -1511,6 +1518,7 @@ impl Gateway {
             current_project: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
+            session_catalog: Arc::new(crate::session_catalog::SessionCatalog::default()),
             external_nodes: BTreeMap::new(),
             templates: Vec::new(),
             next_session: 0,
@@ -1525,6 +1533,7 @@ impl Gateway {
             )),
             project_paths: None,
             config: None,
+            progress_projection: None,
             im_reload_tx: None,
             spawn_claims: Arc::new(SpawnClaims::new()),
             principals: Arc::new(crate::principals::SessionPrincipals::new()),
@@ -1653,7 +1662,17 @@ impl Gateway {
             ccteam_core::config::config_path(&root),
             move || ccteam_core::config::load(&root),
         ));
+        self.progress_projection = Some(crate::progress_projection::ProgressProjection::new(
+            paths.clone(),
+        ));
         self.project_paths = Some(paths);
+    }
+
+    /// Clone the daemon's shared progress projection when path context exists.
+    pub fn progress_projection(
+        &self,
+    ) -> Option<Arc<crate::progress_projection::ProgressProjection>> {
+        self.progress_projection.clone()
     }
 
     /// Load and persist gateway routing + the session-id counter under
@@ -2860,8 +2879,11 @@ impl Gateway {
         if let Some(session) = self.sessions.get(&entry.item.sid) {
             return self.chat_can_access(chat, session);
         }
-        read_session_meta(&entry.project_dir, &entry.item.sid)
-            .map(|meta| self.project_session_owner_visible(chat, &meta.slug, &meta.owner))
+        self.session_catalog
+            .find_or_load(&entry.item.sid, &self.projects)
+            .map(|entry| {
+                self.project_session_owner_visible(chat, &entry.meta.slug, &entry.meta.owner)
+            })
             .unwrap_or(false)
     }
 
@@ -3866,7 +3888,7 @@ impl Gateway {
                 apply_title(&mut meta, t.to_string(), TitleSource::User);
             }
             if let Some(cwd) = self.projects.get(&meta_project) {
-                if let Err(e) = write_session_meta(cwd, &meta) {
+                if let Err(e) = self.persist_session_meta(cwd, &meta) {
                     tracing::warn!(sid = %id, err = %e, "failed to write session meta.json");
                 }
             }
@@ -3980,9 +4002,10 @@ impl Gateway {
         // `/role` re-derives the MODEL from the new role's frontmatter, but the
         // effort belongs to the session, not the role — replay it so a switch
         // doesn't silently drop the level the session was spawned with.
-        let effort = read_session_meta(&meta_dir, &sid)
-            .ok()
-            .and_then(|meta| meta.effort);
+        let effort = self
+            .session_catalog
+            .find_or_load(&sid, &self.projects)
+            .and_then(|entry| entry.meta.effort);
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -4042,7 +4065,11 @@ impl Gateway {
         // The rest of the descriptor (vendor/uuid/owner/origin) is unchanged
         // (same sid ⇒ same deterministic vendor uuid). Best-effort.
         // v0.9 T5 — re-snapshot role_sha for the new role (spawn-time semantics).
-        if let Ok(mut meta) = read_session_meta(&meta_dir, &sid) {
+        if let Some(mut meta) = self
+            .session_catalog
+            .find_or_load(&sid, &self.projects)
+            .map(|entry| entry.meta)
+        {
             meta.role = meta_role.clone();
             meta.model = model_id;
             meta.effort = effort;
@@ -4050,7 +4077,7 @@ impl Gateway {
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
             meta.last_active = chrono::Utc::now().to_rfc3339();
-            let _ = write_session_meta(&meta_dir, &meta);
+            let _ = self.persist_session_meta(&meta_dir, &meta);
         }
         self.spawn_event_pump(&sid);
         Ok(sid)
@@ -4148,13 +4175,16 @@ impl Gateway {
             .as_ref()
             .map(|paths| paths.progress_jsonl(&session.project));
         let mirror_paths = self.project_paths.clone();
+        let progress_projection = self.progress_projection.clone();
         // v0.9 T5 — spawn-time fingerprints for experience.jsonl (do NOT re-read
         // meta.json per turn). Missing meta → None digests.
-        let (pump_role_sha, pump_skills_sha) = project_dir
-            .as_ref()
-            .and_then(|dir| read_session_meta(dir, &session.id).ok())
+        let (pump_role_sha, pump_skills_sha) = self
+            .session_catalog
+            .get(&session.id)
+            .map(|entry| entry.meta)
             .map(|m| (m.role_sha, m.skills_sha))
             .unwrap_or((None, None));
+        let session_catalog = Arc::clone(&self.session_catalog);
         let session_id = session.id.clone();
         let pump_key = session_id.clone();
         // v0.8.10 routing-isolation — read handle to the chat→focus map so the
@@ -4553,9 +4583,11 @@ impl Gateway {
                                     if let Some(dir) = project_dir.as_ref() {
                                         refresh_session_activity_meta(
                                             dir,
+                                            &session.project,
                                             &session_id,
                                             session.vendor,
-                                            progress_path.as_deref(),
+                                            progress_projection.as_deref(),
+                                            &session_catalog,
                                         );
                                     }
                                     let now = Instant::now();
@@ -4611,9 +4643,11 @@ impl Gateway {
                                             if let Some(dir) = project_dir.as_ref() {
                                                 refresh_session_activity_meta(
                                                     dir,
+                                                    &session.project,
                                                     &session_id,
                                                     session.vendor,
-                                                    progress_path.as_deref(),
+                                                    progress_projection.as_deref(),
+                                                    &session_catalog,
                                                 );
                                             }
                                         }
@@ -4855,9 +4889,11 @@ impl Gateway {
                                 if let Some(dir) = project_dir.as_ref() {
                                     refresh_session_activity_meta(
                                         dir,
+                                        &session.project,
                                         &session_id,
                                         session.vendor,
-                                        progress_path.as_deref(),
+                                        progress_projection.as_deref(),
+                                        &session_catalog,
                                     );
                                 }
                             }
@@ -4995,9 +5031,11 @@ impl Gateway {
                                 // meta.json on turn completion (v0.8.22 P1).
                                 refresh_session_activity_meta(
                                     dir,
+                                    &session.project,
                                     &session_id,
                                     session.vendor,
-                                    progress_path.as_deref(),
+                                    progress_projection.as_deref(),
+                                    &session_catalog,
                                 );
                             }
                             // Resolve the live reply target ONCE (reply_to → owner
@@ -5041,10 +5079,9 @@ impl Gateway {
                                 if channel == "web" {
                                     text.clone()
                                 } else {
-                                    let title = project_dir
-                                        .as_ref()
-                                        .and_then(|dir| read_session_meta(dir, &session_id).ok())
-                                        .and_then(|m| m.title);
+                                    let title = session_catalog
+                                        .get(&session_id)
+                                        .and_then(|entry| entry.meta.title);
                                     format!(
                                         "{text}\n\n{}",
                                         context_echo_line(
@@ -5293,20 +5330,18 @@ impl Gateway {
     /// (a stray `/stop` afterwards) against the alternative of silently
     /// dropping genuinely-live conversations.
     fn recover_routing_from_meta(&mut self) {
-        self.restore_pending = self
-            .projects
-            .values()
-            .flat_map(|dir| list_session_metas(dir))
-            // An external node's `meta.json` describes a process ccteam never
-            // started and whose client died with the daemon. There is nothing to
-            // rebuild: spawning a vendor in its place would mint a managed
-            // thread wearing another agent's identity. The meta stays as audit;
-            // the client re-enrolls (a fresh `initialize`) if it comes back.
-            .filter(|meta| {
-                meta.managed_by != ccteam_harness::execution::session_meta::ManagedBy::External
-            })
-            .map(|meta| meta.sid)
-            .collect();
+        let mut pending = Vec::new();
+        for dir in self.projects.values() {
+            for meta in list_session_metas(dir) {
+                self.session_catalog.insert(dir, &meta);
+                // An external node's metadata describes a process ccteam never
+                // started and whose client died with the daemon.
+                if meta.managed_by != ccteam_harness::execution::session_meta::ManagedBy::External {
+                    pending.push(meta.sid);
+                }
+            }
+        }
+        self.restore_pending = pending;
     }
 
     /// v0.8.21 Wave-2 — persist the ROUTING snapshot (per-chat focus + the
@@ -5842,11 +5877,15 @@ impl Gateway {
         // the slot and is left alone (`apply_title`'s precedence would reject
         // an Auto write over either anyway — this check just skips the
         // redundant meta.json read/write on every later turn).
-        if let Ok(mut meta) = read_session_meta(&project_dir, &session.id) {
+        if let Some(mut meta) = self
+            .session_catalog
+            .find_or_load(&session.id, &self.projects)
+            .map(|entry| entry.meta)
+        {
             if meta.title.is_none() {
                 if let Some(candidate) = truncate_title(user_text) {
                     if apply_title(&mut meta, candidate, TitleSource::Auto) {
-                        let _ = write_session_meta(&project_dir, &meta);
+                        let _ = self.persist_session_meta(&project_dir, &meta);
                     }
                 }
             }
@@ -6012,7 +6051,10 @@ impl Gateway {
         // One read for both axes: `model` falls back to the role's frontmatter
         // (a role may pin a model), `effort` has no such fallback — the vendor
         // default is the honest answer when the session never named one.
-        let meta = read_session_meta(&cwd, session_id).ok();
+        let meta = self
+            .session_catalog
+            .find_or_load(session_id, &self.projects)
+            .map(|entry| entry.meta);
         let model_id = meta
             .as_ref()
             .and_then(|m| m.model.clone())
@@ -7679,27 +7721,22 @@ impl Gateway {
         out
     }
 
-    /// Best-effort `last_active` (RFC3339) for a LIVE session, read from its
-    /// `meta.json`. Empty when the project/meta can't be resolved — sorts as
-    /// "oldest" in [`render_sessions`]'s ordering, never panics/blocks the list.
+    /// Best-effort `last_active` (RFC3339) for a LIVE session from the catalog.
+    /// Empty when metadata can't be resolved — sorts as "oldest" in
+    /// [`render_sessions`]'s ordering without filesystem I/O.
     fn session_last_active(&self, s: &GatewaySession) -> String {
-        self.projects
-            .get(&s.project)
-            .and_then(|dir| read_session_meta(dir, &s.id).ok())
-            .map(|m| m.last_active)
+        self.session_catalog
+            .get(&s.id)
+            .map(|entry| entry.meta.last_active)
             .unwrap_or_default()
     }
 
-    /// Best-effort user-facing title (v0.8.22 P1) for a LIVE session, read
-    /// from its `meta.json`. `None` when untitled or the meta can't be
-    /// resolved — [`render_sessions`] then falls back to the existing bare
-    /// `id:project:vendor:role` row (no behavior change for an untitled
-    /// session).
+    /// Best-effort user-facing title (v0.8.22 P1) for a LIVE session from the
+    /// catalog. `None` when untitled or metadata can't be resolved.
     fn session_title(&self, s: &GatewaySession) -> Option<String> {
-        self.projects
-            .get(&s.project)
-            .and_then(|dir| read_session_meta(dir, &s.id).ok())
-            .and_then(|m| m.title)
+        self.session_catalog
+            .get(&s.id)
+            .and_then(|entry| entry.meta.title)
     }
 
     /// The daemon's own in-flight turn state for one session — [`LiveTurn`]
@@ -7756,43 +7793,25 @@ impl Gateway {
     }
 
     /// Classify live sessions through the shared resolver
-    /// (`ccteam_core::stall::classify_session_activity`) — file-backed progress
+    /// (`ccteam_core::stall::classify_session_activity`) — projected progress
     /// truth folded with the daemon's in-flight turns, the same
     /// `working|idle|stale|stuck` vocabulary MCP `session_list` and the web
-    /// session list report. Reads each distinct project's progress stream once.
+    /// session list report. Each distinct project is snapshotted once from the
+    /// incremental projection; an up-to-date byte cursor makes this a stat plus
+    /// an in-memory clone rather than a journal scan.
     fn session_activity_snapshot(
         &self,
         sessions: &[&GatewaySession],
     ) -> std::collections::HashMap<String, String> {
-        let fallback_by_project: std::collections::HashMap<String, u64> = self
-            .project_paths
-            .as_ref()
-            .and_then(|paths| ccteam_core::collect_projects(paths).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|project| (project.state.slug, project.stall_silent_seconds))
-            .collect();
-        let mut project_events: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
-            std::collections::HashMap::new();
+        let mut projections = std::collections::HashMap::new();
         for session in sessions {
-            project_events
+            projections
                 .entry(session.project.clone())
                 .or_insert_with(|| {
-                    let events = self
-                        .project_paths
+                    self.progress_projection
                         .as_ref()
-                        .map(|paths| {
-                            ccteam_core::progress::read_all_events(
-                                &paths.progress_jsonl(&session.project),
-                            )
-                            .unwrap_or_default()
-                        })
-                        .unwrap_or_default();
-                    let silent = fallback_by_project
-                        .get(&session.project)
-                        .copied()
-                        .unwrap_or(0);
-                    (events, silent)
+                        .map(|projection| projection.project_snapshot(&session.project))
+                        .unwrap_or_default()
                 });
         }
         let now = chrono::Utc::now();
@@ -7800,19 +7819,21 @@ impl Gateway {
         sessions
             .iter()
             .map(|session| {
-                let (events, silent) = project_events
+                let projection = projections
                     .get(&session.project)
                     .expect("every requested project was classified");
-                let activity = ccteam_core::stall::classify_session_activity(
-                    events,
+                let silent = projection
+                    .last_valid
+                    .as_ref()
+                    .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+                    .unwrap_or(0);
+                let activity = projection.session_activity(
                     &session.id,
-                    *silent,
+                    silent,
                     self.live_turn(session, mono),
                     now,
-                )
-                .status
-                .activity;
-                (session.id.clone(), activity.to_string())
+                );
+                (session.id.clone(), activity.status.activity.to_string())
             })
             .collect()
     }
@@ -8156,9 +8177,8 @@ impl Gateway {
     // =================================================================
 
     /// Snapshot every tracked session as a [`SessionView`] (W5b). Holds the
-    /// gateway only long enough to clone scalar fields plus a best-effort
-    /// `meta.json` read per session (sync fs, no `.await` runs under any
-    /// lock) — so an SSE/list handler can call this cheaply. A session is
+    /// gateway only long enough to clone scalar fields and catalog metadata;
+    /// no filesystem access or `.await` occurs under the lock. A session is
     /// `current` when it is the active session for at least one routed chat.
     /// v0.8.22 P0-3 — ordered by `last_active` desc (numeric sid desc
     /// tiebreak for equal/missing `last_active`), replacing the old
@@ -8176,13 +8196,10 @@ impl Gateway {
             .sessions
             .values()
             .map(|s| {
-                // Best-effort `meta.json` read for created_at/last_active — a
-                // missing/unreadable meta degrades to empty strings (never
-                // panics, never drops the row).
-                let meta = self
-                    .projects
-                    .get(&s.project)
-                    .and_then(|dir| read_session_meta(dir, &s.id).ok());
+                // Every live write path synchronously refreshes the catalog.
+                // A missing entry degrades to empty display fields without
+                // turning this locked snapshot back into a disk-read loop.
+                let meta = self.session_catalog.get(&s.id).map(|entry| entry.meta);
                 let created_at = meta
                     .as_ref()
                     .map(|m| m.created_at.clone())
@@ -8255,6 +8272,21 @@ impl Gateway {
         views
     }
 
+    /// Number of lazy catalog disk reads since gateway construction.
+    pub fn session_catalog_disk_reads(&self) -> u64 {
+        self.session_catalog.disk_reads()
+    }
+
+    /// Persist session metadata and synchronously refresh the in-memory index.
+    /// Every gateway-owned metadata write routes through this choke point.
+    pub(crate) fn persist_session_meta(
+        &self,
+        project_dir: &Path,
+        meta: &SessionMeta,
+    ) -> Result<()> {
+        self.session_catalog.write(project_dir, meta)
+    }
+
     // ── external ledger nodes (hand-started clients) ──────────────────────────
 
     /// Mint the ledger node for a hand-started client that just enrolled over
@@ -8296,7 +8328,7 @@ impl Gateway {
         );
         // Same durable write the managed path uses: one `meta.json` shape means
         // a later takeover is a field flip, not a data migration.
-        write_session_meta(&cwd, &meta)?;
+        self.persist_session_meta(&cwd, &meta)?;
         self.external_nodes.insert(sid.clone(), meta);
         Ok(sid)
     }
@@ -8337,7 +8369,11 @@ impl Gateway {
             return vec![];
         };
         let live_sids: HashSet<&str> = self.sessions.keys().map(|s| s.as_str()).collect();
-        list_session_metas(cwd)
+        let metas = list_session_metas(cwd);
+        for meta in &metas {
+            self.session_catalog.insert(cwd, meta);
+        }
+        metas
             .into_iter()
             .filter(|m| !live_sids.contains(m.sid.as_str()))
             .collect()
@@ -8494,7 +8530,7 @@ impl Gateway {
         // "stopped" session in history).
         self.rebuild_session_from_meta(slug, cwd.clone(), &meta, caller.clone())
             .await?;
-        write_session_meta(&cwd, &meta)?;
+        self.persist_session_meta(&cwd, &meta)?;
         self.current_session
             .write()
             .unwrap()
@@ -8503,14 +8539,13 @@ impl Gateway {
         Ok(sid)
     }
 
-    /// Find a `meta.json` for `sid` by scanning all registered project dirs.
+    /// Find session metadata in O(1) after the first true catalog miss.
     fn find_meta_for_sid(&self, sid: &str) -> Result<(String, PathBuf, SessionMeta)> {
-        for (slug, cwd) in &self.projects {
-            if let Ok(meta) = read_session_meta(cwd, sid) {
-                return Ok((slug.clone(), cwd.clone(), meta));
-            }
-        }
-        anyhow::bail!("no meta.json found for session {sid}")
+        let entry = self
+            .session_catalog
+            .find_or_load(sid, &self.projects)
+            .ok_or_else(|| anyhow!("no meta.json found for session {sid}"))?;
+        Ok((entry.project, entry.project_dir, entry.meta))
     }
 
     /// True when `sid` is currently in the live session map (spawned + tracked).
@@ -8524,10 +8559,11 @@ impl Gateway {
 
     /// Resolve the project slug that owns `sid`, whether it is currently live or
     /// a *stopped* session with an on-disk `meta.json`. Checks the live map
-    /// first (O(1)); only a non-live sid pays the `meta.json` scan. Returns
-    /// `None` only when the sid has neither a live session nor any `meta.json` —
-    /// a genuinely unknown id. Unlike the capped history list the web rail
-    /// loads, this always finds a stopped session's project.
+    /// first, then the O(1) catalog; a true catalog miss lazily probes project
+    /// metadata paths and caches a successful result. Returns `None` only when
+    /// the sid has neither a live session nor any `meta.json` — a genuinely
+    /// unknown id. Unlike the capped history list the web rail loads, this
+    /// always finds a stopped session's project.
     pub fn project_slug_for_sid(&self, sid: &str) -> Option<String> {
         if let Some(session) = self.sessions.get(sid) {
             return Some(session.project.clone());
@@ -8961,9 +8997,24 @@ impl Gateway {
     /// / a vendor with no price table (grok/opencode/kimi) → `false` (inert),
     /// so the count guardrails are those vendors' only ceiling.
     pub(crate) fn delegation_budget_exceeded(&self, slug: &str, vendor: AgentVendor) -> bool {
-        self.project_paths
+        let Some(paths) = self.project_paths.as_ref() else {
+            return false;
+        };
+        let Some(cap) = crate::delegation::project_vendor_budget_cap(paths, slug, vendor) else {
+            return false;
+        };
+        self.progress_projection
             .as_ref()
-            .map(|p| crate::delegation::budget_exceeded(p, slug, vendor))
+            .map(|projection| {
+                projection
+                    .project_snapshot(slug)
+                    .cost
+                    .cost_24h_by_vendor
+                    .get(crate::delegation::vendor_key(vendor))
+                    .copied()
+                    .unwrap_or(0.0)
+                    >= cap
+            })
             .unwrap_or(false)
     }
 
@@ -9370,6 +9421,11 @@ impl Gateway {
     /// the client corrects it live from `dispatched`/`completed` SSE frames.
     pub fn armed_delegation_watch_sids(&self) -> std::collections::HashSet<String> {
         self.delegations.keys().cloned().collect()
+    }
+
+    /// Number of currently armed durable completion watches in memory.
+    pub fn armed_delegation_watch_count(&self) -> u32 {
+        self.delegations.len().try_into().unwrap_or(u32::MAX)
     }
 
     /// v0.9.0 W2 (F2/F7) — deliver one completed child turn to its watching
@@ -9896,11 +9952,14 @@ impl Gateway {
             }
         };
 
-        let mut meta = read_session_meta(&dir, sid)
-            .map_err(|e| anyhow!("meta.json missing for session {sid}: {e}"))?;
+        let mut meta = self
+            .session_catalog
+            .find_or_load(sid, &self.projects)
+            .map(|entry| entry.meta)
+            .ok_or_else(|| anyhow!("meta.json missing for session {sid}"))?;
         let previous = meta.title.clone();
         apply_title(&mut meta, cleaned.clone(), TitleSource::User);
-        write_session_meta(&dir, &meta)?;
+        self.persist_session_meta(&dir, &meta)?;
 
         let target = SessionTitleTarget {
             sid: sid.to_string(),
@@ -10132,95 +10191,28 @@ fn context_echo_line(slug: &str, sid: &str, role: &str, title: Option<&str>) -> 
 /// captures out of the gateway by the time this runs).
 fn refresh_session_activity_meta(
     project_dir: &Path,
+    slug: &str,
     sid: &str,
     vendor: AgentVendor,
-    progress_path: Option<&Path>,
+    projection: Option<&crate::progress_projection::ProgressProjection>,
+    catalog: &crate::session_catalog::SessionCatalog,
 ) {
-    let Ok(mut meta) = read_session_meta(project_dir, sid) else {
+    let Some(mut meta) = catalog.get(sid).map(|entry| entry.meta) else {
         return;
     };
     meta.last_active = chrono::Utc::now().to_rfc3339();
     meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
         .map(|turns| turns.len() as u64)
         .unwrap_or(meta.turn_count);
-    if let Some(path) = progress_path {
-        let (cost_usd, tokens_total, observed_model) = session_cost_and_tokens(path, sid, vendor);
-        meta.cost_usd = cost_usd;
-        meta.tokens_total = tokens_total;
-        if observed_model.is_some() {
-            meta.observed_model = observed_model;
+    if let Some(session) = projection.and_then(|projection| projection.session_snapshot(slug, sid))
+    {
+        meta.cost_usd = session.pricing(vendor).cost_usd;
+        meta.tokens_total = session.tokens_total;
+        if session.observed_model.is_some() {
+            meta.observed_model = session.observed_model;
         }
     }
-    let _ = write_session_meta(project_dir, &meta);
-}
-
-/// Sum the deterministic per-turn cost AND raw token count of every
-/// `chat_turn_completed` event in `progress_path` tagged with `sid`, pricing
-/// each turn's `usage` against its own canonical `model` via
-/// [`ccteam_cost::resolve_turn_cost`] — mirrors `ccteam-web`'s
-/// `status::build_session_cost_rows`, scoped to one sid so it can run from the
-/// harness-side pump (which has no access to that web-layer helper). `None`
-/// when nothing priced/counted yet (never a faked `0.0`); a turn whose model
-/// is absent/not in the pricing table is silently skipped from the COST sum
-/// (no fallback to a wrong rate — same honesty contract as the status route)
-/// but still counted into `tokens_total` — the v0.9.5 feedback fix: a vendor
-/// with no price table (codex/grok/opencode/kimi) at least accrues an honest
-/// token ledger instead of a permanently-null row.
-fn session_cost_and_tokens(
-    progress_path: &Path,
-    sid: &str,
-    vendor: AgentVendor,
-) -> (Option<f64>, Option<u64>, Option<String>) {
-    let Ok(events) = ccteam_core::progress::read_all_events(progress_path) else {
-        return (None, None, None);
-    };
-    let cost_vendor = vendor.cost_vendor();
-    let mut total = 0.0_f64;
-    let mut priced = 0usize;
-    let mut tokens = 0u64;
-    let mut counted = 0usize;
-    // The LAST non-empty model tag wins — same events, one extra fact: the
-    // canonical model the vendor itself stamped on the turn, which is what
-    // `SessionMeta::observed_model` durably shows after the session stops.
-    let mut observed_model: Option<String> = None;
-    for ev in &events {
-        if ev.get("event").and_then(|v| v.as_str())
-            != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
-        {
-            continue;
-        }
-        if ev.get("sid").and_then(|v| v.as_str()) != Some(sid) {
-            continue;
-        }
-        if let Some(m) = ev
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            observed_model = Some(m.to_string());
-        }
-        let Some(usage) = ev
-            .get("usage")
-            .and_then(|u| serde_json::from_value::<ccteam_cost::UnifiedTokenUsage>(u.clone()).ok())
-        else {
-            continue;
-        };
-        if usage.total() > 0 {
-            tokens = tokens.saturating_add(usage.total());
-            counted += 1;
-        }
-        let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
-        if let Some(cost) = ccteam_cost::resolve_turn_cost(&usage, cost_vendor, model) {
-            total += cost;
-            priced += 1;
-        }
-    }
-    (
-        (priced > 0).then_some(total),
-        (counted > 0).then_some(tokens),
-        observed_model,
-    )
+    let _ = catalog.write(project_dir, &meta);
 }
 
 /// Admin-web fallback for an unowned legacy resource or an unknown sid.
@@ -11978,6 +11970,30 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.driveable);
+    }
+
+    #[tokio::test]
+    async fn repeated_session_views_do_not_read_live_session_meta_from_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 8 });
+        for _ in 0..6 {
+            spawn_managed(&mut gateway).await;
+        }
+        assert_eq!(gateway.session_views().len(), 6);
+        let reads = gateway.session_catalog_disk_reads();
+
+        for _ in 0..10 {
+            let views = gateway.session_views();
+            assert_eq!(views.len(), 6);
+            assert!(views.iter().all(|view| !view.created_at.is_empty()));
+        }
+        assert_eq!(
+            gateway.session_catalog_disk_reads(),
+            reads,
+            "catalog-backed live views must remain pure in-memory snapshots"
+        );
     }
 
     /// The reason external nodes exist: a child spawned BY a hand-started agent

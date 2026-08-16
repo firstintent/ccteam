@@ -557,6 +557,18 @@ impl Default for WorkflowSummary {
 /// Errors only on hard IO failure (e.g. `state.json` unreadable mid-read,
 /// project directory absent).
 pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSummary> {
+    let events = progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
+    workflow_summary_from_events(slug, paths, &events)
+}
+
+/// Build the same workflow summary from an already-projected event slice.
+/// Daemon consumers use this entry point to preserve the one-shot CLI's file-
+/// based behavior while avoiding a second progress-journal scan.
+pub fn workflow_summary_from_events(
+    slug: &str,
+    paths: &CcteamPaths,
+    events: &[Value],
+) -> Result<WorkflowSummary> {
     let project_dir = paths.project_dir(slug);
 
     // Try to load workflow.yaml; absence is non-fatal (legacy project).
@@ -573,30 +585,21 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
         }
     };
 
-    // Load progress events from the flat `<slug>.jsonl` file (F66
-    // writes there for workflow projects, where V0.4.0 lives).
-    let events: Vec<Value> =
-        progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
-
-    let total_cost_usd = workflow_cost_total(&events);
+    let total_cost_usd = workflow_cost_total(events);
     // V0.4.6 F91 — rich cost surface (24h / active / total). `cost`
     // shares the same agent_done aggregation as `total_cost_usd`; the
     // extra dimensions (24h window + live state.json probe) are what
     // F84 budget cap + F90 sparkline consume. `total_cost_usd` stays
     // for SPA back-compat until F90 finishes the cutover.
-    let cost = compute_cost_summary(&events, Utc::now(), |job_id| {
-        crate::claude_job::probe_job(job_id)
-    });
-    let escalation_count = escalation_count(&events);
+    let cost = compute_cost_summary(events, Utc::now(), crate::claude_job::probe_job);
+    let escalation_count = escalation_count(events);
     // V0.4.5 F80 — liveness-aware accounting. Each open `agent_spawn`
     // is cross-referenced against `~/.claude/jobs/<job_id>/state.json`
     // so phantom rows (daemon SIGKILL casualties whose process died
     // without writing `agent_done`) drop out of the running count
     // immediately, before the orchestrator's next `poll_completions`
     // tick writes the synthetic cleanup event.
-    let sessions = current_agent_sessions_with_liveness(&events, |job_id| {
-        crate::claude_job::probe_job(job_id)
-    });
+    let sessions = current_agent_sessions_with_liveness(events, crate::claude_job::probe_job);
 
     let mut artifact_counts: HashMap<String, u64> = HashMap::new();
     let mut gate_states: HashMap<String, String> = HashMap::new();
@@ -609,7 +612,7 @@ pub fn workflow_summary(slug: &str, paths: &CcteamPaths) -> Result<WorkflowSumma
                 gate_states.insert(agent.role.clone(), "waiting".to_string());
             }
         }
-        for event in &events {
+        for event in events {
             if event.get("event").and_then(|s| s.as_str()) == Some("gate_triggered") {
                 if let Some(role) = event.get("role").and_then(|s| s.as_str()) {
                     gate_states.insert(role.to_string(), "fired".to_string());

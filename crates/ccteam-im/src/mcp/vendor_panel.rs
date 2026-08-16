@@ -671,9 +671,10 @@ fn build_project_panel(paths: &CcteamPaths, slug: &str) -> (PanelHeader, Vec<Pan
         .unwrap_or_else(|| LOCAL_HOST.to_string());
     let project_dir = entry.as_ref().map(|e| e.path.clone());
     let budgets = project_dir.as_deref().and_then(budgets_for_project);
-    let spend_24h = ccteam_core::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
-        .map(|s| s.cost_24h_by_vendor)
-        .unwrap_or_default();
+    let spend_24h = crate::progress_projection::ProgressProjection::new(paths.clone())
+        .project_snapshot(slug)
+        .cost
+        .cost_24h_by_vendor;
 
     if host == LOCAL_HOST {
         let availability = ccteam_core::host_registry::probe_availability(false);
@@ -711,10 +712,10 @@ fn build_local_panel(
                 .map(|e| e.path.clone())
                 .as_deref()
                 .and_then(budgets_for_project);
-            let spend =
-                ccteam_core::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
-                    .map(|s| s.cost_24h_by_vendor)
-                    .unwrap_or_default();
+            let spend = crate::progress_projection::ProgressProjection::new(paths.clone())
+                .project_snapshot(slug)
+                .cost
+                .cost_24h_by_vendor;
             (budgets, spend)
         }
         None => (None, BTreeMap::new()),
