@@ -203,4 +203,26 @@ mod tests {
         assert_eq!(rows[0].event, "Stop");
         assert_eq!(rows[0].ts, "");
     }
+
+    #[test]
+    fn recent_events_survive_torn_utf8_mid_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join(".ccteam"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let path = paths.progress_jsonl("demo");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut raw = b"{\"event\":\"first\"}\n".to_vec();
+        raw.extend_from_slice("{\"text\":\"配置：".as_bytes());
+        raw.truncate(raw.len() - 2);
+        raw.extend_from_slice(b"{\"event\":\"glued\"}\n");
+        raw.extend_from_slice(b"{\"event\":\"latest\"}\n");
+        std::fs::write(path, raw).unwrap();
+
+        let events = slug_recent_events(&paths, "demo", 10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "first");
+        assert_eq!(events[1]["event"], "latest");
+    }
 }

@@ -285,20 +285,7 @@ pub fn collect_recent_events(paths: &CcteamPaths, slug: &str, n: usize) -> Resul
 }
 
 fn read_tail_events(path: &std::path::Path, n: usize) -> Result<Vec<Value>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut all: Vec<Value> = body
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    if all.len() > n {
-        let drop = all.len() - n;
-        all.drain(..drop);
-    }
-    Ok(all)
+    Ok(crate::journal::tail_valid(path, n)?.events)
 }
 
 // ---------------- V0.4.0 F67 WorkflowSummary ----------------

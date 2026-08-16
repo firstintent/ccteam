@@ -937,6 +937,95 @@ async fn rename_session_over_http_happy_path_and_validation() {
     assert_eq!(unknown.status(), 404);
 }
 
+#[tokio::test]
+async fn session_history_defaults_to_newest_100_and_pages_backwards() {
+    ccteam_core::disable_tool_surface_bootstrap_for_tests();
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://{addr}/api/v1");
+
+    let created = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let sid = created.json::<Value>().await.unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for index in 0..105 {
+        ccteam_harness::execution::turns_mirror::append_turn(
+            &project_dir,
+            &sid,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: format!("t{index:03}"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: format!("user {index}"),
+                assistant: format!("assistant {index}"),
+                usage: Value::Null,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let newest: Value = client
+        .get(format!("{base}/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let events = newest["events"].as_array().unwrap();
+    assert_eq!(events.len(), 100);
+    assert_eq!(events.first().unwrap()["turn_id"], "t005");
+    assert_eq!(events.last().unwrap()["turn_id"], "t104");
+    assert_eq!(newest["has_more"], true);
+    let cursor = newest["next_before"].as_str().unwrap();
+
+    let older: Value = client
+        .get(format!("{base}/sessions/{sid}?before={cursor}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let events = older["events"].as_array().unwrap();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events.first().unwrap()["turn_id"], "t000");
+    assert_eq!(events.last().unwrap()["turn_id"], "t004");
+    assert_eq!(older["has_more"], false);
+    assert!(older["next_before"].is_null());
+
+    let invalid = client
+        .get(format!("{base}/sessions/{sid}?before=not-a-cursor"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+}
+
 /// ACL: a tenant may rename its OWN project's session, but a different
 /// tenant (no ownership of that project) gets 404 — the same project-owned
 /// gate every other `/sessions/{sid}/*` route uses (`gate_sid` →

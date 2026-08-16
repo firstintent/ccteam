@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -49,127 +49,24 @@ pub use ccteam_harness::execution::progress_bridge::{
     SESSION_STREAM_DETACHED, SESSION_STREAM_REATTACHED,
 };
 
-/// Read + parse the last non-empty line of `path`. `Ok(None)` when the
-/// file is absent or contains no events yet.
-///
-/// **Tail read (v0.8.7 review-fix R-M7).** This is called by
-/// `queries::collect_projects` on EVERY `ccteam status` / `ccteam … ls` /
-/// `GET /api/v1/projects`, once per project. progress.jsonl has no rotation
-/// or size cap, so a `read_to_string` of the whole file is O(file size) on a
-/// hot, frequently-polled path. Instead we seek to EOF and read bounded
-/// chunks *backwards* ([`TAIL_CHUNK`] at a time) until a newline separating
-/// the last record is found — bytes read are bounded by the size of the last
-/// record(s), independent of total file length. Falls back to reading from
-/// offset 0 only when the entire file is one (chunk-spanning) line.
+/// Read the last parseable event from `path`, skipping corrupt trailing rows.
+/// `Ok(None)` when the file is absent or contains no valid events yet.
 pub fn last_event(path: &Path) -> Result<Option<Value>> {
-    match read_last_line(path).with_context(|| format!("read {}", path.display()))? {
-        None => Ok(None),
-        Some(line) => {
-            let v: Value = serde_json::from_str(line.trim())
-                .with_context(|| format!("parse last line of {}", path.display()))?;
-            Ok(Some(v))
-        }
-    }
-}
-
-/// Backward read chunk size for [`read_last_line`]. 8 KiB comfortably holds a
-/// single progress event line (token-usage payloads are the largest, well
-/// under 8 KiB) so the common case reads exactly one chunk.
-const TAIL_CHUNK: u64 = 8 * 1024;
-
-/// Return the last non-empty line of `path` as an owned `String`, reading
-/// from the tail in bounded [`TAIL_CHUNK`] steps. `Ok(None)` when the file is
-/// absent / empty / only whitespace. Bytes read are O(size of trailing
-/// record), NOT O(file size).
-fn read_last_line(path: &Path) -> std::io::Result<Option<String>> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        // Absent file ⇒ no events yet (matches the old `path.exists()` guard).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut pos = f.seek(SeekFrom::End(0))?;
-    if pos == 0 {
-        return Ok(None); // empty file
-    }
-
-    // Accumulate bytes read so far (in file order) at the FRONT of `buf` so we
-    // can scan for the newline that opens the final record.
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        let step = pos.min(TAIL_CHUNK);
-        pos -= step;
-        f.seek(SeekFrom::Start(pos))?;
-        let mut chunk = vec![0u8; step as usize];
-        f.read_exact(&mut chunk)?;
-        // Prepend this earlier chunk before what we already have.
-        chunk.extend_from_slice(&buf);
-        buf = chunk;
-
-        // Trim trailing newlines/whitespace bytes (a file usually ends with
-        // '\n'); then look for the newline that precedes the final record. We
-        // need a newline with at least one non-whitespace byte after it.
-        if let Some(line) = last_line_from_buf(&buf) {
-            return Ok(Some(line));
-        }
-        if pos == 0 {
-            // Reached BOF without an interior newline ⇒ the whole file is one
-            // line. Return it (trimmed) if non-empty.
-            let s = String::from_utf8_lossy(&buf);
-            let trimmed = s.trim();
-            return Ok(if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            });
-        }
-    }
-}
-
-/// Given a byte buffer that is a *suffix* of the file, return the last
-/// non-empty line IF it is fully contained in the buffer (i.e. there is an
-/// interior `\n` before it). Returns `None` when the buffer might not yet
-/// contain the start of the last line (caller reads another earlier chunk).
-fn last_line_from_buf(buf: &[u8]) -> Option<String> {
-    // Index of the end of the last non-whitespace byte.
-    let end = buf.iter().rposition(|b| !b.is_ascii_whitespace())? + 1;
-    // Scan backwards from `end` for a newline; that newline (if present in
-    // this buffer) delimits the start of the final record.
-    let line_start = buf[..end].iter().rposition(|&b| b == b'\n');
-    match line_start {
-        Some(nl) => {
-            // Interior newline found → the bytes after it are the full last
-            // line, fully contained in `buf`.
-            let line = String::from_utf8_lossy(&buf[nl + 1..end]);
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                // Trailing region was only whitespace after the newline —
-                // shouldn't happen given `end` trims whitespace, but be safe.
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        // No newline yet in this suffix → the last line may start earlier than
-        // the buffer's front; signal "read more".
-        None => None,
-    }
+    crate::journal::last_valid(path)
 }
 
 /// Read + parse all events from `path`. Skips empty lines and lines
 /// that fail to deserialize as JSON (defensive: a half-flushed line
 /// shouldn't crash the orchestrator's read).
 ///
-/// **Damage is per LINE, never per file** — see
-/// [`ccteam_harness::execution::fs_atomic::read_jsonl`], the shared tolerance
-/// rule for every append-only log ccteam writes. It matters most here: this
+/// **Damage is per LINE, never per file**. It matters most here: this
 /// stream is the state SoT, and a read that fails wholesale is degraded to "no
 /// events" by every caller, which then reads as `idle` / `$0` rather than as an
 /// error.
 pub fn read_all_events(path: &Path) -> Result<Vec<Value>> {
-    ccteam_harness::execution::fs_atomic::read_jsonl(path)
+    let mut events = Vec::new();
+    crate::journal::scan_stream(path, |event| events.push(event))?;
+    Ok(events)
 }
 
 /// Return the latest event that belongs to a gateway session id. New chat
@@ -749,6 +646,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const TAIL_CHUNK: u64 = 8 * 1024;
+
     #[test]
     fn idle_when_no_events_yet() {
         assert!(is_idle(None));
@@ -1167,13 +1066,22 @@ mod tests {
         assert_eq!(last["n"], 7);
     }
 
+    #[test]
+    fn last_event_skips_a_corrupt_trailing_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("progress.jsonl");
+        std::fs::write(&path, b"{\"event\":\"Stop\",\"n\":7}\n{not-json").unwrap();
+
+        let last = last_event(&path).unwrap().unwrap();
+        assert_eq!(last["event"], "Stop");
+        assert_eq!(last["n"], 7);
+    }
+
     /// The headline R-M7 assertion: a progress.jsonl far larger than
     /// `TAIL_CHUNK` returns the correct last event, and — crucially — the tail
-    /// reader touches only a bounded number of bytes near EOF, NOT the whole
-    /// file. We prove "bounded" structurally: `read_last_line` on a multi-MiB
-    /// file reads at most one `TAIL_CHUNK` here (the last record is tiny), so
-    /// we assert it returns instantly-correct results on a file two orders of
-    /// magnitude larger than the chunk without slurping it.
+    /// facade touches only a bounded number of bytes near EOF, NOT the whole
+    /// file. The last record fits in one backward block, so this fixture can be
+    /// much larger than the block without changing the read volume.
     #[test]
     fn last_event_tail_reads_large_file_correctly_and_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1199,8 +1107,8 @@ mod tests {
         assert_eq!(last["i"], 99999);
 
         // Bounded-read proof: the last line + its preceding newline fit well
-        // inside one TAIL_CHUNK, so read_last_line should resolve within a
-        // single backward chunk. We can't observe syscalls here, but we CAN
+        // inside one TAIL_CHUNK, so the facade resolves within a single
+        // backward chunk. We can't observe syscalls here, but we CAN
         // assert the last line itself is far smaller than the file — the
         // invariant the implementation relies on to stay O(record), not
         // O(file).
@@ -1211,7 +1119,7 @@ mod tests {
         );
     }
 
-    /// Edge: the final record straddles a `TAIL_CHUNK` boundary — the reader
+    /// Edge: the final record straddles a `TAIL_CHUNK` boundary — the facade
     /// must keep stepping backwards until it finds the opening newline.
     #[test]
     fn last_event_handles_record_spanning_chunk_boundary() {

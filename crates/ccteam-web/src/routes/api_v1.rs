@@ -603,23 +603,20 @@ fn build_workflow_session_detail(
         )
             .into_response();
     }
-    let events: Vec<serde_json::Value> = match std::fs::read_to_string(&progress_path) {
-        Ok(body) => body
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect(),
-        Err(err) => {
-            tracing::error!(slug, sid, %err, "workflow session: progress.jsonl read failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("progress.jsonl read failed for {slug}: {err}")
-                })),
-            )
-                .into_response();
-        }
-    };
+    let events: Vec<serde_json::Value> =
+        match ccteam_core::progress::read_all_events(&progress_path) {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::error!(slug, sid, %err, "workflow session: progress.jsonl read failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("progress.jsonl read failed for {slug}: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Find the `agent_spawn` event for <sid>. If we can't find one,
     // 404 — synthesising a SessionDetail from later events would lose

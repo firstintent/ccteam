@@ -495,6 +495,45 @@ async fn t08_session_detail_workflow_branch_returns_200() {
     );
 }
 
+/// A torn UTF-8 row in progress.jsonl must cost one row, not turn the
+/// workflow-session detail endpoint into a hard 500.
+#[tokio::test]
+async fn t08b_session_detail_survives_torn_utf8_progress_row() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    fixture_project(&paths, "team-torn");
+    let progress = paths.progress_jsonl("team-torn");
+    fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    let mut raw = serde_json::to_vec(&json!({
+        "event": "agent_spawn",
+        "role": "planner",
+        "session_id": "planner-t1",
+        "ts": "2026-05-17T11:00:00Z",
+    }))
+    .unwrap();
+    raw.push(b'\n');
+    raw.extend_from_slice("{\"text\":\"配置：".as_bytes());
+    raw.truncate(raw.len() - 2);
+    raw.extend_from_slice(b"{\"event\":\"glued\"}\n");
+    raw.extend_from_slice(b"{\"event\":\"agent_note\",\"session_id\":\"planner-t1\"}\n");
+    fs::write(progress, raw).unwrap();
+
+    let addr = spawn(AppState::new(paths)).await;
+    let resp = client()
+        .get(format!(
+            "http://{addr}/api/v1/projects/team-torn/sessions/planner-t1"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().any(|event| event["event"] == "agent_spawn"));
+    assert!(events.iter().any(|event| event["event"] == "agent_note"));
+}
+
 /// Workflow project with no matching agent_spawn for the requested
 /// sid → 404 (we don't synthesise a SessionDetail from nothing).
 #[tokio::test]

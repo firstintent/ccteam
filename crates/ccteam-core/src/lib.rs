@@ -253,6 +253,9 @@ pub use ccteam_cost::{
     estimate_cost, pricing_schema_version, pricing_schema_version_for, ModelPrices,
     UnifiedTokenUsage as Usage, Vendor,
 };
+pub mod journal {
+    pub use ccteam_harness::execution::journal::*;
+}
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
 pub use paths::{
     agent_tasks_root, agent_teams_root, canonical_home_dirs, ensure_ccteam_home,

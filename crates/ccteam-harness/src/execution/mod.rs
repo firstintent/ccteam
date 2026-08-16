@@ -15,6 +15,7 @@ pub mod experience;
 pub mod fs_atomic;
 pub mod grok_acp;
 pub mod host_channel;
+pub mod journal;
 pub mod kimi_acp;
 pub mod mcp_config;
 pub mod opencode_acp;
