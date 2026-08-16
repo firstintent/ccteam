@@ -38,18 +38,18 @@
 - **W1 收口(规划,合并序 V1-1→V1-2→V1-3 全 ff)**:`cargo fmt --all -- --check` PASS;`make check` clippy 0;`make test-baseline` 并行跑两轮各撞登记 `/tmp/alpha` 族(隔离双绿、s433 已 base 对照),序列化跑 **1916/0**(基线 1896→+20);`cargo test -p ccteam-web --no-fail-fast` **401/1**(唯一红 = 登记 pty env-flake `ws_last_client_disconnect_stops_pipe_pane`);writeback 绿。
 
 ### PERF-V1-4 StatusProjection + SessionCatalog(W2;依赖 V1-1 门 + V1-2 facade)
-- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs + crates/ccteam-web/src(routes/status.rs · routes/api_v1.rs · routes/sessions_api.rs · queries.rs · delegation.rs)` · **建议入口**:codex 委派
+- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-im/src(gateway.rs + 新投影模块)+ crates/ccteam-web/src(routes/status.rs · routes/api_v1.rs · routes/sessions_api.rs · queries.rs · delegation.rs · state.rs)+ harness progress_bridge(observer 缝)` · **建议入口**:codex 委派
 - **规格**:per-slug 内存聚合(last_valid、200 条 tail ring、24h 分钟桶+per-vendor、lifetime cost、per-sid cost/last-activity、委派计数、已消费 byte offset);更新点 = 门放行处单点;启动 `spawn_blocking` 水合(就绪前 stale+`warming_up`);hook 直写 fallback 靠访问时 stat+`read_delta` 补漏;SessionCatalog sid→meta 内存索引,写路径同步失效,`session_views()` 纯内存(消灭锁内逐会话磁盘读;顺手改 `sessions_api.rs:170-171` 与 `status.rs:184` 两条与事实相反的注释);消费面切换 /status(三遍合一)/projects/项目详情/session activity/budget gate/fleet_delegations;**status 聚合语义维持 global**。
 - **DoD**:200MB fixture status p95<100ms 且与大小无关、每调用读量 <10MB;session list(50 live)p95<50ms 锁内零文件 I/O;基线只增。
 
 ### PERF-V1-5 锁窄化(W3)
 - **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs + crates/ccteam-im/src(gateway.rs 委派通知器/emit_delegation_progress + mcp/dispatch.rs)` · **建议入口**:codex 委派
-- **规格**:两阶段模式(短锁校验+resolve+置状态带 generation → 放锁慢活 → 短锁 generation 校验提交)扫全族:`handle_session_turn` 冷 resume+submit、`handle_create_session` spawn+挤停+fsync、MCP `session_spawn`/`session_dispatch`(A2A fan-out 去串行化)、external/import `~/.claude` 扫描出锁、委派通知器仅 boundary/批量抢锁、`emit_delegation_progress` flock append 出锁;`queue_timeout` 与 `vendor_timeout` 分开计量,HTTP 入口起算整体 deadline;5xx additive `error_code`。
+- **规格**:两阶段模式(短锁校验+resolve+置状态带 generation → 放锁慢活 → 短锁 generation 校验提交)扫全族:`handle_session_turn` 冷 resume+submit、`handle_create_session` spawn+挤停+fsync、MCP `session_spawn`/`session_dispatch`(A2A fan-out 去串行化)、external/import `~/.claude` 扫描出锁、委派通知器仅 boundary/批量抢锁、`emit_delegation_progress` flock append 出锁;`queue_timeout` 与 `vendor_timeout` 分开计量,HTTP 入口起算整体 deadline;5xx additive `error_code`;**承接自 V1-6 的后端半件**:status/projects snapshot 带 `version` 支持 304(V1-6 重切为纯 SPA,规划决定 2026-08-16)。
 - **DoD**:50 并发 turn + 冷 resume 风暴互不冻结;「5s 预算被排队吃掉」型 502 消失;generation 防 lock-gap 竞态(挤停/替换窗口旧结果必须丢弃);回归形如「重复动作 + 之后 status 仍秒回」;基线只增。
 
-### PERF-V1-6 前端收敛(W3)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web(SPA)` · **建议入口**:codex 委派
-- **规格**:CostPill 与 StatusView 共用 status store(CostPill 现为可重叠定时链——修);5xx 指数退避+jitter;tab hidden 暂停;`session_lifecycle` 按 slug 增量 + 100-250ms debounce(消灭 `1+2N` 扇出);history 展开时分页(接 V1-2 limit/before);四 mount 视图共用 projects store;snapshot 带 `version` 支持 304。
+### PERF-V1-6 前端收敛(纯 SPA;与 W2 并行,规划重切 2026-08-16)
+- **状态**:进行中(codex 委派·2026-08-16) · **冲突域**:`crates/ccteam-web/web(SPA)` · **建议入口**:codex 委派
+- **规格**:CostPill 与 StatusView 共用 status store(CostPill 现为可重叠定时链——修);5xx 指数退避+jitter;tab hidden 暂停;`session_lifecycle` 按 slug 增量 + 100-250ms debounce(消灭 `1+2N` 扇出);history 展开时分页(接 V1-2 limit/before);四 mount 视图共用 projects store;**后端 version/304 移交 V1-5**(域切分:本卡零 Rust 改动)。
 - **DoD**:lifecycle burst 每 debounce 窗口 ≤1 次 reconcile;vitest/tsc/eslint 绿。
 
 ### PERF-V1-7 rotation + doctor(W4)
