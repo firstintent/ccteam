@@ -71,9 +71,9 @@ pub use execution::delegation::{
     NotifyMode,
 };
 pub use execution::dsh_acp::{
-    build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, resolve_dsh_default_bin,
-    tenant_home_segment, DshAcpAdapter, DshConfigSource, DshWebSpawnOptions, DSH_ACP_ADAPTER_NAME,
-    DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
+    build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, is_ccteam_managed_dsh_orphan,
+    resolve_dsh_default_bin, tenant_home_segment, DshAcpAdapter, DshConfigSource,
+    DshWebSpawnOptions, DSH_ACP_ADAPTER_NAME, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
 };
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};

@@ -108,6 +108,7 @@ axum-extra = { version = "0.10", features = ["cookie"] }
 # persistent login; axum-extra re-exports `Cookie`/`SameSite` but not `time`).
 cookie = "0.18"
 rand = "0.8"
+libc = "0.2"
 
 # V0.3.2 F53 — embed the vite-built SPA bundle (`web/dist/`) into the
 # binary so `ccteam web` ships the React UI without a separate static

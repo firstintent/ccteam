@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU16, Ordering},
     Arc,
@@ -25,8 +25,8 @@ use axum::{
 use axum_extra::extract::CookieJar;
 use ccteam_core::enroll::ensure_user_credential_in;
 use ccteam_harness::{
-    build_web_spawn_spec, tenant_home_segment, DshWebSpawnOptions, DSH_NATIVE_WEB_PROFILE,
-    DSH_WEB_PROFILE,
+    build_web_spawn_spec, is_ccteam_managed_dsh_orphan, tenant_home_segment, DshWebSpawnOptions,
+    DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
@@ -45,6 +45,8 @@ const READINESS_PREFIX: &str = "dsh web: http://127.0.0.1:";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const ORPHAN_STOP_GRACE: Duration = Duration::from_millis(750);
 const ERROR_TAIL_LINES: usize = 24;
 
 #[derive(Debug, Clone)]
@@ -642,6 +644,109 @@ pub fn companion_router() -> Router<AppState> {
         .route("/{*path}", any(handle_companion_request))
 }
 
+/// Reap DSH processes stranded by daemon versions that predate PDEATHSIG.
+///
+/// `/proc` is intentionally the authority here: only an init-parented process
+/// whose own `DSH_HOME` points inside this ccteam installation's managed DSH
+/// runtime can match. Failures are ignored because this startup cleanup is a
+/// best-effort compatibility sweep, never a reason to keep the daemon down.
+#[cfg(target_os = "linux")]
+pub(crate) async fn sweep_legacy_dsh_orphans(ccteam_home: &Path) {
+    let victims = legacy_dsh_orphans(ccteam_home);
+    if victims.is_empty() {
+        return;
+    }
+
+    for victim in &victims {
+        // SAFETY: kill is an async-signal-safe syscall. The predicate already
+        // restricted the target to an init-parented ccteam-managed DSH home.
+        let sent = unsafe { libc::kill(victim.pid, libc::SIGTERM) } == 0;
+        if sent {
+            tracing::info!(pid = victim.pid, "terminating legacy orphaned DSH process");
+        }
+    }
+
+    tokio::time::sleep(ORPHAN_STOP_GRACE).await;
+    for victim in victims {
+        // Re-read both the immutable process start time and the predicate
+        // inputs before escalation. This avoids signaling an unrelated process
+        // if Linux reused the pid during the grace window.
+        let Some(current) = legacy_dsh_process(victim.pid) else {
+            continue;
+        };
+        if current.start_time != victim.start_time
+            || !is_ccteam_managed_dsh_orphan(&current.dsh_home, current.ppid, ccteam_home)
+        {
+            continue;
+        }
+        // SAFETY: same constrained target as above, revalidated after grace.
+        if unsafe { libc::kill(victim.pid, libc::SIGKILL) } == 0 {
+            tracing::warn!(
+                pid = victim.pid,
+                "killed unresponsive legacy orphaned DSH process"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn sweep_legacy_dsh_orphans(_ccteam_home: &Path) {
+    // macOS has neither /proc nor PDEATHSIG; retain the existing graceful
+    // kill-on-drop behavior there.
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LegacyDshProcess {
+    pid: i32,
+    ppid: u32,
+    start_time: u64,
+    dsh_home: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_dsh_orphans(ccteam_home: &Path) -> Vec<LegacyDshProcess> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(legacy_dsh_process)
+        .filter(|process| {
+            is_ccteam_managed_dsh_orphan(&process.dsh_home, process.ppid, ccteam_home)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_dsh_process(pid: i32) -> Option<LegacyDshProcess> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` may contain spaces and parentheses, so split after its final ')'.
+    // The remaining fields begin at state (field 3): ppid is index 1 and
+    // starttime (field 22) is index 19.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let ppid = fields.get(1)?.parse().ok()?;
+    let start_time = fields.get(19)?.parse().ok()?;
+
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let value = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"DSH_HOME="))?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(LegacyDshProcess {
+        pid,
+        ppid,
+        start_time,
+        dsh_home: PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())),
+    })
+}
+
 async fn handle_companion_request(
     State(app): State<AppState>,
     jar: CookieJar,
@@ -935,6 +1040,26 @@ async fn spawn_until_ready(
     }
     for (key, value) in &spawn.env {
         command.env(key, value);
+    }
+    // `kill_on_drop` cannot run when the daemon itself is SIGKILLed. Bind the
+    // DSH web child to the spawning thread in the Linux kernel; macOS has no
+    // PDEATHSIG and keeps the existing graceful-teardown behavior.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getpid is an argument-free syscall.
+        let expected_parent = unsafe { libc::getpid() };
+        // SAFETY: only async-signal-safe libc calls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != expected_parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
     }
     let mut child = command
         .spawn()

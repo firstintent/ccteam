@@ -8,7 +8,7 @@ pub mod materialize;
 pub mod spawn_spec;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -43,6 +43,21 @@ const EVENT_BUFFER: usize = 256;
 
 /// Adapter name — stable id for handles / logs / tests.
 pub const DSH_ACP_ADAPTER_NAME: &str = "dsh-acp";
+
+/// Whether an OS process is an unusable orphan from ccteam's managed DSH
+/// runtime. Kept pure so startup cleanup can be tested without signaling a
+/// real process.
+pub fn is_ccteam_managed_dsh_orphan(dsh_home: &Path, ppid: u32, ccteam_home: &Path) -> bool {
+    if ppid != 1
+        || dsh_home
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let managed_root = ccteam_home.join("runtime").join("dsh");
+    dsh_home != managed_root && dsh_home.starts_with(managed_root)
+}
 
 const DSH_STATUS_GAP: &str = "DSH is driven through ccteam's own Cordis plugin (there is no vendor automation CLI). Vendor memory persists in this session's managed DSH home and survives restarts; deleting that directory resets DSH memory but keeps the ccteam transcript and ledger.";
 
@@ -576,6 +591,29 @@ mod tests {
     fn event_attachment_is_rebuildable() {
         let a = DshAcpAdapter::new();
         assert_eq!(a.event_attachment(), EventAttachment::Rebuildable);
+    }
+
+    #[test]
+    fn orphan_reaping_only_matches_our_init_parented_runtime_homes() {
+        let ccteam_home = Path::new("/srv/ccteam-home");
+        let managed = ccteam_home.join("runtime/dsh/web/user-alice");
+        assert!(is_ccteam_managed_dsh_orphan(&managed, 1, ccteam_home));
+        assert!(!is_ccteam_managed_dsh_orphan(&managed, 4242, ccteam_home));
+        assert!(!is_ccteam_managed_dsh_orphan(
+            Path::new("/home/alice/.dsh"),
+            1,
+            ccteam_home
+        ));
+        assert!(!is_ccteam_managed_dsh_orphan(
+            Path::new("/srv/unrelated/dsh"),
+            1,
+            ccteam_home
+        ));
+        assert!(!is_ccteam_managed_dsh_orphan(
+            Path::new("/srv/ccteam-home/runtime/dsh/../../alice/.dsh"),
+            1,
+            ccteam_home
+        ));
     }
 
     #[tokio::test]

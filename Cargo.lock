@@ -528,6 +528,7 @@ dependencies = [
  "dirs",
  "futures",
  "futures-util",
+ "libc",
  "mime_guess",
  "nix 0.29.0",
  "notify",

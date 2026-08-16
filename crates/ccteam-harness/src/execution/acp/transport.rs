@@ -183,6 +183,32 @@ impl AcpTransport {
         for (key, value) in envs {
             cmd.env(key, value);
         }
+        // `kill_on_drop` only covers graceful Rust teardown. If the daemon is
+        // SIGKILLed, an stdio ACP child can otherwise survive with its pipes
+        // disconnected and be reparented to init. Linux can bind the child to
+        // the exact spawning thread in the kernel; macOS has no PDEATHSIG, so
+        // its existing kill-on-drop behavior remains unchanged.
+        #[cfg(target_os = "linux")]
+        {
+            // Capture before fork so the child can close the classic race
+            // where the parent dies between fork and PR_SET_PDEATHSIG.
+            // SAFETY: getpid is an argument-free syscall.
+            let expected_parent = unsafe { libc::getpid() };
+            // SAFETY: the closure runs after fork and before exec. Its body is
+            // deliberately async-signal-safe: libc syscalls plus construction
+            // of an errno-backed io::Error, with no allocation or locking.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != expected_parent {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn {program} {:?}", args))?;
