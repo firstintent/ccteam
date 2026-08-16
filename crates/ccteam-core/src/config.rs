@@ -36,6 +36,8 @@ use serde::{Deserialize, Serialize};
 
 /// File name relative to `paths.root` (`~/.ccteam/`).
 pub const CONFIG_FILENAME: &str = "config.yaml";
+/// Environment override for [`DaemonConfig::workers`].
+pub const DAEMON_WORKERS_ENV: &str = "CCTEAM_DAEMON_WORKERS";
 
 /// Top-level config schema. Future fields plug in as their own
 /// optional sections without breaking existing files — `serde(default)`
@@ -66,6 +68,10 @@ pub struct CcteamConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog: Option<crate::watchdog::WatchdogConfig>,
 
+    /// Daemon runtime sizing. Absent → documented defaults.
+    #[serde(default, skip_serializing_if = "DaemonConfig::is_default")]
+    pub daemon: DaemonConfig,
+
     /// V0.4.6 F85: how many days a terminated `~/.claude/jobs/<id>/`
     /// directory may live before the daemon's startup GC sweep (or
     /// `ccteam doctor --gc-claude-jobs --apply`) reclaims it. Default
@@ -86,6 +92,55 @@ pub struct CcteamConfig {
     /// enforces on every agent-initiated (Ambient) spawn/dispatch.
     #[serde(default, skip_serializing_if = "DelegationConfig::is_default")]
     pub delegation: DelegationConfig,
+}
+
+/// Daemon runtime sizing. Every field defaults so existing config files remain
+/// valid and zero-config installs get a bounded multi-thread runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonConfig {
+    /// Tokio async worker threads used by `ccteam start`.
+    #[serde(default = "default_daemon_workers")]
+    pub workers: usize,
+}
+
+pub fn default_daemon_workers() -> usize {
+    4
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            workers: default_daemon_workers(),
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// Resolve the worker count, with the environment taking precedence over
+    /// `config.yaml`. Zero is rejected before it reaches Tokio's builder.
+    pub fn effective_workers(&self) -> Result<usize> {
+        let configured = match std::env::var(DAEMON_WORKERS_ENV) {
+            Ok(raw) => raw.parse::<usize>().with_context(|| {
+                format!("parse {DAEMON_WORKERS_ENV}={raw:?} as a positive integer")
+            })?,
+            Err(std::env::VarError::NotPresent) => self.workers,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow!("{DAEMON_WORKERS_ENV} is not valid UTF-8"));
+            }
+        };
+        if configured == 0 {
+            return Err(anyhow!(
+                "daemon.workers must be at least 1 (set in config.yaml or {DAEMON_WORKERS_ENV})"
+            ));
+        }
+        Ok(configured)
+    }
+
+    /// True when this section matches the built-in default, allowing config
+    /// serialization to omit it for byte-stability on untouched installs.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// v0.9.2 — daemon-wide live-session capacity. Every field defaults so older
@@ -178,6 +233,7 @@ impl Default for CcteamConfig {
             default_project: None,
             projects: Vec::new(),
             watchdog: None,
+            daemon: DaemonConfig::default(),
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
             sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
@@ -395,6 +451,7 @@ mod tests {
             default_project: Some("foo".to_string()),
             projects: vec![entry.clone()],
             watchdog: None,
+            daemon: DaemonConfig::default(),
             claude_jobs_retention_days: default_claude_jobs_retention_days(),
             sessions: SessionsConfig::default(),
             delegation: DelegationConfig::default(),
@@ -486,12 +543,29 @@ mod tests {
     }
 
     #[test]
-    fn session_and_delegation_defaults_are_documented_values() {
+    fn daemon_session_and_delegation_defaults_are_documented_values() {
         let cfg = CcteamConfig::default();
+        assert_eq!(cfg.daemon.workers, 4);
         assert_eq!(cfg.sessions.max_live, 50);
         assert_eq!(cfg.delegation.max_depth, 2);
         assert_eq!(cfg.delegation.max_children, 10);
         assert_eq!(cfg.delegation.max_delegated, 50);
+    }
+
+    #[test]
+    fn daemon_workers_yaml_override_parses() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(config_path(tmp.path()), "daemon:\n  workers: 9\n").unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.daemon.workers, 9);
+    }
+
+    #[test]
+    fn daemon_workers_one_is_a_valid_rollback_setting() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(config_path(tmp.path()), "daemon:\n  workers: 1\n").unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.daemon.workers, 1);
     }
 
     #[test]

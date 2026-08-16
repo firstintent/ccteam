@@ -156,11 +156,12 @@ pub use claude_job::{
 pub use claude_job::{link_scan_warn_count, reset_link_scan_warn_for_tests};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
-    default_claude_jobs_retention_days, default_project_host, load as load_ccteam_config,
-    lookup_project as lookup_project_in_config, pick_unused_project_slug,
-    remove_project as remove_project_from_config, save as save_ccteam_config,
-    upsert_project as upsert_project_in_config, CcteamConfig, DelegationConfig, ProjectEntry,
-    SessionsConfig, CONFIG_FILENAME,
+    default_claude_jobs_retention_days, default_daemon_workers, default_project_host,
+    load as load_ccteam_config, lookup_project as lookup_project_in_config,
+    pick_unused_project_slug, remove_project as remove_project_from_config,
+    save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
+    DaemonConfig, DelegationConfig, ProjectEntry, SessionsConfig, CONFIG_FILENAME,
+    DAEMON_WORKERS_ENV,
 };
 // V0.6.3 F142 — `trigger: schedule` cron evaluation.
 pub use cron::{Schedule, ScheduleError};

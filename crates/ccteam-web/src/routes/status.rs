@@ -37,9 +37,11 @@
 //! project-owner ACL.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{
     extract::State,
+    http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -48,6 +50,93 @@ use utoipa::ToSchema;
 
 use crate::auth::Identity;
 use crate::state::AppState;
+
+type StatusResult = Result<StatusResponse, String>;
+
+#[derive(Clone, Default)]
+pub(crate) struct StatusSingleflight {
+    inner: Arc<Mutex<SingleflightState>>,
+}
+
+#[derive(Default)]
+struct SingleflightState {
+    next_id: u64,
+    in_flight: Option<StatusFlight>,
+}
+
+struct StatusFlight {
+    id: u64,
+    result_tx: tokio::sync::watch::Sender<Option<StatusResult>>,
+}
+
+impl StatusSingleflight {
+    /// Run one blocking status computation for every overlapping set of
+    /// callers. The producer lives in a detached task, so dropping any waiter
+    /// cannot cancel it or leave `in_flight` occupied forever.
+    async fn get_or_compute<F>(&self, compute: F) -> StatusResult
+    where
+        F: FnOnce() -> StatusResponse + Send + 'static,
+    {
+        let mut result_rx = {
+            let mut state = self.lock_state();
+            if let Some(flight) = &state.in_flight {
+                flight.result_tx.subscribe()
+            } else {
+                let id = state.next_id;
+                state.next_id = state.next_id.wrapping_add(1);
+                let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                state.in_flight = Some(StatusFlight {
+                    id,
+                    result_tx: result_tx.clone(),
+                });
+
+                let singleflight = self.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(compute)
+                        .await
+                        .map_err(|err| format!("status aggregation task failed: {err}"));
+                    // Clear before publishing while holding one non-async lock:
+                    // existing subscribers receive this result, while a caller
+                    // arriving after completion starts a fresh computation.
+                    let mut state = singleflight.lock_state();
+                    if state.in_flight.as_ref().map(|flight| flight.id) == Some(id) {
+                        state.in_flight = None;
+                    }
+                    let _ = result_tx.send(Some(result));
+                });
+                result_rx
+            }
+        };
+
+        let result = match result_rx.wait_for(Option::is_some).await {
+            Ok(result) => result
+                .clone()
+                .expect("watch predicate guarantees a status result"),
+            Err(_) => Err("status aggregation ended without a result".to_string()),
+        };
+        result
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, SingleflightState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
+        self.lock_state()
+            .in_flight
+            .as_ref()
+            .map(|flight| flight.result_tx.receiver_count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn is_in_flight(&self) -> bool {
+        self.lock_state().in_flight.is_some()
+    }
+}
 
 /// `GET /api/v1/status` response — the daemon-wide snapshot the cost pill +
 /// Status view render.
@@ -174,6 +263,45 @@ pub(crate) async fn handle_status(
     State(app): State<AppState>,
     Extension(identity): Extension<Identity>,
 ) -> Response {
+    let compute_app = app.clone();
+    let status = match app
+        .status_singleflight
+        .get_or_compute(move || aggregate_status(&compute_app))
+        .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::error!(error = %err, "GET /api/v1/status aggregation failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err})),
+            )
+                .into_response();
+        }
+    };
+
+    // Project ACL checks read project state; keep those per-identity reads off
+    // async workers too, while the expensive global snapshot above stays shared.
+    let filter_app = app.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut status = status;
+        retain_visible_session_rows(&filter_app, &identity, &mut status.sessions);
+        Json(status).into_response()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(error = %err, "GET /api/v1/status ACL task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Compute the global snapshot synchronously. This function only runs inside
+/// `spawn_blocking`; even the gateway snapshot uses `blocking_lock`, so no
+/// filesystem scan or synchronous lock wait occupies a Tokio worker.
+fn aggregate_status(app: &AppState) -> StatusResponse {
     let daemon_healthy = ccteam_core::check_daemon_health(&app.paths).is_healthy();
 
     // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
@@ -181,11 +309,7 @@ pub(crate) async fn handle_status(
     // split is daemon health (the gateway has no finer per-session bit).
     let mut session_rows: Vec<SessionCostRow> = Vec::new();
     let tracked_count: u32 = if let Some(gw) = app.gateway.as_ref() {
-        // session_views() is sync once we hold the lock (no `.await` under it).
-        let views = {
-            let guard = gw.lock().await;
-            guard.session_views()
-        };
+        let views = gw.blocking_lock().session_views();
         // v0.8.18 柱1 — decorate each live session with its best-effort cost.
         session_rows = build_session_cost_rows(&app.paths, &views);
         views.len() as u32
@@ -228,9 +352,7 @@ pub(crate) async fn handle_status(
     let (active_watches, notified_24h, denied_24h) =
         ccteam_im::delegation::fleet_delegations(&app.paths);
 
-    retain_visible_session_rows(&app, &identity, &mut session_rows);
-
-    Json(StatusResponse {
+    StatusResponse {
         daemon_healthy,
         sessions_live,
         sessions_idle,
@@ -243,8 +365,7 @@ pub(crate) async fn handle_status(
             notified_24h,
             denied_24h,
         },
-    })
-    .into_response()
+    }
 }
 
 /// Keep daemon-wide aggregates global while hiding per-session rows whose
@@ -370,6 +491,140 @@ fn vendor_from_str(vendor: &str) -> ccteam_cost::Vendor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct BlockingGate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl BlockingGate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn status_with_live_count(sessions_live: u32) -> StatusResponse {
+        StatusResponse {
+            daemon_healthy: false,
+            sessions_live,
+            sessions_idle: 0,
+            cost_24h_usd: 0.0,
+            cost_24h_by_vendor: BTreeMap::new(),
+            budget_cap_24h: None,
+            sessions: Vec::new(),
+            delegations: DelegationSummary::default(),
+        }
+    }
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !predicate() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition should become true promptly");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_singleflight_coalesces_concurrent_requests() {
+        const REQUESTS: usize = 12;
+        let singleflight = StatusSingleflight::default();
+        let start = Arc::new(tokio::sync::Barrier::new(REQUESTS + 1));
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(BlockingGate::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let mut requests = Vec::new();
+
+        for _ in 0..REQUESTS {
+            let singleflight = singleflight.clone();
+            let start = Arc::clone(&start);
+            let compute_count = Arc::clone(&compute_count);
+            let gate = Arc::clone(&gate);
+            let started_tx = Arc::clone(&started_tx);
+            requests.push(tokio::spawn(async move {
+                start.wait().await;
+                singleflight
+                    .get_or_compute(move || {
+                        compute_count.fetch_add(1, Ordering::SeqCst);
+                        if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                            let _ = started_tx.send(());
+                        }
+                        gate.wait();
+                        status_with_live_count(7)
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        start.wait().await;
+        started_rx.await.unwrap();
+        wait_until(|| singleflight.subscriber_count() == REQUESTS).await;
+        gate.release();
+
+        for request in requests {
+            assert_eq!(request.await.unwrap().sessions_live, 7);
+        }
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_status_request_does_not_wedge_the_next_request() {
+        let singleflight = StatusSingleflight::default();
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(BlockingGate::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first = {
+            let singleflight = singleflight.clone();
+            let compute_count = Arc::clone(&compute_count);
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                singleflight
+                    .get_or_compute(move || {
+                        compute_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
+                        gate.wait();
+                        status_with_live_count(1)
+                    })
+                    .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        gate.release();
+        wait_until(|| !singleflight.is_in_flight()).await;
+
+        let next_count = Arc::clone(&compute_count);
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            singleflight.get_or_compute(move || {
+                next_count.fetch_add(1, Ordering::SeqCst);
+                status_with_live_count(2)
+            }),
+        )
+        .await
+        .expect("the request after cancellation must complete promptly")
+        .unwrap();
+        assert_eq!(next.sessions_live, 2, "completed results are not cached");
+        assert_eq!(compute_count.load(Ordering::SeqCst), 2);
+    }
 
     fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {
         ccteam_core::CcteamPaths {

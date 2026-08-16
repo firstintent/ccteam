@@ -1608,6 +1608,19 @@ struct StartImdOpts {
     disabled: bool,
 }
 
+const DAEMON_MAX_BLOCKING_THREADS: usize = 16;
+
+fn build_daemon_runtime(workers: usize) -> Result<tokio::runtime::Runtime> {
+    // `daemon.workers=1` (or CCTEAM_DAEMON_WORKERS=1) is the rollback switch:
+    // it keeps the runtime topology while restoring one async worker thread.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(DAEMON_MAX_BLOCKING_THREADS)
+        .enable_all()
+        .build()
+        .context("build tokio daemon runtime")
+}
+
 fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     init_tracing();
 
@@ -1629,6 +1642,11 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     );
 
     let paths = CcteamPaths::from_env()?;
+    let daemon_workers = ccteam_core::config::load(&paths.root)
+        .context("load daemon runtime config")?
+        .daemon
+        .effective_workers()
+        .context("resolve daemon.workers")?;
 
     // Ensure the global `~/.ccteam/` home (canonical dirs +
     // `hooks/hook.sh` dispatcher) is complete BEFORE the daemon starts
@@ -1758,10 +1776,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
     }
 
     let hook_sink_paths = paths.clone();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
+    let runtime = build_daemon_runtime(daemon_workers)?;
     let result = runtime.block_on(async move {
         // v8.1 gateway + web + hook sink share one shutdown signal
         // (Ctrl-C, SIGTERM, or `ccteam stop` trigger file). No flow
@@ -2772,5 +2787,20 @@ mod lan_ip_tests {
         if let Some(ip) = first_lan_ipv4() {
             assert!(is_lan_ipv4(&ip), "returned non-LAN ip: {ip}");
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_runtime_is_multi_thread_with_requested_worker_count() {
+        let runtime = build_daemon_runtime(3).unwrap();
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
+        assert_eq!(runtime.metrics().num_workers(), 3);
     }
 }
