@@ -266,6 +266,7 @@ async fn end_to_end_turn_completed_writes_progress_jsonl_with_vendor_codex() {
     let ctx = SpawnCtx {
         slug: "demo-codex".into(),
         sid: "codex-sid-1".into(),
+        owner: "user:web-api".into(),
         cwd: home.path().to_path_buf(),
         project_dir: home.path().to_path_buf(),
         extra_args: vec![],

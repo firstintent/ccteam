@@ -200,6 +200,7 @@ fn ctx(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
         sid: sid.to_string(),
+        owner: "user:web-api".into(),
         cwd: tmp.to_path_buf(),
         project_dir: tmp.to_path_buf(),
         extra_args: vec![],

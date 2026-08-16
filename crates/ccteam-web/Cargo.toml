@@ -89,6 +89,7 @@ axum = { workspace = true, features = ["ws"] }
 # the `tungstenite::Message` bridge type. Same 0.24 pin as ccteam-harness
 # (matches axum 0.8's internal tungstenite).
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
 askama = { workspace = true }
 # Constant-time token comparison (M5.3 token auth). Pulled in now so
 # `ServeOpts` can carry the token-file knob without churning dep
@@ -108,6 +109,7 @@ axum-extra = { version = "0.10", features = ["cookie"] }
 # persistent login; axum-extra re-exports `Cookie`/`SameSite` but not `time`).
 cookie = "0.18"
 rand = "0.8"
+libc = "0.2"
 
 # V0.3.2 F53 — embed the vite-built SPA bundle (`web/dist/`) into the
 # binary so `ccteam web` ships the React UI without a separate static
@@ -155,3 +157,4 @@ async-trait.workspace = true
 # session_name collisions can't happen even on `cargo test -j N`.
 serial_test = "3"
 nix = { version = "0.29", default-features = false, features = ["signal", "process"] }
+flate2.workspace = true

@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use axum::{middleware::from_fn_with_state, Router};
 use ccteam_core::CcteamPaths;
 use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
 
 pub mod auth;
 pub mod chat_protocol;
@@ -152,6 +153,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(routes::stateless_router())
         .merge(mcp)
         .merge(stateful)
+        .layer(CompressionLayer::new().gzip(true).br(true))
 }
 
 /// Standalone `ccteam web` entry. Calls [`serve_with_shutdown`] with
@@ -199,6 +201,12 @@ where
     B: FnOnce(CcteamPaths, AuthState) -> AppState,
 {
     let paths = CcteamPaths::from_env().context("resolve CcteamPaths from env for ccteam web")?;
+
+    // Older builds could leave DSH children behind when the daemon was
+    // SIGKILLed. Sweep only init-parented processes carrying a DSH_HOME under
+    // this resolved ccteam runtime before accepting new work. New children are
+    // also protected by Linux PDEATHSIG at both DSH spawn sites.
+    dsh_web::sweep_legacy_dsh_orphans(&paths.root).await;
 
     let listener = TcpListener::bind(opts.bind)
         .await

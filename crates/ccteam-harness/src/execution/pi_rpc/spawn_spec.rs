@@ -122,6 +122,7 @@ mod tests {
         SpawnCtx {
             slug: "demo".to_string(),
             sid: "s42".to_string(),
+            owner: "user:web-api".into(),
             cwd: PathBuf::from("/tmp/demo"),
             project_dir: PathBuf::from("/tmp/demo"),
             secret: "sekret".to_string(),

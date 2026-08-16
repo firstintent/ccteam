@@ -68,6 +68,7 @@ fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
         slug: "demo".into(),
         sid: sid.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -719,6 +720,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     let ctx_with_secret = |sid: &str| SpawnCtx {
         slug: "demo".into(),
         sid: sid.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -843,6 +845,7 @@ async fn session_new_offers_this_sessions_principal_verbatim() {
             &SpawnCtx {
                 slug: "demo".into(),
                 sid: "s77".into(),
+                owner: "user:web-api".into(),
                 cwd: tmp.path().to_path_buf(),
                 project_dir: tmp.path().to_path_buf(),
                 extra_args: vec![],

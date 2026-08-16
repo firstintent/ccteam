@@ -149,6 +149,7 @@ fn make_ctx_sid(slug: &str, sid: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
         sid: sid.to_string(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],
@@ -166,6 +167,7 @@ fn make_ctx_hitl(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
         sid: F172_SID.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],

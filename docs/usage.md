@@ -40,7 +40,7 @@ ccteam calls the Claude Code, Codex, Grok Build, OpenCode, Kimi Code, DSH, and P
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`; managed DSH sessions can read `DEEPSEEK_API_KEY`, and DSH Web spaces can be configured from native Settings → Models |
+| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`; DSH sessions and DSH Web use `DEEPSEEK_API_KEY` when set, otherwise the identity's DSH Settings → Models config |
 | Pi | [pi.dev](https://pi.dev/) | provider API key, verified with `pi auth check --provider <provider>` |
 
 **1 · Let an agent do it**
@@ -125,9 +125,10 @@ Every `ccteam daemon start` (and foreground `ccteam start`) automatically regist
 The **DSH** page embeds native DeepSeek Harness Web through the companion listener. It uses the same ccteam login cookie as the rest of the console; the DSH process never receives the ccteam cookie or bearer token.
 
 - **Owner:** ccteam uses the real `~/.dsh` space. If a native `dsh web` is already running on `127.0.0.1:3080`, ccteam attaches to it instead of starting a second writer. If not, ccteam starts one on an ephemeral loopback port. A local browser can open the native URL directly; a LAN browser uses the ccteam proxy.
-- **Regular users:** each identity gets `$CCTEAM_HOME/runtime/dsh/web/<user>/` with the DSH base app and `@ccteam/dsh-client` present. The profile is merge-style: DSH plugins the user installs stay in place, and ccteam's plugin symlink self-heals on each start. The home ships with no copied owner credential; users add model keys through DSH's native Settings → Models flow.
+- **Regular users:** each identity gets `$CCTEAM_HOME/runtime/dsh/web/<user>/` with the DSH base app and `@ccteam/dsh-client` present. The profile is merge-style: DSH plugins the user installs stay in place, and ccteam's plugin symlink self-heals on each start. The first start works out of the box when this machine already has a DSH login: ccteam seeds the identity's DSH config files from the machine's DSH home and follows those bytes while the user has not changed them.
+- **Model keys:** configure your own provider in native DSH **Settings → Models**. That identity's DSH Web home then becomes its DSH config home, so every DSH session for the same identity — including DSH sessions hired from inside ccteam — uses that config on its next spawn. ccteam copies and hashes the DSH config files as bytes; it does not parse vendor YAML.
 - **Ledger:** native DSH Web turns are not ccteam sessions, so they do not show up as `$0` or any other fake value in the ccteam ledger. Work delegated from DSH through the ccteam plugin is recorded normally.
-- **Trust boundary:** tenant DSH Web is same-OS-user isolation. DSH agents can run shell commands, and self-installed DSH plugins are arbitrary npm code with the same trust level as that OS account.
+- **Trust boundary:** tenant DSH Web is same-OS-user isolation. DSH agents can run shell commands, and self-installed DSH plugins are arbitrary npm code with the same trust level as that OS account. Sharing one OS user means config visibility is a convenience boundary, not a hard security boundary.
 - **Plain-HTTP LAN access:** DSH Web is written for a loopback origin, where browsers grant it secure-context APIs — it mints every RPC id with `crypto.randomUUID`, which browsers withhold from plain HTTP on a LAN address. Because ccteam is what moves the UI off loopback, the companion listener restores that one API (a real `crypto.getRandomValues`-backed UUID v4) in the HTML it serves, and stays out of the way when the browser already provides it. Serving the console over HTTPS or opening it on the daemon host needs none of this.
 
 When running ccteam behind HTTPS, proxy the DSH companion listener as well as the main web listener. DSH Web has no base-path support, so use a second HTTPS port or subdomain; proxying only `:7331` leaves the iframe on plain HTTP and browsers block it as mixed content.

@@ -41,6 +41,7 @@ fn make_ctx(slug: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     SpawnCtx {
         slug: slug.to_string(),
         sid: F175_SID.into(),
+        owner: "user:web-api".into(),
         cwd: tmp.path().to_path_buf(),
         project_dir: tmp.path().to_path_buf(),
         extra_args: vec![],

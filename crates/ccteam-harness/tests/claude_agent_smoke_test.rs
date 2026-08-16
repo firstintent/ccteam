@@ -172,6 +172,7 @@ fn make_ctx(cwd: &Path) -> SpawnCtx {
     SpawnCtx {
         slug: SLUG.to_string(),
         sid: "s-agent-smoke".to_string(),
+        owner: "user:web-api".into(),
         cwd: cwd.to_path_buf(),
         project_dir: cwd.to_path_buf(),
         extra_args: vec![],
@@ -495,6 +496,7 @@ fn make_ctx_hitl(cwd: &Path) -> SpawnCtx {
     SpawnCtx {
         slug: HITL_SLUG.to_string(),
         sid: "s-agent-hitl".to_string(),
+        owner: "user:web-api".into(),
         cwd: cwd.to_path_buf(),
         project_dir: cwd.to_path_buf(),
         extra_args: vec![],
@@ -631,6 +633,7 @@ async fn run_hitl_decision_turn(allow: bool, tag: &str) -> (bool, bool) {
     let ctx = SpawnCtx {
         slug: slug.clone(),
         sid: format!("s-agent-hitl-{tag}"),
+        owner: "user:web-api".into(),
         cwd: project.path().to_path_buf(),
         project_dir: project.path().to_path_buf(),
         extra_args: vec![],

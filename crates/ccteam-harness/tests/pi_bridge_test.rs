@@ -72,6 +72,7 @@ impl TestEnv {
         SpawnCtx {
             slug: "pi-bridge".into(),
             sid: "s901".into(),
+            owner: "user:web-api".into(),
             cwd: self.project.path().to_path_buf(),
             project_dir: self.project.path().to_path_buf(),
             extra_args: Vec::new(),

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU16, Ordering},
     Arc,
@@ -25,15 +25,16 @@ use axum::{
 use axum_extra::extract::CookieJar;
 use ccteam_core::enroll::ensure_user_credential_in;
 use ccteam_harness::{
-    build_web_spawn_spec, DshWebSpawnOptions, DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
+    build_web_spawn_spec, is_ccteam_managed_dsh_orphan, tenant_home_segment, DshWebSpawnOptions,
+    DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+use tower_http::compression::CompressionLayer;
 use utoipa::ToSchema;
 
 use crate::auth::Identity;
@@ -45,6 +46,8 @@ const READINESS_PREFIX: &str = "dsh web: http://127.0.0.1:";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const ORPHAN_STOP_GRACE: Duration = Duration::from_millis(750);
 const ERROR_TAIL_LINES: usize = 24;
 
 #[derive(Debug, Clone)]
@@ -118,6 +121,33 @@ enum DshInstanceKind {
     Tenant,
 }
 
+enum StartClaim {
+    Wait {
+        rx: watch::Receiver<bool>,
+    },
+    Spawn {
+        rx: watch::Receiver<bool>,
+        tx: watch::Sender<bool>,
+    },
+}
+
+impl StartClaim {
+    fn into_rx(self) -> watch::Receiver<bool> {
+        match self {
+            Self::Wait { rx } | Self::Spawn { rx, .. } => rx,
+        }
+    }
+}
+
+/// Marks the inflight start as done on drop (success, error, or panic).
+struct StartDone(watch::Sender<bool>);
+
+impl Drop for StartDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
 type ErrorTail = Arc<Mutex<VecDeque<String>>>;
 
 #[derive(Debug)]
@@ -125,6 +155,10 @@ pub struct DshWebSupervisor {
     config: DshWebRuntimeConfig,
     companion_port: AtomicU16,
     instances: Mutex<HashMap<String, DshInstance>>,
+    /// In-flight start waiters, keyed like `instances`. A `Starting` row
+    /// without an entry here is an orphan (the HTTP task that called
+    /// `start_for` was cancelled and took the child with it).
+    inflight: Mutex<HashMap<String, watch::Receiver<bool>>>,
     client: reqwest::Client,
 }
 
@@ -144,6 +178,7 @@ impl DshWebSupervisor {
             config,
             companion_port: AtomicU16::new(0),
             instances: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
         }
     }
@@ -178,7 +213,20 @@ impl DshWebSupervisor {
 
         let key = identity.owner_tag();
         let snapshot = {
-            let instances = self.instances.lock().await;
+            let mut instances = self.instances.lock().await;
+            if let Some(instance) = instances.get_mut(&key) {
+                if instance.state == DshWebStatusState::Starting {
+                    let inflight = self.inflight.lock().await;
+                    if !inflight.contains_key(&key) {
+                        // Orphan: a cancelled request dropped the spawn future
+                        // (and `kill_on_drop` the child) after inserting
+                        // Starting. Tell the truth so the UI offers Start
+                        // instead of spinning forever.
+                        instance.state = DshWebStatusState::Stopped;
+                        instance.port = None;
+                    }
+                }
+            }
             instances.get(&key).map(|instance| {
                 (
                     instance.state.clone(),
@@ -223,26 +271,24 @@ impl DshWebSupervisor {
             return self.status_for(identity).await;
         }
         let key = identity.owner_tag();
-        let already_live = {
-            let instances = self.instances.lock().await;
-            matches!(
-                instances.get(&key).map(|i| &i.state),
-                Some(
-                    DshWebStatusState::Starting
-                        | DshWebStatusState::Running
-                        | DshWebStatusState::Attached
-                )
-            )
-            // `instances` (the MutexGuard) drops HERE, at the end of this
-            // block — before `status_for` below tries to lock the same
-            // `tokio::sync::Mutex` again. Awaiting `status_for` while still
-            // holding the guard (the original bug) self-deadlocks: the task
-            // waits on a lock only it holds, and every later caller of
-            // `self.instances.lock()` — including every proxied request and
-            // every future `/status` poll — then hangs forever too, because
-            // the mutex is never non-reentrant and never releases.
-        };
-        if already_live {
+
+        // Serving, or another start is actually running: do not spawn a
+        // second child. `Starting` WITHOUT an inflight waiter is an orphan
+        // (cancelled HTTP task) and must be retried — treating it as live
+        // is what left the rob tenant spinning on "Starting the DSH web
+        // instance…" with no process behind it.
+        //
+        // `instances` (the MutexGuard) drops at the end of this block —
+        // before any `.await` below tries to lock the same
+        // `tokio::sync::Mutex` again. Awaiting `status_for` while still
+        // holding the guard (the original deadlock) self-deadlocks: the
+        // task waits on a lock only it holds, and every later caller of
+        // `self.instances.lock()` — including every proxied request and
+        // every future `/status` poll — then hangs forever too.
+        if let Some(rx) = self.live_or_inflight(&key).await {
+            if let Some(mut rx) = rx {
+                let _ = rx.wait_for(|done| *done).await;
+            }
             return self.status_for(identity).await;
         }
 
@@ -259,45 +305,149 @@ impl DshWebSupervisor {
                 return self.status_for(identity).await;
             }
         };
-        let tail = new_error_tail();
-        {
-            let mut instances = self.instances.lock().await;
-            instances.insert(
-                key.clone(),
-                DshInstance {
-                    child: None,
-                    port: None,
-                    _home: home.clone(),
-                    _started_at: Utc::now(),
-                    last_activity: Utc::now(),
-                    kind,
-                    state: DshWebStatusState::Starting,
-                    error_tail: tail.clone(),
-                    dsh_version: None,
-                    native_url: None,
-                },
-            );
-        }
 
-        let start_result = if identity.is_admin {
-            self.start_operator(home.clone(), tail.clone()).await
-        } else {
-            self.start_tenant(app, identity, home.clone(), tail.clone())
-                .await
+        let Some(claimed) = self.claim_start(&key, kind, home.clone()).await else {
+            return self.status_for(identity).await;
         };
 
+        if let StartClaim::Spawn { tx, .. } = &claimed {
+            let tx = tx.clone();
+            // The spawn itself lives on a detached task so cancelling the
+            // HTTP request (browser abort, iframe timeout, companion-port
+            // retry) cannot drop `spawn_until_ready`'s `kill_on_drop` Child
+            // and leave the map stuck at Starting. This waiter is the only
+            // thing the request owns; dropping it just stops waiting.
+            let supervisor = app.dsh_web.clone();
+            let app = app.clone();
+            let identity = identity.clone();
+            let start_key = key.clone();
+            tokio::spawn(async move {
+                let _done = StartDone(tx);
+                let tail = {
+                    let instances = supervisor.instances.lock().await;
+                    instances
+                        .get(&start_key)
+                        .map(|i| i.error_tail.clone())
+                        .unwrap_or_else(new_error_tail)
+                };
+                let start_result = if identity.is_admin {
+                    supervisor
+                        .start_operator(&app, &identity, home.clone(), tail.clone())
+                        .await
+                } else {
+                    supervisor
+                        .start_tenant(&app, &identity, home.clone(), tail.clone())
+                        .await
+                };
+                supervisor
+                    .finish_start(&start_key, kind, home, tail, start_result)
+                    .await;
+            });
+        }
+
+        let mut rx = claimed.into_rx();
+        let _ = rx.wait_for(|done| *done).await;
+        self.status_for(identity).await
+    }
+
+    /// `None` = caller should start. `Some(None)` = already serving.
+    /// `Some(Some(rx))` = wait for the in-flight start.
+    async fn live_or_inflight(&self, key: &str) -> Option<Option<watch::Receiver<bool>>> {
+        let instances = self.instances.lock().await;
+        match instances.get(key).map(|i| &i.state) {
+            Some(DshWebStatusState::Running | DshWebStatusState::Attached) => Some(None),
+            Some(DshWebStatusState::Starting) => {
+                let inflight = self.inflight.lock().await;
+                inflight.get(key).cloned().map(Some)
+            }
+            _ => None,
+        }
+    }
+
+    /// Insert the Starting row + inflight waiter. Returns `None` if the
+    /// instance is already serving; otherwise a claim the caller either
+    /// waits on (another start is running) or uses to spawn the work.
+    async fn claim_start(
+        &self,
+        key: &str,
+        kind: DshInstanceKind,
+        home: PathBuf,
+    ) -> Option<StartClaim> {
+        let mut instances = self.instances.lock().await;
+        match instances.get(key).map(|i| &i.state) {
+            Some(DshWebStatusState::Running | DshWebStatusState::Attached) => return None,
+            Some(DshWebStatusState::Starting) => {
+                let inflight = self.inflight.lock().await;
+                if let Some(rx) = inflight.get(key) {
+                    return Some(StartClaim::Wait { rx: rx.clone() });
+                }
+            }
+            _ => {}
+        }
+        let (tx, rx) = watch::channel(false);
+        instances.insert(
+            key.to_string(),
+            DshInstance {
+                child: None,
+                port: None,
+                _home: home,
+                _started_at: Utc::now(),
+                last_activity: Utc::now(),
+                kind,
+                state: DshWebStatusState::Starting,
+                error_tail: new_error_tail(),
+                dsh_version: None,
+                native_url: None,
+            },
+        );
+        drop(instances);
+        let mut inflight = self.inflight.lock().await;
+        inflight.insert(key.to_string(), rx.clone());
+        Some(StartClaim::Spawn { rx, tx })
+    }
+
+    async fn finish_start(
+        &self,
+        key: &str,
+        kind: DshInstanceKind,
+        home: PathBuf,
+        tail: ErrorTail,
+        start_result: Result<DshInstance>,
+    ) {
         match start_result {
             Ok(mut instance) => {
                 instance.error_tail = tail;
-                let mut instances = self.instances.lock().await;
-                instances.insert(key, instance);
+                let leftover = {
+                    let mut instances = self.instances.lock().await;
+                    if matches!(
+                        instances.get(key).map(|i| &i.state),
+                        Some(DshWebStatusState::Starting)
+                    ) {
+                        instances.insert(key.to_string(), instance);
+                        None
+                    } else {
+                        Some(instance)
+                    }
+                };
+                if let Some(instance) = leftover {
+                    terminate_instance(instance).await;
+                }
             }
             Err(err) => {
-                self.record_stopped_error(&key, kind, home, err.to_string())
-                    .await;
+                let still_starting = {
+                    let instances = self.instances.lock().await;
+                    matches!(
+                        instances.get(key).map(|i| &i.state),
+                        Some(DshWebStatusState::Starting)
+                    )
+                };
+                if still_starting {
+                    self.record_stopped_error(key, kind, home, err.to_string())
+                        .await;
+                }
             }
         }
-        self.status_for(identity).await
+        self.inflight.lock().await.remove(key);
     }
 
     pub async fn stop_for(&self, identity: &Identity) -> DshStatusResponse {
@@ -373,7 +523,13 @@ impl DshWebSupervisor {
         );
     }
 
-    async fn start_operator(&self, home: PathBuf, tail: ErrorTail) -> Result<DshInstance> {
+    async fn start_operator(
+        &self,
+        app: &AppState,
+        identity: &Identity,
+        home: PathBuf,
+        tail: ErrorTail,
+    ) -> Result<DshInstance> {
         let attach_url = self
             .config
             .attach_url
@@ -398,12 +554,13 @@ impl DshWebSupervisor {
 
         let spawn_home = home.clone();
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: &identity.owner_tag(),
+            ccteam_home: app.paths.root.clone(),
             dsh_home: spawn_home,
             profile: DSH_NATIVE_WEB_PROFILE,
             materialize_profile: false,
             enrollment: None,
             daemon_url: None,
-            scrub_provider_env: false,
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -432,12 +589,13 @@ impl DshWebSupervisor {
         let credential = ensure_user_credential_in(&app.paths.root, &owner)
             .with_context(|| format!("ensure enrollment credential for {owner}"))?;
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: &owner,
+            ccteam_home: app.paths.root.clone(),
             dsh_home: home.clone(),
             profile: DSH_WEB_PROFILE,
             materialize_profile: true,
             enrollment: Some(&credential.bearer()),
             daemon_url: Some(&self.config.daemon_url),
-            scrub_provider_env: true,
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -485,6 +643,114 @@ pub fn companion_router() -> Router<AppState> {
     Router::new()
         .route("/", any(handle_companion_request))
         .route("/{*path}", any(handle_companion_request))
+        // The origin hop deliberately stays identity-encoded so HTML can be
+        // spliced safely (see `should_strip_request_header`). Compression is
+        // applied only after that splice, on the outbound browser/WAN hop.
+        // CompressionLayer leaves WebSocket 101 upgrades untouched.
+        .layer(CompressionLayer::new().gzip(true).br(true))
+}
+
+/// Reap DSH processes stranded by daemon versions that predate PDEATHSIG.
+///
+/// `/proc` is intentionally the authority here: only an init-parented process
+/// whose own `DSH_HOME` points inside this ccteam installation's managed DSH
+/// runtime can match. Failures are ignored because this startup cleanup is a
+/// best-effort compatibility sweep, never a reason to keep the daemon down.
+#[cfg(target_os = "linux")]
+pub(crate) async fn sweep_legacy_dsh_orphans(ccteam_home: &Path) {
+    let victims = legacy_dsh_orphans(ccteam_home);
+    if victims.is_empty() {
+        return;
+    }
+
+    for victim in &victims {
+        // SAFETY: kill is an async-signal-safe syscall. The predicate already
+        // restricted the target to an init-parented ccteam-managed DSH home.
+        let sent = unsafe { libc::kill(victim.pid, libc::SIGTERM) } == 0;
+        if sent {
+            tracing::info!(pid = victim.pid, "terminating legacy orphaned DSH process");
+        }
+    }
+
+    tokio::time::sleep(ORPHAN_STOP_GRACE).await;
+    for victim in victims {
+        // Re-read both the immutable process start time and the predicate
+        // inputs before escalation. This avoids signaling an unrelated process
+        // if Linux reused the pid during the grace window.
+        let Some(current) = legacy_dsh_process(victim.pid) else {
+            continue;
+        };
+        if current.start_time != victim.start_time
+            || !is_ccteam_managed_dsh_orphan(&current.dsh_home, current.ppid, ccteam_home)
+        {
+            continue;
+        }
+        // SAFETY: same constrained target as above, revalidated after grace.
+        if unsafe { libc::kill(victim.pid, libc::SIGKILL) } == 0 {
+            tracing::warn!(
+                pid = victim.pid,
+                "killed unresponsive legacy orphaned DSH process"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn sweep_legacy_dsh_orphans(_ccteam_home: &Path) {
+    // macOS has neither /proc nor PDEATHSIG; retain the existing graceful
+    // kill-on-drop behavior there.
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LegacyDshProcess {
+    pid: i32,
+    ppid: u32,
+    start_time: u64,
+    dsh_home: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_dsh_orphans(ccteam_home: &Path) -> Vec<LegacyDshProcess> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(legacy_dsh_process)
+        .filter(|process| {
+            is_ccteam_managed_dsh_orphan(&process.dsh_home, process.ppid, ccteam_home)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_dsh_process(pid: i32) -> Option<LegacyDshProcess> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` may contain spaces and parentheses, so split after its final ')'.
+    // The remaining fields begin at state (field 3): ppid is index 1 and
+    // starttime (field 22) is index 19.
+    let (_, fields) = stat.rsplit_once(')')?;
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let ppid = fields.get(1)?.parse().ok()?;
+    let start_time = fields.get(19)?.parse().ok()?;
+
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let value = environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"DSH_HOME="))?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(LegacyDshProcess {
+        pid,
+        ppid,
+        start_time,
+        dsh_home: PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())),
+    })
 }
 
 async fn handle_companion_request(
@@ -781,6 +1047,26 @@ async fn spawn_until_ready(
     for (key, value) in &spawn.env {
         command.env(key, value);
     }
+    // `kill_on_drop` cannot run when the daemon itself is SIGKILLed. Bind the
+    // DSH web child to the spawning thread in the Linux kernel; macOS has no
+    // PDEATHSIG and keeps the existing graceful-teardown behavior.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getpid is an argument-free syscall.
+        let expected_parent = unsafe { libc::getpid() };
+        // SAFETY: only async-signal-safe libc calls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != expected_parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn DSH web `{}` {:?}", spawn.bin, spawn.args))?;
@@ -889,22 +1175,6 @@ fn dsh_home_for(app: &AppState, identity: &Identity) -> Result<PathBuf> {
     }
 }
 
-fn tenant_home_segment(id: &str) -> String {
-    if !id.is_empty()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return id.to_string();
-    }
-    let hash = Sha256::digest(id.as_bytes());
-    let suffix = hash[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    format!("tenant-{suffix}")
-}
-
 fn home_kind(identity: &Identity) -> DshHomeKind {
     if identity.is_admin {
         DshHomeKind::Own
@@ -1003,6 +1273,41 @@ mod tests {
     fn polyfill_injection_is_inert_without_a_head() {
         assert!(inject_polyfill("{\"json\":true}").is_none());
         assert!(inject_polyfill("plain text").is_none());
+    }
+
+    #[tokio::test]
+    async fn orphaned_starting_status_heals_to_stopped() {
+        let supervisor = DshWebSupervisor::new(DshWebRuntimeConfig {
+            enabled: true,
+            daemon_url: "http://127.0.0.1:7331".to_string(),
+            attach_url: None,
+        });
+        let identity = Identity::admin();
+        let key = identity.owner_tag();
+        {
+            let mut instances = supervisor.instances.lock().await;
+            instances.insert(
+                key,
+                DshInstance {
+                    child: None,
+                    port: None,
+                    _home: PathBuf::new(),
+                    _started_at: Utc::now(),
+                    last_activity: Utc::now(),
+                    kind: DshInstanceKind::Operator,
+                    state: DshWebStatusState::Starting,
+                    error_tail: new_error_tail(),
+                    dsh_version: None,
+                    native_url: None,
+                },
+            );
+        }
+        let status = supervisor.status_for(&identity).await;
+        assert_eq!(
+            status.state,
+            DshWebStatusState::Stopped,
+            "Starting with no inflight task is an orphan, not a live boot"
+        );
     }
 
     #[test]
