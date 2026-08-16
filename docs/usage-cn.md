@@ -40,7 +40,7 @@ ccteam 调用你机器上**已装好并完成认证的** Claude Code / Codex / G
 | Grok Build | [docs.x.ai/build/overview](https://docs.x.ai/build/overview) | `grok login` |
 | OpenCode | [opencode.ai](https://opencode.ai) | `opencode auth login` |
 | Kimi Code | [moonshotai.github.io/kimi-code](https://moonshotai.github.io/kimi-code/) | `kimi login` |
-| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`;受管 DSH 会话可读 daemon 环境里的 `DEEPSEEK_API_KEY`,DSH Web 空间也可直接在原生 Settings → Models 里配置 |
+| DSH | [npmjs.com/package/@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) | `npm i -g @deepseek-ai/dsh`;DSH 会话与 DSH Web 优先用 `DEEPSEEK_API_KEY`,否则用该身份在 DSH Settings → Models 里的配置 |
 | Pi | [pi.dev](https://pi.dev/) | 配好 provider API key,用 `pi auth check --provider <provider>` 验证 |
 
 **1 · 让 agent 装**
@@ -123,9 +123,10 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 **DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
 
 - **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程;否则 ccteam 自己在临时 loopback 端口启动。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
-- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件 symlink 每次启动自愈。出厂不复制 owner 的模型凭据;用户在 DSH 原生 Settings → Models 里填自己的 key。
+- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件 symlink 每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
+- **模型密钥**:在 DSH 原生 **Settings → Models** 里配置自己的 provider。之后这个身份的 DSH Web home 就是它的 DSH 配置家;同身份的所有 DSH 会话——包括在 ccteam 里被其它 agent 雇出来的 DSH 会话——下次 spawn 都用这份配置。ccteam 只逐字节复制和 hash 这些 DSH 配置文件,不解析 vendor YAML。
 - **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;从 DSH 通过 ccteam 插件委派出去的工作照常入账。
-- **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。
+- **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。同一个 OS 用户下的配置可见性只是便利边界,不是硬安全边界。
 - **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
 
 如果 ccteam 前面有 HTTPS 反代,**伴生端口也必须一起反代**。DSH Web 没有 base-path 支持,所以用第二个 HTTPS 端口或子域;只反代 `:7331` 会让 iframe 继续加载明文 HTTP,浏览器按 mixed-content 拒绝。
