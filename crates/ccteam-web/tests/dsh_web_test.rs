@@ -139,3 +139,56 @@ async fn repeated_start_on_an_already_attached_instance_never_deadlocks() {
         .unwrap();
     assert_eq!(status.status(), 200);
 }
+
+/// A cancelled `/start` (browser abort, iframe timeout, companion-port
+/// retry) used to drop the in-request spawn future. `kill_on_drop` then
+/// killed the child, the map stayed at `Starting`, and every later start
+/// took the already-live path — the page spun on "Starting the DSH web
+/// instance…" forever. Start work must outlive the HTTP task.
+#[tokio::test]
+async fn cancelled_start_request_still_reaches_attached() {
+    let attach_addr = spawn_slow_attached_dsh(Duration::from_millis(400)).await;
+    let tmp = TempDir::new().unwrap();
+    let supervisor = Arc::new(DshWebSupervisor::new(DshWebRuntimeConfig {
+        enabled: true,
+        daemon_url: "http://127.0.0.1:7331".to_string(),
+        attach_url: Some(format!("http://{attach_addr}")),
+    }));
+    let state =
+        AppState::with_auth(fake_paths(tmp.path()), AuthState::disabled()).with_dsh_web(supervisor);
+    let addr = spawn_app(router_with_state(state)).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let start_url = format!("http://{addr}/api/v1/dsh/start");
+    let status_url = format!("http://{addr}/api/v1/dsh/status");
+
+    let aborted =
+        tokio::time::timeout(Duration::from_millis(80), client.post(&start_url).send()).await;
+    assert!(
+        aborted.is_err(),
+        "the first start must still be inside the delayed attach probe"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last = serde_json::json!(null);
+    while tokio::time::Instant::now() < deadline {
+        let resp = client.get(&status_url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        last = resp.json().await.unwrap();
+        if last["state"] == "attached" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("cancelled start left DSH web stuck at {last}");
+}
+
+async fn spawn_slow_attached_dsh(delay: Duration) -> SocketAddr {
+    let app = axum::Router::new().route(
+        "/",
+        get(move || async move {
+            tokio::time::sleep(delay).await;
+            "dsh web fake origin".into_response()
+        }),
+    );
+    spawn_app(app).await
+}
