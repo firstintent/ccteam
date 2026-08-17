@@ -78,6 +78,7 @@ function renderSidebar(rows: RailRow[], over: Partial<React.ComponentProps<typeo
       userInitial="R"
       onQuery={() => {}}
       onCollapse={() => {}}
+      onOpenHome={() => {}}
       onNewSession={() => {}}
       onNewInProject={() => {}}
       onOpenFlow={() => {}}
@@ -203,6 +204,39 @@ describe("Sidebar SSR structure", () => {
     // The dropdown itself only mounts on click.
     expect(html).not.toContain('data-testid="ws-menu-demo"');
     expect(html).not.toContain('data-testid="project-remove-dialog-demo"');
+  });
+
+  it("both logos are home buttons: pointer cursor, tooltip, testid", () => {
+    const html = renderSidebar([]);
+    for (const testId of ["side-home", "side-home-rail"]) {
+      // One svg tag carries it all: button role + testid + pointer cursor.
+      expect(html).toMatch(
+        new RegExp(`role="button"[^>]*data-testid="${testId}"[^>]*cursor:pointer`),
+      );
+    }
+    // The SVG-native <title> child is the hover tooltip (one per logo).
+    expect(html.match(/<title>首页<\/title>/g) ?? []).toHaveLength(2);
+  });
+
+  it("side-bottom puts the user row on top and 设置 last (very bottom)", () => {
+    const html = renderSidebar([row()]);
+    const bottom = html.slice(html.indexOf('class="side-bottom"'), html.indexOf('data-testid="side-mini"'));
+    const userAt = bottom.indexOf('class="side-user"');
+    const settingsAt = bottom.indexOf('data-testid="side-settings"');
+    expect(userAt).toBeGreaterThanOrEqual(0);
+    expect(settingsAt).toBeGreaterThan(userAt);
+    // Nothing follows the settings button inside side-bottom.
+    expect(bottom.slice(settingsAt)).not.toContain('class="side-user"');
+  });
+
+  it("the collapsed rail mirrors the swap: avatar above settings, settings last", () => {
+    const html = renderSidebar([row()]);
+    const rail = html.slice(html.indexOf('data-testid="side-mini"'));
+    const avatarAt = rail.indexOf('class="avatar"');
+    const settingsAt = rail.indexOf('data-testid="side-settings-rail"');
+    expect(avatarAt).toBeGreaterThanOrEqual(0);
+    expect(settingsAt).toBeGreaterThan(avatarAt);
+    expect(rail.slice(settingsAt)).not.toContain('class="avatar"');
   });
 });
 

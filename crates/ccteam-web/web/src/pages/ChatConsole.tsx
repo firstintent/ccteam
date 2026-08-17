@@ -438,6 +438,10 @@ export default function ChatConsole() {
         searchRef={searchRef}
         onQuery={setQuery}
         onCollapse={setSideCollapsed}
+        onOpenHome={() => {
+          navigate("/");
+          closeMobile();
+        }}
         onNewSession={() => goHome(null)}
         onNewInProject={(p) => goHome(p)}
         onOpenFlow={() => {
