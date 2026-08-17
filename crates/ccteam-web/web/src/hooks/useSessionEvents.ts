@@ -3,7 +3,7 @@
 // Generalizes `useProgressStream`'s EventSource dance to the W2 endpoint
 //   GET /api/v1/sessions/{sid}/events
 // which streams `event: progress` frames whose payload is the W2 shape
-//   { id, sid, kind: "answer" | "progress", content, done?, options? }
+//   { id, sid, kind: "answer" | "progress", content, ts, done?, options? }
 // (see `crates/ccteam-web/src/routes/sessions_api.rs::session_event_payload`).
 // `options` is the non-empty label list of an approval ChoicePrompt — the
 // hook surfaces it so ChatConsole can render "session sX wants to run …
@@ -61,6 +61,10 @@ export interface SessionEvent {
   sid?: string;
   kind: "answer" | "progress" | "activity" | "session_lifecycle" | "scheduled_changed";
   content: string;
+  /** Server-side frame timestamp (WEB-TS-1): RFC 3339, the same clock/shape
+   *  as the mirrored `TurnRecord.ts`. Optional — an older daemon's frames
+   *  simply have none. */
+  ts?: string;
   done?: boolean;
   options?: SessionEventOption[];
   /** Reference-only outbound files; the parser copies only these four scalar
@@ -164,6 +168,7 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   };
   if (typeof obj.id === "string") event.id = obj.id;
   if (typeof obj.sid === "string") event.sid = obj.sid;
+  if (typeof obj.ts === "string") event.ts = obj.ts;
   if (obj.done === true) event.done = true;
   // v0.8.19 — the structured per-step activity object (DOM-free, defensive:
   // a malformed `activity` is simply dropped, leaving a bare "activity" event

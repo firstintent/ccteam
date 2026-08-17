@@ -1989,6 +1989,12 @@ fn session_event(ev: &GatewayEvent, seq: u64) -> Event {
 /// `GET /api/v1/agents/events` (`crate::routes::agents`) can reuse this exact
 /// serializer for the team view's global SSE frames instead of duplicating
 /// the shape. `pub(crate)` for that cross-module reuse.
+///
+/// WEB-TS-1 — also carries `ts`: a server-side timestamp serialized through
+/// chrono's [`chrono::DateTime`] serde, the exact RFC 3339 shape the mirrored
+/// `TurnRecord.ts` writes into turns.jsonl, so live frames and history events
+/// share one clock/format and the SPA never needs its own `Date.now()`.
+/// Additive: old clients ignore the field.
 pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     use ccteam_im::gateway::GatewayEventKind;
     let (kind, done) = match &ev.kind {
@@ -2015,6 +2021,9 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         "slug": ev.slug,
         "kind": kind,
         "content": ev.content,
+        // WEB-TS-1 — server-side frame timestamp; serialized via chrono's
+        // `DateTime<Utc>` serde → the same RFC 3339 shape as turns.jsonl `ts`.
+        "ts": chrono::Utc::now(),
     });
     if done {
         payload["done"] = serde_json::Value::Bool(true);
@@ -2405,6 +2414,24 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    /// WEB-TS-1 — every frame carries a server-side `ts` in the same RFC 3339
+    /// (`…Z`) shape the mirrored `TurnRecord.ts` writes into turns.jsonl, so a
+    /// live row and a history row share one clock/format.
+    #[test]
+    fn session_event_carries_server_ts() {
+        let before = chrono::Utc::now();
+        let payload = session_event_payload(&gw_event(Some("s1")));
+        let after = chrono::Utc::now();
+        let ts = payload["ts"].as_str().expect("ts is a string");
+        assert!(ts.ends_with('Z'), "UTC Z-suffixed like turns.jsonl: {ts}");
+        let parsed = chrono::DateTime::parse_from_rfc3339(ts).expect("ts parses as RFC 3339");
+        let parsed = parsed.with_timezone(&chrono::Utc);
+        assert!(
+            before <= parsed && parsed <= after,
+            "ts {ts} stamps the payload build, between {before} and {after}"
+        );
     }
 
     #[test]

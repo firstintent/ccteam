@@ -695,6 +695,13 @@ html.dark .dot.off { background: #4b4e57; }
   background: var(--bg-soft); border: 1px solid var(--border);
   border-radius: var(--radius-card); white-space: pre-wrap;
 }
+/* WEB-TS-1 — per-row timestamp line: own line under the bubble (never an
+   inline column, so the bubble keeps its width on narrow viewports). Follows
+   the row's own alignment: user rows right-align via align-items, system rows
+   center, activity rows indent to match the rail. */
+.msg-time { font-size: 11px; color: var(--text-faint); }
+.msg.system .msg-time { text-align: center; }
+.msg.activity .msg-time { padding-left: 12px; font-family: var(--font-mono); font-size: 10.5px; }
 .bubble { padding: 10px 15px; border-radius: 14px; line-height: 1.65; font-size: 14.5px; white-space: pre-wrap; }
 .bubble.md { white-space: normal; }
 .outbound-attachments { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }

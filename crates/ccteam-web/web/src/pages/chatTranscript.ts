@@ -28,6 +28,10 @@ export interface TranscriptRow {
   id: string;
   kind: RowKind;
   content: string;
+  /** Server-side timestamp (RFC 3339) — from the history event's `ts` or the
+   *  live SSE frame's `ts` (WEB-TS-1). Rows of one turn legitimately share
+   *  it; rows persisted before this field existed simply have none. */
+  ts?: string;
   /** Project asset references only; rendering constructs a fixed same-origin
    * URL from `id` and never accepts a URL or byte payload from this state. */
   attachments?: OutboundAttachmentRef[];
@@ -85,6 +89,7 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       id: ev.id ?? nextRowId("approval"),
       kind: "approval",
       content: ev.content || "needs approval",
+      ts: ev.ts,
       options: ev.options,
       token: ev.token,
     };
@@ -99,6 +104,7 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       id: ev.id ?? nextRowId("activity"),
       kind: "activity",
       content: summary,
+      ts: ev.ts,
       activity: ev.activity,
     };
   }
@@ -108,12 +114,13 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       id: ev.id ?? nextRowId("assistant"),
       kind: "assistant",
       content: ev.content,
+      ts: ev.ts,
       attachments: ev.attachments,
     };
   }
   // progress — only surface a finalizing edit with text (status churn is noise).
   if (ev.done && ev.content) {
-    return { id: ev.id ?? nextRowId("system"), kind: "system", content: ev.content };
+    return { id: ev.id ?? nextRowId("system"), kind: "system", content: ev.content, ts: ev.ts };
   }
   return null;
 }
@@ -252,6 +259,7 @@ export function appendEvent(rows: TranscriptRow[], ev: SessionEvent): Transcript
       id: ev.id ?? nextRowId("activity"),
       kind: "activity",
       content: renderFold(fold),
+      ts: ev.ts,
       fold,
     });
   }
@@ -267,13 +275,14 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
   for (const ev of events) {
     if (ev.user) {
-      rows.push({ id: `${ev.turn_id}-u`, kind: "user", content: ev.user });
+      rows.push({ id: `${ev.turn_id}-u`, kind: "user", content: ev.user, ts: ev.ts });
     }
     if (ev.assistant || (ev.attachments && ev.attachments.length > 0)) {
       rows.push({
         id: `${ev.turn_id}-a`,
         kind: "assistant",
         content: ev.assistant,
+        ts: ev.ts,
         attachments: ev.attachments,
       });
     }

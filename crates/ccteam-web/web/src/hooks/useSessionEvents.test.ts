@@ -204,6 +204,15 @@ describe("parseSessionEvent (W2 payload shape)", () => {
     expect(ev!.options).toBeUndefined();
   });
 
+  it("carries the server-side ts; a non-string ts is dropped (WEB-TS-1)", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({ kind: "answer", content: "hello", ts: "2026-08-17T01:02:03Z" }),
+    );
+    expect(ev!.ts).toBe("2026-08-17T01:02:03Z");
+    const noTs = parseSessionEvent(JSON.stringify({ kind: "answer", content: "hello", ts: 42 }));
+    expect(noTs!.ts).toBeUndefined();
+  });
+
   it("copies only reference fields from outbound attachments", () => {
     const ev = parseSessionEvent(
       JSON.stringify({

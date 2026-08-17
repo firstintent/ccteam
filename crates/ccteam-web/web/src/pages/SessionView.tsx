@@ -60,6 +60,23 @@ function formatAttachmentSize(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** A row's server-side timestamp (WEB-TS-1, `row.ts` — RFC 3339) rendered as
+ *  local `HH:MM`; the full date-time rides the tooltip. Sits on its own line
+ *  under the bubble, so it never squeezes the bubble on narrow viewports.
+ *  Absent/unparseable `ts` (old daemons, rows persisted before this field)
+ *  renders nothing. */
+function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
+  if (!ts) return null;
+  const when = new Date(ts);
+  if (Number.isNaN(when.getTime())) return null;
+  const locale = lang === "en" ? "en-US" : "zh-CN";
+  return (
+    <time className="msg-time" dateTime={ts} title={when.toLocaleString(locale)}>
+      {when.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12: false })}
+    </time>
+  );
+}
+
 function OutboundAttachments({
   project,
   attachments,
@@ -580,6 +597,7 @@ export default function SessionView({
                             </div>
                           ) : null}
                         </div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -587,6 +605,7 @@ export default function SessionView({
                     return (
                       <div key={row.id} className="msg system fade-in">
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -594,6 +613,7 @@ export default function SessionView({
                     return (
                       <div key={row.id} className="msg activity">
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -602,6 +622,7 @@ export default function SessionView({
                       <div key={row.id} className="msg user fade-in">
                         <span className="who">you</span>
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -609,6 +630,7 @@ export default function SessionView({
                     return (
                       <div key={row.id} className="msg tool fade-in">
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -623,6 +645,7 @@ export default function SessionView({
                           attachments={row.attachments}
                         />
                       </div>
+                      <RowTime ts={row.ts} lang={lang} />
                     </div>
                   );
                 })}
