@@ -58,14 +58,17 @@
 - **W2 收口(规划,V1-4→V1-6 rebase+ff)**:fmt PASS;clippy 0;序列化 baseline **1922/0**(1916→+6);web 套件 401/1(唯一红 = 登记 pty env-flake);`make web-check` vitest **637/637**(58 文件,622→+15)+ tsc 绿;writeback 绿。
 
 ### PERF-V1-7 rotation + doctor(W4)
-- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`crates/ccteam-cli/src/doctor.rs + harness(progress_bridge rollover)+ im/progress_projection.rs(checkpoint 水合)` · **建议入口**:codex 委派
+- **状态**:完成(a3104cf) · **冲突域**:`crates/ccteam-cli/src/doctor.rs + harness(progress_bridge rollover)+ im/progress_projection.rs(checkpoint 水合)` · **建议入口**:codex 委派
 - **规格**:append 时体积检查(默认 64MB)→ 单级 rollover `<slug>.jsonl`→`<slug>.1.jsonl` + lifetime-cost checkpoint 小 json(投影水合 = checkpoint+活跃文件);doctor 增 progress 检查(体积、坏行数+offset、按字节 Top kinds、checkpoint 一致性);`--repair-progress` bytes 逐行 parse 原子重写先备份。零新定时器。
 - **DoD**:rollover 触发/恢复测试;doctor 检查+修复(先备份)测试;基线只增。
+- **验证**:2026-08-17 codex s438 交付 `a3104cf`(per-slug 稳定锁串行 append/rotation/recovery/repair;64MiB 默认 + `CCTEAM_PROGRESS_ROTATE_BYTES` 覆盖;mv→流式扫 `.1` 折进累计 checkpoint(原子写,记 coverage 标记 + rotation 序号),崩溃窗 = 水合时补折未覆盖 `.1` 恰一次;cost 提取与投影共享零漂移;doctor 六项检查 + `--repair-progress` 先备份原子替换幂等;24h 桶跨界欠计为记录在案的取舍,lifetime 精确;卡内 doctor 12/12、rotation 2/2、恢复 1/1、im 705/0)。
 
 ### PERF-V1-8 观测与性能门禁(W4)
-- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`Makefile(perf-gate)+ web 层指标(middleware)+ im/gateway 锁计量 + 生成式 fixture 测试` · **建议入口**:codex 委派 + 规划收口(verify 登记归规划)
+- **状态**:完成(d3931fb) · **冲突域**:`Makefile(perf-gate)+ web 层指标(middleware)+ im/gateway 锁计量 + 生成式 fixture 测试` · **建议入口**:codex 委派 + 规划收口(verify 登记归规划)
 - **规格**:per-route latency(>500ms WARN)、progress bytes read/records parsed/invalid lines、per-kind append rate/bytes、gateway lock wait/hold、blocking pool queue;测试时生成 fixture(~150-200MB/100 万行,中部 torn UTF-8+尾部坏行;50 live/380 stopped;单会话 1 万 turns),挂 env 开关/`make perf-gate`,普通 CI 不变慢;断言 §〇 数字(status p95<100ms 与大小无关、healthz p99<10ms、registry 锁持有 p99<5ms)。
 - **DoD**:perf-gate 目标数字全绿;`.loop/verify/README.md` 登记(规划执笔);基线只增。
+- **验证**:2026-08-17 codex s439 交付 `d3931fb`(与 V1-7 的 journal.rs 语义冲突由 s439 自解:保 `DetailedScanSummary` 形状,metrics 直接消费 next_offset/valid_count/corrupt_count;指标四面 = 路由延迟 middleware(>500ms WARN)/ journal 读累计 / top kinds / gateway 锁 wait+hold(>250ms WARN),tokio 阻塞池指标因 stable API 缺席跳过留痕;fixture 生成器 176.8MiB/100 万行/0.16s 确定性)。**规划在最终合并树复跑 `make perf-gate` 全绿**:status p95 25.43ms(目标<100)· 投影摄取 0B · 读放大 0.008MiB(目标<10)· health-during-status p99 0.14ms(目标<10)· session-list p95 42.32ms(目标<50)· tail_valid(200) 1.07ms(目标<50)· 10k-history 1.47ms(目标<100)· 锁持有 p99 0.176ms(目标<5)。
+- **W4 收口(规划,V1-7→V1-8 rebase+ff)**:fmt PASS;clippy 0;序列化 baseline **1924/0**(W4 新测试全在 tests/*.rs 集成口径);web 406/1(唯一红 = 登记 pty env-flake);全量 make test 133 bins **2717/7**(7 红全为登记族:`/tmp/alpha` ×2(新面孔 `gateway_status_shows_real_vendor_resume_uuid` 实锤同用字面 `/tmp/alpha`,隔离绿)+ CLI 子进程计时 ×1 + DSH default-model ×4);writeback 绿。
 
 ### DSHCFG-1 DSH 配置单一解析器 + 租户家种子/跟随 + de-scrub(v0.10.1 主卡)
 - **状态**:完成(68c4bbd) · **冲突域**:`crates/ccteam-harness(dsh_acp) + crates/ccteam-web(dsh_web) + crates/ccteam-im(SpawnCtx owner 装填)` · **建议入口**:codex 委派(规划 briefing 自包含)

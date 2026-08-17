@@ -16,6 +16,7 @@
 | SPA(`crates/ccteam-web/web`) | 最低门 + `make web-check` | vitest + tsc |
 | docs / `.loop/` only(零代码 diff) | 最低门即可(免 cargo test) | 免跑失效条件:换机 / 换 toolchain / 动依赖解析后首轮必真跑 |
 | `.github/workflows/` | CI 自证;须 SSH push(gh token 无 workflow scope,AGENTS.md §六) | |
+| **性能敏感面**(progress 读写路径 / journal facade / ProgressProjection / gateway 锁范围 / status·projects·sessions 热端点) | 上行 + `make perf-gate` | perf-v1 门禁(2026-08-17 立):`CCTEAM_PERF_GATE=1` + release 编译,生成式 fixture(~177MiB/100 万行,含 torn UTF-8 + 尾部坏行;50 live/380 stopped;单会话 1 万 turns),普通 CI/test 零感知。判据:status p95<100ms 且投影零摄取字节(与文件大小无关的结构证明)· 每调用读放大 <10MiB · status 进行中 health p99<10ms · session list(50 live)p95<50ms · `tail_valid(200)`<50ms · 10k-history 默认页 <100ms · gateway 锁持有 p99<5ms。基准实测(88 核 dev 机,2026-08-17):25.43ms / 0B / 0.008MiB / 0.14ms / 42.32ms / 1.07ms / 1.47ms / 0.176ms |
 
 一键全量 = `make gate`(fmt-check + clippy + test + test-web + web-check)。
 
@@ -33,7 +34,7 @@
 - **基线口径内的测试必须密封**:不得依赖 PATH 上的真实 vendor CLI、全局 env、或宿主特有状态——CI test job(`check.yml`,同口径)是干净环境仲裁。实锤:v0.9.9 CI 首跑咬出 `session_tool_tests` 15 个隐性 PATH 依赖(开发机 vendor 常驻 → 本地恒绿假象);修法 = 注入缝(per-Gateway 可用性快照),非 env 突变、非 CI 装桩。
 - **env-flake 族**(live-daemon 宿主才出现,不计入 baseline;干净环境应全绿):
   `inbound_wiring daemon_*` · `daemon_test register_*` · `im_progress_*` · `codex_streaming_delta` ·
-  `ws_*` · gateway 共享 `/tmp/alpha` 并行污染(v0.10.0 ship 实锤扩容一族:`gateway::tests` 里 `turn_answer_carries_context_echo_for_focused_im_session` 与 `turn_answer_context_echo_omits_role_when_roleless` 在 PR #180 CI 连续两次独立触发(每次各一,从未同时红)——后者自己的代码注释已明写病根:`FakeAdapter::events()` 跨身份共享一个 `Notify`,并行跑多个 session 的 pump 可能把唤醒错发给还在等待的另一个测试的 session(**纯测试替身竞态,非生产 bug**);前者是 `context_echo_line` 的 `title` 参数(同 turn 内对 meta.json 的 best-effort 读)与「首条消息自动生成标题」异步写之间的窄窗口序竞态。两者均与本次改动(零 touch `gateway.rs`/`ccteam-im`)无关,本机隔离/全量套件复现不了、CI 独立重跑即绿,判定同族,不改测试/不改 gateway.rs——真正修法是给 `FakeAdapter` per-session `Notify`,留作 dev 会话候选卡)。
+  `ws_*` · gateway 共享 `/tmp/alpha` 并行污染(perf-v1 收口(2026-08-17)再实锤两名成员:`gateway_resumes_dead_session_on_next_turn`(pending-turn 文件被并行测试先 drain,返回 `pending-drain:s1` 兜底值)与 `gateway_status_shows_real_vendor_resume_uuid` —— 两者都 `Gateway::new(fake,"alpha","/tmp/alpha")` 字面共享路径 + 撞 s1 sid 命名空间,隔离必绿、序列化 baseline 全绿;长线修法 = 这族测试改 tempdir,候选卡未立)(v0.10.0 ship 实锤扩容一族:`gateway::tests` 里 `turn_answer_carries_context_echo_for_focused_im_session` 与 `turn_answer_context_echo_omits_role_when_roleless` 在 PR #180 CI 连续两次独立触发(每次各一,从未同时红)——后者自己的代码注释已明写病根:`FakeAdapter::events()` 跨身份共享一个 `Notify`,并行跑多个 session 的 pump 可能把唤醒错发给还在等待的另一个测试的 session(**纯测试替身竞态,非生产 bug**);前者是 `context_echo_line` 的 `title` 参数(同 turn 内对 meta.json 的 best-effort 读)与「首条消息自动生成标题」异步写之间的窄窗口序竞态。两者均与本次改动(零 touch `gateway.rs`/`ccteam-im`)无关,本机隔离/全量套件复现不了、CI 独立重跑即绿,判定同族,不改测试/不改 gateway.rs——真正修法是给 `FakeAdapter` per-session `Notify`,留作 dev 会话候选卡)。
   判 flake 前先在干净环境或 CI 复测;**禁「测试瞬时红就顺手改测试消红」**——先证据后定性,留账不冒充全绿。
   **`resume_*` / `hook_*` 已于 2026-07-28 出族(根因定死、非 flake)**——两族都是「宿主态泄漏」的具体形态,登记在册反而掩盖了确定性缺陷:
   ① `claude_stream_json_test resume_failure_*` 读 progress 路径漏了 `state/` 段(**永远读空文件**,处处确定性红);
