@@ -73,6 +73,13 @@ export interface SessionEvent {
   token?: string;
   /** Present on an "activity" frame: the structured per-step payload. */
   activity?: SessionActivity;
+  /** Lifecycle-only (`kind === "session_lifecycle"`): the transition state —
+   *  `evicted` | `renamed` | `identity_degraded` on today's wire (`stopped` /
+   *  a live-family token reserved) — with `reason` the machine-readable cause
+   *  (e.g. `capacity`). Mirrors `session_event_payload`'s SessionLifecycle
+   *  branch (`ccteam-web/src/routes/sessions_api.rs`). */
+  state?: string;
+  reason?: string;
 }
 
 export interface UseSessionEventsResult {
@@ -221,6 +228,11 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
     if (attachments.length > 0) event.attachments = attachments;
   }
   if (typeof obj.token === "string") event.token = obj.token;
+  // session_lifecycle frames carry the transition state + machine-readable
+  // cause; consumers (the SessionView head dot, WEB-STATUS-1) fold them into
+  // session liveness — they never become transcript rows.
+  if (typeof obj.state === "string") event.state = obj.state;
+  if (typeof obj.reason === "string") event.reason = obj.reason;
   return event;
 }
 
@@ -234,6 +246,32 @@ export function appendSessionEvent(
     return [...prev.slice(prev.length - SESSION_RING_CAP + 1), event];
   }
   return [...prev, event];
+}
+
+/** Lifecycle states that END liveness: `evicted` (capacity stop) is the only
+ *  one on today's wire; `stopped` is reserved for an explicit-stop frame. */
+const LIFECYCLE_OFF_STATES = new Set(["evicted", "stopped"]);
+/** Lifecycle states that ASSERT liveness — reserved for a future resume/spawn
+ *  frame; none are emitted today (a cold-resume currently emits none). */
+const LIFECYCLE_ON_STATES = new Set(["live", "resumed"]);
+
+/** Fold one sid's `session_lifecycle` frames (oldest → newest) over the REST
+ *  base liveness (`session.status === "live"`) into the session's CURRENT
+ *  liveness — the head-dot data source (WEB-STATUS-1). A frame whose state
+ *  carries no liveness opinion (`renamed`, `identity_degraded`, an unknown
+ *  future state) leaves the running value untouched, so it can never flip
+ *  the dot. Pure — unit-testable. */
+export function foldSessionLiveness(
+  baseLive: boolean,
+  events: readonly Pick<SessionEvent, "kind" | "state">[],
+): boolean {
+  let live = baseLive;
+  for (const ev of events) {
+    if (ev.kind !== "session_lifecycle" || !ev.state) continue;
+    if (LIFECYCLE_OFF_STATES.has(ev.state)) live = false;
+    else if (LIFECYCLE_ON_STATES.has(ev.state)) live = true;
+  }
+  return live;
 }
 
 interface SessionEventSource {

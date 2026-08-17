@@ -25,7 +25,7 @@ import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
-import { useSessionEvents } from "../hooks/useSessionEvents";
+import { foldSessionLiveness, useSessionEvents } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
 import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
 import {
@@ -142,7 +142,7 @@ export default function SessionView({
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
 
-  const { events, connected, lastError, gatewayUnavailable, connectionEpoch } =
+  const { events, lastError, gatewayUnavailable, connectionEpoch } =
     useSessionEvents(sid);
 
   // The SSE buffer survives reconnects. Keep both the fold cursor and a live
@@ -426,14 +426,17 @@ export default function SessionView({
     }
   }, [rows, showTerminal]);
 
-  // conv-head status dot: busy amber › connection state.
-  const headDot = busy
-    ? "dot busy"
-    : gatewayUnavailable || lastError
-      ? "dot err"
-      : connected
-        ? "dot on"
-        : "dot off";
+  // conv-head status dot: busy amber › SESSION state. The base is the rail's
+  // REST `session.status`; this sid's live `session_lifecycle` frames fold on
+  // top, so a capacity eviction greys the dot immediately, without waiting
+  // for the rail's next REST reconcile. The SSE CONNECTION state is a
+  // different fact and no longer drives this dot (an open stream on a dead
+  // session is what made it "always green").
+  const sessionLive = foldSessionLiveness(session?.status === "live", events);
+  const headDot = busy ? "dot busy" : sessionLive ? "dot on" : "dot off";
+  // A broken stream (retries exhausted / no gateway) stays visible as its own
+  // red connection dot next to the status dot.
+  const connLost = gatewayUnavailable || lastError !== null;
 
   const serverTitle = session ? railSessionLabel(session) : sid;
   const title = pendingTitle ?? serverTitle;
@@ -462,6 +465,9 @@ export default function SessionView({
     <section className="view active" data-testid="conversation-view">
       <div className="conv-head">
         <span className={headDot} data-testid="conv-dot" />
+        {connLost ? (
+          <span className="dot err" data-testid="conn-dot" title={t("connLost")} />
+        ) : null}
         {editingTitle && onRename ? (
           <InlineRename
             className="title rename-input"

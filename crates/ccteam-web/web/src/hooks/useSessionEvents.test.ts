@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   appendSessionEvent,
+  foldSessionLiveness,
   parseSessionEvent,
   sessionEventsUrl,
   startSessionEventStream,
@@ -195,6 +196,24 @@ describe("parseSessionEvent (W2 payload shape)", () => {
     expect(ev).toMatchObject({ kind: "session_lifecycle", content: "session evicted: s4" });
   });
 
+  it("carries a lifecycle frame's state + machine reason (WEB-STATUS-1)", () => {
+    const ev = parseSessionEvent(
+      JSON.stringify({
+        kind: "session_lifecycle",
+        content: "session evicted: s4",
+        state: "evicted",
+        reason: "capacity",
+      }),
+    );
+    expect(ev).toMatchObject({ kind: "session_lifecycle", state: "evicted", reason: "capacity" });
+    // Non-string state/reason are dropped defensively, never synthesized.
+    const bare = parseSessionEvent(
+      JSON.stringify({ kind: "session_lifecycle", content: "x", state: 7, reason: null }),
+    );
+    expect(bare!.state).toBeUndefined();
+    expect(bare!.reason).toBeUndefined();
+  });
+
   it("parses an answer payload", () => {
     const ev = parseSessionEvent(
       JSON.stringify({ id: "e1", sid: "s1", kind: "answer", content: "hello" }),
@@ -356,5 +375,39 @@ describe("appendSessionEvent ring buffer", () => {
     expect(events).toHaveLength(SESSION_RING_CAP);
     expect(events[events.length - 1].content).toBe(String(SESSION_RING_CAP + 9));
     expect(events[0].content).toBe(String(10));
+  });
+});
+
+describe("foldSessionLiveness (WEB-STATUS-1 head-dot state)", () => {
+  const lifecycle = (state?: string): SessionEvent => ({
+    kind: "session_lifecycle",
+    content: "",
+    ...(state === undefined ? {} : { state }),
+  });
+
+  it("keeps the REST base when no lifecycle frame has an opinion", () => {
+    expect(foldSessionLiveness(true, [])).toBe(true);
+    expect(foldSessionLiveness(false, [])).toBe(false);
+    // Non-lifecycle frames and opinion-less lifecycle states never flip it.
+    expect(
+      foldSessionLiveness(true, [
+        { kind: "answer", content: "hi" },
+        lifecycle("renamed"),
+        lifecycle("identity_degraded"),
+        lifecycle(),
+      ]),
+    ).toBe(true);
+    expect(foldSessionLiveness(false, [lifecycle("renamed")])).toBe(false);
+  });
+
+  it("an evicted/stopped frame turns a live session off", () => {
+    expect(foldSessionLiveness(true, [lifecycle("evicted")])).toBe(false);
+    expect(foldSessionLiveness(true, [lifecycle("stopped")])).toBe(false);
+    expect(foldSessionLiveness(false, [lifecycle("evicted")])).toBe(false);
+  });
+
+  it("the latest opinion wins (a live-family frame re-asserts liveness)", () => {
+    expect(foldSessionLiveness(true, [lifecycle("evicted"), lifecycle("live")])).toBe(true);
+    expect(foldSessionLiveness(false, [lifecycle("resumed"), lifecycle("evicted")])).toBe(false);
   });
 });

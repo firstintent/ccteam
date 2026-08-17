@@ -27,6 +27,7 @@ import { MemoryRouter } from "react-router-dom";
 import SessionView from "./SessionView";
 import { rowsKeyFor } from "./chatTranscript";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
+import type { SessionEvent } from "../hooks/useSessionEvents";
 
 const SESSION: SessionSummary = {
   sid: "s9",
@@ -307,7 +308,13 @@ describe("SessionView reconnect history reseed", () => {
       ...(await vi.importActual<typeof import("react")>("react")),
       ...harness.hooks,
     }));
-    vi.doMock("../hooks/useSessionEvents", () => ({ useSessionEvents: () => stream }));
+    // Spread the real module: SessionView imports foldSessionLiveness too.
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
+      useSessionEvents: () => stream,
+    }));
     vi.doMock("../lib/sessionsApi", async () => ({
       ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
       getHistory: history,
@@ -382,7 +389,11 @@ describe("SessionView paged history", () => {
       ...(await vi.importActual<typeof import("react")>("react")),
       ...harness.hooks,
     }));
-    vi.doMock("../hooks/useSessionEvents", () => ({
+    // Spread the real module: SessionView imports foldSessionLiveness too.
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
       useSessionEvents: () => ({
         events: [],
         connected: true,
@@ -482,7 +493,13 @@ describe("SessionView paged history", () => {
       ...(await vi.importActual<typeof import("react")>("react")),
       ...harness.hooks,
     }));
-    vi.doMock("../hooks/useSessionEvents", () => ({ useSessionEvents: () => stream }));
+    // Spread the real module: SessionView imports foldSessionLiveness too.
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
+      useSessionEvents: () => stream,
+    }));
     vi.doMock("../lib/sessionsApi", async () => ({
       ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
       getHistory: history,
@@ -559,6 +576,125 @@ describe("SessionView paged history", () => {
       vi.doUnmock("../hooks/useSessionEvents");
       vi.doUnmock("../lib/sessionsApi");
       vi.resetModules();
+    }
+  });
+});
+
+describe("SessionView header status dot (WEB-STATUS-1)", () => {
+  interface StreamState {
+    events: SessionEvent[];
+    connected: boolean;
+    connectionEpoch: number;
+    lastError: string | null;
+    gatewayUnavailable: boolean;
+  }
+
+  const healthyStream = (): StreamState => ({
+    events: [],
+    connected: true,
+    connectionEpoch: 1,
+    lastError: null,
+    gatewayUnavailable: false,
+  });
+
+  /** Mount SessionView against a mutable per-sid stream box; `render()`
+   *  re-renders the SAME mounted instance (no reload/remount). */
+  async function mountDotView(box: { stream: StreamState }, session: SessionSummary | null) {
+    const harness = createHookHarness();
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      // The real foldSessionLiveness — only the stream itself is stubbed.
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
+      useSessionEvents: () => box.stream,
+    }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: vi.fn().mockResolvedValue({ sid: "s9", events: [] }),
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+    }));
+    const View = (await import("./SessionView")).default;
+    return () => harness.render(() => View({ sid: "s9", session }));
+  }
+
+  function unmockDotView() {
+    vi.doUnmock("react");
+    vi.doUnmock("../hooks/useSessionEvents");
+    vi.doUnmock("../lib/sessionsApi");
+    vi.resetModules();
+  }
+
+  const dotClass = (tree: unknown) => findByTestId(tree, "conv-dot")?.props.className;
+
+  it("reads SESSION state (REST base + lifecycle frames), never the SSE connection", async () => {
+    const box = { stream: healthyStream() };
+    try {
+      const render = await mountDotView(box, SESSION); // SESSION.status = "live"
+      let tree = render();
+      // Live session + healthy stream → green.
+      expect(dotClass(tree)).toBe("dot on");
+
+      // A capacity-eviction lifecycle frame greys the dot IMMEDIATELY — same
+      // mounted instance, no reload, no rail REST reconcile.
+      box.stream = {
+        ...box.stream,
+        events: [
+          {
+            kind: "session_lifecycle",
+            content: "session evicted: s9",
+            state: "evicted",
+            reason: "capacity",
+          },
+        ],
+      };
+      tree = render();
+      expect(dotClass(tree)).toBe("dot off");
+
+      // An opinion-less lifecycle frame (rename) must not resurrect the dot.
+      box.stream = {
+        ...box.stream,
+        events: [...box.stream.events, { kind: "session_lifecycle", content: "", state: "renamed" }],
+      };
+      tree = render();
+      expect(dotClass(tree)).toBe("dot off");
+    } finally {
+      unmockDotView();
+    }
+  });
+
+  it("seeds grey from a stopped session's REST status, with no frame at all", async () => {
+    const box = { stream: healthyStream() };
+    try {
+      const render = await mountDotView(box, { ...SESSION, status: "off" });
+      expect(dotClass(render())).toBe("dot off");
+    } finally {
+      unmockDotView();
+    }
+  });
+
+  it("keeps a broken stream as its OWN red dot — the session fact is untouched", async () => {
+    const box = {
+      stream: { ...healthyStream(), connected: false, lastError: "SSE max retries reached" },
+    };
+    try {
+      const render = await mountDotView(box, SESSION);
+      const tree = render();
+      expect(dotClass(tree)).toBe("dot on"); // session is still live
+      const connDot = findByTestId(tree, "conn-dot");
+      expect(connDot?.props.className).toBe("dot err");
+      expect(connDot?.props.title).toBe("连接已断开");
+    } finally {
+      unmockDotView();
     }
   });
 });
