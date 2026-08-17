@@ -44,9 +44,11 @@
 - **验证**:2026-08-16 codex s435 交付 `734eb7c`(单一摄取路 = byte cursor+`read_delta`,`fold_event` 全仓唯一调用点在 `catch_up_locked`;observer 缝仅持久化成功后触发,OnceLock 极小;零定时器;rotation 缩小即重置守卫;两条错注释改真;status 语义保持 global;IM/MCP/web 消费面 + budget gate 全切投影;序列化 im 全量 701/0);perf 数字的正式门禁归 V1-8(本卡以「无新数据零摄取字节」结构断言证 O(1))。
 
 ### PERF-V1-5 锁窄化(W3)
-- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs + crates/ccteam-im/src(gateway.rs 委派通知器/emit_delegation_progress + mcp/dispatch.rs)` · **建议入口**:codex 委派
+- **状态**:完成(9bd876b) · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs + crates/ccteam-im/src(gateway.rs 委派通知器/emit_delegation_progress + mcp/dispatch.rs)` · **建议入口**:codex 委派
 - **规格**:两阶段模式(短锁校验+resolve+置状态带 generation → 放锁慢活 → 短锁 generation 校验提交)扫全族:`handle_session_turn` 冷 resume+submit、`handle_create_session` spawn+挤停+fsync、MCP `session_spawn`/`session_dispatch`(A2A fan-out 去串行化)、external/import `~/.claude` 扫描出锁、委派通知器仅 boundary/批量抢锁、`emit_delegation_progress` flock append 出锁;`queue_timeout` 与 `vendor_timeout` 分开计量,HTTP 入口起算整体 deadline;5xx additive `error_code`;**承接自 V1-6 的后端半件**:status/projects snapshot 带 `version` 支持 304(V1-6 重切为纯 SPA,规划决定 2026-08-16)。
 - **DoD**:50 并发 turn + 冷 resume 风暴互不冻结;「5s 预算被排队吃掉」型 502 消失;generation 防 lock-gap 竞态(挤停/替换窗口旧结果必须丢弃);回归形如「重复动作 + 之后 status 仍秒回」;基线只增。
+- **验证**:2026-08-17 codex s437 交付 `9bd876b`(per-live-session 单调 generation,提交前校验 6+ 处含挤停 victim 复核与委派 mirror;stale 句柄关闭并回 `session_generation_conflict`;通知器 watch-set 出全局锁,仅 boundary 进锁,append→notify 顺序保持;queue deadline 30s 起算于 HTTP/MCP 入口(env 可调),vendor 5s 预算独立;error_code 八枚 additive;/status·/projects 投影 version+ETag/If-None-Match→304,warming 期不发稳定 version;挤停既有测试零改动;新增 sessions_deadline_test + snapshot_etag_test;卡内 im 全量 704/0)。
+- **W3 收口(规划,rebase+ff)**:fmt PASS;clippy 0;序列化 baseline **1924/0**(1922→+2);web 404/1(唯一红 = 登记 pty env-flake);writeback 绿。
 
 ### PERF-V1-6 前端收敛(纯 SPA;与 W2 并行,规划重切 2026-08-16)
 - **状态**:完成(ee1947f) · **冲突域**:`crates/ccteam-web/web(SPA)` · **建议入口**:codex 委派
@@ -56,12 +58,12 @@
 - **W2 收口(规划,V1-4→V1-6 rebase+ff)**:fmt PASS;clippy 0;序列化 baseline **1922/0**(1916→+6);web 套件 401/1(唯一红 = 登记 pty env-flake);`make web-check` vitest **637/637**(58 文件,622→+15)+ tsc 绿;writeback 绿。
 
 ### PERF-V1-7 rotation + doctor(W4)
-- **状态**:待排 · **冲突域**:`crates/ccteam-cli/src/doctor.rs + harness(progress_bridge rollover)` · **建议入口**:codex 委派
+- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`crates/ccteam-cli/src/doctor.rs + harness(progress_bridge rollover)+ im/progress_projection.rs(checkpoint 水合)` · **建议入口**:codex 委派
 - **规格**:append 时体积检查(默认 64MB)→ 单级 rollover `<slug>.jsonl`→`<slug>.1.jsonl` + lifetime-cost checkpoint 小 json(投影水合 = checkpoint+活跃文件);doctor 增 progress 检查(体积、坏行数+offset、按字节 Top kinds、checkpoint 一致性);`--repair-progress` bytes 逐行 parse 原子重写先备份。零新定时器。
 - **DoD**:rollover 触发/恢复测试;doctor 检查+修复(先备份)测试;基线只增。
 
 ### PERF-V1-8 观测与性能门禁(W4)
-- **状态**:待排 · **冲突域**:`.loop/verify + Makefile(perf-gate)+ web 层指标` · **建议入口**:codex 委派 + 规划收口(verify 登记归规划)
+- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`Makefile(perf-gate)+ web 层指标(middleware)+ im/gateway 锁计量 + 生成式 fixture 测试` · **建议入口**:codex 委派 + 规划收口(verify 登记归规划)
 - **规格**:per-route latency(>500ms WARN)、progress bytes read/records parsed/invalid lines、per-kind append rate/bytes、gateway lock wait/hold、blocking pool queue;测试时生成 fixture(~150-200MB/100 万行,中部 torn UTF-8+尾部坏行;50 live/380 stopped;单会话 1 万 turns),挂 env 开关/`make perf-gate`,普通 CI 不变慢;断言 §〇 数字(status p95<100ms 与大小无关、healthz p99<10ms、registry 锁持有 p99<5ms)。
 - **DoD**:perf-gate 目标数字全绿;`.loop/verify/README.md` 登记(规划执笔);基线只增。
 
