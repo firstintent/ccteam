@@ -16,31 +16,36 @@
 ## 当前卡
 
 ### WEB-TS-1 web 聊天消息时间戳(v0.10.2 N1)★ W1
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs(session_event_payload)+ crates/ccteam-web/web/src(chatTranscript.ts · hooks/useSessionEvents.ts · SessionView.tsx 气泡渲染段)` · **建议入口**:subagent(briefing 自包含)
+- **状态**:完成(c07ad2a3) · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs(session_event_payload)+ crates/ccteam-web/web/src(chatTranscript.ts · hooks/useSessionEvents.ts · SessionView.tsx 气泡渲染段)` · **建议入口**:subagent(briefing 自包含)
+- **验证**:2026-08-17 coder subagent 交付,规划收口(rebase+ff):payload additive `ts`(chrono Utc,RFC3339 与 turns.jsonl 同形同钟,定向单测 `session_event_carries_server_ts`);`TranscriptRow.ts` history/SSE 两路都填;`RowTime` 本地 HH:MM + title 完整时间,移动端零横向挤压。vitest 合并树 658/658 · tsc/eslint 绿 · `cargo test -p ccteam-web --lib` 164/0。**偏差**:无;judgment call = ts 取 payload 构建时刻(GatewayEvent 本体无 ts,加它要碰 ccteam-im 出卡域),与 turns 写入亚秒级差。
 - **背景**:需求 SoT = `docs-local/versions/v0-10-2/README.md` N1(gitignored,briefing 内嵌全文)。数据链路本来通:turns.jsonl 每行有 ts、REST 历史透传 ts,但前端 `TranscriptRow` 丢弃、SSE 实时帧无 ts 字段。
 - **规格**:① 后端 `session_event_payload`(sessions_api.rs:2012-2018)additive 加 `ts`(与 turns.jsonl 同源的服务端时间,禁前端 Date.now);② `TranscriptRow` 加 ts,`historyToRows`/`eventToRow` 都填;③ SessionView 气泡渲染小字 `HH:MM`(本地时区,title 给完整时间),移动端不挤压;④ additive 不破坏旧前端。
 - **DoD**:历史与实时消息都显时间;刷新后同一消息时间不变;vitest/tsc/eslint 绿;`make test-baseline` 只增(1928/0 起);clippy 0;fmt 干净;writeback 绿。
 
 ### WEB-TREE-1 团队→拓扑按项目折叠(v0.10.2 N2)★ W1
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(pages/AgentsView.tsx · lib/agentsTree.ts)` · **建议入口**:subagent(与 WEB-NAV-1 同只,两 commit)
+- **状态**:完成(cbd4e12d) · **冲突域**:`crates/ccteam-web/web/src(pages/AgentsView.tsx · lib/agentsTree.ts)` · **建议入口**:subagent(与 WEB-NAV-1 同只,两 commit)
+- **验证**:2026-08-17 coder subagent 交付:`groupDelegationTrees` 第三参 `collapsedProjects`(折叠 = rows 空但 slug/live/total 计数保留,与 per-sid collapsed 正交);localStorage `ccteam.agents.collapsedProjects.v1`(损坏回落全展开);toggle 带 aria-expanded/testid;vitest +4(纯函数 2 + 视图 2),合并树门禁见 W1 收口行。**偏差**:无。
 - **背景**:N2。`AgentsTree` 已按项目分组(AgentsView.tsx:138-216),既有折叠仅到会话子树级(`collapsed: Set<sid>`,agentsTree.ts:30-45)。
 - **规格**:`collapsedProjects: Set<slug>` state(与 Set<sid> 并存不混);项目 header(AgentsView.tsx:139-143)加展开/收起 toggle,折叠隐藏该项目全部会话行、header 计数保留;默认全展开;localStorage 持久化;过滤逻辑落 agentsTree.ts 纯函数(保持「React 只持集合、过滤纯函数」风格);纯展示层不动数据获取。
 - **DoD**:折叠/展开正确、计数在、刷新后折叠态保留;vitest 覆盖纯函数;`make web-check` 绿;writeback 绿。
 
 ### WEB-NAV-1 logo 回首页 + Sidebar 底部换序(v0.10.2 N7+N8)★ W1
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(components/Sidebar.tsx · components/Logo.tsx)` · **建议入口**:subagent(与 WEB-TREE-1 同只,两 commit)
+- **状态**:完成(5b382e29) · **冲突域**:`crates/ccteam-web/web/src(components/Sidebar.tsx · components/Logo.tsx)` · **建议入口**:subagent(与 WEB-TREE-1 同只,两 commit)
+- **验证**:2026-08-17 coder subagent 交付:Sidebar 新必需 prop `onOpenHome`(ChatConsole 接线 navigate("/")),两态 logo 可点(testid `side-home`/`side-home-rail`);side-bottom 用户行在上、设置最底,rail 镜像,顺序注释同步;i18n `home` 键双语;vitest +3,ChatConsole.shell rail 顺序断言更新。**偏差**:tooltip 用 SVG `<title>` 子元素(React SVG typings 不收 title 属性)。
 - **背景**:N7/N8。展开态 logo(Sidebar.tsx:291)无点击;折叠态 logo(:596)点击=展开(与 :597 Chevron 冗余);`side-bottom`(:574-591)现状设置在上、用户行在下;折叠 rail 同序(两态顺序一致是既有不变量,:594 注释)。
 - **规格**:① 两态 logo 点击 → navigate `/`(即 /app/ 首页),折叠态展开职能留 Chevron;cursor pointer + title + data-testid。② side-bottom 换序:用户行在上、设置最底;折叠 rail 同步换;两态一致注释同步改。
 - **DoD**:任意页点 logo 回 `/`;折叠态仍能 Chevron 展开;两态顺序断言更新;vitest 绿;writeback 绿。
 
 ### WEB-DSH-1 DSH 菜单 iframe keep-alive(v0.10.2 N9)★ W1
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(App.tsx · ChatConsole.tsx shell · pages/DshView.tsx)` · **建议入口**:subagent
+- **状态**:完成(06faf815) · **冲突域**:`crates/ccteam-web/web/src(App.tsx · ChatConsole.tsx shell · pages/DshView.tsx)` · **建议入口**:subagent
+- **验证**:2026-08-17 coder subagent 交付:新 `dshStore.ts`(useSyncExternalStore,visited 懒门 + 单一 status 源消重复轮询)+ `DshFrameHost.tsx`(ChatConsole `<main>` 内、view switch 外常驻,off-/dsh 只 `hidden`);stop→start 经 src=null 自然换新 iframe(预期 reload)。jsdom 真 ChatConsole 导航测试:iframe 节点身份跨 `/`→`/dsh`→`/`→`/dsh` 不变 + hidden 切换 + stop→start 新节点;未访问零 dsh fetch。vitest 子树 647(60 文件)。**真机 DoD 余项**:浏览器手感复核随版本 dogfood。**偏差**:无。
 - **背景**:N9。`/dsh` 普通路由切走即 unmount DshView → iframe 销毁 → 切回整页重载。修法 = 挂载一次 + CSS 隐藏,不引第三方库。
 - **规格**:iframe 宿主提升到常驻 shell(ChatConsole 布局层),首次访问 `/dsh` 才挂载(模块级 flag,未访问零请求),路由切换只 display/visibility 不 unmount;DshView 本体(status head/空态)仍随路由渲染;`embedSrc(status)` 为 null 时无 iframe 可保;stop→start 后 reload 属预期。**不**顺势改 TerminalView。
 - **DoD**:真机/Playwright:加载完切走再切回,DSH 内草稿/滚动原样、网络面板无资产重拉;未访问零 dsh 请求;vitest 覆盖「路由切换不 unmount」;`make web-check` 绿;writeback 绿。
 
 ### WEB-STATUS-1 会话页状态点实时化(v0.10.2 N3)★ W2
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(pages/SessionView.tsx 头部 · hooks/useSessionEvents.ts · components/ChatConsole.tsx)` · **建议入口**:subagent(W1 合入后开工,SessionView 与 WEB-TS-1 串行)
+- **状态**:完成(7948e17f) · **冲突域**:`crates/ccteam-web/web/src(pages/SessionView.tsx 头部 · hooks/useSessionEvents.ts · components/ChatConsole.tsx)` · **建议入口**:subagent(W1 合入后开工,SessionView 与 WEB-TS-1 串行)
+- **验证**:2026-08-17 coder subagent 交付(基 06faf815):`SessionEvent` 增 state/reason 解析 + 纯函数 `foldSessionLiveness`(evicted/stopped→off,renamed/identity_degraded 无意见);headDot = busy 琥珀 › 会话活性(session.status 基 + lifecycle 折);连接失败拆成独立红色 conn-dot(i18n `connLost` 双语)。vitest +7;合并后 `make web-check` **665/665** EXIT 0。**同形扫一遍**:rail 会话行本无状态点,conv-head 是唯一病点;HostsView 等点 = host/daemon 级出域。**诚实留痕**:显式 stop 与冷 resume 目前不发 lifecycle 帧(wire 词表仅 evicted/renamed/identity_degraded),off→on 靠 rail REST reconcile;词表扩充列后续候选。**真机 DoD 余项**:挤停实测随 dogfood。**偏差**:无。
 - **背景**:N3 根因:SessionView.tsx:413-419 headDot 数据源 = per-sid SSE 连接态(connected 恒绿),会话被挤停照样绿;服务端本在发 `session_lifecycle` 帧(sessions_api.rs:2056-2059 带 state/reason)但 eventToRow 丢弃、SessionView 不消费;`session.status` prop 现成未用。拓扑页对 = REST 快照 + 全局 SSE。
 - **规格**:headDot 换数据源:初值 `session.status`,之后消费 per-sid SSE `session_lifecycle` 即时更新(live=绿/off=灰;busy 琥珀保留本地推导;连接错误红点保留为连接信号,可与状态点分开表达,实现从简);范式参考 ChatConsole.tsx:198 `useAgentsEvents(true,"session_lifecycle")` + lib/lifecycleReconciler;**同形扫一遍**:rail 列表会话项状态点若同病一并修;服务端零改动。
 - **DoD**:挤停/结束后事件到达即变灰(不刷新页面);live 绿、本页 turn 琥珀;与拓扑页同会话状态一致;vitest 覆盖 lifecycle 帧驱动迁移;`make web-check` 绿;writeback 绿。
@@ -58,7 +63,8 @@
 - **DoD**:本机已登录订阅 vendor 行内显示与 vendor 自家 /usage 一致;API-key/未登录行无额度区无报错;非 admin 403;每探测器 fake-HTTP 定向测试(shape 解析 + 401/超时降级);TTL 生效断言;基线只增、clippy 0、vitest 三态;writeback 绿。
 
 ### CLI-HELP-1 `ccteam --help` 文案整洁化(v0.10.2 N4)★ W1
-- **状态**:待排 · **冲突域**:`crates/ccteam-cli` · **建议入口**:subagent
+- **状态**:完成(485da277) · **冲突域**:`crates/ccteam-cli` · **建议入口**:subagent
+- **验证**:2026-08-17 coder subagent 交付(5 文件 +284/−556 纯文案):顶层 about = "Multi-harness agent team bridge and governance layer";57 个 help 页脚本化扫描全 ≤100 字符、零版本字面量;`grep '///.*[vV]0\.'` 全 crate 零命中(版本注记只存 `//` 实现注释);cli lib 94/94 + cli_surface 等定向测绿;`web_subcommand_test::ccteam_web_serves_health_then_exits_when_killed` 红 = pristine base 复跑同红,登记环境族非本卡。**偏差**:同形扫按字面执行(内部 fn/test doc 的版本字面量也清);无版本号的 feature-id(PRD F3.3 等)保留,非用户面。
 - **背景**:N4。现状:多条命令/选项描述是多段开发笔记(Init 5 段/Update 3 段/Start 每选项 3-4 行);版本号写进用户面(`--home`「v0.8.20 —…」main.rs:55、`--owner`「v0.8.20 F1:…」:101、`--no-clipboard`「V0.4.6 F88—…」:145、Status「V0.4.1:…」:152);内部开发史引用数十处(Item 4/W3/W4a/v0.9 T5/Track D);顶层 about「built on Claude Code」名不副实(七 vendor)。
 - **规格**:① 全部用户可见命令/选项描述 ≤100 字符、首段一行(clap 短 help 语义)、简洁用户导向;② **零版本号字面量**(v0.x.y/V0.x 全清);③ 范围:顶层 + project/session/role/skill/host/daemon/config/init/start/stop/status/update 全部子命令与选项;internal(hide)顺手清但不强求 100 字符;④ 顶层 about 改中性现行描述(对齐 README 口径,如 "Multi-harness agent team bridge and governance layer");⑤ 被删开发史注记直接删(git history/docs-local 是其家),有价值行为说明改 `//` 注释留实现处;⑥ grep 全 crate `///` 里 `v0\.|V0\.` 同形扫净。
 - **DoD**:`ccteam --help` 及各子命令 --help 全部描述 ≤100 字符、零版本号;顶层一屏每命令一行;行为零变更(纯文案);`make test-baseline` 只增(1928/0 起)、clippy 0、fmt 干净;writeback 绿。
