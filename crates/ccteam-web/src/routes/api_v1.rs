@@ -22,7 +22,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -32,6 +32,7 @@ use ccteam_core::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use crate::queries::{
@@ -129,9 +130,17 @@ pub struct AuthToken {
 pub(crate) async fn handle_projects(
     State(app): State<AppState>,
     Extension(identity): Extension<crate::auth::Identity>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
     match build_projects(&app, &identity) {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(mut rows) => {
+            let version = app.progress_projection.snapshot_version();
+            for row in &mut rows {
+                row.version = version;
+            }
+            let etag = snapshot_etag("projects", version, &rows);
+            snapshot_response(Json(rows).into_response(), etag, &headers)
+        }
         Err(err) => {
             tracing::error!(?err, "GET /api/v1/projects build failed");
             (
@@ -141,6 +150,42 @@ pub(crate) async fn handle_projects(
                 .into_response()
         }
     }
+}
+
+fn snapshot_response(
+    mut response: Response,
+    etag: Option<String>,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(etag) = etag else {
+        return response;
+    };
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        response = StatusCode::NOT_MODIFIED.into_response();
+    }
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
+/// ETags include the monotonic projection revision and a digest of the exact
+/// response payload. The digest is load-bearing: status/project rows also
+/// contain live registry and host-health state that can change without a
+/// progress ingest, so a bare projection counter could return a false 304.
+pub(crate) fn snapshot_etag<T: Serialize>(
+    kind: &str,
+    version: Option<u64>,
+    value: &T,
+) -> Option<String> {
+    let version = version?;
+    let body = serde_json::to_vec(value).ok()?;
+    let digest = Sha256::digest(body);
+    Some(format!("\"{kind}-{version}-{digest:x}\""))
 }
 
 fn build_projects(
@@ -185,6 +230,7 @@ fn build_projects(
                 .get(&host)
                 .is_some_and(|record| record.is_online(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS));
         rows.push(DashboardRow {
+            version: None,
             slug: s.state.slug.clone(),
             // The real working-tree dir (config-registry resolved) so the SPA can
             // show it next to the slug — disambiguates an auto-appended slug.
@@ -222,6 +268,7 @@ fn build_projects(
                     continue;
                 }
                 rows.push(DashboardRow {
+                    version: None,
                     slug: entry.slug.clone(),
                     path: entry.path.display().to_string(),
                     host: if entry.host.is_empty() {

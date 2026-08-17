@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -140,6 +140,10 @@ impl StatusSingleflight {
 /// Status view render.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct StatusResponse {
+    /// Monotonic revision of the projection snapshot. `null` while startup
+    /// hydration is in progress, which also suppresses ETag/304 responses.
+    #[serde(default)]
+    pub version: Option<u64>,
     /// Startup hydration is still folding one or more project journals.
     #[serde(default)]
     pub warming_up: bool,
@@ -263,6 +267,7 @@ fn project_budget_cap_24h(project_dir: &std::path::Path) -> Option<f64> {
 pub(crate) async fn handle_status(
     State(app): State<AppState>,
     Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
 ) -> Response {
     let compute_app = app.clone();
     let status = match app
@@ -287,7 +292,21 @@ pub(crate) async fn handle_status(
     match tokio::task::spawn_blocking(move || {
         let mut status = status;
         retain_visible_session_rows(&filter_app, &identity, &mut status.sessions);
-        Json(status).into_response()
+        let etag = super::api_v1::snapshot_etag("status", status.version, &status);
+        let mut response = Json(status).into_response();
+        if let Some(etag) = etag {
+            if headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+            {
+                response = StatusCode::NOT_MODIFIED.into_response();
+            }
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                response.headers_mut().insert(header::ETAG, value);
+            }
+        }
+        response
     })
     .await
     {
@@ -369,6 +388,7 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
     }
 
     StatusResponse {
+        version: app.progress_projection.snapshot_version(),
         warming_up: app.progress_projection.warming_up(),
         daemon_healthy,
         sessions_live,
@@ -478,6 +498,7 @@ mod tests {
 
     fn status_with_live_count(sessions_live: u32) -> StatusResponse {
         StatusResponse {
+            version: Some(1),
             warming_up: false,
             daemon_healthy: false,
             sessions_live,

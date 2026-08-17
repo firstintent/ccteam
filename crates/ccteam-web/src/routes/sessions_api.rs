@@ -357,6 +357,7 @@ pub(crate) async fn handle_create_session(
     Path(slug): Path<String>,
     FormOrJson(form, mode): FormOrJson<CreateSessionForm>,
 ) -> Response {
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     if form.removed_host.0 {
         return create_error(
             StatusCode::BAD_REQUEST,
@@ -403,23 +404,18 @@ pub(crate) async fn handle_create_session(
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
     let tuning = spawn_tuning_from_form(vendor, form.model.clone(), form.effort.clone());
-    let created = {
-        let mut guard = gw.lock().await;
-        guard
-            .create_session_api_tuned(
-                slug.clone(),
-                role.clone(),
-                vendor,
-                permission_mode,
-                protocol,
-                // v0.8.20 web↔IM convergence — own the session by the caller's
-                // identity (`user:<tenant>` / `user:web-api`) so the tenant's own
-                // IM bot sees it too.
-                identity.web_chat_id(),
-                tuning,
-            )
-            .await
-    };
+    let created = ccteam_im::gateway::Gateway::create_session_api_tuned_shared(
+        Arc::clone(gw),
+        slug.clone(),
+        role.clone(),
+        vendor,
+        permission_mode,
+        protocol,
+        identity.web_chat_id(),
+        tuning,
+        deadline,
+    )
+    .await;
     match created {
         Ok(created) => (StatusCode::CREATED, Json(json!({"sid": created.sid}))).into_response(),
         // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
@@ -432,9 +428,10 @@ pub(crate) async fn handle_create_session(
                 return create_error(StatusCode::UNPROCESSABLE_ENTITY, missing.to_string(), mode);
             }
             tracing::warn!(%slug, %role, %err, "create_session_api failed");
-            create_error(
+            create_gateway_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format_create_session_error(&err),
+                &err,
                 mode,
             )
         }
@@ -963,9 +960,7 @@ pub(crate) async fn handle_session_turn(
     Path(sid): Path<String>,
     FormOrJson(form, mode): FormOrJson<TurnForm>,
 ) -> Response {
-    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
-        return deny;
-    }
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     let has_global_attachment = form
         .attachments
         .iter()
@@ -973,6 +968,29 @@ pub(crate) async fn handle_session_turn(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
+    // This is the first gateway acquisition for the request. Resolve ACL and
+    // liveness together under the entry-point deadline so lock queuing cannot
+    // consume time invisibly before the vendor-specific timeout begins.
+    let (project, is_live) = match deadline.lock(gw).await {
+        Ok(guard) => (
+            guard.project_slug_for_sid(&sid),
+            guard.is_session_live(&sid),
+        ),
+        Err(err) => {
+            return create_gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format_submit_error(&err),
+                &err,
+                mode,
+            )
+        }
+    };
+    let Some(project) = project else {
+        return unknown_session(&sid);
+    };
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &project) {
+        return unknown_session(&sid);
+    }
     // Attachments make a bare send meaningful ("look at this file"), so text
     // is only required when nothing is attached.
     if form.text.trim().is_empty() && form.attachments.is_empty() {
@@ -982,35 +1000,38 @@ pub(crate) async fn handle_session_turn(
             mode,
         );
     }
-    let result = {
-        let mut guard = gw.lock().await;
-        // Resume-by-sid (红线「会话 = resume-by-session-id」): a session evicted
-        // for capacity, dropped by a daemon restart whose rebuild failed, or
-        // explicitly stopped is not in the live map — but its `meta.json`
-        // persists on disk. Cold-resume it on demand rather than 404, so a chat
-        // whose session "disappeared" out from under it accepts the next turn
-        // (the same path the sidebar resume button + IM `/use` take). A
-        // genuinely unknown sid (no live session, no meta) still 404s below.
-        if !guard.is_session_live(&sid) {
-            let Some(slug) = guard.project_slug_for_sid(&sid) else {
-                return unknown_session(&sid);
-            };
-            // `gate_sid` already project-gated the caller; bind the resume to
-            // the resolved owning project so `resume_stopped_session`'s own ACL
-            // guard is satisfied (`exp == slug` holds).
-            let caller_identity = identity.owner_tag();
-            if let Err(err) = guard
-                .resume_stopped_session(&sid, &caller_identity, Some(&slug))
-                .await
-            {
-                tracing::warn!(%sid, %err, "auto-resume on web turn failed");
-                return create_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("session {sid} could not be resumed: {err}"),
-                    mode,
-                );
-            }
+    let resume_slug = (!is_live).then_some(project);
+    if let Some(slug) = resume_slug {
+        if let Err(err) = ccteam_im::gateway::Gateway::resume_stopped_session_shared(
+            Arc::clone(gw),
+            &sid,
+            &identity.owner_tag(),
+            Some(&slug),
+            deadline,
+        )
+        .await
+        {
+            tracing::warn!(%sid, %err, "auto-resume on web turn failed");
+            return create_gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format!("session {sid} could not be resumed: {err}"),
+                &err,
+                mode,
+            );
         }
+    }
+    let text = {
+        let guard = match deadline.lock(gw).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                return create_gateway_error(
+                    StatusCode::BAD_GATEWAY,
+                    format_submit_error(&err),
+                    &err,
+                    mode,
+                )
+            }
+        };
         let Some(view) = guard
             .session_views()
             .into_iter()
@@ -1022,7 +1043,7 @@ pub(crate) async fn handle_session_turn(
         // inbound attachment grammar). Project uploads and the global library
         // live on the daemon host, so a remote-host session can't see them —
         // readable error, no silent rot.
-        let text = if form.attachments.is_empty() {
+        if form.attachments.is_empty() {
             form.text
         } else {
             let Some(resolved) = guard.session_resolve(&sid) else {
@@ -1070,17 +1091,28 @@ pub(crate) async fn handle_session_turn(
                 Ok(text) => text,
                 Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
             }
-        };
-        // Web interactive path: run the gateway control-command face (/status,
-        // /sessions, …) first — parity with IM — then fall back to a turn. The
-        // fleet renders are admin-only (see `submit_web_sid`).
-        guard.submit_web_sid(&sid, text, identity.is_admin).await
+        }
     };
+    // Web interactive path: run the gateway control-command face (/status,
+    // /sessions, …) first — parity with IM — then fall back to a turn.
+    let result = ccteam_im::gateway::Gateway::submit_web_sid_shared(
+        Arc::clone(gw),
+        &sid,
+        text,
+        identity.is_admin,
+        deadline,
+    )
+    .await;
     match result {
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "submit_to_sid failed");
-            create_error(StatusCode::BAD_GATEWAY, format_submit_error(&err), mode)
+            create_gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format_submit_error(&err),
+                &err,
+                mode,
+            )
         }
     }
 }
@@ -1744,6 +1776,7 @@ pub(crate) async fn handle_session_resume(
     Extension(identity): Extension<crate::auth::Identity>,
     Path((slug, sid)): Path<(String, String)>,
 ) -> Response {
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
         return project_not_visible(&slug);
     }
@@ -1751,25 +1784,19 @@ pub(crate) async fn handle_session_resume(
         return no_gateway();
     };
     let caller_identity = identity.owner_tag();
-    let result = {
-        let mut guard = gw.lock().await;
-        // Bind the resume to the authorised project slug: the sid must belong to
-        // `slug` (gated by `can_see_project` above). Without this a tenant could
-        // resume another project's session by passing its sid under a slug they
-        // own.
-        guard
-            .resume_stopped_session(&sid, &caller_identity, Some(&slug))
-            .await
-    };
+    let result = ccteam_im::gateway::Gateway::resume_stopped_session_shared(
+        Arc::clone(gw),
+        &sid,
+        &caller_identity,
+        Some(&slug),
+        deadline,
+    )
+    .await;
     match result {
         Ok(resumed_sid) => Json(json!({"sid": resumed_sid})).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "resume_stopped_session failed");
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
+            gateway_json_error(StatusCode::NOT_FOUND, &err)
         }
     }
 }
@@ -1800,9 +1827,21 @@ pub(crate) async fn handle_external_sessions(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let sessions = {
-        let guard = gw.lock().await;
-        guard.list_external_claude_sessions(&slug)
+    let sessions = match ccteam_im::gateway::Gateway::list_external_claude_sessions_shared(
+        Arc::clone(gw),
+        &slug,
+    )
+    .await
+    {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::warn!(%slug, %err, "external session scan failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string(), "error_code": "storage_read_corrupt"})),
+            )
+                .into_response();
+        }
     };
     let views: Vec<serde_json::Value> = sessions
         .into_iter()
@@ -1850,6 +1889,7 @@ pub(crate) async fn handle_import_session(
     Path(slug): Path<String>,
     Json(body): Json<ImportSessionRequest>,
 ) -> Response {
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
         return project_not_visible(&slug);
     }
@@ -1871,21 +1911,19 @@ pub(crate) async fn handle_import_session(
         return no_gateway();
     };
     let caller_identity = identity.owner_tag();
-    let result = {
-        let mut guard = gw.lock().await;
-        guard
-            .import_external_session(&slug, &body.vendor_uuid, &caller_identity)
-            .await
-    };
+    let result = ccteam_im::gateway::Gateway::import_external_session_shared(
+        Arc::clone(gw),
+        &slug,
+        &body.vendor_uuid,
+        &caller_identity,
+        deadline,
+    )
+    .await;
     match result {
         Ok(sid) => (StatusCode::CREATED, Json(json!({"sid": sid}))).into_response(),
         Err(err) => {
             tracing::warn!(%slug, %err, "import_external_session failed");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
+            gateway_json_error(StatusCode::BAD_REQUEST, &err)
         }
     }
 }
@@ -2065,6 +2103,39 @@ fn create_error(status: StatusCode, msg: String, mode: InputMode) -> Response {
     match mode {
         InputMode::Form => (status, msg).into_response(),
         InputMode::Json => (status, Json(json!({"ok": false, "error": msg}))).into_response(),
+    }
+}
+
+fn create_gateway_error(
+    status: StatusCode,
+    msg: String,
+    err: &anyhow::Error,
+    mode: InputMode,
+) -> Response {
+    let code = err
+        .downcast_ref::<ccteam_im::gateway::GatewayRequestError>()
+        .map(ccteam_im::gateway::GatewayRequestError::error_code);
+    match (mode, code) {
+        (InputMode::Json, Some(error_code)) => (
+            status,
+            Json(json!({"ok": false, "error": msg, "error_code": error_code})),
+        )
+            .into_response(),
+        _ => create_error(status, msg, mode),
+    }
+}
+
+fn gateway_json_error(default_status: StatusCode, err: &anyhow::Error) -> Response {
+    match err.downcast_ref::<ccteam_im::gateway::GatewayRequestError>() {
+        Some(kind) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": err.to_string(),
+                "error_code": kind.error_code()
+            })),
+        )
+            .into_response(),
+        None => (default_status, Json(json!({"error": err.to_string()}))).into_response(),
     }
 }
 

@@ -59,6 +59,27 @@ async fn companion_rejects_anonymous_and_query_token_requests() {
 }
 
 #[tokio::test]
+async fn disabled_companion_reports_machine_readable_upstream_error() {
+    let tmp = TempDir::new().unwrap();
+    let state = AppState::with_auth(fake_paths(tmp.path()), AuthState::disabled());
+    let addr = spawn_app(dsh_web::companion_router().with_state(state)).await;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{addr}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
+    assert_eq!(body["error_code"], "dsh_upstream_unready");
+}
+
+#[tokio::test]
 async fn dsh_status_reports_disabled_shape_when_companion_is_off() {
     let tmp = TempDir::new().unwrap();
     let state = AppState::with_auth(fake_paths(tmp.path()), AuthState::disabled());

@@ -204,6 +204,10 @@ pub struct ProgressProjection {
     catch_up_invocations: AtomicU64,
     bytes_ingested: AtomicU64,
     rotations: AtomicU64,
+    /// Monotonic snapshot revision. It advances after every journal delta and
+    /// once when startup hydration becomes complete, so an HTTP cache token
+    /// can never make the warming snapshot look stable.
+    version: AtomicU64,
 }
 
 impl ProgressProjection {
@@ -251,6 +255,7 @@ impl ProgressProjection {
             catch_up_invocations: AtomicU64::new(0),
             bytes_ingested: AtomicU64::new(0),
             rotations: AtomicU64::new(0),
+            version: AtomicU64::new(0),
         })
     }
 
@@ -293,6 +298,7 @@ impl ProgressProjection {
                 }
             }
             projection.hydration_complete.store(true, Ordering::Release);
+            projection.version.fetch_add(1, Ordering::AcqRel);
         });
     }
 
@@ -304,12 +310,19 @@ impl ProgressProjection {
             self.catch_up(slug)?;
         }
         self.hydration_complete.store(true, Ordering::Release);
+        self.version.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     /// Whether the startup hydration pass has not completed yet.
     pub fn warming_up(&self) -> bool {
         !self.hydration_complete.load(Ordering::Acquire)
+    }
+
+    /// Stable cache revision for projection-backed HTTP snapshots. `None`
+    /// while hydration is in progress deliberately disables 304 responses.
+    pub fn snapshot_version(&self) -> Option<u64> {
+        (!self.warming_up()).then(|| self.version.load(Ordering::Acquire))
     }
 
     /// Query one project. A metadata check first catches hook fallback writes
@@ -410,12 +423,16 @@ impl ProgressProjection {
             Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
         };
 
-        if size < offset {
+        let rotated = size < offset;
+        if rotated {
             *write_lock(&projection.state) = SlugState::default();
             self.rotations.fetch_add(1, Ordering::Relaxed);
             offset = 0;
         }
         if size == offset {
+            if rotated {
+                self.version.fetch_add(1, Ordering::AcqRel);
+            }
             return Ok(());
         }
 
@@ -431,6 +448,7 @@ impl ProgressProjection {
         state.offset = delta.next_offset;
         drop(state);
         self.bytes_ingested.fetch_add(consumed, Ordering::Relaxed);
+        self.version.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }

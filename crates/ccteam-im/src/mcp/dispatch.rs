@@ -1847,6 +1847,7 @@ async fn resolve_call_origin(
     caller: &McpCaller,
     args: &Value,
     gateway: Option<&std::sync::Arc<tokio::sync::Mutex<crate::gateway::Gateway>>>,
+    deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> Result<Option<crate::gateway::DelegationParent>, String> {
     match caller {
         McpCaller::Ambient => {
@@ -1888,7 +1889,13 @@ async fn resolve_call_origin(
                 ));
             };
             let view = {
-                let gw = gateway.lock().await;
+                let gw = match deadline {
+                    Some(deadline) => deadline
+                        .lock(gateway)
+                        .await
+                        .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
+                    None => gateway.lock().await,
+                };
                 gw.session_views().into_iter().find(|v| v.sid == declared)
             };
             let Some(view) = view else {
@@ -1912,6 +1919,7 @@ async fn run_session_spawn_at(
     caller: McpCaller,
     paths: Option<&CcteamPaths>,
 ) -> std::result::Result<String, String> {
+    let deadline = crate::gateway::GatewayDeadline::start();
     if args.get("host").is_some() {
         return Err(crate::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string());
     }
@@ -2014,7 +2022,7 @@ async fn run_session_spawn_at(
     // from CallerCtx — never caller-supplied). Admin (the local mcp.sock
     // admin-token tier) = a human/root spawn unless it declares a `parent_sid`.
     // Guardrails apply only when a real parent is present.
-    let parent = resolve_call_origin(&caller, args, Some(gateway)).await?;
+    let parent = resolve_call_origin(&caller, args, Some(gateway), Some(deadline)).await?;
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
@@ -2045,7 +2053,10 @@ async fn run_session_spawn_at(
     let vendor_wire = session_vendor_wire(vendor);
     {
         let (bound_host, local_snapshot, sat_snapshot) = {
-            let gw = gateway.lock().await;
+            let gw = deadline
+                .lock(gateway)
+                .await
+                .map_err(|error| mcp_gateway_error("session_spawn", &error))?;
             let host = gw.project_bound_host(&project);
             let (local, satellite) = if host == ccteam_core::LOCAL_HOST {
                 (gw.local_vendor_availability_override(), None)
@@ -2104,56 +2115,56 @@ async fn run_session_spawn_at(
         }
     }
 
-    // Check idempotency + create under ONE lock so a concurrent same-key retry
-    // can never race past the replay into a second spawn.
-    let (sid, resolved, replay) = {
-        let mut gw = gateway.lock().await;
-        if let Some(key) = idem_key.as_deref() {
-            if let Some(body) = gw.spawn_idem_replay(&project, key) {
-                (String::new(), None, Some(body))
-            } else {
-                let created = gw
-                    .create_delegated_session(
-                        project.clone(),
-                        role.clone(),
-                        vendor,
-                        permission_mode,
-                        protocol,
-                        fallback_owner_id,
-                        tuning,
-                        parent,
-                        title.clone(),
-                    )
-                    .await
-                    .map_err(|e| spawn_create_error(e, &project, &caller, paths))?;
-                let sid = created.sid.clone();
-                let resolved = gw.session_resolve(&sid);
-                (sid, resolved, None)
-            }
-        } else {
-            let created = gw
-                .create_delegated_session(
-                    project.clone(),
-                    role.clone(),
-                    vendor,
-                    permission_mode,
-                    protocol,
-                    fallback_owner_id,
-                    tuning,
-                    parent,
-                    title.clone(),
-                )
+    // Per-key singleflight preserves idempotency while the vendor spawn itself
+    // runs without the global gateway lock.
+    let _idem_claim = if let Some(key) = idem_key.as_deref() {
+        Some(
+            crate::gateway::Gateway::claim_spawn_idempotency(gateway, &project, key, deadline)
                 .await
-                .map_err(|e| spawn_create_error(e, &project, &caller, paths))?;
-            let sid = created.sid.clone();
-            let resolved = gw.session_resolve(&sid);
-            (sid, resolved, None)
-        }
+                .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
+        )
+    } else {
+        None
+    };
+    let replay = if let Some(key) = idem_key.as_deref() {
+        let mut gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error("session_spawn", &error))?;
+        gw.spawn_idem_replay(&project, key)
+    } else {
+        None
     };
     // Idempotent replay: return the ORIGINAL body verbatim (+ a replay flag).
     if let Some(body) = replay {
         return Ok(mark_idempotent_replay(&body));
     }
+    let created = crate::gateway::Gateway::create_delegated_session_shared(
+        Arc::clone(gateway),
+        project.clone(),
+        role.clone(),
+        vendor,
+        permission_mode,
+        protocol,
+        fallback_owner_id,
+        tuning,
+        parent,
+        title.clone(),
+        deadline,
+    )
+    .await
+    .map_err(|error| {
+        if error
+            .downcast_ref::<crate::gateway::GatewayRequestError>()
+            .is_some()
+        {
+            mcp_gateway_error("session_spawn", &error)
+        } else {
+            spawn_create_error(error, &project, &caller, paths)
+        }
+    })?;
+    let sid = created.sid;
+    let resolved = gateway.lock().await.session_resolve(&sid);
     // Read the child meta once for the vendor resume key + the delegation
     // lineage (parent_sid/depth) the ledger just persisted.
     // vendor_session_id = the vendor's native resume key (`meta.vendor_uuid`).
@@ -2209,6 +2220,7 @@ async fn run_session_spawn_at(
             effective_wait_seconds,
             notify,
             title.clone(),
+            deadline,
         )
         .await?;
         if let Some(obj) = body.as_object_mut() {
@@ -2341,6 +2353,16 @@ fn spawn_create_error(
     )
 }
 
+fn mcp_gateway_error(tool: &str, err: &anyhow::Error) -> String {
+    let code = err
+        .downcast_ref::<crate::gateway::GatewayRequestError>()
+        .map(crate::gateway::GatewayRequestError::error_code);
+    match code {
+        Some(code) => format!("{tool} failed: {err} (error_code={code})"),
+        None => format!("{tool} failed: {err}"),
+    }
+}
+
 /// v0.9.0 W2 (F7) — mark a recorded idempotency body as a replay: parse it,
 /// insert `"idempotent_replay": true`, re-serialize. On a parse miss (should
 /// never happen — we only store our own bodies) return the stored body as-is.
@@ -2401,11 +2423,12 @@ async fn run_session_dispatch(
     gateway: &GatewayHandle,
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
+    let deadline = crate::gateway::GatewayDeadline::start();
     let sid = arg_session_sid(args)?;
     // Driveability before anything else: ccteam has no thread to submit into for
     // an enrolled hand-started client, and every path below would call it
     // unknown instead of saying so.
-    assert_target_is_driveable("session_dispatch", gateway, &sid).await?;
+    assert_target_is_driveable("session_dispatch", gateway, &sid, Some(deadline)).await?;
     let task = args
         .get("task")
         .and_then(|v| v.as_str())
@@ -2413,7 +2436,15 @@ async fn run_session_dispatch(
         .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
         .to_string();
     // R-M3 — only operate sessions in the caller's own project.
-    assert_caller_owns_session("session_dispatch", args, gateway, &sid, &caller).await?;
+    assert_caller_owns_session(
+        "session_dispatch",
+        args,
+        gateway,
+        &sid,
+        &caller,
+        Some(deadline),
+    )
+    .await?;
 
     let requested_wait_seconds = requested_inline_wait_seconds(args);
     let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
@@ -2457,7 +2488,10 @@ async fn run_session_dispatch(
 
     // ---- Scope 1: idempotent replay + cycle guard (fast, no submit) ----
     {
-        let mut gw = gateway.lock().await;
+        let mut gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error("session_dispatch", &error))?;
         if let Some(key) = idem_key.as_deref() {
             if let Some(body) = gw.dispatch_idem_replay(&sid, key) {
                 return Ok(mark_idempotent_replay(&body));
@@ -2526,6 +2560,7 @@ async fn run_session_dispatch(
         effective_wait_seconds,
         notify,
         title,
+        deadline,
     )
     .await?;
     let mut body = serde_json::json!({ "ok": true, "sid": sid });
@@ -2660,10 +2695,14 @@ async fn dispatch_task(
     effective_wait_seconds: u64,
     notify: ccteam_harness::NotifyMode,
     title: Option<String>,
+    deadline: crate::gateway::GatewayDeadline,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
-    let (turn_id, rx, parent_is_external) = {
-        let mut gw = gateway.lock().await;
+    let (rx, parent_is_external) = {
+        let gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error(tool, &error))?;
         // Whether a completion turn is deliverable is a property of the PARENT's
         // ledger row, not of the caller's auth tier: a hand-started client dials
         // in over MCP, so there is no thread to steer and no session to resume.
@@ -2677,45 +2716,63 @@ async fn dispatch_task(
         } else {
             None
         };
-        let turn_id = gw
-            .submit_to_sid(sid, task)
-            .await
-            .map_err(|e| format!("{tool} failed: {e}"))?;
-        if is_delegation {
-            // The watch is armed either way — the completion edge belongs in the
-            // ledger (`delegation_completed` fires off the mirror, whatever the
-            // notify mode). An external parent gets it with notifications OFF:
-            // left on, the first completion would submit into a session ccteam
-            // must never re-spawn, fail, and drop the watch — silently ending
-            // that child's completion accounting for every later turn.
-            let watch_notify = if parent_is_external {
-                ccteam_harness::NotifyMode::Off
-            } else {
-                notify
-            };
-            gw.arm_delegation_watch(
-                sid,
-                caller_sid,
-                watch_notify,
-                title.clone(),
-                Some(turn_id.clone()),
-            );
-            if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
-                gw.emit_delegation_progress(
-                    &slug,
-                    ccteam_harness::execution::progress_bridge::DELEGATION_DISPATCHED,
-                    caller_sid,
-                    sid,
-                    vendor,
-                    &host,
-                    Some(&turn_id),
-                    title.as_deref(),
-                    None,
-                );
-            }
-        }
-        (turn_id, rx, parent_is_external)
+        (rx, parent_is_external)
     };
+    if is_delegation {
+        // The watch is armed either way — the completion edge belongs in the
+        // ledger (`delegation_completed` fires off the mirror, whatever the
+        // notify mode). Durable watch IO is explicitly outside the gateway
+        // mutex; a generation fence rejects a concurrently replaced child.
+        let watch_notify = if parent_is_external {
+            ccteam_harness::NotifyMode::Off
+        } else {
+            notify
+        };
+        crate::gateway::Gateway::arm_delegation_watch_shared(
+            Arc::clone(gateway),
+            sid,
+            caller_sid,
+            watch_notify,
+            title.clone(),
+            None,
+            deadline,
+        )
+        .await
+        .map_err(|error| mcp_gateway_error(tool, &error))?;
+    }
+    let turn_id = match crate::gateway::Gateway::submit_to_sid_shared(
+        Arc::clone(gateway),
+        sid,
+        task,
+        deadline,
+    )
+    .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            if is_delegation {
+                crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), sid)
+                    .await;
+            }
+            return Err(mcp_gateway_error(tool, &error));
+        }
+    };
+    if is_delegation {
+        let gw = gateway.lock().await;
+        if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
+            gw.emit_delegation_progress(
+                &slug,
+                ccteam_harness::execution::progress_bridge::DELEGATION_DISPATCHED,
+                caller_sid,
+                sid,
+                vendor,
+                &host,
+                Some(&turn_id),
+                title.as_deref(),
+                None,
+            );
+        }
+    }
     let notification_route =
         CompletionNotificationRoute::resolve(caller_sid, notify, parent_is_external);
     if notification_route == CompletionNotificationRoute::Unavailable {
@@ -2932,7 +2989,8 @@ async fn dispatch_wait_for_completion(
     // Inline completion: the caller already holds the result → disarm the watch
     // so a delegation doesn't ALSO wake the parent with a redundant turn.
     if is_delegation {
-        gateway.lock().await.disarm_delegation_watch(child_sid);
+        crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), child_sid)
+            .await;
     }
 
     let mut m = serde_json::Map::new();
@@ -3172,7 +3230,7 @@ async fn run_session_collect(
     // Same gate as dispatch/stop: ccteam mirrors no transcript for a client it
     // never spawned, so the honest answer is what the session is — not an empty
     // page or an "unknown session" from the resolve below.
-    assert_target_is_driveable("session_collect", gateway, &sid).await?;
+    assert_target_is_driveable("session_collect", gateway, &sid, None).await?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
     let n = args
         .get("n")
@@ -3182,7 +3240,7 @@ async fn run_session_collect(
     let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
     let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
-    assert_caller_owns_session("session_collect", args, gateway, &sid, &caller).await?;
+    assert_caller_owns_session("session_collect", args, gateway, &sid, &caller, None).await?;
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
@@ -3563,10 +3621,10 @@ async fn run_session_stop(
     // Ahead of both scope checks: a hand-started client's process belongs to its
     // operator, and the descendant walk below would otherwise reject it as "not
     // a descendant" — true, but not the reason.
-    assert_target_is_driveable("session_stop", gateway, &sid).await?;
+    assert_target_is_driveable("session_stop", gateway, &sid, None).await?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
-    assert_caller_owns_session("session_stop", args, gateway, &sid, &caller).await?;
+    assert_caller_owns_session("session_stop", args, gateway, &sid, &caller, None).await?;
     // v0.9.0 W2 (F2) — an Ambient (agent) caller may only stop its OWN
     // descendants (walk the target's parent chain; it must reach the caller).
     // Admin/human callers are unrestricted (fleet-wide).
@@ -3640,8 +3698,17 @@ async fn assert_target_is_driveable(
     tool: &str,
     gateway: &GatewayHandle,
     sid: &str,
+    deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> std::result::Result<(), String> {
-    if gateway.lock().await.is_external_node(sid) {
+    let is_external = match deadline {
+        Some(deadline) => deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error(tool, &error))?
+            .is_external_node(sid),
+        None => gateway.lock().await.is_external_node(sid),
+    };
+    if is_external {
         return Err(crate::external_nodes::not_driveable_error(tool, sid));
     }
     Ok(())
@@ -3661,12 +3728,19 @@ async fn assert_caller_owns_session(
     gateway: &GatewayHandle,
     sid: &str,
     caller: &McpCaller,
+    deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> std::result::Result<(), String> {
     // v0.9 T4 review fix — the verified admin (local mcp.sock admin token)
     // operates fleet-wide (same semantics as the web admin Identity): no ambient
     // slug to bind to. Unknown sids still fail inside the op itself.
     let resolved = {
-        let gw = gateway.lock().await;
+        let gw = match deadline {
+            Some(deadline) => deadline
+                .lock(gateway)
+                .await
+                .map_err(|error| mcp_gateway_error(name, &error))?,
+            None => gateway.lock().await,
+        };
         gw.session_resolve(sid)
     };
     match caller {
@@ -4063,6 +4137,7 @@ mod session_tool_tests {
                 1,
                 ccteam_harness::NotifyMode::Final,
                 None,
+                crate::gateway::GatewayDeadline::start(),
             )
             .await
             .expect("a capped inline timeout is a normal pending response"),
@@ -4162,6 +4237,36 @@ mod session_tool_tests {
     // `Gateway` can mint per-session secrets + track project scope without
     // spawning a `claude` pane. `start_thread` records the `(sid, secret)` the
     // gateway minted so the test can present the real secret to the gate.
+    struct StubSpawnBarrier {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicUsize,
+        entered_notify: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for StubSpawnBarrier {
+        fn default() -> Self {
+            Self {
+                armed: std::sync::atomic::AtomicBool::new(false),
+                entered: std::sync::atomic::AtomicUsize::new(0),
+                entered_notify: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl StubSpawnBarrier {
+        async fn wait_for(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.entered.load(std::sync::atomic::Ordering::SeqCst) < count {
+                    self.entered_notify.notified().await;
+                }
+            })
+            .await
+            .expect("concurrent MCP spawns reach the vendor barrier");
+        }
+    }
+
     #[derive(Clone, Default)]
     struct StubAdapter {
         spawns: std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
@@ -4182,6 +4287,7 @@ mod session_tool_tests {
             tokio::sync::Mutex<std::collections::VecDeque<(String, ccteam_harness::ThreadEvent)>>,
         >,
         notify: std::sync::Arc<tokio::sync::Notify>,
+        spawn_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
     }
 
     #[async_trait::async_trait]
@@ -4202,6 +4308,20 @@ mod session_tool_tests {
                 .lock()
                 .await
                 .push((ctx.sid.clone(), ctx.secret.clone()));
+            if let Some(barrier) = self.spawn_barrier.as_ref() {
+                if barrier.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                    barrier
+                        .entered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    barrier.entered_notify.notify_waiters();
+                    barrier
+                        .release
+                        .acquire()
+                        .await
+                        .expect("test barrier stays open")
+                        .forget();
+                }
+            }
             Ok(ccteam_harness::ThreadHandle {
                 vendor: ccteam_harness::AgentVendor::Claude,
                 mode: ccteam_harness::ExecutionMode::Chat,
@@ -5375,6 +5495,7 @@ mod session_tool_tests {
             6,
             ccteam_harness::NotifyMode::Final,
             None,
+            crate::gateway::GatewayDeadline::start(),
         )
         .await
         .unwrap();
@@ -5934,6 +6055,54 @@ mod session_tool_tests {
             .filter(|s| s["parent_sid"] == json!(principal))
             .count();
         assert_eq!(children, 1, "no double-spawn: {list}");
+    }
+
+    /// Two independent MCP session_spawn calls must reach vendor startup at
+    /// the same time; only the post-spawn admission seam is serialized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn session_spawn_fanout_reaches_two_vendor_spawns_concurrently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let barrier = std::sync::Arc::new(StubSpawnBarrier::default());
+        let factory: crate::daemon::AdapterFactory = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::sync::Arc::new(move |_, _| {
+                std::sync::Arc::new(StubAdapter {
+                    spawn_barrier: Some(std::sync::Arc::clone(&barrier)),
+                    ..Default::default()
+                })
+                    as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+            })
+        };
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp.path());
+        mark_stub_vendors_installed(&mut gateway);
+        let gateway = std::sync::Arc::new(tokio::sync::Mutex::new(gateway));
+        barrier
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn = |role: &'static str| {
+            let gateway = std::sync::Arc::clone(&gateway);
+            tokio::spawn(async move {
+                run_session_spawn(
+                    &json!({"project": "alpha", "vendor": "claude", "role": role}),
+                    &gateway,
+                    McpCaller::Admin,
+                )
+                .await
+            })
+        };
+        let first = spawn("first");
+        let second = spawn("second");
+        barrier.wait_for(2).await;
+        assert_eq!(
+            barrier.entered.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both fan-out branches reached phase-2 vendor startup"
+        );
+        barrier.release.add_permits(2);
+        let first = first.await.unwrap().expect("first spawn succeeds");
+        let second = second.await.unwrap().expect("second spawn succeeds");
+        assert_ne!(parse(&first)["sid"], parse(&second)["sid"]);
     }
 
     /// v0.9.5 feedback fix — `session_list` accepts `project`/`activity`/

@@ -94,6 +94,10 @@ enum TurnOrigin {
 
 #[derive(Clone)]
 struct GatewaySession {
+    /// Monotonic live-entry epoch. Every replacement gets a fresh value;
+    /// unlocked vendor work must present the epoch it planned against before
+    /// committing any result.
+    generation: u64,
     id: String,
     /// Chat that created the session.
     owner: ChatKey,
@@ -217,6 +221,23 @@ struct GatewaySession {
     delegation_depth: u32,
 }
 
+#[derive(Clone)]
+struct UnlockedTurnPlan {
+    session: GatewaySession,
+    generation: u64,
+    project_dir: PathBuf,
+    project_paths: Option<CcteamPaths>,
+    session_catalog: Arc<crate::session_catalog::SessionCatalog>,
+    has_event_sink: bool,
+    origin: TurnOrigin,
+    user_text: String,
+    start_visible_events: u64,
+    requested_routing: TurnRouting,
+    provisional_inject: bool,
+    prior_steered: bool,
+    prime_tool_surface: bool,
+}
+
 /// How often a paneless session's pump mirrors a mid-turn "still working"
 /// heartbeat into `progress.jsonl`.
 ///
@@ -329,6 +350,11 @@ pub struct Gateway {
     /// sids that were live at last persist. Session CONTENT lives in each
     /// session's `meta.json` (the SoT), never here. `None` ⇒ in-memory only.
     routing_path: Option<PathBuf>,
+    routing_persist_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes only post-spawn capacity checks and live-map installation.
+    /// Vendor startup remains concurrent while two completed spawns cannot
+    /// both consume the same apparent free slot.
+    capacity_admission_lock: Arc<tokio::sync::Mutex<()>>,
     /// v0.8.21 Wave-2 — persisted monotonic session-id counter
     /// (`~/.ccteam/state/sessions/next-sid`). Its own file so "sid never
     /// reused" survives a wiped routing table / purged meta.json set.
@@ -360,6 +386,16 @@ pub struct Gateway {
     /// stream (v0.8.10 routing-isolation fix).
     current_session: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
     sessions: BTreeMap<String, GatewaySession>,
+    /// Process-wide allocator for [`GatewaySession::generation`]. It is not a
+    /// persisted identity; it only fences races within this daemon lifetime.
+    next_session_generation: u64,
+    /// Epoch reservations for absent-session rebuilds. Apply must still own
+    /// the reservation and observe no live replacement before installing.
+    rebuild_reservations: BTreeMap<String, u64>,
+    new_session_reservations: BTreeMap<String, u64>,
+    /// In-flight delegated plans count toward fan-out/project guardrails even
+    /// before their concurrently-starting vendor processes enter `sessions`.
+    delegation_spawn_reservations: BTreeMap<String, DelegationSpawnReservation>,
     /// O(1) sid-to-meta index. All live-session reads stay off the filesystem;
     /// stopped sessions pay one lazy scan on the first true miss only.
     session_catalog: Arc<crate::session_catalog::SessionCatalog>,
@@ -447,6 +483,10 @@ pub struct Gateway {
     /// the completion-notification hot path (checked on every watched child
     /// turn) off the filesystem. Rebuilt from disk by the startup reconcile.
     delegations: std::collections::HashMap<String, DelegationMirror>,
+    /// Lock-independent hot-path filter for pump chatter. It mirrors the keys
+    /// of `delegations`; notifier drops unwatched/non-boundary signals without
+    /// ever joining the gateway mutex queue.
+    delegation_watch_set: Arc<std::sync::RwLock<HashSet<String>>>,
     /// v0.9.0 W2 (F7) — idempotency cache for `session_spawn` (per-project
     /// `key → response body`). In-memory only (honest: a daemon restart forgets
     /// keys); within one lifetime a replay returns the original body + zero
@@ -486,6 +526,7 @@ struct ScheduledEntry {
 /// lockstep with every durable write.
 #[derive(Debug, Clone)]
 struct DelegationMirror {
+    generation: u64,
     /// sid of the session to notify on a watched turn (the dispatcher).
     parent_sid: String,
     /// When completion delivers a notification turn — `final` (turn boundary
@@ -500,6 +541,105 @@ struct DelegationMirror {
     /// Child turns already notified — the at-least-once dedup set (mirrors the
     /// durable `DelegationWatch.notified_turns`).
     notified_turns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DelegationSpawnReservation {
+    project: String,
+    parent_sid: String,
+}
+
+#[derive(Clone)]
+struct DelegationProgressEmitter {
+    progress_root: Option<CcteamPaths>,
+    event_sink: Option<GatewayEventSink>,
+    events_broadcast: tokio::sync::broadcast::Sender<GatewayEvent>,
+}
+
+#[derive(Clone)]
+struct DelegationProgressRecord {
+    slug: String,
+    event: String,
+    parent_sid: String,
+    child_sid: String,
+    vendor: AgentVendor,
+    host: String,
+    turn: Option<String>,
+    title: Option<String>,
+    reason: Option<String>,
+}
+
+struct DelegationDeliveryPlan {
+    signal: crate::delegation::DelegationSignal,
+    mirror: DelegationMirror,
+    dedup_key: String,
+    notification: Option<String>,
+    emitter: DelegationProgressEmitter,
+}
+
+impl DelegationProgressEmitter {
+    async fn append(&self, record: &DelegationProgressRecord) {
+        if let Some(paths) = self.progress_root.clone() {
+            let append = record.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let event = ccteam_harness::execution::progress_bridge::build_delegation_event(
+                    &append.event,
+                    &append.parent_sid,
+                    &append.child_sid,
+                    crate::delegation::vendor_key(append.vendor),
+                    &append.host,
+                    append.turn.as_deref(),
+                    append.title.as_deref(),
+                    append.reason.as_deref(),
+                );
+                ccteam_core::progress::append_event(&paths.progress_jsonl(&append.slug), &event)
+            })
+            .await;
+        }
+    }
+
+    fn broadcast(&self, record: DelegationProgressRecord) {
+        let relation = record
+            .event
+            .strip_prefix("delegation_")
+            .unwrap_or(&record.event);
+        let event = GatewayEvent {
+            id: format!(
+                "delegation-{relation}-{}-{}-{}",
+                record.parent_sid,
+                record.child_sid,
+                record.turn.as_deref().unwrap_or("")
+            ),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!(
+                "delegation {relation}: {} -> {}",
+                record.parent_sid, record.child_sid
+            ),
+            kind: GatewayEventKind::Delegation {
+                relation: relation.to_string(),
+                parent_sid: record.parent_sid,
+                child_sid: record.child_sid,
+                title: record.title.filter(|title| !title.is_empty()),
+                reason: record.reason.filter(|reason| !reason.is_empty()),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: None,
+            slug: Some(record.slug),
+        };
+        if let Some(sink) = &self.event_sink {
+            let _ = sink.send(event);
+        } else {
+            let _ = self.events_broadcast.send(event);
+        }
+    }
+
+    async fn emit(&self, record: DelegationProgressRecord) {
+        self.append(&record).await;
+        self.broadcast(record);
+    }
 }
 
 /// One structured step of session activity (v0.8.19). Carried by
@@ -944,6 +1084,115 @@ pub struct CreateSessionOutcome {
     pub sid: String,
 }
 
+/// Stable machine classifications for gateway 5xx responses. Human messages
+/// remain the primary error text; HTTP/MCP layers may add `error_code` from
+/// this enum without changing existing strings.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayRequestError {
+    /// The request could not reach its vendor phase within the queue budget.
+    #[error("gateway queue deadline elapsed before vendor work could start")]
+    QueueDeadline,
+    /// A cold or dead-thread resume failed before the session became live.
+    #[error("session resume failed: {0}")]
+    SessionResumeFailed(String),
+    /// The vendor did not acknowledge a submitted turn within its own budget.
+    #[error("vendor submit timed out for session {sid}")]
+    VendorSubmitTimeout {
+        /// Gateway session id.
+        sid: String,
+    },
+    /// The vendor transport closed before accepting the turn.
+    #[error("vendor channel closed for session {sid}: {detail}")]
+    VendorChannelClosed {
+        /// Gateway session id.
+        sid: String,
+        /// Adapter-provided close reason.
+        detail: String,
+    },
+    /// Capacity cleanup could not complete its durable bookkeeping.
+    #[error("capacity eviction failed: {0}")]
+    CapacityEvictionFailed(String),
+    /// The DSH companion process has not become proxy-ready.
+    #[error("DSH upstream is not ready: {0}")]
+    DshUpstreamUnready(String),
+    /// A storage-backed lookup found unreadable or corrupt data.
+    #[error("storage read is corrupt: {0}")]
+    StorageReadCorrupt(String),
+    /// A session/watch was replaced while unlocked work was in flight.
+    #[error("session generation changed while work was in flight: {0}")]
+    SessionGenerationConflict(String),
+}
+
+impl GatewayRequestError {
+    /// Stable additive wire code for HTTP and MCP callers.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::QueueDeadline => "gateway_queue_deadline",
+            Self::SessionResumeFailed(_) => "session_resume_failed",
+            Self::VendorSubmitTimeout { .. } => "vendor_submit_timeout",
+            Self::VendorChannelClosed { .. } => "vendor_channel_closed",
+            Self::CapacityEvictionFailed(_) => "capacity_eviction_failed",
+            Self::DshUpstreamUnready(_) => "dsh_upstream_unready",
+            Self::StorageReadCorrupt(_) => "storage_read_corrupt",
+            Self::SessionGenerationConflict(_) => "session_generation_conflict",
+        }
+    }
+}
+
+/// Overall queue budget for one externally-entered gateway operation. Vendor
+/// RPCs retain their independent timeout; this deadline only bounds time spent
+/// waiting to reach the vendor phase.
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayDeadline {
+    expires_at: Instant,
+}
+
+impl GatewayDeadline {
+    /// Start a queue deadline at the external request entry point.
+    pub fn start() -> Self {
+        Self {
+            expires_at: Instant::now() + gateway_queue_deadline_duration(),
+        }
+    }
+
+    /// Acquire the shared registry within this operation's queue budget.
+    /// Entry-point crates use this for their own short resolve/auth phases so
+    /// waiting before the shared helper cannot silently escape the deadline.
+    pub async fn lock<'a>(
+        self,
+        gateway: &'a Arc<tokio::sync::Mutex<Gateway>>,
+    ) -> Result<tokio::sync::MutexGuard<'a, Gateway>> {
+        tokio::time::timeout_at(self.expires_at.into(), gateway.lock())
+            .await
+            .map_err(|_| GatewayRequestError::QueueDeadline.into())
+    }
+
+    fn ensure_vendor_phase_can_start(self) -> Result<()> {
+        if Instant::now() >= self.expires_at {
+            Err(GatewayRequestError::QueueDeadline.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Gateway {
+    /// Serialize retries for one MCP spawn idempotency key without occupying
+    /// the global registry mutex during vendor startup.
+    pub async fn claim_spawn_idempotency(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        project: &str,
+        key: &str,
+        deadline: GatewayDeadline,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let claims = Arc::clone(&deadline.lock(gateway).await?.spawn_claims);
+        let claim_key = ChatKey::new("mcp-idempotency", project, key);
+        tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for(&claim_key))
+            .await
+            .map_err(|_| GatewayRequestError::QueueDeadline.into())
+    }
+}
+
 impl CreateSessionOutcome {
     /// Borrow the session id as a string slice.
     pub fn as_str(&self) -> &str {
@@ -1091,6 +1340,7 @@ struct RoutingState {
 /// stale session's `system:init` — while the on-demand resume path runs the
 /// same core under its already-held lock. One construction site, no drift.
 struct MetaRebuildPlan {
+    generation: u64,
     sid: String,
     slug: String,
     role: String,
@@ -1133,6 +1383,7 @@ struct MetaRebuildPlan {
 /// construction site (`plan_new_session`), no drift between the inline and
 /// lock-dropping callers.
 struct NewSessionPlan {
+    generation: u64,
     id: String,
     /// Canonical resource owner used by session ACL and persisted meta.
     owner: ChatKey,
@@ -1202,10 +1453,9 @@ struct ResumeDeadPlan {
     /// Replayed from `meta.effort`, exactly like `model_id` above.
     effort: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
-    /// Race marker: `format!("{identity}@{started_at}")` of the thread that
-    /// was live when we planned. Apply aborts if the map's thread no longer
-    /// matches (someone else resumed/replaced) or the sid is gone (stop).
-    generation: String,
+    /// Live-entry epoch captured during planning. Apply aborts if the entry was
+    /// replaced or removed while the vendor spawn was in flight.
+    generation: u64,
     /// v0.9.0 W3 (G10) — see `MetaRebuildPlan::ccteam_root` / `remote_proxy`;
     /// same re-gate contract, performed by `spawn_for_resume_plan`.
     ccteam_root: Option<PathBuf>,
@@ -1473,6 +1723,11 @@ fn append_next_hint(reply: &mut String, hint: &str) {
 }
 
 impl Gateway {
+    fn next_live_generation(&mut self) -> u64 {
+        self.next_session_generation = self.next_session_generation.wrapping_add(1).max(1);
+        self.next_session_generation
+    }
+
     /// Create a gateway with one default project.
     pub fn new(
         adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -1510,6 +1765,8 @@ impl Gateway {
             adapter_factory,
             default_project,
             routing_path: None,
+            routing_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+            capacity_admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_sid_path: None,
             next_scheduled_path: None,
             restore_pending: Vec::new(),
@@ -1518,6 +1775,10 @@ impl Gateway {
             current_project: BTreeMap::new(),
             current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             sessions: BTreeMap::new(),
+            next_session_generation: 0,
+            rebuild_reservations: BTreeMap::new(),
+            new_session_reservations: BTreeMap::new(),
+            delegation_spawn_reservations: BTreeMap::new(),
             session_catalog: Arc::new(crate::session_catalog::SessionCatalog::default()),
             external_nodes: BTreeMap::new(),
             templates: Vec::new(),
@@ -1540,6 +1801,7 @@ impl Gateway {
             remote_host_proxy: None,
             local_vendor_availability_override: None,
             delegations: std::collections::HashMap::new(),
+            delegation_watch_set: Arc::new(std::sync::RwLock::new(HashSet::new())),
             spawn_idem: crate::delegation::IdemCache::default(),
             dispatch_idem: crate::delegation::IdemCache::default(),
             delegation_tx: None,
@@ -1707,7 +1969,7 @@ impl Gateway {
     /// value), and select the adapter. The caller then `spawn_for_plan` (the
     /// slow await) + `apply_rebuilt_session` (insert + pump).
     fn plan_session_rebuild(
-        &self,
+        &mut self,
         slug: &str,
         cwd: PathBuf,
         meta: &SessionMeta,
@@ -1752,7 +2014,11 @@ impl Gateway {
             &meta.role,
             meta.delegation_depth,
         );
+        let generation = self.next_live_generation();
+        self.rebuild_reservations
+            .insert(meta.sid.clone(), generation);
         Ok(MetaRebuildPlan {
+            generation,
             sid: meta.sid.clone(),
             slug: slug.to_string(),
             role: meta.role.clone(),
@@ -1853,10 +2119,25 @@ impl Gateway {
         plan: MetaRebuildPlan,
         thread: ThreadHandle,
         reply_to: ChatKey,
-    ) {
+        capacity_checked: bool,
+    ) -> Result<()> {
         let sid = plan.sid.clone();
-        let excluded = self.live_capacity_exclusions(&sid, plan.parent_sid.as_deref());
-        self.ensure_live_capacity(&excluded).await;
+        let reservation_matches = self
+            .rebuild_reservations
+            .get(&sid)
+            .is_some_and(|generation| *generation == plan.generation);
+        if !reservation_matches || self.sessions.contains_key(&sid) {
+            let adapter = Arc::clone(&plan.adapter);
+            tokio::spawn(async move {
+                let _ = adapter.close_thread(&thread).await;
+            });
+            return Err(GatewayRequestError::SessionGenerationConflict(sid).into());
+        }
+        self.rebuild_reservations.remove(&sid);
+        if !capacity_checked {
+            let excluded = self.live_capacity_exclusions(&sid, plan.parent_sid.as_deref());
+            self.ensure_live_capacity(&excluded).await;
+        }
         // Rebuilt session is live: full authority, same secret.
         self.principals.promote(
             &sid,
@@ -1865,9 +2146,11 @@ impl Gateway {
             &plan.role,
             plan.delegation_depth,
         );
+        let generation = plan.generation;
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
+                generation,
                 id: plan.sid,
                 owner: plan.owner,
                 project: plan.slug,
@@ -1896,6 +2179,7 @@ impl Gateway {
             },
         );
         self.spawn_event_pump(&sid);
+        Ok(())
     }
 
     /// v0.8.21 Wave-2 — cold-start rebuild a live [`GatewaySession`] from its
@@ -1921,8 +2205,8 @@ impl Gateway {
                 return Err(err.into());
             }
         };
-        self.apply_rebuilt_session(plan, thread, reply_to).await;
-        Ok(())
+        self.apply_rebuilt_session(plan, thread, reply_to, false)
+            .await
     }
 
     /// Drop `current_session` routes pointing at a missing or foreign session.
@@ -1992,7 +2276,7 @@ impl Gateway {
         for sid in pending {
             // Build the plan under the lock, then drop it before the spawn await.
             let plan_and_reply = {
-                let g = gateway.lock().await;
+                let mut g = gateway.lock().await;
                 if g.sessions.contains_key(&sid) {
                     None
                 } else {
@@ -2026,11 +2310,14 @@ impl Gateway {
             // Spawn OUTSIDE the lock — the slow part.
             match Self::spawn_for_plan(&plan).await {
                 Ok(thread) => {
-                    gateway
+                    if let Err(err) = gateway
                         .lock()
                         .await
-                        .apply_rebuilt_session(plan, thread, reply_to)
-                        .await;
+                        .apply_rebuilt_session(plan, thread, reply_to, false)
+                        .await
+                    {
+                        tracing::warn!(session = %sid, error = %err, "ccteam-im: stale restored session discarded");
+                    }
                 }
                 Err(err) => {
                     gateway.lock().await.forget_principal(&plan.sid);
@@ -2489,7 +2776,9 @@ impl Gateway {
                 };
                 let sid = {
                     let mut g = gateway.lock().await;
-                    let outcome = g.apply_new_session(*plan, thread, None).await?;
+                    let outcome = g
+                        .apply_new_session(*plan, thread, None, false, None)
+                        .await?;
                     let sid = outcome.id.clone();
                     g.drain_and_dispatch_pending_turns(&sid).await;
                     sid
@@ -3274,7 +3563,9 @@ impl Gateway {
                         return Err(err.into());
                     }
                 };
-                let outcome = self.apply_new_session(*plan, thread, None).await?;
+                let outcome = self
+                    .apply_new_session(*plan, thread, None, false, None)
+                    .await?;
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
             }
@@ -3524,7 +3815,9 @@ impl Gateway {
                 return Err(err.into());
             }
         };
-        let outcome = self.apply_new_session(plan, thread, None).await?;
+        let outcome = self
+            .apply_new_session(plan, thread, None, false, None)
+            .await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
         Ok(outcome)
     }
@@ -3599,6 +3892,8 @@ impl Gateway {
         // then leaves a harmless gap, never a reused sid — red line: monotonic).
         self.persist_next_sid()?;
         let id = format!("s{}", self.next_session);
+        let generation = self.next_live_generation();
+        self.new_session_reservations.insert(id.clone(), generation);
         // v0.8.8 F2 — roleless(空 role)session 的 handle 默认会随 role 一起变空,
         // 而空 handle 会让 @handle 路由(session_by_handle / template_by_handle)
         // 误匹配/互撞。空 handle 时回退到 sid(全局唯一,绝不撞),保证 @handle
@@ -3636,6 +3931,7 @@ impl Gateway {
             .tenant_project_owner(&project)
             .unwrap_or_else(|| canonical_owner(&reply_to));
         Ok(NewSessionPlan {
+            generation,
             id,
             owner,
             reply_to,
@@ -3726,6 +4022,74 @@ impl Gateway {
             .await
     }
 
+    /// Build the durable metadata for a fresh session without borrowing the
+    /// gateway. Shared entry points run this filesystem-backed fingerprinting
+    /// step before the short live-map apply lock.
+    fn meta_for_new_session(
+        plan: &NewSessionPlan,
+        thread: &ThreadHandle,
+        trigger: Option<&str>,
+    ) -> SessionMeta {
+        let now = chrono::Utc::now().to_rfc3339();
+        let (role_sha, skills_sha) = (
+            ccteam_harness::execution::experience::role_fingerprint(&plan.cwd, &plan.role),
+            ccteam_harness::execution::experience::skills_fingerprint(&plan.cwd),
+        );
+        let trigger = trigger.map(str::to_string).unwrap_or_else(|| {
+            let channel = plan.reply_to.channel.as_str();
+            if channel == "web" || channel == "user" {
+                "web".to_string()
+            } else if channel == "mcp" || channel == "session" {
+                "mcp".to_string()
+            } else {
+                "im".to_string()
+            }
+        });
+        let mut meta = SessionMeta {
+            managed_by: Default::default(),
+            sid: plan.id.clone(),
+            slug: plan.project.clone(),
+            vendor: plan.vendor,
+            protocol: plan.protocol,
+            role: plan.role.clone(),
+            permission_mode: plan.permission_mode,
+            owner: plan.owner.identity(),
+            vendor_uuid: thread
+                .raw_extras
+                .get("vendor_uuid")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string(),
+            model: plan.model_id.clone(),
+            observed_model: None,
+            effort: plan.effort.clone(),
+            host: plan.host.clone(),
+            created_at: now.clone(),
+            last_active: now,
+            origin: SessionOrigin::Ccteam,
+            title: None,
+            title_source: None,
+            turn_count: 0,
+            cost_usd: None,
+            tokens_total: None,
+            role_sha,
+            skills_sha,
+            trigger: Some(trigger),
+            parent_sid: plan.parent_sid.clone(),
+            spawned_by_role: plan.spawned_by_role.clone(),
+            delegation_depth: plan.delegation_depth,
+        };
+        if let Some(title) = plan
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            apply_title(&mut meta, title.to_string(), TitleSource::User);
+        }
+        meta
+    }
+
     /// v0.8.x (concurrency review §4.1 P1) — the apply half after the spawn:
     /// insert the live [`GatewaySession`], persist routing + `meta.json`, and
     /// start its event pump. Mirrors `apply_rebuilt_session`'s shape.
@@ -3734,8 +4098,13 @@ impl Gateway {
         plan: NewSessionPlan,
         thread: ThreadHandle,
         trigger: Option<&str>,
+        capacity_checked: bool,
+        prepared_meta: Option<SessionMeta>,
     ) -> Result<StartOutcome> {
+        let meta =
+            prepared_meta.unwrap_or_else(|| Self::meta_for_new_session(&plan, &thread, trigger));
         let NewSessionPlan {
+            generation,
             id,
             owner,
             reply_to,
@@ -3749,29 +4118,36 @@ impl Gateway {
             wire_slug: _,
             secret,
             cwd: _,
-            model_id,
-            effort: effort_meta,
+            model_id: _,
+            effort: _,
             adapter,
             parent_sid,
-            spawned_by_role,
+            spawned_by_role: _,
             delegation_depth,
-            title: spawn_title,
+            title: _,
             remote: _,
             ccteam_root: _,
             remote_proxy: _,
         } = plan;
-        // Capture before the session insert moves these.
-        let meta_vendor_uuid = thread
-            .raw_extras
-            .get("vendor_uuid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let reservation_matches = self
+            .new_session_reservations
+            .get(&id)
+            .is_some_and(|reserved| *reserved == generation);
+        if !reservation_matches || self.sessions.contains_key(&id) {
+            self.delegation_spawn_reservations.remove(&id);
+            let orphan_adapter = Arc::clone(&adapter);
+            tokio::spawn(async move {
+                let _ = orphan_adapter.close_thread(&thread).await;
+            });
+            return Err(GatewayRequestError::SessionGenerationConflict(id).into());
+        }
+        self.new_session_reservations.remove(&id);
+        self.delegation_spawn_reservations.remove(&id);
         let meta_project = project.clone();
-        let meta_role = role.clone();
-        let owner_channel = reply_to.channel.clone();
-        let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
-        self.ensure_live_capacity(&excluded).await;
+        if !capacity_checked {
+            let excluded = self.live_capacity_exclusions(&id, parent_sid.as_deref());
+            self.ensure_live_capacity(&excluded).await;
+        }
         // The session is live: the same secret now carries full authority
         // (`Spawning` only ever allowed tool-face discovery).
         self.principals
@@ -3779,6 +4155,7 @@ impl Gateway {
         self.sessions.insert(
             id.clone(),
             GatewaySession {
+                generation,
                 id: id.clone(),
                 // v0.8.20 web↔IM convergence — owner is the canonical resource
                 // identity while reply_to remains the concrete frontend route.
@@ -3812,81 +4189,11 @@ impl Gateway {
             .write()
             .unwrap()
             .insert(reply_to, id.clone());
-        self.persist_routing()?;
-        // Write per-session meta.json for history list + resume after stop.
-        {
-            let now = chrono::Utc::now().to_rfc3339();
-            let owner_tag = self
-                .sessions
-                .get(&id)
-                .map(|s| s.owner.identity())
-                .unwrap_or_default();
-            // v0.9 T5 — snapshot role/skill fingerprints at spawn (not rehashed
-            // mid-session).
-            let (role_sha, skills_sha) = self
-                .projects
-                .get(&meta_project)
-                .map(|cwd| {
-                    (
-                        ccteam_harness::execution::experience::role_fingerprint(cwd, &meta_role),
-                        ccteam_harness::execution::experience::skills_fingerprint(cwd),
-                    )
-                })
-                .unwrap_or((None, None));
-            // v0.8.24 F5 — surface attribution from owner channel. MCP
-            // `session_spawn` supplies its explicit trigger at the apply seam.
-            let trigger = trigger.map(str::to_string).unwrap_or_else(|| {
-                let ch = owner_channel.as_str();
-                if ch == "web" || ch == "user" {
-                    "web".to_string()
-                } else if ch == "mcp" || ch == "session" {
-                    "mcp".to_string()
-                } else {
-                    "im".to_string()
-                }
-            });
-            let meta = SessionMeta {
-                managed_by: Default::default(),
-                sid: id.clone(),
-                slug: meta_project.clone(),
-                vendor,
-                protocol,
-                role: meta_role,
-                permission_mode,
-                owner: owner_tag,
-                vendor_uuid: meta_vendor_uuid,
-                model: model_id,
-                observed_model: None,
-                effort: effort_meta,
-                host: host.clone(),
-                created_at: now.clone(),
-                last_active: now,
-                origin: SessionOrigin::Ccteam,
-                // A fresh spawn has no title yet — the first mirrored user
-                // message auto-titles it (see `mirror_user_turn`).
-                title: None,
-                title_source: None,
-                turn_count: 0,
-                cost_usd: None,
-                tokens_total: None,
-                role_sha,
-                skills_sha,
-                trigger: Some(trigger),
-                parent_sid: parent_sid.clone(),
-                spawned_by_role: spawned_by_role.clone(),
-                delegation_depth,
-            };
-            // v0.9.0 W2 (F2) — an explicit `session_spawn` title is a
-            // user-authored label (highest precedence: it survives the
-            // first-message auto-title). Ledger/display only — never a prompt.
-            let mut meta = meta;
-            if let Some(t) = spawn_title
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                apply_title(&mut meta, t.to_string(), TitleSource::User);
-            }
+        if !capacity_checked {
+            self.persist_routing()?;
+        }
+        // Shared entry points persist after releasing the registry mutex.
+        if !capacity_checked {
             if let Some(cwd) = self.projects.get(&meta_project) {
                 if let Err(e) = self.persist_session_meta(cwd, &meta) {
                     tracing::warn!(sid = %id, err = %e, "failed to write session meta.json");
@@ -4025,9 +4332,11 @@ impl Gateway {
         // Replace the record in place: same sid, new role/handle/thread, fresh
         // pane counters; replies route back to the owner (the chat that drives
         // it), matching `start_session`.
+        let generation = self.next_live_generation();
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
+                generation,
                 id: sid.clone(),
                 owner: owner.clone(),
                 project,
@@ -5385,6 +5694,65 @@ impl Gateway {
         atomic_write_durable(path, &serde_json::to_vec_pretty(&saved)?)
     }
 
+    async fn persist_latest_routing_shared(gateway: &Arc<tokio::sync::Mutex<Self>>) -> Result<()> {
+        let persist_lock = Arc::clone(&gateway.lock().await.routing_persist_lock);
+        let _persist = persist_lock.lock().await;
+        let write = {
+            let guard = gateway.lock().await;
+            let Some(path) = guard.routing_path.clone() else {
+                return Ok(());
+            };
+            let saved = RoutingState {
+                default_project: guard.default_project.clone(),
+                current_project: guard
+                    .current_project
+                    .iter()
+                    .map(|(chat, value)| SavedGatewayRoute {
+                        chat: chat.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                current_session: guard
+                    .current_session
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|(chat, value)| SavedGatewayRoute {
+                        chat: chat.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                live_sids: guard.sessions.keys().cloned().collect(),
+            };
+            (path, serde_json::to_vec_pretty(&saved)?)
+        };
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = write.0.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            atomic_write_durable(&write.0, &write.1)
+        })
+        .await
+        .map_err(|error| anyhow!("routing persistence task failed: {error}"))?
+    }
+
+    async fn persist_prepared_session_meta(
+        catalog: Arc<crate::session_catalog::SessionCatalog>,
+        cwd: PathBuf,
+        meta: SessionMeta,
+    ) {
+        let sid = meta.sid.clone();
+        match tokio::task::spawn_blocking(move || catalog.write(&cwd, &meta)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%sid, %error, "failed to write session meta.json")
+            }
+            Err(error) => {
+                tracing::warn!(%sid, %error, "session metadata task failed")
+            }
+        }
+    }
+
     /// v0.8.21 Wave-2 — persist the monotonic session-id counter to its own
     /// file. Called right after each `next_session` bump so the counter is
     /// durable BEFORE the sid is used (a spawn failure then leaves a harmless
@@ -5999,17 +6367,36 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Gateway>>,
         session_id: &str,
     ) -> Result<()> {
-        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
-        let _claim = claims.lock_for_sid(session_id).await;
+        Self::resume_dead_session_shared_with_deadline(
+            gateway,
+            session_id,
+            GatewayDeadline::start(),
+        )
+        .await
+    }
+
+    async fn resume_dead_session_shared_with_deadline(
+        gateway: Arc<tokio::sync::Mutex<Gateway>>,
+        session_id: &str,
+        deadline: GatewayDeadline,
+    ) -> Result<()> {
+        let claims = Arc::clone(&deadline.lock(&gateway).await?.spawn_claims);
+        let _claim =
+            tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for_sid(session_id))
+                .await
+                .map_err(|_| GatewayRequestError::QueueDeadline)?;
         let plan = {
-            let mut g = gateway.lock().await;
+            let mut g = deadline.lock(&gateway).await?;
             g.plan_resume_dead_session(session_id)?
         };
         let Some(plan) = plan else {
             return Ok(());
         };
         // Slow part — deliberately NO gateway lock held here.
-        let thread = Self::spawn_for_resume_plan(&plan).await?;
+        deadline.ensure_vendor_phase_can_start()?;
+        let thread = Self::spawn_for_resume_plan(&plan)
+            .await
+            .map_err(|error| GatewayRequestError::SessionResumeFailed(error.to_string()))?;
         gateway
             .lock()
             .await
@@ -6038,7 +6425,7 @@ impl Gateway {
         let host = s.host.clone();
         let permission_mode = s.permission_mode;
         let secret = s.secret.clone();
-        let generation = format!("{}@{}", s.thread.identity, s.thread.started_at);
+        let generation = s.generation;
         // Sync a possibly-registered-after-start project from the config.yaml
         // SoT before the lookup (mirrors start_session / `/role`).
         self.ensure_project_loaded(&project);
@@ -6153,22 +6540,25 @@ impl Gateway {
             ccteam_root: _,
             remote_proxy: _,
         } = plan;
-        let still_matches = self.sessions.get(&session_id).is_some_and(|s| {
-            format!("{}@{}", s.thread.identity, s.thread.started_at) == generation
-        });
+        let still_matches = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.generation == generation);
         if !still_matches {
             // Session was stopped or its thread was replaced while we spawned —
             // do NOT insert a zombie; close the fresh thread gracefully.
-            let _ = adapter.close_thread(&thread).await;
+            let orphan_adapter = Arc::clone(&adapter);
+            let orphan_thread = thread.clone();
+            tokio::spawn(async move {
+                let _ = orphan_adapter.close_thread(&orphan_thread).await;
+            });
             tracing::warn!(
                 session_id = %session_id,
                 vendor = ?vendor,
                 protocol = ?protocol,
                 "ccteam-im: discarded resumed thread (session gone or replaced during spawn)"
             );
-            return Err(anyhow!(
-                "session vanished or replaced during resume: {session_id}"
-            ));
+            return Err(GatewayRequestError::SessionGenerationConflict(session_id).into());
         }
         // Swap the fresh handle/adapter into the existing GatewaySession in
         // place — every Arc-shared cell (owner / reply_to / counters) survives.
@@ -6179,6 +6569,10 @@ impl Gateway {
         if let Some(s) = self.sessions.get_mut(&session_id) {
             s.thread = thread;
             s.adapter = adapter;
+        }
+        let generation = self.next_live_generation();
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            s.generation = generation;
         }
         // Drop the stale pump (its task is already ending — it was bound to the
         // now-closed transport) so spawn_event_pump installs a fresh one on the
@@ -8394,6 +8788,43 @@ impl Gateway {
         discover_external_claude_sessions(cwd, &known_uuids)
     }
 
+    /// Directory-walk variant for HTTP: snapshot the project binding briefly,
+    /// scan Claude history on the blocking pool, then verify the binding before
+    /// returning the result.
+    pub async fn list_external_claude_sessions_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+    ) -> Result<Vec<ExternalClaudeSession>> {
+        let cwd = gateway
+            .lock()
+            .await
+            .projects
+            .get(slug)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {slug}"))?;
+        let scan_dir = cwd.clone();
+        let sessions = tokio::task::spawn_blocking(move || {
+            let known_uuids: HashSet<String> = list_session_metas(&scan_dir)
+                .into_iter()
+                .filter(|meta| !meta.vendor_uuid.is_empty())
+                .map(|meta| meta.vendor_uuid)
+                .collect();
+            discover_external_claude_sessions(&scan_dir, &known_uuids)
+        })
+        .await
+        .map_err(|error| anyhow!("external session scan failed: {error}"))?;
+        let still_bound = gateway
+            .lock()
+            .await
+            .projects
+            .get(slug)
+            .is_some_and(|current| current == &cwd);
+        if !still_bound {
+            return Err(GatewayRequestError::SessionGenerationConflict(slug.to_string()).into());
+        }
+        Ok(sessions)
+    }
+
     /// Resume a *stopped* ccteam session by its sid: read `meta.json`, re-insert
     /// into the live map, spawn the child via the fidelity ladder, persist state.
     /// The `caller` chat becomes the `reply_to` target for this session.
@@ -8434,6 +8865,80 @@ impl Gateway {
             .unwrap()
             .insert(caller, sid.to_string());
         self.persist_routing()?;
+        Ok(sid.to_string())
+    }
+
+    /// Lock-narrowed stopped-session resume used by HTTP/MCP entry points.
+    /// Planning and fenced apply are brief; the vendor handshake runs without
+    /// the daemon-wide gateway mutex.
+    pub async fn resume_stopped_session_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        caller_identity: &str,
+        expected_slug: Option<&str>,
+        deadline: GatewayDeadline,
+    ) -> Result<String> {
+        let claims = {
+            let guard = deadline.lock(&gateway).await?;
+            Arc::clone(&guard.spawn_claims)
+        };
+        let _claim = tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for_sid(sid))
+            .await
+            .map_err(|_| GatewayRequestError::QueueDeadline)?;
+        let caller = ChatKey::from_identity(caller_identity)
+            .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        let plan = {
+            let mut guard = deadline.lock(&gateway).await?;
+            if guard.sessions.contains_key(sid) {
+                return Ok(sid.to_string());
+            }
+            let (slug, cwd, meta) = guard.find_meta_for_sid(sid)?;
+            if expected_slug.is_some_and(|expected| expected != slug) {
+                anyhow::bail!(
+                    "session {sid} does not belong to project {}",
+                    expected_slug.unwrap_or_default()
+                );
+            }
+            guard.plan_session_rebuild(&slug, cwd, &meta, &caller)?
+        };
+        if let Err(error) = deadline.ensure_vendor_phase_can_start() {
+            gateway.lock().await.forget_principal(&plan.sid);
+            return Err(error);
+        }
+        let thread = match Self::spawn_for_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                gateway.lock().await.forget_principal(&plan.sid);
+                return Err(GatewayRequestError::SessionResumeFailed(error.to_string()).into());
+            }
+        };
+        let _admission = Self::claim_capacity_admission(&gateway).await;
+        let exclusions = gateway
+            .lock()
+            .await
+            .live_capacity_exclusions(&plan.sid, plan.parent_sid.as_deref());
+        if let Err(error) = Self::ensure_live_capacity_shared(&gateway, &exclusions).await {
+            Self::discard_uninstalled_thread(
+                &gateway,
+                &plan.sid,
+                Arc::clone(&plan.adapter),
+                &thread,
+            )
+            .await;
+            return Err(GatewayRequestError::CapacityEvictionFailed(error.to_string()).into());
+        }
+        {
+            let mut guard = gateway.lock().await;
+            guard
+                .apply_rebuilt_session(plan, thread, caller.clone(), true)
+                .await?;
+            guard
+                .current_session
+                .write()
+                .unwrap()
+                .insert(caller, sid.to_string());
+        }
+        Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid.to_string())
     }
 
@@ -8536,6 +9041,136 @@ impl Gateway {
             .unwrap()
             .insert(caller, sid.clone());
         self.persist_routing()?;
+        Ok(sid)
+    }
+
+    /// Lock-narrowed external import. The host-wide Claude directory scan and
+    /// vendor resume run outside the gateway mutex; project binding and rebuild
+    /// generation are revalidated before installation.
+    pub async fn import_external_session_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        slug: &str,
+        vendor_uuid: &str,
+        caller_identity: &str,
+        deadline: GatewayDeadline,
+    ) -> Result<String> {
+        let caller = ChatKey::from_identity(caller_identity)
+            .unwrap_or_else(|| ChatKey::new("web", "web-api", "web-api"));
+        let cwd = {
+            let mut guard = deadline.lock(&gateway).await?;
+            guard.ensure_project_loaded(slug);
+            guard
+                .projects
+                .get(slug)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown project: {slug}"))?
+        };
+        let scan_dir = cwd.clone();
+        let wanted = vendor_uuid.to_string();
+        let matched = tokio::task::spawn_blocking(move || {
+            let known_uuids: HashSet<String> = list_session_metas(&scan_dir)
+                .into_iter()
+                .filter(|meta| !meta.vendor_uuid.is_empty())
+                .map(|meta| meta.vendor_uuid)
+                .collect();
+            discover_external_claude_sessions(&scan_dir, &known_uuids)
+                .into_iter()
+                .find(|session| session.vendor_uuid == wanted)
+        })
+        .await
+        .map_err(|error| anyhow!("external session scan failed: {error}"))?
+        .ok_or_else(|| {
+            anyhow!("vendor_uuid {vendor_uuid} is not an adoptable session for project {slug}")
+        })?;
+        let (plan, meta, catalog) = {
+            let mut guard = deadline.lock(&gateway).await?;
+            if guard.projects.get(slug) != Some(&cwd) {
+                return Err(
+                    GatewayRequestError::SessionGenerationConflict(slug.to_string()).into(),
+                );
+            }
+            guard.next_session += 1;
+            guard.persist_next_sid()?;
+            let sid = format!("s{}", guard.next_session);
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut meta = SessionMeta {
+                managed_by: Default::default(),
+                sid: sid.clone(),
+                slug: slug.to_string(),
+                vendor: AgentVendor::Claude,
+                protocol: SessionProtocol::StreamJson,
+                role: String::new(),
+                permission_mode: PermissionMode::Skip,
+                owner: canonical_owner(&caller).identity(),
+                vendor_uuid: vendor_uuid.to_string(),
+                model: None,
+                observed_model: None,
+                effort: None,
+                host: "local".to_string(),
+                created_at: now.clone(),
+                last_active: now,
+                origin: SessionOrigin::Adopted,
+                title: None,
+                title_source: None,
+                turn_count: 0,
+                cost_usd: None,
+                tokens_total: None,
+                role_sha: None,
+                skills_sha: ccteam_harness::execution::experience::skills_fingerprint(&cwd),
+                trigger: None,
+                parent_sid: None,
+                spawned_by_role: None,
+                delegation_depth: 0,
+            };
+            if !matched.title.trim().is_empty() {
+                apply_title(&mut meta, matched.title, TitleSource::Vendor);
+            }
+            let plan = guard.plan_session_rebuild(slug, cwd.clone(), &meta, &caller)?;
+            (plan, meta, Arc::clone(&guard.session_catalog))
+        };
+        if let Err(error) = deadline.ensure_vendor_phase_can_start() {
+            gateway.lock().await.forget_principal(&plan.sid);
+            return Err(error);
+        }
+        let thread = match Self::spawn_for_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                gateway.lock().await.forget_principal(&plan.sid);
+                return Err(GatewayRequestError::SessionResumeFailed(error.to_string()).into());
+            }
+        };
+        let sid = meta.sid.clone();
+        let _admission = Self::claim_capacity_admission(&gateway).await;
+        let exclusions = gateway
+            .lock()
+            .await
+            .live_capacity_exclusions(&plan.sid, plan.parent_sid.as_deref());
+        if let Err(error) = Self::ensure_live_capacity_shared(&gateway, &exclusions).await {
+            Self::discard_uninstalled_thread(
+                &gateway,
+                &plan.sid,
+                Arc::clone(&plan.adapter),
+                &thread,
+            )
+            .await;
+            return Err(GatewayRequestError::CapacityEvictionFailed(error.to_string()).into());
+        }
+        gateway
+            .lock()
+            .await
+            .apply_rebuilt_session(plan, thread, caller.clone(), true)
+            .await?;
+        // Slow durable writes are deliberately outside the registry lock.
+        catalog.write(&cwd, &meta)?;
+        {
+            let guard = gateway.lock().await;
+            guard
+                .current_session
+                .write()
+                .unwrap()
+                .insert(caller, sid.clone());
+        }
+        Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid)
     }
 
@@ -8663,8 +9298,30 @@ impl Gateway {
     /// `Spawning` state already withholds every authority except listing the
     /// tool face, so a leak is untidy rather than dangerous — but a secret for
     /// a session that does not exist has no reason to keep verifying.
-    fn forget_principal(&self, sid: &str) {
+    fn forget_principal(&mut self, sid: &str) {
+        self.new_session_reservations.remove(sid);
+        self.rebuild_reservations.remove(sid);
+        self.delegation_spawn_reservations.remove(sid);
         self.principals.forget(sid);
+    }
+
+    async fn claim_capacity_admission(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = Arc::clone(&gateway.lock().await.capacity_admission_lock);
+        lock.lock_owned().await
+    }
+
+    async fn discard_uninstalled_thread(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+        thread: &ThreadHandle,
+    ) {
+        gateway.lock().await.forget_principal(sid);
+        if let Err(error) = adapter.close_thread(thread).await {
+            tracing::warn!(%sid, %error, "failed to close uninstalled vendor thread");
+        }
     }
 
     /// Handle to the `(sid, secret)` registry, so a front door can verify a
@@ -8823,6 +9480,98 @@ impl Gateway {
         .map(|o| CreateSessionOutcome { sid: o.id })
     }
 
+    /// Lock-narrowed network creation path. Host probing and vendor startup run
+    /// outside the registry mutex; the generated sid is installed only by the
+    /// fenced apply phase.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session_api_tuned_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+        owner_id: String,
+        tuning: SpawnTuning,
+        deadline: GatewayDeadline,
+    ) -> Result<CreateSessionOutcome> {
+        let (host, wire_slug, root, proxy) = {
+            let mut guard = deadline.lock(&gateway).await?;
+            guard.ensure_project_loaded(&project);
+            let (host, wire_slug) = guard.project_host_binding(&project)?;
+            (
+                host,
+                wire_slug,
+                guard.project_paths.as_ref().map(|paths| paths.root.clone()),
+                guard.remote_host_proxy.clone(),
+            )
+        };
+        let host_target = crate::remote_host::prepare_host_for_spawn(
+            root.as_deref(),
+            &host,
+            &wire_slug,
+            vendor,
+            protocol,
+            proxy.as_ref(),
+        )
+        .await?;
+        let plan = {
+            let mut guard = deadline.lock(&gateway).await?;
+            let owner = ChatKey::new("web", &owner_id, &owner_id);
+            let handle = role.clone();
+            let mut plan = guard.plan_new_session(
+                owner,
+                project,
+                vendor,
+                role,
+                handle,
+                permission_mode,
+                protocol,
+                tuning,
+            )?;
+            plan.remote = host_target.remote;
+            plan
+        };
+        if let Err(error) = deadline.ensure_vendor_phase_can_start() {
+            gateway.lock().await.forget_principal(&plan.id);
+            return Err(error);
+        }
+        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                gateway.lock().await.forget_principal(&plan.id);
+                return Err(error.into());
+            }
+        };
+        let meta = Self::meta_for_new_session(&plan, &thread, None);
+        let meta_cwd = plan.cwd.clone();
+        let catalog = Arc::clone(&gateway.lock().await.session_catalog);
+        let _admission = Self::claim_capacity_admission(&gateway).await;
+        let exclusions = gateway
+            .lock()
+            .await
+            .live_capacity_exclusions(&plan.id, plan.parent_sid.as_deref());
+        if let Err(error) = Self::ensure_live_capacity_shared(&gateway, &exclusions).await {
+            Self::discard_uninstalled_thread(
+                &gateway,
+                &plan.id,
+                Arc::clone(&plan.adapter),
+                &thread,
+            )
+            .await;
+            return Err(GatewayRequestError::CapacityEvictionFailed(error.to_string()).into());
+        }
+        let outcome = gateway
+            .lock()
+            .await
+            .apply_new_session(plan, thread, None, true, Some(meta.clone()))
+            .await?;
+        drop(_admission);
+        Self::persist_prepared_session_meta(catalog, meta_cwd, meta).await;
+        Self::persist_latest_routing_shared(&gateway).await?;
+        Ok(CreateSessionOutcome { sid: outcome.id })
+    }
+
     // ── live-session capacity (v0.9.2) ──────────────────────────────────────
 
     fn sessions_config(&self) -> ccteam_core::SessionsConfig {
@@ -8880,10 +9629,14 @@ impl Gateway {
                 sid, "capacity",
             );
             let path = paths.progress_jsonl(slug);
-            if let Err(err) = ccteam_core::progress::append_event(&path, &event) {
-                tracing::warn!(%sid, %slug, error = %err,
-                    "ccteam-im: failed to append session eviction progress event");
-            }
+            let sid = sid.to_string();
+            let slug = slug.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = ccteam_core::progress::append_event(&path, &event) {
+                    tracing::warn!(%sid, %slug, %error,
+                        "ccteam-im: failed to append session eviction progress event");
+                }
+            });
         }
         self.emit_user_signal(GatewayEvent {
             id: format!("session-evicted-{sid}"),
@@ -8966,6 +9719,85 @@ impl Gateway {
                     "ccteam-im: capacity eviction left candidate live; admitting over cap");
                 break;
             }
+        }
+    }
+
+    async fn ensure_live_capacity_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        exclude: &[String],
+    ) -> Result<()> {
+        let excluded: HashSet<String> = exclude.iter().cloned().collect();
+        loop {
+            let victim = {
+                let mut guard = gateway.lock().await;
+                let configured = guard.sessions_config().max_live;
+                let max_live = configured.max(1) as usize;
+                if guard.sessions.len() < max_live {
+                    return Ok(());
+                }
+                let candidates = {
+                    let pending = guard.pending.lock().await;
+                    guard
+                        .sessions
+                        .values()
+                        .map(|session| LiveCapacityCandidate {
+                            sid: session.id.clone(),
+                            idle: session
+                                .turn_started_at
+                                .lock()
+                                .map(|started| started.is_none())
+                                .unwrap_or(false),
+                            last_active: guard.session_last_active(session),
+                            waiting_approval: pending.pending_for_sid(&session.id).is_some(),
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let Some(sid) = select_live_capacity_eviction(&candidates, &excluded) else {
+                    tracing::warn!(
+                        live = guard.sessions.len(),
+                        max_live,
+                        "ccteam-im: no eligible capacity victim; admitting over cap"
+                    );
+                    return Ok(());
+                };
+                // Re-check the selected entry under the same short lock that
+                // removes it. A replacement gets a new generation and will be
+                // selected afresh on the next loop rather than stopped stale.
+                let Some(session) = guard.sessions.get(&sid).cloned() else {
+                    continue;
+                };
+                guard.principals.forget(&sid);
+                if let Some(pump) = guard.event_pumps.remove(&sid) {
+                    pump.abort();
+                }
+                let removed = guard.sessions.remove(&sid);
+                if removed
+                    .as_ref()
+                    .is_none_or(|current| current.generation != session.generation)
+                {
+                    continue;
+                }
+                guard
+                    .current_session
+                    .write()
+                    .unwrap()
+                    .retain(|_, current| current != &sid);
+                (
+                    sid,
+                    session.project.clone(),
+                    Arc::clone(&session.adapter),
+                    session.thread.clone(),
+                )
+            };
+            let (sid, slug, adapter, thread) = victim;
+            // Graceful vendor close is the slow half and never occupies the
+            // registry lock. The entry is already fenced out, so new work
+            // cannot race onto the retiring handle.
+            if let Err(error) = adapter.close_thread(&thread).await {
+                tracing::warn!(%sid, %error, "capacity eviction close failed");
+            }
+            Self::persist_latest_routing_shared(gateway).await?;
+            gateway.lock().await.emit_session_evicted(&sid, &slug);
         }
     }
 
@@ -9087,51 +9919,27 @@ impl Gateway {
         title: Option<&str>,
         reason: Option<&str>,
     ) {
-        let relation = event.strip_prefix("delegation_").unwrap_or(event);
-        let title_owned = title.filter(|t| !t.is_empty()).map(str::to_string);
-        let reason_owned = reason.filter(|r| !r.is_empty()).map(str::to_string);
-        self.emit_user_signal(GatewayEvent {
-            id: format!(
-                "delegation-{relation}-{parent_sid}-{child_sid}-{}",
-                turn.unwrap_or("")
-            ),
-            channel: String::new(),
-            chat_id: String::new(),
-            thread_ts: None,
-            content: format!("delegation {relation}: {parent_sid} -> {child_sid}"),
-            kind: GatewayEventKind::Delegation {
-                relation: relation.to_string(),
-                parent_sid: parent_sid.to_string(),
-                child_sid: child_sid.to_string(),
-                title: title_owned,
-                reason: reason_owned,
-            },
-            attachments: Vec::new(),
-            options: Vec::new(),
-            // Not a per-session event (it names TWO sessions) — never routed
-            // through the per-sid SSE ring/filter; the global agents SSE
-            // subscribes the broadcast directly (see `crate::ring`).
-            sid: None,
-            slug: Some(slug.to_string()),
-        });
-
-        let Some(paths) = self.project_paths.as_ref() else {
-            return;
+        let emitter = self.delegation_progress_emitter();
+        let record = DelegationProgressRecord {
+            slug: slug.to_string(),
+            event: event.to_string(),
+            parent_sid: parent_sid.to_string(),
+            child_sid: child_sid.to_string(),
+            vendor,
+            host: host.to_string(),
+            turn: turn.map(str::to_string),
+            title: title.map(str::to_string),
+            reason: reason.map(str::to_string),
         };
-        let ev = ccteam_harness::execution::progress_bridge::build_delegation_event(
-            event,
-            parent_sid,
-            child_sid,
-            crate::delegation::vendor_key(vendor),
-            host,
-            turn,
-            title,
-            reason,
-        );
-        let path = paths.progress_jsonl(slug);
-        if let Err(e) = ccteam_core::progress::append_event(&path, &ev) {
-            tracing::warn!(slug = %slug, event = %event, err = %e,
-                "ccteam-im: failed to append delegation progress event");
+        emitter.broadcast(record.clone());
+        tokio::spawn(async move { emitter.append(&record).await });
+    }
+
+    fn delegation_progress_emitter(&self) -> DelegationProgressEmitter {
+        DelegationProgressEmitter {
+            progress_root: self.project_paths.clone(),
+            event_sink: self.event_sink.clone(),
+            events_broadcast: self.events_broadcast.clone(),
         }
     }
 
@@ -9269,7 +10077,7 @@ impl Gateway {
             }
         };
         let outcome = self
-            .apply_new_session(plan, thread, Some("session_spawn"))
+            .apply_new_session(plan, thread, Some("session_spawn"), false, None)
             .await?;
         self.drain_and_dispatch_pending_turns(&outcome.id).await;
 
@@ -9279,6 +10087,215 @@ impl Gateway {
                 &project,
                 ccteam_harness::execution::progress_bridge::DELEGATION_SPAWNED,
                 psid,
+                &child_sid,
+                vendor,
+                &host,
+                None,
+                title.as_deref(),
+                None,
+            );
+        }
+        Ok(CreateSessionOutcome { sid: outcome.id })
+    }
+
+    /// Shared-handle delegation spawn. The guardrail snapshot and plan/apply
+    /// sections are short; host probing and vendor startup are concurrent
+    /// across independent MCP calls.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_delegated_session_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        project: String,
+        role: String,
+        vendor: AgentVendor,
+        permission_mode: PermissionMode,
+        protocol: SessionProtocol,
+        owner_id: String,
+        tuning: SpawnTuning,
+        parent: Option<DelegationParent>,
+        title: Option<String>,
+        deadline: GatewayDeadline,
+    ) -> Result<CreateSessionOutcome> {
+        let (host, wire_slug, root, proxy) = {
+            let mut guard = deadline.lock(&gateway).await?;
+            guard.ensure_project_loaded(&project);
+            let (host, wire_slug) = guard.project_host_binding(&project)?;
+            (
+                host,
+                wire_slug,
+                guard.project_paths.as_ref().map(|paths| paths.root.clone()),
+                guard.remote_host_proxy.clone(),
+            )
+        };
+        let host_target = crate::remote_host::prepare_host_for_spawn(
+            root.as_deref(),
+            &host,
+            &wire_slug,
+            vendor,
+            protocol,
+            proxy.as_ref(),
+        )
+        .await?;
+        let host = host_target.host.clone();
+        let plan = {
+            let mut guard = deadline.lock(&gateway).await?;
+            let (parent_sid, spawned_by_role, child_depth) = if let Some(p) = &parent {
+                let cfg = guard.delegation_config();
+                let child_depth = p.depth.saturating_add(1);
+                let deny =
+                    |guard: &Self, reason: crate::delegation::DenyReason, message: String| {
+                        guard.emit_delegation_progress(
+                            &project,
+                            ccteam_harness::execution::progress_bridge::DELEGATION_DENIED,
+                            &p.sid,
+                            "",
+                            vendor,
+                            &host,
+                            None,
+                            title.as_deref(),
+                            Some(reason.tag()),
+                        );
+                        anyhow!(message)
+                    };
+                if child_depth > cfg.max_depth {
+                    return Err(deny(
+                        &guard,
+                        crate::delegation::DenyReason::Depth,
+                        format!(
+                            "delegation denied: depth limit reached (child would be depth {child_depth} > delegation.max_depth {})",
+                            cfg.max_depth
+                        ),
+                    ));
+                }
+                let reserved_children = guard
+                    .delegation_spawn_reservations
+                    .values()
+                    .filter(|reservation| reservation.parent_sid == p.sid)
+                    .count() as u32;
+                let children = guard
+                    .count_active_children(&p.sid)
+                    .saturating_add(reserved_children);
+                if children >= cfg.max_children {
+                    return Err(deny(
+                        &guard,
+                        crate::delegation::DenyReason::Children,
+                        format!(
+                            "delegation denied: fan-out limit reached (parent {} already has {children} active children, including {reserved_children} starting ≥ delegation.max_children {})",
+                            p.sid, cfg.max_children
+                        ),
+                    ));
+                }
+                let reserved_delegated = guard
+                    .delegation_spawn_reservations
+                    .values()
+                    .filter(|reservation| reservation.project == project)
+                    .count() as u32;
+                let delegated = guard
+                    .count_active_delegated(&project)
+                    .saturating_add(reserved_delegated);
+                if delegated >= cfg.max_delegated {
+                    return Err(deny(
+                        &guard,
+                        crate::delegation::DenyReason::Delegated,
+                        format!(
+                            "delegation denied: project delegation ceiling reached ({delegated} active delegated sessions, including {reserved_delegated} starting ≥ delegation.max_delegated {})",
+                            cfg.max_delegated
+                        ),
+                    ));
+                }
+                if guard.delegation_budget_exceeded(&project, vendor) {
+                    return Err(deny(
+                        &guard,
+                        crate::delegation::DenyReason::Budget,
+                        format!(
+                            "delegation denied: vendor `{}` has reached its 24h budget for project `{project}` (adjust budgets or wait for the window to slide / choose another vendor)",
+                            crate::delegation::vendor_key(vendor)
+                        ),
+                    ));
+                }
+                (Some(p.sid.clone()), Some(p.role.clone()), child_depth)
+            } else {
+                (None, None, 0)
+            };
+            let reply_to = guard
+                .tenant_project_owner_reply_target(&project)
+                .unwrap_or_else(|| ChatKey::new("web", &owner_id, &owner_id));
+            let handle = role.clone();
+            let mut plan = guard.plan_new_session(
+                reply_to,
+                project.clone(),
+                vendor,
+                role,
+                handle,
+                permission_mode,
+                protocol,
+                tuning,
+            )?;
+            plan.remote = host_target.remote;
+            plan.parent_sid = parent_sid.clone();
+            plan.spawned_by_role = spawned_by_role;
+            plan.delegation_depth = child_depth;
+            plan.title = title.clone();
+            if let Some(parent_sid) = plan.parent_sid.clone() {
+                guard.delegation_spawn_reservations.insert(
+                    plan.id.clone(),
+                    DelegationSpawnReservation {
+                        project: project.clone(),
+                        parent_sid,
+                    },
+                );
+            }
+            plan
+        };
+        let parent_sid = plan.parent_sid.clone();
+        let child_sid = plan.id.clone();
+        if let Err(error) = deadline.ensure_vendor_phase_can_start() {
+            gateway.lock().await.forget_principal(&plan.id);
+            return Err(error);
+        }
+        let thread = match Self::spawn_for_new_session_plan(&plan).await {
+            Ok(thread) => thread,
+            Err(error) => {
+                gateway.lock().await.forget_principal(&plan.id);
+                return Err(error.into());
+            }
+        };
+        let meta = Self::meta_for_new_session(&plan, &thread, Some("session_spawn"));
+        let meta_cwd = plan.cwd.clone();
+        let catalog = Arc::clone(&gateway.lock().await.session_catalog);
+        let _admission = Self::claim_capacity_admission(&gateway).await;
+        let exclusions = gateway
+            .lock()
+            .await
+            .live_capacity_exclusions(&plan.id, plan.parent_sid.as_deref());
+        if let Err(error) = Self::ensure_live_capacity_shared(&gateway, &exclusions).await {
+            Self::discard_uninstalled_thread(
+                &gateway,
+                &plan.id,
+                Arc::clone(&plan.adapter),
+                &thread,
+            )
+            .await;
+            return Err(GatewayRequestError::CapacityEvictionFailed(error.to_string()).into());
+        }
+        let outcome = gateway
+            .lock()
+            .await
+            .apply_new_session(
+                plan,
+                thread,
+                Some("session_spawn"),
+                true,
+                Some(meta.clone()),
+            )
+            .await?;
+        drop(_admission);
+        Self::persist_prepared_session_meta(catalog, meta_cwd, meta).await;
+        Self::persist_latest_routing_shared(&gateway).await?;
+        if let Some(parent_sid) = parent_sid {
+            gateway.lock().await.emit_delegation_progress(
+                &project,
+                ccteam_harness::execution::progress_bridge::DELEGATION_SPAWNED,
+                &parent_sid,
                 &child_sid,
                 vendor,
                 &host,
@@ -9381,9 +10398,11 @@ impl Gateway {
             tracing::warn!(child = %child_sid, err = %e, "ccteam-im: failed to write delegation.json");
             return false;
         }
+        let generation = self.next_live_generation();
         self.delegations.insert(
             child_sid.to_string(),
             DelegationMirror {
+                generation,
                 parent_sid: parent_sid.to_string(),
                 notify,
                 title,
@@ -9392,13 +10411,148 @@ impl Gateway {
                 notified_turns,
             },
         );
+        self.delegation_watch_set
+            .write()
+            .unwrap()
+            .insert(child_sid.to_string());
         true
+    }
+
+    /// Lock-narrowed durable watch registration for MCP dispatch. Per-child
+    /// serialization lives beside the gateway lock; JSON read/fsync/rename run
+    /// on the blocking pool, and the live session generation is rechecked
+    /// before the hot-path mirror becomes visible.
+    pub async fn arm_delegation_watch_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        child_sid: &str,
+        parent_sid: &str,
+        notify: ccteam_harness::NotifyMode,
+        title: Option<String>,
+        dispatched_turn: Option<String>,
+        deadline: GatewayDeadline,
+    ) -> Result<bool> {
+        let claims = Arc::clone(&deadline.lock(&gateway).await?.spawn_claims);
+        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
+        let _claim =
+            tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for(&claim_key))
+                .await
+                .map_err(|_| GatewayRequestError::QueueDeadline)?;
+        let (project_dir, slug, session_generation) = {
+            let guard = deadline.lock(&gateway).await?;
+            let Some(resolved) = guard.session_resolve(child_sid) else {
+                return Ok(false);
+            };
+            let generation = guard
+                .sessions
+                .get(child_sid)
+                .map(|session| session.generation)
+                .ok_or_else(|| anyhow!("current session missing: {child_sid}"))?;
+            (resolved.project_dir, resolved.project, generation)
+        };
+        let io_dir = project_dir.clone();
+        let io_child = child_sid.to_string();
+        let io_parent = parent_sid.to_string();
+        let io_title = title.clone();
+        let (old_watch, watch) = tokio::task::spawn_blocking(move || {
+            let old = ccteam_harness::read_delegation_watch(&io_dir, &io_child);
+            let mut watch = ccteam_harness::DelegationWatch::armed(
+                io_parent,
+                notify,
+                io_title,
+                dispatched_turn,
+            );
+            watch.notified_turns = old
+                .as_ref()
+                .map(|current| current.notified_turns.clone())
+                .unwrap_or_default();
+            ccteam_harness::write_delegation_watch(&io_dir, &io_child, &watch)?;
+            Ok::<_, anyhow::Error>((old, watch))
+        })
+        .await
+        .map_err(|error| {
+            GatewayRequestError::StorageReadCorrupt(format!(
+                "delegation watch task failed for {child_sid}: {error}"
+            ))
+        })??;
+
+        let mut guard = match deadline.lock(&gateway).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                let restore_dir = project_dir.clone();
+                let restore_child = child_sid.to_string();
+                let restore_watch = old_watch.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(old) = restore_watch {
+                        let _ = ccteam_harness::write_delegation_watch(
+                            &restore_dir,
+                            &restore_child,
+                            &old,
+                        );
+                    } else {
+                        ccteam_harness::execution::delegation::remove_delegation_watch(
+                            &restore_dir,
+                            &restore_child,
+                        );
+                    }
+                })
+                .await;
+                return Err(error);
+            }
+        };
+        let committed = {
+            let session_matches = guard.sessions.get(child_sid).is_some_and(|session| {
+                session.generation == session_generation && session.project == slug
+            });
+            if !session_matches {
+                false
+            } else {
+                let generation = guard.next_live_generation();
+                guard.delegations.insert(
+                    child_sid.to_string(),
+                    DelegationMirror {
+                        generation,
+                        parent_sid: parent_sid.to_string(),
+                        notify,
+                        title,
+                        slug,
+                        project_dir: project_dir.clone(),
+                        notified_turns: watch.notified_turns.clone(),
+                    },
+                );
+                guard
+                    .delegation_watch_set
+                    .write()
+                    .unwrap()
+                    .insert(child_sid.to_string());
+                true
+            }
+        };
+        drop(guard);
+        if committed {
+            return Ok(true);
+        }
+
+        let restore_dir = project_dir;
+        let restore_child = child_sid.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(old) = old_watch {
+                let _ = ccteam_harness::write_delegation_watch(&restore_dir, &restore_child, &old);
+            } else {
+                ccteam_harness::execution::delegation::remove_delegation_watch(
+                    &restore_dir,
+                    &restore_child,
+                );
+            }
+        })
+        .await;
+        Err(GatewayRequestError::SessionGenerationConflict(child_sid.to_string()).into())
     }
 
     /// v0.9.0 W2 (F2) — drop a child's completion watch (mirror + durable
     /// `delegation.json`). Used on an inline `wait` completion (suppress the
     /// redundant notification) and by the reconcile when the parent is gone.
     pub fn disarm_delegation_watch(&mut self, child_sid: &str) {
+        self.delegation_watch_set.write().unwrap().remove(child_sid);
         if let Some(m) = self.delegations.remove(child_sid) {
             ccteam_harness::execution::delegation::remove_delegation_watch(
                 &m.project_dir,
@@ -9409,6 +10563,43 @@ impl Gateway {
                 &resolved.project_dir,
                 child_sid,
             );
+        }
+    }
+
+    /// Remove a watch without holding the gateway mutex across filesystem IO.
+    pub async fn disarm_delegation_watch_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        child_sid: &str,
+    ) {
+        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
+        let _claim = claims.lock_for(&claim_key).await;
+        let project_dir = {
+            let mut guard = gateway.lock().await;
+            guard
+                .delegation_watch_set
+                .write()
+                .unwrap()
+                .remove(child_sid);
+            guard
+                .delegations
+                .remove(child_sid)
+                .map(|mirror| mirror.project_dir)
+                .or_else(|| {
+                    guard
+                        .session_resolve(child_sid)
+                        .map(|resolved| resolved.project_dir)
+                })
+        };
+        if let Some(project_dir) = project_dir {
+            let child_sid = child_sid.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                ccteam_harness::execution::delegation::remove_delegation_watch(
+                    &project_dir,
+                    &child_sid,
+                );
+            })
+            .await;
         }
     }
 
@@ -9428,140 +10619,125 @@ impl Gateway {
         self.delegations.len().try_into().unwrap_or(u32::MAX)
     }
 
-    /// v0.9.0 W2 (F2/F7) — deliver one completed child turn to its watching
-    /// parent. The in-memory `delegations` mirror is the HOT-PATH GATE: a turn
-    /// from a session with no mirror entry (the vast majority) is a cheap
-    /// no-op (no fs read). For a watched, not-yet-notified turn it (a) emits
-    /// `delegation_completed`, (b) — when `notify` — builds the English
-    /// notification and submits it to the parent via the ordinary submit path
-    /// (live=steer / dead=pending-turns FIFO), emitting `delegation_notified`,
-    /// and (c) records the turn in `notified_turns` (mirror + durable
-    /// `delegation.json`) so it is delivered AT-MOST-once per turn. A parent
-    /// that no longer exists drops the watch (+ a warn). Called under the
-    /// gateway lock by the notifier task / reconcile (submit is a gateway
-    /// method — the same lock scope every submit uses).
-    pub(crate) async fn deliver_delegation_signal(
-        &mut self,
+    fn plan_delegation_delivery(
+        &self,
+        signal: crate::delegation::DelegationSignal,
+    ) -> Option<DelegationDeliveryPlan> {
+        use ccteam_harness::NotifyMode;
+        if !signal.boundary {
+            return None;
+        }
+        let mirror = self.delegations.get(&signal.child_sid)?.clone();
+        let dedup_key = crate::delegation::final_dedup_key(&signal.turn_id);
+        if mirror.notified_turns.iter().any(|turn| turn == &dedup_key) {
+            return None;
+        }
+        let notification = (mirror.notify != NotifyMode::Off).then(|| {
+            crate::delegation::build_notification_text_with_outcome(
+                &signal.child_sid,
+                signal.vendor,
+                mirror.title.as_deref(),
+                &signal.turn_id,
+                &signal.tail,
+                signal.interim_notes,
+                signal.vendor_error,
+            )
+        });
+        Some(DelegationDeliveryPlan {
+            signal,
+            mirror,
+            dedup_key,
+            notification,
+            emitter: self.delegation_progress_emitter(),
+        })
+    }
+
+    async fn deliver_delegation_signal_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
     ) {
-        use ccteam_harness::NotifyMode;
-        let child = signal.child_sid.clone();
-        // Hot-path gate: no mirror entry ⇒ not a watched child ⇒ nothing to do.
-        let Some(mirror) = self.delegations.get(&child).cloned() else {
+        let Some(plan) = gateway.lock().await.plan_delegation_delivery(signal) else {
             return;
         };
-        // v0.9.5 feedback fix — interim messages (a still-running vendor turn)
-        // only concern an `all` watch; the default `final` mode drops them here
-        // (they stay in the ledger) so a chatty child can NEVER flood its
-        // parent's context or hold the notifier busy.
-        if !signal.boundary && mirror.notify != NotifyMode::All {
-            return;
-        }
-        // Dedup: this exact delivery was already handled (crash-safe
-        // at-most-once). A boundary uses a distinct `{turn_id}#final` key so an
-        // `all` watch still gets its idle wake-up after the same turn's interim
-        // notification.
-        let dedup_key = if signal.boundary {
-            crate::delegation::final_dedup_key(&signal.turn_id)
-        } else {
-            signal.turn_id.clone()
+        let child = plan.signal.child_sid.clone();
+        let completed = DelegationProgressRecord {
+            slug: plan.mirror.slug.clone(),
+            event: ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED.to_string(),
+            parent_sid: plan.mirror.parent_sid.clone(),
+            child_sid: child.clone(),
+            vendor: plan.signal.vendor,
+            host: plan.signal.host.clone(),
+            turn: Some(plan.signal.turn_id.clone()),
+            title: plan.mirror.title.clone(),
+            reason: None,
         };
-        if mirror.notified_turns.iter().any(|t| t == &dedup_key) {
-            return;
-        }
-        // The watched TASK completed (turn boundary; regardless of notify).
-        if signal.boundary {
-            self.emit_delegation_progress(
-                &mirror.slug,
-                ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED,
-                &mirror.parent_sid,
-                &child,
-                signal.vendor,
-                &signal.host,
-                Some(&signal.turn_id),
-                mirror.title.as_deref(),
-                None,
-            );
-        }
-        let should_notify = match mirror.notify {
-            NotifyMode::Final => signal.boundary,
-            NotifyMode::All => true,
-            NotifyMode::Off => false,
-        };
-        if should_notify {
-            let text = if signal.boundary {
-                crate::delegation::build_notification_text_with_outcome(
-                    &child,
-                    signal.vendor,
-                    mirror.title.as_deref(),
-                    &signal.turn_id,
-                    &signal.tail,
-                    signal.interim_notes,
-                    signal.vendor_error,
-                )
-            } else {
-                crate::delegation::build_interim_notification_text(
-                    &child,
-                    signal.vendor,
-                    mirror.title.as_deref(),
-                    &signal.turn_id,
-                    &signal.tail,
-                )
-            };
-            match self.submit_to_sid(&mirror.parent_sid, text).await {
+        // Reliability contract: durable append completes before the parent
+        // notification turn is submitted.
+        plan.emitter.emit(completed).await;
+        if let Some(text) = plan.notification.as_ref() {
+            match Self::submit_to_sid_shared(
+                Arc::clone(&gateway),
+                &plan.mirror.parent_sid,
+                text.clone(),
+                GatewayDeadline::start(),
+            )
+            .await
+            {
                 Ok(_) => {
-                    self.emit_delegation_progress(
-                        &mirror.slug,
-                        ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED,
-                        &mirror.parent_sid,
-                        &child,
-                        signal.vendor,
-                        &signal.host,
-                        Some(&signal.turn_id),
-                        mirror.title.as_deref(),
-                        None,
-                    );
+                    plan.emitter
+                        .emit(DelegationProgressRecord {
+                            slug: plan.mirror.slug.clone(),
+                            event: ccteam_harness::execution::progress_bridge::DELEGATION_NOTIFIED
+                                .to_string(),
+                            parent_sid: plan.mirror.parent_sid.clone(),
+                            child_sid: child.clone(),
+                            vendor: plan.signal.vendor,
+                            host: plan.signal.host.clone(),
+                            turn: Some(plan.signal.turn_id.clone()),
+                            title: plan.mirror.title.clone(),
+                            reason: None,
+                        })
+                        .await;
                 }
-                Err(e) => {
-                    tracing::warn!(parent = %mirror.parent_sid, child = %child, err = %e,
-                        "ccteam-im: delegation notify failed (parent gone); dropping watch");
-                    self.disarm_delegation_watch(&child);
+                Err(error) => {
+                    tracing::warn!(parent = %plan.mirror.parent_sid, %child, %error,
+                        "ccteam-im: delegation notify failed; dropping watch");
+                    Self::disarm_delegation_watch_shared(Arc::clone(&gateway), &child).await;
                     return;
                 }
             }
         }
-        // Record the delivery as handled — mirror (hot path) + durable
-        // delegation.json. A boundary batch-records every turn id it covered
-        // (the folded interim messages) so a daemon-restart reconcile never
-        // re-delivers them.
-        let mut to_record: Vec<String> = signal.covered_turns.clone();
-        to_record.push(dedup_key);
-        if let Some(m) = self.delegations.get_mut(&child) {
-            for id in &to_record {
-                if !m.notified_turns.iter().any(|t| t == id) {
-                    m.notified_turns.push(id.clone());
+
+        let mut to_record = plan.signal.covered_turns.clone();
+        to_record.push(plan.dedup_key.clone());
+        let watch = {
+            let mut guard = gateway.lock().await;
+            let Some(current) = guard.delegations.get_mut(&child) else {
+                return;
+            };
+            if current.generation != plan.mirror.generation {
+                tracing::warn!(%child, "delegation watch changed during unlocked delivery");
+                return;
+            }
+            for turn in &to_record {
+                if !current.notified_turns.iter().any(|seen| seen == turn) {
+                    current.notified_turns.push(turn.clone());
                 }
             }
-        }
-        let mut watch = ccteam_harness::read_delegation_watch(&mirror.project_dir, &child)
-            .unwrap_or_else(|| {
-                ccteam_harness::DelegationWatch::armed(
-                    &mirror.parent_sid,
-                    mirror.notify,
-                    mirror.title.clone(),
-                    None,
-                )
-            });
-        for id in &to_record {
-            if !watch.notified_turns.iter().any(|t| t == id) {
-                watch.notified_turns.push(id.clone());
-            }
-        }
-        if let Err(e) = ccteam_harness::write_delegation_watch(&mirror.project_dir, &child, &watch)
-        {
-            tracing::warn!(child = %child, err = %e,
-                "ccteam-im: failed to persist delegation.json notified_turns");
-        }
+            let mut watch = ccteam_harness::DelegationWatch::armed(
+                &current.parent_sid,
+                current.notify,
+                current.title.clone(),
+                None,
+            );
+            watch.notified_turns = current.notified_turns.clone();
+            watch
+        };
+        let project_dir = plan.mirror.project_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            ccteam_harness::write_delegation_watch(&project_dir, &child, &watch)
+        })
+        .await;
     }
 
     /// v0.9.0 W2 (F2) — the delegation notifier task: run once on the passed
@@ -9573,9 +10749,16 @@ impl Gateway {
         mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
     ) {
         Self::reconcile_delegations(Arc::clone(&gateway)).await;
+        let watch_set = Arc::clone(&gateway.lock().await.delegation_watch_set);
         while let Some(signal) = rx.recv().await {
-            let mut gw = gateway.lock().await;
-            gw.deliver_delegation_signal(signal).await;
+            let watched = watch_set.read().unwrap().contains(&signal.child_sid);
+            // Unwatched fleet chatter and watched mid-turn narration create no
+            // gateway-lock traffic. The child pump already mirrored narration
+            // into its ledger; only a vendor turn boundary can notify a parent.
+            if !watched || !signal.boundary {
+                continue;
+            }
+            Self::deliver_delegation_signal_shared(Arc::clone(&gateway), signal).await;
         }
     }
 
@@ -9607,6 +10790,7 @@ impl Gateway {
                 seeds.push((
                     child_sid.clone(),
                     DelegationMirror {
+                        generation: 0,
                         parent_sid: watch.parent_sid.clone(),
                         notify: watch.notify,
                         title: watch.title.clone(),
@@ -9640,7 +10824,14 @@ impl Gateway {
                         vendor,
                         host: host.clone(),
                         boundary: true,
-                        vendor_error: false,
+                        // Reconcile may race the live notifier at startup. A
+                        // durable failed turn must retain the same explicit
+                        // vendor-error outcome as its live boundary signal;
+                        // whichever delivery wins the dedup race is then
+                        // semantically identical.
+                        vendor_error: last.outcome.as_deref() == Some("failed")
+                            || last.error_kind.is_some()
+                            || last.error.is_some(),
                         interim_notes: missed.len().saturating_sub(1),
                         covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
                     });
@@ -9652,12 +10843,15 @@ impl Gateway {
         {
             let mut gw = gateway.lock().await;
             for (child, mirror) in seeds {
+                gw.delegation_watch_set
+                    .write()
+                    .unwrap()
+                    .insert(child.clone());
                 gw.delegations.entry(child).or_insert(mirror);
             }
         }
         for signal in pending {
-            let mut gw = gateway.lock().await;
-            gw.deliver_delegation_signal(signal).await;
+            Self::deliver_delegation_signal_shared(Arc::clone(&gateway), signal).await;
         }
     }
 
@@ -9670,6 +10864,480 @@ impl Gateway {
     pub async fn submit_to_sid(&mut self, sid: &str, text: String) -> Result<String> {
         self.submit_to_sid_with_origin(sid, text, TurnOrigin::Internal)
             .await
+    }
+
+    /// Lock-narrowed A2A submit. The queue deadline covers registry waits up to
+    /// the vendor phase; the existing submit timeout starts only around the
+    /// vendor RPC itself.
+    pub async fn submit_to_sid_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        deadline: GatewayDeadline,
+    ) -> Result<String> {
+        Self::submit_to_sid_shared_with_origin(gateway, sid, text, TurnOrigin::Internal, deadline)
+            .await
+    }
+
+    /// Lock-narrowed web submit. Gateway control commands retain their
+    /// synchronous command path; ordinary turns use the shared unlocked RPC.
+    pub async fn submit_web_sid_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        is_admin: bool,
+        deadline: GatewayDeadline,
+    ) -> Result<String> {
+        if is_admin && text.trim_start().starts_with('/') {
+            let is_gateway_control = parse_session_directive(&text).is_none();
+            if is_gateway_control {
+                return deadline
+                    .lock(&gateway)
+                    .await?
+                    .submit_web_sid(sid, text, true)
+                    .await;
+            }
+        }
+        Self::submit_to_sid_shared_with_origin(gateway, sid, text, TurnOrigin::User, deadline).await
+    }
+
+    async fn submit_to_sid_shared_with_origin(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        text: String,
+        origin: TurnOrigin,
+        deadline: GatewayDeadline,
+    ) -> Result<String> {
+        // Resolve the reply route and cold-resume an absent entry without
+        // holding the registry over the vendor handshake.
+        let absent_resume_identity = {
+            let guard = deadline.lock(&gateway).await?;
+            if guard.sessions.contains_key(sid) {
+                None
+            } else if let Ok((slug, _, meta)) = guard.find_meta_for_sid(sid) {
+                let reply = guard
+                    .tenant_project_owner_reply_target(&slug)
+                    .or_else(|| {
+                        ChatKey::from_identity(&meta.owner)
+                            .map(|owner| reply_target_for_owner(&owner))
+                    })
+                    .unwrap_or_else(web_api_chat);
+                Some(reply.identity())
+            } else {
+                return Err(anyhow!("unknown session: {sid}"));
+            }
+        };
+        if let Some(identity) = absent_resume_identity {
+            Self::resume_stopped_session_shared(
+                Arc::clone(&gateway),
+                sid,
+                &identity,
+                None,
+                deadline,
+            )
+            .await?;
+        }
+
+        if let Some(directive) = parse_session_directive(&text) {
+            let needs_resume = deadline
+                .lock(&gateway)
+                .await?
+                .sessions
+                .get(sid)
+                .is_some_and(|session| !session.adapter.thread_is_live(&session.thread));
+            if needs_resume {
+                Self::resume_dead_session_shared_with_deadline(Arc::clone(&gateway), sid, deadline)
+                    .await?;
+            }
+            let replies = Self::dispatch_directive_shared(
+                Arc::clone(&gateway),
+                sid,
+                directive,
+                origin,
+                deadline,
+            )
+            .await?;
+            let guard = gateway.lock().await;
+            for (index, reply) in replies.into_iter().enumerate() {
+                guard.emit_sid_answer(sid, index, reply);
+            }
+            return Ok(format!("directive:{sid}"));
+        }
+
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let plan = {
+                let mut guard = deadline.lock(&gateway).await?;
+                let needs_resume = guard
+                    .sessions
+                    .get(sid)
+                    .is_some_and(|session| !session.adapter.thread_is_live(&session.thread));
+                if needs_resume {
+                    drop(guard);
+                    Self::resume_dead_session_shared_with_deadline(
+                        Arc::clone(&gateway),
+                        sid,
+                        deadline,
+                    )
+                    .await?;
+                    let mut guard = deadline.lock(&gateway).await?;
+                    guard.plan_unlocked_turn(sid, text.clone(), origin)?
+                } else {
+                    guard.plan_unlocked_turn(sid, text.clone(), origin)?
+                }
+            };
+            deadline.ensure_vendor_phase_can_start()?;
+            if plan.prime_tool_surface {
+                let _ = tokio::time::timeout(
+                    TOOL_FACE_PRIME_TIMEOUT,
+                    plan.session
+                        .adapter
+                        .rebuild_tool_surface(&plan.session.thread),
+                )
+                .await;
+            }
+            let submit_wait = gateway_submit_timeout_duration();
+            let outcome = tokio::time::timeout(
+                submit_wait,
+                plan.session.adapter.submit_turn_routed(
+                    &plan.session.thread,
+                    TurnInput::UserText(text.clone()),
+                    plan.requested_routing,
+                ),
+            )
+            .await;
+            let submitted = match outcome {
+                Err(_) => {
+                    return Err(GatewayRequestError::VendorSubmitTimeout {
+                        sid: sid.to_string(),
+                    }
+                    .into())
+                }
+                Ok(Err(HarnessError::ThreadDied(_detail))) if attempt == 1 => {
+                    Self::resume_dead_session_shared_with_deadline(
+                        Arc::clone(&gateway),
+                        sid,
+                        deadline,
+                    )
+                    .await?;
+                    continue;
+                }
+                Ok(Err(HarnessError::ThreadDied(detail))) => {
+                    return Err(GatewayRequestError::VendorChannelClosed {
+                        sid: sid.to_string(),
+                        detail,
+                    }
+                    .into())
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Ok(Ok(submitted)) => submitted,
+            };
+            return Self::commit_unlocked_turn(gateway, plan, submitted).await;
+        }
+    }
+
+    async fn dispatch_directive_shared(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        directive: Directive,
+        origin: TurnOrigin,
+        deadline: GatewayDeadline,
+    ) -> Result<Vec<String>> {
+        let (chat, session, generation, start_visible_events, project_paths, event_sink, pending) = {
+            let guard = deadline.lock(&gateway).await?;
+            let session = guard
+                .sessions
+                .get(sid)
+                .cloned()
+                .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
+            let chat = guard
+                .tenant_project_owner_reply_target(&session.project)
+                .unwrap_or_else(|| reply_target_for_owner(&session.owner));
+            if let Ok(mut target) = session.reply_to.lock() {
+                *target = chat.clone();
+            }
+            (
+                chat,
+                session.clone(),
+                session.generation,
+                session.visible_events.load(Ordering::SeqCst),
+                guard.project_paths.clone(),
+                guard.event_sink.clone(),
+                Arc::clone(&guard.pending),
+            )
+        };
+        deadline.ensure_vendor_phase_can_start()?;
+        let original = directive.clone();
+        let submit_wait = gateway_submit_timeout_duration();
+        let outcome = tokio::time::timeout(
+            submit_wait,
+            session.adapter.handle_directive(&session.thread, directive),
+        )
+        .await
+        .map_err(|_| GatewayRequestError::VendorSubmitTimeout {
+            sid: sid.to_string(),
+        })?
+        .map_err(|error| match error {
+            HarnessError::ThreadDied(detail) => GatewayRequestError::VendorChannelClosed {
+                sid: sid.to_string(),
+                detail,
+            }
+            .into(),
+            other => anyhow::Error::from(other),
+        })?;
+
+        {
+            let guard = gateway.lock().await;
+            let matches = guard
+                .sessions
+                .get(sid)
+                .is_some_and(|current| current.generation == generation);
+            if !matches {
+                return Err(GatewayRequestError::SessionGenerationConflict(sid.to_string()).into());
+            }
+        }
+
+        match outcome {
+            DirectiveOutcome::Turn(turn_id) => {
+                if let Ok(mut origins) = session.turn_origins.lock() {
+                    origins.insert(turn_id.0.clone(), origin);
+                }
+                if !session.protocol.is_terminal() {
+                    if let Some(paths) = project_paths.as_ref() {
+                        let event = ccteam_core::progress::build_chat_turn_user_prompt_event(
+                            &session.role,
+                            &session.id,
+                            &turn_id.0,
+                            "",
+                        );
+                        if let Err(error) = ccteam_core::progress::append_event(
+                            &paths.progress_jsonl(&session.project),
+                            &event,
+                        ) {
+                            tracing::warn!(session = %session.id, %error,
+                                "failed to append directive turn progress");
+                        }
+                    }
+                }
+                if event_sink.is_some() {
+                    if !gateway_turn_timeout_duration().is_zero() {
+                        if let Ok(mut watch) = session.watched_turn.lock() {
+                            *watch = Some((turn_id.0.clone(), start_visible_events));
+                        }
+                    }
+                    Ok(Vec::new())
+                } else {
+                    let mut events = session.adapter.events(&session.thread);
+                    let wait = gateway_reply_wait_duration();
+                    while let Ok(Some(event)) = tokio::time::timeout(wait, events.next()).await {
+                        if let Some(text) = event_text(&event) {
+                            return Ok(vec![text]);
+                        }
+                    }
+                    Ok(vec![format!("submitted turn {}", turn_id.0)])
+                }
+            }
+            DirectiveOutcome::Done { receipt } => Ok(vec![receipt]),
+            DirectiveOutcome::Rejected { reason } => Ok(vec![reason]),
+            DirectiveOutcome::Redirect { hint } => Ok(vec![hint]),
+            DirectiveOutcome::NeedsChoice(prompt) => {
+                let key = pending_key(&chat, sid);
+                let expires_at = Instant::now() + gateway_pending_ttl();
+                let _evicted = pending.lock().await.register(
+                    key,
+                    prompt.clone(),
+                    InteractionOrigin::Directive {
+                        session_id: sid.to_string(),
+                        directive: original,
+                    },
+                    expires_at,
+                );
+                let body = render_choice_text(&prompt);
+                if let Some(tx) = event_sink {
+                    let _ = tx.send(GatewayEvent {
+                        id: format!("gateway-choice-{sid}-{}", prompt.token),
+                        channel: chat.channel,
+                        chat_id: chat.chat_id,
+                        thread_ts: None,
+                        content: body,
+                        kind: GatewayEventKind::Answer,
+                        attachments: Vec::new(),
+                        options: to_message_options(&prompt),
+                        sid: Some(sid.to_string()),
+                        slug: Some(session.project),
+                    });
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![body])
+                }
+            }
+        }
+    }
+
+    fn plan_unlocked_turn(
+        &mut self,
+        sid: &str,
+        user_text: String,
+        origin: TurnOrigin,
+    ) -> Result<UnlockedTurnPlan> {
+        let session = self
+            .sessions
+            .get(sid)
+            .cloned()
+            .ok_or_else(|| anyhow!("current session missing: {sid}"))?;
+        let reply_to = self
+            .tenant_project_owner_reply_target(&session.project)
+            .unwrap_or_else(|| reply_target_for_owner(&session.owner));
+        if let Ok(mut target) = session.reply_to.lock() {
+            *target = reply_to;
+        }
+        let was_in_flight = session
+            .turn_started_at
+            .lock()
+            .map(|started| started.is_some())
+            .unwrap_or(false);
+        let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
+        let requested_routing = TurnRouting::Inject;
+        let provisional_inject = was_in_flight;
+        if !was_in_flight {
+            session.steered_this_turn.store(false, Ordering::SeqCst);
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = Some(Instant::now());
+            }
+        } else {
+            session.steered_this_turn.store(true, Ordering::SeqCst);
+        }
+        let project_dir = self
+            .projects
+            .get(&session.project)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown project: {}", session.project))?;
+        Ok(UnlockedTurnPlan {
+            generation: session.generation,
+            start_visible_events: session.visible_events.load(Ordering::SeqCst),
+            prime_tool_surface: !session.tool_face_primed.swap(true, Ordering::SeqCst),
+            session,
+            project_dir,
+            project_paths: self.project_paths.clone(),
+            session_catalog: Arc::clone(&self.session_catalog),
+            has_event_sink: self.event_sink.is_some(),
+            origin,
+            user_text,
+            requested_routing,
+            provisional_inject,
+            prior_steered,
+        })
+    }
+
+    async fn commit_unlocked_turn(
+        gateway: Arc<tokio::sync::Mutex<Self>>,
+        plan: UnlockedTurnPlan,
+        mut submitted: ccteam_harness::TurnSubmission,
+    ) -> Result<String> {
+        {
+            let guard = gateway.lock().await;
+            let Some(current) = guard.sessions.get(&plan.session.id) else {
+                return Err(GatewayRequestError::SessionGenerationConflict(
+                    plan.session.id.clone(),
+                )
+                .into());
+            };
+            if current.generation != plan.generation {
+                return Err(GatewayRequestError::SessionGenerationConflict(
+                    plan.session.id.clone(),
+                )
+                .into());
+            }
+            if submitted.disposition == TurnDisposition::Started {
+                if let Ok(mut started) = current.turn_started_at.lock() {
+                    *started = Some(Instant::now());
+                }
+                current.steered_this_turn.store(false, Ordering::SeqCst);
+            } else if plan.provisional_inject && submitted.disposition == TurnDisposition::Queued {
+                current
+                    .steered_this_turn
+                    .store(plan.prior_steered, Ordering::SeqCst);
+            }
+            if let Ok(mut origins) = current.turn_origins.lock() {
+                origins.insert(submitted.turn_id.0.clone(), plan.origin);
+            };
+        }
+
+        Self::mirror_unlocked_user_turn(&plan, &submitted.input_id);
+        Self::open_unlocked_turn_progress(&plan, &submitted.turn_id.0);
+        submitted.release_completion();
+        if plan.has_event_sink {
+            if !gateway_turn_timeout_duration().is_zero()
+                && submitted.disposition != TurnDisposition::Queued
+            {
+                if let Ok(mut watch) = plan.session.watched_turn.lock() {
+                    *watch = Some((submitted.turn_id.0.clone(), plan.start_visible_events));
+                }
+            }
+        } else {
+            let mut events = plan.session.adapter.events(&plan.session.thread);
+            let wait = gateway_reply_wait_duration();
+            let _ = tokio::time::timeout(wait, events.next()).await;
+        }
+        Ok(submitted.turn_id.0)
+    }
+
+    fn mirror_unlocked_user_turn(plan: &UnlockedTurnPlan, input_id: &str) {
+        if plan.user_text.is_empty() {
+            return;
+        }
+        if let Some(mut meta) = plan.session_catalog.get(&plan.session.id) {
+            if meta.meta.title.is_none() {
+                if let Some(candidate) = truncate_title(&plan.user_text) {
+                    if apply_title(&mut meta.meta, candidate, TitleSource::Auto) {
+                        let _ = plan.session_catalog.write(&plan.project_dir, &meta.meta);
+                    }
+                }
+            }
+        }
+        let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: input_id.to_string(),
+            ts: chrono::Utc::now(),
+            vendor: vendor_str(plan.session.vendor).to_string(),
+            role: plan.session.role.clone(),
+            user: plan.user_text.clone(),
+            assistant: String::new(),
+            usage: serde_json::Value::Null,
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
+        };
+        if let Err(error) = ccteam_harness::execution::turns_mirror::append_turn(
+            &plan.project_dir,
+            &plan.session.id,
+            &record,
+        ) {
+            tracing::warn!(session = %plan.session.id, %error, "failed to mirror unlocked user turn");
+        }
+    }
+
+    fn open_unlocked_turn_progress(plan: &UnlockedTurnPlan, turn_id: &str) {
+        if plan.session.protocol.is_terminal() {
+            return;
+        }
+        let Some(paths) = plan.project_paths.as_ref() else {
+            return;
+        };
+        let event = ccteam_core::progress::build_chat_turn_user_prompt_event(
+            &plan.session.role,
+            &plan.session.id,
+            turn_id,
+            &plan.user_text,
+        );
+        if let Err(error) = ccteam_core::progress::append_event(
+            &paths.progress_jsonl(&plan.session.project),
+            &event,
+        ) {
+            tracing::warn!(session = %plan.session.id, %error, "failed to append unlocked turn progress");
+        }
     }
 
     async fn submit_to_sid_with_origin(
@@ -11018,6 +12686,15 @@ const TOOL_FACE_PRIME_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 fn gateway_submit_timeout_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5_000;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_SUBMIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn gateway_queue_deadline_duration() -> std::time::Duration {
+    const DEFAULT_MS: u64 = 30_000;
+    let ms = std::env::var("CCTEAM_GATEWAY_QUEUE_DEADLINE_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MS);
@@ -12647,6 +14324,45 @@ mod tests {
     type CapturedTuning = (Option<String>, Option<String>);
 
     #[derive(Debug)]
+    struct TestStartBarrier {
+        armed: std::sync::atomic::AtomicBool,
+        entered: AtomicUsize,
+        entered_notify: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for TestStartBarrier {
+        fn default() -> Self {
+            Self {
+                armed: std::sync::atomic::AtomicBool::new(false),
+                entered: AtomicUsize::new(0),
+                entered_notify: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl TestStartBarrier {
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_entered(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.entered.load(Ordering::SeqCst) < count {
+                    self.entered_notify.notified().await;
+                }
+            })
+            .await
+            .expect("vendor start reaches the controlled barrier");
+        }
+
+        fn release_all(&self) {
+            self.release.add_permits(64);
+        }
+    }
+
+    #[derive(Debug)]
     struct FakeAdapter {
         vendor: AgentVendor,
         starts: AtomicUsize,
@@ -12664,6 +14380,7 @@ mod tests {
         /// batch restore (which cold-starts via `start_thread`) does not hold the
         /// gateway lock across the slow spawn.
         start_delay: std::time::Duration,
+        start_barrier: Option<Arc<TestStartBarrier>>,
         resume_started: Arc<AtomicUsize>,
         /// Recorded `handle_directive` calls (thread id + directive) for
         /// routing + choice-reentry assertions (v0.8.5 D1).
@@ -12752,6 +14469,7 @@ mod tests {
                 event_delay: std::time::Duration::ZERO,
                 resume_delay: std::time::Duration::ZERO,
                 start_delay: std::time::Duration::ZERO,
+                start_barrier: None,
                 resume_started: Arc::new(AtomicUsize::new(0)),
                 directives: Arc::new(Mutex::new(Vec::new())),
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
@@ -12815,6 +14533,11 @@ mod tests {
             self.start_delay = start_delay;
             self
         }
+
+        fn with_start_barrier(mut self, barrier: Arc<TestStartBarrier>) -> Self {
+            self.start_barrier = Some(barrier);
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -12833,6 +14556,18 @@ mod tests {
             ctx: &SpawnCtx,
         ) -> Result<ThreadHandle, HarnessError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            if let Some(barrier) = self.start_barrier.as_ref() {
+                if barrier.armed.load(Ordering::SeqCst) {
+                    barrier.entered.fetch_add(1, Ordering::SeqCst);
+                    barrier.entered_notify.notify_waiters();
+                    barrier
+                        .release
+                        .acquire()
+                        .await
+                        .expect("test barrier stays open")
+                        .forget();
+                }
+            }
             if !self.start_delay.is_zero() {
                 tokio::time::sleep(self.start_delay).await;
             }
@@ -13527,7 +15262,7 @@ mod tests {
         assert_eq!(plan.session_id, "s1");
         assert_eq!(plan.project, "alpha");
         assert_eq!(plan.role, "reviewer");
-        assert!(!plan.generation.is_empty());
+        assert!(plan.generation > 0);
 
         let thread = Gateway::spawn_for_resume_plan(&plan).await.unwrap();
         assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
@@ -13546,16 +15281,15 @@ mod tests {
         assert_eq!(fake.closes.load(Ordering::SeqCst), 0);
     }
 
-    /// v0.9 T2 — concurrent `stop_session` during the lock-free resume spawn
-    /// window must not deadlock and must not leave a zombie session in the map.
-    /// Prefer stop-wins: apply sees generation mismatch / missing session and
-    /// discards the freshly spawned thread via `close_thread`.
+    /// A replacement during the lock-free resume window wins its generation
+    /// fence. The stale vendor result is closed and never overwrites the newer
+    /// live handle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_stop_during_resume_spawn_does_not_deadlock_or_leave_zombie() {
+    async fn concurrent_replacement_discards_stale_resume_without_touching_newer_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let barrier = Arc::new(TestStartBarrier::default());
         let fake = Arc::new(
-            FakeAdapter::new(AgentVendor::Claude)
-                .with_start_delay(std::time::Duration::from_millis(200)),
+            FakeAdapter::new(AgentVendor::Claude).with_start_barrier(Arc::clone(&barrier)),
         );
         let mut gw = Gateway::new(fake.clone(), "alpha", tmp.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
@@ -13574,8 +15308,10 @@ mod tests {
         assert_eq!(sid, "s1");
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
 
-        // Child dies; resume will cold-start with the 200ms delay.
+        // Child dies; the controlled barrier holds the replacement spawn in
+        // the phase-2 window with no gateway lock.
         fake.live.store(false, Ordering::SeqCst);
+        barrier.arm();
         let gateway = Arc::new(tokio::sync::Mutex::new(gw));
 
         let gw_a = Arc::clone(&gateway);
@@ -13583,51 +15319,138 @@ mod tests {
         let resume_task =
             tokio::spawn(async move { Gateway::resume_dead_session_shared(gw_a, &sid_a).await });
 
-        // Wait until the resume spawn is mid-flight (2nd start_thread entered).
-        for _ in 0..100 {
-            if fake.starts.load(Ordering::SeqCst) >= 2 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(
-            fake.starts.load(Ordering::SeqCst) >= 2,
-            "resume spawn must be in flight before concurrent stop"
-        );
+        barrier.wait_until_entered(1).await;
 
-        // Concurrent stop while resume holds NO gateway lock across spawn.
-        let stop_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            gateway.lock().await.stop_session(&sid).await
-        })
-        .await
-        .expect("stop_session must not hang behind resume spawn");
-        assert!(
-            stop_result.is_ok(),
-            "stop_session must succeed: {stop_result:?}"
-        );
+        // Model an eviction/replacement installing a newer live entry while
+        // the old resume result is still blocked at the vendor.
+        let newer_generation = {
+            let mut guard = gateway.lock().await;
+            let generation = guard.next_live_generation();
+            let current = guard.sessions.get_mut(&sid).unwrap();
+            current.generation = generation;
+            current.thread.identity = "newer-live-thread".to_string();
+            generation
+        };
+        barrier.release_all();
 
         let resume_join = tokio::time::timeout(std::time::Duration::from_secs(5), resume_task)
             .await
             .expect("resume task must not hang");
         let resume_result = resume_join.expect("resume task must not panic");
-        // Stop removed the session → apply discards the fresh thread.
-        assert!(
-            resume_result.is_err(),
-            "resume apply must fail after concurrent stop (no zombie insert): {resume_result:?}"
+        let error = resume_result.expect_err("stale resume must lose the generation fence");
+        assert_eq!(
+            error
+                .downcast_ref::<GatewayRequestError>()
+                .map(GatewayRequestError::error_code),
+            Some("session_generation_conflict")
         );
-
-        // Preferred race outcome: session gone, no zombie in the map.
-        let views = gateway.lock().await.session_views();
+        let guard = gateway.lock().await;
+        let current = guard.sessions.get(&sid).expect("newer entry remains live");
+        assert_eq!(current.generation, newer_generation);
+        assert_eq!(current.thread.identity, "newer-live-thread");
+        drop(guard);
         assert!(
-            views.is_empty(),
-            "sessions map must not keep a zombie after stop-during-resume: {views:?}"
-        );
-        // stop closes the old thread; apply closes the discarded resume thread.
-        assert!(
-            fake.closes.load(Ordering::SeqCst) >= 2,
-            "expected stop + discard closes, got {}",
+            fake.closes.load(Ordering::SeqCst) >= 1,
+            "the discarded vendor result must be closed, got {} closes",
             fake.closes.load(Ordering::SeqCst)
         );
+    }
+
+    /// A cold resume on one sid must not freeze a different live sid or the
+    /// fleet snapshot while its vendor handshake is deliberately blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn blocked_cold_resume_does_not_freeze_other_turn_or_status_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let barrier = Arc::new(TestStartBarrier::default());
+        let adapters: Arc<std::sync::Mutex<Vec<Arc<FakeAdapter>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: crate::daemon::AdapterFactory = {
+            let barrier = Arc::clone(&barrier);
+            let adapters = Arc::clone(&adapters);
+            Arc::new(move |vendor, _| {
+                let adapter =
+                    Arc::new(FakeAdapter::new(vendor).with_start_barrier(Arc::clone(&barrier)));
+                adapters.lock().unwrap().push(Arc::clone(&adapter));
+                adapter as Arc<dyn HarnessAdapter + Send + Sync>
+            })
+        };
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp.path());
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(events);
+        let sid_a = gateway
+            .create_session_api(
+                "alpha".into(),
+                "slow".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let sid_b = gateway
+            .create_session_api(
+                "alpha".into(),
+                "healthy".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let adapter_a = adapters.lock().unwrap()[0].clone();
+        adapter_a.live.store(false, Ordering::SeqCst);
+        barrier.arm();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        let slow = {
+            let gateway = Arc::clone(&gateway);
+            let sid = sid_a.clone();
+            tokio::spawn(async move {
+                Gateway::submit_to_sid_shared(
+                    gateway,
+                    &sid,
+                    "resume me".into(),
+                    GatewayDeadline::start(),
+                )
+                .await
+            })
+        };
+        barrier.wait_until_entered(1).await;
+
+        let healthy_turn = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            Gateway::submit_to_sid_shared(
+                Arc::clone(&gateway),
+                &sid_b,
+                "independent".into(),
+                GatewayDeadline::start(),
+            ),
+        )
+        .await
+        .expect("turn B completes while turn A is blocked")
+        .expect("turn B succeeds");
+        assert!(!healthy_turn.is_empty());
+        let views = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            gateway.lock().await.session_views()
+        })
+        .await
+        .expect("status snapshot completes while turn A is blocked");
+        assert_eq!(views.len(), 2);
+
+        barrier.release_all();
+        tokio::time::timeout(std::time::Duration::from_secs(5), slow)
+            .await
+            .expect("slow resume finishes after release")
+            .expect("slow task does not panic")
+            .expect("slow resumed turn succeeds");
+        Gateway::submit_to_sid_shared(
+            Arc::clone(&gateway),
+            &sid_b,
+            "healthy again".into(),
+            GatewayDeadline::start(),
+        )
+        .await
+        .expect("next normal turn remains healthy");
     }
 
     /// v0.9 T2 review fix — mixed flavors must not ABBA-deadlock: a shared
@@ -21480,16 +23303,7 @@ mod tests {
         // so a newly-created watch cannot race a historical replay.
         Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
         let notifier_gateway = Arc::clone(&gateway);
-        tokio::spawn(async move {
-            let mut drx = drx;
-            while let Some(signal) = drx.recv().await {
-                notifier_gateway
-                    .lock()
-                    .await
-                    .deliver_delegation_signal(signal)
-                    .await;
-            }
-        });
+        tokio::spawn(Gateway::run_delegation_notifier(notifier_gateway, drx));
         gateway
     }
 
@@ -21516,6 +23330,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
         let gateway = delegation_gateway(&project_dir).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        gateway.lock().await.enable_project_creation(paths.clone());
 
         let parent_sid = {
             let mut gw = gateway.lock().await;
@@ -21588,6 +23407,17 @@ mod tests {
         assert!(
             notified,
             "parent must receive the `[ccteam]` completion notification"
+        );
+        let progress = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
+            .unwrap_or_default();
+        assert!(
+            progress.iter().any(|event| {
+                event.get("event").and_then(serde_json::Value::as_str)
+                    == Some(ccteam_harness::execution::progress_bridge::DELEGATION_COMPLETED)
+                    && event.get("child_sid").and_then(serde_json::Value::as_str)
+                        == Some(child_sid.as_str())
+            }),
+            "delegation_completed must be durably appended before the parent notification is observable: {progress:#?}"
         );
         // ORDERING: the child's turn is durably on disk (collect sees it).
         let child_turns = read_all_turns(&project_dir, &child_sid).unwrap_or_default();
@@ -21771,11 +23601,8 @@ mod tests {
             covered_turns: vec![format!("{child_sid}-{n}")],
         };
         // Three interim narration messages inside the running turn → silence.
-        {
-            let mut gw = gateway.lock().await;
-            for n in 1..=3 {
-                gw.deliver_delegation_signal(interim(n)).await;
-            }
+        for n in 1..=3 {
+            Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), interim(n)).await;
         }
         assert!(
             ccteam_notification_turns(&project_dir, &parent_sid).is_empty(),
@@ -21794,11 +23621,7 @@ mod tests {
             interim_notes: 3,
             covered_turns: (1..=4).map(|n| format!("{child_sid}-{n}")).collect(),
         };
-        gateway
-            .lock()
-            .await
-            .deliver_delegation_signal(boundary.clone())
-            .await;
+        Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
         assert!(
@@ -21816,11 +23639,7 @@ mod tests {
         assert!(notes[0].user.contains("wave finished: 3 cards done"));
 
         // Replay (at-least-once upstream) → deduped, still one notification.
-        gateway
-            .lock()
-            .await
-            .deliver_delegation_signal(boundary)
-            .await;
+        Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         assert_eq!(
             ccteam_notification_turns(&project_dir, &parent_sid).len(),
             1,
@@ -21828,10 +23647,8 @@ mod tests {
         );
     }
 
-    /// v0.9.5 feedback fix — an `all` watch still gets the per-message
-    /// firehose (labeled still-working) PLUS the idle boundary wake-up; an
-    /// `off` watch gets nothing while `delegation_completed` still lands in
-    /// progress.jsonl at the boundary.
+    /// Narration stays ledger-only even for `all`; only the idle boundary
+    /// wakes the parent. `off` still records completion.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn delegation_all_and_off_modes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -21884,22 +23701,14 @@ mod tests {
             interim_notes: if boundary { n as usize - 1 } else { 0 },
             covered_turns: vec![format!("{child_sid}-{n}")],
         };
-        {
-            let mut gw = gateway.lock().await;
-            gw.deliver_delegation_signal(signal(1, false)).await;
-            gw.deliver_delegation_signal(signal(2, false)).await;
-            // Boundary carries the same turn_id as the last interim (the
-            // final answer IS the last mirrored message) — the distinct
-            // `#final` dedup key must still let the idle wake-up through.
-            let mut b = signal(2, true);
-            b.interim_notes = 1;
-            gw.deliver_delegation_signal(b).await;
-        }
+        Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(1, false)).await;
+        Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(2, false)).await;
+        let mut boundary = signal(2, true);
+        boundary.interim_notes = 1;
+        Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
-        assert_eq!(notes.len(), 3, "all-mode: 2 interim + 1 boundary");
-        assert!(notes[0].user.contains("still WORKING, no action needed"));
-        assert!(notes[1].user.contains("still WORKING, no action needed"));
-        assert!(notes[2].user.contains("is now IDLE"));
+        assert_eq!(notes.len(), 1, "all-mode narration remains ledger-only");
+        assert!(notes[0].user.contains("is now IDLE"));
 
         // `off` mode: nothing notifies, but the boundary still lands
         // delegation_completed in progress.jsonl.
@@ -21937,9 +23746,9 @@ mod tests {
             gw.arm_delegation_watch(&child, &parent, ccteam_harness::NotifyMode::Off, None, None);
             (parent, child)
         };
-        {
-            let mut gw = gateway.lock().await;
-            gw.deliver_delegation_signal(crate::delegation::DelegationSignal {
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
                 child_sid: child2.clone(),
                 turn_id: format!("{child2}-1"),
                 tail: "done".into(),
@@ -21949,9 +23758,9 @@ mod tests {
                 vendor_error: false,
                 interim_notes: 0,
                 covered_turns: vec![format!("{child2}-1")],
-            })
-            .await;
-        }
+            },
+        )
+        .await;
         assert!(
             ccteam_notification_turns(&project_dir, &parent2).is_empty(),
             "off-mode must never notify"
@@ -22071,6 +23880,7 @@ mod tests {
         assert!(e3.to_string().contains("ceiling"), "delegated: {e3}");
 
         // All three emitted a `delegation_denied` with the right reason.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         let events =
             ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
         let reasons: Vec<&str> = events
@@ -22130,6 +23940,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("budget"), "budget: {e}");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         let events =
             ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
         assert!(events.iter().any(|e| {
