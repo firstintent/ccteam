@@ -367,6 +367,10 @@ enum DaemonCommand {
         /// Emit exactly one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// If the serving daemon is not managed by `ccteam daemon`, warn
+        /// that the new binary is not live and exit successfully.
+        #[arg(long, default_value_t = false)]
+        if_managed: bool,
     },
     /// Dual-verdict snapshot: ready? (versioned MCP probe) × managed?
     /// (pid record ↔ live process), plus running-daemon version vs this
@@ -955,7 +959,10 @@ fn main() -> Result<()> {
                 web_bind,
                 dsh_web_bind,
                 json,
-            } => daemon_cli::run_daemon_restart(&web_bind, dsh_web_bind.as_deref(), json),
+                if_managed,
+            } => {
+                daemon_cli::run_daemon_restart(&web_bind, dsh_web_bind.as_deref(), json, if_managed)
+            }
             DaemonCommand::Status { json } => daemon_cli::run_daemon_status(json),
             DaemonCommand::Logs { n, follow, json } => daemon_cli::run_daemon_logs(n, follow, json),
         },

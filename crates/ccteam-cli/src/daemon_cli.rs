@@ -6,7 +6,7 @@
 //! machine contract:
 //!
 //! - `--json` → EXACTLY one line of JSON on stdout
-//!   (`status ∈ started|alreadyRunning|stopped|notRunning|restarted`,
+//!   (`status ∈ started|alreadyRunning|stopped|notRunning|restarted|skippedNotManaged`,
 //!   or `{"status":"error","code":…,"message":…}`); human prose goes to
 //!   stderr.
 //! - without `--json` → human prose on stdout.
@@ -311,58 +311,98 @@ pub(crate) fn restart_managed(
     }
 }
 
-/// Shared success emit for `daemon restart` (status = `restarted` when a
-/// daemon was running, `started` when none was).
-fn emit_restart_started(
-    json: bool,
+#[derive(Debug, Clone, PartialEq)]
+enum RestartCommandAction {
+    Emit {
+        machine: serde_json::Value,
+        human: String,
+    },
+    Fail {
+        code: &'static str,
+        message: String,
+    },
+}
+
+/// Shared success rendering for `daemon restart` (status = `restarted`
+/// when a daemon was running, `started` when none was).
+fn restart_started_action(
     status: &str,
     pid: u32,
     version: Option<String>,
     web_bind: &str,
-) {
+) -> RestartCommandAction {
     let v = version.clone().unwrap_or_else(|| "unknown".into());
-    emit(
-        json,
-        serde_json::json!({ "status": status, "pid": pid, "version": version }),
-        &format!(
+    RestartCommandAction::Emit {
+        machine: serde_json::json!({ "status": status, "pid": pid, "version": version }),
+        human: format!(
             "ccteam daemon {status} (pid {pid}, version {v}).\n{}",
             web_hint(web_bind)
         ),
-    );
+    }
 }
 
-pub fn run_daemon_restart(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) -> Result<()> {
+fn restart_command_action(
+    outcome: RestartOutcome,
+    if_managed: bool,
+    web_bind: &str,
+) -> RestartCommandAction {
+    match outcome {
+        RestartOutcome::Restarted { pid, version } => {
+            restart_started_action("restarted", pid, version, web_bind)
+        }
+        RestartOutcome::Started { pid, version } => {
+            // Nothing was running before this restart — it was a plain start.
+            restart_started_action("started", pid, version, web_bind)
+        }
+        RestartOutcome::AlreadyServing { version } => RestartCommandAction::Emit {
+            machine: serde_json::json!({ "status": "alreadyRunning", "version": version }),
+            human: "a daemon is already serving the socket (not spawned by this restart)."
+                .to_string(),
+        },
+        RestartOutcome::NotManaged { hint } if if_managed => {
+            let hint = format!(
+                "{hint}; the newly installed binary is NOT live until you restart that daemon \
+                 yourself"
+            );
+            RestartCommandAction::Emit {
+                machine: serde_json::json!({
+                    "status": "skippedNotManaged",
+                    "hint": hint,
+                }),
+                human: format!("warning: {hint}"),
+            }
+        }
+        RestartOutcome::NotManaged { hint } => RestartCommandAction::Fail {
+            code: "notManaged",
+            message: hint,
+        },
+        RestartOutcome::StopTimedOut { pid } => RestartCommandAction::Fail {
+            code: "stopTimeout",
+            message: format!(
+                "daemon pid {pid} did not exit within the stop wait; restart aborted \
+                 (`ccteam daemon stop --force` can escalate)"
+            ),
+        },
+    }
+}
+
+pub fn run_daemon_restart(
+    web_bind: &str,
+    dsh_web_bind: Option<&str>,
+    json: bool,
+    if_managed: bool,
+) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     // Restart is the verb `make install` runs on upgraded dev boxes, so
     // it carries the same takeover pre-step as start.
     takeover_pre_step();
-    match restart_managed(&paths, web_bind, dsh_web_bind) {
-        Ok(RestartOutcome::Restarted { pid, version }) => {
-            emit_restart_started(json, "restarted", pid, version, web_bind);
-        }
-        Ok(RestartOutcome::Started { pid, version }) => {
-            // Nothing was running before this restart — it was a plain start.
-            emit_restart_started(json, "started", pid, version, web_bind);
-        }
-        Ok(RestartOutcome::AlreadyServing { version }) => {
-            // Only reachable if an unmanaged instance grabbed the socket
-            // between our stop and start — surface it honestly.
-            emit(
-                json,
-                serde_json::json!({ "status": "alreadyRunning", "version": version }),
-                "a daemon is already serving the socket (not spawned by this restart).",
-            );
-        }
-        Ok(RestartOutcome::NotManaged { hint }) => fail(json, "notManaged", &hint),
-        Ok(RestartOutcome::StopTimedOut { pid }) => fail(
-            json,
-            "stopTimeout",
-            &format!(
-                "daemon pid {pid} did not exit within the stop wait; restart aborted \
-                 (`ccteam daemon stop --force` can escalate)"
-            ),
-        ),
+    let outcome = match restart_managed(&paths, web_bind, dsh_web_bind) {
+        Ok(outcome) => outcome,
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
+    };
+    match restart_command_action(outcome, if_managed, web_bind) {
+        RestartCommandAction::Emit { machine, human } => emit(json, machine, &human),
+        RestartCommandAction::Fail { code, message } => fail(json, code, &message),
     }
     Ok(())
 }
@@ -515,6 +555,116 @@ fn tail_lines(path: &std::path::Path, n: usize) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn emitted(action: RestartCommandAction) -> (serde_json::Value, String) {
+        match action {
+            RestartCommandAction::Emit { machine, human } => (machine, human),
+            other => panic!("expected successful emit, got {other:?}"),
+        }
+    }
+
+    fn failed(action: RestartCommandAction) -> (&'static str, String) {
+        match action {
+            RestartCommandAction::Fail { code, message } => (code, message),
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restart_if_managed_skips_unmanaged_with_loud_drift_warning() {
+        let original_hint = "the socket belongs to a foreground daemon";
+        let (machine, human) = emitted(restart_command_action(
+            RestartOutcome::NotManaged {
+                hint: original_hint.to_string(),
+            },
+            true,
+            DEFAULT_WEB_BIND,
+        ));
+
+        assert_eq!(machine["status"], "skippedNotManaged");
+        let machine_hint = machine["hint"].as_str().expect("JSON hint");
+        for rendered in [machine_hint, human.as_str()] {
+            assert!(
+                rendered.contains(original_hint),
+                "missing original hint: {rendered}"
+            );
+            assert!(
+                rendered.contains(
+                    "the newly installed binary is NOT live until you restart that daemon yourself"
+                ),
+                "missing deploy-drift warning: {rendered}"
+            );
+        }
+        assert!(
+            human.starts_with("warning:"),
+            "warning must be loud: {human}"
+        );
+    }
+
+    #[test]
+    fn restart_if_managed_preserves_restarted_and_started_successes() {
+        for (outcome, expected_status, expected_pid, expected_version) in [
+            (
+                RestartOutcome::Restarted {
+                    pid: 41,
+                    version: Some("0.10.0".to_string()),
+                },
+                "restarted",
+                41,
+                "0.10.0",
+            ),
+            (
+                RestartOutcome::Started {
+                    pid: 42,
+                    version: Some("0.10.1".to_string()),
+                },
+                "started",
+                42,
+                "0.10.1",
+            ),
+        ] {
+            let (machine, human) = emitted(restart_command_action(outcome, true, "127.0.0.1:7331"));
+            assert_eq!(machine["status"], expected_status);
+            assert_eq!(machine["pid"], expected_pid);
+            assert_eq!(machine["version"], expected_version);
+            assert!(human.starts_with(&format!(
+                "ccteam daemon {expected_status} (pid {expected_pid}, version {expected_version})."
+            )));
+            assert!(human.contains("web console:"));
+            assert!(human.contains("logs:        ccteam daemon logs -f"));
+        }
+    }
+
+    #[test]
+    fn restart_if_managed_keeps_stop_timeout_fatal() {
+        let (code, message) = failed(restart_command_action(
+            RestartOutcome::StopTimedOut { pid: 99 },
+            true,
+            DEFAULT_WEB_BIND,
+        ));
+
+        assert_eq!(code, "stopTimeout");
+        assert_eq!(
+            message,
+            "daemon pid 99 did not exit within the stop wait; restart aborted \
+             (`ccteam daemon stop --force` can escalate)"
+        );
+    }
+
+    #[test]
+    fn restart_without_if_managed_keeps_unmanaged_failure_unchanged() {
+        let hint = "existing unmanaged-daemon guidance";
+        let (code, message) = failed(restart_command_action(
+            RestartOutcome::NotManaged {
+                hint: hint.to_string(),
+            },
+            false,
+            DEFAULT_WEB_BIND,
+        ));
+
+        assert_eq!(code, "notManaged");
+        assert_eq!(message, hint);
+    }
 
     #[test]
     fn tail_lines_returns_last_n() {

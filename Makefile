@@ -242,7 +242,7 @@ install: install-binary
 	    *:$(BIN_DIR):*) ;; \
 	    *) printf '\033[33mwarning:\033[0m %s is not on PATH; add it to your shell rc.\n' '$(BIN_DIR)' ;; \
 	esac
-	@$(BIN_LINK) daemon restart
+	@$(BIN_LINK) daemon restart --if-managed
 	@$(MAKE) --no-print-directory next-steps
 
 # Internal: poll the fresh daemon for its web URL (≤20s; the `web url:` line of
