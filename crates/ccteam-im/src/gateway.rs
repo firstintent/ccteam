@@ -92,6 +92,50 @@ enum TurnOrigin {
     Internal,
 }
 
+/// Who asked for a session's turns, in the two shapes the delivery paths need.
+///
+/// `by_turn` answers "who asked for turn X" and is consumed at the vendor turn
+/// boundary — only the events that carry a turn id (a failure) can use it.
+/// `latest` answers "who asked the question this session is answering NOW",
+/// which is what IM egress needs: an ordinary assistant answer carries no turn
+/// id, and an answer nobody in the chat asked for must not be pushed into that
+/// chat. Both are written by the same `record`, so they cannot drift.
+#[derive(Debug, Default)]
+struct TurnOrigins {
+    by_turn: BTreeMap<String, TurnOrigin>,
+    latest: TurnOrigin,
+}
+
+impl Default for TurnOrigin {
+    /// A session nobody has submitted to yet has no ccteam-authored question
+    /// pending; the fail-open direction for delivery is "a human is waiting".
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+impl TurnOrigins {
+    fn record(&mut self, turn_id: String, origin: TurnOrigin) {
+        self.by_turn.insert(turn_id, origin);
+        self.latest = origin;
+    }
+
+    /// Consume the origin of `turn_id` (or of the single in-flight turn when
+    /// the event carries no id). An untracked harness wake-up defaults to
+    /// internal — nobody in this chat asked for it.
+    fn take(&mut self, turn_id: Option<&str>) -> TurnOrigin {
+        match turn_id {
+            Some(id) => self.by_turn.remove(id).unwrap_or(TurnOrigin::Internal),
+            None if self.by_turn.len() == 1 => {
+                let id = self.by_turn.keys().next().cloned();
+                id.and_then(|id| self.by_turn.remove(&id))
+                    .unwrap_or(TurnOrigin::Internal)
+            }
+            None => TurnOrigin::Internal,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct GatewaySession {
     /// Monotonic live-entry epoch. Every replacement gets a fresh value;
@@ -205,11 +249,10 @@ struct GatewaySession {
     /// never touch that field, but DID get a watchdog before this fold — this
     /// preserves that).
     watched_turn: Arc<std::sync::Mutex<Option<(String, u64)>>>,
-    /// Origin of submitted vendor turns, keyed by the vendor's turn id. Human
-    /// IM/web submit paths record `User`; A2A/delegation/pending-drain paths
-    /// record `Internal`. The event pump consumes the entry at the vendor turn
-    /// boundary; an untracked harness wake-up therefore defaults to internal.
-    turn_origins: Arc<std::sync::Mutex<BTreeMap<String, TurnOrigin>>>,
+    /// Who asked for the turns this session is running — see [`TurnOrigins`].
+    /// Human IM/web submit paths record `User`; A2A/delegation/pending-drain
+    /// paths record `Internal`.
+    turn_origins: Arc<std::sync::Mutex<TurnOrigins>>,
     /// v0.9.0 W2 (F2) — delegation parent sid (the spawner's principal). `None`
     /// for a human-created (root) session. Mirrors `meta.parent_sid`, kept
     /// in-memory so the guardrail child/delegated counts + the stop-descendant
@@ -861,6 +904,16 @@ impl GatewayEventSink {
     /// phone notification only.
     fn send_delivery_only(&self, event: GatewayEvent) -> bool {
         self.mpsc.send(event).is_ok()
+    }
+
+    /// v0.10.1 — publish to the SSE fan-out (web console + the inline-wait
+    /// subscriber) WITHOUT the IM egress leg: the answer belongs in the record
+    /// but has no human addressee in the chat right now. Returns the same
+    /// pump-liveness signal as [`Self::send`] (the mpsc being closed is still
+    /// "the daemon exited"), so a caller's `if !send { break }` is unchanged.
+    fn send_broadcast_only(&self, event: GatewayEvent) -> bool {
+        let _ = self.broadcast.send(event);
+        !self.mpsc.is_closed()
     }
 }
 
@@ -2179,7 +2232,7 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
-                turn_origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                turn_origins: Arc::new(std::sync::Mutex::new(TurnOrigins::default())),
                 parent_sid: plan.parent_sid,
                 delegation_depth: plan.delegation_depth,
             },
@@ -4194,7 +4247,7 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
-                turn_origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                turn_origins: Arc::new(std::sync::Mutex::new(TurnOrigins::default())),
                 parent_sid: parent_sid.clone(),
                 delegation_depth,
             },
@@ -4373,7 +4426,7 @@ impl Gateway {
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
-                turn_origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+                turn_origins: Arc::new(std::sync::Mutex::new(TurnOrigins::default())),
                 parent_sid,
                 delegation_depth,
             },
@@ -4447,6 +4500,14 @@ impl Gateway {
         }
         let mut ids = Vec::new();
         for turn in pending {
+            // v0.10.1 — the queue carries who asked (`internal`); the drain used
+            // to relabel every row internal, which made a human's queued
+            // question look unasked-for on the delivery side.
+            let origin = if turn.internal {
+                TurnOrigin::Internal
+            } else {
+                TurnOrigin::User
+            };
             // Box::pin: drain ↔ submit_resolved are mutually recursive when
             // a not-live submit enqueues then drains (async recursion needs
             // indirection for a finite future type).
@@ -4455,7 +4516,7 @@ impl Gateway {
                 session_id,
                 "",
                 turn.text,
-                TurnOrigin::Internal,
+                origin,
                 turn.literal,
             ))
             .await
@@ -5424,9 +5485,24 @@ impl Gateway {
                                     &text,
                                 )
                             };
-                            // `GatewayEventSink::send` returns false only when the
-                            // mpsc consumer is gone (daemon exited) → stop the pump.
-                            if !tx.send(GatewayEvent {
+                            // v0.10.1 — a shared IM thread needs an ADDRESSEE,
+                            // not just a label. An answer to an INTERNAL turn (a
+                            // delegation completion notification, a drained
+                            // internal turn) was asked for by ccteam, not by
+                            // anyone in this chat; when the session is also not
+                            // the chat's focus, the prefix above was never
+                            // isolation — the human just got a second speaker in
+                            // their thread, answering a question they never
+                            // asked. Keep it in the record (turns.jsonl, above)
+                            // and on the SSE fan-out (web console, inline
+                            // `wait_seconds` subscriber); drop only the IM leg.
+                            // The web console is exempt for the same reason the
+                            // context echo above skips it: every session has its
+                            // own tab there, so nothing is being talked over.
+                            let has_addressee = is_focused
+                                || channel == "web"
+                                || latest_turn_origin(&session) == TurnOrigin::User;
+                            let answer = GatewayEvent {
                                 id: format!("gateway-event-{session_id}-{seq}"),
                                 channel,
                                 chat_id,
@@ -5437,7 +5513,15 @@ impl Gateway {
                                 options: Vec::new(),
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
-                            }) {
+                            };
+                            // Either sink returns false only when the mpsc
+                            // consumer is gone (daemon exited) → stop the pump.
+                            let delivered = if has_addressee {
+                                tx.send(answer)
+                            } else {
+                                tx.send_broadcast_only(answer)
+                            };
+                            if !delivered {
                                 break;
                             }
                             if let Some(origin) = boundary_origin {
@@ -6777,7 +6861,7 @@ impl Gateway {
             }
         };
         if not_live {
-            let (project, origin) = {
+            let (project, channel) = {
                 let s = self
                     .sessions
                     .get(session_id)
@@ -6796,8 +6880,9 @@ impl Gateway {
                 &cwd,
                 session_id,
                 payload.clone(),
-                Some(origin),
+                Some(channel),
                 literal_user_text,
+                origin == TurnOrigin::Internal,
             )?;
             self.resume_dead_session(session_id).await?;
             let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
@@ -6974,7 +7059,7 @@ impl Gateway {
         }
         let turn_id = submitted.turn_id.clone();
         if let Ok(mut origins) = session.turn_origins.lock() {
-            origins.insert(turn_id.0.clone(), origin);
+            origins.record(turn_id.0.clone(), origin);
         }
         self.mirror_user_turn(session, &user_text, &submitted.input_id);
         // Grok's native interjection path may hold its TurnCompleted boundary
@@ -7026,7 +7111,7 @@ impl Gateway {
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
                 if let Ok(mut origins) = session.turn_origins.lock() {
-                    origins.insert(turn_id.0.clone(), origin);
+                    origins.record(turn_id.0.clone(), origin);
                 }
                 // A directive that resolves to a turn was submitted by the
                 // adapter itself (`/model` re-prompt, grok steer): it is
@@ -9908,6 +9993,42 @@ impl Gateway {
         out
     }
 
+    /// v0.10.1 — does `sid`'s lineage reach `ancestor`, i.e. is `sid` one of
+    /// the sessions `ancestor` (transitively) delegated? The live map is the
+    /// hot path, with the durable `meta.json` parent link as the fallback for a
+    /// rung the live map lost (a middle child evicted for capacity, a rebuild
+    /// that failed): without it a capacity eviction would silently reclassify a
+    /// real grandchild as an unrelated peer. Bounded by the same depth cap as
+    /// [`Self::ancestor_chain`].
+    pub(crate) fn lineage_reaches(&self, sid: &str, ancestor: &str) -> bool {
+        if sid == ancestor {
+            return false;
+        }
+        let cap = (self.delegation_config().max_depth as usize)
+            .saturating_add(2)
+            .min(64);
+        let mut seen = std::collections::HashSet::new();
+        let mut cur = Some(sid.to_string());
+        for _ in 0..=cap {
+            let Some(c) = cur else { return false };
+            if !seen.insert(c.clone()) {
+                return false;
+            }
+            let parent = match self.sessions.get(&c) {
+                Some(s) => s.parent_sid.clone(),
+                None => self
+                    .find_meta_for_sid(&c)
+                    .ok()
+                    .and_then(|(_, _, meta)| meta.parent_sid.clone()),
+            };
+            match parent {
+                Some(p) if p == ancestor => return true,
+                other => cur = other,
+            }
+        }
+        false
+    }
+
     /// v0.9.0 W2 (F2) — append one `delegation_*` event to the project's
     /// `progress.jsonl` (the state SoT; schema owned by `progress_bridge`).
     /// Best-effort: a write failure only warns, never blocks the delegation.
@@ -10380,9 +10501,12 @@ impl Gateway {
 
     /// v0.9.0 W2 (F2/F7) — arm/refresh the durable completion watch for a child
     /// after a dispatch: writes `<project>/.ccteam/chat/<child>/delegation.json`
-    /// (atomic-durable) + the in-memory mirror. A re-dispatch UPDATES
-    /// parent/notify/title/dispatched_turn but PRESERVES `notified_turns` (never
-    /// re-notifies an already-delivered turn). Returns false (no watch) when the
+    /// (atomic-durable) + the in-memory mirror. A re-dispatch ARRIVING BEFORE
+    /// the current task's boundary updates parent/notify/title/dispatched_turn
+    /// but PRESERVES `notified_turns` (never re-notifies an already-delivered
+    /// turn); a dispatch after the boundary spent the watch (v0.10.1) starts a
+    /// clean one — the turns it would have deduped are over. Returns false (no
+    /// watch) when the
     /// child's project can't be resolved. `parent_sid` is the DISPATCHER's
     /// principal (usually the spawner, but not necessarily).
     pub fn arm_delegation_watch(
@@ -10564,7 +10688,9 @@ impl Gateway {
 
     /// v0.9.0 W2 (F2) — drop a child's completion watch (mirror + durable
     /// `delegation.json`). Used on an inline `wait` completion (suppress the
-    /// redundant notification) and by the reconcile when the parent is gone.
+    /// redundant notification), when the dispatched task's turn boundary spends
+    /// the watch (v0.10.1), by `session_stop`, and by the reconcile when the
+    /// parent is gone.
     pub fn disarm_delegation_watch(&mut self, child_sid: &str) {
         self.delegation_watch_set.write().unwrap().remove(child_sid);
         if let Some(m) = self.delegations.remove(child_sid) {
@@ -10618,12 +10744,12 @@ impl Gateway {
     }
 
     /// v0.9.0 W4 (F4) — child sids with an ARMED completion watch, for the
-    /// team view graph's best-effort `edges[].active` seed (a dispatch that
-    /// hasn't yet been disarmed — see [`Self::disarm_delegation_watch`] for
-    /// when that happens). Honest scope: a watch also stays armed briefly
-    /// after a delivered (notified) completion until the next inline-wait
-    /// disarm or a parent-gone reconcile, so this is a best-effort snapshot —
-    /// the client corrects it live from `dispatched`/`completed` SSE frames.
+    /// team view graph's best-effort `edges[].active` seed (a dispatch whose
+    /// task has not yet reached its turn boundary — see
+    /// [`Self::disarm_delegation_watch`] for every way a watch ends). Honest
+    /// scope: the entry disappears the moment the dispatched task completes, so
+    /// this is a snapshot of work IN FLIGHT — the client corrects it live from
+    /// `dispatched`/`completed` SSE frames.
     pub fn armed_delegation_watch_sids(&self) -> std::collections::HashSet<String> {
         self.delegations.keys().cloned().collect()
     }
@@ -10666,6 +10792,17 @@ impl Gateway {
         })
     }
 
+    /// v0.9.0 W2 (F2/F7) — deliver one completed child turn to its watching
+    /// parent, holding the gateway lock only to plan and to commit. It (a)
+    /// emits `delegation_completed`, (b) — unless `notify:off` — submits the
+    /// English notification to the parent through the ordinary submit path
+    /// (live=steer / dead=pending-turns FIFO), emitting `delegation_notified`,
+    /// (c) records the turn in `notified_turns` so it is delivered AT-MOST-once,
+    /// and (d) v0.10.1 — SPENDS the watch: this boundary is the end of the
+    /// dispatched task, and one dispatch subscribes to exactly one task. A
+    /// parent that no longer exists drops the watch (+ a warn); a watch re-armed
+    /// mid-delivery (generation changed) is left alone — it belongs to the next
+    /// task.
     async fn deliver_delegation_signal_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
@@ -10748,11 +10885,31 @@ impl Gateway {
                 None,
             );
             watch.notified_turns = current.notified_turns.clone();
+            // v0.10.1 — ONE dispatch subscribes to ONE task. This boundary IS
+            // the end of the dispatched task, so the watch is spent: drop the
+            // hot-path mirror here (the durable file goes with the write
+            // below). Left armed, `final` kept matching every LATER turn
+            // boundary of a child that has a life of its own — a peer IM root
+            // handed a task once stayed subscribed for the rest of its life,
+            // replaying its answers into the dispatcher (and through it back
+            // into the human's chat). A later dispatch re-arms; a watch
+            // re-armed DURING this delivery returned above on the generation
+            // check, so this can never eat the next task's subscription.
+            guard.delegations.remove(&child);
+            guard.delegation_watch_set.write().unwrap().remove(&child);
             watch
         };
         let project_dir = plan.mirror.project_dir.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            ccteam_harness::write_delegation_watch(&project_dir, &child, &watch)
+            // Record first, remove second: a crash between the two leaves a
+            // watch whose `notified_turns` already covers this turn, so the
+            // restart reconcile delivers nothing for it.
+            if let Err(error) = ccteam_harness::write_delegation_watch(&project_dir, &child, &watch)
+            {
+                tracing::warn!(%child, %error,
+                    "ccteam-im: failed to persist delegation.json notified_turns");
+            }
+            ccteam_harness::execution::delegation::remove_delegation_watch(&project_dir, &child);
         })
         .await;
     }
@@ -11122,7 +11279,7 @@ impl Gateway {
         match outcome {
             DirectiveOutcome::Turn(turn_id) => {
                 if let Ok(mut origins) = session.turn_origins.lock() {
-                    origins.insert(turn_id.0.clone(), origin);
+                    origins.record(turn_id.0.clone(), origin);
                 }
                 if !session.protocol.is_terminal() {
                     if let Some(paths) = project_paths.as_ref() {
@@ -11281,7 +11438,7 @@ impl Gateway {
                     .store(plan.prior_steered, Ordering::SeqCst);
             }
             if let Ok(mut origins) = current.turn_origins.lock() {
-                origins.insert(submitted.turn_id.0.clone(), plan.origin);
+                origins.record(submitted.turn_id.0.clone(), plan.origin);
             };
         }
 
@@ -12334,15 +12491,18 @@ fn take_turn_origin(session: &GatewaySession, turn_id: Option<&str>) -> TurnOrig
     let Ok(mut origins) = session.turn_origins.lock() else {
         return TurnOrigin::Internal;
     };
-    match turn_id {
-        Some(id) => origins.remove(id).unwrap_or(TurnOrigin::Internal),
-        None if origins.len() == 1 => {
-            let id = origins.keys().next().cloned();
-            id.and_then(|id| origins.remove(&id))
-                .unwrap_or(TurnOrigin::Internal)
-        }
-        None => TurnOrigin::Internal,
-    }
+    origins.take(turn_id)
+}
+
+/// Who asked the question this session is answering right now (v0.10.1) — the
+/// delivery-side view of [`TurnOrigins`]. A poisoned lock reads as `User`: the
+/// fail-open direction is to deliver.
+fn latest_turn_origin(session: &GatewaySession) -> TurnOrigin {
+    session
+        .turn_origins
+        .lock()
+        .map(|o| o.latest)
+        .unwrap_or(TurnOrigin::User)
 }
 
 fn contextual_answer(
@@ -15852,6 +16012,7 @@ mod tests {
             "queued-first",
             Some("web".into()),
             false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -16844,6 +17005,90 @@ mod tests {
             im_ev.content.ends_with("\n\n→ alpha/s1"),
             "roleless echo carries no (role) parens: {:?}",
             im_ev.content
+        );
+    }
+
+    /// v0.10.1 (issue #184) — a shared IM thread needs an ADDRESSEE. An answer
+    /// to a ccteam-authored turn (a delegation completion notification) from a
+    /// session that is NOT the chat's focus reaches nobody who asked: the `[sid
+    /// …]` prefix labelled the second speaker, it never stopped him talking.
+    /// The record (turns.jsonl) and the SSE fan-out still get it; only the IM
+    /// leg is dropped — and a human's own question to that same out-of-focus
+    /// session is answered exactly as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn out_of_focus_internal_answer_stays_out_of_the_im_thread() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A FRESH fake per spawn: one shared `events_notify` could wake the
+        // wrong session's pump (test-double race, see `delegation_gateway`).
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp.path());
+        gateway.register_project("alpha", tmp.path());
+        let (tx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        let mut broadcast = gateway.subscribe_events();
+
+        // Two independent roots in ONE chat; the human is talking to the second.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+
+        // A completion notification wakes the out-of-focus s1.
+        gateway
+            .submit_to_sid(
+                "s1",
+                "[ccteam] delegated session s9 completed turn s9-1".into(),
+            )
+            .await
+            .unwrap();
+        let seen = recv_answer(&mut broadcast).await;
+        assert_eq!(seen.sid.as_deref(), Some("s1"));
+        assert!(
+            seen.content.starts_with("[s1 alpha claude"),
+            "the record keeps the labelled answer: {}",
+            seen.content
+        );
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer) {
+                    return ev;
+                }
+            }
+        })
+        .await;
+        assert!(
+            leaked.is_err(),
+            "an out-of-focus answer to an internal turn must not reach the IM thread: {leaked:?}"
+        );
+
+        // Same session, same lack of focus — but now a human asked.
+        gateway
+            .submit_web_sid("s1", "are you still there?".into(), false)
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("a human's question is still answered in the IM thread");
+        assert_eq!(delivered.sid.as_deref(), Some("s1"));
+        assert!(
+            delivered.content.contains("are you still there?"),
+            "got: {}",
+            delivered.content
         );
     }
 
@@ -23665,6 +23910,120 @@ mod tests {
             ccteam_notification_turns(&project_dir, &parent_sid).len(),
             1,
             "boundary replay must dedup"
+        );
+    }
+
+    /// v0.10.1 (issue #184) — the watch covers exactly the dispatched TASK.
+    /// The boundary that ends it SPENDS the watch (mirror + `delegation.json`),
+    /// so the child's next turn — its own conversation, with its own human —
+    /// never wakes the dispatcher again. Before this, one handoff dispatch to
+    /// an independent IM root replayed that root's every later answer into the
+    /// dispatcher for the rest of its life.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_watch_is_spent_by_the_dispatched_task_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            // A peer root, not a child: exactly the handoff shape from the bug.
+            let peer = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            gw.arm_delegation_watch(
+                &peer,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("P0 handoff".into()),
+                Some("turn-handoff".into()),
+            );
+            (parent, peer)
+        };
+
+        let boundary = |n: u32, text: &str| crate::delegation::DelegationSignal {
+            child_sid: child_sid.clone(),
+            turn_id: format!("{child_sid}-{n}"),
+            tail: text.to_string(),
+            vendor: AgentVendor::Claude,
+            host: "local".into(),
+            boundary: true,
+            vendor_error: false,
+            interim_notes: 0,
+            covered_turns: vec![format!("{child_sid}-{n}")],
+        };
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(1, "handoff accepted, P0 fixed"),
+        )
+        .await;
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &parent_sid).len(),
+            1,
+            "the dispatched task notifies once"
+        );
+        // Spent: neither the durable watch nor the hot-path mirror survives it.
+        assert!(
+            ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_none(),
+            "the task boundary removes delegation.json"
+        );
+        assert!(
+            !gateway
+                .lock()
+                .await
+                .armed_delegation_watch_sids()
+                .contains(&child_sid),
+            "the task boundary removes the in-memory mirror (the hot-path gate)"
+        );
+
+        // The child keeps living its own life: later turns reach nobody.
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(2, "answer to its OWN human"),
+        )
+        .await;
+        Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary(3, "another one"))
+            .await;
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &parent_sid).len(),
+            1,
+            "a spent watch never notifies again"
+        );
+
+        // A fresh dispatch re-arms — the mechanism is one-shot, not one-time.
+        gateway.lock().await.arm_delegation_watch(
+            &child_sid,
+            &parent_sid,
+            ccteam_harness::NotifyMode::Final,
+            None,
+            Some("turn-second".into()),
+        );
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(4, "second task done"),
+        )
+        .await;
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &parent_sid).len(),
+            2,
+            "re-dispatch subscribes to the next task"
         );
     }
 
