@@ -47,10 +47,13 @@ export function filterCollapsedTreeRows(
 /** Build the topology view's project-grouped delegation forests. Projects
  *  sort by slug; roots sort by most-recent activity, while children retain a
  *  stable natural-sid order. Missing parents and corrupt cycles still render
- *  exactly once. */
+ *  exactly once. A project whose slug is in `collapsedProjects` keeps its
+ *  header data (slug + counts) but renders zero session rows — the header
+ *  itself stays visible so the project can be re-expanded. */
 export function groupDelegationTrees(
   nodes: AgentNode[],
   collapsed: ReadonlySet<string> = new Set<string>(),
+  collapsedProjects: ReadonlySet<string> = new Set<string>(),
 ): ProjectDelegationTree[] {
   const byProject = new Map<string, AgentNode[]>();
   for (const node of nodes) {
@@ -102,7 +105,7 @@ export function groupDelegationTrees(
         slug,
         liveCount: projectNodes.filter((node) => node.status === "live").length,
         totalCount: projectNodes.length,
-        rows: filterCollapsedTreeRows(rows, collapsed),
+        rows: collapsedProjects.has(slug) ? [] : filterCollapsedTreeRows(rows, collapsed),
       };
     });
 }

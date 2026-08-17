@@ -1199,6 +1199,8 @@ select:focus-visible,
 .agents-tree-project { width: max-content; min-width: 100%; border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; background: var(--bg-card); }
 .agents-tree-project-head { height: 26px; padding: 0 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--bg-soft); border-bottom: 1px solid var(--border-soft); color: var(--text-faint); font-size: 11px; }
 .agents-tree-project-head .mono { color: var(--text-muted); font-weight: 600; }
+.agents-tree-project-name { display: inline-flex; align-items: center; gap: 4px; min-width: 0; margin-left: -6px; }
+.agents-tree-project-name .agents-tree-toggle:hover { background: var(--bg-card); }
 .agents-tree-row { --tree-guide: var(--border); min-width: max-content; height: 28px; display: grid; grid-template-columns: auto 18px 34px 50px minmax(140px, 1fr) 150px 8px 90px 86px 38px auto; gap: 7px; align-items: center; padding: 0 10px 0 4px; border-bottom: 1px solid color-mix(in srgb, var(--border-soft) 65%, transparent); color: var(--text-muted); cursor: pointer; font-size: 12px; }
 /* Host badge column exists only when the graph spans >1 host. */
 .agents-tree.with-host .agents-tree-row { grid-template-columns: auto 18px 34px 50px minmax(140px, 1fr) 150px 90px 8px 90px 86px 38px auto; }

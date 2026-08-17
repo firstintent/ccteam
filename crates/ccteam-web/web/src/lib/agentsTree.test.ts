@@ -45,6 +45,31 @@ describe("groupDelegationTrees", () => {
     );
     expect(groups[0]!.rows.map((row) => row.node.sid)).toEqual(["s1", "s4"]);
   });
+
+  it("a collapsed project keeps its header counts but renders zero rows", () => {
+    const demoNodes = [node("s1", null), node("s2", "s1")];
+    const otherProject = { ...node("s3", null), slug: "alpha" };
+    const groups = groupDelegationTrees(
+      [...demoNodes, otherProject],
+      new Set(),
+      new Set(["demo"]),
+    );
+    expect(groups.map((group) => group.slug)).toEqual(["alpha", "demo"]);
+    // The collapsed project's rows are gone; slug + counts stay for the header.
+    expect(groups[1]).toMatchObject({ slug: "demo", liveCount: 2, totalCount: 2, rows: [] });
+    // Other projects are untouched.
+    expect(groups[0]!.rows.map((row) => row.node.sid)).toEqual(["s3"]);
+  });
+
+  it("project collapse composes with per-sid collapse on the surviving projects", () => {
+    const groups = groupDelegationTrees(
+      [node("s1", null), node("s2", "s1"), { ...node("s3", null), slug: "alpha" }],
+      new Set(["s1"]),
+      new Set(["alpha"]),
+    );
+    expect(groups[0]!.rows).toEqual([]); // alpha: collapsed project
+    expect(groups[1]!.rows.map((row) => row.node.sid)).toEqual(["s1"]); // demo: s2 hidden by sid collapse
+  });
 });
 
 describe("filterCollapsedTreeRows", () => {

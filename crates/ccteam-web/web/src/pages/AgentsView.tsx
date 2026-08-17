@@ -88,10 +88,28 @@ function costCell(node: { cost_usd?: number | null; tokens_total?: number | null
   return "—";
 }
 
+/** localStorage key for the topology's collapsed-PROJECT set (per browser;
+ *  holds slugs. Per-sid subtree collapse stays component-local — it is a
+ *  transient reading aid, while a collapsed project is a layout preference
+ *  worth keeping across reloads). */
+const COLLAPSED_PROJECTS_KEY = "ccteam.agents.collapsedProjects.v1";
+
+/** Read the persisted collapsed-project slugs; any corruption degrades to
+ *  the default (everything expanded). */
+function loadCollapsedProjects(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_PROJECTS_KEY);
+    if (raw) return new Set(JSON.parse(raw) as string[]);
+  } catch {
+    /* fall through — default below */
+  }
+  return new Set();
+}
+
 /** Project-grouped, collapsible delegation tree. Component state contains
- *  only collapsed sids, so the initial render stays deterministic and SSR-safe.
- *  `hosts` = every host in the graph; the per-row host badge renders only
- *  when there is more than one. */
+ *  only the two collapsed sets (sids + project slugs), so the initial render
+ *  stays deterministic and SSR-safe. `hosts` = every host in the graph; the
+ *  per-row host badge renders only when there is more than one. */
 export function AgentsTree({
   nodes,
   edges,
@@ -112,7 +130,13 @@ export function AgentsTree({
   const lang = langProp ?? "zh";
   const t = makeT(langProp ?? "zh");
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
-  const projects = useMemo(() => groupDelegationTrees(nodes, collapsed), [nodes, collapsed]);
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() =>
+    loadCollapsedProjects(),
+  );
+  const projects = useMemo(
+    () => groupDelegationTrees(nodes, collapsed, collapsedProjects),
+    [nodes, collapsed, collapsedProjects],
+  );
   const delegating = useMemo(
     () => new Set(edges.filter((edge) => edge.active).map((edge) => edge.child)),
     [edges],
@@ -128,6 +152,20 @@ export function AgentsTree({
     });
   };
 
+  const toggleProject = (slug: string) => {
+    setCollapsedProjects((previous) => {
+      const next = new Set(previous);
+      if (next.has(slug)) next.delete(slug);
+      else next.add(slug);
+      try {
+        localStorage.setItem(COLLAPSED_PROJECTS_KEY, JSON.stringify([...next]));
+      } catch {
+        /* persistence is best-effort — the toggle still applies */
+      }
+      return next;
+    });
+  };
+
   return (
     <div
       className={showHost ? "agents-tree with-host" : "agents-tree"}
@@ -135,10 +173,25 @@ export function AgentsTree({
       role="tree"
       aria-label={t("team")}
     >
-      {projects.map((project) => (
+      {projects.map((project) => {
+        const projectCollapsed = collapsedProjects.has(project.slug);
+        return (
         <section className="agents-tree-project" data-testid={`agents-tree-project-${project.slug}`} key={project.slug}>
           <header className="agents-tree-project-head">
-            <span className="mono">{project.slug}</span>
+            <span className="agents-tree-project-name">
+              <button
+                type="button"
+                className="agents-tree-toggle"
+                aria-label={projectCollapsed ? t("expand") : t("collapse")}
+                aria-expanded={!projectCollapsed}
+                title={projectCollapsed ? t("expand") : t("collapse")}
+                data-testid={`agents-tree-project-toggle-${project.slug}`}
+                onClick={() => toggleProject(project.slug)}
+              >
+                {projectCollapsed ? "›" : "⌄"}
+              </button>
+              <span className="mono">{project.slug}</span>
+            </span>
             <span>{project.liveCount}/{project.totalCount} {t("teamKpiLive")}</span>
           </header>
           {project.rows.map(({ node: n, indent, hasChildren }) => {
@@ -213,7 +266,8 @@ export function AgentsTree({
             );
           })}
         </section>
-      ))}
+        );
+      })}
     </div>
   );
 }
