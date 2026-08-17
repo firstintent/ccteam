@@ -107,8 +107,8 @@ pub(crate) enum UpdateGate {
 /// [`ccteam_core::version_check::REFRESH_INTERVAL_HOURS`] cache), and the probe
 /// cache carries no `dismissed_version` — dismissal only silences the passive
 /// nag and must never block an explicit update. Version comparison itself is
-/// delegated to the shared normalized comparator so `v0.9.8` vs `0.9.7`
-/// resolves identically everywhere.
+/// delegated to the shared normalized comparator so a `v`-prefixed tag
+/// and a bare version resolve identically everywhere.
 pub(crate) fn gate(latest: Option<&str>, current: &str) -> UpdateGate {
     let Some(latest) = latest else {
         return UpdateGate::Unknown;
@@ -643,11 +643,11 @@ pub(crate) fn fetch_latest_version() -> Option<String> {
     None
 }
 
-/// v0.9.7 (PRD F3.6) — one line per registered satellite whose ccteam
-/// version differs from `daemon_version`. Empty when the registry is
-/// empty/absent or every host is aligned, so the common no-satellite case
-/// stays silent (no noise). Shared by `ccteam status` and the `ccteam
-/// doctor` updates section so the two never drift.
+/// One line per registered satellite whose ccteam version differs from
+/// `daemon_version`. Empty when the registry is empty/absent or every host
+/// is aligned, so the common no-satellite case stays silent (no noise).
+/// Shared by `ccteam status` and the `ccteam doctor` updates section so
+/// the two never drift.
 pub(crate) fn fleet_version_skew(paths: &CcteamPaths, daemon_version: &str) -> Vec<String> {
     let registry = ccteam_core::HostRegistry::load(&paths.host_registry_path()).unwrap_or_default();
     registry

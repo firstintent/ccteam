@@ -496,13 +496,13 @@ fn check_vendor_auth_pi() -> AuthCheck {
     AuthCheck::simple(None, "")
 }
 
-/// v0.9.15 K23/D13 — two Pass sources, checked in order: explicit env wins
-/// (matches DSH's own resolution order), else a mirrorable
-/// `~/.dsh/.credentials.yaml` counts (the real spawn-time credential mirror,
-/// K17/K23 — `check_vendor_mcp`'s bridge short-circuit skips the generic
-/// vendor-config probe for a `ManagedSessionBridge` vendor, so this is the
-/// only auth signal `dsh`'s doctor row gets). Neither present → Fail with
-/// both fixes named (matches the two-hint convention above).
+/// Two Pass sources, checked in order: explicit env wins (matches DSH's
+/// own resolution order), else a mirrorable `~/.dsh/.credentials.yaml`
+/// counts (the real spawn-time credential mirror — `check_vendor_mcp`'s
+/// bridge short-circuit skips the generic vendor-config probe for a
+/// `ManagedSessionBridge` vendor, so this is the only auth signal `dsh`'s
+/// doctor row gets). Neither present → Fail with both fixes named (matches
+/// the two-hint convention above).
 fn check_vendor_auth_dsh() -> AuthCheck {
     if std::env::var("DEEPSEEK_API_KEY").is_ok() {
         return AuthCheck {

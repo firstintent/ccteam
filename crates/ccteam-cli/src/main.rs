@@ -49,12 +49,10 @@ const VERSION: &str = concat!(
 #[command(
     name = "ccteam",
     version = VERSION,
-    about = "Autonomous AI development orchestrator built on Claude Code"
+    about = "Multi-harness agent team bridge and governance layer"
 )]
 struct Cli {
-    /// v0.8.20 — override the ccteam home dir (default `~/.ccteam`). Lets a
-    /// second, fully isolated instance live under e.g. `~/.ccteam2`. Equivalent
-    /// to setting `CCTEAM_HOME`; this flag wins when both are given.
+    /// Override the ccteam home dir (default `~/.ccteam`); wins over `CCTEAM_HOME`.
     #[arg(long, value_name = "DIR", global = true)]
     home: Option<PathBuf>,
     #[command(subcommand)]
@@ -63,325 +61,169 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// One-shot project setup: ensure the `~/.ccteam/` skeleton, scaffold
-    /// the per-project `.ccteam/state.json` + `.ccteam/workflow.yaml`,
-    /// register the project, and run a quick health check (claude / tmux /
-    /// ccteam-on-PATH). Idempotent — safe to re-run.
-    ///
-    /// Seeds NO roles: the default session is roleless (a bare vendor
-    /// reading the project `CLAUDE.md`/`AGENTS.md`); author or install
-    /// work-roles into `.claude/agents/<role>.md` yourself. MCP
-    /// registration lives in `ccteam config`.
-    ///
-    /// Defaults to installing in the current working directory (slug =
-    /// cwd basename). Use `--in <path>` to install elsewhere, `--slug
-    /// <name>` to override the derived slug. Re-running on a directory
-    /// that's already a ccteam project refreshes state.json + the settings
-    /// marker section but preserves `workflow.yaml` (use `--force` to
-    /// overwrite it); `.claude/agents/*.md` is always left untouched.
+    /// Register a directory as a ccteam project and scaffold its `.ccteam/` state. Safe to re-run.
     Init {
-        /// Install in this directory instead of the cwd. Created if
-        /// absent. Combine with `--slug` to override the auto-derived slug
-        /// (default: dir basename).
+        /// Install in this directory instead of the cwd (created if absent).
         #[arg(long, value_name = "PATH")]
         r#in: Option<PathBuf>,
-        /// Explicit project name (registered slug). Overrides the
-        /// install-dir basename default. Does NOT change where the
-        /// project installs — that stays the cwd (or `--in <path>`). To
-        /// create a fresh project under `<projects_root>/<slug>/`,
-        /// use `ccteam project new <slug>` (e.g. `ccteam project new demo`).
+        /// Registered project name (default: install-dir basename); does not move the install.
         #[arg(long, value_name = "NAME")]
         slug: Option<String>,
-        /// Overwrite the ccteam-managed files: state.json, the settings
-        /// marker section, and `workflow.yaml`. Without `--force` re-runs
-        /// preserve a user-edited `workflow.yaml`. Never touches
-        /// `.claude/agents/*.md` (ccteam seeds no roles).
+        /// Overwrite ccteam-managed files (state.json, workflow.yaml); never touches `.claude/agents/`.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// v0.8.20 F1: set the project owner identity (`ProjectState.owner`,
-        /// `"channel:chat_id"` — e.g. `user:<tenant>`). A bare value (no `:`)
-        /// is scoped to the per-user identity namespace (`alice` → `user:alice`). Present
-        /// overrides an existing owner on re-init (no `--force` needed);
-        /// absent preserves it.
+        /// Project owner identity (e.g. `user:alice`; a bare name maps to `user:<name>`).
         #[arg(long, value_name = "OWNER")]
         owner: Option<String>,
     },
-    /// Run the gateway daemon (IM gateway plus, by default, the
-    /// web UI in the same process). Foreground is the only mode —
-    /// `ccteam start` is enough. Pass `--no-web` to run the gateway
-    /// without web.
+    /// Run the gateway daemon in the foreground: IM gateway plus embedded web UI.
     Start {
-        /// Skip starting the embedded web UI. Use this when you want
-        /// only the IM gateway (e.g. headless server, custom web bind
-        /// via a separate `ccteam web` invocation).
+        /// Run without the embedded web UI (IM gateway only).
         #[arg(long, default_value_t = false)]
         no_web: bool,
-        /// Skip starting the embedded `ccteam-im` gateway (Telegram /
-        /// Slack / Discord bridge). The gateway lives in this process
-        /// (no separate `ccteam-im` binary); pass this to run web-only.
+        /// Run without the IM gateway (Telegram / Slack / Discord bridge); web only.
         #[arg(long, default_value_t = false)]
         no_imd: bool,
-        /// Embedded web UI bind address. Default `0.0.0.0:7331` so
-        /// host deployments are LAN-reachable out of the box; auth is
-        /// auto-enabled on non-loopback binds and the token lands in
-        /// `~/.ccteam/web-token`. Use `127.0.0.1:7331` to restrict to
-        /// loopback (auth then disabled).
+        /// Web UI bind address; non-loopback binds auto-enable token auth.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
-        /// DSH web companion reverse-proxy bind address. Omit to use
-        /// `--web-bind`'s port + 1; pass `off` to disable the companion
-        /// listener while keeping `/api/v1/dsh/status` available.
+        /// DSH web companion proxy bind (default: web-bind port + 1; `off` disables).
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Disable token auth on the embedded web. DANGEROUS on
-        /// non-loopback bind — prints a 5-second warning before
-        /// listening.
+        /// Disable web token auth. DANGEROUS on non-loopback binds.
         #[arg(long, default_value_t = false)]
         web_no_auth: bool,
-        /// Custom path to read the auth token from (default
-        /// `~/.ccteam/web-token`).
+        /// Read the auth token from this file (default `~/.ccteam/web-token`).
         #[arg(long, value_name = "PATH")]
         web_token_file: Option<PathBuf>,
-        /// V0.4.6 F88 — disable the auto-clipboard of the web bearer
-        /// token. Default behavior probes `xclip` / `wl-copy` /
-        /// `pbcopy` / `clip.exe` and copies on first hit; pass this
-        /// flag in CI / headless / unattended runs to skip the probe.
+        /// Do not copy the web auth token to the clipboard (for CI / headless runs).
         #[arg(long, default_value_t = false)]
         no_clipboard: bool,
     },
-    /// V0.4.1: one-screen aggregate health view. Reports daemon
-    /// heartbeat age, every project's slug + age + last-event time with
-    /// its tracked sessions (role · vendor · status · sid) nested
-    /// underneath, and the embedded-web token + LAN URL. Replaces having
-    /// to grep `ls` + `session ls` + multiple `doctor` checks.
+    /// One-screen health view: daemon, projects, sessions, web URL and token.
     Status,
-    /// Internal commands — hook handlers + MCP integration
-    /// points + low-level utilities (mux hook-emit, web).
-    /// Not user-facing day to day. Hidden from top-level help; run
-    /// `ccteam internal --help` for the list.
+    /// Internal hook handlers and low-level utilities (not for daily use).
     #[command(hide = true)]
     Internal {
         #[command(subcommand)]
         cmd: InternalCommand,
     },
-    /// Stop the running gateway daemon (alias for `ccteam daemon stop`):
-    /// SIGTERM to the managed daemon, wait for a clean exit. A ready but
-    /// NOT managed instance (foreground `ccteam start` / self-supervised)
-    /// is refused with guidance. Live agent sessions are NOT killed. To
-    /// stop one project's sessions, use `ccteam project stop <slug>`.
+    /// Stop the managed gateway daemon (alias for `daemon stop`); agent sessions keep running.
     Stop,
-    /// Daemon lifecycle group: `ccteam daemon <start|stop|restart|status|logs>`.
-    ///
-    /// `start` detaches the daemon (setsid; stdout+stderr →
-    /// `~/.ccteam/daemon.log`), writes the managed pid record, and waits
-    /// for readiness — idempotent, and it auto-takes-over a legacy
-    /// installer-written systemd/launchd unit first. `stop` SIGTERMs the
-    /// managed daemon (`--force` escalates to SIGKILL after the wait —
-    /// daemon only, never agent sessions). `restart` = stop + start under
-    /// one operation lock. `status` reports ready/managed plus the
-    /// running-vs-binary version. `logs` tails `~/.ccteam/daemon.log`.
-    /// All verbs support `--json` (one machine-readable line on stdout).
+    /// Manage the background daemon: start, stop, restart, status, logs.
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCommand,
     },
-    /// Update ccteam to the latest release, by install channel
-    /// (`ccteam status` / `ccteam doctor` show when one is available).
-    ///
-    /// A standalone install (the `curl … | sh` prebuilt in `~/.local/bin`)
-    /// replays `install.sh` non-interactively — it downloads, verifies the
-    /// sha256, and swaps the binary atomically — then gracefully restarts a
-    /// running daemon onto the new binary (waiting up to 5 min for in-flight
-    /// turns to go idle first; `--now` skips the wait, `--no-restart` swaps
-    /// the binary only). A source build prints `git pull && make install`;
-    /// the npm channels aren't published yet.
-    ///
-    /// The latest release is checked FIRST: when you are already on it,
-    /// nothing is downloaded and the command exits early (`--force` reinstalls
-    /// anyway). If the release can't be reached, the update proceeds.
+    /// Update ccteam to the latest release and restart the daemon onto the new binary.
     Update {
         /// Skip the in-flight drain and restart the daemon immediately.
         #[arg(long, default_value_t = false)]
         now: bool,
-        /// Swap the binary only — do not restart the running daemon (it
-        /// keeps running the old version until `ccteam daemon restart`).
+        /// Swap the binary only; do not restart the running daemon.
         #[arg(long, default_value_t = false)]
         no_restart: bool,
-        /// Emit exactly one machine-readable JSON line on stdout (human
-        /// prose moves to stderr).
+        /// Emit one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// Reinstall even when already on the latest release (repair a
-        /// corrupt/partial install). Without it, `update` checks the latest
-        /// release first and exits early when there is nothing newer.
+        /// Reinstall even when already on the latest release (repair a corrupt install).
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Project lifecycle group: `ccteam project <ls|show|new|stop|rm>`.
-    ///
-    /// `ls`/`show` inspect registered projects; `new` scaffolds a fresh
-    /// project under `<projects_root>/<team>-<slug>/`; `stop` halts a
-    /// project's live sessions without removing it; `rm` un-registers a
-    /// project and (with `--purge`) deletes ccteam's on-disk footprint.
-    /// Run `ccteam project --help` for the list.
+    /// Manage registered projects: ls, show, new, stop, rm.
     Project {
         #[command(subcommand)]
         cmd: ProjectCommand,
     },
-    /// Session group: `ccteam session <ls|attach>`.
-    ///
-    /// `ls` enumerates live gateway chat sessions; `attach` reaches a
-    /// `terminal`-protocol session's tmux pane (stream-json sessions have
-    /// no pane — drive them from the web chat console or IM).
-    /// Run `ccteam session --help` for the list.
+    /// List or attach to live sessions: ls, attach.
     Session {
         #[command(subcommand)]
         cmd: SessionCommand,
     },
-    /// Role / plugin marketplace group: `ccteam role <search|add|list>`.
-    ///
-    /// Browse the curated ccteam-hub marketplace (`search`), one-shot install
-    /// an agent/vendor plugin into the project's `.claude/` (`add <id>`), or
-    /// list installed roles. Hub skills use the separate `ccteam skill` group.
-    /// This is a different
-    /// noun from `session role` (which switches a *live* chat session's role
-    /// inside the daemon).
+    /// Browse and install agent plugins from the ccteam-hub marketplace.
     Role {
         #[command(subcommand)]
         cmd: RoleCommand,
     },
-    /// Global skill library group: `ccteam skill <search|add|ls|rm|update|source|ensure-project|migrate-project>`.
+    /// Manage the user-level skill library and project skill links.
     Skill {
         #[command(subcommand)]
         cmd: SkillCommand,
     },
-    /// Multi-host group: `ccteam host <join|mint-token|rm|heartbeat|ls>`.
-    ///
-    /// Register a satellite with the main daemon (`join`), mint a join
-    /// token on the main daemon (`mint-token`, admin web-token), deregister
-    /// a satellite from the main daemon's host registry (`rm`), send a
-    /// keepalive (`heartbeat`), or list the local self credentials (`ls`).
+    /// Multi-host operations: join a satellite, mint join tokens, deregister, list.
     Host {
         #[command(subcommand)]
         cmd: HostCommand,
     },
-    /// Bare `ccteam doctor` groups one consolidated readiness row per vendor
-    /// under `agents`, ccteam/project advisories under their own sections, and
-    /// a summary plus a final daemon-start hint when the daemon is down. Only a
-    /// missing Claude Code binary is a FAIL; warnings remain READY.
-    /// `--verify-mcp` is a separate CI-oriented invariant (the MCP
-    /// tool-surface / STUB self-check).
-    /// The historical hidden one-shot migration / repair flags from older
-    /// ccteam versions were removed (pre-v1.0 = no back-compat shims).
+    /// Check readiness: one row per agent vendor, plus ccteam/project advisories.
     Doctor {
-        /// V0.6.6 F171: assert the MCP tool surface is fully wired.
-        /// Counts active vs STUB tools (cross-checked against
-        /// `mcp_tool_groups::STUB_TOOLS`) and exits 1 when any STUB
-        /// is registered. Pair with `--json` for machine-readable
-        /// output (single JSON object on stdout).
+        /// CI check: assert the MCP tool surface is fully wired (exits 1 on any STUB).
         #[arg(long, default_value_t = false)]
         verify_mcp: bool,
-        /// Repair corrupt lines in active and `.1` progress journals. Every
-        /// changed file is backed up before atomic replacement.
+        /// Repair corrupt lines in progress journals (each file is backed up first).
         #[arg(long, default_value_t = false, conflicts_with = "verify_mcp")]
         repair_progress: bool,
-        /// V0.6.6 F171: emit machine-readable JSON instead of the
-        /// human-friendly text report (only used with `--verify-mcp`
-        /// today; ignored otherwise).
+        /// Emit machine-readable JSON (only meaningful with `--verify-mcp`).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// v0.8.6 Item 4 — setup hub. Bare `ccteam config` opens an
-    /// interactive menu (register/refresh the ccteam MCP server, set the
-    /// IM Telegram token, show preferences). The non-interactive forms are
-    /// the headless/CI surface and wrap the preferences store
-    /// (`~/.ccteam/preferences.toml`):
-    ///
-    ///   - `ccteam config show`          print the active preferences
-    ///   - `ccteam config get <key>`     read one preference
-    ///   - `ccteam config <key> <value>` set one preference
-    ///
-    /// `config` absorbs the former `ccteam prefs` command plus the setup
-    /// actions retired from `ccteam doctor` (`--install-mcp`) and the
-    /// `ccteam-im-setup` skill (IM token onboarding).
+    /// Set up ccteam (MCP registration, IM token) and view or set preferences.
     Config {
-        /// Positional words. Empty → interactive menu. `show` → print
-        /// preferences. `get <key>` → read one preference. `<key> <value>`
-        /// → set one preference (the bare two-arg form). A single
-        /// non-keyword word is treated as `get <key>`.
+        /// Empty = interactive menu; `show`; `get <key>`; `<key> <value>` to set.
         #[arg(value_name = "ARGS", num_args = 0..=2)]
         args: Vec<String>,
     },
 }
 
-/// v0.9.7 — `ccteam daemon` lifecycle group. Codex-style pure-userland
-/// daemon management: setsid detach + pid-record ownership + versioned
-/// socket probe. The single mechanism on Linux / macOS / WSL (systemd /
-/// launchd retired).
+/// `ccteam daemon` lifecycle group: detached spawn + pid-record ownership +
+/// versioned socket probe; the single mechanism on Linux / macOS / WSL.
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Start the daemon in the background: legacy-unit takeover →
-    /// operation lock → readiness probe (already ready = idempotent
-    /// `alreadyRunning`) → setsid-detached spawn of this binary's
-    /// `start` (full env/PATH inherited; stdout+stderr append to
-    /// `~/.ccteam/daemon.log`) → pid record → wait ready (≤15s; failure
-    /// = non-zero exit with the log tail).
+    /// Start the daemon in the background and wait for readiness (idempotent).
     Start {
         /// Embedded web UI bind address, forwarded to the detached
         /// `ccteam start`.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
-        /// DSH web companion bind forwarded to the detached `ccteam start`.
-        /// Omit to use `--web-bind`'s port + 1; pass `off` to disable.
+        /// DSH web companion bind (default: web-bind port + 1; `off` disables).
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Emit exactly one machine-readable JSON line on stdout
-        /// (human prose moves to stderr).
+        /// Emit one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Stop the managed daemon: SIGTERM + wait (≤40s). Refuses a ready
-    /// but not-managed instance (foreground / self-supervised) with
-    /// guidance. Nothing running → `notRunning`, exit 0.
+    /// Stop the managed daemon (SIGTERM + wait); a non-managed instance is refused.
     Stop {
-        /// After the SIGTERM wait, escalate to SIGKILL — the daemon
-        /// process ONLY; agent sessions are never touched (owner-gated
-        /// red-line exception D2).
+        /// Escalate to SIGKILL after the wait (daemon only; agent sessions untouched).
         #[arg(long, default_value_t = false)]
         force: bool,
         /// Emit exactly one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Stop (if managed) + start under ONE operation lock, so no
-    /// concurrent lifecycle operation can interleave.
+    /// Restart the managed daemon (stop + start under one operation lock).
     Restart {
         /// Embedded web UI bind address, forwarded to the detached
         /// `ccteam start`.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
         web_bind: String,
-        /// DSH web companion bind forwarded to the detached `ccteam start`.
-        /// Omit to use `--web-bind`'s port + 1; pass `off` to disable.
+        /// DSH web companion bind (default: web-bind port + 1; `off` disables).
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
         /// Emit exactly one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
-        /// If the serving daemon is not managed by `ccteam daemon`, warn
-        /// that the new binary is not live and exit successfully.
+        /// If the running daemon is not managed, warn and exit successfully without restarting.
         #[arg(long, default_value_t = false)]
         if_managed: bool,
     },
-    /// Dual-verdict snapshot: ready? (versioned MCP probe) × managed?
-    /// (pid record ↔ live process), plus running-daemon version vs this
-    /// binary's version.
+    /// Show readiness, managed state, and running-vs-binary version.
     Status {
         /// Emit exactly one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Print the tail of `~/.ccteam/daemon.log` (the only log surface —
-    /// journald left with systemd).
+    /// Print the tail of `~/.ccteam/daemon.log`.
     Logs {
         /// Number of trailing lines to print.
         #[arg(short = 'n', long = "lines", default_value_t = 50)]
@@ -396,47 +238,23 @@ enum DaemonCommand {
     },
 }
 
-/// `ccteam session` subcommand surface: read-only enumeration (`ls`) plus
-/// tmux attach for `terminal`-protocol sessions (`attach`). The pre-v0.9
-/// chat-mode bot ops (register / unregister / persona / add-tool / bots)
-/// and the orchestrator-era pause / resume / role verbs are gone — their
-/// MCP mirrors were culled in v0.9-T1 and the daemon no longer consumes
-/// what they wrote.
+/// `ccteam session` verbs: read-only enumeration (`ls`) plus tmux attach (`attach`).
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// List live gateway chat-mode bot sessions (`ccteam-chat-<slug>-<sid>`).
-    ///
-    /// Read-only control-plane enumeration: lists session names from the mux
-    /// backend (never capture-pane) and reconciles them against the daemon's
-    /// persisted registry, flagging orphans (live but untracked) and registered
-    /// sessions that are not running. Attach one with
-    /// `ccteam session attach <slug> [sid]`.
+    /// List live gateway chat sessions.
     Ls,
-    /// Attach to a session. Reaches a gateway chat-mode bot session
-    /// (`ccteam-chat-<slug>-<sid>`) first; with `<slug>` alone, attaches when
-    /// the slug has exactly one live chat session, else lists them to
-    /// disambiguate. Falls back to the project session (`ccteam-<slug>`) when
-    /// no live chat session matches.
+    /// Attach to a live session's tmux pane (stream-json sessions have no pane).
     Attach {
         slug: String,
-        /// Chat session id (the trailing segment of `ccteam-chat-<slug>-<sid>`).
-        /// Omit to auto-resolve a single live chat session for `<slug>`.
+        /// Chat session id; omit to auto-resolve a slug's single live session.
         sid: Option<String>,
     },
 }
 
-/// V0.8 rmux W6 — `ccteam mux` subcommand group.
+/// Mux backend utilities (`hook-emit`).
 #[derive(Subcommand)]
 enum MuxCommand {
-    /// W6 daemon-bus hook reroute client. A Claude Code hook subprocess
-    /// invokes this (only when the host opted in with
-    /// `CCTEAM_HOOK_VIA_DAEMON=1`) to forward its firing to the
-    /// orchestrator over `~/.ccteam/run/hook.sock` instead of writing
-    /// `progress.jsonl` directly. Reads the hook payload from `--json`
-    /// or stdin; derives the session id from `CCTEAM_CHAT_SLUG` /
-    /// `CCTEAM_CHAT_ROLE`. Exits 0 on send; exits non-zero but QUIET
-    /// when the sink isn't listening so a stray fire never error-spams
-    /// Claude Code's UI.
+    /// Forward a Claude Code hook firing to the daemon over `~/.ccteam/run/hook.sock`.
     HookEmit {
         /// Dispatch kind, e.g. `chat-progress`.
         #[arg(long, value_name = "KIND")]
@@ -444,22 +262,17 @@ enum MuxCommand {
         /// Dispatch action (the event arg), e.g. `session-start`.
         #[arg(long, value_name = "ACTION")]
         action: Option<String>,
-        /// Explicit session id; defaults to `<slug>-<role>` derived from
-        /// `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE` env.
+        /// Explicit session id (default: from `CCTEAM_CHAT_SLUG` / `CCTEAM_CHAT_ROLE`).
         #[arg(long, value_name = "SID")]
         session: Option<String>,
-        /// Hook payload JSON inline. When absent, the payload is read
-        /// from stdin (`-` is also treated as "read stdin").
+        /// Hook payload JSON inline; when absent, read from stdin (`-` also works).
         #[arg(long, value_name = "JSON")]
         json: Option<String>,
     },
 }
 
-/// v0.8.6 W3/W4a — `ccteam project` subcommand group. Houses the project
-/// lifecycle verbs: `ls` / `show` inspect, `new` scaffolds, `stop` halts
-/// live sessions, `rm` un-registers (with `--purge` deletes the on-disk
-/// footprint). W4a folded the former flat `ls` / `show` / `new` commands
-/// in here.
+/// `ccteam project` lifecycle verbs: `ls` / `show` inspect, `new` scaffolds,
+/// `stop` halts live sessions, `rm` un-registers (`--purge` deletes the footprint).
 #[derive(Subcommand)]
 enum ProjectCommand {
     /// List all known projects.
@@ -467,67 +280,43 @@ enum ProjectCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Show one project's full state, recent events, and artifacts.
-    /// With no slug, lists every available slug + a re-run hint.
+    /// Show one project's state, recent events, and artifacts.
     Show {
         slug: Option<String>,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Scaffold a fresh project under `<projects_root>/<slug>/` (thin
-    /// wrapper over `ccteam init --in <projects_root>/<slug>`). The dir
-    /// name is the slug verbatim (collisions get a numeric suffix). To
-    /// install in the cwd instead, use `ccteam init`.
+    /// Scaffold a fresh project under `<projects_root>/<slug>/`.
     New {
         /// Project slug. Becomes the dir name under `projects_root`.
         slug: String,
     },
-    /// Un-register a project: drop its `~/.ccteam/config.yaml::projects[]`
-    /// entry + scrub the per-slug `~/.ccteam/` state. With `--purge`,
-    /// also delete ccteam's project footprint — `.ccteam/`, the seeded
-    /// `.claude/agents/cto.md`, and ccteam's hooks inside
-    /// `.claude/settings.local.json`. Never touches `.env`, user
-    /// work-roles, `CLAUDE.md` / `AGENTS.md`, or the user's
-    /// `settings.json`.
+    /// Un-register a project; `--purge` also deletes ccteam's on-disk footprint.
     Rm {
-        /// Project slug as listed in `ccteam ls` / registered under
-        /// `~/.ccteam/config.yaml::projects[]`.
+        /// Project slug (as listed by `ccteam project ls`).
         slug: String,
-        /// Also delete ccteam's project footprint (`.ccteam/`, seeded
-        /// `cto.md`, ccteam hook section in `settings.local.json`).
-        /// Default leaves the project directory's files in place
-        /// (config-only deregister).
+        /// Also delete ccteam's footprint in the project (`.ccteam/`, hook settings section).
         #[arg(long, default_value_t = false)]
         purge: bool,
-        /// Print every step that would change the filesystem / config /
-        /// daemon roster, but don't touch anything. Combine with
-        /// `--purge` to see the full clobber list.
+        /// Print every planned change without touching anything.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-        /// Skip the CLAUDE.md §三 "永不主动 kill 长 session" refusal
-        /// gate (tmux / claude bg / open spawn checks).
+        /// Skip the live-work refusal checks (tmux panes, background jobs, open spawns).
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Stop a project's live sessions (tmux chat panes + bg jobs)
-    /// WITHOUT removing it — an explicit, resumable user-requested stop.
-    /// The project stays registered; re-engaging it resumes by id.
+    /// Stop a project's live sessions without removing it (resumable).
     Stop {
         /// Project slug to stop.
         slug: String,
     },
 }
 
-/// v0.8.9 Phase 2 — `ccteam role` subcommand group. Browse the curated
-/// ccteam-hub marketplace and one-shot install a plugin into a project's
-/// `.claude/`. Distinct from `session role` (the live in-daemon role switch):
-/// these are one-shot project-file marketplace/install operations.
+/// `ccteam role` marketplace verbs. Distinct from a live session's role
+/// switch: these are one-shot project-file install operations.
 #[derive(Subcommand)]
 enum RoleCommand {
-    /// Search the curated ccteam-hub marketplace. Matches the query
-    /// (case-insensitive) against each plugin's id / name / description /
-    /// tags. An empty query lists everything. Each row prints the plugin
-    /// `id` to pass to `ccteam role add <id>`.
+    /// Search the ccteam-hub marketplace (empty query lists everything).
     Search {
         /// Substring query. Omit (or pass "") to list everything.
         #[arg(default_value = "")]
@@ -535,8 +324,7 @@ enum RoleCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
-    /// Install a ccteam-hub agent/vendor plugin into a project. Skill entries
-    /// are refused with a pointer to `ccteam skill add`.
+    /// Install a hub agent/plugin into a project's `.claude/`.
     Add {
         /// Plugin id (as shown by `ccteam role search`).
         id: String,
@@ -544,17 +332,14 @@ enum RoleCommand {
         /// `id`. Sanitized to `[a-z0-9_-]`.
         #[arg(long = "as", value_name = "ROLE")]
         as_role: Option<String>,
-        /// Target project slug (resolved via `~/.ccteam/config.yaml`).
-        /// Default: the current working directory.
+        /// Target project slug (default: current directory).
         #[arg(long, value_name = "SLUG")]
         project: Option<String>,
         /// Overwrite an existing role file of the same name.
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// List the roles already installed in a project's `.claude/agents/`
-    /// (wraps the resource-API role reader). Default project = the current
-    /// working directory.
+    /// List roles installed in a project's `.claude/agents/`.
     List {
         /// Target project slug. Default: the current working directory.
         #[arg(long, value_name = "SLUG")]
@@ -642,7 +427,7 @@ enum SkillSourceCommand {
     Rm { stem: String },
 }
 
-/// v0.8.24 Track D — `ccteam host` multi-host ops.
+/// `ccteam host` multi-host operations.
 #[derive(Subcommand)]
 enum HostCommand {
     /// Register this machine as a satellite of a main daemon.
@@ -670,10 +455,7 @@ enum HostCommand {
         #[arg(long)]
         max_uses: Option<u32>,
     },
-    /// Deregister a satellite from the main daemon's host registry (drop its
-    /// record; a later `ccteam host join` re-adds it under a fresh token).
-    /// Refuses a live (heartbeating) host unless `--force`. `local` can never
-    /// be removed — it IS the main daemon machine.
+    /// Deregister a satellite from the main daemon (refuses a live host unless `--force`).
     Rm {
         /// Main daemon base URL.
         #[arg(long)]
@@ -681,8 +463,7 @@ enum HostCommand {
         /// Admin web token hex (or `ccteam:<hex>`). Env `CCTEAM_WEB_TOKEN` fallback.
         #[arg(long)]
         web_token: Option<String>,
-        /// Host id to deregister (see `ccteam host ls` on the satellite, or the
-        /// web Team → 分工 vendor roster on the main daemon).
+        /// Host id to deregister (see `ccteam host ls` or the web Team page).
         host_id: String,
         /// Deregister even if the host is currently online.
         #[arg(long, default_value_t = false)]
@@ -692,15 +473,11 @@ enum HostCommand {
     Ls,
 }
 
-/// Subcommands hidden under `ccteam internal` — hook handlers, the MCP
-/// server, low-level session utilities (peek / progress / attach), the
-/// mux hook-emit client, and the standalone web server. Not user-facing
-/// day to day.
+/// Subcommands hidden under `ccteam internal`: hook handlers, low-level
+/// session utilities (peek / progress / attach), mux hook-emit, web server.
 #[derive(Subcommand)]
 enum InternalCommand {
-    /// Hook handlers invoked by Claude Code per project settings.json.
-    /// Each subcommand reads stdin JSON (the Claude Code hook payload)
-    /// and performs its side effect; stdout is normally empty.
+    /// Claude Code hook handlers (read the hook payload JSON on stdin).
     Hook {
         #[command(subcommand)]
         cmd: HookCommand,
@@ -712,21 +489,13 @@ enum InternalCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Attach to a session. Resolves a gateway chat-mode bot session
-    /// (`ccteam-chat-<slug>-<sid>`) first: `<slug> <sid>` (or a full session
-    /// name) is deterministic; with `<slug>` alone, attaches when the slug has
-    /// exactly one live chat session, else lists them to disambiguate. Falls
-    /// back to the project session (`ccteam-<slug>`) when no live chat session
-    /// matches.
+    /// Attach to a live session's tmux pane (same resolution as `session attach`).
     Attach {
         slug: String,
-        /// Chat session id (the trailing segment of `ccteam-chat-<slug>-<sid>`).
-        /// Omit to auto-resolve a single live chat session for `<slug>`.
+        /// Chat session id; omit to auto-resolve a slug's single live session.
         sid: Option<String>,
     },
-    /// Capture the project's pane content without attaching. Resolves a
-    /// live chat session (`ccteam-chat-<slug>-<sid>`) first, falling back
-    /// to the project pane (`ccteam-<slug>`) — same resolution as `attach`.
+    /// Print a session's pane content without attaching.
     Peek {
         slug: String,
         /// Chat session id; omit to auto-resolve a single live chat session.
@@ -738,55 +507,38 @@ enum InternalCommand {
         #[arg(long)]
         tail: bool,
     },
-    /// V0.8 rmux — mux backend utilities. Today the only subcommand is
-    /// `hook-emit`, the W6 daemon-bus hook reroute client (active only
-    /// when `CCTEAM_HOOK_VIA_DAEMON=1`; see
-    /// `ccteam internal mux hook-emit --help`).
+    /// Mux backend utilities (`hook-emit`).
     Mux {
         #[command(subcommand)]
         cmd: MuxCommand,
     },
-    /// Serve the ccteam web UI standalone (the gateway daemon embeds
-    /// this by default; this subcommand runs it on its own bind for
-    /// headless / custom deployments).
+    /// Serve the web UI standalone (the gateway daemon embeds it by default).
     Web {
-        /// Listen address. Default `0.0.0.0:7331` so host deployments
-        /// reach the LAN out of the box; auth is auto-enabled on
-        /// non-loopback. Use `127.0.0.1:7331` for loopback-only
-        /// (auth then disabled). Requires token auth on non-loopback
-        /// unless `--no-auth`.
+        /// Listen address; non-loopback binds require token auth unless `--no-auth`.
         #[arg(long, default_value = "0.0.0.0:7331")]
         bind: String,
         /// DSH web companion bind. Omit to use `--bind`'s port + 1; pass
         /// `off` to disable.
         #[arg(long, value_name = "ADDR|off")]
         dsh_web_bind: Option<String>,
-        /// Disable token auth on write endpoints. DANGEROUS on
-        /// non-loopback bind — prints a 5-second warning before
-        /// listening.
+        /// Disable token auth on write endpoints. DANGEROUS on non-loopback binds.
         #[arg(long, default_value_t = false)]
         no_auth: bool,
-        /// Custom path to read the auth token from (default
-        /// `~/.ccteam/web-token`).
+        /// Read the auth token from this file (default `~/.ccteam/web-token`).
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
     },
-    /// v0.9 T5 — derived experience.jsonl maintenance (offline / disaster
-    /// recovery). Regenerates `kind:turn` rows from turns + progress;
-    /// preserves `kind:verdict`. Not for concurrent use with a live
-    /// daemon writer.
+    /// Rebuild the derived experience.jsonl index (offline repair only).
     Experience {
         #[command(subcommand)]
         cmd: ExperienceCommand,
     },
 }
 
-/// v0.9 T5 — `ccteam internal experience <…>`.
+/// `ccteam internal experience` verbs.
 #[derive(Subcommand)]
 enum ExperienceCommand {
-    /// Rebuild `<project>/.ccteam/experience.jsonl` from turns.jsonl +
-    /// progress.jsonl + meta.json. Preserves existing verdict lines.
-    /// Offline / disaster recovery only.
+    /// Regenerate experience.jsonl from turns + progress (verdicts preserved).
     Rebuild {
         /// Project slug.
         slug: String,
@@ -795,33 +547,17 @@ enum ExperienceCommand {
 
 #[derive(Subcommand)]
 enum HookCommand {
-    /// Append one event line to ~/.ccteam/progress/<slug>.jsonl.
-    /// `event_type` is the `event` field on the resulting JSONL record
-    /// (e.g. "PreToolUse" / "Stop" / "session_start").
+    /// Append one event line to the project's progress journal.
     ProgressAppend { event_type: String },
-    /// SessionStart hook: a validating no-op seam. Validates the hook
-    /// stdin `cwd` shape (fails loudly if missing) but performs no
-    /// filesystem side effects — no `.ccteam/ready` marker is written.
-    /// Kept registered for future per-session bootstrap work.
+    /// SessionStart hook: validating no-op seam (no filesystem side effects).
     LoadContext,
-    /// V0.2 M0.19.3 PreToolUse hook for `AskUserQuestion`. Returns a
-    /// `permissionDecision: deny` so the assistant routes through the
-    /// outbox / clarify protocol instead of synchronously waiting on
-    /// an offline user.
+    /// PreToolUse hook for `AskUserQuestion`: deny, route via the async clarify flow.
     InterceptAsk,
-    /// v0.8.7 W2 (DB.3) — `PermissionRequest` hook for HITL chat sessions.
-    /// Fires only for a non-allowlist tool (Claude's ask-path); turns it
-    /// into an IM approve/deny round-trip over the daemon mcp.sock and
-    /// returns the `behavior: allow|deny` decision. Fail-safe deny.
+    /// PermissionRequest hook: non-allowlist tool call → IM approve/deny round-trip.
     PermissionRequest,
-    /// V0.6.0 F108 — `mode: chat` Claude Code hook callback. Each
-    /// hook event arg maps to one ccteam `chat_*` progress.jsonl
-    /// emission. See `ccteam_hooks::chat_progress` for the dispatch
-    /// table.
+    /// Chat-mode hook callback: map each hook event to a progress emission.
     ChatProgress {
-        /// The hook-event arg (e.g. `session-start`, `user-prompt`,
-        /// `stop`, `subagent-stop`, `tool-use`, `session-end`,
-        /// `pre-compact`, `post-compact`).
+        /// Hook event arg (e.g. `session-start`, `stop`, `tool-use`, `session-end`).
         event: String,
     },
 }
@@ -1026,9 +762,8 @@ fn main() -> Result<()> {
     }
 }
 
-/// v0.8.6 Item 4 — dispatch `ccteam config`. The interactive menu and the
-/// headless forms both live in `commands`; this only routes the positional
-/// words. Forms:
+/// Dispatch `ccteam config`. The interactive menu and the headless forms
+/// both live in `commands`; this only routes the positional words. Forms:
 ///
 /// - (no args) → interactive menu (`commands::run_config_menu`)
 /// - `mcp` → register/refresh the ccteam MCP server (headless escape hatch
@@ -1087,7 +822,7 @@ fn run_session(cmd: SessionCommand) -> Result<()> {
     }
 }
 
-/// v0.8.24 Track D — multi-host CLI surface.
+/// Multi-host CLI surface.
 fn run_host(cmd: HostCommand) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1261,9 +996,9 @@ fn host_ls(paths: &CcteamPaths) -> Result<()> {
     Ok(())
 }
 
-/// v0.8.7 W3 — `ccteam role <search|add|list>` dispatcher. `search` is
-/// offline (no project / no network); `add` / `list` resolve a project dir
-/// from `--project <slug>` (or the cwd) and call into the commands layer.
+/// `ccteam role <search|add|list>` dispatcher. `search` is offline (no
+/// project / no network); `add` / `list` resolve a project dir from
+/// `--project <slug>` (or the cwd) and call into the commands layer.
 fn run_role(cmd: RoleCommand) -> Result<()> {
     match cmd {
         RoleCommand::Search { query, format } => {
@@ -1407,11 +1142,11 @@ fn run_internal_register_mcp(json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// v0.9 T5 — `ccteam internal experience rebuild <slug>`.
+/// `ccteam internal experience rebuild <slug>`.
 ///
 /// Regenerates the derived experience index offline. A live daemon may
 /// still be appending concurrent turn rows — use only for disaster
-/// recovery / offline repair (acceptable pre-v1.0).
+/// recovery / offline repair.
 fn run_experience(cmd: ExperienceCommand) -> Result<()> {
     match cmd {
         ExperienceCommand::Rebuild { slug } => {
@@ -1436,7 +1171,7 @@ fn run_experience(cmd: ExperienceCommand) -> Result<()> {
     }
 }
 
-/// V0.8 rmux W6 — `ccteam mux <subcommand>` dispatch.
+/// `ccteam mux <subcommand>` dispatch.
 fn run_mux(cmd: MuxCommand) -> Result<()> {
     match cmd {
         MuxCommand::HookEmit {
@@ -1448,7 +1183,7 @@ fn run_mux(cmd: MuxCommand) -> Result<()> {
     }
 }
 
-/// V0.8 rmux W6 — connect to `~/.ccteam/run/hook.sock` and forward one
+/// Connect to `~/.ccteam/run/hook.sock` and forward one
 /// hook firing to the orchestrator (single-writer path).
 ///
 /// QUIET-on-failure contract: when the sink isn't listening (no
@@ -1614,15 +1349,15 @@ struct StartWebOpts {
     dsh_bind: Option<String>,
     no_auth: bool,
     token_file: Option<PathBuf>,
-    /// V0.4.6 F88 — when true, skip the clipboard probe in
-    /// `print_web_banner` and just print the token. CI / unattended.
+    /// When true, skip the clipboard probe in `print_web_banner` and
+    /// just print the token. CI / unattended.
     no_clipboard: bool,
 }
 
-/// V0.6.1 F130 — IM supervisor task knobs. Today the only operator
-/// switch is `disabled` (mirror of `--no-imd`); future knobs (custom
-/// credentials path, custom registry root) attach here without changing
-/// `run_start`'s signature.
+/// IM supervisor task knobs. Today the only operator switch is
+/// `disabled` (mirror of `--no-imd`); future knobs (custom credentials
+/// path, custom registry root) attach here without changing `run_start`'s
+/// signature.
 struct StartImdOpts {
     disabled: bool,
 }
@@ -2636,7 +2371,7 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
-/// v0.8.8 F3 — predicate for a LAN-reachable IPv4: a private
+/// Predicate for a LAN-reachable IPv4: a private
 /// (RFC1918) address that is neither loopback (`127.0.0.0/8`) nor
 /// link-local (`169.254.0.0/16`). Pure so the interface-walk in
 /// [`first_lan_ipv4`] can be unit-tested without real interfaces.
@@ -2644,7 +2379,7 @@ fn is_lan_ipv4(ip: &std::net::Ipv4Addr) -> bool {
     !ip.is_loopback() && !ip.is_link_local() && ip.is_private()
 }
 
-/// v0.8.8 F3 — first non-loopback, non-link-local, private IPv4 of any local
+/// First non-loopback, non-link-local, private IPv4 of any local
 /// interface, for the `ccteam status` web URL line (so the operator gets a
 /// LAN-reachable address, not `127.0.0.1`). Returns `None` when no private
 /// IPv4 is configured (the URL line then degrades to a localhost hint).
@@ -2783,9 +2518,8 @@ mod lan_ip_tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    /// v0.8.8 F3 — the LAN predicate accepts only private addresses and
-    /// rejects loopback / link-local. Exercises the exact tiers the recon
-    /// test plan named (192.168 / 127.0.0.1 / 169.254).
+    /// The LAN predicate accepts only private addresses and rejects
+    /// loopback / link-local (192.168 / 127.0.0.1 / 169.254 tiers).
     #[test]
     fn is_lan_ipv4_filters_loopback_and_linklocal() {
         // Private (RFC1918) → accepted.
@@ -2798,9 +2532,9 @@ mod lan_ip_tests {
         assert!(!is_lan_ipv4(&Ipv4Addr::new(8, 8, 8, 8)));
     }
 
-    /// v0.8.8 F3 — querying real interfaces must never panic, and any
-    /// address it returns must satisfy the LAN predicate (no loopback /
-    /// link-local / public leaking into the web URL).
+    /// Querying real interfaces must never panic, and any address it
+    /// returns must satisfy the LAN predicate (no loopback / link-local /
+    /// public leaking into the web URL).
     #[test]
     fn first_lan_ipv4_does_not_panic_and_is_lan() {
         if let Some(ip) = first_lan_ipv4() {

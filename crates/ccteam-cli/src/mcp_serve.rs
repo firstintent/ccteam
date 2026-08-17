@@ -129,8 +129,8 @@ pub fn install_codex_mcp() -> Result<std::path::PathBuf> {
     Ok(config_toml)
 }
 
-/// Production path for Grok CLI MCP install (v0.9.3 vendor symmetry): the
-/// global `~/.grok/config.toml` entry carries the machine-user enrollment
+/// Production path for Grok CLI MCP install: the global
+/// `~/.grok/config.toml` entry carries the machine-user enrollment
 /// credential so a plain `grok` main session is a first-class caller;
 /// ccteam-managed grok sessions keep their ACP-injected per-session principal
 /// (same-name dedup, injected server wins — real-machine verified).
@@ -144,9 +144,9 @@ pub fn install_grok_mcp() -> Result<std::path::PathBuf> {
     Ok(config_toml)
 }
 
-/// Production path for OpenCode MCP install (v0.9.3 vendor symmetry). Managed
-/// OpenCode sessions override the same-named entry at runtime (`MCP.add`
-/// replaces by name with the ACP-injected per-session principal).
+/// Production path for OpenCode MCP install. Managed OpenCode sessions
+/// override the same-named entry at runtime (`MCP.add` replaces by name
+/// with the ACP-injected per-session principal).
 pub fn install_opencode_mcp() -> Result<std::path::PathBuf> {
     let opencode_json = ccteam_core::mcp_register::resolve_opencode_config_path()?;
     let paths = CcteamPaths::from_env()?;
