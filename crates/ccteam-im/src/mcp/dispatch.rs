@@ -6096,7 +6096,7 @@ mod session_tool_tests {
         );
         assert!(error.contains("installed there: none"), "{error}");
         assert!(error.contains("observed just now"), "{error}");
-        assert!(error.contains("ccteam never installs a CLI"), "{error}");
+        assert!(error.contains("one-click install"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

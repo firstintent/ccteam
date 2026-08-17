@@ -164,6 +164,10 @@ export const I18N: Record<Lang, Record<string, string>> = {
     registeringMcp: "注册中…",
     mcpOk: "MCP 已注册",
     notInstalled: "未安装",
+    updateVendor: "更新",
+    installingVendor: "安装中…",
+    installFailed: "安装失败",
+    npmMissingHint: "npm 不在 PATH 上,无法一键安装",
     offlineRow: "离线 —— 无法探测 agent。",
     joinTitle: "连接新主机(卫星节点)",
     joinDesc:
@@ -460,6 +464,10 @@ export const I18N: Record<Lang, Record<string, string>> = {
     registeringMcp: "Registering…",
     mcpOk: "MCP registered",
     notInstalled: "not installed",
+    updateVendor: "Update",
+    installingVendor: "Installing…",
+    installFailed: "Install failed",
+    npmMissingHint: "npm not on PATH — one-click install unavailable",
     offlineRow: "Offline — cannot probe agents.",
     joinTitle: "Connect a new host (satellite)",
     joinDesc:

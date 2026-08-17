@@ -76,6 +76,10 @@ pub mod session;
 // Project-local skill listing remains in `uploads`.
 pub mod skills;
 pub mod uploads;
+// VENDOR-INSTALL-1 — admin one-click vendor install/update jobs on the local
+// host (`POST/GET /api/v1/hosts/{host}/vendors/{vendor}/install[/{job_id}]`).
+// Recipe argv lives in `AgentProbeSpec::install_recipe`, executed shell-free.
+pub mod vendor_install;
 // v0.8.6 W5b ResSessions — session resource API over the gateway spine.
 pub mod sessions_api;
 // v0.8.9 Phase 4 — daemon-wide status aggregate (`GET /api/v1/status`) for the

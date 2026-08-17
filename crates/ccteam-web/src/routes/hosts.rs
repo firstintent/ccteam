@@ -10,12 +10,14 @@
 //! a `ready` / `needs_config` / `not_installed` status with a copy-paste
 //! remediation hint.
 //!
-//! **The only writable endpoint** is `POST .../register-mcp`: ccteam
-//! writing its OWN MCP server into the vendor config — the single allowed
-//! write to a vendor footprint (red line: ccteam never writes a vendor
-//! login / key and never installs a CLI from the web; it `execute`s
-//! nothing else). It delegates to [`ccteam_core::mcp_register`], the same
-//! idempotent seam `ccteam config` uses.
+//! **Writable endpoints**: `POST .../register-mcp` (ccteam writing its OWN
+//! MCP server into the vendor config — the single allowed write to a vendor
+//! footprint; it delegates to [`ccteam_core::mcp_register`], the same
+//! idempotent seam `ccteam config` uses) and the VENDOR-INSTALL-1 admin
+//! one-click install/update jobs under `.../vendors/{vendor}/install`
+//! ([`super::vendor_install`] — recipe argv pinned in
+//! `AgentProbeSpec::install_recipe`, executed shell-free as the daemon's OS
+//! user; kimi/pi stay manual). ccteam still never writes a vendor login/key.
 //!
 //! Merged into the `/api/v1` [`OpenApiRouter`] (see [`super::openapi`]) so
 //! the shared web-token gate applies for free.
@@ -115,6 +117,11 @@ pub struct HostDetail {
     /// ccteam build version driving this host.
     pub ccteam_version: String,
     pub agents: Vec<AgentHealth>,
+    /// Whether `npm` is runnable on this machine — every VENDOR-INSTALL-1
+    /// recipe is npm-based, so the SPA disables the one-click button with a
+    /// hint when this is false. Only probed for `local` (always false for a
+    /// satellite: its detail row renders no install CTA anyway).
+    pub npm_available: bool,
     /// v0.9.0 W3 (G9) — projects registered on this host (its own
     /// `~/.ccteam/config.yaml::projects[]`, local read directly / satellite
     /// last reported at heartbeat). Drives the remote-spawn gate
@@ -174,10 +181,25 @@ fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
     let registered = native_mcp && mcp_registered(spec.vendor);
     let status = classify_status(installed, registered, spec.tool_surface);
     let hint: Option<String> = match status {
-        "not_installed" => Some(format!(
-            "{} not found on PATH — install it (or set {}); ccteam never installs a CLI for you",
-            spec.vendor, spec.bin_env
-        )),
+        // VENDOR-INSTALL-1 — recipe-backed vendors get the one-click pointer
+        // (admin-only, backend-gated) with the exact manual command alongside;
+        // kimi/pi stay manual with their docs link.
+        "not_installed" => Some(match (spec.install_recipe, spec.manual_install_url) {
+            (Some(recipe), _) => format!(
+                "{} not found on PATH — admin: one-click Install here, or run `{}`; or set {}",
+                spec.vendor,
+                recipe.join(" "),
+                spec.bin_env
+            ),
+            (None, Some(url)) => format!(
+                "{} not found on PATH — install it manually ({}) or set {}",
+                spec.vendor, url, spec.bin_env
+            ),
+            (None, None) => format!(
+                "{} not found on PATH — install it or set {}",
+                spec.vendor, spec.bin_env
+            ),
+        }),
         "needs_config" => Some(format!(
             "register the ccteam MCP server: POST /api/v1/hosts/{LOCAL_HOST}/register-mcp?vendor={}",
             spec.vendor
@@ -243,6 +265,15 @@ async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
         tracing::warn!(?err, "hosts: agent probe worker failed");
         Vec::new()
     })
+}
+
+/// Whether `npm` resolves and runs on THIS machine (the local host) — every
+/// one-click install recipe is `npm install -g …`, so the SPA hides/disables
+/// the button when this is false. Cached like the vendor probes.
+async fn probe_npm_available(refresh: bool) -> bool {
+    tokio::task::spawn_blocking(move || probe_bin_cached("npm", refresh).0)
+        .await
+        .unwrap_or(false)
 }
 
 /// `GET /api/v1/hosts` — list every host (today just this machine).
@@ -315,6 +346,7 @@ pub(crate) async fn handle_host_detail(
 ) -> Response {
     if host == LOCAL_HOST {
         let agents = probe_all_agents(q.refresh).await;
+        let npm_available = probe_npm_available(q.refresh).await;
         let projects = ccteam_core::config::load(&app.paths.root)
             .map(|cfg| {
                 cfg.projects
@@ -341,6 +373,7 @@ pub(crate) async fn handle_host_detail(
             arch: std::env::consts::ARCH.to_string(),
             ccteam_version: ccteam_core::VERSION.to_string(),
             agents,
+            npm_available,
             projects,
         })
         .into_response();
@@ -379,6 +412,8 @@ pub(crate) async fn handle_host_detail(
                     arch: h.arch.clone(),
                     ccteam_version: h.ccteam_version.clone(),
                     agents,
+                    // Installs never target a satellite — the field is local-only.
+                    npm_available: false,
                     projects: h
                         .projects
                         .iter()
@@ -444,8 +479,9 @@ pub struct RegisterMcpQuery {
 
 /// `POST /api/v1/hosts/{host}/register-mcp` — register ccteam's OWN MCP
 /// server into the vendor config(s). **Idempotent** (merge, never clobber)
-/// and the ONLY write this surface performs. ccteam executes nothing else:
-/// it never writes a vendor login/key and never installs a CLI. 404 for a
+/// and the only CONFIG write this surface performs. ccteam never writes a
+/// vendor login/key; vendor CLI installs live in the separate
+/// VENDOR-INSTALL-1 job surface (`.../vendors/{vendor}/install`). 404 for a
 /// non-`local` host; 400 for an unknown `vendor`; 500 if the vendor config or
 /// admin HTTP credential cannot be resolved.
 #[utoipa::path(
@@ -1280,6 +1316,8 @@ mod tests {
             bin_env: "CCTEAM_TEST_UNSET_BIN_ENV_ZZZ",
             default_bin: "/nonexistent/ccteam-fake-zzz",
             tool_surface: ToolSurfaceMode::NativeMcpConfig,
+            install_recipe: None,
+            manual_install_url: None,
         };
         let h = agent_health(&spec, true);
         assert!(!h.installed);

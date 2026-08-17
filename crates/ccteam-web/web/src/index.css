@@ -859,6 +859,7 @@ html.dark .dot.off { background: #4b4e57; }
   font-size: 11.5px; color: var(--text-faint);
 }
 .host-vendor-mcp .ok { color: var(--green-text); }
+.host-vendor-install { display: inline-flex; align-items: center; gap: 8px; }
 .host-vendor-hint { width: 100%; font-size: 11px; color: var(--text-faint); }
 .host-projects {
   display: flex; flex-direction: column; gap: 6px;

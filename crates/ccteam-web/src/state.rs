@@ -119,6 +119,9 @@ pub struct AppState {
     /// agent sessions and never enter the gateway live map.
     pub dsh_web: Arc<crate::dsh_web::DshWebSupervisor>,
     pub dsh_proxy_client: reqwest::Client,
+    /// VENDOR-INSTALL-1 — admin one-click vendor install/update job table
+    /// (process-lifetime; jobs do not survive a daemon restart).
+    pub vendor_installs: Arc<crate::routes::vendor_install::VendorInstallManager>,
     /// Coalesces concurrent daemon-wide status aggregations. The completed
     /// result is never retained after its in-flight computation finishes.
     pub(crate) status_singleflight: crate::routes::status::StatusSingleflight,
@@ -187,6 +190,9 @@ impl AppState {
             host_hub: Arc::new(ccteam_harness::HostChannelHub::default()),
             dsh_web: Arc::new(crate::dsh_web::DshWebSupervisor::disabled()),
             dsh_proxy_client: reqwest::Client::new(),
+            vendor_installs: Arc::new(
+                crate::routes::vendor_install::VendorInstallManager::default(),
+            ),
             status_singleflight: crate::routes::status::StatusSingleflight::default(),
         }
     }

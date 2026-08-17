@@ -63,6 +63,12 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("POST", "/api/v1/hosts/{host}/register-mcp"),
         // TEAM-5 — deregister a satellite (drop its registry record).
         ("DELETE", "/api/v1/hosts/{host}"),
+        // VENDOR-INSTALL-1 — admin one-click vendor install/update jobs.
+        ("POST", "/api/v1/hosts/{host}/vendors/{vendor}/install"),
+        (
+            "GET",
+            "/api/v1/hosts/{host}/vendors/{vendor}/install/{job_id}",
+        ),
         ("POST", "/api/v1/hosts/join-token"),
         ("GET", "/api/v1/hosts/join-token"),
         ("POST", "/api/v1/hosts/join"),

@@ -77,6 +77,16 @@ pub struct AgentProbeSpec {
     pub default_bin: &'static str,
     /// How ccteam exposes its eight tools to this vendor.
     pub tool_surface: ToolSurfaceMode,
+    /// Admin one-click install/update recipe (VENDOR-INSTALL-1): the exact
+    /// argv the daemon runs via `std::process::Command::new(argv[0])
+    /// .args(&argv[1..])` — NEVER through a shell, and the package name is
+    /// pinned here in the table, never taken from a request. `None` = no
+    /// supported recipe (kimi/pi install manually, see
+    /// `manual_install_url`).
+    pub install_recipe: Option<&'static [&'static str]>,
+    /// Manual-install docs link shown when there is no recipe. `None` for
+    /// recipe-backed vendors (their recipe IS the guidance).
+    pub manual_install_url: Option<&'static str>,
 }
 
 /// Where a vendor receives ccteam's tool surface. Adding a future vendor
@@ -105,6 +115,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         bin_env: ccteam_harness::CLAUDE_BIN_ENV,
         default_bin: "claude",
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
+        install_recipe: Some(&["npm", "install", "-g", "@anthropic-ai/claude-code@latest"]),
+        manual_install_url: None,
     },
     AgentProbeSpec {
         vendor: "codex",
@@ -112,6 +124,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         bin_env: ccteam_harness::CODEX_BIN_ENV,
         default_bin: "codex",
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
+        install_recipe: Some(&["npm", "install", "-g", "@openai/codex@latest"]),
+        manual_install_url: None,
     },
     AgentProbeSpec {
         vendor: "grok",
@@ -119,6 +133,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         bin_env: ccteam_harness::GROK_BIN_ENV,
         default_bin: "grok",
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
+        install_recipe: Some(&["npm", "install", "-g", "@xai-official/grok@latest"]),
+        manual_install_url: None,
     },
     AgentProbeSpec {
         vendor: "opencode",
@@ -126,6 +142,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         bin_env: ccteam_harness::OPENCODE_BIN_ENV,
         default_bin: "opencode",
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
+        install_recipe: Some(&["npm", "install", "-g", "opencode-ai@latest"]),
+        manual_install_url: None,
     },
     AgentProbeSpec {
         vendor: "kimi",
@@ -134,6 +152,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         default_bin: "kimi",
         // Kimi has a config-file MCP seam: `$KIMI_CODE_HOME/mcp.json`.
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
+        install_recipe: None,
+        manual_install_url: Some("https://moonshotai.github.io/kimi-code/"),
     },
     AgentProbeSpec {
         vendor: "pi",
@@ -141,6 +161,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         bin_env: ccteam_harness::PI_BIN_ENV,
         default_bin: "pi",
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
+        install_recipe: None,
+        manual_install_url: Some("https://pi.dev/"),
     },
     AgentProbeSpec {
         vendor: "dsh",
@@ -150,6 +172,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         // v0.9.15 K5/§5.2.
         default_bin: "dsh",
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
+        install_recipe: Some(&["npm", "install", "-g", "@deepseek-ai/dsh@latest"]),
+        manual_install_url: None,
     },
 ];
 
@@ -1180,6 +1204,8 @@ mod tests {
             bin_env: "CCTEAM_FUTURE_BIN",
             default_bin: "future",
             tool_surface: ToolSurfaceMode::ManagedSessionBridge,
+            install_recipe: None,
+            manual_install_url: None,
         };
         assert_eq!(
             future.tool_surface_notice().as_deref(),
@@ -1234,5 +1260,69 @@ mod tests {
         );
         // harness_id is carried through from the spec.
         assert_eq!(avail[0].harness_id, "claude-code");
+    }
+
+    #[test]
+    fn install_recipes_are_exact_argv_and_shell_free() {
+        // The npm-backed vendors pin their exact recipe argv in the table.
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "claude",
+                &["npm", "install", "-g", "@anthropic-ai/claude-code@latest"],
+            ),
+            ("codex", &["npm", "install", "-g", "@openai/codex@latest"]),
+            (
+                "grok",
+                &["npm", "install", "-g", "@xai-official/grok@latest"],
+            ),
+            ("opencode", &["npm", "install", "-g", "opencode-ai@latest"]),
+            ("dsh", &["npm", "install", "-g", "@deepseek-ai/dsh@latest"]),
+        ];
+        for (vendor, argv) in expected {
+            let spec = AgentProbeSpec::by_vendor(vendor).unwrap();
+            assert_eq!(spec.install_recipe, Some(*argv), "{vendor}");
+            assert!(spec.manual_install_url.is_none(), "{vendor}");
+        }
+        // Every recipe executes `npm` directly as argv[0] (no shell wrapper)
+        // and every token is a bare word — no metacharacter a shell could
+        // reinterpret, so exec-without-shell is semantics-preserving.
+        for spec in AGENT_PROBE_SPECS {
+            let Some(argv) = spec.install_recipe else {
+                continue;
+            };
+            assert_eq!(argv[0], "npm", "{spec:?}");
+            assert!(argv.len() >= 2, "{spec:?}");
+            for token in argv {
+                assert!(
+                    token
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-._/@".contains(c)),
+                    "{spec:?}: unsafe token {token:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn install_recipe_absent_means_manual_with_a_link() {
+        // kimi/pi have no supported recipe: the UI keeps manual guidance and
+        // the API 400s the install endpoint. The link must be present so the
+        // hint can point at real docs.
+        for vendor in ["kimi", "pi"] {
+            let spec = AgentProbeSpec::by_vendor(vendor).unwrap();
+            assert!(spec.install_recipe.is_none(), "{vendor}");
+            let url = spec
+                .manual_install_url
+                .unwrap_or_else(|| panic!("{vendor}"));
+            assert!(url.starts_with("https://"), "{vendor}: {url}");
+        }
+        // Recipe-backed vendors never carry a manual link (one guidance home).
+        for spec in AGENT_PROBE_SPECS {
+            assert_eq!(
+                spec.install_recipe.is_some(),
+                spec.manual_install_url.is_none(),
+                "{spec:?}"
+            );
+        }
     }
 }

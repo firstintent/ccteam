@@ -402,9 +402,10 @@ pub(crate) fn spawn_unavailable_message(
     format!(
         "session_spawn: vendor `{vendor}` is not installed on host `{host}` \
          (installed there: {installed}; observed {freshness}). Spawn one of the installed \
-         vendors, or install `{vendor}` on that host and retry — ccteam never installs a CLI \
-         for you. Model ids stay advisory (ccteam does not validate them), so a genuinely fresh \
-         install can just retry."
+         vendors, or install `{vendor}` on that host and retry — the admin can one-click \
+         install npm-packaged vendors (claude/codex/grok/opencode/dsh) from the Ops & Hosts \
+         web page; kimi/pi install manually. Model ids stay advisory (ccteam does not \
+         validate them), so a genuinely fresh install can just retry."
     )
 }
 
@@ -1148,8 +1149,8 @@ mod tests {
         assert!(msg.contains("installed there: claude, codex"));
         assert!(msg.contains("observed just now"));
         assert!(msg.contains("advisory"));
-        // Never a local fallback; never installs.
-        assert!(msg.contains("never installs a CLI"));
+        // Never a local fallback; the admin one-click install is the pointer.
+        assert!(msg.contains("one-click install"));
     }
 
     #[test]
