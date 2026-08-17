@@ -122,6 +122,8 @@ pub struct AppState {
     /// VENDOR-INSTALL-1 — admin one-click vendor install/update job table
     /// (process-lifetime; jobs do not survive a daemon restart).
     pub vendor_installs: Arc<crate::routes::vendor_install::VendorInstallManager>,
+    /// VENDOR-QUOTA-1 — per-vendor quota probe service (HTTP + 5min cache).
+    pub vendor_quotas: Arc<crate::routes::vendor_quota::VendorQuotaService>,
     /// Coalesces concurrent daemon-wide status aggregations. The completed
     /// result is never retained after its in-flight computation finishes.
     pub(crate) status_singleflight: crate::routes::status::StatusSingleflight,
@@ -193,6 +195,7 @@ impl AppState {
             vendor_installs: Arc::new(
                 crate::routes::vendor_install::VendorInstallManager::default(),
             ),
+            vendor_quotas: Arc::new(crate::routes::vendor_quota::VendorQuotaService::default()),
             status_singleflight: crate::routes::status::StatusSingleflight::default(),
         }
     }

@@ -69,6 +69,8 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
             "GET",
             "/api/v1/hosts/{host}/vendors/{vendor}/install/{job_id}",
         ),
+        // VENDOR-QUOTA-1 — vendor subscription-quota snapshot (admin).
+        ("GET", "/api/v1/vendors/quota"),
         ("POST", "/api/v1/hosts/join-token"),
         ("GET", "/api/v1/hosts/join-token"),
         ("POST", "/api/v1/hosts/join"),

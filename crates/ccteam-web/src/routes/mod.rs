@@ -80,6 +80,10 @@ pub mod uploads;
 // host (`POST/GET /api/v1/hosts/{host}/vendors/{vendor}/install[/{job_id}]`).
 // Recipe argv lives in `AgentProbeSpec::install_recipe`, executed shell-free.
 pub mod vendor_install;
+// VENDOR-QUOTA-1 — vendor subscription-quota snapshot for Ops & Hosts
+// (`GET /api/v1/vendors/quota`, admin). Normalized model + pure parsers in
+// `ccteam_core::vendor_quota`; this is the thin HTTP/credential/cache layer.
+pub mod vendor_quota;
 // v0.8.6 W5b ResSessions — session resource API over the gateway spine.
 pub mod sessions_api;
 // v0.8.9 Phase 4 — daemon-wide status aggregate (`GET /api/v1/status`) for the

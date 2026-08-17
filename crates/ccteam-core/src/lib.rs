@@ -120,6 +120,10 @@ pub mod teams_task_parser;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
+// VENDOR-QUOTA-1 — normalized vendor subscription-quota model + pure
+// response/credential parsers (zero I/O). The HTTP layer + cache + endpoint
+// live in `ccteam_web::routes::vendor_quota`.
+pub mod vendor_quota;
 // V0.5.0 F92 — cumulative-cost scanner over Claude Code transcript JSONLs.
 pub mod transcript_scanner;
 pub mod vendor;

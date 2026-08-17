@@ -1318,6 +1318,7 @@ mod tests {
             tool_surface: ToolSurfaceMode::NativeMcpConfig,
             install_recipe: None,
             manual_install_url: None,
+            quota_probe: None,
         };
         let h = agent_health(&spec, true);
         assert!(!h.installed);

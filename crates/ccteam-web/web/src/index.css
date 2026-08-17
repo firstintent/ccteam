@@ -860,6 +860,10 @@ html.dark .dot.off { background: #4b4e57; }
 }
 .host-vendor-mcp .ok { color: var(--green-text); }
 .host-vendor-install { display: inline-flex; align-items: center; gap: 8px; }
+/* VENDOR-QUOTA-1 mini bars: inline with the row (flex-wrap reflows them on
+   narrow screens instead of squeezing), one nowrap line per window. */
+.host-vendor-quota { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.host-vendor-quota-line { font-size: 11px; color: var(--text-faint); white-space: nowrap; }
 .host-vendor-hint { width: 100%; font-size: 11px; color: var(--text-faint); }
 .host-projects {
   display: flex; flex-direction: column; gap: 6px;

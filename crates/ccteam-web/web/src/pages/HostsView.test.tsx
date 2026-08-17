@@ -337,6 +337,96 @@ describe("VendorManageRow install CTA (VENDOR-INSTALL-1)", () => {
   });
 });
 
+describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
+  function quotaDetail(agents: AgentHealth[]): HostDetail {
+    return {
+      host: "local",
+      hostname: "devbox",
+      is_local: true,
+      os: "linux",
+      arch: "x86_64",
+      ccteam_version: "0.10.0",
+      npm_available: true,
+      agents,
+    };
+  }
+
+  it("available: up to two mini bars + plan badge on the vendor row", () => {
+    const detail = quotaDetail([
+      agent({ vendor: "claude", mcp_registered: true }),
+      agent({ vendor: "kimi", mcp_registered: true }),
+    ]);
+    const quotas = {
+      claude: {
+        vendor: "claude",
+        state: "available" as const,
+        plan: "max",
+        windows: [
+          { kind: "five_hour" as const, used_percent: 42, resets_at: null },
+          { kind: "weekly" as const, used_percent: 15, resets_at: null },
+        ],
+      },
+      kimi: {
+        vendor: "kimi",
+        state: "available" as const,
+        windows: [{ kind: "weekly" as const, used_percent: 4, resets_at: null }],
+      },
+    };
+    const html = renderToString(
+      <HostManageCard
+        detail={detail}
+        busy={null}
+        isAdmin
+        quotas={quotas}
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="quota-bars-claude"');
+    expect(html).toContain('data-testid="quota-plan-claude"');
+    expect(html).toContain("max");
+    expect(html).toContain("5h ▓▓░░░ 42%");
+    expect(html).toContain("周 ▓░░░░ 15%");
+    // Single-window vendor renders exactly one bar and no badge.
+    expect(html).toContain('data-testid="quota-bars-kimi"');
+    expect(html).toContain("周 ░░░░░ 4%");
+    expect(html).not.toContain('data-testid="quota-plan-kimi"');
+  });
+
+  it("not_subscription / unavailable / absent vendors render no quota zone", () => {
+    const detail = quotaDetail([
+      agent({ vendor: "codex", mcp_registered: true }),
+      agent({ vendor: "grok", mcp_registered: true }),
+      agent({ vendor: "opencode", mcp_registered: true }),
+    ]);
+    const quotas = {
+      codex: { vendor: "codex", state: "not_subscription" as const },
+      grok: { vendor: "grok", state: "unavailable" as const },
+      // opencode: absent from the map entirely (no probe surface).
+    };
+    const html = renderToString(
+      <HostManageCard
+        detail={detail}
+        busy={null}
+        isAdmin
+        quotas={quotas}
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).not.toContain("quota-bars-");
+    expect(html).not.toContain("quota-plan-");
+  });
+
+  it("no quota prop at all (tenant view) renders nothing and does not crash", () => {
+    const detail = quotaDetail([agent({ vendor: "claude", mcp_registered: true })]);
+    const html = renderToString(
+      <HostManageCard detail={detail} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).not.toContain("quota-bars-");
+  });
+});
+
 describe("HostManageCard (full vendor inventory)", () => {
   it("renders identity + os/arch/build + EVERY vendor row, not just pending ones", () => {
     const html = renderToString(

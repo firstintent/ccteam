@@ -48,6 +48,8 @@ import { copyText } from "../lib/clipboard";
 import { makeT, type Lang } from "../lib/i18n";
 import { vendorDotClass } from "../lib/vendors";
 import { fetchVendorLatests, isOutdated, npmPackageForVendor } from "../lib/vendorLatest";
+import { getVendorQuotas, type VendorQuota } from "../lib/vendorQuotaApi";
+import { quotaLines, quotaPlan } from "../lib/quotaBars";
 import { useMe } from "../hooks/useMe";
 
 type HostState =
@@ -175,6 +177,8 @@ export default function HostsView({
   const [latests, setLatests] = useState<Record<string, string>>({});
   /** Local-host install jobs by vendor — running progress or a kept failure. */
   const [installJobs, setInstallJobs] = useState<Record<string, InstallJob>>({});
+  /** VENDOR-QUOTA-1 — quota rows by vendor (admin only; see the effect). */
+  const [quotas, setQuotas] = useState<Record<string, VendorQuota>>({});
 
   const load = useCallback(async (refresh: boolean) => {
     try {
@@ -222,6 +226,27 @@ export default function HostsView({
       cancelled = true;
     };
   }, []);
+
+  // VENDOR-QUOTA-1 — vendor quota bars, ADMIN only: the endpoint 403s a
+  // tenant, and `isAdmin` is fail-closed (stays false until /me resolves),
+  // so a tenant never fires the request. Any failure leaves the map empty
+  // and the rows render no quota zone — exactly the not_subscription /
+  // unavailable presentation.
+  useEffect(() => {
+    if (!isAdmin) return;
+    let cancelled = false;
+    getVendorQuotas()
+      .then((rows) => {
+        if (cancelled) return;
+        setQuotas(Object.fromEntries(rows.map((row) => [row.vendor, row])));
+      })
+      .catch(() => {
+        if (!cancelled) setQuotas({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isAdmin]);
 
   const onRefresh = async () => {
     setActionError(null);
@@ -385,6 +410,7 @@ export default function HostsView({
               isAdmin={isAdmin}
               latests={latests}
               installJobs={installJobs}
+              quotas={quotas}
               onRegister={(vendor) => void onRegister(h.detail.host, vendor)}
               onImport={(remoteSlug) => void onImport(h.detail.host, remoteSlug)}
               onInstall={(vendor) => void onInstall(vendor)}
@@ -546,6 +572,7 @@ function VendorManageRow({
   latest = null,
   npmAvailable = false,
   job = null,
+  quota = null,
   onRegister,
   onInstall,
 }: {
@@ -564,6 +591,8 @@ function VendorManageRow({
   npmAvailable?: boolean;
   /** The vendor's current/last install job, if any. */
   job?: InstallJob | null;
+  /** VENDOR-QUOTA-1 — this vendor's quota row, when the admin fetched any. */
+  quota?: VendorQuota | null;
   onRegister: (vendor: string) => void;
   onInstall?: (vendor: string) => void;
 }) {
@@ -571,6 +600,10 @@ function VendorManageRow({
   const badge = statusBadge(agent.status, t);
   const cta = installCtaFor(agent, { isAdmin, isLocal, latest });
   const jobRunning = job?.state === "running";
+  // Quota: up to two window lines + an optional plan badge; every
+  // non-available state collapses to nothing (no error styling).
+  const plan = quotaPlan(quota);
+  const lines = quotaLines(quota, new Date(), lang);
   return (
     <div className="host-vendor-row" data-testid={`host-vendor-${hostId}-${agent.vendor}`}>
       <span className={vendorDotClass(agent.vendor)} />
@@ -579,6 +612,20 @@ function VendorManageRow({
         {agent.installed ? (agent.version ?? "—") : t("notInstalled")}
       </span>
       <span className={badge.cls}>{badge.label}</span>
+      {plan ? (
+        <span className="badge" data-testid={`quota-plan-${agent.vendor}`}>
+          {plan}
+        </span>
+      ) : null}
+      {lines.length > 0 ? (
+        <span className="host-vendor-quota" data-testid={`quota-bars-${agent.vendor}`}>
+          {lines.map((line) => (
+            <span key={line} className="host-vendor-quota-line mono">
+              {line}
+            </span>
+          ))}
+        </span>
+      ) : null}
       <span className="host-vendor-mcp">
         {agent.tool_surface === "native_mcp_config" && agent.installed ? (
           agent.mcp_registered ? (
@@ -658,6 +705,7 @@ export function HostManageCard({
   isAdmin = false,
   latests = {},
   installJobs = {},
+  quotas = {},
   onRegister,
   onImport,
   onInstall,
@@ -670,6 +718,8 @@ export function HostManageCard({
   isAdmin?: boolean;
   latests?: Record<string, string>;
   installJobs?: Record<string, InstallJob>;
+  /** VENDOR-QUOTA-1 — quota rows by vendor (admin only; empty otherwise). */
+  quotas?: Record<string, VendorQuota>;
   onRegister: (vendor: string) => void;
   onImport: (remoteSlug: string) => void;
   onInstall?: (vendor: string) => void;
@@ -704,6 +754,7 @@ export function HostManageCard({
             latest={latests[agent.vendor] ?? null}
             npmAvailable={detail.npm_available ?? false}
             job={installJobs[agent.vendor] ?? null}
+            quota={quotas[agent.vendor] ?? null}
             onRegister={onRegister}
             onInstall={onInstall}
           />

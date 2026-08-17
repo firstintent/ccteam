@@ -87,6 +87,11 @@ pub struct AgentProbeSpec {
     /// Manual-install docs link shown when there is no recipe. `None` for
     /// recipe-backed vendors (their recipe IS the guidance).
     pub manual_install_url: Option<&'static str>,
+    /// VENDOR-QUOTA-1 — which subscription-quota probe this vendor has, if
+    /// any (`ccteam_core::vendor_quota`; implementations in
+    /// `ccteam_web::routes::vendor_quota`). `None` = no surface, the UI
+    /// renders nothing (opencode/pi/dsh).
+    pub quota_probe: Option<crate::vendor_quota::QuotaProbeKind>,
 }
 
 /// Where a vendor receives ccteam's tool surface. Adding a future vendor
@@ -117,6 +122,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: Some(&["npm", "install", "-g", "@anthropic-ai/claude-code@latest"]),
         manual_install_url: None,
+        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::ClaudeOauthUsage),
     },
     AgentProbeSpec {
         vendor: "codex",
@@ -126,6 +132,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: Some(&["npm", "install", "-g", "@openai/codex@latest"]),
         manual_install_url: None,
+        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::CodexWhamUsage),
     },
     AgentProbeSpec {
         vendor: "grok",
@@ -135,6 +142,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: Some(&["npm", "install", "-g", "@xai-official/grok@latest"]),
         manual_install_url: None,
+        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::GrokBillingUnavailable),
     },
     AgentProbeSpec {
         vendor: "opencode",
@@ -144,6 +152,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: Some(&["npm", "install", "-g", "opencode-ai@latest"]),
         manual_install_url: None,
+        quota_probe: None,
     },
     AgentProbeSpec {
         vendor: "kimi",
@@ -154,6 +163,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::NativeMcpConfig,
         install_recipe: None,
         manual_install_url: Some("https://moonshotai.github.io/kimi-code/"),
+        quota_probe: Some(crate::vendor_quota::QuotaProbeKind::KimiManagedUsages),
     },
     AgentProbeSpec {
         vendor: "pi",
@@ -163,6 +173,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
         install_recipe: None,
         manual_install_url: Some("https://pi.dev/"),
+        quota_probe: None,
     },
     AgentProbeSpec {
         vendor: "dsh",
@@ -174,6 +185,7 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
         install_recipe: Some(&["npm", "install", "-g", "@deepseek-ai/dsh@latest"]),
         manual_install_url: None,
+        quota_probe: None,
     },
 ];
 
@@ -1206,6 +1218,7 @@ mod tests {
             tool_surface: ToolSurfaceMode::ManagedSessionBridge,
             install_recipe: None,
             manual_install_url: None,
+            quota_probe: None,
         };
         assert_eq!(
             future.tool_surface_notice().as_deref(),
