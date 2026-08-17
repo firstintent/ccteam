@@ -152,7 +152,7 @@ pub(crate) async fn handle_projects(
     }
 }
 
-fn snapshot_response(
+pub(crate) fn snapshot_response(
     mut response: Response,
     etag: Option<String>,
     headers: &HeaderMap,
@@ -163,13 +163,25 @@ fn snapshot_response(
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                candidate
+                    .trim()
+                    .strip_prefix("W/")
+                    .unwrap_or(candidate.trim())
+                    == etag
+            })
+        })
     {
         response = StatusCode::NOT_MODIFIED.into_response();
     }
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
     }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
     response
 }
 

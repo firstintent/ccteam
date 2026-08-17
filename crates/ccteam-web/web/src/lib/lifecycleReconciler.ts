@@ -10,7 +10,31 @@ export interface LifecycleReconcilerEnvironment {
 
 export interface LifecycleReconciler {
   enqueue(slug: string | undefined): void;
+  setVisibilityRefreshSlugs(slugs: Iterable<string>): void;
   stop(): void;
+}
+
+interface SequencedLifecycleEvent {
+  seq?: number;
+  kind: string;
+  slug?: string;
+}
+
+/** Enqueue only lifecycle frames newer than the caller's numeric watermark.
+ * Object identity is intentionally irrelevant because the source is a bounded
+ * ring whose retained entries may be reconstructed after an overflow. */
+export function enqueueUnseenLifecycleEvents(
+  events: readonly SequencedLifecycleEvent[],
+  lastConsumedSeq: number,
+  enqueue: (slug: string | undefined) => void,
+): number {
+  let nextConsumedSeq = lastConsumedSeq;
+  for (const event of events) {
+    if (event.seq === undefined || event.seq <= nextConsumedSeq) continue;
+    nextConsumedSeq = Math.max(nextConsumedSeq, event.seq);
+    if (event.kind === "session_lifecycle") enqueue(event.slug);
+  }
+  return nextConsumedSeq;
 }
 
 const defaultEnvironment: LifecycleReconcilerEnvironment = {
@@ -27,7 +51,7 @@ const defaultEnvironment: LifecycleReconcilerEnvironment = {
 
 /** Collect lifecycle frames for a short window and reconcile each named
  * project once. Failed slugs retry independently with jittered backoff; hidden
- * tabs hold their pending slugs until one immediate visible-state reconcile.
+ * tabs hold their pending slugs until one visible-state debounce.
  * The API accepts only a slug callback, so it has no path that can refresh
  * `/projects` or fan out across unrelated projects. */
 export function createLifecycleReconciler(
@@ -37,6 +61,7 @@ export function createLifecycleReconciler(
 ): LifecycleReconciler {
   const pending = new Set<string>();
   const active = new Set<string>();
+  const visibilityRefreshSlugs = new Set<string>();
   const failures = new Map<string, number>();
   const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const isHidden = () => env.isHidden?.() ?? false;
@@ -113,8 +138,11 @@ export function createLifecycleReconciler(
       retryTimers.clear();
       return;
     }
-    // Becoming visible reconciles every accumulated slug immediately once.
-    if (pending.size > 0) flush();
+    // The SSE stream may have disconnected while hidden. Add every registered
+    // project to the SAME per-slug debounce window as retained lifecycle
+    // frames, filling that replay gap without a global projects refresh.
+    for (const slug of visibilityRefreshSlugs) pending.add(slug);
+    scheduleDebounce();
   });
 
   return {
@@ -125,9 +153,14 @@ export function createLifecycleReconciler(
       if (active.has(slug)) return;
       scheduleDebounce();
     },
+    setVisibilityRefreshSlugs: (slugs) => {
+      visibilityRefreshSlugs.clear();
+      for (const slug of slugs) visibilityRefreshSlugs.add(slug);
+    },
     stop: () => {
       stopped = true;
       pending.clear();
+      visibilityRefreshSlugs.clear();
       if (debounceTimer !== null) env.clearTimer(debounceTimer);
       debounceTimer = null;
       for (const timer of retryTimers.values()) env.clearTimer(timer);

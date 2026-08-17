@@ -44,7 +44,11 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { useMe } from "../hooks/useMe";
 import { projectsStore, useProjectsStore } from "../hooks/useProjectsStore";
-import { createLifecycleReconciler, type LifecycleReconciler } from "../lib/lifecycleReconciler";
+import {
+  createLifecycleReconciler,
+  enqueueUnseenLifecycleEvents,
+  type LifecycleReconciler,
+} from "../lib/lifecycleReconciler";
 import { railSessionLabel, renameToastText } from "./railHelpers";
 import { mergeProjectSlugs } from "./projectList";
 
@@ -202,17 +206,21 @@ export default function ChatConsole() {
     };
   }, [reconcileProject]);
 
-  // React may batch many SSE frames into one render. Walk every newly-appended
-  // ring entry so a two-project burst cannot lose the earlier slug.
-  const lastLifecycleEvent = useRef<(typeof globalEvents)[number] | null>(null);
   useEffect(() => {
-    const previous = lastLifecycleEvent.current;
-    const previousIndex = previous ? globalEvents.indexOf(previous) : -1;
-    const fresh = globalEvents.slice(previousIndex >= 0 ? previousIndex + 1 : 0);
-    for (const event of fresh) {
-      if (event.kind === "session_lifecycle") lifecycleReconciler.current?.enqueue(event.slug);
-    }
-    lastLifecycleEvent.current = globalEvents[globalEvents.length - 1] ?? previous;
+    lifecycleReconciler.current?.setVisibilityRefreshSlugs(registeredProjects);
+  }, [registeredProjects]);
+
+  // React may batch many SSE frames into one render. Walk every newly-appended
+  // ring entry so a two-project burst cannot lose the earlier slug. The
+  // numeric watermark survives ring eviction/reconstruction; object identity
+  // cannot provide that guarantee.
+  const lastLifecycleSeq = useRef(0);
+  useEffect(() => {
+    lastLifecycleSeq.current = enqueueUnseenLifecycleEvents(
+      globalEvents,
+      lastLifecycleSeq.current,
+      (slug) => lifecycleReconciler.current?.enqueue(slug),
+    );
   }, [globalEvents]);
 
   const projects = useMemo(

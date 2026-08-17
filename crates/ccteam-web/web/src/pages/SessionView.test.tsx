@@ -432,4 +432,133 @@ describe("SessionView paged history", () => {
       vi.resetModules();
     }
   });
+
+  it("discards a stale load-earlier page after reconnect reseed and accepts the fresh cursor", async () => {
+    const harness = createHookHarness();
+    let stream = {
+      events: [],
+      connected: true,
+      connectionEpoch: 1,
+      lastError: null,
+      gatewayUnavailable: false,
+    };
+    let resolveStale: (value: unknown) => void = () => {};
+    let resolveReseed: (value: unknown) => void = () => {};
+    const stalePage = new Promise((resolve) => {
+      resolveStale = resolve;
+    });
+    const reseedPage = new Promise((resolve) => {
+      resolveReseed = resolve;
+    });
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t3", ts: "new", role: "cto", user: "seed-user", assistant: "seed-answer" },
+        ],
+        next_before: "cursor-old",
+        has_more: true,
+      })
+      .mockReturnValueOnce(stalePage)
+      .mockReturnValueOnce(reseedPage)
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t1",
+            ts: "old",
+            role: "cto",
+            user: "fresh-old-user",
+            assistant: "fresh-old-answer",
+          },
+        ],
+        next_before: null,
+        has_more: false,
+      });
+
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", () => ({ useSessionEvents: () => stream }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: history,
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+    }));
+
+    try {
+      const PagedSessionView = (await import("./SessionView")).default;
+      const renderPagedView = () =>
+        harness.render(() => PagedSessionView({ sid: "s9", session: SESSION }));
+
+      renderPagedView();
+      await Promise.resolve();
+      let tree = renderPagedView();
+      (findByTestId(tree, "load-earlier")?.props.onClick as () => void)();
+      expect(history).toHaveBeenNthCalledWith(2, "s9", { before: "cursor-old" });
+
+      stream = { ...stream, connectionEpoch: 2 };
+      renderPagedView();
+      resolveReseed({
+        sid: "s9",
+        events: [
+          {
+            turn_id: "t4",
+            ts: "newest",
+            role: "cto",
+            user: "reseed-user",
+            assistant: "reseed-answer",
+          },
+        ],
+        next_before: "cursor-new",
+        has_more: true,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      tree = renderPagedView();
+      expect(collectElementText(tree)).toContain("reseed-user");
+
+      resolveStale({
+        sid: "s9",
+        events: [
+          {
+            turn_id: "stale",
+            ts: "stale",
+            role: "cto",
+            user: "stale-user",
+            assistant: "stale-answer",
+          },
+        ],
+        next_before: "stale-cursor",
+        has_more: true,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      tree = renderPagedView();
+      expect(collectElementText(tree)).not.toContain("stale-user");
+      expect(collectElementText(tree)).toContain("reseed-user");
+
+      (findByTestId(tree, "load-earlier")?.props.onClick as () => void)();
+      await Promise.resolve();
+      await Promise.resolve();
+      tree = renderPagedView();
+      expect(history).toHaveBeenNthCalledWith(4, "s9", { before: "cursor-new" });
+      const text = collectElementText(tree);
+      expect(text.indexOf("fresh-old-user")).toBeLessThan(text.indexOf("reseed-user"));
+      expect(findByTestId(tree, "load-earlier")).toBeNull();
+    } finally {
+      vi.doUnmock("react");
+      vi.doUnmock("../hooks/useSessionEvents");
+      vi.doUnmock("../lib/sessionsApi");
+      vi.resetModules();
+    }
+  });
 });

@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{
     extract::State,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -293,20 +293,7 @@ pub(crate) async fn handle_status(
         let mut status = status;
         retain_visible_session_rows(&filter_app, &identity, &mut status.sessions);
         let etag = super::api_v1::snapshot_etag("status", status.version, &status);
-        let mut response = Json(status).into_response();
-        if let Some(etag) = etag {
-            if headers
-                .get(header::IF_NONE_MATCH)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
-            {
-                response = StatusCode::NOT_MODIFIED.into_response();
-            }
-            if let Ok(value) = HeaderValue::from_str(&etag) {
-                response.headers_mut().insert(header::ETAG, value);
-            }
-        }
-        response
+        super::api_v1::snapshot_response(Json(status).into_response(), etag, &headers)
     })
     .await
     {

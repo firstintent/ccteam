@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ccteam_core::{bootstrap_project, disable_tool_surface_bootstrap_for_tests, CcteamPaths};
 use ccteam_web::{router_with_state, AppState};
-use reqwest::header::{ETAG, IF_NONE_MATCH};
+use reqwest::header::{CACHE_CONTROL, ETAG, IF_NONE_MATCH};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -44,6 +44,9 @@ async fn stable_snapshot(
                 .get(ETAG)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
+            if etag.is_some() {
+                assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+            }
             let body = response.json::<Value>().await.unwrap();
             if let Some(etag) = etag {
                 return (etag, body, status);
@@ -104,6 +107,10 @@ async fn status_and_projects_etags_track_projection_ingest() {
         .unwrap();
     assert_eq!(status_not_modified.status(), 304);
     assert_eq!(status_not_modified.headers()[ETAG], status_etag);
+    assert_eq!(
+        status_not_modified.headers()[CACHE_CONTROL],
+        "private, no-cache"
+    );
     assert!(status_not_modified.bytes().await.unwrap().is_empty());
 
     let projects_not_modified = client
@@ -114,7 +121,37 @@ async fn status_and_projects_etags_track_projection_ingest() {
         .unwrap();
     assert_eq!(projects_not_modified.status(), 304);
     assert_eq!(projects_not_modified.headers()[ETAG], projects_etag);
+    assert_eq!(
+        projects_not_modified.headers()[CACHE_CONTROL],
+        "private, no-cache"
+    );
     assert!(projects_not_modified.bytes().await.unwrap().is_empty());
+
+    for (url, etag) in [(&status_url, &status_etag), (&projects_url, &projects_etag)] {
+        for candidate in [format!("W/{etag}"), format!("\"unrelated\", W/{etag}")] {
+            let response = client
+                .get(url)
+                .header(IF_NONE_MATCH, candidate)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 304);
+            assert_eq!(response.headers()[ETAG], etag.as_str());
+            assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+            assert!(response.bytes().await.unwrap().is_empty());
+        }
+
+        let response = client
+            .get(url)
+            .header(IF_NONE_MATCH, "W/\"not-this-one\", \"nor-this-one\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[ETAG], etag.as_str());
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-cache");
+        assert!(!response.bytes().await.unwrap().is_empty());
+    }
 
     append_event(
         &paths,
@@ -129,6 +166,7 @@ async fn status_and_projects_etags_track_projection_ingest() {
         .await
         .unwrap();
     assert_eq!(changed_status.status(), 200);
+    assert_eq!(changed_status.headers()[CACHE_CONTROL], "private, no-cache");
     let changed_status_etag = changed_status.headers()[ETAG].to_str().unwrap().to_string();
     assert_ne!(changed_status_etag, status_etag);
     let changed_status_body = changed_status.json::<Value>().await.unwrap();
@@ -142,6 +180,10 @@ async fn status_and_projects_etags_track_projection_ingest() {
         .await
         .unwrap();
     assert_eq!(changed_projects.status(), 200);
+    assert_eq!(
+        changed_projects.headers()[CACHE_CONTROL],
+        "private, no-cache"
+    );
     assert_ne!(changed_projects.headers()[ETAG], projects_etag);
     let changed_projects_body = changed_projects.json::<Value>().await.unwrap();
     assert_eq!(changed_projects_body[0]["version"], changed_version);

@@ -197,9 +197,11 @@ export default function SessionView({
   const loadEarlier = useCallback(() => {
     if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
     const before = historyPage.nextBefore;
+    const request = historyRequestRef.current;
     setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
     getHistory(sid, { before })
       .then((history) => {
+        if (request !== historyRequestRef.current) return;
         const earlier = historyToRows(history.events);
         if (earlier.length > 0) setRows((current) => [...earlier, ...current]);
         setHistoryPage({
@@ -209,6 +211,7 @@ export default function SessionView({
         });
       })
       .catch(() => {
+        if (request !== historyRequestRef.current) return;
         setHistoryPage((current) => ({ ...current, loadingEarlier: false }));
       });
   }, [sid, historyPage]);
