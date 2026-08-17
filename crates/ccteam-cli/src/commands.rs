@@ -1190,6 +1190,8 @@ pub struct DoctorOptions {
     /// pretty-printed JSON object on stdout instead of the human-
     /// friendly text report. Ignored when `verify_mcp == false`.
     pub verify_mcp_json: bool,
+    /// Repair corrupt progress journals after preserving byte-exact backups.
+    pub repair_progress: bool,
 }
 
 fn render_install_mcp_report() -> Result<String> {

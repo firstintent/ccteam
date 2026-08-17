@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use anyhow::{Context, Result};
 use ccteam_core::{CcteamPaths, CostSummary};
 use ccteam_harness::execution::progress_bridge::{
-    self, AGENT_DONE, CHAT_TURN_COMPLETED, DELEGATION_COLLECTED, DELEGATION_COMPLETED,
-    DELEGATION_DENIED, DELEGATION_DISPATCHED, DELEGATION_NOTIFIED, DELEGATION_SPAWNED,
-    DELEGATION_STOPPED,
+    self, ProgressCheckpoint, ProgressCostContribution, AGENT_DONE, CHAT_TURN_COMPLETED,
+    DELEGATION_COLLECTED, DELEGATION_COMPLETED, DELEGATION_DENIED, DELEGATION_DISPATCHED,
+    DELEGATION_NOTIFIED, DELEGATION_SPAWNED, DELEGATION_STOPPED,
 };
 use ccteam_harness::AgentVendor;
 use chrono::{DateTime, Utc};
@@ -174,6 +174,7 @@ struct DelegationBucket {
 
 #[derive(Debug, Clone, Default)]
 struct SlugState {
+    checkpoint_loaded: bool,
     offset: u64,
     corrupt_count: usize,
     last_valid: Option<Value>,
@@ -379,31 +380,38 @@ impl ProgressProjection {
             .map(str::to_string)
     }
 
-    fn catch_up_path(&self, path: &Path) {
+    fn catch_up_path(&self, path: &Path, rotated: bool) {
         let Some(slug) = self.observed_path(path) else {
             return;
         };
-        if let Err(error) = self.catch_up(&slug) {
+        if let Err(error) = self.catch_up_with_rotation(&slug, rotated) {
             tracing::warn!(slug, %error, "progress projection observer catch-up failed");
         }
     }
 
     fn catch_up(&self, slug: &str) -> Result<()> {
+        self.catch_up_with_rotation(slug, false)
+    }
+
+    fn catch_up_with_rotation(&self, slug: &str, force_rehydrate: bool) -> Result<()> {
         let projection = self.slug(slug);
         let _ingest = lock(&projection.ingest);
-        self.catch_up_locked(slug, &projection)
+        self.catch_up_locked(slug, &projection, force_rehydrate)
     }
 
     fn catch_up_for_query(&self, slug: &str) -> Result<()> {
         let projection = self.slug(slug);
         let path = self.progress_path(slug);
-        let offset = read_lock(&projection.state).offset;
+        let (offset, checkpoint_loaded) = {
+            let state = read_lock(&projection.state);
+            (state.offset, state.checkpoint_loaded)
+        };
         let size = match fs::metadata(&path) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
         };
-        if size == offset {
+        if size == offset && checkpoint_loaded {
             return Ok(());
         }
         let _ingest = match projection.ingest.try_lock() {
@@ -411,21 +419,39 @@ impl ProgressProjection {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
         };
-        self.catch_up_locked(slug, &projection)
+        self.catch_up_locked(slug, &projection, false)
     }
 
-    fn catch_up_locked(&self, slug: &str, projection: &SlugProjection) -> Result<()> {
+    fn catch_up_locked(
+        &self,
+        slug: &str,
+        projection: &SlugProjection,
+        force_rehydrate: bool,
+    ) -> Result<()> {
         let path = self.progress_path(slug);
-        let mut offset = read_lock(&projection.state).offset;
+        let (mut offset, checkpoint_loaded) = {
+            let state = read_lock(&projection.state);
+            (state.offset, state.checkpoint_loaded)
+        };
         let size = match fs::metadata(&path) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
         };
 
-        let rotated = size < offset;
+        let rotated = force_rehydrate || size < offset;
+        if !checkpoint_loaded || rotated {
+            let checkpoint = progress_bridge::load_or_recover_progress_checkpoint(&path)?;
+            let mut state = SlugState {
+                checkpoint_loaded: true,
+                ..SlugState::default()
+            };
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                apply_checkpoint(&mut state, checkpoint);
+            }
+            *write_lock(&projection.state) = state;
+        }
         if rotated {
-            *write_lock(&projection.state) = SlugState::default();
             self.rotations.fetch_add(1, Ordering::Relaxed);
             offset = 0;
         }
@@ -465,7 +491,7 @@ fn install_observer() {
     });
 }
 
-fn notify_persisted(path: &Path) {
+fn notify_persisted(path: &Path, rotated: bool) {
     let projections = {
         let mut registry = lock(PROJECTIONS.get_or_init(|| Mutex::new(Vec::new())));
         let mut live = Vec::with_capacity(registry.len());
@@ -479,7 +505,7 @@ fn notify_persisted(path: &Path) {
         live
     };
     for projection in projections {
-        projection.catch_up_path(path);
+        projection.catch_up_path(path, rotated);
     }
 }
 
@@ -506,8 +532,8 @@ fn fold_event(state: &mut SlugState, event: Value, now: DateTime<Utc>) {
     ) {
         state.workflow_events.push(event.clone());
     }
-    if kind == AGENT_DONE {
-        fold_cost(state, &event, now);
+    if let Some(cost) = progress_bridge::progress_cost_contribution(&event) {
+        fold_cost(state, cost, &event, now);
     }
     if kind == CHAT_TURN_COMPLETED {
         if let Some(sid) = sid {
@@ -517,10 +543,15 @@ fn fold_event(state: &mut SlugState, event: Value, now: DateTime<Utc>) {
     fold_delegation(state, kind, &event, now);
 }
 
-fn fold_cost(state: &mut SlugState, event: &Value, now: DateTime<Utc>) {
-    let cost = event.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+fn fold_cost(
+    state: &mut SlugState,
+    contribution: ProgressCostContribution<'_>,
+    event: &Value,
+    now: DateTime<Utc>,
+) {
+    let cost = contribution.cost_usd;
     state.lifetime_cost += cost;
-    let vendor = event.get("vendor").and_then(Value::as_str);
+    let vendor = contribution.vendor;
     if let Some(vendor) = vendor {
         *state
             .lifetime_by_vendor
@@ -541,6 +572,11 @@ fn fold_cost(state: &mut SlugState, event: &Value, now: DateTime<Utc>) {
     if let Some(vendor) = vendor {
         *bucket.by_vendor.entry(vendor.to_string()).or_insert(0.0) += cost;
     }
+}
+
+fn apply_checkpoint(state: &mut SlugState, checkpoint: &ProgressCheckpoint) {
+    state.lifetime_cost = checkpoint.cost_total_usd;
+    state.lifetime_by_vendor = checkpoint.cost_total_by_vendor.clone();
 }
 
 fn fold_session_turn(session: &mut SessionProjection, event: &Value) {

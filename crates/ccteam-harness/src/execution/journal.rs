@@ -42,6 +42,19 @@ pub struct ScanSummary {
     pub next_offset: u64,
 }
 
+/// Detailed metadata from a streaming forward scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DetailedScanSummary {
+    /// Number of parseable, non-blank JSON rows.
+    pub valid_count: u64,
+    /// Number of non-blank rows that were not valid JSON.
+    pub corrupt_count: usize,
+    /// Byte offset of the first corrupt row, when one exists.
+    pub first_corrupt_offset: Option<u64>,
+    /// Byte position immediately after the last row read.
+    pub next_offset: u64,
+}
+
 /// Complete rows read after a durable byte checkpoint.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Delta {
@@ -148,16 +161,32 @@ pub fn scan_stream<F>(path: &Path, mut reduce: F) -> Result<ScanSummary>
 where
     F: FnMut(Value),
 {
+    let detailed = scan_stream_detailed(path, |value, _bytes| reduce(value))?;
+    Ok(ScanSummary {
+        corrupt_count: detailed.corrupt_count,
+        next_offset: detailed.next_offset,
+    })
+}
+
+/// Stream every parseable row with its exact on-disk byte length.
+///
+/// The callback receives the row length including its trailing newline when
+/// present. Invalid UTF-8 and invalid JSON are isolated to their byte line;
+/// their first offset is reported without materializing the file.
+pub fn scan_stream_detailed<F>(path: &Path, mut reduce: F) -> Result<DetailedScanSummary>
+where
+    F: FnMut(Value, u64),
+{
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ScanSummary::default());
+            return Ok(DetailedScanSummary::default());
         }
         Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
     };
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
-    let mut summary = ScanSummary::default();
+    let mut summary = DetailedScanSummary::default();
 
     loop {
         raw.clear();
@@ -167,14 +196,22 @@ where
         if read == 0 {
             break;
         }
-        summary.next_offset += read as u64;
+        let row_offset = summary.next_offset;
+        let row_bytes = u64::try_from(read).unwrap_or(u64::MAX);
+        summary.next_offset = summary.next_offset.saturating_add(row_bytes);
         let line = trim_ascii(&raw);
         if line.is_empty() {
             continue;
         }
         match serde_json::from_slice::<Value>(line) {
-            Ok(value) => reduce(value),
-            Err(_) => summary.corrupt_count += 1,
+            Ok(value) => {
+                summary.valid_count = summary.valid_count.saturating_add(1);
+                reduce(value, row_bytes);
+            }
+            Err(_) => {
+                summary.corrupt_count += 1;
+                summary.first_corrupt_offset.get_or_insert(row_offset);
+            }
         }
     }
 

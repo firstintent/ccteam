@@ -4,8 +4,9 @@
 //! on core without reintroducing a cargo cycle. Keep only the small append
 //! and row-builder subset needed by execution adapters here.
 
-use std::collections::HashMap;
-use std::io::Write as _;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -14,14 +15,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::fs_atomic::atomic_write_durable;
+use super::journal;
 use crate::ccteam_root_from_env;
 
-type PersistObserver = dyn Fn(&Path) + Send + Sync + 'static;
+type PersistObserver = dyn Fn(&Path, bool) + Send + Sync + 'static;
 
 static PERSIST_OBSERVER: OnceLock<Box<PersistObserver>> = OnceLock::new();
+
+/// Default active progress journal size before single-level rotation.
+pub const DEFAULT_PROGRESS_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
 pub const CHAT_SESSION_RESET: &str = "chat_session_reset";
 pub const CHAT_SESSION_STARTED: &str = "chat_session_started";
@@ -307,6 +315,80 @@ pub struct KindStat {
     pub suppressed_bytes: u64,
 }
 
+/// Stable identity for the single retained `<slug>.1.jsonl` archive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveCoverage {
+    /// Exact archive byte length.
+    pub byte_size: u64,
+    /// SHA-256 of the first raw line, including its newline when present.
+    pub first_line_sha256: Option<String>,
+}
+
+/// Cumulative lifetime aggregates for data no longer present in the active
+/// progress journal.
+///
+/// Per-sid cost totals are retained because they are effectively free while
+/// streaming the archive and make the checkpoint useful to future per-session
+/// consumers. Rolling 24-hour minute buckets deliberately remain active-file
+/// only; after rotation they can undercount pre-rotation minutes, while every
+/// lifetime field here remains exact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgressCheckpoint {
+    /// Checkpoint wire schema.
+    pub schema_version: u32,
+    /// Monotonic count of archives folded into this checkpoint.
+    pub rotation_sequence: u64,
+    /// Parseable events folded across all rotated-away generations.
+    pub event_count: u64,
+    /// Corrupt byte-lines observed across rotated-away generations.
+    pub corrupt_line_count: u64,
+    /// Lifetime `agent_done.cost_usd` total.
+    pub cost_total_usd: f64,
+    /// Lifetime cost grouped by event vendor.
+    pub cost_total_by_vendor: BTreeMap<String, f64>,
+    /// Lifetime cost grouped by `sid` (falling back to legacy `session_id`).
+    pub cost_total_by_sid: BTreeMap<String, f64>,
+    /// The current `.1` archive already included in these cumulative totals.
+    pub coverage: Option<ArchiveCoverage>,
+}
+
+impl Default for ProgressCheckpoint {
+    fn default() -> Self {
+        Self {
+            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            rotation_sequence: 0,
+            event_count: 0,
+            corrupt_line_count: 0,
+            cost_total_usd: 0.0,
+            cost_total_by_vendor: BTreeMap::new(),
+            cost_total_by_sid: BTreeMap::new(),
+            coverage: None,
+        }
+    }
+}
+
+/// Shared cost fields extracted from one canonical progress event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProgressCostContribution<'a> {
+    /// Numeric `cost_usd` on an `agent_done` row (missing means zero).
+    pub cost_usd: f64,
+    /// Optional vendor label from the same row.
+    pub vendor: Option<&'a str>,
+    /// Optional canonical or legacy session id from the same row.
+    pub sid: Option<&'a str>,
+}
+
+/// Result of repairing one corrupt active or archive journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressRepairReport {
+    /// Parseable records preserved.
+    pub kept_count: u64,
+    /// Corrupt byte-lines removed.
+    pub dropped_count: u64,
+    /// Durable backup containing the exact original bytes.
+    pub backup_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct KindCounters {
     unknown: bool,
@@ -379,8 +461,9 @@ pub fn kind_stats() -> Vec<KindStat> {
 }
 
 /// Install the process-wide callback invoked after a progress row is durably
-/// appended. Returns `false` when another daemon component already installed
-/// the callback. One-shot CLI processes never call this function.
+/// appended. The boolean marks an append that also rotated the active file.
+/// Returns `false` when another daemon component already installed the
+/// callback. One-shot CLI processes never call this function.
 pub fn set_persist_observer(observer: Box<PersistObserver>) -> bool {
     PERSIST_OBSERVER.set(observer).is_ok()
 }
@@ -394,6 +477,92 @@ pub fn progress_jsonl_from_env(slug: &str) -> Option<PathBuf> {
         root.join("state")
             .join("progress")
             .join(format!("{slug}.jsonl"))
+    })
+}
+
+/// Resolve the rotation threshold.
+///
+/// `CCTEAM_PROGRESS_ROTATE_BYTES` is an operational/test override. Unset,
+/// non-numeric, and zero values all fall back to the 64 MiB default so a bad
+/// environment cannot accidentally turn every append into a rotation.
+pub fn progress_rotate_bytes() -> u64 {
+    std::env::var("CCTEAM_PROGRESS_ROTATE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROGRESS_ROTATE_BYTES)
+}
+
+/// Derive the single retained archive path for an active progress journal.
+pub fn progress_archive_path(active_path: &Path) -> PathBuf {
+    progress_sibling_path(active_path, ".1.jsonl")
+}
+
+/// Derive the lifetime checkpoint path for an active progress journal.
+pub fn progress_checkpoint_path(active_path: &Path) -> PathBuf {
+    progress_sibling_path(active_path, ".checkpoint.json")
+}
+
+/// Read a progress checkpoint without mutating or recovering it.
+pub fn read_progress_checkpoint(active_path: &Path) -> Result<Option<ProgressCheckpoint>> {
+    let path = progress_checkpoint_path(active_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let checkpoint = serde_json::from_slice::<ProgressCheckpoint>(&bytes)
+        .with_context(|| format!("parse {}", path.display()))?;
+    if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported progress checkpoint schema {} in {}",
+            checkpoint.schema_version,
+            path.display()
+        );
+    }
+    Ok(Some(checkpoint))
+}
+
+/// Compute the coverage marker for an archive, or `None` when it is absent.
+pub fn progress_archive_coverage(active_path: &Path) -> Result<Option<ArchiveCoverage>> {
+    archive_coverage_for_path(&progress_archive_path(active_path))
+}
+
+/// Return whether a parsed checkpoint covers the current `.1` archive.
+pub fn checkpoint_covers_archive(
+    checkpoint: &ProgressCheckpoint,
+    archive: Option<&ArchiveCoverage>,
+) -> bool {
+    checkpoint.coverage.as_ref() == archive
+}
+
+/// Load the lifetime checkpoint and close the crash window where active was
+/// renamed to `.1` but its aggregates were not checkpointed yet.
+///
+/// Recovery uses the same stable flock as append/rotation, streams `.1` once,
+/// and atomically replaces the checkpoint. A covered archive is never scanned.
+pub fn load_or_recover_progress_checkpoint(
+    active_path: &Path,
+) -> Result<Option<ProgressCheckpoint>> {
+    if let Some(parent) = active_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let lock_file = open_progress_lock(active_path)?;
+    let _lock = ProgressFileLock::lock(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(active_path).display()))?;
+    recover_progress_checkpoint_locked(active_path)
+}
+
+/// Extract the one lifetime cost formula shared by projection and checkpoint
+/// folding. Only `agent_done` contributes; missing/non-numeric cost is zero.
+pub fn progress_cost_contribution(event: &Value) -> Option<ProgressCostContribution<'_>> {
+    (event_kind_name(event) == Some(AGENT_DONE)).then(|| ProgressCostContribution {
+        cost_usd: event.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
+        vendor: event.get("vendor").and_then(Value::as_str),
+        sid: event
+            .get("sid")
+            .and_then(Value::as_str)
+            .or_else(|| event.get("session_id").and_then(Value::as_str)),
     })
 }
 
@@ -475,10 +644,10 @@ fn append_event_at(
     if let Some(reservation) = reservation {
         finish_latest(reservation, result.is_ok(), now);
     }
-    result?;
+    let rotated = result?;
     record_appended(kind_name, unknown, byte_count);
     if let Some(observer) = PERSIST_OBSERVER.get() {
-        observer(path);
+        observer(path, rotated);
     }
     Ok(())
 }
@@ -490,18 +659,360 @@ fn event_kind_name(event: &Value) -> Option<&str> {
         .or_else(|| event.get("kind").and_then(Value::as_str))
 }
 
-fn append_serialized(path: &Path, line: &[u8]) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
+fn append_serialized(path: &Path, line: &[u8]) -> Result<bool> {
+    let lock_file = open_progress_lock(path)?;
+    let _lock = ProgressFileLock::lock(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(path).display()))?;
+
+    // A real crash in the rename -> checkpoint window leaves `.1` present and
+    // active absent. Recover before accepting another row so an uncovered
+    // archive can never survive until a later rotation replaces it.
+    if !path.exists() && progress_archive_path(path).exists() {
+        recover_progress_checkpoint_locked(path)?;
+    }
+
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
-
-    let _lock =
-        ProgressFileLock::lock(&file).with_context(|| format!("lock {}", path.display()))?;
     file.write_all(line)
         .with_context(|| format!("write event to {}", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    drop(file);
+
+    if size > progress_rotate_bytes() {
+        rotate_progress_locked(path)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn progress_sibling_path(active_path: &Path, suffix: &str) -> PathBuf {
+    let file_name = active_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let stem = file_name.strip_suffix(".jsonl").unwrap_or(&file_name);
+    active_path.with_file_name(format!("{stem}{suffix}"))
+}
+
+fn progress_lock_path(active_path: &Path) -> PathBuf {
+    progress_sibling_path(active_path, ".lock")
+}
+
+fn open_progress_lock(active_path: &Path) -> Result<File> {
+    let path = progress_lock_path(active_path);
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+fn rotate_progress_locked(active_path: &Path) -> Result<()> {
+    let archive_path = progress_archive_path(active_path);
+    match std::fs::remove_file(&archive_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("remove {}", archive_path.display()))
+        }
+    }
+    std::fs::rename(active_path, &archive_path).with_context(|| {
+        format!(
+            "rotate {} -> {}",
+            active_path.display(),
+            archive_path.display()
+        )
+    })?;
+
+    // Crash consistency is marker based: rename first, then fold the now
+    // immutable archive and atomically publish the checkpoint. A crash between
+    // these operations leaves a marker mismatch that startup hydration repairs.
+    recover_progress_checkpoint_locked(active_path)?;
+    File::create(active_path).with_context(|| format!("create {}", active_path.display()))?;
     Ok(())
+}
+
+fn recover_progress_checkpoint_locked(active_path: &Path) -> Result<Option<ProgressCheckpoint>> {
+    let archive_path = progress_archive_path(active_path);
+    let archive = archive_coverage_for_path(&archive_path)?;
+    let mut checkpoint = read_progress_checkpoint(active_path)?;
+    let Some(archive) = archive else {
+        return Ok(checkpoint);
+    };
+    if checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint_covers_archive(checkpoint, Some(&archive)))
+    {
+        return Ok(checkpoint);
+    }
+
+    let mut next = checkpoint.take().unwrap_or_default();
+    let summary = journal::scan_stream(&archive_path, |event| {
+        if let Some(cost) = progress_cost_contribution(&event) {
+            next.cost_total_usd += cost.cost_usd;
+            if let Some(vendor) = cost.vendor {
+                *next
+                    .cost_total_by_vendor
+                    .entry(vendor.to_string())
+                    .or_insert(0.0) += cost.cost_usd;
+            }
+            if let Some(sid) = cost.sid {
+                *next.cost_total_by_sid.entry(sid.to_string()).or_insert(0.0) += cost.cost_usd;
+            }
+        }
+        next.event_count = next.event_count.saturating_add(1);
+    })?;
+    next.corrupt_line_count = next
+        .corrupt_line_count
+        .saturating_add(u64::try_from(summary.corrupt_count).unwrap_or(u64::MAX));
+    next.rotation_sequence = next.rotation_sequence.saturating_add(1);
+    next.coverage = Some(archive);
+    write_progress_checkpoint(active_path, &next)?;
+    Ok(Some(next))
+}
+
+fn write_progress_checkpoint(active_path: &Path, checkpoint: &ProgressCheckpoint) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(checkpoint).context("serialize progress checkpoint")?;
+    atomic_write_durable(&progress_checkpoint_path(active_path), &bytes)
+}
+
+fn archive_coverage_for_path(path: &Path) -> Result<Option<ArchiveCoverage>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    let byte_size = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut found_bytes = false;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .with_context(|| format!("read first line from {}", path.display()))?;
+        if buffer.is_empty() {
+            break;
+        }
+        found_bytes = true;
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        hasher.update(&buffer[..take]);
+        let ended = buffer[take - 1] == b'\n';
+        reader.consume(take);
+        if ended {
+            break;
+        }
+    }
+    let first_line_sha256 = found_bytes.then(|| hex_digest(hasher.finalize().as_slice()));
+    Ok(Some(ArchiveCoverage {
+        byte_size,
+        first_line_sha256,
+    }))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+/// Repair corrupt byte-lines in the active journal or its `.1` archive.
+///
+/// The original is first renamed to a timestamped backup and the directory is
+/// synced before the repaired tmp is installed. Clean files are left untouched
+/// and return `None`, making repeated repair runs idempotent.
+pub fn repair_progress_journal(
+    active_path: &Path,
+    target_path: &Path,
+) -> Result<Option<ProgressRepairReport>> {
+    let archive_path = progress_archive_path(active_path);
+    if target_path != active_path && target_path != archive_path {
+        anyhow::bail!(
+            "repair target {} is not active/archive for {}",
+            target_path.display(),
+            active_path.display()
+        );
+    }
+    if let Some(parent) = active_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let lock_file = open_progress_lock(active_path)?;
+    let _lock = ProgressFileLock::lock(&lock_file)
+        .with_context(|| format!("lock {}", progress_lock_path(active_path).display()))?;
+    repair_progress_journal_locked(active_path, target_path)
+}
+
+fn repair_progress_journal_locked(
+    active_path: &Path,
+    target_path: &Path,
+) -> Result<Option<ProgressRepairReport>> {
+    let input = match File::open(target_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open {}", target_path.display())),
+    };
+    let repairing_archive = target_path == progress_archive_path(active_path);
+    let old_coverage = repairing_archive
+        .then(|| archive_coverage_for_path(target_path))
+        .transpose()?
+        .flatten();
+    // Checkpoint damage must never prevent byte repair. A parse/I/O error is
+    // already a doctor warning; leave that sidecar untouched and repair the
+    // journal, updating coverage only when a valid checkpoint covered `.1`.
+    let checkpoint = if repairing_archive {
+        read_progress_checkpoint(active_path).ok().flatten()
+    } else {
+        None
+    };
+    let checkpoint_covered_old = old_coverage.as_ref().is_some_and(|coverage| {
+        checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.coverage.as_ref() == Some(coverage))
+    });
+
+    let tmp_path = unique_maintenance_path(target_path, "repair-tmp");
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .with_context(|| format!("create {}", tmp_path.display()))?;
+    let mut reader = BufReader::new(input);
+    let mut raw = Vec::new();
+    let mut kept_count = 0_u64;
+    let mut dropped_count = 0_u64;
+    loop {
+        raw.clear();
+        let read = reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("read {}", target_path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let line = trim_ascii_bytes(&raw);
+        if line.is_empty() {
+            continue;
+        }
+        if serde_json::from_slice::<Value>(line).is_ok() {
+            output
+                .write_all(&raw)
+                .with_context(|| format!("write {}", tmp_path.display()))?;
+            if raw.last() != Some(&b'\n') {
+                output
+                    .write_all(b"\n")
+                    .with_context(|| format!("finish line in {}", tmp_path.display()))?;
+            }
+            kept_count = kept_count.saturating_add(1);
+        } else {
+            dropped_count = dropped_count.saturating_add(1);
+        }
+    }
+
+    if dropped_count == 0 {
+        drop(output);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Ok(None);
+    }
+    output
+        .sync_all()
+        .with_context(|| format!("fsync {}", tmp_path.display()))?;
+    drop(output);
+    drop(reader);
+
+    let backup_path = unique_backup_path(target_path);
+    std::fs::rename(target_path, &backup_path).with_context(|| {
+        format!(
+            "back up {} -> {}",
+            target_path.display(),
+            backup_path.display()
+        )
+    })?;
+    sync_parent_dir(target_path);
+    std::fs::rename(&tmp_path, target_path).with_context(|| {
+        format!(
+            "replace {} from repaired copy {} (original is safe at {})",
+            target_path.display(),
+            tmp_path.display(),
+            backup_path.display()
+        )
+    })?;
+    sync_parent_dir(target_path);
+
+    if checkpoint_covered_old {
+        let mut checkpoint = checkpoint.expect("coverage match requires a checkpoint");
+        checkpoint.coverage = archive_coverage_for_path(target_path)?;
+        write_progress_checkpoint(active_path, &checkpoint)?;
+    }
+
+    Ok(Some(ProgressRepairReport {
+        kept_count,
+        dropped_count,
+        backup_path,
+    }))
+}
+
+fn unique_maintenance_path(path: &Path, suffix: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
+    path.with_file_name(format!("{name}.{suffix}-{stamp}-{}", std::process::id()))
+}
+
+fn unique_backup_path(path: &Path) -> PathBuf {
+    let candidate = unique_maintenance_path(path, "bak");
+    if !candidate.exists() {
+        return candidate;
+    }
+    for sequence in 1_u32.. {
+        let numbered = candidate.with_file_name(format!(
+            "{}-{sequence}",
+            candidate
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        ));
+        if !numbered.exists() {
+            return numbered;
+        }
+    }
+    unreachable!("u32 backup suffix space exhausted")
+}
+
+fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 #[derive(Debug)]

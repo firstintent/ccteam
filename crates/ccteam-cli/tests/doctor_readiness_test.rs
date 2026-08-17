@@ -483,4 +483,8 @@ fn doctor_help_hides_migration_flags_but_keeps_verify_mcp_visible() {
         stdout.contains("--json"),
         "ccteam doctor --help must keep advertising --json; got:\n{stdout}",
     );
+    assert!(
+        stdout.contains("--repair-progress"),
+        "ccteam doctor --help must advertise progress repair; got:\n{stdout}",
+    );
 }

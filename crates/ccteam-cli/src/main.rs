@@ -281,6 +281,10 @@ enum Command {
         /// output (single JSON object on stdout).
         #[arg(long, default_value_t = false)]
         verify_mcp: bool,
+        /// Repair corrupt lines in active and `.1` progress journals. Every
+        /// changed file is backed up before atomic replacement.
+        #[arg(long, default_value_t = false, conflicts_with = "verify_mcp")]
+        repair_progress: bool,
         /// V0.6.6 F171: emit machine-readable JSON instead of the
         /// human-friendly text report (only used with `--verify-mcp`
         /// today; ignored otherwise).
@@ -1002,9 +1006,14 @@ fn main() -> Result<()> {
         Command::Role { cmd } => run_role(cmd),
         Command::Skill { cmd } => run_skill(cmd),
         Command::Host { cmd } => run_host(cmd),
-        Command::Doctor { verify_mcp, json } => run_doctor(commands::DoctorOptions {
+        Command::Doctor {
+            verify_mcp,
+            repair_progress,
+            json,
+        } => run_doctor(commands::DoctorOptions {
             verify_mcp,
             verify_mcp_json: json,
+            repair_progress,
         }),
         Command::Config { args } => run_config(args),
     }
@@ -1533,6 +1542,9 @@ fn run_doctor(opts: commands::DoctorOptions) -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+    if opts.repair_progress {
+        print!("{}", doctor::repair_progress(&paths)?);
     }
     // Any other invocation is the full readiness checkup.
     let (body, any_fail) = doctor::run_readiness_checkup(&paths);
