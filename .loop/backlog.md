@@ -15,6 +15,54 @@
 
 ## 当前卡
 
+### WEB-TS-1 web 聊天消息时间戳(v0.10.2 N1)★ W1
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs(session_event_payload)+ crates/ccteam-web/web/src(chatTranscript.ts · hooks/useSessionEvents.ts · SessionView.tsx 气泡渲染段)` · **建议入口**:subagent(briefing 自包含)
+- **背景**:需求 SoT = `docs-local/versions/v0-10-2/README.md` N1(gitignored,briefing 内嵌全文)。数据链路本来通:turns.jsonl 每行有 ts、REST 历史透传 ts,但前端 `TranscriptRow` 丢弃、SSE 实时帧无 ts 字段。
+- **规格**:① 后端 `session_event_payload`(sessions_api.rs:2012-2018)additive 加 `ts`(与 turns.jsonl 同源的服务端时间,禁前端 Date.now);② `TranscriptRow` 加 ts,`historyToRows`/`eventToRow` 都填;③ SessionView 气泡渲染小字 `HH:MM`(本地时区,title 给完整时间),移动端不挤压;④ additive 不破坏旧前端。
+- **DoD**:历史与实时消息都显时间;刷新后同一消息时间不变;vitest/tsc/eslint 绿;`make test-baseline` 只增(1928/0 起);clippy 0;fmt 干净;writeback 绿。
+
+### WEB-TREE-1 团队→拓扑按项目折叠(v0.10.2 N2)★ W1
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(pages/AgentsView.tsx · lib/agentsTree.ts)` · **建议入口**:subagent(与 WEB-NAV-1 同只,两 commit)
+- **背景**:N2。`AgentsTree` 已按项目分组(AgentsView.tsx:138-216),既有折叠仅到会话子树级(`collapsed: Set<sid>`,agentsTree.ts:30-45)。
+- **规格**:`collapsedProjects: Set<slug>` state(与 Set<sid> 并存不混);项目 header(AgentsView.tsx:139-143)加展开/收起 toggle,折叠隐藏该项目全部会话行、header 计数保留;默认全展开;localStorage 持久化;过滤逻辑落 agentsTree.ts 纯函数(保持「React 只持集合、过滤纯函数」风格);纯展示层不动数据获取。
+- **DoD**:折叠/展开正确、计数在、刷新后折叠态保留;vitest 覆盖纯函数;`make web-check` 绿;writeback 绿。
+
+### WEB-NAV-1 logo 回首页 + Sidebar 底部换序(v0.10.2 N7+N8)★ W1
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(components/Sidebar.tsx · components/Logo.tsx)` · **建议入口**:subagent(与 WEB-TREE-1 同只,两 commit)
+- **背景**:N7/N8。展开态 logo(Sidebar.tsx:291)无点击;折叠态 logo(:596)点击=展开(与 :597 Chevron 冗余);`side-bottom`(:574-591)现状设置在上、用户行在下;折叠 rail 同序(两态顺序一致是既有不变量,:594 注释)。
+- **规格**:① 两态 logo 点击 → navigate `/`(即 /app/ 首页),折叠态展开职能留 Chevron;cursor pointer + title + data-testid。② side-bottom 换序:用户行在上、设置最底;折叠 rail 同步换;两态一致注释同步改。
+- **DoD**:任意页点 logo 回 `/`;折叠态仍能 Chevron 展开;两态顺序断言更新;vitest 绿;writeback 绿。
+
+### WEB-DSH-1 DSH 菜单 iframe keep-alive(v0.10.2 N9)★ W1
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(App.tsx · ChatConsole.tsx shell · pages/DshView.tsx)` · **建议入口**:subagent
+- **背景**:N9。`/dsh` 普通路由切走即 unmount DshView → iframe 销毁 → 切回整页重载。修法 = 挂载一次 + CSS 隐藏,不引第三方库。
+- **规格**:iframe 宿主提升到常驻 shell(ChatConsole 布局层),首次访问 `/dsh` 才挂载(模块级 flag,未访问零请求),路由切换只 display/visibility 不 unmount;DshView 本体(status head/空态)仍随路由渲染;`embedSrc(status)` 为 null 时无 iframe 可保;stop→start 后 reload 属预期。**不**顺势改 TerminalView。
+- **DoD**:真机/Playwright:加载完切走再切回,DSH 内草稿/滚动原样、网络面板无资产重拉;未访问零 dsh 请求;vitest 覆盖「路由切换不 unmount」;`make web-check` 绿;writeback 绿。
+
+### WEB-STATUS-1 会话页状态点实时化(v0.10.2 N3)★ W2
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/web/src(pages/SessionView.tsx 头部 · hooks/useSessionEvents.ts · components/ChatConsole.tsx)` · **建议入口**:subagent(W1 合入后开工,SessionView 与 WEB-TS-1 串行)
+- **背景**:N3 根因:SessionView.tsx:413-419 headDot 数据源 = per-sid SSE 连接态(connected 恒绿),会话被挤停照样绿;服务端本在发 `session_lifecycle` 帧(sessions_api.rs:2056-2059 带 state/reason)但 eventToRow 丢弃、SessionView 不消费;`session.status` prop 现成未用。拓扑页对 = REST 快照 + 全局 SSE。
+- **规格**:headDot 换数据源:初值 `session.status`,之后消费 per-sid SSE `session_lifecycle` 即时更新(live=绿/off=灰;busy 琥珀保留本地推导;连接错误红点保留为连接信号,可与状态点分开表达,实现从简);范式参考 ChatConsole.tsx:198 `useAgentsEvents(true,"session_lifecycle")` + lib/lifecycleReconciler;**同形扫一遍**:rail 列表会话项状态点若同病一并修;服务端零改动。
+- **DoD**:挤停/结束后事件到达即变灰(不刷新页面);live 绿、本页 turn 琥珀;与拓扑页同会话状态一致;vitest 覆盖 lifecycle 帧驱动迁移;`make web-check` 绿;writeback 绿。
+
+### VENDOR-INSTALL-1 Ops & Hosts vendor 一键安装/更新(v0.10.2 N5)★ W2
+- **状态**:待排 · **冲突域**:`crates/ccteam-core(host_registry.rs)+ crates/ccteam-web/src/routes(hosts.rs 等新端点)+ crates/ccteam-web/web/src(pages/HostsView.tsx · lib/hostsApi.ts)` · **建议入口**:subagent(与 VENDOR-QUOTA-1 同只串行,两 commit)
+- **背景**:N5。**owner 显式推翻既有立场** "ccteam never installs a CLI for you"(hosts.rs:177-179 / HostsView.tsx:13 / vendor_panel.rs:403-407 三处文案随卡改写);红线本体(不 vendor 二进制)不动。npm 包映射现成在 `web/src/lib/vendorLatest.ts`(claude/codex/grok/opencode/dsh 有,kimi/pi 无);admin 门 = `deny_non_admin`(auth.rs:220);受管子进程范式 = dsh_web.rs;daemon 无「REST 触发子进程」先例,本卡收敛引入。
+- **规格**:① `AGENT_PROBE_SPECS` 每 vendor 增 `install_recipe: Option<&[&str]>`(npm 系 = `npm install -g <pkg>@latest`;kimi/pi = None);`Command::new(argv[0]).args(...)` 直起**不过 shell**,请求只带 vendor 名服务端查表,无自由命令面。② `POST /api/v1/hosts/local/vendors/{vendor}/install`(deny_non_admin)→ 202 + job id;`GET …/install/{job}` 轮询(running/exit/输出尾);同 vendor 并发去重;超时(~10min)强杀记失败;spawn_blocking/detached 仿 dsh_web。③ 仅本机(远端卫星行无按钮)。④ VendorManageRow 按钮三态:未装=安装/已装且 outdated=更新/最新不渲染;仅 `useMe().isAdmin` 渲染(真门在后端 403);行内展开输出尾+终态,成功后 `getHostDetail(host, refresh=true)`。⑤ hint 三处改写新口径。⑥ npm 不在 PATH 置灰+hint;权限不足如实报 stderr tail,不提权。
+- **DoD**:真机装/升一个 npm 系 vendor 全链路;非 admin POST 403;kimi/pi 无按钮;伪造 vendor 名/参数 → 4xx,argv 恒等于配方表(定向测试);基线只增、clippy 0、vitest 三态;writeback 绿。
+
+### VENDOR-QUOTA-1 Ops & Hosts vendor 额度展示(v0.10.2 N6)★ W2
+- **状态**:待排 · **冲突域**:同 VENDOR-INSTALL-1(同只 subagent 串行) · **建议入口**:subagent
+- **背景**:N6,各 vendor 额度面已全部实锤(需求文档表格):claude `GET api.anthropic.com/api/oauth/usage`(Bearer=~/.claude/.credentials.json OAuth token)→ five_hour/seven_day.{utilization%,resets_at};codex `GET chatgpt.com/backend-api/wham/usage`(Bearer=~/.codex/auth.json + ChatGPT-Account-Id)→ primary(5h)/secondary(weekly).{used_percent,reset_at}+plan_type;kimi `GET api.kimi.com/coding/v1/usages`(managed OAuth)→ usage(weekly)+limits[] 300min 窗(5h)各带 resetTime;grok `{cli-chat-proxy}/billing?format=credits`(四头)→ creditUsagePercent+currentPeriod.end+subscriptionTier(无 5h);opencode/pi 无面;dsh 余额制候选不做。
+- **规格**:① 归一模型 `VendorQuota{state: Available{plan, windows:Vec<QuotaWindow{kind:5h|weekly|monthly, used_percent, resets_at}>} | NotSubscription | Unavailable}` + per-vendor `quota_probe` 注册表(host_registry 旁,与 AGENT_PROBE_SPECS 同哲学,新 vendor 加一行 UI 零改)。② `GET /api/v1/vendors/quota` additive 独立端点(不塞 host detail),**admin-only**,per-vendor 缓存 TTL ~5min(仿 probe_bin_cached),页面加载并行拉取,配额面挂不影响主数据。③ 凭据**只读**;401/超时/API-key 登录 → Unavailable 不渲染不报错;不做 OAuth refresh。④ UI:行内迷你条 `5h ▓▓░ 42% · 3h12m 后重置` / `周 …`,单窗 vendor 只一条,plan 名小 badge,本地时区相对化,移动端不挤压。⑤ 被动流(claude rate_limit_event/codex headers)不做;dsh 余额、opencode 429 抠字 = 候选不做。
+- **DoD**:本机已登录订阅 vendor 行内显示与 vendor 自家 /usage 一致;API-key/未登录行无额度区无报错;非 admin 403;每探测器 fake-HTTP 定向测试(shape 解析 + 401/超时降级);TTL 生效断言;基线只增、clippy 0、vitest 三态;writeback 绿。
+
+### CLI-HELP-1 `ccteam --help` 文案整洁化(v0.10.2 N4)★ W1
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli` · **建议入口**:subagent
+- **背景**:N4。现状:多条命令/选项描述是多段开发笔记(Init 5 段/Update 3 段/Start 每选项 3-4 行);版本号写进用户面(`--home`「v0.8.20 —…」main.rs:55、`--owner`「v0.8.20 F1:…」:101、`--no-clipboard`「V0.4.6 F88—…」:145、Status「V0.4.1:…」:152);内部开发史引用数十处(Item 4/W3/W4a/v0.9 T5/Track D);顶层 about「built on Claude Code」名不副实(七 vendor)。
+- **规格**:① 全部用户可见命令/选项描述 ≤100 字符、首段一行(clap 短 help 语义)、简洁用户导向;② **零版本号字面量**(v0.x.y/V0.x 全清);③ 范围:顶层 + project/session/role/skill/host/daemon/config/init/start/stop/status/update 全部子命令与选项;internal(hide)顺手清但不强求 100 字符;④ 顶层 about 改中性现行描述(对齐 README 口径,如 "Multi-harness agent team bridge and governance layer");⑤ 被删开发史注记直接删(git history/docs-local 是其家),有价值行为说明改 `//` 注释留实现处;⑥ grep 全 crate `///` 里 `v0\.|V0\.` 同形扫净。
+- **DoD**:`ccteam --help` 及各子命令 --help 全部描述 ≤100 字符、零版本号;顶层一屏每命令一行;行为零变更(纯文案);`make test-baseline` 只增(1928/0 起)、clippy 0、fmt 干净;writeback 绿。
+
 ### PERF-REVIEW-FIX-1 perf-v1 review 定性后的修复批(owner「review and fix」2026-08-17)
 - **状态**:完成(6ee84bf) · **冲突域**:`crates/ccteam-web/web(SessionView/ChatConsole/stores)+ crates/ccteam-web/src/routes(ETag 响应头)` · **建议入口**:codex 委派(单只,owner 限 ≤1 并发)
 - **背景**:owner 令「review and fix」;review 舰队被叫停(以后禁用 code-review),已完成的 web 角扫描 8 条发现经规划逐条核代码定性:**4 伪**(external 500——per-file 容错在扫描器内;activity fallback 0——与 IM 同款且注释明写;ETag 双序列化——per-identity 304 正确性所需;error_code 标签微偏不修)、**2 微**(If-None-Match 不认弱验证器;lifecycle 环 indexOf 对象身份)、**2 实**(loadEarlier 无 epoch 守卫可致断层+游标错位;ETag 响应缺 `Cache-Control: private` 在共享缓存部署下可跨租户串看)+ **1 实**(hidden 期 SSE 断链后 focus 不补刷 session 列表,rail 陈旧)。
