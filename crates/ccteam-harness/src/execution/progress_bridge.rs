@@ -544,6 +544,15 @@ pub fn checkpoint_covers_archive(
 pub fn load_or_recover_progress_checkpoint(
     active_path: &Path,
 ) -> Result<Option<ProgressCheckpoint>> {
+    // Read-only callers (projection catch-up runs this for EVERY slug) must
+    // not materialize the lock/dir for a project that has no progress state
+    // at all — otherwise a mere query mints `.lock` droppings.
+    if !active_path.exists()
+        && !progress_archive_path(active_path).exists()
+        && !progress_checkpoint_path(active_path).exists()
+    {
+        return Ok(None);
+    }
     if let Some(parent) = active_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
