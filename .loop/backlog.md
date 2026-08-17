@@ -61,7 +61,7 @@
 - **状态**:完成(a3104cf) · **冲突域**:`crates/ccteam-cli/src/doctor.rs + harness(progress_bridge rollover)+ im/progress_projection.rs(checkpoint 水合)` · **建议入口**:codex 委派
 - **规格**:append 时体积检查(默认 64MB)→ 单级 rollover `<slug>.jsonl`→`<slug>.1.jsonl` + lifetime-cost checkpoint 小 json(投影水合 = checkpoint+活跃文件);doctor 增 progress 检查(体积、坏行数+offset、按字节 Top kinds、checkpoint 一致性);`--repair-progress` bytes 逐行 parse 原子重写先备份。零新定时器。
 - **DoD**:rollover 触发/恢复测试;doctor 检查+修复(先备份)测试;基线只增。
-- **验证**:2026-08-17 codex s438 交付 `a3104cf`(per-slug 稳定锁串行 append/rotation/recovery/repair;64MiB 默认 + `CCTEAM_PROGRESS_ROTATE_BYTES` 覆盖;mv→流式扫 `.1` 折进累计 checkpoint(原子写,记 coverage 标记 + rotation 序号),崩溃窗 = 水合时补折未覆盖 `.1` 恰一次;cost 提取与投影共享零漂移;doctor 六项检查 + `--repair-progress` 先备份原子替换幂等;24h 桶跨界欠计为记录在案的取舍,lifetime 精确;卡内 doctor 12/12、rotation 2/2、恢复 1/1、im 705/0)。
+- **验证**:2026-08-17 规划收口追加 `34f448f`:`load_or_recover_progress_checkpoint` 在 active/`.1`/checkpoint 全不存在时提前返回,不再物化 `.lock`(投影 catch_up 每 slug 都调,原实现让零事件项目/测试夹具凭空长出锁残留 —— 实锤 `cargo test -p ccteam-im --lib` 每跑一次在 crate 目录重生 `state/progress/*.lock` 弄脏主仓;修后同套件 CLEAN,rotation 三测试 + harness/im lib 全绿)。2026-08-17 codex s438 交付 `a3104cf`(per-slug 稳定锁串行 append/rotation/recovery/repair;64MiB 默认 + `CCTEAM_PROGRESS_ROTATE_BYTES` 覆盖;mv→流式扫 `.1` 折进累计 checkpoint(原子写,记 coverage 标记 + rotation 序号),崩溃窗 = 水合时补折未覆盖 `.1` 恰一次;cost 提取与投影共享零漂移;doctor 六项检查 + `--repair-progress` 先备份原子替换幂等;24h 桶跨界欠计为记录在案的取舍,lifetime 精确;卡内 doctor 12/12、rotation 2/2、恢复 1/1、im 705/0)。
 
 ### PERF-V1-8 观测与性能门禁(W4)
 - **状态**:完成(d3931fb) · **冲突域**:`Makefile(perf-gate)+ web 层指标(middleware)+ im/gateway 锁计量 + 生成式 fixture 测试` · **建议入口**:codex 委派 + 规划收口(verify 登记归规划)
