@@ -16,12 +16,11 @@
 ## 当前卡
 
 ### PERF-REVIEW-FIX-1 perf-v1 review 定性后的修复批(owner「review and fix」2026-08-17)
-- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`crates/ccteam-web/web(SessionView/ChatConsole/stores)+ crates/ccteam-web/src/routes(ETag 响应头)` · **建议入口**:codex 委派(单只,owner 限 ≤1 并发)
+- **状态**:完成(6ee84bf) · **冲突域**:`crates/ccteam-web/web(SessionView/ChatConsole/stores)+ crates/ccteam-web/src/routes(ETag 响应头)` · **建议入口**:codex 委派(单只,owner 限 ≤1 并发)
 - **背景**:owner 令「review and fix」;review 舰队被叫停(以后禁用 code-review),已完成的 web 角扫描 8 条发现经规划逐条核代码定性:**4 伪**(external 500——per-file 容错在扫描器内;activity fallback 0——与 IM 同款且注释明写;ETag 双序列化——per-identity 304 正确性所需;error_code 标签微偏不修)、**2 微**(If-None-Match 不认弱验证器;lifecycle 环 indexOf 对象身份)、**2 实**(loadEarlier 无 epoch 守卫可致断层+游标错位;ETag 响应缺 `Cache-Control: private` 在共享缓存部署下可跨租户串看)+ **1 实**(hidden 期 SSE 断链后 focus 不补刷 session 列表,rail 陈旧)。
 - **规格**:① SessionView `loadEarlier` 套用与 seed/reseed 相同的 `historyRequestRef` epoch 守卫,过期响应丢弃;② status/projects 的 ETag 响应统一加 `Cache-Control: private, no-cache`(304 revalidation 语义保留);③ visibilitychange→visible 时对已注册 slug 触发一次 debounced reconcile(补 SSE 盲窗);④ lifecycle 已消费指针改单调序号,不用对象身份 indexOf;⑤ If-None-Match 比对容忍 `W/` 前缀(`*` 不做)。
 - **DoD**:各项 vitest/HTTP 断言;vitest/tsc/eslint 绿;Rust 面 fmt/clippy/基线只增(1928/0 起)。
-
-### INSTALL-FIX-1 `make install` 撞非受管 daemon 时误报安装失败(owner 直驱 2026-08-17)
+- **验证**:2026-08-17 codex s445 交付 `6ee84bf`(五项全落:loadEarlier 复用 seed 同款 `historyRequestRef` epoch 双检;status/projects 的 200 与 304 全带 `Cache-Control: private, no-cache`;visible 恢复经既有 debounced reconciler 每 slug 一次;lifecycle 环 additive 单调序号;If-None-Match 逗号列表 + `W/` 前缀容忍)。规划收口(合并树):fmt PASS、clippy 0、序列化 baseline **1928/0**、`make web-check` vitest **640/640**(637→+3)+ tsc 绿、web 套件 406/1(登记 pty flake)、writeback 绿。 `make install` 撞非受管 daemon 时误报安装失败(owner 直驱 2026-08-17)
 - **状态**:完成(9e6375e) · **冲突域**:`crates/ccteam-cli/src(daemon_cli.rs + main.rs clap)+ Makefile(install)` · **建议入口**:codex 委派
 - **背景**:owner 在另一台机器 dev 分支 `make install` 报 Error 1——二进制已成功安装,但 install 目标的 `ccteam daemon restart` 对「非受管 daemon 占 socket」(前台 `ccteam start`/supervisor,owner 常态)按设计拒绝(`StopVerdict::RefusedNotManaged`,daemon_cli.rs 映射为 fail)→ make 把成功的安装打成失败。v0.9.7(`825ae7d6`)起即有。同形:`ccteam update` 的 RestartRefused 同样非零退出(update.rs:442,契约面,本卡不动、报 owner 裁决)。
 - **规格**:`daemon restart` 加 `--if-managed` flag——非受管占 socket 时打响亮 drift 警告(明说「新装二进制未生效,需自行重启那只 daemon」)+ exit 0;受管/无 daemon 行为不变;真失败(stop 超时/spawn 错)仍非零。install 目标改用 `daemon restart --if-managed`。
