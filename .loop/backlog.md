@@ -16,10 +16,11 @@
 ## 当前卡
 
 ### INSTALL-FIX-1 `make install` 撞非受管 daemon 时误报安装失败(owner 直驱 2026-08-17)
-- **状态**:进行中(codex 委派·2026-08-17) · **冲突域**:`crates/ccteam-cli/src(daemon_cli.rs + main.rs clap)+ Makefile(install)` · **建议入口**:codex 委派
+- **状态**:完成(9e6375e) · **冲突域**:`crates/ccteam-cli/src(daemon_cli.rs + main.rs clap)+ Makefile(install)` · **建议入口**:codex 委派
 - **背景**:owner 在另一台机器 dev 分支 `make install` 报 Error 1——二进制已成功安装,但 install 目标的 `ccteam daemon restart` 对「非受管 daemon 占 socket」(前台 `ccteam start`/supervisor,owner 常态)按设计拒绝(`StopVerdict::RefusedNotManaged`,daemon_cli.rs 映射为 fail)→ make 把成功的安装打成失败。v0.9.7(`825ae7d6`)起即有。同形:`ccteam update` 的 RestartRefused 同样非零退出(update.rs:442,契约面,本卡不动、报 owner 裁决)。
 - **规格**:`daemon restart` 加 `--if-managed` flag——非受管占 socket 时打响亮 drift 警告(明说「新装二进制未生效,需自行重启那只 daemon」)+ exit 0;受管/无 daemon 行为不变;真失败(stop 超时/spawn 错)仍非零。install 目标改用 `daemon restart --if-managed`。
 - **DoD**:flag 三态测试(非受管→警告+exit0 / 受管→重启 / 无→启动);Makefile 改行;基线只增、clippy 0、fmt 干净。
+- **验证**:2026-08-17 codex s444 交付 `9e6375e`(纯映射缝 `restart_command_action(outcome, if_managed) -> Emit|Fail`,单元测试 4/4;`--if-managed` 仅放宽 NotManaged 一臂 → `skippedNotManaged` + drift 警告「新装二进制未生效需自行重启」;裸 `daemon restart` 与 StopTimedOut/真失败契约一字不动;Makefile install 改用 `--if-managed`)。规划收口:fmt PASS、clippy 0、序列化 baseline **1928/0**(1924→+4)、cli 全量 198/1(唯一红 = 登记 web 子进程计时族,base 复现)、writeback 绿。
 
 ### PERF-V1-1 事件准入门(EventClass admission)★ W1
 - **状态**:完成(11fc808) · **冲突域**:`crates/ccteam-harness/src/execution(progress_bridge.rs + 新 event_class + codex_app_server.rs)` · **建议入口**:codex 委派(规划 briefing 自包含)
