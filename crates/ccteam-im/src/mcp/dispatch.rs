@@ -1894,7 +1894,7 @@ async fn resolve_call_origin(
                         .lock(gateway)
                         .await
                         .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
-                    None => gateway.lock().await,
+                    None => crate::latency::gateway_lock(gateway, "mcp.spawn.resolve").await,
                 };
                 gw.session_views().into_iter().find(|v| v.sid == declared)
             };
@@ -3739,7 +3739,7 @@ async fn assert_caller_owns_session(
                 .lock(gateway)
                 .await
                 .map_err(|error| mcp_gateway_error(name, &error))?,
-            None => gateway.lock().await,
+            None => crate::latency::gateway_lock(gateway, "mcp.session.resolve").await,
         };
         gw.session_resolve(sid)
     };

@@ -42,6 +42,7 @@ pub mod auth;
 pub mod chat_protocol;
 pub mod decisions;
 pub mod dsh_web;
+pub mod metrics;
 pub mod pty;
 pub mod queries;
 // v0.8.22 P1 (review §3.1-3) — per-session SSE replay ring + live tap; see
@@ -158,6 +159,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(mcp)
         .merge(stateful)
         .layer(CompressionLayer::new().gzip(true).br(true))
+        .layer(axum::middleware::from_fn(metrics::record_request_latency))
 }
 
 /// Standalone `ccteam web` entry. Calls [`serve_with_shutdown`] with

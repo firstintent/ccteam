@@ -7,11 +7,43 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 const READ_BLOCK_SIZE: u64 = 8 * 1024;
+
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+static RECORDS_PARSED: AtomicU64 = AtomicU64::new(0);
+static INVALID_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide aggregate of journal-facade work.
+///
+/// Counters are monotonic and relaxed: they are diagnostics, not a
+/// synchronization primitive. Callers can subtract two snapshots to measure
+/// one operation without adding per-request allocations or locks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalMetrics {
+    pub bytes_read: u64,
+    pub records_parsed: u64,
+    pub invalid_lines: u64,
+}
+
+/// Snapshot process-wide journal read counters.
+pub fn metrics() -> JournalMetrics {
+    JournalMetrics {
+        bytes_read: BYTES_READ.load(Ordering::Relaxed),
+        records_parsed: RECORDS_PARSED.load(Ordering::Relaxed),
+        invalid_lines: INVALID_LINES.load(Ordering::Relaxed),
+    }
+}
+
+fn record_metrics(bytes_read: u64, records_parsed: u64, invalid_lines: usize) {
+    BYTES_READ.fetch_add(bytes_read, Ordering::Relaxed);
+    RECORDS_PARSED.fetch_add(records_parsed, Ordering::Relaxed);
+    INVALID_LINES.fetch_add(invalid_lines as u64, Ordering::Relaxed);
+}
 
 /// A corruption-tolerant tail, ordered oldest first.
 #[derive(Debug, Clone, PartialEq)]
@@ -140,13 +172,16 @@ where
         }
     }
 
-    let has_more = probe_older && rows.len() > n;
+    let records_parsed = rows.len();
+    let has_more = probe_older && records_parsed > n;
     if has_more {
         rows.truncate(n);
     }
     rows.reverse();
     let first_offset = rows.first().map(|(offset, _)| *offset);
     let events = rows.into_iter().map(|(_, value)| value).collect();
+
+    record_metrics(reader.bytes_read, records_parsed as u64, corrupt_count);
 
     Ok(Tail {
         events,
@@ -215,6 +250,12 @@ where
         }
     }
 
+    record_metrics(
+        summary.next_offset,
+        summary.valid_count,
+        summary.corrupt_count,
+    );
+
     Ok(summary)
 }
 
@@ -253,6 +294,7 @@ pub fn read_delta(path: &Path, from_offset: u64) -> Result<Delta> {
         ..Delta::default()
     };
     let mut raw = Vec::new();
+    let mut bytes_read = 0u64;
 
     loop {
         raw.clear();
@@ -262,6 +304,7 @@ pub fn read_delta(path: &Path, from_offset: u64) -> Result<Delta> {
         if read == 0 {
             break;
         }
+        bytes_read = bytes_read.saturating_add(read as u64);
         if raw.last() != Some(&b'\n') {
             break;
         }
@@ -276,6 +319,8 @@ pub fn read_delta(path: &Path, from_offset: u64) -> Result<Delta> {
         }
     }
 
+    record_metrics(bytes_read, delta.events.len() as u64, delta.corrupt_count);
+
     Ok(delta)
 }
 
@@ -285,6 +330,7 @@ struct ReverseLines {
     buffer_start: u64,
     buffer: Vec<u8>,
     reached_bof: bool,
+    bytes_read: u64,
 }
 
 impl ReverseLines {
@@ -305,6 +351,7 @@ impl ReverseLines {
             buffer_start: end,
             buffer: Vec::new(),
             reached_bof: false,
+            bytes_read: 0,
         }))
     }
 
@@ -334,6 +381,7 @@ impl ReverseLines {
             self.file
                 .read_exact(&mut prefix)
                 .context("read journal tail block")?;
+            self.bytes_read = self.bytes_read.saturating_add(step);
             prefix.extend_from_slice(&self.buffer);
             self.buffer = prefix;
             self.buffer_start = next_pos;

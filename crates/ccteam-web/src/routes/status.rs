@@ -330,7 +330,7 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
     let mut active_watches = 0;
     let mut views = Vec::new();
     let tracked_count: u32 = if let Some(gw) = app.gateway.as_ref() {
-        let guard = gw.blocking_lock();
+        let guard = ccteam_im::latency::gateway_blocking_lock(gw, "web.status.snapshot");
         views = guard.session_views();
         active_watches = guard.armed_delegation_watch_count();
         views.len() as u32

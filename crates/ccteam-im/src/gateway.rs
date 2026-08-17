@@ -1161,10 +1161,16 @@ impl GatewayDeadline {
     pub async fn lock<'a>(
         self,
         gateway: &'a Arc<tokio::sync::Mutex<Gateway>>,
-    ) -> Result<tokio::sync::MutexGuard<'a, Gateway>> {
-        tokio::time::timeout_at(self.expires_at.into(), gateway.lock())
+    ) -> Result<crate::latency::GatewayLockGuard<'a>> {
+        let requested_at = Instant::now();
+        let guard = tokio::time::timeout_at(self.expires_at.into(), gateway.lock())
             .await
-            .map_err(|_| GatewayRequestError::QueueDeadline.into())
+            .map_err(|_| GatewayRequestError::QueueDeadline)?;
+        Ok(crate::latency::instrument_gateway_guard(
+            guard,
+            requested_at.elapsed(),
+            "gateway.deadline",
+        ))
     }
 
     fn ensure_vendor_phase_can_start(self) -> Result<()> {
@@ -2748,21 +2754,28 @@ impl Gateway {
         // other shape (selection / command / mention / already-has-a-session)
         // falls straight through to the ordinary `handle_message` call below,
         // unchanged.
-        let candidate = selection.is_none()
+        let candidate_shape = selection.is_none()
             && !Self::is_gateway_command(text)
-            && crate::router::parse_first_mention(text).is_none()
-            && !gateway
-                .lock()
+            && crate::router::parse_first_mention(text).is_none();
+        let candidate = if candidate_shape {
+            !crate::latency::gateway_lock(&gateway, "im.turn.candidate")
                 .await
-                .has_current_session(channel, chat_id, user_id);
+                .has_current_session(channel, chat_id, user_id)
+        } else {
+            false
+        };
         if candidate {
-            let claims = Arc::clone(&gateway.lock().await.spawn_claims);
+            let claims = Arc::clone(
+                &crate::latency::gateway_lock(&gateway, "im.turn.spawn_claims")
+                    .await
+                    .spawn_claims,
+            );
             // Hold the per-chat claim across plan+spawn+apply so a second
             // concurrent "no session yet" message for this SAME chat waits
             // here instead of racing to spawn a duplicate session.
             let _claim = claims.lock_for(&chat).await;
             let outcome = {
-                let mut g = gateway.lock().await;
+                let mut g = crate::latency::gateway_lock(&gateway, "im.turn.spawn_plan").await;
                 g.plan_ensure_current_session(&chat)?
             };
             if let EnsureSessionOutcome::Spawn(plan) = outcome {
@@ -2770,12 +2783,14 @@ impl Gateway {
                 let thread = match Self::spawn_for_new_session_plan(&plan).await {
                     Ok(thread) => thread,
                     Err(err) => {
-                        gateway.lock().await.forget_principal(&plan.id);
+                        crate::latency::gateway_lock(&gateway, "im.turn.spawn_rollback")
+                            .await
+                            .forget_principal(&plan.id);
                         return Err(err.into());
                     }
                 };
                 let sid = {
-                    let mut g = gateway.lock().await;
+                    let mut g = crate::latency::gateway_lock(&gateway, "im.turn.spawn_apply").await;
                     let outcome = g
                         .apply_new_session(*plan, thread, None, false, None)
                         .await?;
@@ -2788,8 +2803,7 @@ impl Gateway {
             // `_claim` (and thus the per-chat single-flight) releases here,
             // waking any waiter for this same chat.
         }
-        gateway
-            .lock()
+        crate::latency::gateway_lock(&gateway, "im.turn.handle")
             .await
             .handle_message(
                 channel,
@@ -10656,7 +10670,10 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
     ) {
-        let Some(plan) = gateway.lock().await.plan_delegation_delivery(signal) else {
+        let Some(plan) = crate::latency::gateway_lock(&gateway, "notifier.plan")
+            .await
+            .plan_delegation_delivery(signal)
+        else {
             return;
         };
         let child = plan.signal.child_sid.clone();
@@ -10711,7 +10728,7 @@ impl Gateway {
         let mut to_record = plan.signal.covered_turns.clone();
         to_record.push(plan.dedup_key.clone());
         let watch = {
-            let mut guard = gateway.lock().await;
+            let mut guard = crate::latency::gateway_lock(&gateway, "notifier.commit").await;
             let Some(current) = guard.delegations.get_mut(&child) else {
                 return;
             };
@@ -10749,7 +10766,11 @@ impl Gateway {
         mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
     ) {
         Self::reconcile_delegations(Arc::clone(&gateway)).await;
-        let watch_set = Arc::clone(&gateway.lock().await.delegation_watch_set);
+        let watch_set = Arc::clone(
+            &crate::latency::gateway_lock(&gateway, "notifier.watch_set")
+                .await
+                .delegation_watch_set,
+        );
         while let Some(signal) = rx.recv().await {
             let watched = watch_set.read().unwrap().contains(&signal.child_sid);
             // Unwatched fleet chatter and watched mid-turn narration create no

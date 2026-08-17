@@ -169,7 +169,7 @@ pub(crate) async fn handle_list_sessions(
     // session_views() is catalog-backed and live_turns() is process state:
     // both are pure in-memory snapshots while the gateway lock is held.
     let (mut views, live_turns) = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.list").await;
         (
             guard
                 .session_views()
@@ -214,7 +214,7 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
     // No live gateway → the handler runs its own no-gateway path; don't gate.
     let gw = app.gateway.as_ref()?;
     let project = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.acl").await;
         guard.project_slug_for_sid(sid)
     };
     match project {
@@ -254,7 +254,7 @@ fn apply_progress_activity_status(
         .unwrap_or(0);
     let now = chrono::Utc::now();
     for view in views {
-        let activity = snapshot.session_activity(
+        let activity = snapshot.session_activity_borrowed(
             &view.sid,
             silent_seconds,
             live_turns.get(&view.sid).copied(),
@@ -485,7 +485,7 @@ pub(crate) async fn handle_session_history(
     // stopped session's transcript outlives the live map by design, and this
     // endpoint is what the team panel's 最近对话 reads for exactly those rows.
     let resolved = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.history").await;
         guard.session_resolve_any(&sid)
     };
     let Some(resolved) = resolved else {
@@ -1723,7 +1723,7 @@ pub(crate) async fn handle_session_history_list(
         return no_gateway();
     };
     let metas = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.history_list").await;
         guard.list_history_sessions(&slug)
     };
     let views: Vec<serde_json::Value> = metas

@@ -157,6 +157,31 @@ impl ProjectProjectionSnapshot {
             now,
         )
     }
+
+    /// Allocation-free activity lookup for fleet callers that already hold
+    /// this immutable snapshot. Unlike [`Self::session_activity`], this borrows
+    /// the selected JSON event instead of cloning it into a one-row vector.
+    pub fn session_activity_borrowed(
+        &self,
+        sid: &str,
+        fallback_silent_seconds: u64,
+        live: Option<ccteam_core::stall::LiveTurn>,
+        now: DateTime<Utc>,
+    ) -> ccteam_core::stall::ProgressActivityStatus {
+        let selected = self
+            .sessions
+            .get(sid)
+            .and_then(|session| session.last_event.as_ref())
+            .or(self.last_unscoped.as_ref());
+        let events = selected.map(std::slice::from_ref).unwrap_or_default();
+        ccteam_core::stall::classify_session_activity(
+            events,
+            sid,
+            fallback_silent_seconds,
+            live,
+            now,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
