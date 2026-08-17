@@ -1373,6 +1373,10 @@ select:focus-visible,
    meta chips · lifecycle actions) over a full-bleed iframe; empty states are
    centered cards. Skin follows conv-head / agents-view; accent = --dsh. */
 .dsh-view { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--base); }
+/* v0.10.2 (WEB-DSH-1) — keep-alive: while the instance is serving, the iframe
+   lives in the persistent .dsh-keepalive stage (a <main> sibling rendered by
+   ChatConsole) and DshView collapses to the head only. */
+.dsh-view--flat { flex: none; }
 .dsh-head { display: flex; align-items: center; gap: 10px; padding: 12px 24px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
 .dsh-title { font-size: 15px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; }
 .dsh-meta { display: inline-flex; align-items: center; gap: 7px; flex-wrap: wrap; }
@@ -1382,6 +1386,10 @@ select:focus-visible,
 .dsh-actions { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
 .dsh-actions .btn { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
 .dsh-stage { flex: 1; min-height: 0; position: relative; background: var(--bg-soft); }
+/* Keep-alive stage: off-/dsh it is only hidden, never unmounted, so the DSH
+   SPA inside the iframe survives navigation. Explicit display beats any
+   preflight ambiguity around the `hidden` attribute. */
+.dsh-keepalive[hidden] { display: none; }
 .dsh-frame { width: 100%; height: 100%; border: 0; display: block; background: var(--base); }
 .dsh-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center; padding: 40px; animation: fadeIn .25s ease; }
 .dsh-empty-icon { width: 48px; height: 48px; border-radius: 14px; display: inline-flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--dsh) 12%, transparent); color: var(--dsh); }

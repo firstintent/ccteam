@@ -27,6 +27,7 @@ import WorkflowView from "./WorkflowView";
 import SettingsView from "./SettingsView";
 import AgentsView from "./AgentsView";
 import DshView from "./DshView";
+import DshFrameHost from "./DshFrameHost";
 import { Sidebar, type RailRow } from "../components/Sidebar";
 import { deleteProject } from "../lib/dashboardApi";
 import {
@@ -526,6 +527,11 @@ export default function ChatConsole() {
             onOpenSettings={(t) => navigate(`/settings/${t}`)}
           />
         )}
+        {/* WEB-DSH-1 — keep-alive DSH iframe stage. Lives OUTSIDE the view
+            switch (this shell survives route changes), so leaving /dsh only
+            hides the frame; DshView renders the head + empty states in place.
+            Inert (renders null) until the first /dsh visit. */}
+        <DshFrameHost active={view === "dsh"} />
       </main>
     </div>
   );
