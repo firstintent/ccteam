@@ -15,6 +15,29 @@
 
 ## 当前卡
 
+### DSH1-A 插件传输面 v2:socket listener + turn 归属 + `_meta` 凭据(v0.10.3 P1)★ 可并行
+- **状态**:待排 · **冲突域**:`plugins/dsh-client + crates/ccteam-harness/src/execution/dsh_acp/assets/dsh-client.tgz` · **建议入口**:subagent(opus,worktree,briefing 自包含)
+- **背景**:v0.10.3「DSH 会话一元化」P1(PRD+spike = `docs-local/versions/v0-10-3/`,gitignored,briefing 内嵌)。一个身份一个 DSH 运行时(dsh web),插件在运行时进程内开 unix socket 继续 serve ACP;spike 四问全 PASS。现行传输面 = env 双开关 + stdio + 无 turn 归属(共享会话下会把人发起的 turn 灌进 ccteam transcript)。
+- **规格**:① config `transportSocket?: string` 驱动(替代 `CCTEAM_DSH_TRANSPORT`/bootBearer env 面,D19 自净逻辑整体删除):有值即 listen(unlink 陈旧 socket),多连接 = 每 accept 实例化一个 ACP 对端(现 server 已 per-instance 持流)。② `session/new|load` params 携带 `_meta.ccteam{sid,bearer,mcpUrl,approvalMode}`,凭据存 runtime 级 sessionId→bearer map(不进 env);工具面 `execute(args, exec)` 按 `exec.agent.id` 查 map 路由 per-sid bearer,查无回落 enrollment(方式二不变)。③ `session/new`:ensureWorkspace(cwd)(串行 create 链)→ `agents.create({sessionId, meta:{cwd}})` → `attachSession`(失败 warn 不回滚)。④ `session/load` reuse-live-first:`agents.get` 有则直接用 live agent,无则 `agents.resume`(resume 对 live 会话 vendor 侧明确拒绝,spike 实证);断连不 dispose 不 cancel(对齐 DSH 自家 ensureSession 弃置 handle 语义)。⑤ **turn 归属过滤**(账本诚实):记住自己 `UserMessage.id`;`turn/start{turn}`+`user/message`(id 匹配)绑定归属 turn;只转发归属 turn 的 assistant/tool 事件(事件自带 turn 字段);完成 = 归属 `turn/end{turn,reason}`(弃 whenIdle);`session/cancel`:归属 turn 活跃 → `agent.cancel`,仍排队 → `inbox.remove(messageId)` + resolve cancelled。⑥ 版本 bump + `npm pack` 重打 `assets/dsh-client.tgz`(K25 内嵌链路)。
+- **DoD**:npm test 绿(多连接隔离 / bearer 零 env / workspace 挂载 / turn 归属过滤与人机混流 / cancel 两臂 / 方式二 enrollment 回归);tgz 与 `dist` 同源重打;fmt/writeback 绿(Rust 面零改动)。
+
+### DSH1-B 运行时归属搬家:`DshRuntimeManager` 下沉 harness(v0.10.3 P2)★ 可并行
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/dsh_web.rs + crates/ccteam-web/src/lib.rs + crates/ccteam-web/src/state.rs + crates/ccteam-web/tests/dsh_web_test.rs + crates/ccteam-harness/src/execution/dsh_runtime.rs(新)+ crates/ccteam-harness/src/execution/mod.rs + crates/ccteam-cli/src/main.rs(装配)` · **建议入口**:subagent(opus,worktree,briefing 自包含)
+- **背景**:v0.10.3 P2。`DshWebSupervisor` 居 web 且 `start_for(&self, app: &AppState, …)` 耦合 AppState;harness 不能依赖 web,adapter(P3)需要同一实例 → 进程核心下沉 harness,「一个身份一个运行时」由共享 Arc 保证而非约定。
+- **规格**:行为零变更的搬家:进程管理核心(start/attach-if-detected/健康检查/合并式物化/种子/stop/shutdown/错误尾)下沉 `ccteam-harness/execution/dsh_runtime.rs::DshRuntimeManager`,输入去 AppState 化(root/身份 owner_tag/配置);web `DshWebSupervisor` 变薄委托层(Identity→owner_tag 映射、反代 target、REST 形状不变);`DshRuntimeManager` 支持「cli 先造、web bind 后 `configure(daemon_url/enabled/attach)`」两段式;`ServeOpts` 增可选外供实例(run_start 传 Some,独立 `ccteam web` 自造);`start_for` 不可重入锁纪律原样保留(v0.10.0 死锁教训)。
+- **DoD**:`dsh_web_test` 全绿(含 deadlock 回归「重复 start + 之后 status 5s 内返回」);web/harness/cli 编译零行为漂移;`make test-baseline` 只增(1947/0 起);clippy 0;fmt 干净;writeback 绿。
+
+### DSH1-C adapter 切换:connect 代替 spawn + 装配 + fake(v0.10.3 P3,A/B 合入后串行)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/acp/transport.rs + crates/ccteam-harness/src/execution/dsh_acp/ + crates/ccteam-harness/tests/(dsh 族 + fixtures/dsh_acp)+ crates/ccteam-im/src/daemon.rs(接线)` · **建议入口**:subagent(opus,依赖 DSH1-A tgz + DSH1-B manager)
+- **背景**:v0.10.3 P3 + 人工门②已签核(退役 per-hire 子进程与 per-sid `DSH_HOME`,历史 DSH 会话 vendor 侧 resume 不迁移直接退役)。
+- **规格**:① `acp/transport.rs` 增 UnixStream connect 构造(坐现成 `from_halves_with_policy`,child=None)。② `dsh_acp/mod.rs::start` = `identity_dsh_home(owner)`(stash 收割,与 `dsh_config_source` 同谱系:`user:<id>`→租户 web 家、其余→真 `~/.dsh`)→ `runtime.ensure_runtime_for(owner)` → connect(短退避等运行时就绪)→ 原握手(版本门改 `agentInfo.version` ≥ 最低值,删 argv 探测)→ `session/new`(`_meta.ccteam` + cwd)/ resume 阶梯 `session/load`;stop/挤停 = `session/cancel` + 断连,**永不杀共享运行时**。③ **删**:spawn_spec env 表、凭据镜像/purge、per-sid home、`CCTEAM_DSH_TRANSPORT` 嗅探、managed profile(`dsh --profile ccteam`);留一次性 legacy 扫除(旧 `runtime/dsh/<sid>` 残留进程与目录)。④ materialize:web profile patch 增 `transportSocket`(路径 = `$CCTEAM_HOME/runtime/dsh/acp/<segment>.sock`,注意 sun_path 108B,测试一律短路径);新增 `register_dsh_client_into_profile(profile_dir, config)` 幂等 merge-only 注册(package.json bundles + node_modules 物化 + cordis.patch.yml 自己的行,人工门①已签核含 operator 真 `~/.dsh`;文件不可解析 → 可读错误不碾压)。⑤ fake:`fake_dsh_acp.py` 改绑 unix socket,adapter 测试经 socket 直连注入(允许 `CCTEAM_DSH_SOCKET` 内部 override,仿 `CCTEAM_*_BIN` 先例);历史 sid resume → 可读错误(vendor 记忆已随一元化退役)。⑥ daemon 装配:cli 造的同一 `Arc<DshRuntimeManager>` 交给 adapter(daemon.rs)与 web。
+- **DoD**:`dsh_acp_test` 族绿(既有 4 个 default-model env 红维持登记态,不新增红);同身份雇两会话 = 单运行时(结构断言);挤停不杀运行时;`make test-baseline` 只增;clippy 0;fmt 干净;writeback 绿。
+
+### DSH1-P4 表面与收口:Hosts 注册按钮 + docs + 真机 DoD(v0.10.3 P4)
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes + crates/ccteam-web/web + README.md + docs/` · **建议入口**:规划(控制)会话亲自(C 合入后)
+- **规格**:① Hosts 页「注册 DSH 插件」按钮(operator attach 缺插件路径,VENDOR-INSTALL-1 先例,admin 门)调 C 的注册函数;② docs 五处(usage 中英/orchestration 中英/README)融入当前能力描述 + tech-design 指针行;③ 真机 DoD 四条(PRD §7):雇的会话 DSH 侧栏实时出现且 workspace 分组正确 / DSH 侧接话后 dispatch 上下文连续 / operator attach 全流程 / 方式二回归;跑不了的如实登记余项。
+- **DoD**:`make web-check` 绿;全门禁(fmt/clippy/test-baseline/writeback);真机四条留痕 `docs-local/versions/v0-10-3/`。
+
 ### WEB-TS-1 web 聊天消息时间戳(v0.10.2 N1)★ W1
 - **状态**:完成(c07ad2a3) · **冲突域**:`crates/ccteam-web/src/routes/sessions_api.rs(session_event_payload)+ crates/ccteam-web/web/src(chatTranscript.ts · hooks/useSessionEvents.ts · SessionView.tsx 气泡渲染段)` · **建议入口**:subagent(briefing 自包含)
 - **验证**:2026-08-17 coder subagent 交付,规划收口(rebase+ff):payload additive `ts`(chrono Utc,RFC3339 与 turns.jsonl 同形同钟,定向单测 `session_event_carries_server_ts`);`TranscriptRow.ts` history/SSE 两路都填;`RowTime` 本地 HH:MM + title 完整时间,移动端零横向挤压。vitest 合并树 658/658 · tsc/eslint 绿 · `cargo test -p ccteam-web --lib` 164/0。**偏差**:无;judgment call = ts 取 payload 构建时刻(GatewayEvent 本体无 ts,加它要碰 ccteam-im 出卡域),与 turns 写入亚秒级差。
