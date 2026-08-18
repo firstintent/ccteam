@@ -40,9 +40,9 @@
 - **DoD**:`dsh_acp_test` 族绿(既有 4 个 default-model env 红维持登记态,不新增红);同身份雇两会话 = 单运行时(结构断言);挤停不杀运行时;`make test-baseline` 只增;clippy 0;fmt 干净;writeback 绿。
 
 ### DSH1-P4 表面与收口:Hosts 注册按钮 + docs + 真机 DoD(v0.10.3 P4)
-- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes + crates/ccteam-web/web + README.md + docs/` · **建议入口**:规划(控制)会话亲自(C 合入后)
-- **规格**:① Hosts 页「注册 DSH 插件」按钮(operator attach 缺插件路径,VENDOR-INSTALL-1 先例,admin 门)调 C 的注册函数;② docs 五处(usage 中英/orchestration 中英/README)融入当前能力描述 + tech-design 指针行;③ 真机 DoD 四条(PRD §7):雇的会话 DSH 侧栏实时出现且 workspace 分组正确 / DSH 侧接话后 dispatch 上下文连续 / operator attach 全流程 / 方式二回归;跑不了的如实登记余项。
-- **DoD**:`make web-check` 绿;全门禁(fmt/clippy/test-baseline/writeback);真机四条留痕 `docs-local/versions/v0-10-3/`。
+- **状态**:完成(ea612c0b) · **冲突域**:`crates/ccteam-web/src/routes + crates/ccteam-web/web + README.md + docs/`(规划自扩:+ harness `dsh_runtime.rs` 注册 seam / `dsh_acp/materialize.rs`+tgz 真机修复 / `plugins/dsh-client` 真机修复 / core `host_registry.rs` notice) · **建议入口**:规划(控制)会话亲自(C 合入后)
+- **验证**:2026-08-18 规划亲自交付:①`register-mcp?vendor=dsh` 特判走 `DshRuntimeManager::register_operator_profile`(同按钮同语义,vendor 各自的「注册 ccteam」),Hosts DSH 行 admin CTA(vitest +2),HTTP 集成测试锁 merge-only+幂等(`dsh_register_test`);②docs 五处 + tech-design v0.10.3 行 + v0.9.15 行陈旧段收指针;③**真机 DoD(隔离沙箱 + 真 dsh 0.1.0-rc.6)①②③ PASS**:侧栏实时(mux 帧实测)+ workspace 分组 / 人插话(teal)后 dispatch 双记忆连续且 ccteam transcript 恰只含自己路由的 turn(账本诚实同证)/ operator attach 全流程(注册→手起→雇进用户实例,缺插件负臂可读 remedy 也真机撞到);附加:二雇同 pid、stop 不杀运行时、daemon 重启冷 resume 全量召回。留痕 `docs-local/versions/v0-10-3/dod-notes.md`。**真机抓出两个跨过单测防线的 bug 并修复**:缺席 profile 的 MergeOnly 产不可 boot manifest(修 = 脚手架 vendor 默认 bundles,先红后绿回归测试)/ Cordis 未 inject 服务属性访问 throw 致挂载恒静默失败(修 = vendor 官方 `ctx.get()` 可选访问器;fake 改 Cordis-faithful 属性 throw,防假绿复发)。门禁:fmt 干净、clippy 0、baseline **1961/2**(两红均在册族,隔离绿;1947→+14)、web-check 689/689、dsh_acp_test 21/4(恰在册族零新增)。
+- **偏差**:①冲突域自扩如上(规划裁决:真机修复与 seam 是 DoD 必然连带,无并行卡同域);②DoD ④ 方式二 = 回归测试覆盖(24/24),live 重跑留 owner dogfood 余项,不假报;③真机附带发现「双写窗口 teardown unlink 他人 socket」留观不修(产品正常流不触发,详 dod-notes)。
 
 ### TEST-HYG-1 两族并行测试卫生修复(`/tmp/alpha` 共享路径 + harness env-mutating lib 对)
 - **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs(tests mod)+ crates/ccteam-harness/src(model_catalog tests + dsh_acp/spawn_spec tests 迁移)` · **建议入口**:dev 会话
