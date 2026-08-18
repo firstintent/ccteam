@@ -1,3 +1,4 @@
+import type { SessionCredentialStore } from './credentials.js';
 export interface ContentBlock {
     type: string;
     text?: string;
@@ -31,6 +32,39 @@ export declare class CcteamMcpClient {
     close(): void;
     private assertOpen;
 }
+/**
+ * One MCP client per distinct daemon credential: a bearer IS an identity on the
+ * daemon, so two hires sharing one `Mcp-Session-Id` would share one ledger node.
+ * The enrollment client (mode 2, hand-installed plugin) stays shared.
+ */
+export declare class CcteamMcpClientPool {
+    private readonly daemonUrl;
+    private readonly enrollment;
+    private readonly credentials;
+    private readonly clientName;
+    private readonly clientVersion;
+    private readonly fetchImpl;
+    private readonly byCredential;
+    private enrollmentClient;
+    private readonly offRemoved;
+    constructor(options: {
+        daemonUrl: () => string;
+        enrollment: () => string | undefined;
+        credentials?: SessionCredentialStore;
+        clientName: string;
+        clientVersion: string;
+        fetchImpl?: typeof fetch;
+    });
+    /** Resolve the caller: its own session bearer when known, else enrollment. */
+    clientFor(exec: ToolRunContext): CcteamMcpClient;
+    private forEnrollment;
+    private forCredential;
+    private build;
+    private urlFor;
+    private key;
+    close(): void;
+}
+export declare function sessionIdOfAgent(agent: DshAgent | undefined): string | undefined;
 export interface ToolRunContext {
     agent?: DshAgent;
     signal?: AbortSignal;
@@ -42,10 +76,15 @@ export interface DshAgent {
         id?: string;
         events?: unknown[];
     };
+    inbox?: {
+        remove?(messageId: string): boolean;
+    };
     followup?(message: unknown): void;
     whenIdle?(): Promise<void>;
     cancel?(cause: {
         kind: string;
+    }, options?: {
+        keepInbox?: boolean;
     }): void;
     [key: string]: unknown;
 }
@@ -66,30 +105,43 @@ export interface DshToolDefinition {
     execute(args: unknown, exec: ToolRunContext): Promise<McpToolResult>;
 }
 export interface DelegationNotifier {
-    maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext): void;
+    maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext, client: CcteamMcpClient): void;
 }
+/** Resolves which daemon identity a tool call runs under. */
+export type McpClientForExec = (exec: ToolRunContext) => CcteamMcpClient;
 interface McpToolDefinition {
     name: string;
     description: string;
     inputSchema: unknown;
 }
 export declare const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[];
-export declare function registerCcteamTools(ctx: ToolRegistryContext, client: CcteamMcpClient, notifier?: DelegationNotifier): void;
+export declare function registerCcteamTools(ctx: ToolRegistryContext, clientFor: McpClientForExec, notifier?: DelegationNotifier): void;
 export declare class CcteamCompletionNotifier implements DelegationNotifier {
-    private readonly client;
     private readonly pollIntervalMs;
     private readonly maxPolls;
     private readonly sleep;
     private closed;
-    constructor(client: CcteamMcpClient, options?: {
+    constructor(options?: {
         pollIntervalMs?: number;
         maxPolls?: number;
         sleep?: (ms: number) => Promise<void>;
     });
-    maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext): void;
+    maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext, client: CcteamMcpClient): void;
     private pollAndFollowup;
     close(): void;
 }
-export declare function createUserTextMessage(text: string): unknown;
+/** A ccteam-minted user turn; its `id` is what turn attribution binds on. */
+export interface UserTextMessage {
+    readonly id: string;
+    readonly role: 'user';
+    readonly content: readonly [{
+        readonly type: 'text';
+        readonly text: string;
+    }];
+    readonly source: {
+        readonly kind: 'user';
+    };
+}
+export declare function createUserTextMessage(text: string): UserTextMessage;
 export {};
 //# sourceMappingURL=tools.d.ts.map

@@ -5,6 +5,7 @@ export declare const inject: string[];
 export interface Config extends Partial<CcteamSettings> {
     completionPollIntervalMs?: number;
     completionMaxPolls?: number;
+    transportSocket?: string;
 }
 export declare const Config: Schema<Config>;
 export interface ApplyContext {
@@ -26,6 +27,7 @@ export interface ApplyContext {
             model?: string;
         } | undefined;
     };
+    workspaceRegistry?: unknown;
     on?(event: string, handler: (...args: never[]) => unknown): () => void;
     effect?<T extends (() => void | Promise<void>) | void>(setup: () => T, label?: string): () => void;
     logger?: {

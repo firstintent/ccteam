@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { CcteamMcpClient, CCTEAM_TOOL_DEFINITIONS, registerCcteamTools } from '../src/tools.js'
+import { SessionCredentialStore } from '../src/credentials.js'
+import { CcteamMcpClient, CcteamMcpClientPool, CCTEAM_TOOL_DEFINITIONS, registerCcteamTools } from '../src/tools.js'
 
 describe('ccteam tools', () => {
   it('keeps the original MCP tool registration count and names', () => {
@@ -33,9 +34,41 @@ describe('ccteam tools', () => {
         setup()
         return () => undefined
       },
-    }, client)
+    }, () => client)
 
     expect(registered.sort()).toEqual(CCTEAM_TOOL_DEFINITIONS.map(tool => tool.name).sort())
+  })
+
+  it('pools one MCP client per distinct credential and shares the enrollment client', () => {
+    const credentials = new SessionCredentialStore()
+    credentials.set('session-a', { bearer: 'ccteam-sid:s1:aaa' })
+    credentials.set('session-b', { bearer: 'ccteam-sid:s2:bbb' })
+    credentials.set('session-c', { bearer: 'ccteam-sid:s1:aaa' })
+    const pool = new CcteamMcpClientPool({
+      daemonUrl: () => 'http://daemon.test',
+      enrollment: () => 'ccteam-enroll:e1:secret',
+      credentials,
+      clientName: 'test-client',
+      clientVersion: '0',
+    })
+
+    const a = pool.clientFor({ agent: { id: 'session-a' } })
+    const b = pool.clientFor({ agent: { id: 'session-b' } })
+    const c = pool.clientFor({ agent: { id: 'session-c' } })
+    const enrolled = pool.clientFor({ agent: { id: 'unknown-session' } })
+    const enrolledAgain = pool.clientFor({})
+
+    expect(a).not.toBe(b)
+    expect(a).toBe(c)
+    expect(enrolled).toBe(enrolledAgain)
+    expect(enrolled).not.toBe(a)
+
+    // A disposed session's client is dropped, and a later one is rebuilt.
+    credentials.delete('session-a')
+    credentials.set('session-a', { bearer: 'ccteam-sid:s1:aaa' })
+    expect(pool.clientFor({ agent: { id: 'session-a' } })).not.toBe(a)
+
+    pool.close()
   })
 
   it('initializes over streamable HTTP, captures Mcp-Session-Id, and echoes it on tool calls', async () => {

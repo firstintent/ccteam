@@ -1,0 +1,261 @@
+import { randomUUID } from 'node:crypto'
+import { connect, type Socket } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { vi } from 'vitest'
+
+export interface FakeAgent {
+  id: string
+  session: { id: string }
+  followup: ReturnType<typeof vi.fn>
+  cancel: ReturnType<typeof vi.fn>
+  whenIdle: ReturnType<typeof vi.fn>
+  inbox: { remove: ReturnType<typeof vi.fn> }
+  [key: string]: unknown
+}
+
+export interface FakeTool {
+  name: string
+  execute(args: unknown, exec: unknown): Promise<{ content: { type: string; text?: string }[]; isError: boolean }>
+}
+
+type Listener = (...args: never[]) => unknown
+
+export function makeFakeAgent(id: string): FakeAgent {
+  return {
+    id,
+    session: { id },
+    followup: vi.fn(),
+    cancel: vi.fn(),
+    whenIdle: vi.fn(async () => undefined),
+    inbox: { remove: vi.fn(() => true) },
+  }
+}
+
+export interface FakeWorkspace {
+  path: string
+  attachSession: ReturnType<typeof vi.fn>
+}
+
+/**
+ * A stand-in for the Cordis plugin context: multi-listener events, an agent
+ * registry with the live/resume ladder, an optional workspace registry, and the
+ * tool + settings surfaces `apply` needs.
+ */
+export function makeFakeCtx(options?: {
+  workspaces?: boolean
+  workspaceCreateFails?: boolean
+  attachFails?: boolean
+  settings?: Record<string, unknown>
+  resumeUnavailable?: boolean
+}) {
+  const listeners = new Map<string, Set<Listener>>()
+  const agents = new Map<string, FakeAgent>()
+  const workspaces = new Map<string, FakeWorkspace>()
+  const tools: FakeTool[] = []
+  const cleanups: unknown[] = []
+  const warnings: string[] = []
+
+  const create = vi.fn(async (request: { sessionId: string; meta?: { cwd?: string }; agentOptions?: unknown }) => {
+    const agent = makeFakeAgent(request.sessionId)
+    agents.set(request.sessionId, agent)
+    return { agent, dispose: vi.fn() }
+  })
+  const resume = vi.fn(async (request: { resumeSessionId: string }) => {
+    if (options?.resumeUnavailable === true) {
+      throw new Error(`cannot prepare session "${request.resumeSessionId}" while it is live`)
+    }
+    const agent = makeFakeAgent(request.resumeSessionId)
+    agents.set(request.resumeSessionId, agent)
+    return { agent, dispose: vi.fn() }
+  })
+  const workspaceCreate = vi.fn(async (path: string) => {
+    if (options?.workspaceCreateFails === true) throw new Error(`no such directory: ${path}`)
+    const existing = workspaces.get(path)
+    if (existing !== undefined) return existing
+    const workspace: FakeWorkspace = {
+      path,
+      attachSession: vi.fn(async () => {
+        if (options?.attachFails === true) throw new Error('attach refused')
+      }),
+    }
+    workspaces.set(path, workspace)
+    return workspace
+  })
+
+  const ctx = {
+    tools: {
+      register: vi.fn((tool: FakeTool) => {
+        tools.push(tool)
+        return vi.fn()
+      }),
+    },
+    settings: {
+      register: vi.fn(() => ({
+        get: () => ({
+          daemonUrl: 'http://daemon.test',
+          enrollment: '',
+          connectionStatus: '',
+          boundProject: '',
+          ...options?.settings,
+        }),
+      })),
+    },
+    agents: {
+      create,
+      resume,
+      get: vi.fn((id: string) => agents.get(id)),
+    },
+    ...(options?.workspaces === false ? {} : { workspaceRegistry: { create: workspaceCreate } }),
+    agentDefaultModel: {
+      currentSelection: vi.fn(() => ({ provider: 'aliyun', model: 'deepseek-v4-pro' })),
+    },
+    on: vi.fn((event: string, handler: Listener) => {
+      const bucket = listeners.get(event) ?? new Set<Listener>()
+      bucket.add(handler)
+      listeners.set(event, bucket)
+      return vi.fn(() => {
+        bucket.delete(handler)
+      })
+    }),
+    effect: vi.fn((setup: () => unknown) => {
+      cleanups.push(setup())
+      return vi.fn()
+    }),
+    logger: { warn: vi.fn((message: string) => { warnings.push(message) }) },
+  }
+
+  const emit = (event: string, ...args: unknown[]): void => {
+    for (const handler of [...(listeners.get(event) ?? [])]) {
+      (handler as (...rest: unknown[]) => unknown)(...args)
+    }
+  }
+
+  /** Run the `approval/request` waterfall over every registered listener. */
+  const requestApproval = async (request: unknown): Promise<unknown> => {
+    const handlers = [...(listeners.get('approval/request') ?? [])]
+    let index = 0
+    const next = async (): Promise<unknown> => {
+      if (index >= handlers.length) return 'unavailable'
+      const handler = handlers[index++] as (req: unknown, nxt: () => unknown) => unknown
+      return await handler(request, next)
+    }
+    return next()
+  }
+
+  const sessionEvent = (sessionId: string, type: string, data: unknown): void => {
+    emit('session/event', { id: sessionId }, { type, seq: 1, time: new Date().toISOString(), data })
+  }
+
+  return {
+    ctx,
+    tools,
+    cleanups,
+    warnings,
+    agents,
+    workspaces,
+    create,
+    resume,
+    workspaceCreate,
+    emit,
+    sessionEvent,
+    requestApproval,
+    listenerCount: (event: string) => listeners.get(event)?.size ?? 0,
+  }
+}
+
+/** Linux caps unix socket paths near 108 bytes: stay directly under tmpdir. */
+export function shortSocketPath(): string {
+  return join(tmpdir(), `cct-${randomUUID().slice(0, 8)}.sock`)
+}
+
+/** Minimal ACP client over one connection: requests, notifications, updates. */
+export class AcpClient {
+  private readonly socket: Socket
+  private buffer = ''
+  private nextId = 1
+  private readonly pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  readonly updates: Record<string, unknown>[] = []
+  permissionResponder: (params: unknown) => unknown = () => ({ outcome: { outcome: 'selected', optionId: 'allow-once' } })
+
+  private constructor(socket: Socket) {
+    this.socket = socket
+    socket.setEncoding('utf8')
+    socket.on('data', chunk => this.receive(String(chunk)))
+  }
+
+  static connect(path: string): Promise<AcpClient> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(path)
+      socket.once('error', reject)
+      socket.once('connect', () => {
+        socket.off('error', reject)
+        socket.on('error', () => undefined)
+        resolve(new AcpClient(socket))
+      })
+    })
+  }
+
+  private receive(chunk: string): void {
+    this.buffer += chunk
+    for (;;) {
+      const newline = this.buffer.indexOf('\n')
+      if (newline < 0) break
+      const line = this.buffer.slice(0, newline).trim()
+      this.buffer = this.buffer.slice(newline + 1)
+      if (line === '') continue
+      const message = JSON.parse(line) as Record<string, unknown>
+      if (message.method === 'session/update') {
+        this.updates.push(message.params as Record<string, unknown>)
+        continue
+      }
+      if (message.method === 'session/request_permission') {
+        const result = this.permissionResponder(message.params)
+        this.write({ jsonrpc: '2.0', id: message.id, result })
+        continue
+      }
+      if (message.id === undefined) continue
+      const waiter = this.pending.get(String(message.id))
+      if (waiter === undefined) continue
+      this.pending.delete(String(message.id))
+      if (message.error !== undefined) {
+        waiter.reject(new Error(JSON.stringify(message.error)))
+      } else {
+        waiter.resolve(message.result)
+      }
+    }
+  }
+
+  request(method: string, params: unknown): Promise<any> {
+    const id = `c${this.nextId++}`
+    const promise = new Promise<unknown>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+    })
+    this.write({ jsonrpc: '2.0', id, method, params })
+    return promise as Promise<any>
+  }
+
+  notify(method: string, params: unknown): void {
+    this.write({ jsonrpc: '2.0', method, params })
+  }
+
+  private write(message: unknown): void {
+    this.socket.write(`${JSON.stringify(message)}\n`)
+  }
+
+  close(): void {
+    this.socket.destroy()
+  }
+}
+
+export async function waitFor(predicate: () => boolean, label = 'condition'): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out waiting for ${label}`)
+}
+
+export async function settle(ticks = 3): Promise<void> {
+  for (let i = 0; i < ticks; i++) await new Promise(resolve => setTimeout(resolve, 1))
+}

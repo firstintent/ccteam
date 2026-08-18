@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { createUserTextMessage } from './tools.js';
+import { mkdirSync, unlinkSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { dirname } from 'node:path';
+import { parseCcteamMeta } from './credentials.js';
+import { createUserTextMessage, sessionIdOfAgent } from './tools.js';
 class RpcError extends Error {
     code;
     data;
@@ -10,24 +14,152 @@ class RpcError extends Error {
         this.data = data;
     }
 }
-export function shouldStartTransport(env, bootBearer) {
-    return env.CCTEAM_DSH_TRANSPORT === '1' && typeof bootBearer === 'string' && bootBearer.startsWith('ccteam-sid:');
+/**
+ * Serializes `workspaceRegistry.create` the way the DSH host does: concurrent
+ * creates of one path would otherwise race to own the same canonical directory.
+ */
+export class WorkspaceMounter {
+    ctx;
+    chain = Promise.resolve();
+    constructor(ctx) {
+        this.ctx = ctx;
+    }
+    async mount(cwd, sessionId) {
+        const registry = this.ctx.workspaceRegistry;
+        if (registry === undefined) {
+            this.ctx.logger?.warn(`ccteam dsh transport: no workspaceRegistry, session ${sessionId} stays ungrouped`);
+            return;
+        }
+        const operation = this.chain.then(() => registry.create(cwd));
+        this.chain = operation.then(() => undefined, () => undefined);
+        const workspace = await operation;
+        await workspace.attachSession(sessionId);
+    }
 }
-export function startDshTransport(ctx, options) {
-    const server = new DshAcpServer(ctx, options);
+/** Unix-socket ACP listener: one isolated {@link DshAcpServer} per connection. */
+export class DshSocketTransport {
+    ctx;
+    options;
+    workspaces;
+    peers = new Set();
+    server;
+    offDisposed;
+    closed = false;
+    constructor(ctx, options) {
+        this.ctx = ctx;
+        this.options = options;
+        this.workspaces = new WorkspaceMounter(ctx);
+    }
+    /** Bind the socket. Never throws: a bind failure warns and leaves the plugin working. */
+    async listen() {
+        if (this.closed || this.server !== undefined)
+            return;
+        const path = this.options.socketPath;
+        try {
+            mkdirSync(dirname(path), { recursive: true });
+        }
+        catch {
+            // the parent directory is the caller's business; listen reports the real failure
+        }
+        try {
+            unlinkSync(path);
+        }
+        catch {
+            // no stale socket file to remove
+        }
+        const server = createServer(socket => this.accept(socket));
+        this.offDisposed = this.ctx.on?.('session/disposed', ((session) => {
+            const sessionId = sessionIdFromSession(session);
+            if (sessionId !== undefined)
+                this.options.credentials.delete(sessionId);
+        }));
+        await new Promise(resolve => {
+            const onListenError = (error) => {
+                this.ctx.logger?.warn(`ccteam dsh transport cannot listen on ${path}: ${errorMessage(error)}`);
+                try {
+                    server.close();
+                }
+                catch {
+                    // never bound
+                }
+                resolve();
+            };
+            server.once('error', onListenError);
+            server.listen(path, () => {
+                server.off('error', onListenError);
+                server.on('error', error => {
+                    this.ctx.logger?.warn(`ccteam dsh transport socket error: ${errorMessage(error)}`);
+                });
+                this.server = server;
+                resolve();
+            });
+        });
+    }
+    accept(socket) {
+        if (this.closed) {
+            socket.destroy();
+            return;
+        }
+        const peer = new DshAcpServer(this.ctx, {
+            version: this.options.version,
+            input: socket,
+            output: socket,
+            credentials: this.options.credentials,
+            workspaces: this.workspaces,
+        });
+        const entry = { socket, teardown: peer.start() };
+        this.peers.add(entry);
+        const drop = () => {
+            if (!this.peers.delete(entry))
+                return;
+            void entry.teardown().catch(() => undefined);
+        };
+        socket.on('close', drop);
+        socket.on('error', error => {
+            this.ctx.logger?.warn(`ccteam dsh transport peer error: ${errorMessage(error)}`);
+        });
+    }
+    async close() {
+        this.closed = true;
+        this.offDisposed?.();
+        this.offDisposed = undefined;
+        const server = this.server;
+        this.server = undefined;
+        const peers = [...this.peers];
+        this.peers.clear();
+        for (const peer of peers)
+            peer.socket.destroy();
+        await Promise.allSettled(peers.map(peer => peer.teardown()));
+        if (server !== undefined) {
+            await new Promise(resolve => server.close(() => resolve()));
+        }
+    }
+}
+/**
+ * Start the socket transport, scoped to the plugin effect when available.
+ * @returns a teardown that closes the listener and its peers.
+ */
+export function startDshSocketTransport(ctx, options) {
+    const transport = new DshSocketTransport(ctx, options);
+    const setup = () => {
+        void transport.listen();
+        return () => transport.close();
+    };
     if (typeof ctx.effect === 'function') {
-        ctx.effect(() => server.start(), 'ccteam.dsh.transport');
+        ctx.effect(setup, 'ccteam.dsh.transport');
     }
     else {
-        server.start();
+        setup();
     }
+    return () => transport.close();
 }
 export class DshAcpServer {
     ctx;
     version;
     input;
     output;
-    approvalMode;
+    credentials;
+    workspaces;
     sessions = new Map();
     pendingClientRequests = new Map();
     buffer = '';
@@ -35,9 +167,10 @@ export class DshAcpServer {
     constructor(ctx, options) {
         this.ctx = ctx;
         this.version = options.version;
-        this.input = options.input ?? process.stdin;
-        this.output = options.output ?? process.stdout;
-        this.approvalMode = options.approvalMode ?? 'skip';
+        this.input = options.input;
+        this.output = options.output;
+        this.credentials = options.credentials;
+        this.workspaces = options.workspaces ?? new WorkspaceMounter(ctx);
     }
     start() {
         const onData = (chunk) => this.receive(chunk);
@@ -62,12 +195,14 @@ export class DshAcpServer {
             offSession?.();
             offError?.();
             offApproval?.();
+            // Agents stay live and un-cancelled: the human at the DSH UI owns them too.
             const records = [...this.sessions.values()];
             this.sessions.clear();
-            await Promise.allSettled(records.map(async (record) => {
-                record.agent.cancel?.({ kind: 'user' });
-                await record.dispose?.();
-            }));
+            for (const record of records) {
+                const inflight = record.inflight;
+                record.inflight = undefined;
+                inflight?.reject(new RpcError('ccteam transport connection closed', -32603));
+            }
         };
     }
     receive(chunk) {
@@ -134,9 +269,18 @@ export class DshAcpServer {
             const record = this.sessions.get(sessionId);
             if (record === undefined)
                 return;
-            record.agent.cancel?.({ kind: 'user' });
-            record.inflight?.resolve({ stopReason: 'cancelled', _meta: { stopReason: 'cancelled' } });
+            const inflight = record.inflight;
+            if (inflight === undefined)
+                return;
             record.inflight = undefined;
+            if (this.ownsActiveTurn(record, inflight)) {
+                record.agent.cancel?.({ kind: 'user' });
+            }
+            else if (record.agent.inbox?.remove?.(inflight.messageId) !== true) {
+                // Not still queued (or no inbox surface): fall back to aborting the agent.
+                record.agent.cancel?.({ kind: 'user' });
+            }
+            inflight.resolve({ stopReason: 'cancelled', _meta: { stopReason: 'cancelled' } });
         }
     }
     async handleRequest(method, params) {
@@ -166,6 +310,9 @@ export class DshAcpServer {
         const cwd = requireString(body, 'cwd');
         const sessionId = randomUUID();
         const agentOptions = this.resolveAgentOptions(body.agentOptions);
+        const meta = parseCcteamMeta(body);
+        if (meta !== undefined)
+            this.credentials?.set(sessionId, meta);
         let handle;
         try {
             const request = {
@@ -177,32 +324,44 @@ export class DshAcpServer {
             handle = await this.ctx.agents.create(request);
         }
         catch (error) {
+            this.credentials?.delete(sessionId);
             throw errorToRpc(error);
         }
-        this.sessions.set(sessionId, {
-            agent: handle.agent,
-            dispose: handle.dispose?.bind(handle),
-        });
+        this.sessions.set(sessionId, { agent: handle.agent });
+        try {
+            await this.workspaces.mount(cwd, sessionId);
+        }
+        catch (error) {
+            this.ctx.logger?.warn(`ccteam dsh transport could not mount ${cwd}: ${errorMessage(error)}`);
+        }
         return { sessionId, ...modelInfoFromAgentOptions(agentOptions) };
     }
     async loadSession(params) {
         const body = requireRecord(params, 'session/load params');
         const sessionId = requireString(body, 'sessionId');
         const agentOptions = this.resolveAgentOptions(body.agentOptions);
-        let handle;
+        const meta = parseCcteamMeta(body);
+        if (meta !== undefined)
+            this.credentials?.set(sessionId, meta);
+        let agent;
         try {
-            handle = await this.ctx.agents.resume({
-                resumeSessionId: sessionId,
-                ...agentOptions === undefined ? {} : { agentOptions },
-            });
+            // Reuse-live-first: `agents.resume` rejects while the session is already live.
+            const live = this.ctx.agents.get?.(sessionId);
+            if (live !== undefined) {
+                agent = live;
+            }
+            else {
+                const handle = await this.ctx.agents.resume({
+                    resumeSessionId: sessionId,
+                    ...agentOptions === undefined ? {} : { agentOptions },
+                });
+                agent = handle.agent;
+            }
         }
         catch (error) {
             throw errorToRpc(error);
         }
-        this.sessions.set(sessionId, {
-            agent: handle.agent,
-            dispose: handle.dispose?.bind(handle),
-        });
+        this.sessions.set(sessionId, { agent });
         return { sessionId, ...modelInfoFromAgentOptions(agentOptions) };
     }
     async prompt(params) {
@@ -216,35 +375,27 @@ export class DshAcpServer {
         const text = acpPromptToText(body.prompt);
         if (text.trim() === '')
             throw new RpcError('empty prompt', -32602);
-        const result = await new Promise((resolve, reject) => {
+        const message = createUserTextMessage(text);
+        return new Promise((resolve, reject) => {
             record.inflight = {
                 resolve,
                 reject,
                 usage: {},
+                messageId: message.id,
+                bindNextTurn: false,
+                toolCalls: new Set(),
             };
             try {
-                if (typeof record.agent.followup !== 'function' || typeof record.agent.whenIdle !== 'function') {
+                if (typeof record.agent.followup !== 'function') {
                     throw new Error('agent cannot accept prompts');
                 }
-                record.agent.followup(createUserTextMessage(text));
+                record.agent.followup(message);
             }
             catch (error) {
                 record.inflight = undefined;
                 reject(errorToRpc(error, 'prompt was not queued'));
-                return;
             }
-            void record.agent.whenIdle().then(() => {
-                const inflight = record.inflight;
-                if (inflight === undefined)
-                    return;
-                record.inflight = undefined;
-                resolve(promptResultFromReason(inflight.endReason, inflight.usage));
-            }, error => {
-                record.inflight = undefined;
-                reject(errorToRpc(error, 'turn failed'));
-            });
         });
-        return result;
     }
     onSessionEvent(session, event) {
         const sessionId = sessionIdFromSession(session);
@@ -257,18 +408,50 @@ export class DshAcpServer {
         const type = typeof ev.type === 'string' ? ev.type : '';
         const data = asRecord(ev.data);
         switch (type) {
+            case 'turn/start': {
+                const turn = numberField(data, 'turn');
+                record.openTurn = turn;
+                const inflight = record.inflight;
+                if (inflight !== undefined && inflight.bindNextTurn && turn !== undefined) {
+                    inflight.bindNextTurn = false;
+                    inflight.ownedTurn = turn;
+                }
+                break;
+            }
+            case 'user/message': {
+                const inflight = record.inflight;
+                if (inflight === undefined || inflight.ownedTurn !== undefined)
+                    break;
+                if (stringField(data, 'id') !== inflight.messageId)
+                    break;
+                if (record.openTurn === undefined) {
+                    inflight.bindNextTurn = true;
+                    break;
+                }
+                inflight.ownedTurn = record.openTurn;
+                break;
+            }
             case 'assistant/message':
+                if (!this.ownsTurn(record, numberField(data, 'turn')))
+                    break;
                 this.onAssistantMessage(sessionId, data, record);
                 break;
             case 'assistant/chunk':
+                if (!this.ownsTurn(record, numberField(data, 'turn')))
+                    break;
                 this.onAssistantChunk(sessionId, data, record);
                 break;
-            case 'tool/call':
+            case 'tool/call': {
+                if (!this.ownsTurn(record, numberField(data, 'turn')))
+                    break;
+                const callId = stringField(data, 'callId');
+                if (callId !== undefined)
+                    record.inflight?.toolCalls.add(callId);
                 this.notify({
                     sessionId,
                     update: {
                         sessionUpdate: 'tool_call',
-                        toolCallId: stringField(data, 'callId') ?? 'tool',
+                        toolCallId: callId ?? 'tool',
                         name: stringField(data, 'name') ?? 'tool',
                         title: stringField(data, 'name') ?? 'tool',
                         rawInput: parseMaybeJson(data.arguments),
@@ -276,36 +459,63 @@ export class DshAcpServer {
                     },
                 });
                 break;
-            case 'tool/result':
+            }
+            case 'tool/result': {
+                const callId = stringField(asRecord(asRecord(data.message).source), 'callId');
+                if (!this.ownsToolResult(record, numberField(data, 'turn'), callId))
+                    break;
                 this.notify({
                     sessionId,
                     update: {
                         sessionUpdate: 'tool_call_update',
-                        toolCallId: stringField(asRecord(asRecord(data.message).source), 'callId') ?? 'tool',
+                        toolCallId: callId ?? 'tool',
                         status: 'completed',
                         content: toolResultText(data),
                         isError: toolResultIsError(data),
                     },
                 });
                 break;
-            case 'turn/end':
+            }
+            case 'turn/end': {
+                const turn = numberField(data, 'turn');
+                if (turn === undefined || record.openTurn === turn)
+                    record.openTurn = undefined;
+                const inflight = record.inflight;
+                if (inflight === undefined || !this.ownsTurn(record, turn))
+                    break;
+                record.inflight = undefined;
                 this.notify({
                     sessionId,
                     update: { sessionUpdate: 'turn_completed' },
                 });
-                if (record.inflight !== undefined) {
-                    const reason = asRecord(data).reason;
-                    if (isErrorReason(reason)) {
-                        const failure = asRecord(reason).error;
-                        record.inflight.reject(new RpcError(`turn failed: ${failureMessage(failure)}`, -32603, failure));
-                        record.inflight = undefined;
-                    }
-                    else {
-                        record.inflight.endReason = reason;
-                    }
+                const reason = data.reason;
+                if (isErrorReason(reason)) {
+                    const failure = asRecord(reason).error;
+                    inflight.reject(new RpcError(`turn failed: ${failureMessage(failure)}`, -32603, failure));
+                }
+                else {
+                    inflight.resolve(promptResultFromReason(reason, inflight.usage));
                 }
                 break;
+            }
         }
+    }
+    /** True while `turn` is the turn that claimed this transport's queued message. */
+    ownsTurn(record, turn) {
+        const owned = record.inflight?.ownedTurn;
+        return owned !== undefined && turn !== undefined && owned === turn;
+    }
+    /** True while the owned turn is also the turn currently running on the agent. */
+    ownsActiveTurn(record, inflight) {
+        const owned = (inflight ?? record.inflight)?.ownedTurn;
+        return owned !== undefined && record.openTurn === owned;
+    }
+    ownsToolResult(record, turn, callId) {
+        if (this.ownsTurn(record, turn))
+            return true;
+        if (turn !== undefined)
+            return false;
+        return callId !== undefined && record.inflight?.toolCalls.has(callId) === true;
     }
     onAssistantMessage(sessionId, data, record) {
         const message = asRecord(data.message);
@@ -353,26 +563,34 @@ export class DshAcpServer {
     onAgentError(payload) {
         const body = asRecord(payload);
         const agent = body.agent;
-        const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : undefined;
+        const sessionId = sessionIdOfAgent(agent);
         if (sessionId === undefined)
             return;
         const record = this.sessions.get(sessionId);
-        if (record === undefined)
+        if (record === undefined || record.agent !== agent)
             return;
         const inflight = record.inflight;
         if (inflight === undefined)
             return;
+        const turn = numberField(body, 'turn');
+        if (inflight.ownedTurn !== undefined && turn !== undefined && inflight.ownedTurn !== turn)
+            return;
         record.inflight = undefined;
+        record.openTurn = undefined;
         inflight.reject(errorToRpc(body.error, 'turn failed'));
     }
     onApprovalRequest(request, next) {
         const body = asRecord(request);
         const agent = body.agent;
-        const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : undefined;
-        if (sessionId === undefined || this.sessions.get(sessionId)?.agent !== agent) {
+        const sessionId = sessionIdOfAgent(agent);
+        if (sessionId === undefined)
+            return next();
+        const record = this.sessions.get(sessionId);
+        // A human-initiated turn on a hired session keeps its own approval route.
+        if (record === undefined || record.agent !== agent || !this.ownsActiveTurn(record)) {
             return next();
         }
-        if (this.approvalMode !== 'hitl') {
+        if ((this.credentials?.get(sessionId)?.approvalMode ?? 'skip') !== 'hitl') {
             return 'allowed-once';
         }
         return this.requestPermission(sessionId, stringField(body, 'callId') ?? 'tool').then(result => {
