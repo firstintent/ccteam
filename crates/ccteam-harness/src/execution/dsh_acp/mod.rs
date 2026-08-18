@@ -78,14 +78,14 @@ struct LiveSession {
 /// Resolve the ccteam `mode` axis to a DSH agent-preset id. The vendor's
 /// shipped presets are `standard` | `code` (displayed "PTC") | `minimal` |
 /// `cordis` (displayed "creator"); ccteam accepts both spellings and an unset
-/// mode defaults a hire to PTC (owner decree — DSH's own web default is
-/// `standard`). Presets pick the TOOLSET: a session created without one has no
+/// mode defaults a hire to `standard` (owner decree, matching DSH's own web
+/// default). Presets pick the TOOLSET: a session created without one has no
 /// bash/read/write at all in the web runtime.
 pub fn mode_agent_preset(mode: Option<&str>) -> Result<String, HarnessError> {
     let token = mode
         .map(str::trim)
         .filter(|m| !m.is_empty())
-        .unwrap_or("ptc");
+        .unwrap_or("standard");
     match token.to_ascii_lowercase().as_str() {
         "ptc" | "code" => Ok("code".to_string()),
         "standard" => Ok("standard".to_string()),
@@ -93,7 +93,7 @@ pub fn mode_agent_preset(mode: Option<&str>) -> Result<String, HarnessError> {
         "creator" | "cordis" => Ok("cordis".to_string()),
         other => Err(HarnessError::SpawnFailed(format!(
             "unknown DSH session mode `{other}`: accepts standard | ptc (code) | minimal | \
-             creator (cordis); omit it for the ccteam default (ptc)"
+             creator (cordis); omit it for the ccteam default (standard)"
         ))),
     }
 }
@@ -729,8 +729,8 @@ mod tests {
 
     #[test]
     fn mode_tokens_resolve_to_vendor_preset_ids() {
-        assert_eq!(mode_agent_preset(None).unwrap(), "code");
-        assert_eq!(mode_agent_preset(Some("")).unwrap(), "code");
+        assert_eq!(mode_agent_preset(None).unwrap(), "standard");
+        assert_eq!(mode_agent_preset(Some("")).unwrap(), "standard");
         assert_eq!(mode_agent_preset(Some("ptc")).unwrap(), "code");
         assert_eq!(mode_agent_preset(Some("PTC")).unwrap(), "code");
         assert_eq!(mode_agent_preset(Some("code")).unwrap(), "code");

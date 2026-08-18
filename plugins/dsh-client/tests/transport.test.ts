@@ -236,6 +236,40 @@ describe('DSH ACP socket transport', () => {
     expect(h.agentPresets.mount).not.toHaveBeenCalled()
   })
 
+  it('pins danger-full-access on a skip-posture hire', async () => {
+    const h = await startTransport()
+    const client = await connectClient(h.socketPath)
+
+    const created = await client.request('session/new', {
+      cwd: '/tmp/work',
+      _meta: { ccteam: { sid: 's8', bearer: 'ccteam-sid:s8:x', approvalMode: 'skip' } },
+    })
+
+    const agent = h.agents.get(created.sessionId as string)!
+    expect(h.permissionPresets.set).toHaveBeenCalledWith(agent.session, 'danger-full-access')
+  })
+
+  it('keeps the vendor default permission preset on a hitl hire', async () => {
+    const h = await startTransport()
+    const client = await connectClient(h.socketPath)
+
+    await client.request('session/new', {
+      cwd: '/tmp/work',
+      _meta: { ccteam: { sid: 's8', bearer: 'ccteam-sid:s8:x', approvalMode: 'hitl' } },
+    })
+
+    expect(h.permissionPresets.set).not.toHaveBeenCalled()
+  })
+
+  it('creates the session with a warning when permissionPresets is absent', async () => {
+    const h = await startTransport({ permissions: false })
+    const client = await connectClient(h.socketPath)
+
+    const created = await client.request('session/new', { cwd: '/tmp/work' })
+    expect(created.sessionId).toBeTypeOf('string')
+    expect(h.warnings.some(line => line.includes('permissionPresets'))).toBe(true)
+  })
+
   it('creates the session without a workspaceRegistry and warns', async () => {
     const h = await startTransport({ workspaces: false })
     const client = await connectClient(h.socketPath)

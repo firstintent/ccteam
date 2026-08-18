@@ -914,8 +914,8 @@ async fn session_new_carries_the_per_session_ccteam_identity() {
             "bearer": "ccteam-sid:s-meta:seKret1234",
             "mcpUrl": "http://127.0.0.1:65535/mcp",
             "approvalMode": "skip",
-            // Unset mode = the ccteam default: PTC (vendor preset id `code`).
-            "agentPreset": "code",
+            // Unset mode = the ccteam default: `standard` (the vendor's own).
+            "agentPreset": "standard",
         })),
         "session/new must install this hire's ccteam identity: {params}"
     );

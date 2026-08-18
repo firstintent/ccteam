@@ -52,6 +52,8 @@ export function makeFakeCtx(options?: {
   presets?: boolean
   /** When set, `sessionPersistence.inspect` serves this snapshot. */
   persistence?: { meta?: Record<string, unknown>; events?: unknown[] }
+  /** `false` hides the `permissionPresets` service. */
+  permissions?: boolean
 }) {
   const listeners = new Map<string, Set<Listener>>()
   const agents = new Map<string, FakeAgent>()
@@ -93,6 +95,7 @@ export function makeFakeCtx(options?: {
     mount: vi.fn(async (_agentCtx: unknown, _id?: string) => undefined),
   }
   const persistenceInspect = vi.fn(async (_sessionId: string) => options?.persistence ?? {})
+  const permissionPresets = { set: vi.fn((_session: unknown, _name: string) => undefined) }
 
   const ctx = {
     tools: {
@@ -128,6 +131,9 @@ export function makeFakeCtx(options?: {
       }
       if (name === 'sessionPersistence' && options?.persistence !== undefined) {
         return { inspect: persistenceInspect }
+      }
+      if (name === 'permissionPresets' && options?.permissions !== false) {
+        return permissionPresets
       }
       return undefined
     }),
@@ -192,6 +198,7 @@ export function makeFakeCtx(options?: {
     workspaceCreate,
     agentPresets,
     persistenceInspect,
+    permissionPresets,
     emit,
     sessionEvent,
     requestApproval,

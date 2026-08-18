@@ -4,6 +4,7 @@ import { createServer } from 'node:net';
 import { dirname } from 'node:path';
 import { parseCcteamMeta } from './credentials.js';
 import { createUserTextMessage, sessionIdOfAgent } from './tools.js';
+const HIRE_PERMISSION_PRESET = 'danger-full-access';
 class RpcError extends Error {
     code;
     data;
@@ -413,6 +414,9 @@ export class DshAcpServer {
             throw errorToRpc(error);
         }
         this.sessions.set(sessionId, { agent: handle.agent });
+        if ((meta?.approvalMode ?? 'skip') !== 'hitl') {
+            this.applyHirePermissionPreset(sessionId, handle.agent);
+        }
         try {
             await this.workspaces.mount(cwd, sessionId);
         }
@@ -420,6 +424,21 @@ export class DshAcpServer {
             this.ctx.logger?.warn(`ccteam dsh transport could not mount ${cwd}: ${errorMessage(error)}`);
         }
         return { sessionId, ...modelInfoFromAgentOptions(agentOptions) };
+    }
+    /** Full access for a `skip`-posture hire; best-effort, never fails the create. */
+    applyHirePermissionPreset(sessionId, agent) {
+        const svc = typeof this.ctx.get === 'function' ? this.ctx.get('permissionPresets') : undefined;
+        const presets = svc;
+        if (typeof presets?.set !== 'function') {
+            this.ctx.logger?.warn(`ccteam dsh transport: no permissionPresets service, session ${sessionId} keeps the runtime default`);
+            return;
+        }
+        try {
+            presets.set(agent.session, HIRE_PERMISSION_PRESET);
+        }
+        catch (error) {
+            this.ctx.logger?.warn(`ccteam dsh transport could not set ${HIRE_PERMISSION_PRESET} on ${sessionId}: ${errorMessage(error)}`);
+        }
     }
     async loadSession(params) {
         const body = requireRecord(params, 'session/load params');

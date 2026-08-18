@@ -1178,7 +1178,7 @@ pub struct SpawnCtx {
     /// (`spawn_pick_refused`) instead of quietly ignoring it. Today only DSH
     /// consumes it — its agent presets `standard` | `ptc`/`code` | `minimal`
     /// | `creator`/`cordis` pick the toolset; unset ccteam-hires default to
-    /// PTC (`code`).
+    /// `standard`.
     pub mode: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops

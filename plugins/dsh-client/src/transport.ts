@@ -46,6 +46,19 @@ interface DshSessionPersistence {
   inspect(sessionId: string): Promise<{ meta?: unknown; events?: unknown[] }>
 }
 
+/**
+ * DSH's permission-preset roster (Cordis service `permissionPresets`).
+ * `set(session, name)` records the preset and rewrites the sandbox/approval
+ * knobs. ccteam hires default to `danger-full-access` (full file access, no
+ * approval prompts — the DSH counterpart of ccteam's `skip` posture); a
+ * `hitl` hire keeps the vendor's pinned default so approvals keep flowing.
+ */
+interface DshPermissionPresets {
+  set(session: unknown, name: string): void
+}
+
+const HIRE_PERMISSION_PRESET = 'danger-full-access'
+
 export interface DshWorkspaceRegistry {
   create(path: string, title?: string): Promise<DshWorkspace>
 }
@@ -560,12 +573,34 @@ export class DshAcpServer {
       throw errorToRpc(error)
     }
     this.sessions.set(sessionId, { agent: handle.agent })
+    if ((meta?.approvalMode ?? 'skip') !== 'hitl') {
+      this.applyHirePermissionPreset(sessionId, handle.agent)
+    }
     try {
       await this.workspaces.mount(cwd, sessionId)
     } catch (error) {
       this.ctx.logger?.warn(`ccteam dsh transport could not mount ${cwd}: ${errorMessage(error)}`)
     }
     return { sessionId, ...modelInfoFromAgentOptions(agentOptions) }
+  }
+
+  /** Full access for a `skip`-posture hire; best-effort, never fails the create. */
+  private applyHirePermissionPreset(sessionId: string, agent: DshAgent): void {
+    const svc = typeof this.ctx.get === 'function' ? this.ctx.get('permissionPresets') : undefined
+    const presets = svc as DshPermissionPresets | undefined
+    if (typeof presets?.set !== 'function') {
+      this.ctx.logger?.warn(
+        `ccteam dsh transport: no permissionPresets service, session ${sessionId} keeps the runtime default`,
+      )
+      return
+    }
+    try {
+      presets.set(agent.session, HIRE_PERMISSION_PRESET)
+    } catch (error) {
+      this.ctx.logger?.warn(
+        `ccteam dsh transport could not set ${HIRE_PERMISSION_PRESET} on ${sessionId}: ${errorMessage(error)}`,
+      )
+    }
   }
 
   private async loadSession(params: unknown): Promise<{ sessionId: string }> {

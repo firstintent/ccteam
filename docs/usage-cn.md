@@ -122,7 +122,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 **DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
 
-一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`session_spawn`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `ptc`;`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它。
+一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`session_spawn`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `standard`,`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它;雇佣会话权限 preset 默认 `danger-full-access`(全文件访问、免审批),spawn 时选 `hitl` 则保留逐次审批。
 
 - **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程——此时雇 DSH 需要那个实例里装有 ccteam 插件(**Hosts** 页一键注册,然后你自己重启它;ccteam 绝不重启不是它起的进程)。没有原生实例时 ccteam 自己在临时 loopback 端口启动,插件已注册。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
 - **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`;从 ccteam 雇的 DSH 会话也住这个家,所以会出现在 DSH 页里。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件物化每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。

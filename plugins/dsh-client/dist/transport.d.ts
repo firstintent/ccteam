@@ -146,6 +146,8 @@ export declare class DshAcpServer {
      */
     private storedPreset;
     private newSession;
+    /** Full access for a `skip`-posture hire; best-effort, never fails the create. */
+    private applyHirePermissionPreset;
     private loadSession;
     private prompt;
     private onSessionEvent;

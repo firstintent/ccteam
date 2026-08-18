@@ -439,7 +439,7 @@ export interface CreateSessionOpts {
   effort?: string;
   /** Vendor session-mode token. DSH only today: its agent preset —
    *  `standard` | `ptc` | `minimal` | `creator`; omitted → DSH hires default
-   *  to `ptc`. Other vendors refuse a non-empty mode. */
+   *  to `standard`. Other vendors refuse a non-empty mode. */
   mode?: string;
 }
 
