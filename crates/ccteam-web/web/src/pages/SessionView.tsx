@@ -61,18 +61,39 @@ function formatAttachmentSize(size: number): string {
 }
 
 /** A row's server-side timestamp (WEB-TS-1, `row.ts` — RFC 3339) rendered as
- *  local `HH:MM`; the full date-time rides the tooltip. Sits on its own line
- *  under the bubble, so it never squeezes the bubble on narrow viewports.
- *  Absent/unparseable `ts` (old daemons, rows persisted before this field)
- *  renders nothing. */
-function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
-  if (!ts) return null;
+ *  local `HH:MM` for today, `MM-DD HH:MM` within the current year, and
+ *  `YYYY-MM-DD HH:MM` for older rows; the full date-time rides the tooltip.
+ *  Sits on its own line under the bubble, so it never squeezes the bubble on
+ *  narrow viewports. Absent/unparseable `ts` (old daemons, rows persisted
+ *  before this field) renders nothing. */
+function rowTimeParts(ts: string, now: Date): { date: boolean; year: boolean } | null {
   const when = new Date(ts);
   if (Number.isNaN(when.getTime())) return null;
+  return {
+    date: when.toDateString() !== now.toDateString(),
+    year: when.getFullYear() !== now.getFullYear(),
+  };
+}
+
+export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
+  if (!ts) return null;
+  const when = new Date(ts);
+  const parts = rowTimeParts(ts, new Date());
+  if (!parts) return null;
   const locale = lang === "en" ? "en-US" : "zh-CN";
+  const text = when.toLocaleString(locale, {
+    ...(parts.date
+      ? parts.year
+        ? { year: "numeric" as const, month: "2-digit" as const, day: "2-digit" as const }
+        : { month: "2-digit" as const, day: "2-digit" as const }
+      : {}),
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
   return (
     <time className="msg-time" dateTime={ts} title={when.toLocaleString(locale)}>
-      {when.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", hour12: false })}
+      {text}
     </time>
   );
 }

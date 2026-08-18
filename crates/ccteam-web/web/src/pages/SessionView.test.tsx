@@ -24,7 +24,7 @@ vi.hoisted(() => {
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 
-import SessionView from "./SessionView";
+import SessionView, { RowTime } from "./SessionView";
 import { rowsKeyFor } from "./chatTranscript";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 import type { SessionEvent } from "../hooks/useSessionEvents";
@@ -696,5 +696,36 @@ describe("SessionView header status dot (WEB-STATUS-1)", () => {
     } finally {
       unmockDotView();
     }
+  });
+});
+
+describe("RowTime date visibility", () => {
+  it("shows time only for today, date within the year, full date for older", () => {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 9, 5);
+    const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 9, 5);
+    const lastYear = new Date(now.getFullYear() - 1, 5, 15, 9, 5);
+
+    const textOf = (html: string) => html.match(/>([^<]*)<\/time>/)?.[1] ?? "";
+
+    const todayHtml = renderToString(<RowTime ts={today.toISOString()} lang="en" />);
+    expect(textOf(todayHtml)).toBe("09:05");
+
+    const yesterdayHtml = renderToString(<RowTime ts={yesterday.toISOString()} lang="en" />);
+    expect(textOf(yesterdayHtml)).toMatch(/\d{2}\/\d{2}.{0,3}09:05/);
+    expect(textOf(yesterdayHtml)).not.toContain(String(now.getFullYear()));
+
+    const lastYearHtml = renderToString(<RowTime ts={lastYear.toISOString()} lang="en" />);
+    expect(textOf(lastYearHtml)).toContain(String(now.getFullYear() - 1));
+    expect(textOf(lastYearHtml)).toContain("09:05");
+
+    // zh locale carries the date too.
+    const zhHtml = renderToString(<RowTime ts={yesterday.toISOString()} lang="zh" />);
+    expect(textOf(zhHtml)).toMatch(/\d{2}\/\d{2}/);
+  });
+
+  it("renders nothing for absent or unparseable ts", () => {
+    expect(renderToString(<RowTime lang="en" />)).toBe("");
+    expect(renderToString(<RowTime ts="not-a-date" lang="en" />)).toBe("");
   });
 });
