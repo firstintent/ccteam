@@ -1574,7 +1574,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         {
             (None, None, None)
         } else {
-            match ccteam_im::build_gateway_for_daemon(None) {
+            match ccteam_im::build_gateway_for_daemon(None, std::sync::Arc::clone(&dsh_runtime)) {
                 Ok((mut g, adapter, pi_rpc)) => {
                     g.set_remote_host_proxy(std::sync::Arc::new(
                         ccteam_im::remote_host::HubRemoteHostProxy::new(host_hub.clone()),
@@ -1667,6 +1667,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             let web_mcp_sink = gw_event_tx.clone();
             let web_mcp_pending = pending_registry.clone();
             let web_host_hub = host_hub.clone();
+            let web_dsh_runtime = std::sync::Arc::clone(&dsh_runtime);
             Some(tokio::spawn(async move {
                 ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
@@ -1682,7 +1683,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         state = state.with_host_hub(web_host_hub);
                         state
                     },
-                    Some(dsh_runtime),
+                    Some(web_dsh_runtime),
                     async move {
                         let _ = rx.changed().await;
                     },
@@ -1710,6 +1711,10 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 // the EXACT adapter this gateway spawns sessions through.
                 claude_stream_json_adapter: shared_claude_stream_json.clone(),
                 pi_rpc_adapter: shared_pi_rpc.clone(),
+                // v0.10.3 — same reasoning for DSH: when the daemon has to
+                // build its own gateway (web off), its DSH adapter must still
+                // hold THIS process's one runtime manager.
+                dsh_runtime: Some(std::sync::Arc::clone(&dsh_runtime)),
                 ..Default::default()
             };
             if let Some(bridge) = web_chat_bridge.as_ref() {

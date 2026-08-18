@@ -1,7 +1,12 @@
 //! DSH (DeepSeek Harness) ACP adapter — seventh vendor (`AgentVendor::Dsh`).
 //!
-//! Topology: one managed session = one `dsh --profile ccteam` child. The ACP
-//! peer is ccteam's Cordis plugin, not the official DSH ACP demo.
+//! Topology (v0.10.3): ccteam spawns NO DSH child per hire. Each identity has
+//! exactly one `dsh web` runtime, owned by
+//! [`crate::execution::dsh_runtime::DshRuntimeManager`], whose embedded ccteam
+//! Cordis plugin serves ACP on a unix socket; every hire is one CONNECTION to
+//! that socket, and the human's DSH web UI is just another client of the same
+//! runtime. Closing a hire closes its connection and nothing else — the
+//! runtime, and the DSH memory in the identity's own home, outlive it.
 
 pub mod handshake;
 pub mod materialize;
@@ -10,6 +15,7 @@ pub mod spawn_spec;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -21,6 +27,7 @@ use crate::execution::acp::{
     released_thread_status, route_acp_turn, AcpTransport, AcpTurnRoute, AcpTurnRunner,
     AcpTurnTuning, InboundPolicy, ModelInfo, SessionTranslateState,
 };
+use crate::execution::dsh_runtime::{DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState};
 use crate::execution::mcp_config::SessionMcpEndpoint;
 use crate::execution::session_meta::read_session_meta;
 use crate::execution::session_status::read_status_file;
@@ -30,36 +37,29 @@ use crate::{
     ThreadStatus, ToolSurfaceRebuild, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
-use handshake::DshAgentOptions;
-use spawn_spec::{build_spawn_spec, purge_mirrored_credentials, verify_dsh_version};
+use handshake::{CcteamSessionMeta, DshAgentOptions};
 pub use spawn_spec::{
-    build_web_spawn_spec, dsh_bin, dsh_config_source, find_cached_dsh_bin, resolve_dsh_default_bin,
-    tenant_home_segment, DshConfigSource, DshWebSpawnOptions, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE,
-    DSH_WEB_PROFILE,
+    build_web_spawn_spec, dsh_bin, dsh_config_source, find_cached_dsh_bin, identity_socket_path,
+    resolve_dsh_default_bin, socket_path_for_identity, tenant_home_segment, DshConfigSource,
+    DshWebSpawnOptions, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE, DSH_SOCKET_ENV, DSH_WEB_PROFILE,
 };
+use spawn_spec::{ccteam_root, dsh_socket_override, identity_dsh_home, project_cwd};
 
 const FINALIZE_BARRIER: std::time::Duration = std::time::Duration::from_millis(750);
 const EVENT_BUFFER: usize = 256;
+/// How long to keep dialing the runtime's socket. The manager reports readiness
+/// from the HTTP listener, but Cordis binds the plugin's socket on its own
+/// schedule, so a fresh runtime is regularly reachable a beat later.
+const CONNECT_BUDGET: Duration = Duration::from_secs(15);
+const CONNECT_RETRY: Duration = Duration::from_millis(250);
+/// How long `close_thread` waits for the runtime to acknowledge the cancel
+/// before dropping the connection out from under it.
+const CANCEL_ON_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Adapter name — stable id for handles / logs / tests.
 pub const DSH_ACP_ADAPTER_NAME: &str = "dsh-acp";
 
-/// Whether an OS process is an unusable orphan from ccteam's managed DSH
-/// runtime. Kept pure so startup cleanup can be tested without signaling a
-/// real process.
-pub fn is_ccteam_managed_dsh_orphan(dsh_home: &Path, ppid: u32, ccteam_home: &Path) -> bool {
-    if ppid != 1
-        || dsh_home
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return false;
-    }
-    let managed_root = ccteam_home.join("runtime").join("dsh");
-    dsh_home != managed_root && dsh_home.starts_with(managed_root)
-}
-
-const DSH_STATUS_GAP: &str = "DSH is driven through ccteam's own Cordis plugin (there is no vendor automation CLI). Vendor memory persists in this session's managed DSH home and survives restarts; deleting that directory resets DSH memory but keeps the ccteam transcript and ledger.";
+const DSH_STATUS_GAP: &str = "DSH is driven through ccteam's own Cordis plugin (there is no vendor automation CLI). Vendor memory persists in this identity's DSH home and survives restarts; deleting that directory resets DSH memory but keeps the ccteam transcript and ledger.";
 
 struct LiveSession {
     transport: Arc<AcpTransport>,
@@ -76,9 +76,13 @@ struct LiveSession {
 }
 
 /// Per-process singleton holding live DSH ACP sessions keyed by DSH session id.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DshAcpAdapter {
     live: Arc<StdMutex<HashMap<String, Arc<LiveSession>>>>,
+    /// The daemon's ONE DSH runtime manager — the same instance ccteam web
+    /// drives. Shared by construction, so "one identity, one `dsh web`
+    /// process" cannot be broken by a consumer forgetting a convention.
+    runtime: Arc<DshRuntimeManager>,
 }
 
 impl std::fmt::Debug for DshAcpAdapter {
@@ -88,8 +92,16 @@ impl std::fmt::Debug for DshAcpAdapter {
 }
 
 impl DshAcpAdapter {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(runtime: Arc<DshRuntimeManager>) -> Self {
+        Self {
+            live: Arc::new(StdMutex::new(HashMap::new())),
+            runtime,
+        }
+    }
+
+    /// The runtime manager this adapter drives — the daemon's single instance.
+    pub fn runtime(&self) -> &Arc<DshRuntimeManager> {
+        &self.runtime
     }
 
     fn inbound_policy(mode: PermissionMode) -> InboundPolicy {
@@ -116,41 +128,77 @@ impl DshAcpAdapter {
             .and_then(|m| m.get(session_id).cloned())
     }
 
-    async fn spawn_transport(
-        spawn: &spawn_spec::DshSpawnSpec,
-        inbound: InboundPolicy,
-        sid: &str,
-    ) -> Result<Arc<AcpTransport>, HarnessError> {
-        AcpTransport::spawn_for_session(
-            &spawn.bin,
-            &spawn.args,
-            &spawn.cwd,
-            &spawn.env,
-            inbound,
-            sid,
-        )
-        .await
-        .map(Arc::new)
-        .map_err(|e| HarnessError::SpawnFailed(format!("spawn dsh acp: {e}")))
+    /// Make sure this identity's `dsh web` runtime is up, and report the
+    /// identity the manager knows it by.
+    async fn ensure_runtime(&self, owner: &str) -> Result<DshRuntimeIdentity, HarnessError> {
+        let identity = DshRuntimeIdentity::for_owner_tag(owner);
+        let status = self.runtime.start(&identity).await;
+        match status.state {
+            DshRuntimeState::Running | DshRuntimeState::Attached => Ok(identity),
+            DshRuntimeState::Disabled => Err(HarnessError::SpawnFailed(
+                "DSH is unavailable: this daemon has no DSH runtime. Run `ccteam start` with the \
+                 web UI enabled (the DSH companion port is what turns the runtime on)."
+                    .to_string(),
+            )),
+            other => Err(HarnessError::SpawnFailed(format!(
+                "DSH runtime for `{owner}` is {}: {}",
+                describe_state(other),
+                status
+                    .error_tail
+                    .unwrap_or_else(|| "no output from the runtime".to_string())
+            ))),
+        }
     }
 
-    async fn handshake_new(
-        transport: &AcpTransport,
-        cwd: &std::path::Path,
-        agent_options: &DshAgentOptions,
-    ) -> Result<(String, ModelInfo), HarnessError> {
-        handshake::initialize(transport).await?;
-        handshake::session_new(transport, cwd, agent_options).await
+    /// Dial the runtime's ACP socket until it answers or the budget runs out.
+    async fn connect(socket: &Path, inbound: InboundPolicy) -> Result<Arc<AcpTransport>, String> {
+        let deadline = tokio::time::Instant::now() + CONNECT_BUDGET;
+        loop {
+            let failure = match AcpTransport::connect_unix(socket, inbound).await {
+                Ok(transport) => return Ok(Arc::new(transport)),
+                Err(err) => format!("{err:#}"),
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(failure);
+            }
+            tokio::time::sleep(CONNECT_RETRY).await;
+        }
     }
 
-    async fn handshake_load(
-        transport: &AcpTransport,
-        cwd: &std::path::Path,
-        session_id: &str,
-        agent_options: &DshAgentOptions,
-    ) -> Result<ModelInfo, HarnessError> {
-        handshake::initialize(transport).await?;
-        handshake::session_load(transport, cwd, session_id, agent_options).await
+    /// Why the socket did not answer, in the words the user can act on.
+    async fn connect_failure(
+        &self,
+        identity: Option<&DshRuntimeIdentity>,
+        socket: &Path,
+        error: String,
+    ) -> HarnessError {
+        let Some(identity) = identity else {
+            return HarnessError::SpawnFailed(format!(
+                "cannot reach the DSH ACP socket {} named by {DSH_SOCKET_ENV}: {error}",
+                socket.display()
+            ));
+        };
+        let status = self.runtime.status(identity).await;
+        let mut message = format!(
+            "cannot reach the ccteam ACP socket {} inside the DSH runtime of `{}` (runtime {})",
+            socket.display(),
+            identity.owner_tag,
+            describe_state(status.state)
+        );
+        if status.state == DshRuntimeState::Attached {
+            // ccteam did not start this instance, so it never wrote the plugin
+            // row into that home: the socket is missing because the human's own
+            // `dsh web` predates the registration.
+            message.push_str(
+                ". That instance was started outside ccteam — register the plugin \
+                 (`dsh plugin add @ccteam/dsh-client`) and restart your DSH web",
+            );
+        }
+        message.push_str(&format!(": {error}"));
+        if let Some(tail) = status.error_tail {
+            message.push_str(&format!("; last runtime output: {tail}"));
+        }
+        HarnessError::SpawnFailed(message)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -298,6 +346,16 @@ impl DshAcpAdapter {
     }
 }
 
+fn describe_state(state: DshRuntimeState) -> &'static str {
+    match state {
+        DshRuntimeState::Disabled => "disabled",
+        DshRuntimeState::Stopped => "stopped",
+        DshRuntimeState::Starting => "still starting",
+        DshRuntimeState::Running => "running",
+        DshRuntimeState::Attached => "attached (started outside ccteam)",
+    }
+}
+
 fn spawn_notif_dispatcher(
     transport: Arc<AcpTransport>,
     state: Arc<StdMutex<SessionTranslateState>>,
@@ -366,11 +424,24 @@ impl HarnessAdapter for DshAcpAdapter {
         }
 
         let mcp = Self::session_mcp_endpoint(ctx)?;
-        let bin = dsh_bin();
-        verify_dsh_version(&bin).await?;
-        let spawn = build_spawn_spec(ctx, &mcp)?;
+        let cwd = project_cwd(ctx)?;
         let inbound = Self::inbound_policy(ctx.permission_mode);
         let agent_options = DshAgentOptions::new(ctx.model_id.as_deref());
+        let meta = CcteamSessionMeta::new(&ctx.sid, &mcp, ctx.permission_mode);
+
+        // The runtime is per identity, so the socket and the DSH home are too.
+        // `CCTEAM_DSH_SOCKET` (test-only) names a socket a fake already serves
+        // and skips the manager entirely.
+        let (identity, socket, dsh_home) = match dsh_socket_override() {
+            Some(socket) => (None, socket, PathBuf::new()),
+            None => {
+                let ccteam_home = ccteam_root()?;
+                let identity = self.ensure_runtime(&ctx.owner).await?;
+                let socket = identity_socket_path(&ctx.owner, &ccteam_home);
+                let home = identity_dsh_home(&ctx.owner, &ccteam_home)?;
+                (Some(identity), socket, home)
+            }
+        };
 
         let prior_uuid = read_session_meta(&ctx.project_dir, &ctx.sid)
             .ok()
@@ -382,37 +453,46 @@ impl HarnessAdapter for DshAcpAdapter {
             }
         }
 
-        let (transport, session_id, info) = match prior_uuid {
+        let transport = match Self::connect(&socket, inbound).await {
+            Ok(transport) => transport,
+            Err(err) => return Err(self.connect_failure(identity.as_ref(), &socket, err).await),
+        };
+        // Once per CONNECTION, before any session work: this is where the peer
+        // proves it is a ccteam plugin new enough to honor `_meta.ccteam`.
+        //
+        // No `vendor_pids` registration here, deliberately: the process-lineage
+        // fallback attributes an `/mcp` caller to ONE sid, and this process
+        // serves every hire of the identity plus the human at the DSH UI.
+        // Attribution is explicit instead — the bearer in `_meta.ccteam` IS the
+        // per-session principal, and the plugin dials the daemon with it.
+        handshake::initialize(&transport).await?;
+        let (session_id, info) = match prior_uuid {
             Some(uuid) => {
-                let transport = Self::spawn_transport(&spawn, inbound, &ctx.sid).await?;
-                match Self::handshake_load(&transport, &spawn.cwd, &uuid, &agent_options).await {
-                    Ok(info) => (transport, uuid, info),
+                match handshake::session_load(&transport, &cwd, &uuid, &agent_options, &meta).await
+                {
+                    Ok(info) => (uuid, info),
                     Err(load_err) => {
                         tracing::warn!(
                             error = %load_err,
                             prior_session_id = %uuid,
                             "dsh session/load failed; falling back to session/new"
                         );
-                        let _ = transport.shutdown().await;
-                        let transport = Self::spawn_transport(&spawn, inbound, &ctx.sid).await?;
+                        // A rejected `session/load` leaves the connection
+                        // perfectly usable — the runtime and every other hire on
+                        // it are untouched — so `session/new` reuses it.
                         let (new_id, info) =
-                            Self::handshake_new(&transport, &spawn.cwd, &agent_options).await?;
+                            handshake::session_new(&transport, &cwd, &agent_options, &meta).await?;
                         if new_id == uuid {
                             tracing::warn!(
                                 session_id = %new_id,
                                 "dsh session/new returned the failed load id"
                             );
                         }
-                        (transport, new_id, info)
+                        (new_id, info)
                     }
                 }
             }
-            None => {
-                let transport = Self::spawn_transport(&spawn, inbound, &ctx.sid).await?;
-                let (session_id, info) =
-                    Self::handshake_new(&transport, &spawn.cwd, &agent_options).await?;
-                (transport, session_id, info)
-            }
+            None => handshake::session_new(&transport, &cwd, &agent_options, &meta).await?,
         };
 
         let live = self.register_live(
@@ -421,8 +501,8 @@ impl HarnessAdapter for DshAcpAdapter {
             ctx.slug.clone(),
             ctx.sid.clone(),
             ctx.project_dir.clone(),
-            spawn.cwd,
-            spawn.dsh_home,
+            cwd,
+            dsh_home,
             info,
             ctx.permission_mode,
             agent_options.requested_model_display(),
@@ -471,8 +551,9 @@ impl HarnessAdapter for DshAcpAdapter {
         _h: &ThreadHandle,
     ) -> Result<ToolSurfaceRebuild, HarnessError> {
         Ok(ToolSurfaceRebuild::RespawnRequired {
-            reason: "DSH loads the ccteam Cordis plugin and MCP bearer only at process start; \
-                     respawn is lossless because `session/load` reattaches the vendor's managed DSH memory"
+            reason: "a DSH session's ccteam identity is installed by its `session/new`; \
+                     respawn is lossless because `session/load` reattaches the same DSH agent \
+                     inside the identity's still-running runtime"
                 .to_string(),
         })
     }
@@ -497,12 +578,30 @@ impl HarnessAdapter for DshAcpAdapter {
             map.remove(&h.identity)
         };
         if let Some(live) = live {
-            let _ = live
+            // Cancel OUR turn, then drop OUR connection. The runtime keeps
+            // running (it is the identity's, not this session's) and the DSH
+            // agent stays live inside it, which is what makes a later
+            // `session/load` a real resume instead of a fresh session.
+            //
+            // A REQUEST, not a notification: `shutdown` aborts the writer task,
+            // so a queued-but-unwritten notification frame is simply dropped —
+            // the cancel would reach the runtime only when it happened to win
+            // the race. Awaiting the reply proves the runtime processed it
+            // before this connection goes away; a peer that never answers just
+            // gets disconnected, which cancels the turn anyway.
+            let cancel = live
                 .transport
-                .notify("session/cancel", json!({ "sessionId": live.session_id }))
-                .await;
+                .call("session/cancel", json!({ "sessionId": live.session_id }));
+            if tokio::time::timeout(CANCEL_ON_CLOSE_BUDGET, cancel)
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    session_id = %live.session_id,
+                    "dsh session/cancel did not answer before close; disconnecting anyway"
+                );
+            }
             let _ = live.transport.shutdown().await;
-            purge_mirrored_credentials(&live.dsh_home);
         }
         Ok(())
     }
@@ -563,6 +662,15 @@ impl HarnessAdapter for DshAcpAdapter {
 mod tests {
     use super::*;
 
+    /// An unconfigured manager answers `disabled` and spawns nothing, so these
+    /// unit tests can hold a real adapter without a real DSH anywhere.
+    fn adapter() -> DshAcpAdapter {
+        DshAcpAdapter::new(Arc::new(DshRuntimeManager::new(
+            PathBuf::from("/nonexistent/ccteam-home"),
+            Arc::new(|_root, _owner| Err(anyhow::anyhow!("no enrollment in tests"))),
+        )))
+    }
+
     fn handle() -> ThreadHandle {
         ThreadHandle {
             vendor: AgentVendor::Dsh,
@@ -573,52 +681,46 @@ mod tests {
         }
     }
 
+    /// "One identity, one `dsh web` process" holds because every consumer shares
+    /// ONE manager. The adapter must therefore keep the instance it was handed —
+    /// building its own would supervise a second child for the same home.
+    #[test]
+    fn adapter_keeps_the_runtime_manager_it_was_built_with() {
+        let manager = Arc::new(DshRuntimeManager::new(
+            PathBuf::from("/nonexistent/ccteam-home"),
+            Arc::new(|_root, _owner| anyhow::bail!("no enrollment in tests")),
+        ));
+        let adapter = DshAcpAdapter::new(Arc::clone(&manager));
+        assert!(Arc::ptr_eq(adapter.runtime(), &manager));
+        assert!(
+            Arc::ptr_eq(adapter.clone().runtime(), &manager),
+            "cloning the adapter (the factory hands out clones) keeps the same manager"
+        );
+    }
+
     #[test]
     fn name_and_vendor_are_dsh() {
-        let a = DshAcpAdapter::new();
+        let a = adapter();
         assert_eq!(a.name(), DSH_ACP_ADAPTER_NAME);
         assert_eq!(a.vendor(), AgentVendor::Dsh);
     }
 
     #[tokio::test]
     async fn resume_thread_is_not_implemented_for_cold_id() {
-        let a = DshAcpAdapter::new();
+        let a = adapter();
         let err = a.resume_thread("some-vendor-uuid").await.unwrap_err();
         assert!(matches!(err, HarnessError::NotImplemented { .. }));
     }
 
     #[test]
     fn event_attachment_is_rebuildable() {
-        let a = DshAcpAdapter::new();
+        let a = adapter();
         assert_eq!(a.event_attachment(), EventAttachment::Rebuildable);
-    }
-
-    #[test]
-    fn orphan_reaping_only_matches_our_init_parented_runtime_homes() {
-        let ccteam_home = Path::new("/srv/ccteam-home");
-        let managed = ccteam_home.join("runtime/dsh/web/user-alice");
-        assert!(is_ccteam_managed_dsh_orphan(&managed, 1, ccteam_home));
-        assert!(!is_ccteam_managed_dsh_orphan(&managed, 4242, ccteam_home));
-        assert!(!is_ccteam_managed_dsh_orphan(
-            Path::new("/home/alice/.dsh"),
-            1,
-            ccteam_home
-        ));
-        assert!(!is_ccteam_managed_dsh_orphan(
-            Path::new("/srv/unrelated/dsh"),
-            1,
-            ccteam_home
-        ));
-        assert!(!is_ccteam_managed_dsh_orphan(
-            Path::new("/srv/ccteam-home/runtime/dsh/../../alice/.dsh"),
-            1,
-            ccteam_home
-        ));
     }
 
     #[tokio::test]
     async fn rebuild_tool_surface_needs_lossless_respawn() {
-        let a = DshAcpAdapter::new();
+        let a = adapter();
         let outcome = a.rebuild_tool_surface(&handle()).await.unwrap();
         let ToolSurfaceRebuild::RespawnRequired { reason } = outcome;
         assert!(reason.contains("lossless"));
@@ -627,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_directive_rejects_private_state_commands() {
-        let a = DshAcpAdapter::new();
+        let a = adapter();
         for cmd in ["compact", "clear", "model"] {
             let outcome = a
                 .handle_directive(

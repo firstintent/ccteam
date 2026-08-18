@@ -24,10 +24,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 
-use crate::execution::dsh_acp::spawn_spec::DshSpawnSpec;
+use crate::execution::dsh_acp::spawn_spec::{
+    dsh_home_for_identity, tenant_id_from_owner_tag, DshSpawnSpec,
+};
 use crate::execution::dsh_acp::{
-    build_web_spawn_spec, is_ccteam_managed_dsh_orphan, tenant_home_segment, DshWebSpawnOptions,
-    DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
+    build_web_spawn_spec, socket_path_for_identity, DshWebSpawnOptions, DSH_NATIVE_WEB_PROFILE,
+    DSH_WEB_PROFILE,
 };
 
 const DEFAULT_ATTACH_URL: &str = "http://127.0.0.1:3080";
@@ -90,6 +92,35 @@ pub struct DshRuntimeIdentity {
     /// Operators use their own `~/.dsh` (attach-if-detected); tenants get a
     /// ccteam-managed home under `<ccteam_home>/runtime/dsh/web/<user>/`.
     pub operator: bool,
+}
+
+/// Owner tag every operator-ish identity collapses to.
+///
+/// The web console's admin already arrives as `user:web-api`; IM chats
+/// (`telegram:123`, …) and a blank owner are the same human at the same
+/// `~/.dsh`. Mapping them to ONE key is what keeps two `dsh web` processes from
+/// writing that home — and from fighting over one ACP socket.
+const OPERATOR_OWNER_TAG: &str = "user:web-api";
+
+impl DshRuntimeIdentity {
+    /// The identity a ledger owner tag belongs to, matching
+    /// [`crate::execution::dsh_acp::identity_dsh_home`]'s lineage exactly: a
+    /// `user:<id>` tenant gets its own managed runtime, everyone else shares the
+    /// operator's.
+    pub fn for_owner_tag(owner_tag: &str) -> Self {
+        match tenant_id_from_owner_tag(owner_tag) {
+            Some(id) => Self {
+                owner_tag: owner_tag.to_string(),
+                id: id.to_string(),
+                operator: false,
+            },
+            None => Self {
+                owner_tag: OPERATOR_OWNER_TAG.to_string(),
+                id: "web-api".to_string(),
+                operator: true,
+            },
+        }
+    }
 }
 
 /// Snapshot of one identity's runtime. Response shaping (REST/JSON) belongs to
@@ -289,17 +320,14 @@ impl Inner {
     }
 
     fn home_for(&self, identity: &DshRuntimeIdentity) -> Result<PathBuf> {
-        if identity.operator {
-            let home = dirs::home_dir().ok_or_else(|| anyhow!("HOME is unknown"))?;
-            Ok(home.join(".dsh"))
-        } else {
-            Ok(self
-                .ccteam_home
-                .join("runtime")
-                .join("dsh")
-                .join("web")
-                .join(tenant_home_segment(&identity.id)))
-        }
+        // One resolver for both key shapes: the adapter asks by owner tag, the
+        // manager by `operator` + id, and they must never disagree.
+        dsh_home_for_identity(identity.operator, &identity.id, &self.ccteam_home)
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    fn socket_for(&self, identity: &DshRuntimeIdentity) -> PathBuf {
+        socket_path_for_identity(identity.operator, &identity.id, &self.ccteam_home)
     }
 
     async fn status(&self, identity: &DshRuntimeIdentity) -> DshRuntimeStatus {
@@ -623,15 +651,20 @@ impl Inner {
             });
         }
 
-        let spawn_home = home.clone();
+        // ccteam is about to start this instance in the operator's own home, so
+        // it may register its own plugin row there (gate ①) — merge-only, and
+        // only on this branch: an ATTACHED instance is the human's process, and
+        // ccteam does not edit the home of a `dsh web` it did not start.
+        let socket = self.socket_for(identity);
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
             owner_tag: &identity.owner_tag,
             ccteam_home: self.ccteam_home.clone(),
-            dsh_home: spawn_home,
+            dsh_home: home.clone(),
             profile: DSH_NATIVE_WEB_PROFILE,
             materialize_profile: false,
             enrollment: None,
-            daemon_url: None,
+            daemon_url: self.config().map(|config| config.daemon_url.as_str()),
+            transport_socket: Some(&socket),
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -661,6 +694,7 @@ impl Inner {
             .ok_or_else(|| anyhow!("DSH web runtime is not configured"))?;
         let bearer = (self.enrollment)(&self.ccteam_home, owner)
             .with_context(|| format!("ensure enrollment credential for {owner}"))?;
+        let socket = self.socket_for(identity);
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
             owner_tag: owner,
             ccteam_home: self.ccteam_home.clone(),
@@ -669,6 +703,7 @@ impl Inner {
             materialize_profile: true,
             enrollment: Some(&bearer),
             daemon_url: Some(&config.daemon_url),
+            transport_socket: Some(&socket),
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -707,7 +742,23 @@ impl Inner {
     }
 }
 
-/// Reap DSH processes stranded by daemon versions that predate PDEATHSIG.
+/// Whether an OS process is an unusable orphan from ccteam's managed DSH
+/// runtime. Kept pure so startup cleanup can be tested without signaling a
+/// real process.
+pub fn is_ccteam_managed_dsh_orphan(dsh_home: &Path, ppid: u32, ccteam_home: &Path) -> bool {
+    if ppid != 1
+        || dsh_home
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let managed_root = ccteam_home.join("runtime").join("dsh");
+    dsh_home != managed_root && dsh_home.starts_with(managed_root)
+}
+
+/// Reap DSH processes stranded by daemon versions that predate PDEATHSIG, then
+/// delete the per-session DSH homes those versions created.
 ///
 /// `/proc` is intentionally the authority here: only an init-parented process
 /// whose own `DSH_HOME` points inside this ccteam installation's managed DSH
@@ -716,6 +767,7 @@ impl Inner {
 #[cfg(target_os = "linux")]
 pub async fn sweep_legacy_dsh_orphans(ccteam_home: &Path) {
     let victims = legacy_dsh_orphans(ccteam_home);
+    remove_legacy_per_sid_homes(ccteam_home);
     if victims.is_empty() {
         return;
     }
@@ -753,9 +805,37 @@ pub async fn sweep_legacy_dsh_orphans(ccteam_home: &Path) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub async fn sweep_legacy_dsh_orphans(_ccteam_home: &Path) {
+pub async fn sweep_legacy_dsh_orphans(ccteam_home: &Path) {
     // macOS has neither /proc nor PDEATHSIG; retain the existing graceful
-    // kill-on-drop behavior there.
+    // kill-on-drop behavior there. The stale per-session homes are plain
+    // directories, so those go either way.
+    remove_legacy_per_sid_homes(ccteam_home);
+}
+
+/// Delete `<ccteam_home>/runtime/dsh/s<N>/` — the per-hire DSH homes ccteam
+/// stopped creating in v0.10.3, when hires became connections to the identity's
+/// one runtime. Only `s<digits>` names match, so the live layout
+/// (`web/`, `client/`, `acp/`) and anything an operator parked there survive.
+fn remove_legacy_per_sid_homes(ccteam_home: &Path) {
+    let Ok(entries) = std::fs::read_dir(ccteam_home.join("runtime").join("dsh")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_sid = name
+            .strip_prefix('s')
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+        if !is_sid || !entry.path().is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::info!(home = ?entry.path(), "removed legacy per-session DSH home"),
+            Err(err) => {
+                tracing::warn!(home = ?entry.path(), error = %err, "could not remove legacy per-session DSH home")
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -998,10 +1078,82 @@ mod tests {
         );
     }
 
+    /// Every non-tenant front door (admin web, IM chats, a blank owner) is the
+    /// same human at the same `~/.dsh`, so they must collapse to ONE instance
+    /// key. Two keys would mean two `dsh web` processes writing that home and
+    /// racing for one ACP socket.
+    #[test]
+    fn operator_shaped_owner_tags_collapse_to_one_instance_key() {
+        let tenant = DshRuntimeIdentity::for_owner_tag("user:alice");
+        assert_eq!(
+            tenant,
+            DshRuntimeIdentity {
+                owner_tag: "user:alice".to_string(),
+                id: "alice".to_string(),
+                operator: false,
+            }
+        );
+        for tag in ["user:web-api", "user:", "telegram:123", "slack:T1/U2", ""] {
+            let identity = DshRuntimeIdentity::for_owner_tag(tag);
+            assert!(identity.operator, "`{tag}` is the operator");
+            assert_eq!(
+                identity.owner_tag, OPERATOR_OWNER_TAG,
+                "`{tag}` must share the operator's single instance"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_reaping_only_matches_our_init_parented_runtime_homes() {
+        let ccteam_home = Path::new("/srv/ccteam-home");
+        let managed = ccteam_home.join("runtime/dsh/web/user-alice");
+        assert!(is_ccteam_managed_dsh_orphan(&managed, 1, ccteam_home));
+        assert!(!is_ccteam_managed_dsh_orphan(&managed, 4242, ccteam_home));
+        assert!(!is_ccteam_managed_dsh_orphan(
+            Path::new("/home/alice/.dsh"),
+            1,
+            ccteam_home
+        ));
+        assert!(!is_ccteam_managed_dsh_orphan(
+            Path::new("/srv/unrelated/dsh"),
+            1,
+            ccteam_home
+        ));
+        assert!(!is_ccteam_managed_dsh_orphan(
+            Path::new("/srv/ccteam-home/runtime/dsh/../../alice/.dsh"),
+            1,
+            ccteam_home
+        ));
+    }
+
+    #[test]
+    fn legacy_sweep_removes_per_sid_homes_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dsh_root = tmp.path().join("runtime").join("dsh");
+        for name in ["s1", "s42", "web", "client", "acp", "spare", "s"] {
+            std::fs::create_dir_all(dsh_root.join(name)).unwrap();
+        }
+        std::fs::write(dsh_root.join("s1").join("marker"), b"x").unwrap();
+
+        remove_legacy_per_sid_homes(tmp.path());
+
+        assert!(!dsh_root.join("s1").exists());
+        assert!(!dsh_root.join("s42").exists());
+        for keep in ["web", "client", "acp", "spare", "s"] {
+            assert!(
+                dsh_root.join(keep).is_dir(),
+                "`{keep}` is not a per-session home and must survive"
+            );
+        }
+    }
+
     #[test]
     fn tenant_home_segment_keeps_safe_ids_and_hashes_unsafe_ids() {
-        assert_eq!(tenant_home_segment("alice-1"), "alice-1");
-        assert!(tenant_home_segment("bad/id").starts_with("tenant-"));
+        assert_eq!(
+            crate::execution::dsh_acp::tenant_home_segment("alice-1"),
+            "alice-1"
+        );
+        assert!(crate::execution::dsh_acp::tenant_home_segment("bad/id").starts_with("tenant-"));
     }
 
     /// The tenant home layout is a contract with the operator (backups, resets)

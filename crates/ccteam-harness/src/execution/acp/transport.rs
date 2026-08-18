@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -253,6 +254,24 @@ impl AcpTransport {
         let transport = Self::spawn_command_full(program, args, cwd, envs, inbound).await?;
         crate::execution::vendor_pids::record(sid, transport.pid());
         Ok(transport)
+    }
+
+    /// Connect to an ACP peer that is ALREADY listening on a unix socket.
+    ///
+    /// Used by DSH: the ACP peer is ccteam's Cordis plugin living inside the
+    /// identity's shared `dsh web` runtime, so there is no child to own — the
+    /// process belongs to
+    /// [`crate::execution::dsh_runtime::DshRuntimeManager`] and outlives every
+    /// connection. `child: None` therefore makes [`Self::shutdown`] close this
+    /// connection only, never the runtime. Everything downstream (reader /
+    /// writer pumps, request correlation, notification fan-out) is
+    /// stream-generic and unchanged.
+    pub async fn connect_unix(path: &std::path::Path, inbound: InboundPolicy) -> Result<Self> {
+        let stream = UnixStream::connect(path)
+            .await
+            .with_context(|| format!("connect ACP unix socket {}", path.display()))?;
+        let (reader, writer) = stream.into_split();
+        Ok(Self::from_halves_with_policy(reader, writer, None, inbound))
     }
 
     /// The child's OS pid, while the transport still holds it.

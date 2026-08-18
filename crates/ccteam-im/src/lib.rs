@@ -614,8 +614,8 @@ pub fn list_bots() -> Result<Vec<BotRegistration>> {
 /// future); `run_daemon` is the SIGINT-only convenience wrapper kept
 /// for the existing integration-test surface.
 pub use daemon::{
-    build_gateway_for_daemon, refresh_telegram_command_menu, run_daemon, run_daemon_with_shutdown,
-    DaemonArgs,
+    adapter_factory_with_dsh_runtime, build_gateway_for_daemon, refresh_telegram_command_menu,
+    run_daemon, run_daemon_with_shutdown, DaemonArgs,
 };
 
 #[cfg(test)]
