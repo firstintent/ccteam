@@ -25,7 +25,9 @@ export class WorkspaceMounter {
         this.ctx = ctx;
     }
     async mount(cwd, sessionId) {
-        const registry = this.ctx.workspaceRegistry;
+        const registry = typeof this.ctx.get === 'function'
+            ? this.ctx.get('workspaceRegistry')
+            : undefined;
         if (registry === undefined) {
             this.ctx.logger?.warn(`ccteam dsh transport: no workspaceRegistry, session ${sessionId} stays ungrouped`);
             return;

@@ -337,6 +337,81 @@ describe("VendorManageRow install CTA (VENDOR-INSTALL-1)", () => {
   });
 });
 
+describe("VendorManageRow DSH plugin registration (v0.10.3 gate ①)", () => {
+  const dshDetail = (over: Partial<HostDetail> = {}): HostDetail => ({
+    host: "local",
+    hostname: "devbox",
+    is_local: true,
+    os: "linux",
+    arch: "x86_64",
+    ccteam_version: "0.10.3",
+    agents: [
+      agent({
+        vendor: "dsh",
+        tool_surface: "managed_session_bridge",
+        version: "0.1.0-rc.6",
+      }),
+    ],
+    ...over,
+  });
+
+  it("admin on the local host sees the register CTA on the dsh row", () => {
+    const html = renderToString(
+      <HostManageCard
+        detail={dshDetail()}
+        busy={null}
+        isAdmin
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="register-dsh-plugin"');
+    expect(html).toContain("注册 DSH 插件");
+  });
+
+  it("tenants, satellites, and a not-installed dsh get no CTA", () => {
+    const tenant = renderToString(
+      <HostManageCard
+        detail={dshDetail()}
+        busy={null}
+        isAdmin={false}
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(tenant).not.toContain("register-dsh-plugin");
+    const satellite = renderToString(
+      <HostManageCard
+        detail={dshDetail({ host: "sat-1", is_local: false })}
+        busy={null}
+        isAdmin
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(satellite).not.toContain("register-dsh-plugin");
+    const missing = renderToString(
+      <HostManageCard
+        detail={dshDetail({
+          agents: [
+            agent({
+              vendor: "dsh",
+              tool_surface: "managed_session_bridge",
+              installed: false,
+              status: "not_installed",
+            }),
+          ],
+        })}
+        busy={null}
+        isAdmin
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(missing).not.toContain("register-dsh-plugin");
+  });
+});
+
 describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
   function quotaDetail(agents: AgentHealth[]): HostDetail {
     return {

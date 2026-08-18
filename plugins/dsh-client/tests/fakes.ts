@@ -106,7 +106,13 @@ export function makeFakeCtx(options?: {
       resume,
       get: vi.fn((id: string) => agents.get(id)),
     },
-    ...(options?.workspaces === false ? {} : { workspaceRegistry: { create: workspaceCreate } }),
+    // Cordis-faithful: services outside the plugin's `inject` list are reached
+    // ONLY through `ctx.get`; direct property access throws (see below).
+    get: vi.fn((name: string) =>
+      name === 'workspaceRegistry' && options?.workspaces !== false
+        ? { create: workspaceCreate }
+        : undefined,
+    ),
     agentDefaultModel: {
       currentSelection: vi.fn(() => ({ provider: 'aliyun', model: 'deepseek-v4-pro' })),
     },
@@ -124,6 +130,15 @@ export function makeFakeCtx(options?: {
     }),
     logger: { warn: vi.fn((message: string) => { warnings.push(message) }) },
   }
+  // Mirror Cordis exactly: reading a service property outside `inject` throws.
+  // This is what shipped the v0.10.3 real-machine ungrouped-session bug — the
+  // fakes exposed `ctx.workspaceRegistry` as a plain property, so the tests
+  // stayed green while every real runtime threw here.
+  Object.defineProperty(ctx, 'workspaceRegistry', {
+    get() {
+      throw new Error('cannot get property "workspaceRegistry" without inject')
+    },
+  })
 
   const emit = (event: string, ...args: unknown[]): void => {
     for (const handler of [...(listeners.get(event) ?? [])]) {

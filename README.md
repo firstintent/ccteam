@@ -20,7 +20,7 @@ Each coding CLI is brilliant alone but works in isolation — one terminal, one 
 - **Codex** — grinds long jobs without wobbling
 - **Grok** — answers fastest
 - **Kimi** — bulk work on a tiny bill
-- **DSH** — plugin-native DeepSeek Harness sessions with cold resume
+- **DSH** — hires live inside your own DeepSeek Harness web space, side by side with you
 - **Pi** — one CLI over many providers (`anthropic/…`, `openai/…`), on your own machine
 
 ccteam is the connective tissue they lack — identity, routing, delivery guarantees, guardrails, a cost ledger — and leaves *how* the team organizes itself to prompts you version.
@@ -154,9 +154,9 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
 - **Settings → Access** — everything that connects to ccteam, on one page: the copy-paste MCP config for external agents (a credential scoped to one project, rendered as the real config each vendor expects, or as plain text for plugin-backed flows such as DSH, listed and revocable afterwards — the secret is shown once, never again), satellite join tokens for new machines, your own Telegram/Lark bot (a numbered two-step card per platform — save the credential, then bind who the bot answers, with sender capture starting on its own), and per-user login links
-- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into the vendor CLIs with writable config (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. DSH uses its own plugin plus a pasted Access credential; Pi gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
+- **Settings → Hosts** — each machine's vendor panel (installed / version / readiness) and one-click registration of the ccteam MCP tools into the vendor CLIs with writable config (Claude Code, Codex, Grok, OpenCode, Kimi), so even hand-started sessions can hire the team. DSH's one-click on the same page registers ccteam's plugin into your own `~/.dsh` web profile instead (a DSH session of yours can also orchestrate after pasting an Access credential); Pi gets the team tools through a ccteam-owned bridge loaded into the sessions ccteam spawns, so a `pi` you start by hand in a shell is left completely untouched
 - **Workflow → Marketplace** — install skills (into your user-level library `~/.ccteam/skills`; the skills tab comes first) and personas (into the project), checksum-verified; attach library skills to any message from the composer
-- **DSH** — open native DSH Web as a first-class console page. The owner sees the real `~/.dsh` space (ccteam attaches to a DSH Web already on `127.0.0.1:3080` when present); each regular user gets an isolated `$CCTEAM_HOME/runtime/dsh/web/<user>/` space with the ccteam client plugin preloaded. It works out of the box by following this machine's DSH login until the user changes DSH Settings → Models; after that, every DSH session for that identity, including ones hired inside ccteam, uses the user's config. User-installed DSH plugins are preserved.
+- **DSH** — open native DSH Web as a first-class console page. Each identity runs one DSH runtime and ccteam is its second client: DSH sessions hired anywhere in ccteam are created inside that same runtime, appear live in this page's sidebar under the project's workspace, and can be opened mid-task to watch or interject — the agent's next dispatch continues the same conversation. The owner sees the real `~/.dsh` space (ccteam attaches to a DSH Web already on `127.0.0.1:3080` when present); each regular user gets an isolated `$CCTEAM_HOME/runtime/dsh/web/<user>/` space with the ccteam client plugin preloaded. It works out of the box by following this machine's DSH login until the user changes DSH Settings → Models; the whole identity — menu sessions and hires alike — runs on that one config. User-installed DSH plugins are preserved.
 
 <p align="center">
   <img src="docs/images/web-workflow-hub.png" width="1000" alt="Workflow hub — skills, roles, marketplace, MCP servers, and the per-project experience ledger: turn records with role and skill fingerprints" />
@@ -166,7 +166,7 @@ After you reboot your computer, run `ccteam daemon start` again to bring ccteam 
 
 > The console binds to `0.0.0.0:7331` with token auth, no TLS — keep it on a trusted LAN. DSH Web uses a companion listener on the web port + 1 by default; override it with `--dsh-web-bind <addr:port>` or disable it with `--dsh-web-bind off`. If you put HTTPS in front of ccteam, proxy the companion listener too (usually a second HTTPS port or subdomain). Proxying only `:7331` makes the DSH iframe mixed-content fail, and DSH Web cannot be safely mounted under a path prefix.
 
-> DSH Web honesty: native DSH turns run inside DSH, not as ccteam sessions, so they do not appear in the ccteam cost ledger; work delegated through the ccteam DSH plugin is ledgered normally. Tenant DSH Web is same-OS-user isolation: DSH agents can run shell commands, and self-installed DSH plugins are arbitrary npm code with the same trust level as that user account.
+> DSH Web honesty: native DSH turns run inside DSH, not as ccteam sessions, so they do not appear in the ccteam cost ledger — including turns you type into a hired session from the DSH side (ccteam records only the turns it routed; the DSH home keeps the full conversation). Work delegated through the ccteam DSH plugin is ledgered normally. Tenant DSH Web is same-OS-user isolation: DSH agents can run shell commands, and self-installed DSH plugins are arbitrary npm code with the same trust level as that user account.
 
 ## Chaining sessions
 

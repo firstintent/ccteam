@@ -179,8 +179,8 @@ pub const AGENT_PROBE_SPECS: &[AgentProbeSpec] = &[
         vendor: "dsh",
         harness_id: "dsh",
         bin_env: ccteam_harness::DSH_BIN_ENV,
-        // The product CLI (`dsh --profile ccteam`), not a demo/dev binary —
-        // v0.9.15 K5/§5.2.
+        // The product CLI (`dsh`, whose web runtime ccteam connects to over
+        // the plugin's unix socket), not a demo/dev binary.
         default_bin: "dsh",
         tool_surface: ToolSurfaceMode::ManagedSessionBridge,
         install_recipe: Some(&["npm", "install", "-g", "@deepseek-ai/dsh@latest"]),
@@ -211,9 +211,11 @@ impl AgentProbeSpec {
         // session CAN unlock the tools; a plain-vendor Pi session cannot).
         if self.vendor == "dsh" {
             return Some(
-                "DSH has no ccteam-writable config file: managed sessions get the ccteam \
-                 plugin automatically; a `dsh` you start yourself does not, until you run \
-                 `dsh plugin --profile web add @ccteam/dsh-client`."
+                "DSH has no ccteam-writable config file: its ccteam surface is the \
+                 `@ccteam/dsh-client` plugin inside your DSH web runtime. ccteam preloads \
+                 it for the runtimes it manages; for a `dsh web` you start yourself, use \
+                 Register here (or `dsh plugin --profile web add @ccteam/dsh-client`) and \
+                 restart that instance."
                     .to_string(),
             );
         }
@@ -1194,9 +1196,11 @@ mod tests {
         assert_eq!(
             by("dsh").tool_surface_notice().as_deref(),
             Some(
-                "DSH has no ccteam-writable config file: managed sessions get the ccteam \
-                 plugin automatically; a `dsh` you start yourself does not, until you run \
-                 `dsh plugin --profile web add @ccteam/dsh-client`."
+                "DSH has no ccteam-writable config file: its ccteam surface is the \
+                 `@ccteam/dsh-client` plugin inside your DSH web runtime. ccteam preloads \
+                 it for the runtimes it manages; for a `dsh web` you start yourself, use \
+                 Register here (or `dsh plugin --profile web add @ccteam/dsh-client`) and \
+                 restart that instance."
             )
         );
         for spec in AGENT_PROBE_SPECS {

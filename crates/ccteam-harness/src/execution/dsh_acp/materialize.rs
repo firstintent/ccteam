@@ -288,7 +288,8 @@ fn merged_profile_package_json(
     spec: &ProfileSpec<'_>,
 ) -> Result<String, HarnessError> {
     let path = profile_dir.join("package.json");
-    let mut value = if path.exists() {
+    let manifest_exists = path.exists();
+    let mut value = if manifest_exists {
         let raw = fs::read_to_string(&path).map_err(|e| {
             HarnessError::SpawnFailed(format!("read DSH profile package {}: {e}", path.display()))
         })?;
@@ -310,7 +311,7 @@ fn merged_profile_package_json(
             serde_json::Value::String(format!("ccteam-{name}-profile", name = spec.name))
         });
         obj.insert("private".to_string(), serde_json::Value::Bool(true));
-    } else if !path.exists() {
+    } else if !manifest_exists {
         // Nothing of the user's to preserve: give the file the minimum a
         // profile manifest needs.
         obj.insert(
@@ -319,6 +320,24 @@ fn merged_profile_package_json(
         );
         obj.insert("private".to_string(), serde_json::Value::Bool(true));
     }
+
+    // Registering into a profile that does not exist yet CREATES it, and a
+    // profile whose bundles are only `@ccteam/dsh-client` cannot boot: the
+    // plugin waits forever for the host services (`agents`, `tools`, …) the
+    // vendor bundles provide, and `dsh web` dies before readiness (real-machine
+    // v0.10.3 DoD). Scaffold the vendor's own defaults first — exactly what a
+    // first `dsh web` run would have written — and merge ours after. An
+    // EXISTING manifest is never given vendor rows: merge-only means ccteam's
+    // own entries only.
+    let scaffold: &[&str] = if spec.manifest == ManifestPolicy::MergeOnly && !manifest_exists {
+        if spec.name == super::spawn_spec::DSH_NATIVE_WEB_PROFILE {
+            &[DSH_BASE_BUNDLE, DSH_WEB_APP_BUNDLE]
+        } else {
+            &[DSH_BASE_BUNDLE]
+        }
+    } else {
+        &[]
+    };
 
     let dsh = obj
         .entry("dsh".to_string())
@@ -343,7 +362,7 @@ fn merged_profile_package_json(
         *bundles = serde_json::json!([]);
     }
     let bundles = bundles.as_array_mut().expect("bundles coerced to array");
-    for required in spec.required_bundles {
+    for required in scaffold.iter().chain(spec.required_bundles) {
         if !bundles.iter().any(|v| v.as_str() == Some(required)) {
             bundles.push(serde_json::Value::String((*required).to_string()));
         }
@@ -738,6 +757,39 @@ mod tests {
                 "@deepseek-ai/dsh-web-app",
                 "@ccteam/dsh-client"
             ])
+        );
+    }
+
+    /// Registering into a profile that does not exist yet must scaffold the
+    /// vendor's own web bundles first — a manifest listing only
+    /// `@ccteam/dsh-client` cannot boot (the plugin waits forever for the host
+    /// services the vendor bundles provide; real-machine v0.10.3 DoD caught
+    /// `dsh web` dying before readiness on a fresh operator home).
+    #[test]
+    fn registering_into_a_missing_profile_scaffolds_the_vendor_web_bundles() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        register_dsh_client_into_profile(
+            root.path(),
+            dsh_home.path(),
+            "web",
+            DshClientConfig {
+                transport_socket: Some(SOCKET),
+                daemon_url: Some("http://127.0.0.1:7331"),
+                ..DshClientConfig::default()
+            },
+        )
+        .unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        let package_json = read_package(&profile_dir);
+        assert_eq!(
+            package_json["dsh"]["profile"]["bundles"],
+            serde_json::json!([
+                "@deepseek-ai/dsh-base",
+                "@deepseek-ai/dsh-web-app",
+                "@ccteam/dsh-client"
+            ]),
+            "a scaffolded manifest must be bootable, vendor bundles first"
         );
     }
 

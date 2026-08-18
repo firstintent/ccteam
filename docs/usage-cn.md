@@ -114,7 +114,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
 
-**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 会自动为该会话物化一份 ccteam 托管的隔离 DSH profile,不写你的 `~/.dsh`,同 sid 可冷恢复,token 用量会入账。从 ccteam 打开的 DSH Web 空间会带上 `@ccteam/dsh-client`;如果你在 ccteam 外部自己打开 DSH Web,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再到 DSH Settings 粘贴 daemon URL(默认 `http://127.0.0.1:7331`)和 **Settings → Access** 里复制的 enrollment 凭据。连上后,这个 DSH 会话拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
+**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 直接接进该身份唯一的 DSH web 运行时——就是 **DSH** 菜单看到的那个空间(普通用户 `$CCTEAM_HOME/runtime/dsh/web/<user>/`,owner 真 `~/.dsh`)——所以雇出来的会话会实时出现在 DSH 侧栏、按项目 workspace 分组,同 sid 可冷恢复,token 用量会入账。ccteam 托管的运行时都预载了 `@ccteam/dsh-client`;你自己手起的 `dsh web`,在 **Hosts** 页一键注册插件(或 `dsh plugin --profile web add @ccteam/dsh-client`)后自行重启即可。你自己的 DSH 会话也能编排团队:到 DSH Settings 粘贴 daemon URL(默认 `http://127.0.0.1:7331`)和 **Settings → Access** 里复制的 enrollment 凭据,即拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
 
 **Pi 也刻意不在 config-writer 表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要给可写配置的 vendor 手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
@@ -122,10 +122,12 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 **DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
 
-- **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程;否则 ccteam 自己在临时 loopback 端口启动。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
-- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件 symlink 每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
-- **模型密钥**:在 DSH 原生 **Settings → Models** 里配置自己的 provider。之后这个身份的 DSH Web home 就是它的 DSH 配置家;同身份的所有 DSH 会话——包括在 ccteam 里被其它 agent 雇出来的 DSH 会话——下次 spawn 都用这份配置。ccteam 只逐字节复制和 hash 这些 DSH 配置文件,不解析 vendor YAML。
-- **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;从 DSH 通过 ccteam 插件委派出去的工作照常入账。
+一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`session_spawn`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。
+
+- **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程——此时雇 DSH 需要那个实例里装有 ccteam 插件(**Hosts** 页一键注册,然后你自己重启它;ccteam 绝不重启不是它起的进程)。没有原生实例时 ccteam 自己在临时 loopback 端口启动,插件已注册。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
+- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`;从 ccteam 雇的 DSH 会话也住这个家,所以会出现在 DSH 页里。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件物化每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
+- **模型密钥**:在 DSH 原生 **Settings → Models** 里配置自己的 provider。同身份的所有 DSH 会话——你在这页打开的和在 ccteam 里雇出来的——都跑在同一个运行时、用同一份配置,改一次全体生效。ccteam 只逐字节复制和 hash 这些 DSH 配置文件,不解析 vendor YAML。
+- **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;同一条规则在雇出来的会话里同样成立——你从 DSH 侧直接输入的 turn 是 vendor 原生 turn,ccteam 的 transcript 与账本只记 ccteam 路由的部分,完整对话以 DSH 家为准。从 DSH 通过 ccteam 插件委派出去的工作照常入账。
 - **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。同一个 OS 用户下的配置可见性只是便利边界,不是硬安全边界。
 - **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
 

@@ -308,6 +308,44 @@ impl DshRuntimeManager {
     pub async fn shutdown_all(&self) {
         self.inner.shutdown_all().await;
     }
+
+    /// Hosts-page "register the ccteam DSH plugin" action (gate ①): merge
+    /// ccteam's OWN bundle entry and its `ccteam-client` patch row — carrying
+    /// this daemon's `transportSocket` and URL — into the operator's real
+    /// `~/.dsh` web profile, WITHOUT starting or attaching a runtime. This is
+    /// how an operator whose hand-started `dsh web` lacks the plugin gets it:
+    /// register here, then restart that instance themselves. Idempotent and
+    /// merge-only; never touches enrollment or any other row.
+    pub async fn register_operator_profile(&self) -> Result<PathBuf> {
+        let daemon_url = self
+            .inner
+            .config()
+            .map(|config| config.daemon_url.clone())
+            .ok_or_else(|| anyhow!("DSH web runtime is not configured"))?;
+        let identity = DshRuntimeIdentity::for_owner_tag(OPERATOR_OWNER_TAG);
+        let home = self.inner.home_for(&identity)?;
+        let socket = self.inner.socket_for(&identity);
+        let ccteam_home = self.inner.ccteam_home.clone();
+        tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+            crate::execution::dsh_acp::spawn_spec::ensure_socket_dir(&socket)
+                .map_err(|e| anyhow!("{e}"))?;
+            let materialized =
+                crate::execution::dsh_acp::materialize::register_dsh_client_into_profile(
+                    &ccteam_home,
+                    &home,
+                    DSH_NATIVE_WEB_PROFILE,
+                    crate::execution::dsh_acp::materialize::DshClientConfig {
+                        enrollment: None,
+                        daemon_url: Some(&daemon_url),
+                        transport_socket: Some(&socket.to_string_lossy()),
+                    },
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(materialized.profile_dir)
+        })
+        .await
+        .context("join DSH plugin registration task")?
+    }
 }
 
 impl Inner {

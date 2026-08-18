@@ -26,8 +26,15 @@ export interface DshWorkspaceRegistry {
 }
 export interface TransportContext {
     agents: DshAgents;
-    /** Absent in profiles without the workspace service; mounting is then skipped. */
-    workspaceRegistry?: DshWorkspaceRegistry;
+    /**
+     * Optional service lookup (`ctx.get`). Cordis THROWS on `ctx.workspaceRegistry`
+     * when the service is not in this plugin's `inject` list — and it cannot be:
+     * `dsh-workspace` ships in the web-app bundle only, so a hard inject would
+     * dead-lock plugin activation on every non-web profile (mode 2). `ctx.get`
+     * is the vendor's own optional accessor (dsh-host-apiproxy uses it for
+     * `sessionPersistence`).
+     */
+    get?(name: string): unknown;
     agentDefaultModel?: {
         currentSelection(): {
             provider?: string;
