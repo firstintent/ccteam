@@ -79,6 +79,7 @@ pub fn external_node_meta(
         model: None,
         observed_model: None,
         effort: None,
+        mode: None,
         host: ccteam_core::LOCAL_HOST.to_string(),
         created_at: now.clone(),
         last_active: now,

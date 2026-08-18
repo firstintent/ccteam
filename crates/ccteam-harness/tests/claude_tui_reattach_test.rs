@@ -54,6 +54,7 @@ fn fake_claude_script(tmp: &tempfile::TempDir) -> PathBuf {
 fn make_ctx(slug: &str, sid: &str, role: &str, tmp: &tempfile::TempDir) -> SpawnCtx {
     let _ = role; // role rides on AgentSpecBrief, not the pane identity.
     SpawnCtx {
+        mode: None,
         slug: slug.to_string(),
         sid: sid.to_string(),
         owner: "user:web-api".into(),

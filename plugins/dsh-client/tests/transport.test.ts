@@ -79,8 +79,9 @@ describe('DSH ACP socket transport', () => {
     const sessionId = created.sessionId as string
     expect(h.create).toHaveBeenCalledWith({
       sessionId,
-      meta: { cwd: '/tmp/work' },
+      meta: { cwd: '/tmp/work', agentPreset: 'standard' },
       agentOptions: { provider: 'aliyun', model: 'deepseek-reasoner' },
+      setup: expect.any(Function),
     })
     expect(h.workspaceCreate).toHaveBeenCalledWith('/tmp/work')
     expect(h.workspaces.get('/tmp/work')?.attachSession).toHaveBeenCalledWith(sessionId)
@@ -131,10 +132,108 @@ describe('DSH ACP socket transport', () => {
     const created = await client.request('session/new', { cwd: '/tmp/work' })
     expect(h.create).toHaveBeenCalledWith({
       sessionId: created.sessionId,
-      meta: { cwd: '/tmp/work' },
+      meta: { cwd: '/tmp/work', agentPreset: 'standard' },
       agentOptions: { provider: 'aliyun', model: 'deepseek-v4-pro' },
+      setup: expect.any(Function),
     })
     expect(created.models.currentModelId).toBe('aliyun/deepseek-v4-pro')
+  })
+
+  it('mounts the vendor default preset on a bare session/new', async () => {
+    const h = await startTransport()
+    const client = await connectClient(h.socketPath)
+
+    await client.request('session/new', { cwd: '/tmp/work' })
+
+    const request = h.create.mock.calls[0]![0] as {
+      meta: { agentPreset?: string }
+      setup?: (agentCtx: unknown) => Promise<void>
+    }
+    expect(request.meta.agentPreset).toBe('standard')
+    expect(request.setup).toBeTypeOf('function')
+    await request.setup!('agent-ctx')
+    expect(h.agentPresets.mount).toHaveBeenCalledWith('agent-ctx', 'standard')
+  })
+
+  it('mounts the ccteam-requested preset from _meta.ccteam.agentPreset', async () => {
+    const h = await startTransport()
+    const client = await connectClient(h.socketPath)
+
+    await client.request('session/new', {
+      cwd: '/tmp/work',
+      _meta: { ccteam: { sid: 's9', bearer: 'ccteam-sid:s9:x', agentPreset: 'code' } },
+    })
+
+    const request = h.create.mock.calls[0]![0] as {
+      meta: { agentPreset?: string }
+      setup?: (agentCtx: unknown) => Promise<void>
+    }
+    expect(h.agentPresets.resolve).toHaveBeenCalledWith('code')
+    expect(request.meta.agentPreset).toBe('code')
+    await request.setup!('agent-ctx')
+    expect(h.agentPresets.mount).toHaveBeenCalledWith('agent-ctx', 'code')
+  })
+
+  it('refuses an explicit preset when the runtime has no agentPresets service', async () => {
+    const h = await startTransport({ presets: false })
+    const client = await connectClient(h.socketPath)
+
+    await expect(
+      client.request('session/new', {
+        cwd: '/tmp/work',
+        _meta: { ccteam: { agentPreset: 'code' } },
+      }),
+    ).rejects.toThrow(/agentPresets/)
+    expect(h.create).not.toHaveBeenCalled()
+  })
+
+  it('creates bare with a warning when nothing was requested and no roster exists', async () => {
+    const h = await startTransport({ presets: false })
+    const client = await connectClient(h.socketPath)
+
+    const created = await client.request('session/new', { cwd: '/tmp/work' })
+    expect(created.sessionId).toBeTypeOf('string')
+    const request = h.create.mock.calls[0]![0] as { setup?: unknown; meta: { agentPreset?: string } }
+    expect(request.setup).toBeUndefined()
+    expect(request.meta.agentPreset).toBeUndefined()
+    expect(h.warnings.some(line => line.includes('agentPresets'))).toBe(true)
+  })
+
+  it('re-mounts the STORED preset on resume, ignoring the _meta request', async () => {
+    const h = await startTransport({
+      persistence: {
+        meta: { agentPreset: 'minimal' },
+        events: [
+          { type: 'agent-preset/selected', data: { agentPreset: 'cordis' } },
+          { type: 'turn/start', data: { turn: 1 } },
+        ],
+      },
+    })
+    const client = await connectClient(h.socketPath)
+
+    await client.request('session/load', {
+      sessionId: 'persisted-1',
+      _meta: { ccteam: { agentPreset: 'code' } },
+    })
+
+    const request = h.resume.mock.calls[0]![0] as { setup?: (agentCtx: unknown) => Promise<void> }
+    expect(request.setup).toBeTypeOf('function')
+    await request.setup!('agent-ctx')
+    // The newest agent-preset/selected event outranks the creation header,
+    // and the ccteam-side request never overrides vendor storage.
+    expect(h.agentPresets.mount).toHaveBeenCalledWith('agent-ctx', 'cordis')
+  })
+
+  it('does not mount anything when session/load reuses a live agent', async () => {
+    const h = await startTransport()
+    const client = await connectClient(h.socketPath)
+    const created = await client.request('session/new', { cwd: '/tmp/work' })
+    h.agentPresets.mount.mockClear()
+
+    await client.request('session/load', { sessionId: created.sessionId })
+
+    expect(h.resume).not.toHaveBeenCalled()
+    expect(h.agentPresets.mount).not.toHaveBeenCalled()
   })
 
   it('creates the session without a workspaceRegistry and warns', async () => {

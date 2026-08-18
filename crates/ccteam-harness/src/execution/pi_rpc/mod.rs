@@ -1137,6 +1137,13 @@ impl HarnessAdapter for PiRpcAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Pi has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         self.start_impl(spec, ctx).await
     }
 

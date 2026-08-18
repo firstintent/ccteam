@@ -51,6 +51,9 @@ export function parseCcteamMeta(params) {
     const mcpUrl = trimmedString(meta.mcpUrl);
     if (mcpUrl !== undefined)
         parsed.mcpUrl = mcpUrl;
+    const agentPreset = trimmedString(meta.agentPreset);
+    if (agentPreset !== undefined)
+        parsed.agentPreset = agentPreset;
     parsed.approvalMode = meta.approvalMode === 'hitl' ? 'hitl' : 'skip';
     return parsed;
 }

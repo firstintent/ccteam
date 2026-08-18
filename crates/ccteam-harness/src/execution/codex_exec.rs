@@ -225,6 +225,13 @@ impl HarnessAdapter for CodexExecAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Codex has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // v0.8.8 B5 — pane 名走单一权威 helper(web 终端 sid→pane 解析共用),
         // 字节定义不变(`ccteam-{slug}-{sid}`,空 slug 边界 trim 前导 '-')。
         let tmux_session = codex_chat_session_name(&ctx.slug, &ctx.sid);

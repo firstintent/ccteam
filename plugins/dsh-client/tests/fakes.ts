@@ -48,6 +48,10 @@ export function makeFakeCtx(options?: {
   attachFails?: boolean
   settings?: Record<string, unknown>
   resumeUnavailable?: boolean
+  /** `false` hides the `agentPresets` service (ACP-bundle-style runtime). */
+  presets?: boolean
+  /** When set, `sessionPersistence.inspect` serves this snapshot. */
+  persistence?: { meta?: Record<string, unknown>; events?: unknown[] }
 }) {
   const listeners = new Map<string, Set<Listener>>()
   const agents = new Map<string, FakeAgent>()
@@ -83,6 +87,13 @@ export function makeFakeCtx(options?: {
     return workspace
   })
 
+  const agentPresets = {
+    // Mirrors the vendor roster: resolve(undefined) falls back to the default id.
+    resolve: vi.fn(async (id?: string) => ({ id: id ?? 'standard' })),
+    mount: vi.fn(async (_agentCtx: unknown, _id?: string) => undefined),
+  }
+  const persistenceInspect = vi.fn(async (_sessionId: string) => options?.persistence ?? {})
+
   const ctx = {
     tools: {
       register: vi.fn((tool: FakeTool) => {
@@ -108,11 +119,18 @@ export function makeFakeCtx(options?: {
     },
     // Cordis-faithful: services outside the plugin's `inject` list are reached
     // ONLY through `ctx.get`; direct property access throws (see below).
-    get: vi.fn((name: string) =>
-      name === 'workspaceRegistry' && options?.workspaces !== false
-        ? { create: workspaceCreate }
-        : undefined,
-    ),
+    get: vi.fn((name: string) => {
+      if (name === 'workspaceRegistry' && options?.workspaces !== false) {
+        return { create: workspaceCreate }
+      }
+      if (name === 'agentPresets' && options?.presets !== false) {
+        return agentPresets
+      }
+      if (name === 'sessionPersistence' && options?.persistence !== undefined) {
+        return { inspect: persistenceInspect }
+      }
+      return undefined
+    }),
     agentDefaultModel: {
       currentSelection: vi.fn(() => ({ provider: 'aliyun', model: 'deepseek-v4-pro' })),
     },
@@ -172,6 +190,8 @@ export function makeFakeCtx(options?: {
     create,
     resume,
     workspaceCreate,
+    agentPresets,
+    persistenceInspect,
     emit,
     sessionEvent,
     requestApproval,

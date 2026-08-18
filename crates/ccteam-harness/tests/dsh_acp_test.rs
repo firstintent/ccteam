@@ -236,6 +236,7 @@ fn adapter() -> DshAcpAdapter {
 
 fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        mode: None,
         slug: "demo".into(),
         sid: sid.into(),
         owner: "user:web-api".into(),
@@ -261,6 +262,7 @@ fn spawn_ctx_with_model(tmp: &TempDir, sid: &str) -> SpawnCtx {
 
 fn write_meta(project: &Path, sid: &str, vendor_uuid: &str) {
     let meta = SessionMeta {
+        mode: None,
         managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
@@ -912,6 +914,8 @@ async fn session_new_carries_the_per_session_ccteam_identity() {
             "bearer": "ccteam-sid:s-meta:seKret1234",
             "mcpUrl": "http://127.0.0.1:65535/mcp",
             "approvalMode": "skip",
+            // Unset mode = the ccteam default: PTC (vendor preset id `code`).
+            "agentPreset": "code",
         })),
         "session/new must install this hire's ccteam identity: {params}"
     );
@@ -956,8 +960,63 @@ async fn session_load_carries_the_per_session_ccteam_identity() {
         Some("ccteam-sid:s-meta-load:seKret1234"),
         "a resumed session re-installs its ccteam identity: {params}"
     );
+    assert!(
+        params.pointer("/_meta/ccteam/agentPreset").is_none(),
+        "session/load never names a preset — the stored one is authoritative: {params}"
+    );
 
     adapter.close_thread(&handle).await.unwrap();
+}
+
+/// The ccteam `mode` axis picks the DSH agent preset on session/new — vendor
+/// spelling and ccteam alias both accepted, unknown tokens refused readably.
+#[tokio::test]
+#[serial(dsh_env)]
+async fn mode_axis_picks_the_agent_preset_on_session_new() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dump = tmp.path().join("dsh_acp_dump.jsonl");
+    let _fake = FakeRuntime::builder().dump(&dump).start();
+
+    let adapter = adapter();
+    let mut ctx = spawn_ctx_with_model(&tmp, "s-mode");
+    ctx.mode = Some("minimal".to_string());
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        )
+        .await
+        .expect("start ok");
+    let records = read_dump(&dump);
+    let params = &find_method(&records, "session/new")["params"];
+    assert_eq!(
+        params
+            .pointer("/_meta/ccteam/agentPreset")
+            .and_then(Value::as_str),
+        Some("minimal"),
+        "{params}"
+    );
+    adapter.close_thread(&handle).await.unwrap();
+
+    let mut bad = spawn_ctx_with_model(&tmp, "s-mode-bad");
+    bad.mode = Some("turbo".to_string());
+    let err = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &bad,
+        )
+        .await
+        .expect_err("unknown mode must refuse the spawn");
+    let text = err.to_string();
+    assert!(
+        text.contains("turbo") && text.contains("ptc"),
+        "the refusal names the token and the valid set: {text}"
+    );
 }
 
 /// hitl vs skip is a per-session posture on a runtime that serves both.

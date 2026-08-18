@@ -1159,6 +1159,13 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Claude has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
         // bot-token getUpdates poll structurally collides with ccteam's IM
         // gateway). Same managed layer the tmux path uses; only this one

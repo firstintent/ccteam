@@ -29,6 +29,10 @@ pub struct CcteamSessionMeta {
     pub bearer: String,
     pub mcp_url: String,
     pub approval_mode: &'static str,
+    /// DSH agent-preset id for `session/new` ONLY (`standard` | `code` |
+    /// `minimal` | `cordis`). Never sent on `session/load`: the stored preset
+    /// in the vendor's own session data is authoritative on resume.
+    pub agent_preset: Option<String>,
 }
 
 impl CcteamSessionMeta {
@@ -42,18 +46,27 @@ impl CcteamSessionMeta {
                 PermissionMode::Hitl => "hitl",
                 PermissionMode::Skip => "skip",
             },
+            agent_preset: None,
         }
     }
 
+    /// The `session/new` variant carrying the resolved DSH agent preset.
+    pub fn with_agent_preset(mut self, agent_preset: String) -> Self {
+        self.agent_preset = Some(agent_preset);
+        self
+    }
+
     fn to_json(&self) -> Value {
-        json!({
-            "ccteam": {
-                "sid": self.sid,
-                "bearer": self.bearer,
-                "mcpUrl": self.mcp_url,
-                "approvalMode": self.approval_mode,
-            }
-        })
+        let mut ccteam = json!({
+            "sid": self.sid,
+            "bearer": self.bearer,
+            "mcpUrl": self.mcp_url,
+            "approvalMode": self.approval_mode,
+        });
+        if let Some(preset) = &self.agent_preset {
+            ccteam["agentPreset"] = json!(preset);
+        }
+        json!({ "ccteam": ccteam })
     }
 }
 

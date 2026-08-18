@@ -14,6 +14,13 @@ export interface CcteamSessionMeta {
     mcpUrl?: string;
     /** Tool-approval posture for turns this transport owns. */
     approvalMode?: 'skip' | 'hitl';
+    /**
+     * DSH agent-preset id for `session/new` (`standard` | `code` | `minimal` |
+     * `cordis`). Absent = the vendor's own default. Never sent on
+     * `session/load`: a resumed session's preset is recovered from the vendor's
+     * own storage, which stays authoritative if the human switched it.
+     */
+    agentPreset?: string;
 }
 /** Plugin-scoped map of DSH session id → ccteam identity. */
 export declare class SessionCredentialStore {

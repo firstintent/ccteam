@@ -206,6 +206,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     },
                     "model": { "type": "string", "description": "Optional explicit model id, passed to the vendor verbatim; overrides the role's `model:` frontmatter. Omitted → vendor default. `status` lists each installed vendor's observed ids." },
                     "effort": { "type": "string", "description": "Optional reasoning-effort token, passed to the vendor verbatim for EVERY vendor — the value set is vendor-specific and the vendor validates it (a bad token fails the spawn with its own error, it is never silently ignored). Omitted → vendor default. `status` lists each installed vendor's effort ladder." },
+                    "mode": { "type": "string", "description": "Optional vendor session-mode token, validated by the vendor adapter. DSH only today: its agent preset — `standard` | `ptc` (alias `code`) | `minimal` | `creator` (alias `cordis`); omitted → DSH hires default to `ptc`. Every other vendor refuses a non-empty mode." },
                     "project": { "type": "string", "description": "Target project slug. A managed session always spawns into its OWN project and may omit this. A hand-started (enrolled) caller names its workspace here on its first call — that choice sticks for the session, and `status` lists the slugs it can reach. Never inferred from a working directory." },
                     "permission_mode": {
                         "type": "string",
@@ -676,7 +677,7 @@ mod tests {
         );
 
         // v0.9.0 W1 (G1) — new facets are present.
-        for key in ["model", "effort", "title"] {
+        for key in ["model", "effort", "mode", "title"] {
             assert!(
                 props[key].is_object(),
                 "session_spawn schema must carry `{key}`"

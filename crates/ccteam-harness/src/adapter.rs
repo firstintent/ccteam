@@ -1172,6 +1172,14 @@ pub struct SpawnCtx {
     /// cannot carry it is the frozen terminal protocol, which refuses the
     /// spawn with a message naming stream-json instead of ignoring the pick.
     pub effort: Option<String>,
+    /// Explicit vendor session-mode token for this thread. `None` = the
+    /// ccteam default for that vendor. Same verbatim-ride contract as
+    /// `effort`: an adapter with no mode axis REFUSES a non-empty value
+    /// (`spawn_pick_refused`) instead of quietly ignoring it. Today only DSH
+    /// consumes it — its agent presets `standard` | `ptc`/`code` | `minimal`
+    /// | `creator`/`cordis` pick the toolset; unset ccteam-hires default to
+    /// PTC (`code`).
+    pub mode: Option<String>,
     /// v0.8.7 W2 (DB.1) — per-session permission posture. `Skip` (default)
     /// keeps today's `--dangerously-skip-permissions` spawn; `Hitl` drops
     /// that flag, spawns `--permission-mode default`, and installs the

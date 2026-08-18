@@ -117,6 +117,7 @@ fn ctx_remote(
     target: RemoteExecTarget,
 ) -> SpawnCtx {
     SpawnCtx {
+        mode: None,
         slug: slug.to_string(),
         sid: sid.to_string(),
         owner: "user:web-api".into(),

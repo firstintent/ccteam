@@ -1958,7 +1958,17 @@ async fn run_session_spawn_at(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    let tuning = crate::gateway::SpawnTuning { model, effort };
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let tuning = crate::gateway::SpawnTuning {
+        model,
+        effort,
+        mode,
+    };
     // Optional `title` — metadata/ledger only, NEVER concatenated into any
     // prompt. Validate ≤80 chars; W1 accepts + echoes it (meta persistence
     // lands with the W2 delegation ledger).

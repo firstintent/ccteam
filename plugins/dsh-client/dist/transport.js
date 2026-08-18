@@ -307,6 +307,86 @@ export class DshAcpServer {
                 throw new RpcError(`method not found: ${method}`, -32601);
         }
     }
+    presetService() {
+        const svc = typeof this.ctx.get === 'function' ? this.ctx.get('agentPresets') : undefined;
+        const candidate = svc;
+        return typeof candidate?.resolve === 'function' && typeof candidate?.mount === 'function'
+            ? candidate
+            : undefined;
+    }
+    /**
+     * Preset for a NEW session: the ccteam-requested id when present, else the
+     * vendor's own default. Without the roster service, an explicit request is a
+     * hard error (silently creating a toolless agent is the exact bug this
+     * exists to prevent), while no request degrades to a bare create with a
+     * warning — an ACP-bundle-style runtime keeps its host-plane tools.
+     */
+    async composeCreatePreset(requested, sessionId) {
+        const presets = this.presetService();
+        if (presets === undefined) {
+            if (requested !== undefined) {
+                throw new RpcError(`agent preset "${requested}" was requested but this DSH runtime has no agentPresets service`, -32602);
+            }
+            this.ctx.logger?.warn(`ccteam dsh transport: no agentPresets service, session ${sessionId} gets host-plane tools only`);
+            return {};
+        }
+        let id;
+        try {
+            const resolved = await presets.resolve(requested);
+            id = typeof resolved?.id === 'string' && resolved.id.trim() !== '' ? resolved.id : requested;
+        }
+        catch (error) {
+            throw errorToRpc(error, `resolve DSH agent preset "${requested ?? '(default)'}"`);
+        }
+        return {
+            id,
+            setup: async (agentCtx) => {
+                await presets.mount(agentCtx, id);
+            },
+        };
+    }
+    /** Re-mount the STORED preset when resuming a persisted session. */
+    async composeResumeSetup(sessionId) {
+        const presets = this.presetService();
+        if (presets === undefined)
+            return undefined;
+        const stored = await this.storedPreset(sessionId);
+        return async (agentCtx) => {
+            await presets.mount(agentCtx, stored);
+        };
+    }
+    /**
+     * The preset a persisted session was using: the newest
+     * `agent-preset/selected` event wins (a blank-session switch in the DSH UI),
+     * else the creation header's `agentPreset`; `undefined` mounts the vendor
+     * default. Mirrors the vendor's own `resolveSessionPreset` fold — the
+     * package is not importable from this plugin, so the two-field fold is
+     * reimplemented against the same durable data.
+     */
+    async storedPreset(sessionId) {
+        const svc = typeof this.ctx.get === 'function' ? this.ctx.get('sessionPersistence') : undefined;
+        const persistence = svc;
+        if (typeof persistence?.inspect !== 'function')
+            return undefined;
+        try {
+            const inspected = await persistence.inspect(sessionId);
+            const events = Array.isArray(inspected?.events) ? inspected.events : [];
+            for (let i = events.length - 1; i >= 0; i--) {
+                const event = asRecord(events[i]);
+                if (event.type !== 'agent-preset/selected')
+                    continue;
+                const chosen = asRecord(event.data).agentPreset;
+                if (typeof chosen === 'string' && chosen.trim() !== '')
+                    return chosen;
+            }
+            const header = asRecord(inspected?.meta).agentPreset;
+            return typeof header === 'string' && header.trim() !== '' ? header : undefined;
+        }
+        catch (error) {
+            this.ctx.logger?.warn(`ccteam dsh transport could not read the stored preset of ${sessionId}: ${errorMessage(error)}`);
+            return undefined;
+        }
+    }
     async newSession(params) {
         const body = requireRecord(params, 'session/new params');
         const cwd = requireString(body, 'cwd');
@@ -317,12 +397,15 @@ export class DshAcpServer {
             this.credentials?.set(sessionId, meta);
         let handle;
         try {
+            const preset = await this.composeCreatePreset(meta?.agentPreset, sessionId);
             const request = {
                 sessionId,
-                meta: { cwd },
+                meta: { cwd, ...(preset.id === undefined ? {} : { agentPreset: preset.id }) },
             };
             if (agentOptions !== undefined)
                 request.agentOptions = agentOptions;
+            if (preset.setup !== undefined)
+                request.setup = preset.setup;
             handle = await this.ctx.agents.create(request);
         }
         catch (error) {
@@ -353,9 +436,14 @@ export class DshAcpServer {
                 agent = live;
             }
             else {
+                // The stored preset is authoritative on resume (the human may have
+                // switched it in the DSH UI); `_meta.ccteam.agentPreset` is a
+                // creation-only field and deliberately ignored here.
+                const setup = await this.composeResumeSetup(sessionId);
                 const handle = await this.ctx.agents.resume({
                     resumeSessionId: sessionId,
                     ...agentOptions === undefined ? {} : { agentOptions },
+                    ...setup === undefined ? {} : { setup },
                 });
                 agent = handle.agent;
             }

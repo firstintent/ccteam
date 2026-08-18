@@ -5,12 +5,15 @@ export interface DshAgents {
         sessionId: string;
         meta?: {
             cwd?: string;
+            agentPreset?: string;
         };
         agentOptions?: unknown;
+        setup?: (agentCtx: unknown) => Promise<void>;
     }): Promise<DshAgentHandle>;
     resume(options: {
         resumeSessionId: string;
         agentOptions?: unknown;
+        setup?: (agentCtx: unknown) => Promise<void>;
     }): Promise<DshAgentHandle>;
     get?(id: string): DshAgent | undefined;
 }
@@ -20,6 +23,20 @@ export interface DshAgentHandle {
 }
 export interface DshWorkspace {
     attachSession(sessionId: string): Promise<void>;
+}
+/**
+ * DSH's agent-preset roster (Cordis service `agentPresets`,
+ * `@deepseek-ai/dsh-agent-presets`). The web bundle DISABLES the host-plane
+ * vendor tools and moves them behind presets, so an agent created without
+ * `setup: mount(...)` has no bash/read/write at all — only globally-registered
+ * tools like ccteam's own (real-machine `unknown tool "bash"` regression).
+ * Shipped ids: `standard` | `code` (PTC) | `minimal` | `cordis` (creator).
+ */
+export interface DshAgentPresets {
+    resolve(id?: string): Promise<{
+        id?: string;
+    } | undefined>;
+    mount(agentCtx: unknown, id?: string): Promise<unknown>;
 }
 export interface DshWorkspaceRegistry {
     create(path: string, title?: string): Promise<DshWorkspace>;
@@ -108,6 +125,26 @@ export declare class DshAcpServer {
     private handleClientResponse;
     private handleNotification;
     private handleRequest;
+    private presetService;
+    /**
+     * Preset for a NEW session: the ccteam-requested id when present, else the
+     * vendor's own default. Without the roster service, an explicit request is a
+     * hard error (silently creating a toolless agent is the exact bug this
+     * exists to prevent), while no request degrades to a bare create with a
+     * warning — an ACP-bundle-style runtime keeps its host-plane tools.
+     */
+    private composeCreatePreset;
+    /** Re-mount the STORED preset when resuming a persisted session. */
+    private composeResumeSetup;
+    /**
+     * The preset a persisted session was using: the newest
+     * `agent-preset/selected` event wins (a blank-session switch in the DSH UI),
+     * else the creation header's `agentPreset`; `undefined` mounts the vendor
+     * default. Mirrors the vendor's own `resolveSessionPreset` fold — the
+     * package is not importable from this plugin, so the two-field fold is
+     * reimplemented against the same durable data.
+     */
+    private storedPreset;
     private newSession;
     private loadSession;
     private prompt;

@@ -304,6 +304,13 @@ pub struct CreateSessionForm {
     /// the live ladders with `GET /api/v1/models`.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Explicit vendor session-mode token, forwarded verbatim and validated
+    /// by the vendor adapter. DSH only today: its agent preset — `standard` |
+    /// `ptc` (alias `code`) | `minimal` | `creator` (alias `cordis`);
+    /// omitted → DSH hires default to `ptc`. Other vendors refuse a non-empty
+    /// mode.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Map the create form's model/effort into a [`SpawnTuning`] — the ONE place
@@ -323,8 +330,13 @@ fn spawn_tuning_from_form(
     _vendor: AgentVendor,
     model: Option<String>,
     effort: Option<String>,
+    mode: Option<String>,
 ) -> ccteam_im::gateway::SpawnTuning {
-    ccteam_im::gateway::SpawnTuning { model, effort }
+    ccteam_im::gateway::SpawnTuning {
+        model,
+        effort,
+        mode,
+    }
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -403,7 +415,12 @@ pub(crate) async fn handle_create_session(
     };
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
-    let tuning = spawn_tuning_from_form(vendor, form.model.clone(), form.effort.clone());
+    let tuning = spawn_tuning_from_form(
+        vendor,
+        form.model.clone(),
+        form.effort.clone(),
+        form.mode.clone(),
+    );
     let created = ccteam_im::gateway::Gateway::create_session_api_tuned_shared(
         Arc::clone(gw),
         slug.clone(),
@@ -3303,7 +3320,12 @@ mod tests {
             (AgentVendor::Kimi, "kimi-code/k3", "max"),
             (AgentVendor::Pi, "anthropic/claude-sonnet-4-5", "high"),
         ] {
-            let t = spawn_tuning_from_form(vendor, Some(model.into()), Some(effort.into()));
+            let t = spawn_tuning_from_form(
+                vendor,
+                Some(model.into()),
+                Some(effort.into()),
+                Some("ptc".into()),
+            );
             assert_eq!(t.model.as_deref(), Some(model), "{vendor:?} dropped model");
             assert_eq!(
                 t.effort.as_deref(),
@@ -3315,7 +3337,7 @@ mod tests {
 
         // Omitted stays omitted: absence is how a caller asks for the vendor
         // default, and it must never be back-filled here either.
-        let t = spawn_tuning_from_form(AgentVendor::Grok, None, None);
+        let t = spawn_tuning_from_form(AgentVendor::Grok, None, None, None);
         assert_eq!(t.model, None);
         assert_eq!(t.effort, None);
     }

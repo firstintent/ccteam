@@ -64,6 +64,7 @@ async fn real_codex_app_server_start_thread_smoke() {
                 role: "real-smoke".to_string(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "real-codex-smoke".to_string(),
                 sid: "s-real".to_string(),
                 owner: "user:web-api".into(),
@@ -128,6 +129,7 @@ async fn real_codex_reply_roundtrip_proves_model_output() {
                 role: "real-reply".to_string(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "real-codex-reply".to_string(),
                 sid: "s-real-reply".to_string(),
                 owner: "user:web-api".into(),
@@ -324,6 +326,7 @@ async fn raw_extras_transport_is_resolved_tag() {
                 role: "demo".into(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "test".into(),
                 sid: "codex-1".into(),
                 owner: "user:web-api".into(),
@@ -387,6 +390,7 @@ async fn spawn_time_model_and_effort_ride_the_first_turn_start() {
                 role: "demo".into(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "tuned".into(),
                 sid: "codex-tuned".into(),
                 owner: "user:web-api".into(),
@@ -465,6 +469,7 @@ async fn submit_turn_resumes_unloaded_thread_before_turn_start() {
                 role: "demo".into(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "ensure-loaded".into(),
                 sid: "codex-el".into(),
                 owner: "user:web-api".into(),
@@ -567,6 +572,7 @@ async fn f10_real_codex_stdio_new_smoke() {
                 role: "f10-stdio-smoke".to_string(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "f10-stdio-smoke".to_string(),
                 sid: "s-f10".to_string(),
                 owner: "user:web-api".into(),
@@ -891,6 +897,7 @@ async fn adapter_returns_spawn_failed_when_socket_missing() {
         role: "demo".into(),
     };
     let ctx = SpawnCtx {
+        mode: None,
         slug: "test".into(),
         sid: "codex-1".into(),
         owner: "user:web-api".into(),
@@ -969,6 +976,7 @@ async fn adapter_sends_initialize_handshake_before_thread_start() {
         role: "demo".into(),
     };
     let ctx = SpawnCtx {
+        mode: None,
         slug: "test".into(),
         sid: "codex-1".into(),
         owner: "user:web-api".into(),
@@ -1071,6 +1079,7 @@ async fn adapter_start_thread_against_scripted_peer() {
         role: "demo".into(),
     };
     let ctx = SpawnCtx {
+        mode: None,
         slug: "test".into(),
         sid: "codex-1".into(),
         owner: "user:web-api".into(),
@@ -1141,6 +1150,7 @@ async fn adapter_maps_system_directives_to_command_rpcs() {
         role: "demo".into(),
     };
     let ctx = SpawnCtx {
+        mode: None,
         slug: "test".into(),
         sid: "codex-1".into(),
         owner: "user:web-api".into(),
@@ -1365,6 +1375,7 @@ async fn d2_start_with_notif(
                 role: "demo".into(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "test".into(),
                 sid: "codex-1".into(),
                 owner: "user:web-api".into(),
@@ -2967,6 +2978,7 @@ async fn start_thread_injects_per_thread_mcp_config_with_identity() {
                 role: "reviewer".into(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "demo".into(),
                 sid: "codex-w1".into(),
                 owner: "user:web-api".into(),
@@ -3050,6 +3062,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
     // Simulate the "before the restart" state: a prior codex session whose
     // vendor_uuid is persisted in meta.json (what apply_new_session writes).
     let meta = ccteam_harness::SessionMeta {
+        mode: None,
         managed_by: Default::default(),
         sid: "codex-r1".into(),
         slug: "demo".into(),
@@ -3088,6 +3101,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
                 role: "reviewer".into(),
             },
             &SpawnCtx {
+                mode: None,
                 slug: "demo".into(),
                 sid: "codex-r1".into(),
                 owner: "user:web-api".into(),
@@ -3134,6 +3148,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
 async fn start_thread_rejects_remote_ctx_readable() {
     let tmp = TempDir::new().unwrap();
     let ctx = SpawnCtx {
+        mode: None,
         slug: "demo".into(),
         sid: "s-remote".into(),
         owner: "user:web-api".into(),

@@ -1117,6 +1117,9 @@ pub struct SpawnTuning {
     /// Explicit reasoning-effort token (vendor-specific value set — the
     /// vendor validates it; see `SpawnCtx::effort`).
     pub effort: Option<String>,
+    /// Explicit vendor session-mode token (DSH agent preset today — the
+    /// vendor validates it; see `SpawnCtx::mode`).
+    pub mode: Option<String>,
 }
 
 impl SpawnTuning {
@@ -1126,6 +1129,7 @@ impl SpawnTuning {
         Self {
             model: clean(self.model),
             effort: clean(self.effort),
+            mode: clean(self.mode),
         }
     }
 }
@@ -1417,6 +1421,8 @@ struct MetaRebuildPlan {
     model_id: Option<String>,
     /// Replayed from `meta.effort`, exactly like `model_id` above.
     effort: Option<String>,
+    /// Replayed from `meta.mode`, exactly like `effort` above.
+    mode: Option<String>,
     secret: String,
     cwd: PathBuf,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
@@ -1465,6 +1471,9 @@ struct NewSessionPlan {
     /// `meta.model`, so a resume / role switch / rebuild replays the pick
     /// instead of quietly reverting one axis to the vendor default.
     effort: Option<String>,
+    /// Explicit vendor session-mode pick. Persisted in `meta.mode` with the
+    /// same replay contract as `effort`.
+    mode: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// v0.9.0 W2 (F2) — delegation parent sid (the spawning principal). `None`
     /// for a human/root spawn. Threaded into `meta.parent_sid` + the live
@@ -1511,6 +1520,8 @@ struct ResumeDeadPlan {
     model_id: Option<String>,
     /// Replayed from `meta.effort`, exactly like `model_id` above.
     effort: Option<String>,
+    /// Replayed from `meta.mode`, exactly like `effort` above.
+    mode: Option<String>,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// Live-entry epoch captured during planning. Apply aborts if the entry was
     /// replaced or removed while the vendor spawn was in flight.
@@ -1654,7 +1665,7 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/new",
-        arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl] [model=<id>] [effort=<level>]"),
+        arg_hint: Some("[claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl] [model=<id>] [effort=<level>] [mode=<mode>]"),
         help: "start a new session (`hitl` = approve tools in IM; model=/effort= go to the vendor as typed)",
         in_menu: true,
     },
@@ -2092,6 +2103,7 @@ impl Gateway {
             handle,
             model_id,
             effort: meta.effort.clone(),
+            mode: meta.mode.clone(),
             secret: rebuild_secret,
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
@@ -2163,6 +2175,7 @@ impl Gateway {
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
                     effort: plan.effort.clone(),
+                    mode: plan.mode.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -3954,6 +3967,7 @@ impl Gateway {
                 .flatten()
         });
         let effort = tuning.effort;
+        let mode = tuning.mode;
         self.next_session += 1;
         // Make the counter durable BEFORE the sid is used (a later spawn failure
         // then leaves a harmless gap, never a reused sid — red line: monotonic).
@@ -4014,6 +4028,7 @@ impl Gateway {
             cwd,
             model_id,
             effort,
+            mode,
             adapter,
             parent_sid: None,
             spawned_by_role: None,
@@ -4081,6 +4096,7 @@ impl Gateway {
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
                     effort: plan.effort.clone(),
+                    mode: plan.mode.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -4130,6 +4146,7 @@ impl Gateway {
             model: plan.model_id.clone(),
             observed_model: None,
             effort: plan.effort.clone(),
+            mode: plan.mode.clone(),
             host: plan.host.clone(),
             created_at: now.clone(),
             last_active: now,
@@ -4187,6 +4204,7 @@ impl Gateway {
             cwd: _,
             model_id: _,
             effort: _,
+            mode: _,
             adapter,
             parent_sid,
             spawned_by_role: _,
@@ -4376,10 +4394,10 @@ impl Gateway {
         // `/role` re-derives the MODEL from the new role's frontmatter, but the
         // effort belongs to the session, not the role — replay it so a switch
         // doesn't silently drop the level the session was spawned with.
-        let effort = self
-            .session_catalog
-            .find_or_load(&sid, &self.projects)
-            .and_then(|entry| entry.meta.effort);
+        let (effort, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
+            Some(entry) => (entry.meta.effort, entry.meta.mode),
+            None => (None, None),
+        };
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -4391,6 +4409,7 @@ impl Gateway {
                 cwd,
                 model_id.clone(),
                 effort.clone(),
+                mode.clone(),
                 permission_mode,
                 secret.clone(),
                 &host,
@@ -4449,6 +4468,7 @@ impl Gateway {
             meta.role = meta_role.clone();
             meta.model = model_id;
             meta.effort = effort;
+            meta.mode = mode;
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
@@ -6544,7 +6564,10 @@ impl Gateway {
             .as_ref()
             .and_then(|m| m.model.clone())
             .or_else(|| role_model_id(role_detail.as_ref()));
-        let effort = meta.and_then(|m| m.effort);
+        let (effort, mode) = match meta {
+            Some(m) => (m.effort, m.mode),
+            None => (None, None),
+        };
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
@@ -6564,6 +6587,7 @@ impl Gateway {
             cwd,
             model_id,
             effort,
+            mode,
             adapter,
             generation,
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
@@ -6601,6 +6625,7 @@ impl Gateway {
                     extra_args: vec![],
                     model_id: plan.model_id.clone(),
                     effort: plan.effort.clone(),
+                    mode: plan.mode.clone(),
                     permission_mode: plan.permission_mode,
                     secret: plan.secret.clone(),
                     remote,
@@ -6633,6 +6658,7 @@ impl Gateway {
             cwd: _,
             model_id: _,
             effort: _,
+            mode: _,
             adapter,
             generation,
             ccteam_root: _,
@@ -6714,6 +6740,8 @@ impl Gateway {
         // Replayed from `meta.effort` — a re-spawn must not reset the axis the
         // caller picked (`/role` swaps the ROLE, not the reasoning level).
         effort: Option<String>,
+        // Replayed from `meta.mode`, same contract.
+        mode: Option<String>,
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
@@ -6750,6 +6778,7 @@ impl Gateway {
                     extra_args: vec![],
                     model_id,
                     effort,
+                    mode,
                     permission_mode,
                     secret,
                     remote,
@@ -9102,6 +9131,7 @@ impl Gateway {
             model: None,
             observed_model: None,
             effort: None,
+            mode: None,
             host: "local".to_string(),
             created_at: now.clone(),
             last_active: now,
@@ -9205,6 +9235,7 @@ impl Gateway {
                 model: None,
                 observed_model: None,
                 effort: None,
+                mode: None,
                 host: "local".to_string(),
                 created_at: now.clone(),
                 last_active: now,
@@ -13274,7 +13305,7 @@ struct NewSessionArgs {
 /// The one-line `/new` syntax, echoed by every parse error so a chat user
 /// never has to leave the conversation to find the shape.
 const NEW_COMMAND_SYNTAX: &str =
-    "/new [claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>]";
+    "/new [claude|codex|grok|opencode|kimi|pi|dsh] [role] [hitl|skip] [terminal|acp] [model=<id>] [effort=<level>] [mode=<mode>]";
 
 /// Parse the tokens after `/new`.
 ///
@@ -13314,9 +13345,10 @@ fn parse_new_command_args(args: &[&str]) -> Result<NewSessionArgs> {
             match key {
                 "model" | "m" => tuning.model = Some(value.to_string()),
                 "effort" | "e" => tuning.effort = Some(value.to_string()),
+                "mode" => tuning.mode = Some(value.to_string()),
                 other => {
                     return Err(anyhow!(
-                        "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=)\nsyntax: {NEW_COMMAND_SYNTAX}"
+                        "/new: unknown option `{other}=` (accepts model=<id> / m=, effort=<level> / e=, mode=<mode>)\nsyntax: {NEW_COMMAND_SYNTAX}"
                     ));
                 }
             }
@@ -13505,6 +13537,7 @@ mod tests {
             assert_eq!(
                 parsed.tuning,
                 SpawnTuning {
+                    mode: None,
                     model: Some("kimi-code/k3".to_string()),
                     effort: Some("max".to_string()),
                 },
@@ -14340,6 +14373,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    mode: None,
                     model: Some("future-model-from-vendor".into()),
                     effort: Some("max".into()),
                 },
@@ -14372,6 +14406,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    mode: None,
                     model: Some("  ".into()),
                     effort: Some("".into()),
                 },
@@ -14412,6 +14447,7 @@ mod tests {
                 SessionProtocol::StreamJson,
                 "web-api".into(),
                 SpawnTuning {
+                    mode: None,
                     model: Some("opus".into()),
                     effort: Some("xhigh".into()),
                 },
@@ -20601,6 +20637,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            mode: None,
             managed_by: Default::default(),
             sid: "s1".into(),
             slug: "alpha".into(),
@@ -20676,6 +20713,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            mode: None,
             managed_by: Default::default(),
             sid: "s1".into(),
             slug: "alpha".into(),

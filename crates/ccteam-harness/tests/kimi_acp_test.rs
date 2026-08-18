@@ -54,6 +54,7 @@ fn clear_fake() {
 
 fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        mode: None,
         slug: "demo".into(),
         sid: sid.into(),
         owner: "user:web-api".into(),
@@ -319,6 +320,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let project = tmp.path();
     let sid = "s-resume";
     let meta = SessionMeta {
+        mode: None,
         managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
@@ -411,6 +413,7 @@ async fn resume_carries_mcp_servers() {
     }
 
     let meta = SessionMeta {
+        mode: None,
         managed_by: Default::default(),
         sid: sid.into(),
         slug: "demo".into(),
@@ -443,6 +446,7 @@ async fn resume_carries_mcp_servers() {
 
     // A SpawnCtx WITH a secret → `acp_mcp_servers_http` yields a non-empty array.
     let ctx = SpawnCtx {
+        mode: None,
         slug: "demo".into(),
         sid: sid.into(),
         owner: "user:web-api".into(),

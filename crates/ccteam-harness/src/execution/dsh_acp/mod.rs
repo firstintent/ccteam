@@ -75,6 +75,29 @@ struct LiveSession {
     _dispatcher: tokio::task::JoinHandle<()>,
 }
 
+/// Resolve the ccteam `mode` axis to a DSH agent-preset id. The vendor's
+/// shipped presets are `standard` | `code` (displayed "PTC") | `minimal` |
+/// `cordis` (displayed "creator"); ccteam accepts both spellings and an unset
+/// mode defaults a hire to PTC (owner decree — DSH's own web default is
+/// `standard`). Presets pick the TOOLSET: a session created without one has no
+/// bash/read/write at all in the web runtime.
+pub fn mode_agent_preset(mode: Option<&str>) -> Result<String, HarnessError> {
+    let token = mode
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("ptc");
+    match token.to_ascii_lowercase().as_str() {
+        "ptc" | "code" => Ok("code".to_string()),
+        "standard" => Ok("standard".to_string()),
+        "minimal" => Ok("minimal".to_string()),
+        "creator" | "cordis" => Ok("cordis".to_string()),
+        other => Err(HarnessError::SpawnFailed(format!(
+            "unknown DSH session mode `{other}`: accepts standard | ptc (code) | minimal | \
+             creator (cordis); omit it for the ccteam default (ptc)"
+        ))),
+    }
+}
+
 /// Per-process singleton holding live DSH ACP sessions keyed by DSH session id.
 #[derive(Clone)]
 pub struct DshAcpAdapter {
@@ -427,7 +450,12 @@ impl HarnessAdapter for DshAcpAdapter {
         let cwd = project_cwd(ctx)?;
         let inbound = Self::inbound_policy(ctx.permission_mode);
         let agent_options = DshAgentOptions::new(ctx.model_id.as_deref());
+        // `session/load` carries the identity WITHOUT a preset (the stored one
+        // is authoritative); `session/new` — fresh or as the failed-load
+        // fallback — carries the resolved mode, ccteam-defaulting to PTC.
+        let agent_preset = mode_agent_preset(ctx.mode.as_deref())?;
         let meta = CcteamSessionMeta::new(&ctx.sid, &mcp, ctx.permission_mode);
+        let new_meta = meta.clone().with_agent_preset(agent_preset);
 
         // The runtime is per identity, so the socket and the DSH home are too.
         // `CCTEAM_DSH_SOCKET` (test-only) names a socket a fake already serves
@@ -481,7 +509,8 @@ impl HarnessAdapter for DshAcpAdapter {
                         // perfectly usable — the runtime and every other hire on
                         // it are untouched — so `session/new` reuses it.
                         let (new_id, info) =
-                            handshake::session_new(&transport, &cwd, &agent_options, &meta).await?;
+                            handshake::session_new(&transport, &cwd, &agent_options, &new_meta)
+                                .await?;
                         if new_id == uuid {
                             tracing::warn!(
                                 session_id = %new_id,
@@ -492,7 +521,7 @@ impl HarnessAdapter for DshAcpAdapter {
                     }
                 }
             }
-            None => handshake::session_new(&transport, &cwd, &agent_options, &meta).await?,
+            None => handshake::session_new(&transport, &cwd, &agent_options, &new_meta).await?,
         };
 
         let live = self.register_live(
@@ -696,6 +725,21 @@ mod tests {
             Arc::ptr_eq(adapter.clone().runtime(), &manager),
             "cloning the adapter (the factory hands out clones) keeps the same manager"
         );
+    }
+
+    #[test]
+    fn mode_tokens_resolve_to_vendor_preset_ids() {
+        assert_eq!(mode_agent_preset(None).unwrap(), "code");
+        assert_eq!(mode_agent_preset(Some("")).unwrap(), "code");
+        assert_eq!(mode_agent_preset(Some("ptc")).unwrap(), "code");
+        assert_eq!(mode_agent_preset(Some("PTC")).unwrap(), "code");
+        assert_eq!(mode_agent_preset(Some("code")).unwrap(), "code");
+        assert_eq!(mode_agent_preset(Some("standard")).unwrap(), "standard");
+        assert_eq!(mode_agent_preset(Some("minimal")).unwrap(), "minimal");
+        assert_eq!(mode_agent_preset(Some("creator")).unwrap(), "cordis");
+        assert_eq!(mode_agent_preset(Some("cordis")).unwrap(), "cordis");
+        let err = mode_agent_preset(Some("turbo")).unwrap_err().to_string();
+        assert!(err.contains("turbo") && err.contains("standard"), "{err}");
     }
 
     #[test]

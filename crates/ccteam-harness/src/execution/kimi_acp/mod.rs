@@ -484,6 +484,13 @@ impl HarnessAdapter for KimiAcpAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Kimi has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // Remote execution is claude-only (red line: 跨机 verdict 钉 claude);
         // see `codex_app_server.rs`'s identical guard for the rationale.
         if ctx.remote.is_some() {
