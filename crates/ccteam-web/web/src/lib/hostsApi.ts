@@ -55,6 +55,9 @@ export interface HostDetail {
   arch: string;
   ccteam_version: string;
   agents: AgentHealth[];
+  /** Whether `npm` runs on this host (local only) — every one-click install
+   *  recipe is npm-based, so a false here disables the button with a hint. */
+  npm_available?: boolean;
   /** Projects registered on THIS host (local: the daemon registry; satellite:
    *  its own `~/.ccteam` registry as reported at heartbeat). A remote spawn
    *  is only possible into a slug listed here. */
@@ -72,6 +75,39 @@ export interface HostProjectView {
 export interface RegisterMcpResult {
   registered: string[];
   paths: Record<string, string>;
+}
+
+/** VENDOR-INSTALL-1 — one install/update job (`InstallJobView`), returned by
+ *  both the POST (202, started or dedup-joined) and the poll GET. */
+export interface InstallJob {
+  job_id: string;
+  vendor: string;
+  /** `running` | `ok` | `failed`. */
+  state: "running" | "ok" | "failed";
+  /** Process exit code once finished; null while running / after a timeout kill. */
+  exit_code: number | null;
+  /** Trailing merged stdout+stderr window (last 24 lines). */
+  output_tail: string;
+}
+
+/** `POST /api/v1/hosts/{host}/vendors/{vendor}/install` — start (or join the
+ *  running) one-click install/update job. Admin-only (backend 403s tenants);
+ *  400 for a recipe-less vendor (kimi/pi), 404 off-local. */
+export function installVendor(host: string, vendor: string): Promise<InstallJob> {
+  return postJson<InstallJob>(
+    `/api/v1/hosts/${encodeURIComponent(host)}/vendors/${encodeURIComponent(vendor)}/install`,
+  );
+}
+
+/** `GET /api/v1/hosts/{host}/vendors/{vendor}/install/{jobId}` — poll one job. */
+export function getInstallJob(
+  host: string,
+  vendor: string,
+  jobId: string,
+): Promise<InstallJob> {
+  return getJson<InstallJob>(
+    `/api/v1/hosts/${encodeURIComponent(host)}/vendors/${encodeURIComponent(vendor)}/install/${encodeURIComponent(jobId)}`,
+  );
 }
 
 /** `GET`/`POST /api/v1/hosts/join-token` response. `token` is

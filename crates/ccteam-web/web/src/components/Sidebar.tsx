@@ -1,13 +1,13 @@
 // v0.8.24 Track A — the prototype sidebar (ui-prototype.html `.side`):
 // expanded 296px column / collapsed 64px icon rail / mobile fixed drawer.
 //
-// Expanded, top→bottom: logo+collapse → ⌘K search → 「新建会话」 → 「工作流」 →
+// Expanded, top→bottom: logo(→home)+collapse → ⌘K search → 「新建会话」 → 「工作流」 →
 // 「工作区」 groups (per-project sessions, 4 shown + 展开显示(还有 N 个),
-// hover-stop per running row) → bottom 「设置」 + user row.
+// hover-stop per running row) → bottom user row + 「设置」(settings last).
 //
 // Collapsed rail keeps the SAME order (prototype CSS comment is the
-// acceptance): logo → expand → search → new → flow → blank(click expands) →
-// settings → avatar.
+// acceptance): logo(→home) → expand → search → new → flow →
+// blank(click expands) → avatar → settings.
 
 import { useEffect, useState } from "react";
 import {
@@ -180,6 +180,7 @@ export function Sidebar({
   searchRef,
   onQuery,
   onCollapse,
+  onOpenHome,
   onNewSession,
   onNewInProject,
   onOpenFlow,
@@ -214,6 +215,8 @@ export function Sidebar({
   searchRef?: React.Ref<HTMLInputElement>;
   onQuery: (q: string) => void;
   onCollapse: (collapsed: boolean) => void;
+  /** Logo click — navigate home (`/`). */
+  onOpenHome: () => void;
   onNewSession: () => void;
   onNewInProject: (project: string) => void;
   onOpenFlow: () => void;
@@ -288,7 +291,7 @@ export function Sidebar({
     >
       <div className="side-inner">
         <div className="side-logo">
-          <CcLogo className="logo-mark lg" />
+          <CcLogo className="logo-mark lg" onClick={onOpenHome} title={t("home")} testId="side-home" />
           <span className="brand">ccteam</span>
           <button
             type="button"
@@ -572,6 +575,12 @@ export function Sidebar({
         </div>
 
         <div className="side-bottom">
+          <div className="side-user">
+            <span className="avatar" style={{ width: 26, height: 26, fontSize: 11, ...avatarStyle }}>
+              {userInitial}
+            </span>
+            {userName}
+          </div>
           <button
             type="button"
             className={`sflow ${settingsActive ? "active" : ""}`}
@@ -582,18 +591,12 @@ export function Sidebar({
             <span>{t("settings")}</span>
             <ChevronRight className="chev" />
           </button>
-          <div className="side-user">
-            <span className="avatar" style={{ width: 26, height: 26, fontSize: 11, ...avatarStyle }}>
-              {userInitial}
-            </span>
-            {userName}
-          </div>
         </div>
       </div>
 
-      {/* 折叠态(顺序与展开一致:logo→展开→搜索→新建→工作流→空白→设置→头像) */}
+      {/* 折叠态(顺序与展开一致:logo→展开→搜索→新建→工作流→空白→头像→设置) */}
       <div className="side-mini" data-testid="side-mini">
-        <CcLogo className="logo-mark" onClick={() => onCollapse(false)} title={t("expand")} />
+        <CcLogo className="logo-mark" onClick={onOpenHome} title={t("home")} testId="side-home-rail" />
         <button
           type="button"
           className="rail-btn"
@@ -668,18 +671,19 @@ export function Sidebar({
             if (e.key === "Enter") onCollapse(false);
           }}
         />
+        <div className="avatar" title={userName} style={avatarStyle}>
+          {userInitial}
+        </div>
         <button
           type="button"
           className="rail-btn"
           onClick={onOpenSettings}
           title={t("settings")}
           aria-label={t("settings")}
+          data-testid="side-settings-rail"
         >
           <Settings />
         </button>
-        <div className="avatar" title={userName} style={avatarStyle}>
-          {userInitial}
-        </div>
       </div>
 
       {removeFor && onRemoveProject ? (

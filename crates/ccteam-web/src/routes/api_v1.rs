@@ -22,20 +22,21 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
 use ccteam_core::{
-    cost_history_buckets, cost_summary, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket,
-    HarnessKind, ProjectState, TeamKind, WorkflowSummary,
+    cost_history_buckets, ActiveSessionInfo, ArtifactQueueEntry, CostHistoryBucket, HarnessKind,
+    ProjectState, TeamKind, WorkflowSummary,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use crate::queries::{
-    events_to_rows, outbox_rows, recent_event_summary, slug_recent_events, DEFAULT_OUTBOX_LIMIT,
+    events_to_rows, outbox_rows, recent_event_summary, DEFAULT_OUTBOX_LIMIT,
     PROJECT_EVENT_DISPLAY_LIMIT, STATUS_EVENT_LIMIT,
 };
 use crate::state::AppState;
@@ -129,9 +130,17 @@ pub struct AuthToken {
 pub(crate) async fn handle_projects(
     State(app): State<AppState>,
     Extension(identity): Extension<crate::auth::Identity>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
     match build_projects(&app, &identity) {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(mut rows) => {
+            let version = app.progress_projection.snapshot_version();
+            for row in &mut rows {
+                row.version = version;
+            }
+            let etag = snapshot_etag("projects", version, &rows);
+            snapshot_response(Json(rows).into_response(), etag, &headers)
+        }
         Err(err) => {
             tracing::error!(?err, "GET /api/v1/projects build failed");
             (
@@ -141,6 +150,54 @@ pub(crate) async fn handle_projects(
                 .into_response()
         }
     }
+}
+
+pub(crate) fn snapshot_response(
+    mut response: Response,
+    etag: Option<String>,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(etag) = etag else {
+        return response;
+    };
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                candidate
+                    .trim()
+                    .strip_prefix("W/")
+                    .unwrap_or(candidate.trim())
+                    == etag
+            })
+        })
+    {
+        response = StatusCode::NOT_MODIFIED.into_response();
+    }
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response
+}
+
+/// ETags include the monotonic projection revision and a digest of the exact
+/// response payload. The digest is load-bearing: status/project rows also
+/// contain live registry and host-health state that can change without a
+/// progress ingest, so a bare projection counter could return a false 304.
+pub(crate) fn snapshot_etag<T: Serialize>(
+    kind: &str,
+    version: Option<u64>,
+    value: &T,
+) -> Option<String> {
+    let version = version?;
+    let body = serde_json::to_vec(value).ok()?;
+    let digest = Sha256::digest(body);
+    Some(format!("\"{kind}-{version}-{digest:x}\""))
 }
 
 fn build_projects(
@@ -158,7 +215,8 @@ fn build_projects(
         if !identity.can_see_owner(s.state.owner.as_deref()) {
             continue;
         }
-        let events = slug_recent_events(&app.paths, &s.state.slug, STATUS_EVENT_LIMIT);
+        let projection = app.progress_projection.project_snapshot(&s.state.slug);
+        let events = projection.recent_events(STATUS_EVENT_LIMIT);
         let badge = status_badge(&s.state, &events, s.stall_silent_seconds);
         let last_event_label = match s.state.last_progress_event_at {
             Some(ts) => recent_event_summary(ts, s.stall_silent_seconds),
@@ -169,13 +227,7 @@ fn build_projects(
         // instead of the now-frozen `state.cost_used_usd`. A missing
         // progress file folds to 0.00 — same shape pre-F91 fresh
         // projects displayed.
-        let cost_total = cost_summary(
-            &s.state.slug,
-            &app.paths.progress_jsonl(&s.state.slug),
-            &app.paths,
-        )
-        .map(|c| c.cost_total_usd)
-        .unwrap_or(0.0);
+        let cost_total = projection.cost.cost_total_usd;
         let project_dir = app.paths.project_dir(&s.state.slug);
         let host = config
             .projects
@@ -190,6 +242,7 @@ fn build_projects(
                 .get(&host)
                 .is_some_and(|record| record.is_online(ccteam_core::DEFAULT_HEARTBEAT_TTL_SECS));
         rows.push(DashboardRow {
+            version: None,
             slug: s.state.slug.clone(),
             // The real working-tree dir (config-registry resolved) so the SPA can
             // show it next to the slug — disambiguates an auto-appended slug.
@@ -227,6 +280,7 @@ fn build_projects(
                     continue;
                 }
                 rows.push(DashboardRow {
+                    version: None,
                     slug: entry.slug.clone(),
                     path: entry.path.display().to_string(),
                     host: if entry.host.is_empty() {
@@ -475,7 +529,8 @@ pub(crate) async fn handle_project(
             .into_response();
     }
 
-    let status_events = slug_recent_events(&app.paths, &slug, STATUS_EVENT_LIMIT);
+    let projection = app.progress_projection.project_snapshot(&slug);
+    let status_events = projection.recent_events(STATUS_EVENT_LIMIT);
     let display_start = status_events
         .len()
         .saturating_sub(PROJECT_EVENT_DISPLAY_LIMIT);
@@ -495,7 +550,11 @@ pub(crate) async fn handle_project(
         }
     };
 
-    let workflow_summary = match ccteam_core::workflow_summary(&slug, &app.paths) {
+    let workflow_summary = match ccteam_core::workflow_summary_from_events(
+        &slug,
+        &app.paths,
+        &projection.workflow_events,
+    ) {
         Ok(s) => Some(s),
         Err(err) => {
             tracing::warn!(slug, error = %err, "workflow_summary build failed");
@@ -508,8 +567,7 @@ pub(crate) async fn handle_project(
     // line read `state.cost_used_usd`, which is now frozen.
     // V0.6.0 Wave 3 F112 — also surface `cost_24h_by_vendor` to drive
     // the SPA's per-vendor split and `/ccteam-advise` UI.
-    let cost =
-        cost_summary(&slug, &app.paths.progress_jsonl(&slug), &app.paths).unwrap_or_default();
+    let cost = projection.cost;
     let cost_total = cost.cost_total_usd;
     let cost_24h_by_vendor = cost.cost_24h_by_vendor.clone();
     let summary = ProjectSummary {
@@ -603,23 +661,20 @@ fn build_workflow_session_detail(
         )
             .into_response();
     }
-    let events: Vec<serde_json::Value> = match std::fs::read_to_string(&progress_path) {
-        Ok(body) => body
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect(),
-        Err(err) => {
-            tracing::error!(slug, sid, %err, "workflow session: progress.jsonl read failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("progress.jsonl read failed for {slug}: {err}")
-                })),
-            )
-                .into_response();
-        }
-    };
+    let events: Vec<serde_json::Value> =
+        match ccteam_core::progress::read_all_events(&progress_path) {
+            Ok(events) => events,
+            Err(err) => {
+                tracing::error!(slug, sid, %err, "workflow session: progress.jsonl read failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("progress.jsonl read failed for {slug}: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Find the `agent_spawn` event for <sid>. If we can't find one,
     // 404 — synthesising a SessionDetail from later events would lose

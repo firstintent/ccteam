@@ -42,7 +42,7 @@ import {
   Skeleton,
   type ComboboxOption,
 } from "../components/ui";
-import { fetchDashboard } from "../lib/dashboardApi";
+import { useProjectsStore } from "../hooks/useProjectsStore";
 import {
   getMarketplace,
   getPluginBody,
@@ -83,9 +83,14 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
   const lang = settings.language;
   const t = makeT(lang);
   // ---- install-target project picker -------------------------------------
-  const [projects, setProjects] = useState<string[]>([]);
-  const [project, setProject] = useState<string>("");
-  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const { projects: projectRows, loading: projectsLoading } = useProjectsStore();
+  const projects = useMemo(
+    () => (projectRows ?? []).map((row) => row.slug).sort(),
+    [projectRows],
+  );
+  const [selectedProject, setSelectedProject] = useState("");
+  const project = projects.includes(selectedProject) ? selectedProject : (projects[0] ?? "");
+  const projectsLoaded = !projectsLoading;
 
   // ---- catalog -----------------------------------------------------------
   const [state, setState] = useState<LoadState>({ kind: "loading" });
@@ -98,29 +103,6 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
 
   // ---- detail drawer -----------------------------------------------------
   const [detailId, setDetailId] = useState<string | null>(null);
-
-  // Load the install-target project list once (cross-shell, like the rail).
-  useEffect(() => {
-    let cancelled = false;
-    fetchDashboard()
-      .then((rows) => {
-        if (cancelled) return;
-        const slugs = rows.map((r) => r.slug).sort();
-        setProjects(slugs);
-        // Default to the first project so the common case (one project) needs
-        // no extra click; an empty list leaves us in browse-only mode.
-        setProject((cur) => cur || slugs[0] || "");
-        setProjectsLoaded(true);
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-        setProjectsLoaded(true); // browse-only fallback (global catalog)
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Fetch the catalog — decorated when a project is selected, global otherwise.
   // The actual network + state-transition core; state is only ever set inside
@@ -164,7 +146,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
   // Initial / dependency-driven load. We fetch directly (no synchronous
   // setState in the effect body); the initial `state` is already `loading`, so
   // there's nothing to reset on the first run. On a later `project` switch
-  // (drawer install-target change → setProject) this re-fires to re-decorate
+  // (drawer install-target change → setSelectedProject) this re-fires to re-decorate
   // installed_status quietly — no loading flash, drawer stays open (it only
   // unmounts when `state.kind !== "ready"`, which we avoid on project switch).
   useEffect(() => {
@@ -419,7 +401,7 @@ export default function MarketplaceView({ embedded = false }: { embedded?: boole
           lang={lang}
           installing={installing === detailPlugin.id}
           onClose={() => setDetailId(null)}
-          onProjectChange={setProject}
+          onProjectChange={setSelectedProject}
           onInstall={() => doInstall(detailPlugin)}
         />
       ) : null}

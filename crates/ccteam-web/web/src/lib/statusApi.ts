@@ -9,6 +9,7 @@
 //   other non-2xx → throw Error("HTTP <status>")
 
 import { httpError } from "./httpError";
+import { backgroundHeaders } from "./backgroundRequest";
 
 /** v0.8.18 柱1 — one live session's fleet-view row (`SessionCostRow`). The
  *  loop-ops console skeleton: per-session cost today, oracle/gate columns
@@ -42,17 +43,26 @@ export interface StatusSnapshot {
   sessions?: SessionCostRow[];
 }
 
-/** `GET /api/v1/status`. */
-export function getStatus(): Promise<StatusSnapshot> {
-  return getJson<StatusSnapshot>("/api/v1/status");
+export interface StatusRequestOptions {
+  signal?: AbortSignal;
+  background?: boolean;
 }
 
-async function getJson<T>(url: string): Promise<T> {
+/** `GET /api/v1/status`. */
+export function getStatus(options: StatusRequestOptions = {}): Promise<StatusSnapshot> {
+  return getJson<StatusSnapshot>("/api/v1/status", options);
+}
+
+async function getJson<T>(url: string, options: StatusRequestOptions): Promise<T> {
   let res: Response;
+  const headers = options.background
+    ? backgroundHeaders({ Accept: "application/json" })
+    : { Accept: "application/json" };
   try {
     res = await fetch(url, {
-      headers: { Accept: "application/json" },
+      headers,
       credentials: "same-origin",
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (e) {
     throw new Error(`network: ${e instanceof Error ? e.message : "connection failed"}`);

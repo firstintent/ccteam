@@ -17,6 +17,8 @@
 //   404 → throw Error("NOT_FOUND")
 //   other non-2xx → throw server `{error}` / text body, else `HTTP <status>`
 
+import { backgroundHeaders } from "./backgroundRequest";
+
 /** One live gateway session (the `SessionView` the backend serializes —
  *  `crates/ccteam-im/src/gateway.rs::SessionView`). `sid` is the gateway
  *  `s{n}` id; `permission_mode` is `"skip"` | `"hitl"` (W2). */
@@ -83,6 +85,13 @@ export interface SessionHistoryEvent {
 export interface SessionHistory {
   sid: string;
   events: SessionHistoryEvent[];
+  next_before: string | null;
+  has_more: boolean;
+}
+
+export interface ReadRequestOptions {
+  signal?: AbortSignal;
+  background?: boolean;
 }
 
 /** Authenticated same-origin URL for one project attachment. Hardcoded path
@@ -169,12 +178,16 @@ export function sessionUrl(sid: string): string {
   return `/api/v1/sessions/${encodeURIComponent(sid)}`;
 }
 
-async function getJson<T>(url: string): Promise<T> {
+async function getJson<T>(url: string, options: ReadRequestOptions = {}): Promise<T> {
   let res: Response;
+  const headers = options.background
+    ? backgroundHeaders({ Accept: "application/json" })
+    : { Accept: "application/json" };
   try {
     res = await fetch(url, {
-      headers: { Accept: "application/json" },
+      headers,
       credentials: "same-origin",
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (e) {
     throw new Error(
@@ -247,13 +260,20 @@ async function errorMessage(res: Response): Promise<string> {
 /** `GET /api/v1/projects/{slug}/sessions` — the gateway `s{n}` session list
  *  for one project (the per-session switcher source). Empty array when the
  *  project has no live session. */
-export function listSessions(slug: string): Promise<SessionView[]> {
-  return getJson<SessionView[]>(sessionsUrl(slug));
+export function listSessions(slug: string, options: ReadRequestOptions = {}): Promise<SessionView[]> {
+  return getJson<SessionView[]>(sessionsUrl(slug), options);
 }
 
 /** `GET /api/v1/sessions/{sid}` — mirrored history to seed a reopened page. */
-export function getHistory(sid: string): Promise<SessionHistory> {
-  return getJson<SessionHistory>(sessionUrl(sid));
+export function getHistory(
+  sid: string,
+  page: { before?: string; limit?: number } = {},
+): Promise<SessionHistory> {
+  const params = new URLSearchParams();
+  if (page.limit !== undefined) params.set("limit", String(page.limit));
+  if (page.before) params.set("before", page.before);
+  const query = params.toString();
+  return getJson<SessionHistory>(`${sessionUrl(sid)}${query ? `?${query}` : ""}`);
 }
 
 /** `GET /api/v1/sessions/{sid}/status` — the per-session statusline (model +
@@ -473,10 +493,11 @@ export interface ExternalSessionView {
 }
 
 /** Fetch stopped ccteam sessions for a project (lazy — call on expand). */
-export function listHistorySessions(slug: string): Promise<HistorySessionView[]> {
-  return getJson<HistorySessionView[]>(
-    `${sessionsUrl(slug)}/history`,
-  );
+export function listHistorySessions(
+  slug: string,
+  options: ReadRequestOptions = {},
+): Promise<HistorySessionView[]> {
+  return getJson<HistorySessionView[]>(`${sessionsUrl(slug)}/history`, options);
 }
 
 /** Re-activate a stopped session. Returns `{sid}`. */

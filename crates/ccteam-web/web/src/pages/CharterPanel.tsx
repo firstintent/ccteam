@@ -41,7 +41,7 @@ import {
   sortRosterHosts,
   type RosterHost,
 } from "../lib/charterRoster";
-import { fetchDashboard, type DashboardRow } from "../lib/dashboardApi";
+import { useProjectsStore } from "../hooks/useProjectsStore";
 import { getHostDetail, getHosts } from "../lib/hostsApi";
 import { getRouting, putRouting } from "../lib/routingApi";
 import { fetchVendorLatests, isOutdated } from "../lib/vendorLatest";
@@ -474,8 +474,12 @@ export default function CharterPanel({
   const lang = langProp ?? "zh";
   const t = makeT(lang);
   const { isAdmin } = useMe();
-  const [projects, setProjects] = useState<DashboardRow[] | null>(null);
-  const [slug, setSlug] = useState<string | null>(null);
+  const { projects } = useProjectsStore();
+  const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
+  const slug =
+    selectedSlug && projects?.some((project) => project.slug === selectedSlug)
+      ? selectedSlug
+      : (projects?.[0]?.slug ?? null);
   const [roster, setRoster] = useState<RosterHost[]>([]);
   // The AgentsTree collapsed-Set idiom (`useState<Set<string>>`, toggle on
   // click) — seeded once with every offline non-local host when the roster
@@ -490,23 +494,6 @@ export default function CharterPanel({
   const [nowMs, setNowMs] = useState<number | null>(null);
   // vendor → latest published version, for the roster's update hint.
   const [latests, setLatests] = useState<Record<string, string>>({});
-
-  // Visible projects → picker options; default to the first one.
-  useEffect(() => {
-    let cancelled = false;
-    fetchDashboard()
-      .then((rows) => {
-        if (cancelled) return;
-        setProjects(rows);
-        setSlug((current) => current ?? rows[0]?.slug ?? null);
-      })
-      .catch(() => {
-        if (!cancelled) setProjects([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // The charter follows the picked project.
   useEffect(() => {
@@ -662,7 +649,7 @@ export default function CharterPanel({
               <select
                 data-testid="charter-project-select"
                 value={slug ?? ""}
-                onChange={(event) => setSlug(event.target.value)}
+                onChange={(event) => setSelectedSlug(event.target.value)}
               >
                 {projects.map((p) => (
                   <option key={p.slug} value={p.slug}>

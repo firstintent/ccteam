@@ -120,6 +120,10 @@ pub mod teams_task_parser;
 pub mod templates;
 pub mod tmux;
 pub mod tool_surface;
+// VENDOR-QUOTA-1 — normalized vendor subscription-quota model + pure
+// response/credential parsers (zero I/O). The HTTP layer + cache + endpoint
+// live in `ccteam_web::routes::vendor_quota`.
+pub mod vendor_quota;
 // V0.5.0 F92 — cumulative-cost scanner over Claude Code transcript JSONLs.
 pub mod transcript_scanner;
 pub mod vendor;
@@ -156,11 +160,12 @@ pub use claude_job::{
 pub use claude_job::{link_scan_warn_count, reset_link_scan_warn_for_tests};
 pub use config::{
     append_project as append_project_to_config, config_path as ccteam_config_path,
-    default_claude_jobs_retention_days, default_project_host, load as load_ccteam_config,
-    lookup_project as lookup_project_in_config, pick_unused_project_slug,
-    remove_project as remove_project_from_config, save as save_ccteam_config,
-    upsert_project as upsert_project_in_config, CcteamConfig, DelegationConfig, ProjectEntry,
-    SessionsConfig, CONFIG_FILENAME,
+    default_claude_jobs_retention_days, default_daemon_workers, default_project_host,
+    load as load_ccteam_config, lookup_project as lookup_project_in_config,
+    pick_unused_project_slug, remove_project as remove_project_from_config,
+    save as save_ccteam_config, upsert_project as upsert_project_in_config, CcteamConfig,
+    DaemonConfig, DelegationConfig, ProjectEntry, SessionsConfig, CONFIG_FILENAME,
+    DAEMON_WORKERS_ENV,
 };
 // V0.6.3 F142 — `trigger: schedule` cron evaluation.
 pub use cron::{Schedule, ScheduleError};
@@ -253,6 +258,9 @@ pub use ccteam_cost::{
     estimate_cost, pricing_schema_version, pricing_schema_version_for, ModelPrices,
     UnifiedTokenUsage as Usage, Vendor,
 };
+pub mod journal {
+    pub use ccteam_harness::execution::journal::*;
+}
 pub use mode_inferrer::{infer_mode, CreatorMode, InferenceResult, Intent, Presence, Timeline};
 pub use paths::{
     agent_tasks_root, agent_teams_root, canonical_home_dirs, ensure_ccteam_home,
@@ -272,9 +280,9 @@ pub use projects::{
 pub use queries::{
     active_sessions, artifact_queue, artifact_status, collect_projects, collect_recent_events,
     compute_cost_summary, cost_history_buckets, cost_summary, cost_summary_from_events,
-    count_agent_spawns_within, job_log_tail, workflow_summary, ActiveSessionInfo, AgentStatus,
-    ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary,
-    WorkflowSummary,
+    count_agent_spawns_within, job_log_tail, workflow_summary, workflow_summary_from_events,
+    ActiveSessionInfo, AgentStatus, ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket,
+    CostSummary, ProjectSummary, WorkflowSummary,
 };
 pub use roles::{
     agents_dir, list_default_library_skills, list_default_library_skills_in, list_library_skills,

@@ -3,24 +3,28 @@
 // the daemon's DSH companion port (same ccteam auth, per-tenant isolation via
 // DSH_HOME — the SPA never reaches `dsh web` directly, redline §四). The page
 // is a thin lifecycle skin over `GET/POST /api/v1/dsh/*`: a status head
-// (state dot · meta chips · start/stop/restart · operator "open native ↗") over
-// a full-bleed <iframe>, with stopped/starting/disabled/error empty states.
+// (state dot · meta chips · start/stop/restart · operator "open native ↗")
+// with stopped/starting/disabled/error empty states.
+//
+// v0.10.2 (WEB-DSH-1) — keep-alive split: the <iframe> itself moved to
+// DshFrameHost (rendered persistently by ChatConsole, hidden off-route), so
+// navigating away no longer re-boots the DSH SPA. This view keeps the head +
+// empty states and renders in place; the shared status lives in dshStore (one
+// source, one starting-poll) — mounting here marks the page `visited`, which
+// is what gates ALL dsh traffic (zero requests for users who never open it).
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Blocks, ExternalLink, Play, RotateCw, Square, TriangleAlert } from "lucide-react";
 import {
   embedSrc,
-  getDshStatus,
   isDisabled,
   nativeHref,
   startDsh,
   stopDsh,
   type DshStatus,
 } from "../lib/dshApi";
+import { dshStore, useDshStatus } from "../hooks/dshStore";
 import { makeT, type Lang } from "../lib/i18n";
-
-/** How often to re-poll while the instance is booting (`starting`). */
-const STARTING_POLL_MS = 1500;
 
 function stateDotClass(status: DshStatus | null, fetchError: boolean): string {
   if (fetchError) return "dot err";
@@ -37,56 +41,29 @@ function stateDotClass(status: DshStatus | null, fetchError: boolean): string {
 
 export default function DshView({ lang = "zh" }: { lang?: Lang }) {
   const t = makeT(lang);
-  const [status, setStatus] = useState<DshStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+  // One shared status source (dshStore): this head, the empty states, and the
+  // persistent DshFrameHost iframe all read it — no duplicate polling.
+  const { status, loading, fetchError } = useDshStatus();
   const [busy, setBusy] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
-  // Derived embed origin. It is a stable string while serving (running/attached
-  // don't poll), so React keeps the same <iframe src> and never reloads the DSH
-  // SPA out from under the user.
+  // The persistent host derives the same src; a serving instance yields a
+  // stable string, so the keep-alive <iframe> is never reloaded by revisits.
   const src = embedSrc(status);
 
-  const refresh = useCallback(async () => {
-    try {
-      const next = await getDshStatus();
-      setStatus(next);
-      setFetchError(null);
-    } catch (e) {
-      if (e instanceof Error && e.message === "UNAUTHENTICATED") return;
-      setFetchError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
+  // Mounting DshView == the user opened /dsh: flip the lazy `visited` gate and
+  // (re)validate the status. A revisit revalidates in the background while the
+  // store's last status keeps the head + iframe on screen immediately.
+  useEffect(() => {
+    dshStore.visit();
   }, []);
 
-  useEffect(() => {
-    queueMicrotask(() => void refresh());
-  }, [refresh]);
-
-  // Poll only while booting — a running/attached/stopped instance is quiescent.
-  useEffect(() => {
-    if (status?.state !== "starting") return;
-    const id = window.setInterval(() => queueMicrotask(() => void refresh()), STARTING_POLL_MS);
-    return () => window.clearInterval(id);
-  }, [status?.state, refresh]);
-
-  const runAction = useCallback(
-    async (action: () => Promise<DshStatus>) => {
-      setBusy(true);
-      try {
-        const next = await action();
-        setStatus(next);
-        setFetchError(null);
-      } catch (e) {
-        if (!(e instanceof Error && e.message === "UNAUTHENTICATED")) {
-          setFetchError(e instanceof Error ? e.message : String(e));
-        }
-      } finally {
-        setBusy(false);
-      }
-    },
-    [],
-  );
+  const runAction = useCallback(async (action: () => Promise<DshStatus>) => {
+    setBusy(true);
+    try {
+      await dshStore.runAction(action);
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   const onStart = useCallback(() => void runAction(startDsh), [runAction]);
   const onStop = useCallback(() => void runAction(stopDsh), [runAction]);
@@ -137,7 +114,11 @@ export default function DshView({ lang = "zh" }: { lang?: Lang }) {
   }, [status, disabled, running, t]);
 
   return (
-    <div className="dsh-view" data-testid="dsh-view">
+    // When the instance is serving, the iframe is the persistent DshFrameHost
+    // sibling below this view — so this collapses to the head (dsh-view--flat)
+    // and renders NO stage of its own. When there is no embed src, the stage
+    // here carries the loading/empty/error states exactly as before.
+    <div className={src ? "dsh-view dsh-view--flat" : "dsh-view"} data-testid="dsh-view">
       <div className="dsh-head">
         <span className="dsh-title">
           <Blocks size={16} style={{ color: "var(--dsh)" }} />
@@ -210,18 +191,8 @@ export default function DshView({ lang = "zh" }: { lang?: Lang }) {
         </div>
       </div>
 
-      <div className="dsh-stage" data-testid="dsh-stage">
-        {src ? (
-          <iframe
-            className="dsh-frame"
-            src={src}
-            title="DeepSeek Harness"
-            data-testid="dsh-frame"
-            // DSH agents run bash under the user's approval — this is the same
-            // trust level as the tenant's own chat sessions (redline §五).
-            allow="clipboard-read; clipboard-write"
-          />
-        ) : (
+      {src ? null : (
+        <div className="dsh-stage" data-testid="dsh-stage">
           <DshEmpty
             lang={lang}
             status={status}
@@ -230,10 +201,10 @@ export default function DshView({ lang = "zh" }: { lang?: Lang }) {
             disabled={disabled}
             busy={busy}
             onStart={onStart}
-            onRetry={() => void refresh()}
+            onRetry={() => void dshStore.refresh()}
           />
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }

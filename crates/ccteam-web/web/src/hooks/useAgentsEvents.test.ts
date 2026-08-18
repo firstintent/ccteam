@@ -122,6 +122,8 @@ describe("appendAgentsEvent ring buffer", () => {
     expect(events).toHaveLength(AGENTS_RING_CAP);
     expect(events[events.length - 1]!.content).toBe(String(AGENTS_RING_CAP + 9));
     expect(events[0]!.content).toBe(String(10));
+    expect(events[0]!.seq).toBe(11);
+    expect(events[events.length - 1]!.seq).toBe(AGENTS_RING_CAP + 10);
   });
 });
 

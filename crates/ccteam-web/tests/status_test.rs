@@ -166,6 +166,10 @@ async fn t01_status_empty_install_is_zeroed_snapshot() {
     let body: Value = resp.json().await.unwrap();
 
     // The full shape parses (each field present + correct type).
+    assert!(
+        body["warming_up"].is_boolean(),
+        "startup projection state is an additive boolean"
+    );
     assert_eq!(
         body["daemon_healthy"],
         json!(false),

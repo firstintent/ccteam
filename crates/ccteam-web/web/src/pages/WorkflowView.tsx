@@ -13,7 +13,7 @@ import {
   type EvolutionSummary,
   type McpServersResponse,
 } from "../lib/workflowApi";
-import { fetchDashboard } from "../lib/dashboardApi";
+import { useProjectsStore } from "../hooks/useProjectsStore";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { toastBus } from "../lib/toastBus";
 import MarketplaceView from "./MarketplaceView";
@@ -53,8 +53,13 @@ export default function WorkflowView({
     onNav?.(next);
   };
 
-  const [projects, setProjects] = useState<string[]>([]);
-  const [slug, setSlug] = useState("");
+  const { projects: projectRows } = useProjectsStore();
+  const projects = useMemo(
+    () => (projectRows ?? []).map((project) => project.slug).filter(Boolean),
+    [projectRows],
+  );
+  const [selectedSlug, setSelectedSlug] = useState("");
+  const slug = projects.includes(selectedSlug) ? selectedSlug : (projects[0] ?? "");
   const [roles, setRoles] = useState<RoleSummary[]>([]);
   const [skills, setSkills] = useState<DecoratedPlugin[]>([]);
   const [evolution, setEvolution] = useState<EvolutionSummary | null>(null);
@@ -63,16 +68,6 @@ export default function WorkflowView({
   const [mcp, setMcp] = useState<McpServersResponse | null>(null);
   const [mcpForm, setMcpForm] = useState({ name: "", url: "", command: "", args: "" });
   const [mcpBusy, setMcpBusy] = useState(false);
-
-  useEffect(() => {
-    void fetchDashboard()
-      .then((rowsRes) => {
-        const slugs = rowsRes.map((p) => p.slug).filter(Boolean);
-        setProjects(slugs);
-        setSlug((cur) => cur || slugs[0] || "");
-      })
-      .catch(() => setProjects([]));
-  }, []);
 
   const refreshTab = useCallback(async () => {
     if (!slug) return;
@@ -145,7 +140,7 @@ export default function WorkflowView({
     () => (
       <select
         value={slug}
-        onChange={(e) => setSlug(e.target.value)}
+        onChange={(e) => setSelectedSlug(e.target.value)}
         data-testid="workflow-project"
         className="btn ghost"
         style={{ padding: "6px 10px", fontSize: 12.5 }}

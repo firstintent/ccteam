@@ -18,12 +18,13 @@ import HostsView, {
   HostManageCard,
   OfflineHostCard,
   JoinCard,
+  installCtaFor,
   pendingActionsFor,
   toolSurfaceNoticesFor,
 } from "./HostsView";
-import { registerMcp } from "../lib/hostsApi";
+import { installVendor, registerMcp } from "../lib/hostsApi";
 import { importProject } from "../lib/dashboardApi";
-import type { AgentHealth, HostDetail } from "../lib/hostsApi";
+import type { AgentHealth, HostDetail, InstallJob } from "../lib/hostsApi";
 
 const realFetch = globalThis.fetch;
 
@@ -153,6 +154,276 @@ describe("toolSurfaceNoticesFor", () => {
     expect(toolSurfaceNoticesFor(LOCAL)).toEqual([
       "Managed Pi sessions get the ccteam bridge; a plain `pi` started in a shell does not.",
     ]);
+  });
+});
+
+describe("installCtaFor (VENDOR-INSTALL-1 button eligibility)", () => {
+  const ADMIN_LOCAL = { isAdmin: true, isLocal: true, latest: null };
+
+  it("offers Install for a missing npm-packaged vendor", () => {
+    const codex = agent({ vendor: "codex", installed: false, status: "not_installed" });
+    expect(installCtaFor(codex, ADMIN_LOCAL)).toEqual({ kind: "install" });
+  });
+
+  it("offers Update with the npm latest when the probe version is older", () => {
+    const claude = agent({ vendor: "claude", version: "claude 2.1.200" });
+    expect(installCtaFor(claude, { ...ADMIN_LOCAL, latest: "2.1.220" })).toEqual({
+      kind: "update",
+      latest: "2.1.220",
+    });
+  });
+
+  it("offers nothing when up-to-date, non-admin, off-local, or recipe-less", () => {
+    const claude = agent({ vendor: "claude", version: "claude 2.1.220" });
+    // Up-to-date (equal or newer probe version, or no latest known).
+    expect(installCtaFor(claude, { ...ADMIN_LOCAL, latest: "2.1.220" })).toEqual({ kind: "none" });
+    expect(installCtaFor(claude, ADMIN_LOCAL)).toEqual({ kind: "none" });
+    // The backend 403 is the real gate; the button simply never renders.
+    const missing = agent({ vendor: "codex", installed: false, status: "not_installed" });
+    expect(installCtaFor(missing, { ...ADMIN_LOCAL, isAdmin: false })).toEqual({ kind: "none" });
+    expect(installCtaFor(missing, { ...ADMIN_LOCAL, isLocal: false })).toEqual({ kind: "none" });
+    // kimi/pi have no recipe — manual install guidance only, never a button.
+    for (const vendor of ["kimi", "pi"]) {
+      const row = agent({ vendor, installed: false, status: "not_installed" });
+      expect(installCtaFor(row, ADMIN_LOCAL)).toEqual({ kind: "none" });
+    }
+  });
+});
+
+describe("VendorManageRow install CTA (VENDOR-INSTALL-1)", () => {
+  /** Local detail whose ONLY row button is the install CTA under test. */
+  function installDetail(agents: AgentHealth[], npmAvailable = true): HostDetail {
+    return {
+      host: "local",
+      hostname: "devbox",
+      is_local: true,
+      os: "linux",
+      arch: "x86_64",
+      ccteam_version: "0.10.0",
+      npm_available: npmAvailable,
+      agents,
+    };
+  }
+
+  it("not-installed npm vendor → Install button; installed+outdated → Update; up-to-date → none", () => {
+    const detail = installDetail([
+      agent({ vendor: "codex", installed: false, status: "not_installed", hint: "…" }),
+      agent({ vendor: "claude", version: "claude 2.1.200", mcp_registered: true }),
+      agent({ vendor: "grok", version: "grok 1.0.0", mcp_registered: true }),
+    ]);
+    const html = renderToString(
+      <HostManageCard
+        detail={detail}
+        busy={null}
+        isAdmin
+        latests={{ claude: "2.1.220", grok: "1.0.0" }}
+        onRegister={() => {}}
+        onImport={() => {}}
+        onInstall={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="install-vendor-codex"');
+    expect(html).toContain('data-testid="install-vendor-claude"');
+    expect(html).toContain("更新 → 2.1.220");
+    // Up-to-date (grok 1.0.0 vs latest 1.0.0) renders no CTA.
+    expect(html).not.toContain('data-testid="install-vendor-grok"');
+  });
+
+  it("renders no install button for kimi/pi, tenants, or satellites", () => {
+    const withManual = installDetail([
+      agent({ vendor: "kimi", installed: false, status: "not_installed", hint: "manual" }),
+      agent({ vendor: "pi", installed: false, status: "not_installed", hint: "manual" }),
+    ]);
+    const adminHtml = renderToString(
+      <HostManageCard detail={withManual} busy={null} isAdmin onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(adminHtml).not.toContain("install-vendor-");
+    // Same rows, tenant view: the CTA never renders (the backend would 403).
+    const missing = installDetail([
+      agent({ vendor: "codex", installed: false, status: "not_installed" }),
+    ]);
+    const tenantHtml = renderToString(
+      <HostManageCard detail={missing} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(tenantHtml).not.toContain("install-vendor-");
+    // A satellite never gets the CTA even for the admin.
+    const sat: HostDetail = { ...SAT, agents: missing.agents };
+    const satHtml = renderToString(
+      <HostManageCard detail={sat} busy={null} isAdmin onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(satHtml).not.toContain("install-vendor-");
+  });
+
+  it("disables the button with the npm-missing hint when npm is not on PATH", () => {
+    const detail = installDetail(
+      [agent({ vendor: "codex", installed: false, status: "not_installed" })],
+      false,
+    );
+    const html = renderToString(
+      <HostManageCard detail={detail} busy={null} isAdmin onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).toContain('data-testid="install-vendor-codex"');
+    expect(html).toContain("disabled");
+    expect(html).toContain("npm 不在 PATH 上");
+  });
+
+  it("shows inline progress while running and the output tail on failure", () => {
+    const detail = installDetail([
+      agent({ vendor: "codex", installed: false, status: "not_installed" }),
+      agent({ vendor: "grok", installed: false, status: "not_installed" }),
+    ]);
+    const jobs: Record<string, InstallJob> = {
+      codex: {
+        job_id: "j1",
+        vendor: "codex",
+        state: "running",
+        exit_code: null,
+        output_tail: "$ npm install -g @openai/codex@latest\nfetching…",
+      },
+      grok: {
+        job_id: "j2",
+        vendor: "grok",
+        state: "failed",
+        exit_code: 1,
+        output_tail: "npm ERR! EACCES: permission denied",
+      },
+    };
+    const html = renderToString(
+      <HostManageCard
+        detail={detail}
+        busy={null}
+        isAdmin
+        installJobs={jobs}
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="install-progress-codex"');
+    expect(html).toContain("安装中…");
+    expect(html).toContain("fetching…");
+    expect(html).toContain('data-testid="install-failed-grok"');
+    expect(html).toContain("安装失败");
+    expect(html).toContain("exit 1");
+    expect(html).toContain("EACCES");
+  });
+
+  it("install click reaches POST /hosts/local/vendors/{vendor}/install", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    try {
+      const detail = installDetail([
+        agent({ vendor: "codex", installed: false, status: "not_installed" }),
+      ]);
+      const clicks = collectOnClicks(
+        HostManageCard({
+          detail,
+          busy: null,
+          isAdmin: true,
+          onRegister: () => {},
+          onImport: () => {},
+          // Exactly what the container's onInstall does with the vendor.
+          onInstall: (vendor) => void installVendor("local", vendor),
+        }),
+      );
+      expect(clicks).toHaveLength(1);
+      clicks[0]();
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(url).toBe("/api/v1/hosts/local/vendors/codex/install");
+      expect((init as RequestInit).method).toBe("POST");
+    } finally {
+      globalThis.fetch = realFetch;
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+describe("VendorManageRow quota bars (VENDOR-QUOTA-1)", () => {
+  function quotaDetail(agents: AgentHealth[]): HostDetail {
+    return {
+      host: "local",
+      hostname: "devbox",
+      is_local: true,
+      os: "linux",
+      arch: "x86_64",
+      ccteam_version: "0.10.0",
+      npm_available: true,
+      agents,
+    };
+  }
+
+  it("available: up to two mini bars + plan badge on the vendor row", () => {
+    const detail = quotaDetail([
+      agent({ vendor: "claude", mcp_registered: true }),
+      agent({ vendor: "kimi", mcp_registered: true }),
+    ]);
+    const quotas = {
+      claude: {
+        vendor: "claude",
+        state: "available" as const,
+        plan: "max",
+        windows: [
+          { kind: "five_hour" as const, used_percent: 42, resets_at: null },
+          { kind: "weekly" as const, used_percent: 15, resets_at: null },
+        ],
+      },
+      kimi: {
+        vendor: "kimi",
+        state: "available" as const,
+        windows: [{ kind: "weekly" as const, used_percent: 4, resets_at: null }],
+      },
+    };
+    const html = renderToString(
+      <HostManageCard
+        detail={detail}
+        busy={null}
+        isAdmin
+        quotas={quotas}
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="quota-bars-claude"');
+    expect(html).toContain('data-testid="quota-plan-claude"');
+    expect(html).toContain("max");
+    expect(html).toContain("5h ▓▓░░░ 42%");
+    expect(html).toContain("周 ▓░░░░ 15%");
+    // Single-window vendor renders exactly one bar and no badge.
+    expect(html).toContain('data-testid="quota-bars-kimi"');
+    expect(html).toContain("周 ░░░░░ 4%");
+    expect(html).not.toContain('data-testid="quota-plan-kimi"');
+  });
+
+  it("not_subscription / unavailable / absent vendors render no quota zone", () => {
+    const detail = quotaDetail([
+      agent({ vendor: "codex", mcp_registered: true }),
+      agent({ vendor: "grok", mcp_registered: true }),
+      agent({ vendor: "opencode", mcp_registered: true }),
+    ]);
+    const quotas = {
+      codex: { vendor: "codex", state: "not_subscription" as const },
+      grok: { vendor: "grok", state: "unavailable" as const },
+      // opencode: absent from the map entirely (no probe surface).
+    };
+    const html = renderToString(
+      <HostManageCard
+        detail={detail}
+        busy={null}
+        isAdmin
+        quotas={quotas}
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).not.toContain("quota-bars-");
+    expect(html).not.toContain("quota-plan-");
+  });
+
+  it("no quota prop at all (tenant view) renders nothing and does not crash", () => {
+    const detail = quotaDetail([agent({ vendor: "claude", mcp_registered: true })]);
+    const html = renderToString(
+      <HostManageCard detail={detail} busy={null} onRegister={() => {}} onImport={() => {}} />,
+    );
+    expect(html).not.toContain("quota-bars-");
   });
 });
 

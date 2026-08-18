@@ -53,7 +53,7 @@ WIPE_DIRS    := state run cache
 DAEMON_LOG   := $(CCTEAM_HOME)/daemon.log
 
 .DEFAULT_GOAL := help
-.PHONY: help build release clean fmt fmt-check clippy check test test-web \
+.PHONY: help build release clean fmt fmt-check clippy check test test-web perf-gate \
         web web-deps web-check gate \
         install install-binary next-steps uninstall reinstall require-cli require-node \
         config init start stop status doctor \
@@ -72,6 +72,7 @@ help:
 	@printf '  make clippy        cargo clippy --workspace --all-targets -D warnings\n'
 	@printf '  make test          cargo test (workspace, excl ccteam-web)\n'
 	@printf '  make test-web      cargo test -p ccteam-web\n'
+	@printf '  make perf-gate     generated ~200MB in-process performance gate (release)\n'
 	@printf '  make web           build the SPA (tsc + vite)\n'
 	@printf '  make web-check     SPA eslint + vitest\n'
 	@printf '  \033[1mmake gate\033[0m          full pre-push gate (fmt+clippy+test+test-web+web-check)\n'
@@ -180,6 +181,12 @@ test-baseline: require-node
 test-web: require-node
 	cargo test -p ccteam-web
 
+# Explicit, release-profile performance contract. The integration target
+# returns immediately unless CCTEAM_PERF_GATE=1, so ordinary test targets never
+# generate the large fixture or start its in-process server.
+perf-gate: require-node
+	CCTEAM_PERF_GATE=1 cargo test --release -p ccteam-web --test perf_gate_test -- --nocapture --test-threads=1
+
 web-deps: require-node
 	cd $(WEB_DIR) && npm ci
 
@@ -235,7 +242,7 @@ install: install-binary
 	    *:$(BIN_DIR):*) ;; \
 	    *) printf '\033[33mwarning:\033[0m %s is not on PATH; add it to your shell rc.\n' '$(BIN_DIR)' ;; \
 	esac
-	@$(BIN_LINK) daemon restart
+	@$(BIN_LINK) daemon restart --if-managed
 	@$(MAKE) --no-print-directory next-steps
 
 # Internal: poll the fresh daemon for its web URL (≤20s; the `web url:` line of

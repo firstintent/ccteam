@@ -22,10 +22,8 @@
 //!   counts **live** when the daemon is healthy, **idle** otherwise — the
 //!   gateway carries no finer per-session live/idle bit (`SessionView::status`
 //!   is `"live"` for any tracked session), so daemon health is the split.
-//! - `cost_24h_usd` + `cost_24h_by_vendor`: sum
-//!   [`ccteam_core::queries::cost_summary`]`.cost_24h_usd` and merge
-//!   `.cost_24h_by_vendor` across every [`ccteam_core::queries::collect_projects`]
-//!   project (same per-project cost surface the workflow cost panel uses).
+//! - `cost_24h_usd` + `cost_24h_by_vendor`: sum the shared incremental
+//!   progress projection across every registered project.
 //! - `budget_cap_24h`: the aggregate 24h cap. Budgets are declared per project
 //!   in `workflow.yaml::budgets_v060` (a [`ccteam_cost::Budgets`]); we sum each
 //!   project's [`Budgets::aggregated_cost_cap_24h`] across all projects.
@@ -37,9 +35,11 @@
 //! project-owner ACL.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use axum::{
     extract::State,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -49,10 +49,104 @@ use utoipa::ToSchema;
 use crate::auth::Identity;
 use crate::state::AppState;
 
+type StatusResult = Result<StatusResponse, String>;
+
+#[derive(Clone, Default)]
+pub(crate) struct StatusSingleflight {
+    inner: Arc<Mutex<SingleflightState>>,
+}
+
+#[derive(Default)]
+struct SingleflightState {
+    next_id: u64,
+    in_flight: Option<StatusFlight>,
+}
+
+struct StatusFlight {
+    id: u64,
+    result_tx: tokio::sync::watch::Sender<Option<StatusResult>>,
+}
+
+impl StatusSingleflight {
+    /// Run one blocking status computation for every overlapping set of
+    /// callers. The producer lives in a detached task, so dropping any waiter
+    /// cannot cancel it or leave `in_flight` occupied forever.
+    async fn get_or_compute<F>(&self, compute: F) -> StatusResult
+    where
+        F: FnOnce() -> StatusResponse + Send + 'static,
+    {
+        let mut result_rx = {
+            let mut state = self.lock_state();
+            if let Some(flight) = &state.in_flight {
+                flight.result_tx.subscribe()
+            } else {
+                let id = state.next_id;
+                state.next_id = state.next_id.wrapping_add(1);
+                let (result_tx, result_rx) = tokio::sync::watch::channel(None);
+                state.in_flight = Some(StatusFlight {
+                    id,
+                    result_tx: result_tx.clone(),
+                });
+
+                let singleflight = self.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(compute)
+                        .await
+                        .map_err(|err| format!("status aggregation task failed: {err}"));
+                    // Clear before publishing while holding one non-async lock:
+                    // existing subscribers receive this result, while a caller
+                    // arriving after completion starts a fresh computation.
+                    let mut state = singleflight.lock_state();
+                    if state.in_flight.as_ref().map(|flight| flight.id) == Some(id) {
+                        state.in_flight = None;
+                    }
+                    let _ = result_tx.send(Some(result));
+                });
+                result_rx
+            }
+        };
+
+        let result = match result_rx.wait_for(Option::is_some).await {
+            Ok(result) => result
+                .clone()
+                .expect("watch predicate guarantees a status result"),
+            Err(_) => Err("status aggregation ended without a result".to_string()),
+        };
+        result
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, SingleflightState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
+        self.lock_state()
+            .in_flight
+            .as_ref()
+            .map(|flight| flight.result_tx.receiver_count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn is_in_flight(&self) -> bool {
+        self.lock_state().in_flight.is_some()
+    }
+}
+
 /// `GET /api/v1/status` response — the daemon-wide snapshot the cost pill +
 /// Status view render.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct StatusResponse {
+    /// Monotonic revision of the projection snapshot. `null` while startup
+    /// hydration is in progress, which also suppresses ETag/304 responses.
+    #[serde(default)]
+    pub version: Option<u64>,
+    /// Startup hydration is still folding one or more project journals.
+    #[serde(default)]
+    pub warming_up: bool,
     /// Whether the daemon MCP socket is reachable (`ccteam status`'s daemon
     /// line). `false` from a standalone web process or when the daemon is down.
     pub daemon_healthy: bool,
@@ -84,8 +178,8 @@ pub struct StatusResponse {
 /// delegation runtime's observability counters.
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct DelegationSummary {
-    /// Durable completion watches currently armed on disk (`delegation.json`
-    /// across every project's `.ccteam/chat/*/`).
+    /// Durable completion watches currently armed in the gateway's in-memory
+    /// mirror (hydrated from `delegation.json` during startup reconciliation).
     pub active_watches: u32,
     /// Completion notifications delivered in the trailing 24h
     /// (`delegation_notified` progress events).
@@ -173,21 +267,59 @@ fn project_budget_cap_24h(project_dir: &std::path::Path) -> Option<f64> {
 pub(crate) async fn handle_status(
     State(app): State<AppState>,
     Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
 ) -> Response {
+    let compute_app = app.clone();
+    let status = match app
+        .status_singleflight
+        .get_or_compute(move || aggregate_status(&compute_app))
+        .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::error!(error = %err, "GET /api/v1/status aggregation failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": err})),
+            )
+                .into_response();
+        }
+    };
+
+    // Project ACL checks read project state; keep those per-identity reads off
+    // async workers too, while the expensive global snapshot above stays shared.
+    let filter_app = app.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut status = status;
+        retain_visible_session_rows(&filter_app, &identity, &mut status.sessions);
+        let etag = super::api_v1::snapshot_etag("status", status.version, &status);
+        super::api_v1::snapshot_response(Json(status).into_response(), etag, &headers)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(error = %err, "GET /api/v1/status ACL task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Compute the global snapshot synchronously inside `spawn_blocking`. The
+/// gateway section is now a pure catalog snapshot; progress reads are byte-
+/// cursor catch-ups outside that lock and normally reduce to metadata stats.
+fn aggregate_status(app: &AppState) -> StatusResponse {
     let daemon_healthy = ccteam_core::check_daemon_health(&app.paths).is_healthy();
 
     // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
     // Either way we only need the COUNT of tracked sessions; the live/idle
     // split is daemon health (the gateway has no finer per-session bit).
-    let mut session_rows: Vec<SessionCostRow> = Vec::new();
+    let mut active_watches = 0;
+    let mut views = Vec::new();
     let tracked_count: u32 = if let Some(gw) = app.gateway.as_ref() {
-        // session_views() is sync once we hold the lock (no `.await` under it).
-        let views = {
-            let guard = gw.lock().await;
-            guard.session_views()
-        };
-        // v0.8.18 柱1 — decorate each live session with its best-effort cost.
-        session_rows = build_session_cost_rows(&app.paths, &views);
+        let guard = ccteam_im::latency::gateway_blocking_lock(gw, "web.status.snapshot");
+        views = guard.session_views();
+        active_watches = guard.armed_delegation_watch_count();
         views.len() as u32
     } else {
         // Standalone web (no daemon gateway): fall back to the persisted route
@@ -204,17 +336,36 @@ pub(crate) async fn handle_status(
     };
 
     // ── cost: sum each project's 24h cost + merge the per-vendor breakdown. ──
+    let projects = ccteam_core::queries::collect_projects(&app.paths).unwrap_or_default();
+    let mut projections = projects
+        .iter()
+        .map(|project| {
+            let slug = project.state.slug.clone();
+            let snapshot = app.progress_projection.project_snapshot(&slug);
+            (slug, snapshot)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for view in &views {
+        projections
+            .entry(view.project.clone())
+            .or_insert_with(|| app.progress_projection.project_snapshot(&view.project));
+    }
+    let session_rows = build_session_cost_rows(&projections, &views);
+
     let mut cost_24h_usd = 0.0_f64;
     let mut cost_24h_by_vendor: BTreeMap<String, f64> = BTreeMap::new();
     let mut budget_cap_24h: Option<f64> = None;
-    for project in ccteam_core::queries::collect_projects(&app.paths).unwrap_or_default() {
+    let mut notified_24h = 0u32;
+    let mut denied_24h = 0u32;
+    for project in projects {
         let slug = &project.state.slug;
-        let summary =
-            ccteam_core::queries::cost_summary(slug, &app.paths.progress_jsonl(slug), &app.paths)
-                .unwrap_or_default();
-        cost_24h_usd += summary.cost_24h_usd;
-        for (vendor, usd) in summary.cost_24h_by_vendor {
-            *cost_24h_by_vendor.entry(vendor).or_insert(0.0) += usd;
+        if let Some(snapshot) = projections.get(slug) {
+            cost_24h_usd += snapshot.cost.cost_24h_usd;
+            for (vendor, usd) in &snapshot.cost.cost_24h_by_vendor {
+                *cost_24h_by_vendor.entry(vendor.clone()).or_insert(0.0) += usd;
+            }
+            notified_24h = notified_24h.saturating_add(snapshot.delegations.notified_24h);
+            denied_24h = denied_24h.saturating_add(snapshot.delegations.denied_24h);
         }
         // Budget caps are additive across projects; a single configured cap
         // flips the aggregate from `None` to `Some`.
@@ -223,14 +374,9 @@ pub(crate) async fn handle_status(
         }
     }
 
-    // v0.9.0 W2 (F2/F7) — delegation counters (shared aggregation in ccteam-im,
-    // `web → im`; active watches on disk + trailing-24h notify/deny counts).
-    let (active_watches, notified_24h, denied_24h) =
-        ccteam_im::delegation::fleet_delegations(&app.paths);
-
-    retain_visible_session_rows(&app, &identity, &mut session_rows);
-
-    Json(StatusResponse {
+    StatusResponse {
+        version: app.progress_projection.snapshot_version(),
+        warming_up: app.progress_projection.warming_up(),
         daemon_healthy,
         sessions_live,
         sessions_idle,
@@ -243,8 +389,7 @@ pub(crate) async fn handle_status(
             notified_24h,
             denied_24h,
         },
-    })
-    .into_response()
+    }
 }
 
 /// Keep daemon-wide aggregates global while hiding per-session rows whose
@@ -260,81 +405,26 @@ fn retain_visible_session_rows(
     rows.retain(|row| crate::routes::api_v1::can_see_project(app, identity, &row.project));
 }
 
-/// Per-session priced accumulator — sum of priced turns + a count of turns
-/// skipped for lacking a table-matched model.
-#[derive(Default, Clone, Copy)]
-struct SessionPriced {
-    cost_usd: f64,
-    priced_turns: usize,
-    unpriced_turns: usize,
-}
-
 /// Build one [`SessionCostRow`] per live gateway session, pricing each
 /// **deterministically per-turn** by the turn's own canonical `model`. Reads
-/// `progress.jsonl` ONCE per project that has a live session (not every
-/// project); for each `chat_turn_completed` event it prices that turn's
-/// `usage × model` via [`ccteam_cost::estimate_cost`] and sums the `Some`
-/// results per sid. A turn whose `model` is absent / not in the table is
-/// skipped (counted) — there is no fallback to a wrong rate. A session with
-/// zero priced turns yields `cost_usd: None` (rendered "—").
+/// from the already-caught-up per-project snapshots. No journal is opened in
+/// this function. A turn whose model is absent/unpriced is counted without a
+/// fallback; zero priced turns yields `cost_usd: None` (rendered "—").
 fn build_session_cost_rows(
-    paths: &ccteam_core::CcteamPaths,
+    projections: &std::collections::HashMap<
+        String,
+        ccteam_im::progress_projection::ProjectProjectionSnapshot,
+    >,
     views: &[ccteam_im::gateway::SessionView],
 ) -> Vec<SessionCostRow> {
-    use std::collections::{BTreeSet, HashMap};
-
-    // Read progress only for projects with a live session.
-    let live_projects: BTreeSet<&str> = views.iter().map(|v| v.project.as_str()).collect();
-    // Vendor per sid (from the view) so each turn prices against the
-    // session's vendor table; default Claude for the rare missing case.
-    let vendor_by_sid: HashMap<&str, ccteam_cost::Vendor> = views
-        .iter()
-        .map(|v| (v.sid.as_str(), vendor_from_str(&v.vendor)))
-        .collect();
-
-    let mut priced_by_sid: HashMap<String, SessionPriced> = HashMap::new();
-    for slug in live_projects {
-        let events =
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
-        for ev in &events {
-            if ev.get("event").and_then(|v| v.as_str())
-                != Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
-            {
-                continue;
-            }
-            let Some(sid) = ev.get("sid").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(usage) = ev.get("usage").and_then(|u| {
-                serde_json::from_value::<ccteam_cost::UnifiedTokenUsage>(u.clone()).ok()
-            }) else {
-                continue;
-            };
-            // The turn's canonical model (written by the pump from the
-            // stream-json translator). Absent → unpriceable (exposed).
-            let model = ev.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            let vendor = vendor_by_sid
-                .get(sid)
-                .copied()
-                .unwrap_or(ccteam_cost::Vendor::Claude);
-            let acc = priced_by_sid.entry(sid.to_string()).or_default();
-            match ccteam_cost::resolve_turn_cost(&usage, vendor, model) {
-                Some(cost) => {
-                    acc.cost_usd += cost;
-                    acc.priced_turns += 1;
-                }
-                None => acc.unpriced_turns += 1,
-            }
-        }
-    }
-
     views
         .iter()
         .map(|v| {
-            let acc = priced_by_sid.get(&v.sid).copied().unwrap_or_default();
-            // `Some` only when a real, table-matched model priced a turn
-            // (or OpenCode reported a non-zero USD).
-            let cost_usd = (acc.priced_turns > 0).then_some(acc.cost_usd);
+            let pricing = projections
+                .get(&v.project)
+                .and_then(|projection| projection.sessions.get(&v.sid))
+                .map(|session| session.pricing(agent_vendor_from_str(&v.vendor)))
+                .unwrap_or_default();
             SessionCostRow {
                 sid: v.sid.clone(),
                 project: v.project.clone(),
@@ -346,36 +436,183 @@ fn build_session_cost_rows(
                     v.host.clone()
                 },
                 status: v.status.clone(),
-                cost_usd,
-                unpriced_turns: acc.unpriced_turns,
+                cost_usd: pricing.cost_usd,
+                unpriced_turns: pricing.unpriced_turns,
             }
         })
         .collect()
 }
 
-/// Map a `SessionView` vendor token to the pricing [`ccteam_cost::Vendor`]
-/// (defaulting to Claude for an unknown token — the dominant vendor).
-fn vendor_from_str(vendor: &str) -> ccteam_cost::Vendor {
+/// Map a session-view vendor token to the harness enum, defaulting to Claude.
+fn agent_vendor_from_str(vendor: &str) -> ccteam_harness::AgentVendor {
     match vendor.trim().to_ascii_lowercase().as_str() {
-        "codex" => ccteam_cost::Vendor::Codex,
-        "grok" => ccteam_cost::Vendor::Grok,
-        "opencode" => ccteam_cost::Vendor::Opencode,
-        "kimi" => ccteam_cost::Vendor::Kimi,
-        "pi" => ccteam_cost::Vendor::Pi,
-        "dsh" => ccteam_cost::Vendor::Dsh,
-        _ => ccteam_cost::Vendor::Claude,
+        "codex" => ccteam_harness::AgentVendor::Codex,
+        "grok" => ccteam_harness::AgentVendor::Grok,
+        "opencode" => ccteam_harness::AgentVendor::Opencode,
+        "kimi" => ccteam_harness::AgentVendor::Kimi,
+        "pi" => ccteam_harness::AgentVendor::Pi,
+        "dsh" => ccteam_harness::AgentVendor::Dsh,
+        _ => ccteam_harness::AgentVendor::Claude,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct BlockingGate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl BlockingGate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn status_with_live_count(sessions_live: u32) -> StatusResponse {
+        StatusResponse {
+            version: Some(1),
+            warming_up: false,
+            daemon_healthy: false,
+            sessions_live,
+            sessions_idle: 0,
+            cost_24h_usd: 0.0,
+            cost_24h_by_vendor: BTreeMap::new(),
+            budget_cap_24h: None,
+            sessions: Vec::new(),
+            delegations: DelegationSummary::default(),
+        }
+    }
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !predicate() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("condition should become true promptly");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_singleflight_coalesces_concurrent_requests() {
+        const REQUESTS: usize = 12;
+        let singleflight = StatusSingleflight::default();
+        let start = Arc::new(tokio::sync::Barrier::new(REQUESTS + 1));
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(BlockingGate::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let mut requests = Vec::new();
+
+        for _ in 0..REQUESTS {
+            let singleflight = singleflight.clone();
+            let start = Arc::clone(&start);
+            let compute_count = Arc::clone(&compute_count);
+            let gate = Arc::clone(&gate);
+            let started_tx = Arc::clone(&started_tx);
+            requests.push(tokio::spawn(async move {
+                start.wait().await;
+                singleflight
+                    .get_or_compute(move || {
+                        compute_count.fetch_add(1, Ordering::SeqCst);
+                        if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                            let _ = started_tx.send(());
+                        }
+                        gate.wait();
+                        status_with_live_count(7)
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        start.wait().await;
+        started_rx.await.unwrap();
+        wait_until(|| singleflight.subscriber_count() == REQUESTS).await;
+        gate.release();
+
+        for request in requests {
+            assert_eq!(request.await.unwrap().sessions_live, 7);
+        }
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_status_request_does_not_wedge_the_next_request() {
+        let singleflight = StatusSingleflight::default();
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(BlockingGate::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first = {
+            let singleflight = singleflight.clone();
+            let compute_count = Arc::clone(&compute_count);
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                singleflight
+                    .get_or_compute(move || {
+                        compute_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
+                        gate.wait();
+                        status_with_live_count(1)
+                    })
+                    .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        gate.release();
+        wait_until(|| !singleflight.is_in_flight()).await;
+
+        let next_count = Arc::clone(&compute_count);
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            singleflight.get_or_compute(move || {
+                next_count.fetch_add(1, Ordering::SeqCst);
+                status_with_live_count(2)
+            }),
+        )
+        .await
+        .expect("the request after cancellation must complete promptly")
+        .unwrap();
+        assert_eq!(next.sessions_live, 2, "completed results are not cached");
+        assert_eq!(compute_count.load(Ordering::SeqCst), 2);
+    }
 
     fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {
         ccteam_core::CcteamPaths {
             root: root.join(".ccteam"),
             projects_root: root.join("projects"),
         }
+    }
+
+    fn projection_snapshots(
+        paths: &ccteam_core::CcteamPaths,
+        slugs: &[&str],
+    ) -> std::collections::HashMap<String, ccteam_im::progress_projection::ProjectProjectionSnapshot>
+    {
+        let projection = ccteam_im::progress_projection::ProgressProjection::new(paths.clone());
+        slugs
+            .iter()
+            .map(|slug| ((*slug).to_string(), projection.project_snapshot(slug)))
+            .collect()
     }
 
     fn view(sid: &str, project: &str, vendor: &str) -> ccteam_im::gateway::SessionView {
@@ -405,14 +642,32 @@ mod tests {
     }
 
     #[test]
-    fn vendor_from_str_maps_tokens() {
-        assert_eq!(vendor_from_str("claude"), ccteam_cost::Vendor::Claude);
-        assert_eq!(vendor_from_str("Codex"), ccteam_cost::Vendor::Codex);
-        assert_eq!(vendor_from_str("grok"), ccteam_cost::Vendor::Grok);
-        assert_eq!(vendor_from_str("opencode"), ccteam_cost::Vendor::Opencode);
-        assert_eq!(vendor_from_str("pi"), ccteam_cost::Vendor::Pi);
-        assert_eq!(vendor_from_str("dsh"), ccteam_cost::Vendor::Dsh);
-        assert_eq!(vendor_from_str("weird"), ccteam_cost::Vendor::Claude);
+    fn agent_vendor_from_str_maps_tokens() {
+        assert_eq!(
+            agent_vendor_from_str("claude"),
+            ccteam_harness::AgentVendor::Claude
+        );
+        assert_eq!(
+            agent_vendor_from_str("Codex"),
+            ccteam_harness::AgentVendor::Codex
+        );
+        assert_eq!(
+            agent_vendor_from_str("grok"),
+            ccteam_harness::AgentVendor::Grok
+        );
+        assert_eq!(
+            agent_vendor_from_str("opencode"),
+            ccteam_harness::AgentVendor::Opencode
+        );
+        assert_eq!(agent_vendor_from_str("pi"), ccteam_harness::AgentVendor::Pi);
+        assert_eq!(
+            agent_vendor_from_str("dsh"),
+            ccteam_harness::AgentVendor::Dsh
+        );
+        assert_eq!(
+            agent_vendor_from_str("weird"),
+            ccteam_harness::AgentVendor::Claude
+        );
     }
 
     #[test]
@@ -443,7 +698,8 @@ mod tests {
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &opus).unwrap();
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &sonnet).unwrap();
 
-        let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude")]);
+        let snapshots = projection_snapshots(&paths, &["demo"]);
+        let rows = build_session_cost_rows(&snapshots, &[view("s1", "demo", "claude")]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sid, "s1");
         let cost = rows[0].cost_usd.expect("priced");
@@ -460,7 +716,8 @@ mod tests {
         // still listed, at cost_usd: None → rendered "—" (never a faked 0).
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
-        let rows = build_session_cost_rows(&paths, &[view("s9", "demo", "claude")]);
+        let snapshots = projection_snapshots(&paths, &["demo"]);
+        let rows = build_session_cost_rows(&snapshots, &[view("s9", "demo", "claude")]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].cost_usd.is_none(), "no turns ⇒ None, not 0.0");
         assert_eq!(rows[0].unpriced_turns, 0);
@@ -486,7 +743,8 @@ mod tests {
         );
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &synthetic).unwrap();
 
-        let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude")]);
+        let snapshots = projection_snapshots(&paths, &["demo"]);
+        let rows = build_session_cost_rows(&snapshots, &[view("s1", "demo", "claude")]);
         assert!(rows[0].cost_usd.is_none(), "unknown model must not price");
         assert_eq!(rows[0].unpriced_turns, 1, "the synthetic turn is exposed");
     }
@@ -499,7 +757,8 @@ mod tests {
         let paths = test_paths(tmp.path());
         let mut remote = view("s2", "demo", "claude");
         remote.host = "sat-east".into();
-        let rows = build_session_cost_rows(&paths, &[view("s1", "demo", "claude"), remote]);
+        let snapshots = projection_snapshots(&paths, &["demo"]);
+        let rows = build_session_cost_rows(&snapshots, &[view("s1", "demo", "claude"), remote]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].host, "local");
         assert_eq!(rows[1].sid, "s2");
@@ -518,8 +777,9 @@ mod tests {
             state.save(&path).unwrap();
         }
         let app = AppState::new(paths);
+        let snapshots = projection_snapshots(&app.paths, &["alice", "bob"]);
         let mut rows = build_session_cost_rows(
-            &app.paths,
+            &snapshots,
             &[view("s1", "alice", "claude"), view("s2", "bob", "codex")],
         );
         let mut admin_rows = rows.clone();

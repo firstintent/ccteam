@@ -151,8 +151,9 @@ pub fn dsh_bin() -> String {
 ///
 /// This is **read-only discovery of something the user already caused to
 /// exist** by running `dsh` themselves at least once — no network call, no
-/// package fetch, no execution. It does not relax "ccteam never installs a
-/// CLI for you": nothing gets installed here, only found.
+/// package fetch, no execution. Nothing gets installed here, only found;
+/// installs are the admin's explicit one-click action (VENDOR-INSTALL-1,
+/// `routes::vendor_install`), never a probe side effect.
 ///
 /// Returns the literal `"dsh"` (ordinary `PATH` resolution) when that
 /// already works, so the common global-install case is untouched; only

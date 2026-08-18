@@ -6,6 +6,7 @@
 
 import { reportError } from "./toastBus";
 import { clearToken, getToken, saveToken } from "./token";
+import { BACKGROUND_REQUEST_HEADER } from "./backgroundRequest";
 
 /** Dispatched on `window` when the auth token is rejected or missing. App.tsx
  *  listens for this to show the token entry page instead of just a toast. */
@@ -74,6 +75,7 @@ export function installFetchErrorToasts(): void {
     // their own lastError — toasting every 5xx/network blip on reconnect
     // would spam the user (up to 7 session + 7 agents retries).
     const isEventStream = acceptIsEventStream(patchedInit);
+    const isBackground = requestIsBackground(patchedInit);
 
     try {
       const res = await original(input, patchedInit);
@@ -89,7 +91,7 @@ export function installFetchErrorToasts(): void {
           handleTokenAuthFailure();
         }
       }
-      if (isApi && res.status >= 500 && !isEventStream) {
+      if (isApi && res.status >= 500 && !isEventStream && !isBackground) {
         reportError(`Server error ${res.status} from ${path}`);
       }
       return res;
@@ -101,7 +103,7 @@ export function installFetchErrorToasts(): void {
       ) {
         throw err;
       }
-      if (isApi && !isEventStream) {
+      if (isApi && !isEventStream && !isBackground) {
         reportError(
           `Network error contacting ${path}. Check your connection.`,
         );
@@ -109,6 +111,14 @@ export function installFetchErrorToasts(): void {
       throw err;
     }
   };
+}
+
+/** Background stores own their error UI and retry cadence. Suppressing their
+ * automatic-request toasts keeps a struggling daemon from producing one toast
+ * per fan-out request; explicit user actions remain noisy. */
+export function requestIsBackground(init: RequestInit | undefined): boolean {
+  if (!init?.headers) return false;
+  return new Headers(init.headers).get(BACKGROUND_REQUEST_HEADER) === "1";
 }
 
 /** True when the request asks for an SSE body (`Accept: text/event-stream`).

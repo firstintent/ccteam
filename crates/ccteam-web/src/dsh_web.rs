@@ -774,7 +774,10 @@ async fn handle_companion_request(
         Err(err) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": err.to_string() })),
+                Json(serde_json::json!({
+                    "error": err.to_string(),
+                    "error_code": "dsh_upstream_unready"
+                })),
             )
                 .into_response();
         }

@@ -189,6 +189,43 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
     expect(html).toContain("打开 ↗");
   });
 
+  it("every project header carries a collapse toggle; default is expanded", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsTree nodes={nodes} edges={[]} selected={null} pulsing={new Set()} onSelect={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(html).toMatch(/aria-expanded="true"[^>]*data-testid="agents-tree-project-toggle-demo"/);
+    expect(html).toMatch(/aria-expanded="true"[^>]*data-testid="agents-tree-project-toggle-other"/);
+    // Rows render under the default (everything expanded).
+    expect(html).toContain('data-testid="agents-tree-row-s0"');
+  });
+
+  it("a slug in the persisted collapsed set renders header-only (rows hidden, counts kept)", () => {
+    const stub = globalThis.localStorage as unknown as { getItem: (key: string) => string | null };
+    const original = stub.getItem;
+    stub.getItem = (key: string) =>
+      key === "ccteam.agents.collapsedProjects.v1" ? '["demo"]' : null;
+    try {
+      const html = renderToString(
+        <MemoryRouter>
+          <AgentsTree nodes={nodes} edges={[]} selected={null} pulsing={new Set()} onSelect={() => {}} />
+        </MemoryRouter>,
+      ).replace(/<!-- -->/g, "");
+      // Header stays visible — slug, counts, and the toggle in collapsed state.
+      expect(html).toContain('data-testid="agents-tree-project-demo"');
+      expect(html).toContain("3/3");
+      expect(html).toMatch(/aria-expanded="false"[^>]*data-testid="agents-tree-project-toggle-demo"/);
+      // …but the project's session rows are gone; other projects are untouched.
+      expect(html).not.toContain('data-testid="agents-tree-row-s0"');
+      expect(html).not.toContain('data-testid="agents-tree-row-s1"');
+      expect(html).not.toContain('data-testid="agents-tree-row-s2"');
+      expect(html).toContain('data-testid="agents-tree-row-s3"');
+    } finally {
+      stub.getItem = original;
+    }
+  });
+
   it("每行展示 模型 · effort — vendor tokens verbatim, dash when nothing live", () => {
     const rows = [
       fixtureNode({ sid: "s0", model: "claude-opus-5", effort: "high" }),

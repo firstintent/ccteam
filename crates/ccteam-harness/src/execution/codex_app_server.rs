@@ -55,7 +55,7 @@ use crate::execution::progress_bridge::{
     append_event, build_agent_done_completed_event, build_agent_done_errored_event,
     build_chat_session_reset_event_with_reason, build_codex_plan_updated_event,
     build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
-    progress_jsonl_from_env,
+    progress_jsonl_from_env, semantic_payload_is_all_null,
 };
 #[cfg(test)]
 use crate::execution::progress_bridge::{
@@ -3610,7 +3610,8 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
             // No thread_id on this notification — it is account-scoped.
             let snapshot = pluck_val(&notif.params, "rate_limits", "rateLimits")
                 .unwrap_or(Value::Object(Default::default()));
-            Some(build_codex_rate_limit_event(snapshot))
+            (!semantic_payload_is_all_null(&snapshot))
+                .then(|| build_codex_rate_limit_event(snapshot))
         }
         _ => None,
     }
@@ -4476,6 +4477,22 @@ mod tests {
         assert_eq!(line["event"], CODEX_RATE_LIMIT);
         assert_eq!(line["vendor"], "codex");
         assert_eq!(line["snapshot"]["primary"]["usedPercent"], 80);
+    }
+
+    #[test]
+    fn account_rate_limits_drops_null_only_snapshot_before_building() {
+        let notification = Notification {
+            method: "account/rateLimits/updated".into(),
+            params: json!({
+                "rateLimits": {
+                    "primary": {"usedPercent": null, "resetsAt": null},
+                    "secondary": null,
+                    "credits": {},
+                },
+            }),
+        };
+
+        assert!(build_codex_notification_progress_line(&notification, "any-thread").is_none());
     }
 
     #[test]

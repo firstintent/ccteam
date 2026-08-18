@@ -5,17 +5,21 @@
 //! binary is missing; warnings are informational because daemon startup can
 //! self-heal vendor MCP registration.
 //!
-//! Every probe here is read-only: doctor never starts or changes the daemon and
-//! never writes vendor configuration. Registration writers are `ccteam config`,
-//! the web `POST .../register-mcp` endpoint, and daemon-start auto-registration.
+//! Bare probes are read-only: doctor never starts or changes the daemon and
+//! never writes vendor configuration. The explicit `--repair-progress` path
+//! only rewrites corrupt ccteam-owned journals after preserving a backup.
 //! `--verify-mcp` remains a separate dev/CI invariant handled by
 //! `main::run_doctor` before this module is called.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::Command;
 
+use anyhow::{Context, Result};
 use ccteam_core::host_registry::AgentProbeSpec;
 use ccteam_core::{CcteamPaths, Vendor};
+use ccteam_harness::execution::{journal, progress_bridge};
 
 /// Severity of one readiness check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +140,7 @@ struct ReadinessReport {
     agents: Vec<ReportRow>,
     ccteam: Vec<ReportRow>,
     projects: Vec<ReportRow>,
+    progress: Vec<ReportRow>,
     daemon_healthy: bool,
 }
 
@@ -242,6 +247,7 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
         agents,
         ccteam,
         projects: vec![ReportRow::advisory(check_project_skill_faces(paths))],
+        progress: check_progress_journals(paths),
         daemon_healthy,
     }
 }
@@ -253,6 +259,7 @@ fn render_readiness(report: &ReadinessReport, color: bool) -> (String, bool) {
     render_section(&mut out, "agents", &report.agents, color, &mut counts);
     render_section(&mut out, "ccteam", &report.ccteam, color, &mut counts);
     render_section(&mut out, "projects", &report.projects, color, &mut counts);
+    render_section(&mut out, "progress", &report.progress, color, &mut counts);
 
     let any_fail = counts.fail > 0;
     out.push_str("summary: ");
@@ -489,13 +496,13 @@ fn check_vendor_auth_pi() -> AuthCheck {
     AuthCheck::simple(None, "")
 }
 
-/// v0.9.15 K23/D13 — two Pass sources, checked in order: explicit env wins
-/// (matches DSH's own resolution order), else a mirrorable
-/// `~/.dsh/.credentials.yaml` counts (the real spawn-time credential mirror,
-/// K17/K23 — `check_vendor_mcp`'s bridge short-circuit skips the generic
-/// vendor-config probe for a `ManagedSessionBridge` vendor, so this is the
-/// only auth signal `dsh`'s doctor row gets). Neither present → Fail with
-/// both fixes named (matches the two-hint convention above).
+/// Two Pass sources, checked in order: explicit env wins (matches DSH's
+/// own resolution order), else a mirrorable `~/.dsh/.credentials.yaml`
+/// counts (the real spawn-time credential mirror — `check_vendor_mcp`'s
+/// bridge short-circuit skips the generic vendor-config probe for a
+/// `ManagedSessionBridge` vendor, so this is the only auth signal `dsh`'s
+/// doctor row gets). Neither present → Fail with both fixes named (matches
+/// the two-hint convention above).
 fn check_vendor_auth_dsh() -> AuthCheck {
     if std::env::var("DEEPSEEK_API_KEY").is_ok() {
         return AuthCheck {
@@ -752,6 +759,265 @@ fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
     }
 }
 
+#[derive(Default)]
+struct ProgressFileScan {
+    size: u64,
+    corrupt_count: usize,
+    first_corrupt_offset: Option<u64>,
+    kind_bytes: BTreeMap<String, u64>,
+}
+
+fn check_progress_journals(paths: &CcteamPaths) -> Vec<ReportRow> {
+    let slugs = progress_slugs(paths);
+    if slugs.is_empty() {
+        return vec![ReportRow::advisory(CheckLine::new(
+            CheckStatus::Pass,
+            "progress",
+            "no progress journals yet",
+        ))];
+    }
+    slugs
+        .into_iter()
+        .map(|slug| ReportRow::visible(check_progress_journal(paths, &slug)))
+        .collect()
+}
+
+fn check_progress_journal(paths: &CcteamPaths, slug: &str) -> CheckLine {
+    let active = paths.progress_jsonl(slug);
+    let archive = progress_bridge::progress_archive_path(&active);
+    let mut status = CheckStatus::Pass;
+    let mut details = Vec::new();
+    let threshold = progress_bridge::progress_rotate_bytes();
+    let warning_size = threshold.saturating_mul(4) / 5;
+
+    let active_scan = match scan_progress_file(&active) {
+        Ok(scan) => scan,
+        Err(error) => {
+            status = CheckStatus::Warn;
+            details.push(format!("active scan error: {error}"));
+            ProgressFileScan::default()
+        }
+    };
+    if active_scan.size > warning_size {
+        status = CheckStatus::Warn;
+        details.push(format!(
+            "active={}B SIZE WARNING (>{}B, 80% of {}B rotation threshold)",
+            active_scan.size, warning_size, threshold
+        ));
+    } else {
+        details.push(format!(
+            "active={}B (warn >{}B; rotate >{}B)",
+            active_scan.size, warning_size, threshold
+        ));
+    }
+    if active_scan.corrupt_count > 0 {
+        status = CheckStatus::Warn;
+    }
+    details.push(format!(
+        "active corrupt={} first_offset={}",
+        active_scan.corrupt_count,
+        format_optional_offset(active_scan.first_corrupt_offset)
+    ));
+
+    let archive_scan = match scan_progress_file(&archive) {
+        Ok(scan) => scan,
+        Err(error) => {
+            status = CheckStatus::Warn;
+            details.push(format!("archive scan error: {error}"));
+            ProgressFileScan::default()
+        }
+    };
+    if archive_scan.corrupt_count > 0 {
+        status = CheckStatus::Warn;
+    }
+    if archive_scan.size > 0 || archive.exists() {
+        details.push(format!(
+            "archive={}B corrupt={} first_offset={}",
+            archive_scan.size,
+            archive_scan.corrupt_count,
+            format_optional_offset(archive_scan.first_corrupt_offset)
+        ));
+    }
+
+    let mut histogram = active_scan.kind_bytes;
+    for (kind, bytes) in archive_scan.kind_bytes {
+        *histogram.entry(kind).or_insert(0) += bytes;
+    }
+    details.push(format!(
+        "TOP KINDS BY BYTES: {}",
+        render_top_kinds(histogram)
+    ));
+
+    let archive_coverage = match progress_bridge::progress_archive_coverage(&active) {
+        Ok(coverage) => coverage,
+        Err(error) => {
+            status = CheckStatus::Warn;
+            details.push(format!("archive marker error: {error}"));
+            None
+        }
+    };
+    match progress_bridge::read_progress_checkpoint(&active) {
+        Ok(Some(checkpoint)) => {
+            if progress_bridge::checkpoint_covers_archive(&checkpoint, archive_coverage.as_ref()) {
+                details.push(format!(
+                    "checkpoint=consistent seq={} events={}",
+                    checkpoint.rotation_sequence, checkpoint.event_count
+                ));
+                details.push(if archive_coverage.is_some() {
+                    "archive status=covered".to_string()
+                } else {
+                    "archive status=absent".to_string()
+                });
+            } else {
+                status = CheckStatus::Warn;
+                details.push(format!(
+                    "checkpoint=INCONSISTENT seq={} (coverage marker does not match .1)",
+                    checkpoint.rotation_sequence
+                ));
+                details.push(if archive_coverage.is_some() {
+                    "archive status=ORPHAN/uncovered".to_string()
+                } else {
+                    "archive status=missing but checkpoint still marks coverage".to_string()
+                });
+            }
+        }
+        Ok(None) => {
+            details.push("checkpoint=absent".to_string());
+            if archive_coverage.is_some() {
+                status = CheckStatus::Warn;
+                details.push("archive status=ORPHAN/uncovered".to_string());
+            } else {
+                details.push("archive status=absent".to_string());
+            }
+        }
+        Err(error) => {
+            status = CheckStatus::Warn;
+            details.push(format!("checkpoint=PARSE ERROR ({error})"));
+            details.push(if archive_coverage.is_some() {
+                "archive status=ORPHAN/coverage unknown".to_string()
+            } else {
+                "archive status=absent".to_string()
+            });
+        }
+    }
+
+    CheckLine::new(
+        status,
+        "progress",
+        format!("{slug}: {}", details.join(" · ")),
+    )
+}
+
+fn scan_progress_file(path: &Path) -> Result<ProgressFileScan> {
+    let size = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error).with_context(|| format!("stat {}", path.display())),
+    };
+    let mut kind_bytes = BTreeMap::new();
+    let summary = journal::scan_stream_detailed(path, |event, bytes| {
+        let kind = event
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| event.get("kind").and_then(serde_json::Value::as_str))
+            .unwrap_or("<unknown>");
+        *kind_bytes.entry(kind.to_string()).or_insert(0_u64) += bytes;
+    })?;
+    Ok(ProgressFileScan {
+        size,
+        corrupt_count: summary.corrupt_count,
+        first_corrupt_offset: summary.first_corrupt_offset,
+        kind_bytes,
+    })
+}
+
+fn render_top_kinds(histogram: BTreeMap<String, u64>) -> String {
+    let mut values = histogram.into_iter().collect::<Vec<_>>();
+    values.sort_unstable_by(|(left_kind, left_bytes), (right_kind, right_bytes)| {
+        right_bytes
+            .cmp(left_bytes)
+            .then_with(|| left_kind.cmp(right_kind))
+    });
+    if values.is_empty() {
+        return "none".to_string();
+    }
+    values
+        .into_iter()
+        .take(5)
+        .map(|(kind, bytes)| format!("{kind}={bytes}B"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_optional_offset(offset: Option<u64>) -> String {
+    offset.map_or_else(|| "none".to_string(), |offset| offset.to_string())
+}
+
+fn progress_slugs(paths: &CcteamPaths) -> BTreeSet<String> {
+    let mut slugs = ccteam_core::load_ccteam_config(&paths.root)
+        .map(|config| {
+            config
+                .projects
+                .into_iter()
+                .map(|project| project.slug)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(paths.progress_dir()) else {
+        return slugs;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let slug = name
+            .strip_suffix(".checkpoint.json")
+            .or_else(|| name.strip_suffix(".1.jsonl"))
+            .or_else(|| name.strip_suffix(".jsonl"));
+        if let Some(slug) = slug.filter(|slug| !slug.is_empty()) {
+            slugs.insert(slug.to_string());
+        }
+    }
+    slugs
+}
+
+/// Repair every corrupt active/archive progress journal under this home.
+pub fn repair_progress(paths: &CcteamPaths) -> Result<String> {
+    let mut out = String::from("progress repair\n");
+    let mut repaired = 0_u64;
+    for slug in progress_slugs(paths) {
+        let active = paths.progress_jsonl(&slug);
+        let targets = [
+            active.clone(),
+            progress_bridge::progress_archive_path(&active),
+        ];
+        for target in targets {
+            if let Some(report) = progress_bridge::repair_progress_journal(&active, &target)? {
+                repaired = repaired.saturating_add(1);
+                out.push_str(&format!(
+                    "  {slug} {}: kept {}, dropped {}, backup {}\n",
+                    target
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_default(),
+                    report.kept_count,
+                    report.dropped_count,
+                    report.backup_path.display()
+                ));
+            }
+        }
+    }
+    if repaired == 0 {
+        out.push_str("  no corrupt progress lines found; no journals changed\n");
+    } else {
+        out.push_str(
+            "  note: a torn line usually costs 2 records (the truncated record and the next record glued to it)\n",
+        );
+    }
+    out.push('\n');
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,6 +1043,7 @@ mod tests {
                 },
             ))],
             projects: Vec::new(),
+            progress: Vec::new(),
             daemon_healthy,
         }
     }
@@ -812,6 +1079,7 @@ mod tests {
                 "clean but hidden",
             ))],
             projects: Vec::new(),
+            progress: Vec::new(),
             daemon_healthy: true,
         };
         let (output, any_fail) = render_readiness(&report, false);

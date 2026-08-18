@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { getStatus, type StatusSnapshot } from "../lib/statusApi";
+import type { StatusSnapshot } from "../lib/statusApi";
+import { useStatusStore } from "../hooks/useStatusStore";
 import { SkeletonRows } from "../components/ui";
 import {
   budgetSeverity,
@@ -8,41 +8,9 @@ import {
   vendorCostSplit,
 } from "../lib/marketplaceFormat";
 
-type LoadState =
-  | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "ready"; status: StatusSnapshot };
-
-const STATUS_POLL_MS = 15000;
-
 /** `embedded` — hide the page header (Ops panel already owns the title). */
 export default function StatusView({ embedded = false }: { embedded?: boolean } = {}) {
-  const [state, setState] = useState<LoadState>({ kind: "loading" });
-
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const tick = (initial: boolean) => {
-      getStatus()
-        .then((status) => {
-          if (!cancelled) setState({ kind: "ready", status });
-        })
-        .catch((e) => {
-          if (cancelled || (e instanceof Error && e.message === "UNAUTHENTICATED")) return;
-          if (initial) {
-            setState({ kind: "error", message: e instanceof Error ? e.message : "加载失败" });
-          }
-        })
-        .finally(() => {
-          if (!cancelled) timer = setTimeout(() => tick(false), STATUS_POLL_MS);
-        });
-    };
-    tick(true);
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, []);
+  const { data: status, loading, error } = useStatusStore();
 
   return (
     <div data-testid="status-view" className="flex flex-col gap-3">
@@ -53,14 +21,14 @@ export default function StatusView({ embedded = false }: { embedded?: boolean } 
         </header>
       )}
       <div className="space-y-3">
-        {state.kind === "loading" ? (
+        {loading && status === null ? (
           <div data-testid="status-loading"><SkeletonRows rows={3} /></div>
-        ) : state.kind === "error" ? (
+        ) : status === null ? (
           <div data-testid="status-error" role="alert" className="rounded-lg border border-status-error/40 bg-status-error/10 px-4 py-4 text-sm text-status-error">
-            加载状态失败: {state.message}
+            加载状态失败: {error ?? "加载失败"}
           </div>
         ) : (
-          <StatusCards status={state.status} />
+          <StatusCards status={status} />
         )}
       </div>
     </div>

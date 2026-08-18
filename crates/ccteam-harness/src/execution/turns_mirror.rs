@@ -32,6 +32,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::journal;
+
 /// A browser-safe reference to one project-scoped outbound attachment.
 ///
 /// The file bytes stay under `<project>/.ccteam/uploads/`; transcript and
@@ -174,12 +176,11 @@ pub fn read_all_turns(project_dir: &Path, sid: &str) -> Result<Vec<TurnRecord>> 
 /// `rebuild_from_turns_jsonl` uses this to bound the conversation
 /// history it injects into a fresh tmux session.
 pub fn last_n_turns(project_dir: &Path, sid: &str, n: usize) -> Result<Vec<TurnRecord>> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let all = read_all_turns(project_dir, sid)?;
-    let start = all.len().saturating_sub(n);
-    Ok(all[start..].to_vec())
+    let path = turns_jsonl_path(project_dir, sid);
+    Ok(journal::tail_filter_map(&path, n, None, |line| {
+        serde_json::from_slice::<TurnRecord>(line).ok()
+    })?
+    .events)
 }
 
 #[cfg(test)]
@@ -240,6 +241,41 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].turn_id, "t3");
         assert_eq!(tail[1].turn_id, "t4");
+    }
+
+    #[test]
+    fn last_n_skips_corrupt_rows_while_reading_backwards() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..2 {
+            append_turn(
+                tmp.path(),
+                "bob",
+                &mk_turn(&format!("t{i}"), "bob", "u", "a"),
+            )
+            .unwrap();
+        }
+        let path = turns_jsonl_path(tmp.path(), "bob");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "not-json").unwrap();
+        drop(file);
+        for i in 2..4 {
+            append_turn(
+                tmp.path(),
+                "bob",
+                &mk_turn(&format!("t{i}"), "bob", "u", "a"),
+            )
+            .unwrap();
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        write!(file, "{{torn").unwrap();
+
+        let tail = last_n_turns(tmp.path(), "bob", 2).unwrap();
+        assert_eq!(
+            tail.iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t2", "t3"]
+        );
     }
 
     #[test]

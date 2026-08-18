@@ -23,6 +23,8 @@ use crate::pty::PtyRegistry;
 #[derive(Clone)]
 pub struct AppState {
     pub paths: Arc<CcteamPaths>,
+    /// Incremental progress-journal aggregate shared with the live gateway.
+    pub progress_projection: Arc<ccteam_im::progress_projection::ProgressProjection>,
     /// V0.3 M5.3 — auth gate state. Cloned per request, so the inner
     /// `Arc<AuthState>` keeps the token allocation shared. When
     /// `enabled = false` (loopback bind, or `--no-auth` opt-out) the
@@ -117,6 +119,14 @@ pub struct AppState {
     /// agent sessions and never enter the gateway live map.
     pub dsh_web: Arc<crate::dsh_web::DshWebSupervisor>,
     pub dsh_proxy_client: reqwest::Client,
+    /// VENDOR-INSTALL-1 — admin one-click vendor install/update job table
+    /// (process-lifetime; jobs do not survive a daemon restart).
+    pub vendor_installs: Arc<crate::routes::vendor_install::VendorInstallManager>,
+    /// VENDOR-QUOTA-1 — per-vendor quota probe service (HTTP + 5min cache).
+    pub vendor_quotas: Arc<crate::routes::vendor_quota::VendorQuotaService>,
+    /// Coalesces concurrent daemon-wide status aggregations. The completed
+    /// result is never retained after its in-flight computation finishes.
+    pub(crate) status_singleflight: crate::routes::status::StatusSingleflight,
 }
 
 /// v0.8.8 F4 — state of an in-flight Telegram `chat_id` long-poll capture
@@ -159,8 +169,11 @@ impl AppState {
 
     fn build(paths: CcteamPaths, auth: AuthState) -> Self {
         let (chat_outbound, _) = broadcast::channel(256);
+        let progress_projection =
+            ccteam_im::progress_projection::ProgressProjection::new(paths.clone());
         Self {
             paths: Arc::new(paths),
+            progress_projection,
             auth: Arc::new(auth),
             pty: PtyRegistry::new(),
             chat_inbound: None,
@@ -179,6 +192,11 @@ impl AppState {
             host_hub: Arc::new(ccteam_harness::HostChannelHub::default()),
             dsh_web: Arc::new(crate::dsh_web::DshWebSupervisor::disabled()),
             dsh_proxy_client: reqwest::Client::new(),
+            vendor_installs: Arc::new(
+                crate::routes::vendor_install::VendorInstallManager::default(),
+            ),
+            vendor_quotas: Arc::new(crate::routes::vendor_quota::VendorQuotaService::default()),
+            status_singleflight: crate::routes::status::StatusSingleflight::default(),
         }
     }
 
@@ -230,6 +248,13 @@ impl AppState {
         gateway: Arc<Mutex<ccteam_im::gateway::Gateway>>,
         principals: Arc<ccteam_im::principals::SessionPrincipals>,
     ) -> Self {
+        if let Ok(guard) = gateway.try_lock() {
+            if let Some(projection) = guard.progress_projection() {
+                debug_assert!(Arc::ptr_eq(&self.progress_projection, &projection));
+                self.progress_projection = projection;
+            }
+        }
+        self.progress_projection.start_hydration();
         self.session_principals = Some(Arc::clone(&principals));
         // v0.10 — reap the `Mcp-Session-Id` bindings of hand-started clients that
         // went away without saying so (most of them: only codex and grok were

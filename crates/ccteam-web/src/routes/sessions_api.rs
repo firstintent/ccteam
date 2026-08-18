@@ -43,9 +43,8 @@
 //! handler resolves `sid → {project_dir, sid, …}` via
 //! [`Gateway::session_resolve`](ccteam_im::gateway::Gateway::session_resolve)
 //! (under the gateway lock, which it drops before the blocking fs read)
-//! then reads the ccteam-owned mirror
-//! `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` via
-//! [`read_all_turns`](ccteam_harness::execution::turns_mirror::read_all_turns).
+//! then tails the ccteam-owned mirror
+//! `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` via the shared journal facade.
 //! v0.8.8 F1 — the mirror is keyed by the session **sid**, not the role, so
 //! two same-role sessions have independent histories (no cross-bleed). It is
 //! best-effort: an empty `events` array is a valid 200 when nothing has been
@@ -64,7 +63,7 @@ use axum::{
     },
     Extension, Json,
 };
-use ccteam_harness::execution::turns_mirror::{read_all_turns, TurnRecord};
+use ccteam_harness::execution::turns_mirror::{turns_jsonl_path, TurnRecord};
 use ccteam_harness::{
     AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
     ThreadStatus,
@@ -167,10 +166,10 @@ pub(crate) async fn handle_list_sessions(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    // session_views() + live_turns() are sync after the lock (and both cheap,
-    // in-memory) — no `.await` and no file read is held under it.
+    // session_views() is catalog-backed and live_turns() is process state:
+    // both are pure in-memory snapshots while the gateway lock is held.
     let (mut views, live_turns) = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.list").await;
         (
             guard
                 .session_views()
@@ -180,7 +179,7 @@ pub(crate) async fn handle_list_sessions(
             guard.live_turns(),
         )
     };
-    apply_progress_activity_status(&app.paths, &slug, &mut views, &live_turns);
+    apply_progress_activity_status(&app.progress_projection, &slug, &mut views, &live_turns);
     Json(views).into_response()
 }
 
@@ -215,7 +214,7 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
     // No live gateway → the handler runs its own no-gateway path; don't gate.
     let gw = app.gateway.as_ref()?;
     let project = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.acl").await;
         guard.project_slug_for_sid(sid)
     };
     match project {
@@ -231,16 +230,15 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
 /// can never tell the user different things about one session.
 ///
 /// `live_turns` is the daemon's in-flight-turn snapshot, taken under the same
-/// lock that produced `views` (cheap, no I/O) — the file read then happens here,
-/// off the lock. It is what keeps a mid-turn session honest when its project's
-/// progress stream cannot be read.
+/// lock that produced `views`. Persisted activity comes from the incremental
+/// projection after the lock is released.
 ///
 /// A project the catalog can't price for staleness no longer bails out (that
 /// left every row saying `"live"`, i.e. green, on a surface whose whole job is
 /// to say what a session is doing): fall back to `0` silent seconds, the same
 /// fallback the IM side uses.
 fn apply_progress_activity_status(
-    paths: &ccteam_core::CcteamPaths,
+    projection: &ccteam_im::progress_projection::ProgressProjection,
     slug: &str,
     views: &mut [SessionView],
     live_turns: &std::collections::HashMap<String, ccteam_core::stall::LiveTurn>,
@@ -248,21 +246,15 @@ fn apply_progress_activity_status(
     if views.is_empty() {
         return;
     }
-    let silent_seconds = ccteam_core::collect_projects(paths)
-        .ok()
-        .and_then(|projects| {
-            projects
-                .into_iter()
-                .find(|project| project.state.slug == slug)
-                .map(|project| project.stall_silent_seconds)
-        })
+    let snapshot = projection.project_snapshot(slug);
+    let silent_seconds = snapshot
+        .last_valid
+        .as_ref()
+        .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, chrono::Utc::now()))
         .unwrap_or(0);
-    let events =
-        ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
     let now = chrono::Utc::now();
     for view in views {
-        let activity = ccteam_core::stall::classify_session_activity(
-            &events,
+        let activity = snapshot.session_activity_borrowed(
             &view.sid,
             silent_seconds,
             live_turns.get(&view.sid).copied(),
@@ -365,6 +357,7 @@ pub(crate) async fn handle_create_session(
     Path(slug): Path<String>,
     FormOrJson(form, mode): FormOrJson<CreateSessionForm>,
 ) -> Response {
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     if form.removed_host.0 {
         return create_error(
             StatusCode::BAD_REQUEST,
@@ -411,23 +404,18 @@ pub(crate) async fn handle_create_session(
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
     let tuning = spawn_tuning_from_form(vendor, form.model.clone(), form.effort.clone());
-    let created = {
-        let mut guard = gw.lock().await;
-        guard
-            .create_session_api_tuned(
-                slug.clone(),
-                role.clone(),
-                vendor,
-                permission_mode,
-                protocol,
-                // v0.8.20 web↔IM convergence — own the session by the caller's
-                // identity (`user:<tenant>` / `user:web-api`) so the tenant's own
-                // IM bot sees it too.
-                identity.web_chat_id(),
-                tuning,
-            )
-            .await
-    };
+    let created = ccteam_im::gateway::Gateway::create_session_api_tuned_shared(
+        Arc::clone(gw),
+        slug.clone(),
+        role.clone(),
+        vendor,
+        permission_mode,
+        protocol,
+        identity.web_chat_id(),
+        tuning,
+        deadline,
+    )
+    .await;
     match created {
         Ok(created) => (StatusCode::CREATED, Json(json!({"sid": created.sid}))).into_response(),
         // v0.8.7 review-fix (R-M6) — distinguish a caller mistake (the named
@@ -440,9 +428,10 @@ pub(crate) async fn handle_create_session(
                 return create_error(StatusCode::UNPROCESSABLE_ENTITY, missing.to_string(), mode);
             }
             tracing::warn!(%slug, %role, %err, "create_session_api failed");
-            create_error(
+            create_gateway_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format_create_session_error(&err),
+                &err,
                 mode,
             )
         }
@@ -456,20 +445,25 @@ pub(crate) async fn handle_create_session(
 /// appears in the flat `<slug>.jsonl` progress — so we resolve the sid to
 /// its `{role, project_dir}` via [`Gateway::session_resolve`] (404 if the
 /// sid is unknown to the gateway) and read the ccteam-owned per-session
-/// mirror `<project_dir>/.ccteam/chat/<role>/turns.jsonl`. Best-effort:
-/// returns `{sid, events: []}` (200) when no turn has been mirrored yet (or
-/// the file read fails). 503 with no gateway.
+/// mirror `<project_dir>/.ccteam/chat/<sid>/turns.jsonl`. Best-effort:
+/// returns the newest 100 turns by default and supports backwards cursor
+/// pagination. `{sid, events: []}` (200) when no turn has been mirrored yet
+/// (or the file read fails). 503 with no gateway.
 ///
 /// Lock discipline: `session_resolve` is sync (no `.await`) and only clones
 /// scalar fields, so we run it under the gateway guard, then **drop the
-/// guard** before the blocking `read_all_turns` fs read.
+/// guard** before the blocking journal tail read.
 #[utoipa::path(
     get,
     path = "/api/v1/sessions/{sid}",
     tag = "sessions",
-    params(("sid" = String, Path, description = "Gateway session id (`s{n}`)")),
+    params(
+        ("sid" = String, Path, description = "Gateway session id (`s{n}`)"),
+        ("limit" = Option<usize>, Query, description = "Newest turns to return (default 100, maximum 1000)"),
+        ("before" = Option<String>, Query, description = "Opaque byte cursor returned as `next_before`")
+    ),
     responses(
-        (status = 200, description = "History `{sid, events:[{turn_id, ts, role, user, assistant}]}`", body = serde_json::Value),
+        (status = 200, description = "History `{sid, events:[...], next_before, has_more}`", body = serde_json::Value),
         (status = 404, description = "Unknown session"),
         (status = 503, description = "No live gateway (standalone web)"),
     ),
@@ -478,6 +472,7 @@ pub(crate) async fn handle_session_history(
     State(app): State<AppState>,
     Extension(identity): Extension<crate::auth::Identity>,
     Path(sid): Path<String>,
+    Query(query): Query<SessionHistoryQuery>,
 ) -> Response {
     if let Some(deny) = gate_sid(&app, &identity, &sid).await {
         return deny;
@@ -490,14 +485,43 @@ pub(crate) async fn handle_session_history(
     // stopped session's transcript outlives the live map by design, and this
     // endpoint is what the team panel's 最近对话 reads for exactly those rows.
     let resolved = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.history").await;
         guard.session_resolve_any(&sid)
     };
     let Some(resolved) = resolved else {
         return unknown_session(&sid);
     };
-    let events = collect_session_turns(&resolved.project_dir, &resolved.sid);
-    Json(json!({ "sid": sid, "events": events })).into_response()
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT);
+    let before = match query.before.as_deref().map(str::parse::<u64>).transpose() {
+        Ok(before) => before,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "before must be a valid history cursor"})),
+            )
+                .into_response();
+        }
+    };
+    let page = collect_session_turns(&resolved.project_dir, &resolved.sid, limit, before);
+    Json(json!({
+        "sid": sid,
+        "events": page.events,
+        "next_before": page.next_before,
+        "has_more": page.has_more,
+    }))
+    .into_response()
+}
+
+const DEFAULT_HISTORY_LIMIT: usize = 100;
+const MAX_HISTORY_LIMIT: usize = 1000;
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SessionHistoryQuery {
+    limit: Option<usize>,
+    before: Option<String>,
 }
 
 /// PATCH body for `PATCH /api/v1/sessions/{sid}` — the only mutable field is
@@ -597,19 +621,41 @@ fn rename_payload(renamed: &ccteam_im::gateway::SessionRename) -> serde_json::Va
 /// Reconstruct a session's history from its ccteam-owned transcript mirror
 /// `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` (the same file the W1
 /// `session_collect` path reads). Each [`TurnRecord`] becomes one event
-/// object; any read error folds to an empty list — a best-effort history
-/// view (an absent file is the legitimate first-turn case, which
-/// [`read_all_turns`] already returns as `Ok(empty)`). Split out from the
+/// object; any read error folds to an empty page — a best-effort history
+/// view (an absent file is the legitimate first-turn case). Split out from the
 /// handler so the disk → events mapping is unit-testable without a live
 /// gateway.
 ///
 /// v0.8.8 F1 — keyed by `sid` (the transcript directory is
 /// `.ccteam/chat/<sid>/`, not role): two same-role sessions therefore have
 /// independent histories that do not bleed into each other.
-fn collect_session_turns(project_dir: &std::path::Path, sid: &str) -> Vec<serde_json::Value> {
-    match read_all_turns(project_dir, sid) {
-        Ok(turns) => turns.iter().map(turn_to_event).collect(),
-        Err(_) => Vec::new(),
+#[derive(Debug, Default)]
+struct SessionHistoryPage {
+    events: Vec<serde_json::Value>,
+    next_before: Option<String>,
+    has_more: bool,
+}
+
+fn collect_session_turns(
+    project_dir: &std::path::Path,
+    sid: &str,
+    limit: usize,
+    before: Option<u64>,
+) -> SessionHistoryPage {
+    let path = turns_jsonl_path(project_dir, sid);
+    match ccteam_core::journal::tail_filter_map(&path, limit, before, |line| {
+        serde_json::from_slice::<TurnRecord>(line).ok()
+    }) {
+        Ok(tail) => SessionHistoryPage {
+            events: tail.events.iter().map(turn_to_event).collect(),
+            next_before: if tail.has_more {
+                tail.first_offset.map(|offset| offset.to_string())
+            } else {
+                None
+            },
+            has_more: tail.has_more,
+        },
+        Err(_) => SessionHistoryPage::default(),
     }
 }
 
@@ -914,9 +960,7 @@ pub(crate) async fn handle_session_turn(
     Path(sid): Path<String>,
     FormOrJson(form, mode): FormOrJson<TurnForm>,
 ) -> Response {
-    if let Some(deny) = gate_sid(&app, &identity, &sid).await {
-        return deny;
-    }
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     let has_global_attachment = form
         .attachments
         .iter()
@@ -924,6 +968,29 @@ pub(crate) async fn handle_session_turn(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
+    // This is the first gateway acquisition for the request. Resolve ACL and
+    // liveness together under the entry-point deadline so lock queuing cannot
+    // consume time invisibly before the vendor-specific timeout begins.
+    let (project, is_live) = match deadline.lock(gw).await {
+        Ok(guard) => (
+            guard.project_slug_for_sid(&sid),
+            guard.is_session_live(&sid),
+        ),
+        Err(err) => {
+            return create_gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format_submit_error(&err),
+                &err,
+                mode,
+            )
+        }
+    };
+    let Some(project) = project else {
+        return unknown_session(&sid);
+    };
+    if !crate::routes::api_v1::can_see_project(&app, &identity, &project) {
+        return unknown_session(&sid);
+    }
     // Attachments make a bare send meaningful ("look at this file"), so text
     // is only required when nothing is attached.
     if form.text.trim().is_empty() && form.attachments.is_empty() {
@@ -933,35 +1000,38 @@ pub(crate) async fn handle_session_turn(
             mode,
         );
     }
-    let result = {
-        let mut guard = gw.lock().await;
-        // Resume-by-sid (红线「会话 = resume-by-session-id」): a session evicted
-        // for capacity, dropped by a daemon restart whose rebuild failed, or
-        // explicitly stopped is not in the live map — but its `meta.json`
-        // persists on disk. Cold-resume it on demand rather than 404, so a chat
-        // whose session "disappeared" out from under it accepts the next turn
-        // (the same path the sidebar resume button + IM `/use` take). A
-        // genuinely unknown sid (no live session, no meta) still 404s below.
-        if !guard.is_session_live(&sid) {
-            let Some(slug) = guard.project_slug_for_sid(&sid) else {
-                return unknown_session(&sid);
-            };
-            // `gate_sid` already project-gated the caller; bind the resume to
-            // the resolved owning project so `resume_stopped_session`'s own ACL
-            // guard is satisfied (`exp == slug` holds).
-            let caller_identity = identity.owner_tag();
-            if let Err(err) = guard
-                .resume_stopped_session(&sid, &caller_identity, Some(&slug))
-                .await
-            {
-                tracing::warn!(%sid, %err, "auto-resume on web turn failed");
-                return create_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("session {sid} could not be resumed: {err}"),
-                    mode,
-                );
-            }
+    let resume_slug = (!is_live).then_some(project);
+    if let Some(slug) = resume_slug {
+        if let Err(err) = ccteam_im::gateway::Gateway::resume_stopped_session_shared(
+            Arc::clone(gw),
+            &sid,
+            &identity.owner_tag(),
+            Some(&slug),
+            deadline,
+        )
+        .await
+        {
+            tracing::warn!(%sid, %err, "auto-resume on web turn failed");
+            return create_gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format!("session {sid} could not be resumed: {err}"),
+                &err,
+                mode,
+            );
         }
+    }
+    let text = {
+        let guard = match deadline.lock(gw).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                return create_gateway_error(
+                    StatusCode::BAD_GATEWAY,
+                    format_submit_error(&err),
+                    &err,
+                    mode,
+                )
+            }
+        };
         let Some(view) = guard
             .session_views()
             .into_iter()
@@ -973,7 +1043,7 @@ pub(crate) async fn handle_session_turn(
         // inbound attachment grammar). Project uploads and the global library
         // live on the daemon host, so a remote-host session can't see them —
         // readable error, no silent rot.
-        let text = if form.attachments.is_empty() {
+        if form.attachments.is_empty() {
             form.text
         } else {
             let Some(resolved) = guard.session_resolve(&sid) else {
@@ -1021,17 +1091,28 @@ pub(crate) async fn handle_session_turn(
                 Ok(text) => text,
                 Err(msg) => return create_error(StatusCode::BAD_REQUEST, msg, mode),
             }
-        };
-        // Web interactive path: run the gateway control-command face (/status,
-        // /sessions, …) first — parity with IM — then fall back to a turn. The
-        // fleet renders are admin-only (see `submit_web_sid`).
-        guard.submit_web_sid(&sid, text, identity.is_admin).await
+        }
     };
+    // Web interactive path: run the gateway control-command face (/status,
+    // /sessions, …) first — parity with IM — then fall back to a turn.
+    let result = ccteam_im::gateway::Gateway::submit_web_sid_shared(
+        Arc::clone(gw),
+        &sid,
+        text,
+        identity.is_admin,
+        deadline,
+    )
+    .await;
     match result {
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "submit_to_sid failed");
-            create_error(StatusCode::BAD_GATEWAY, format_submit_error(&err), mode)
+            create_gateway_error(
+                StatusCode::BAD_GATEWAY,
+                format_submit_error(&err),
+                &err,
+                mode,
+            )
         }
     }
 }
@@ -1642,7 +1723,7 @@ pub(crate) async fn handle_session_history_list(
         return no_gateway();
     };
     let metas = {
-        let guard = gw.lock().await;
+        let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.history_list").await;
         guard.list_history_sessions(&slug)
     };
     let views: Vec<serde_json::Value> = metas
@@ -1695,6 +1776,7 @@ pub(crate) async fn handle_session_resume(
     Extension(identity): Extension<crate::auth::Identity>,
     Path((slug, sid)): Path<(String, String)>,
 ) -> Response {
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
         return project_not_visible(&slug);
     }
@@ -1702,25 +1784,19 @@ pub(crate) async fn handle_session_resume(
         return no_gateway();
     };
     let caller_identity = identity.owner_tag();
-    let result = {
-        let mut guard = gw.lock().await;
-        // Bind the resume to the authorised project slug: the sid must belong to
-        // `slug` (gated by `can_see_project` above). Without this a tenant could
-        // resume another project's session by passing its sid under a slug they
-        // own.
-        guard
-            .resume_stopped_session(&sid, &caller_identity, Some(&slug))
-            .await
-    };
+    let result = ccteam_im::gateway::Gateway::resume_stopped_session_shared(
+        Arc::clone(gw),
+        &sid,
+        &caller_identity,
+        Some(&slug),
+        deadline,
+    )
+    .await;
     match result {
         Ok(resumed_sid) => Json(json!({"sid": resumed_sid})).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "resume_stopped_session failed");
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
+            gateway_json_error(StatusCode::NOT_FOUND, &err)
         }
     }
 }
@@ -1751,9 +1827,21 @@ pub(crate) async fn handle_external_sessions(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let sessions = {
-        let guard = gw.lock().await;
-        guard.list_external_claude_sessions(&slug)
+    let sessions = match ccteam_im::gateway::Gateway::list_external_claude_sessions_shared(
+        Arc::clone(gw),
+        &slug,
+    )
+    .await
+    {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::warn!(%slug, %err, "external session scan failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": err.to_string(), "error_code": "storage_read_corrupt"})),
+            )
+                .into_response();
+        }
     };
     let views: Vec<serde_json::Value> = sessions
         .into_iter()
@@ -1801,6 +1889,7 @@ pub(crate) async fn handle_import_session(
     Path(slug): Path<String>,
     Json(body): Json<ImportSessionRequest>,
 ) -> Response {
+    let deadline = ccteam_im::gateway::GatewayDeadline::start();
     if !crate::routes::api_v1::can_see_project(&app, &identity, &slug) {
         return project_not_visible(&slug);
     }
@@ -1822,21 +1911,19 @@ pub(crate) async fn handle_import_session(
         return no_gateway();
     };
     let caller_identity = identity.owner_tag();
-    let result = {
-        let mut guard = gw.lock().await;
-        guard
-            .import_external_session(&slug, &body.vendor_uuid, &caller_identity)
-            .await
-    };
+    let result = ccteam_im::gateway::Gateway::import_external_session_shared(
+        Arc::clone(gw),
+        &slug,
+        &body.vendor_uuid,
+        &caller_identity,
+        deadline,
+    )
+    .await;
     match result {
         Ok(sid) => (StatusCode::CREATED, Json(json!({"sid": sid}))).into_response(),
         Err(err) => {
             tracing::warn!(%slug, %err, "import_external_session failed");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": err.to_string()})),
-            )
-                .into_response()
+            gateway_json_error(StatusCode::BAD_REQUEST, &err)
         }
     }
 }
@@ -1902,6 +1989,12 @@ fn session_event(ev: &GatewayEvent, seq: u64) -> Event {
 /// `GET /api/v1/agents/events` (`crate::routes::agents`) can reuse this exact
 /// serializer for the team view's global SSE frames instead of duplicating
 /// the shape. `pub(crate)` for that cross-module reuse.
+///
+/// WEB-TS-1 — also carries `ts`: a server-side timestamp serialized through
+/// chrono's [`chrono::DateTime`] serde, the exact RFC 3339 shape the mirrored
+/// `TurnRecord.ts` writes into turns.jsonl, so live frames and history events
+/// share one clock/format and the SPA never needs its own `Date.now()`.
+/// Additive: old clients ignore the field.
 pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     use ccteam_im::gateway::GatewayEventKind;
     let (kind, done) = match &ev.kind {
@@ -1928,6 +2021,9 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
         "slug": ev.slug,
         "kind": kind,
         "content": ev.content,
+        // WEB-TS-1 — server-side frame timestamp; serialized via chrono's
+        // `DateTime<Utc>` serde → the same RFC 3339 shape as turns.jsonl `ts`.
+        "ts": chrono::Utc::now(),
     });
     if done {
         payload["done"] = serde_json::Value::Bool(true);
@@ -2016,6 +2112,39 @@ fn create_error(status: StatusCode, msg: String, mode: InputMode) -> Response {
     match mode {
         InputMode::Form => (status, msg).into_response(),
         InputMode::Json => (status, Json(json!({"ok": false, "error": msg}))).into_response(),
+    }
+}
+
+fn create_gateway_error(
+    status: StatusCode,
+    msg: String,
+    err: &anyhow::Error,
+    mode: InputMode,
+) -> Response {
+    let code = err
+        .downcast_ref::<ccteam_im::gateway::GatewayRequestError>()
+        .map(ccteam_im::gateway::GatewayRequestError::error_code);
+    match (mode, code) {
+        (InputMode::Json, Some(error_code)) => (
+            status,
+            Json(json!({"ok": false, "error": msg, "error_code": error_code})),
+        )
+            .into_response(),
+        _ => create_error(status, msg, mode),
+    }
+}
+
+fn gateway_json_error(default_status: StatusCode, err: &anyhow::Error) -> Response {
+    match err.downcast_ref::<ccteam_im::gateway::GatewayRequestError>() {
+        Some(kind) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": err.to_string(),
+                "error_code": kind.error_code()
+            })),
+        )
+            .into_response(),
+        None => (default_status, Json(json!({"error": err.to_string()}))).into_response(),
     }
 }
 
@@ -2125,7 +2254,7 @@ mod tests {
                 .unwrap();
             writeln!(f, "not-json").unwrap();
         }
-        let events = collect_session_turns(project_dir, sid);
+        let events = collect_session_turns(project_dir, sid, 100, None).events;
         assert_eq!(events.len(), 2, "two parseable turns → two events");
         assert_eq!(events[0]["turn_id"], "t1");
         assert_eq!(events[0]["user"], "review the diff");
@@ -2160,7 +2289,7 @@ mod tests {
         append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
         append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
 
-        let only_s1 = collect_session_turns(project_dir, "s1");
+        let only_s1 = collect_session_turns(project_dir, "s1", 100, None).events;
         assert_eq!(
             only_s1.len(),
             1,
@@ -2169,7 +2298,7 @@ mod tests {
         assert_eq!(only_s1[0]["turn_id"], "t1");
         assert_eq!(only_s1[0]["assistant"], "from-s1");
 
-        let only_s2 = collect_session_turns(project_dir, "s2");
+        let only_s2 = collect_session_turns(project_dir, "s2", 100, None).events;
         assert_eq!(
             only_s2.len(),
             1,
@@ -2285,6 +2414,24 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    /// WEB-TS-1 — every frame carries a server-side `ts` in the same RFC 3339
+    /// (`…Z`) shape the mirrored `TurnRecord.ts` writes into turns.jsonl, so a
+    /// live row and a history row share one clock/format.
+    #[test]
+    fn session_event_carries_server_ts() {
+        let before = chrono::Utc::now();
+        let payload = session_event_payload(&gw_event(Some("s1")));
+        let after = chrono::Utc::now();
+        let ts = payload["ts"].as_str().expect("ts is a string");
+        assert!(ts.ends_with('Z'), "UTC Z-suffixed like turns.jsonl: {ts}");
+        let parsed = chrono::DateTime::parse_from_rfc3339(ts).expect("ts parses as RFC 3339");
+        let parsed = parsed.with_timezone(&chrono::Utc);
+        assert!(
+            before <= parsed && parsed <= after,
+            "ts {ts} stamps the payload build, between {before} and {after}"
+        );
     }
 
     #[test]
@@ -2434,6 +2581,12 @@ mod tests {
         std::collections::HashMap::from([(sid.to_string(), live)])
     }
 
+    fn test_projection(
+        paths: &ccteam_core::CcteamPaths,
+    ) -> std::sync::Arc<ccteam_im::progress_projection::ProgressProjection> {
+        ccteam_im::progress_projection::ProgressProjection::new(paths.clone())
+    }
+
     fn view(sid: &str) -> SessionView {
         SessionView {
             driveable: true,
@@ -2469,15 +2622,16 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![view("s1")];
 
         // No progress stream at all → the file verdict is a bare "idle".
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
 
         views[0].status = "live".into();
         apply_progress_activity_status(
-            &paths,
+            &projection,
             "demo",
             &mut views,
             &one_live_turn(
@@ -2500,16 +2654,18 @@ mod tests {
     fn unknown_project_still_reports_a_real_activity_not_live() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
+        let projection = test_projection(&paths);
         let mut views = vec![view("s1")];
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
     }
 
     #[test]
-    fn progress_activity_status_uses_core_file_backed_classifier() {
+    fn progress_activity_status_uses_projection_backed_classifier() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
             sid: "s1".into(),
@@ -2540,7 +2696,7 @@ mod tests {
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &stale_completed)
             .unwrap();
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
         assert!(views[0].last_activity_seconds.is_some());
 
@@ -2550,7 +2706,7 @@ mod tests {
             "ts": chrono::Utc::now().to_rfc3339(),
         });
         ccteam_core::progress::append_event(&paths.progress_jsonl("demo"), &timeout).unwrap();
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "stuck");
     }
 
@@ -2559,6 +2715,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![
             SessionView {
                 driveable: true,
@@ -2628,7 +2785,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "idle");
         assert!(views[0].last_activity_seconds.unwrap() >= 60);
         assert_eq!(views[1].status, "stuck");
@@ -2640,6 +2797,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
             sid: "s1".into(),
@@ -2674,7 +2832,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "working");
         assert_eq!(views[0].last_activity_seconds, None);
     }
@@ -2684,6 +2842,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = test_paths(tmp.path());
         write_project_state(&paths, "demo");
+        let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
             sid: "s1".into(),
@@ -2720,7 +2879,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_progress_activity_status(&paths, "demo", &mut views, &no_live_turns());
+        apply_progress_activity_status(&projection, "demo", &mut views, &no_live_turns());
         assert_eq!(views[0].status, "stale");
         assert!(
             views[0].last_activity_seconds.unwrap() >= ccteam_core::stall::STALL_WARN_SECONDS - 1
@@ -2730,10 +2889,12 @@ mod tests {
     #[test]
     fn collect_session_turns_missing_file_is_empty() {
         // Absent turns.jsonl is the legitimate first-turn case → empty (200),
-        // not an error. read_all_turns returns Ok(empty) for a missing file.
+        // not an error. The journal facade returns an empty tail for a missing file.
         // v0.8.8 F1 — keyed by sid (the never-spawned `s99` has no mirror yet).
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(collect_session_turns(tmp.path(), "s99").is_empty());
+        assert!(collect_session_turns(tmp.path(), "s99", 100, None)
+            .events
+            .is_empty());
     }
 
     fn test_paths(root: &std::path::Path) -> ccteam_core::CcteamPaths {

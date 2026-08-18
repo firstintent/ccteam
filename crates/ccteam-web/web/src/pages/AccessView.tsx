@@ -14,7 +14,7 @@ import {
 } from "../components/ui";
 import { copyText } from "../lib/clipboard";
 import { getImConfig, type ImConfigStatus } from "../lib/configApi";
-import { fetchDashboard } from "../lib/dashboardApi";
+import { useProjectsStore } from "../hooks/useProjectsStore";
 import {
   listEnrollments,
   mintProjectEnrollment,
@@ -246,8 +246,24 @@ export default function AccessView({ lang }: { lang: Lang }) {
  *  byte-identical to what `ccteam config` would have written. */
 export function ExternalAgentCard({ lang }: { lang: Lang }) {
   const t = makeT(lang);
-  const [projects, setProjects] = useState<string[] | null>(null);
-  const [scope, setScope] = useState("");
+  const { projects: projectRows, loading: projectsLoading } = useProjectsStore();
+  const projects = useMemo(
+    () => projectRows?.map((project) => project.slug) ?? (projectsLoading ? null : []),
+    [projectRows, projectsLoading],
+  );
+  const [selectedScope, setSelectedScope] = useState("");
+  const validProjectScopes = useMemo(
+    () => new Set((projects ?? []).map((slug) => `project:${slug}`)),
+    [projects],
+  );
+  const scope =
+    selectedScope === "user" || validProjectScopes.has(selectedScope)
+      ? selectedScope
+      : projects?.[0]
+        ? `project:${projects[0]}`
+        : projects === null
+          ? ""
+          : "user";
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -262,23 +278,6 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
 
   useEffect(() => {
     let cancelled = false;
-    fetchDashboard()
-      .then((rows) => {
-        if (cancelled) return;
-        const slugs = rows.map((r) => r.slug);
-        setProjects(slugs);
-        // Default to a project (the safer scope); fall back to machine-user
-        // only when the caller can see no project at all.
-        setScope((prev) => prev || (slugs[0] ? `project:${slugs[0]}` : "user"));
-      })
-      .catch(() => {
-        // The project list is an affordance, not a gate: fall back to the
-        // machine-user scope so the card still works (the backend re-checks
-        // project visibility on every mint anyway).
-        if (cancelled) return;
-        setProjects([]);
-        setScope((prev) => prev || "user");
-      });
     listEnrollments()
       .then((rows) => {
         if (!cancelled) setCredentials(rows);
@@ -361,7 +360,7 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
               name="enroll-scope"
               ariaLabel={t("accessMcpScopeLabel")}
               value={scope}
-              onChange={setScope}
+              onChange={setSelectedScope}
               options={scopeOptions}
               searchable={false}
             />

@@ -42,6 +42,7 @@ pub mod auth;
 pub mod chat_protocol;
 pub mod decisions;
 pub mod dsh_web;
+pub mod metrics;
 pub mod pty;
 pub mod queries;
 // v0.8.22 P1 (review §3.1-3) — per-session SSE replay ring + live tap; see
@@ -131,6 +132,10 @@ pub fn router() -> Result<Router> {
 /// `ccteam_token` cookie set via the URL shim (see
 /// `auth::auth_layer`).
 pub fn router_with_state(state: AppState) -> Router {
+    // Start only after composition has had a chance to replace the standalone
+    // projection with the gateway-owned Arc. This avoids hydrating the same
+    // large journals twice during daemon startup.
+    state.progress_projection.start_hydration();
     let stateful = routes::stateful_router()
         // v0.8.18 档1 — project-ownership ACL for every `/projects/{slug}/...`
         // route. Layered INSIDE `auth_layer` (which is added after it, so it
@@ -154,6 +159,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .merge(mcp)
         .merge(stateful)
         .layer(CompressionLayer::new().gzip(true).br(true))
+        .layer(axum::middleware::from_fn(metrics::record_request_latency))
 }
 
 /// Standalone `ccteam web` entry. Calls [`serve_with_shutdown`] with

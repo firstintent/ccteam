@@ -1847,6 +1847,7 @@ async fn resolve_call_origin(
     caller: &McpCaller,
     args: &Value,
     gateway: Option<&std::sync::Arc<tokio::sync::Mutex<crate::gateway::Gateway>>>,
+    deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> Result<Option<crate::gateway::DelegationParent>, String> {
     match caller {
         McpCaller::Ambient => {
@@ -1888,7 +1889,13 @@ async fn resolve_call_origin(
                 ));
             };
             let view = {
-                let gw = gateway.lock().await;
+                let gw = match deadline {
+                    Some(deadline) => deadline
+                        .lock(gateway)
+                        .await
+                        .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
+                    None => crate::latency::gateway_lock(gateway, "mcp.spawn.resolve").await,
+                };
                 gw.session_views().into_iter().find(|v| v.sid == declared)
             };
             let Some(view) = view else {
@@ -1912,6 +1919,7 @@ async fn run_session_spawn_at(
     caller: McpCaller,
     paths: Option<&CcteamPaths>,
 ) -> std::result::Result<String, String> {
+    let deadline = crate::gateway::GatewayDeadline::start();
     if args.get("host").is_some() {
         return Err(crate::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string());
     }
@@ -2014,7 +2022,7 @@ async fn run_session_spawn_at(
     // from CallerCtx — never caller-supplied). Admin (the local mcp.sock
     // admin-token tier) = a human/root spawn unless it declares a `parent_sid`.
     // Guardrails apply only when a real parent is present.
-    let parent = resolve_call_origin(&caller, args, Some(gateway)).await?;
+    let parent = resolve_call_origin(&caller, args, Some(gateway), Some(deadline)).await?;
     // The dispatcher identity for an optional first `task` (captured before
     // `parent` moves into the create call).
     let parent_sid_for_task = parent.as_ref().map(|p| p.sid.clone());
@@ -2045,7 +2053,10 @@ async fn run_session_spawn_at(
     let vendor_wire = session_vendor_wire(vendor);
     {
         let (bound_host, local_snapshot, sat_snapshot) = {
-            let gw = gateway.lock().await;
+            let gw = deadline
+                .lock(gateway)
+                .await
+                .map_err(|error| mcp_gateway_error("session_spawn", &error))?;
             let host = gw.project_bound_host(&project);
             let (local, satellite) = if host == ccteam_core::LOCAL_HOST {
                 (gw.local_vendor_availability_override(), None)
@@ -2104,56 +2115,56 @@ async fn run_session_spawn_at(
         }
     }
 
-    // Check idempotency + create under ONE lock so a concurrent same-key retry
-    // can never race past the replay into a second spawn.
-    let (sid, resolved, replay) = {
-        let mut gw = gateway.lock().await;
-        if let Some(key) = idem_key.as_deref() {
-            if let Some(body) = gw.spawn_idem_replay(&project, key) {
-                (String::new(), None, Some(body))
-            } else {
-                let created = gw
-                    .create_delegated_session(
-                        project.clone(),
-                        role.clone(),
-                        vendor,
-                        permission_mode,
-                        protocol,
-                        fallback_owner_id,
-                        tuning,
-                        parent,
-                        title.clone(),
-                    )
-                    .await
-                    .map_err(|e| spawn_create_error(e, &project, &caller, paths))?;
-                let sid = created.sid.clone();
-                let resolved = gw.session_resolve(&sid);
-                (sid, resolved, None)
-            }
-        } else {
-            let created = gw
-                .create_delegated_session(
-                    project.clone(),
-                    role.clone(),
-                    vendor,
-                    permission_mode,
-                    protocol,
-                    fallback_owner_id,
-                    tuning,
-                    parent,
-                    title.clone(),
-                )
+    // Per-key singleflight preserves idempotency while the vendor spawn itself
+    // runs without the global gateway lock.
+    let _idem_claim = if let Some(key) = idem_key.as_deref() {
+        Some(
+            crate::gateway::Gateway::claim_spawn_idempotency(gateway, &project, key, deadline)
                 .await
-                .map_err(|e| spawn_create_error(e, &project, &caller, paths))?;
-            let sid = created.sid.clone();
-            let resolved = gw.session_resolve(&sid);
-            (sid, resolved, None)
-        }
+                .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
+        )
+    } else {
+        None
+    };
+    let replay = if let Some(key) = idem_key.as_deref() {
+        let mut gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error("session_spawn", &error))?;
+        gw.spawn_idem_replay(&project, key)
+    } else {
+        None
     };
     // Idempotent replay: return the ORIGINAL body verbatim (+ a replay flag).
     if let Some(body) = replay {
         return Ok(mark_idempotent_replay(&body));
     }
+    let created = crate::gateway::Gateway::create_delegated_session_shared(
+        Arc::clone(gateway),
+        project.clone(),
+        role.clone(),
+        vendor,
+        permission_mode,
+        protocol,
+        fallback_owner_id,
+        tuning,
+        parent,
+        title.clone(),
+        deadline,
+    )
+    .await
+    .map_err(|error| {
+        if error
+            .downcast_ref::<crate::gateway::GatewayRequestError>()
+            .is_some()
+        {
+            mcp_gateway_error("session_spawn", &error)
+        } else {
+            spawn_create_error(error, &project, &caller, paths)
+        }
+    })?;
+    let sid = created.sid;
+    let resolved = gateway.lock().await.session_resolve(&sid);
     // Read the child meta once for the vendor resume key + the delegation
     // lineage (parent_sid/depth) the ledger just persisted.
     // vendor_session_id = the vendor's native resume key (`meta.vendor_uuid`).
@@ -2209,6 +2220,7 @@ async fn run_session_spawn_at(
             effective_wait_seconds,
             notify,
             title.clone(),
+            deadline,
         )
         .await?;
         if let Some(obj) = body.as_object_mut() {
@@ -2341,6 +2353,16 @@ fn spawn_create_error(
     )
 }
 
+fn mcp_gateway_error(tool: &str, err: &anyhow::Error) -> String {
+    let code = err
+        .downcast_ref::<crate::gateway::GatewayRequestError>()
+        .map(crate::gateway::GatewayRequestError::error_code);
+    match code {
+        Some(code) => format!("{tool} failed: {err} (error_code={code})"),
+        None => format!("{tool} failed: {err}"),
+    }
+}
+
 /// v0.9.0 W2 (F7) — mark a recorded idempotency body as a replay: parse it,
 /// insert `"idempotent_replay": true`, re-serialize. On a parse miss (should
 /// never happen — we only store our own bodies) return the stored body as-is.
@@ -2401,11 +2423,12 @@ async fn run_session_dispatch(
     gateway: &GatewayHandle,
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
+    let deadline = crate::gateway::GatewayDeadline::start();
     let sid = arg_session_sid(args)?;
     // Driveability before anything else: ccteam has no thread to submit into for
     // an enrolled hand-started client, and every path below would call it
     // unknown instead of saying so.
-    assert_target_is_driveable("session_dispatch", gateway, &sid).await?;
+    assert_target_is_driveable("session_dispatch", gateway, &sid, Some(deadline)).await?;
     let task = args
         .get("task")
         .and_then(|v| v.as_str())
@@ -2413,7 +2436,15 @@ async fn run_session_dispatch(
         .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
         .to_string();
     // R-M3 — only operate sessions in the caller's own project.
-    assert_caller_owns_session("session_dispatch", args, gateway, &sid, &caller).await?;
+    assert_caller_owns_session(
+        "session_dispatch",
+        args,
+        gateway,
+        &sid,
+        &caller,
+        Some(deadline),
+    )
+    .await?;
 
     let requested_wait_seconds = requested_inline_wait_seconds(args);
     let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
@@ -2457,7 +2488,10 @@ async fn run_session_dispatch(
 
     // ---- Scope 1: idempotent replay + cycle guard (fast, no submit) ----
     {
-        let mut gw = gateway.lock().await;
+        let mut gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error("session_dispatch", &error))?;
         if let Some(key) = idem_key.as_deref() {
             if let Some(body) = gw.dispatch_idem_replay(&sid, key) {
                 return Ok(mark_idempotent_replay(&body));
@@ -2526,6 +2560,7 @@ async fn run_session_dispatch(
         effective_wait_seconds,
         notify,
         title,
+        deadline,
     )
     .await?;
     let mut body = serde_json::json!({ "ok": true, "sid": sid });
@@ -2542,17 +2577,50 @@ async fn run_session_dispatch(
 
 /// v0.9.1 delegation-ergonomics — the shared submit half of a dispatch, used
 /// Parse the optional `notify` arg shared by `session_spawn`/`session_dispatch`:
-/// `"final"` (default — notify once the child's vendor turn completes and it
-/// goes idle) / `"all"` (every mirrored assistant message; debug firehose) /
-/// `"off"` (ledger-only). The pre-v0.9.5 boolean form still parses
-/// (`true`→final, `false`→off).
+/// `"final"` (default — notify once, when the dispatched task's vendor turn
+/// completes and the child goes idle) / `"all"` (every mirrored assistant
+/// message of that task; debug firehose) / `"off"` (ledger-only). The
+/// pre-v0.9.5 boolean form still parses (`true`→final, `false`→off). Carries
+/// whether the caller named the mode — see [`NotifyRequest`].
 fn parse_notify_mode(
     tool: &str,
     args: &serde_json::Value,
-) -> std::result::Result<ccteam_harness::NotifyMode, String> {
+) -> std::result::Result<NotifyRequest, String> {
     match args.get("notify") {
-        None | Some(serde_json::Value::Null) => Ok(ccteam_harness::NotifyMode::Final),
-        Some(v) => ccteam_harness::NotifyMode::parse_value(v).map_err(|e| format!("{tool}: {e}")),
+        None | Some(serde_json::Value::Null) => Ok(NotifyRequest::defaulted()),
+        Some(v) => ccteam_harness::NotifyMode::parse_value(v)
+            .map(NotifyRequest::explicit)
+            .map_err(|e| format!("{tool}: {e}")),
+    }
+}
+
+/// What a dispatch asked for on the `notify` axis: the mode, plus whether the
+/// caller ASKED for it or just took the default. The difference only matters
+/// for a target that is not one of the caller's own sessions (a handoff to a
+/// peer): there, a default is not a request, and defaulting a peer into a
+/// completion watch is how a one-off handoff became a standing subscription to
+/// someone else's conversation.
+#[derive(Debug, Clone, Copy)]
+struct NotifyRequest {
+    mode: ccteam_harness::NotifyMode,
+    explicit: bool,
+}
+
+impl NotifyRequest {
+    /// No `notify` arg — `final`, but only because nobody said otherwise.
+    const fn defaulted() -> Self {
+        Self {
+            mode: ccteam_harness::NotifyMode::Final,
+            explicit: false,
+        }
+    }
+
+    /// The caller named a mode.
+    const fn explicit(mode: ccteam_harness::NotifyMode) -> Self {
+        Self {
+            mode,
+            explicit: true,
+        }
     }
 }
 
@@ -2566,6 +2634,11 @@ enum CompletionNotificationRoute {
     ParentSession,
     Disabled,
     Unavailable,
+    /// v0.10.1 — the target is not one of the caller's own sessions and the
+    /// caller did not ask for a notification: a handoff, deliberately not
+    /// subscribed. Distinct from `Disabled` (which the caller chose) so the
+    /// hint can say what to do instead.
+    PeerUnsubscribed,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2583,13 +2656,16 @@ impl CompletionNotificationRoute {
     /// intentional opt-out is not a missing channel.
     fn resolve(
         caller_sid: &str,
-        notify: ccteam_harness::NotifyMode,
+        notify: NotifyRequest,
         parent_is_external: bool,
+        peer_unsubscribed: bool,
     ) -> Self {
-        if notify == ccteam_harness::NotifyMode::Off {
+        if notify.mode == ccteam_harness::NotifyMode::Off {
             Self::Disabled
         } else if caller_sid.is_empty() || parent_is_external {
             Self::Unavailable
+        } else if peer_unsubscribed {
+            Self::PeerUnsubscribed
         } else {
             Self::ParentSession
         }
@@ -2610,6 +2686,9 @@ impl CompletionNotificationRoute {
             Self::Unavailable => {
                 "the child runs asynchronously; this caller has no completion notification channel; poll session_collect{sid}."
             }
+            Self::PeerUnsubscribed => {
+                "the task was handed to a session you did not delegate, so no completion watch was armed; poll session_collect{sid}, or re-dispatch with notify:\"final\" to be told when that one task ends."
+            }
         }
     }
 
@@ -2623,6 +2702,9 @@ impl CompletionNotificationRoute {
             }
             Self::Unavailable => {
                 "still running; this caller has no completion notification channel; poll session_collect{sid}."
+            }
+            Self::PeerUnsubscribed => {
+                "still running; the target is not a session you delegated, so no completion notification will fire; poll session_collect{sid}."
             }
         }
     }
@@ -2645,7 +2727,8 @@ fn derive_title_from_task(task: &str) -> String {
 /// by BOTH `session_dispatch` and `session_spawn{task}` (one-call
 /// spawn+dispatch, the dominant delegation flow). Subscribe (if waiting) →
 /// submit the task as a verbatim user turn → arm the delegation watch (agent
-/// callers only; `caller_sid` empty = admin, no watch) → emit
+/// callers only; `caller_sid` empty = admin, no watch; a target the caller
+/// never delegated is ledger-only unless `notify` was explicit) → emit
 /// `delegation_dispatched` → optionally block inline for the child's answer.
 /// Returns the response FRAGMENT (`turn_id`/`status`/result fields/`hint`)
 /// the caller merges into its own body; `tool` prefixes error strings.
@@ -2658,12 +2741,16 @@ async fn dispatch_task(
     task: String,
     requested_wait_seconds: u64,
     effective_wait_seconds: u64,
-    notify: ccteam_harness::NotifyMode,
+    notify: NotifyRequest,
     title: Option<String>,
+    deadline: crate::gateway::GatewayDeadline,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
-    let (turn_id, rx, parent_is_external) = {
-        let mut gw = gateway.lock().await;
+    let (rx, parent_is_external, peer_unsubscribed) = {
+        let gw = deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error(tool, &error))?;
         // Whether a completion turn is deliverable is a property of the PARENT's
         // ledger row, not of the caller's auth tier: a hand-started client dials
         // in over MCP, so there is no thread to steer and no session to resume.
@@ -2677,55 +2764,100 @@ async fn dispatch_task(
         } else {
             None
         };
-        let turn_id = gw
-            .submit_to_sid(sid, task)
-            .await
-            .map_err(|e| format!("{tool} failed: {e}"))?;
-        if is_delegation {
-            // The watch is armed either way — the completion edge belongs in the
-            // ledger (`delegation_completed` fires off the mirror, whatever the
-            // notify mode). An external parent gets it with notifications OFF:
-            // left on, the first completion would submit into a session ccteam
-            // must never re-spawn, fail, and drop the watch — silently ending
-            // that child's completion accounting for every later turn.
-            let watch_notify = if parent_is_external {
-                ccteam_harness::NotifyMode::Off
-            } else {
-                notify
-            };
-            gw.arm_delegation_watch(
-                sid,
-                caller_sid,
-                watch_notify,
-                title.clone(),
-                Some(turn_id.clone()),
-            );
-            if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
-                gw.emit_delegation_progress(
-                    &slug,
-                    ccteam_harness::execution::progress_bridge::DELEGATION_DISPATCHED,
-                    caller_sid,
-                    sid,
-                    vendor,
-                    &host,
-                    Some(&turn_id),
-                    title.as_deref(),
-                    None,
-                );
-            }
-        }
-        (turn_id, rx, parent_is_external)
+        // v0.10.1 — is the target one of the caller's OWN sessions? A dispatch
+        // to a session the caller never delegated is a HANDOFF: the target has
+        // its own parent, or is a root with its own human. `session_list` draws
+        // no edge for it (that tree is spawn lineage) and `session_stop` refuses
+        // it, so a watch armed here is an edge nobody can see or take down. The
+        // default `notify` is a default, not a request — only an explicit one
+        // subscribes the caller to a session it does not own.
+        let peer_unsubscribed =
+            is_delegation && !notify.explicit && !gw.lineage_reaches(sid, caller_sid);
+        (rx, parent_is_external, peer_unsubscribed)
     };
-    let notification_route =
-        CompletionNotificationRoute::resolve(caller_sid, notify, parent_is_external);
+    if is_delegation {
+        // The watch is armed either way — the completion edge belongs in the
+        // ledger (`delegation_completed` fires off the mirror, whatever the
+        // notify mode). Durable watch IO is explicitly outside the gateway
+        // mutex; a generation fence rejects a concurrently replaced child. An
+        // external parent gets it with notifications OFF: left on, the first
+        // completion would submit into a session ccteam must never re-spawn,
+        // fail, and drop the watch — silently ending that child's completion
+        // accounting. A peer handoff gets the same treatment for the opposite
+        // reason: the edge is real and worth recording, the subscription was
+        // never asked for.
+        let watch_notify = if parent_is_external || peer_unsubscribed {
+            ccteam_harness::NotifyMode::Off
+        } else {
+            notify.mode
+        };
+        crate::gateway::Gateway::arm_delegation_watch_shared(
+            Arc::clone(gateway),
+            sid,
+            caller_sid,
+            watch_notify,
+            title.clone(),
+            None,
+            deadline,
+        )
+        .await
+        .map_err(|error| mcp_gateway_error(tool, &error))?;
+    }
+    let turn_id = match crate::gateway::Gateway::submit_to_sid_shared(
+        Arc::clone(gateway),
+        sid,
+        task,
+        deadline,
+    )
+    .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            if is_delegation {
+                crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), sid)
+                    .await;
+            }
+            return Err(mcp_gateway_error(tool, &error));
+        }
+    };
+    if is_delegation {
+        let gw = gateway.lock().await;
+        if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
+            gw.emit_delegation_progress(
+                &slug,
+                ccteam_harness::execution::progress_bridge::DELEGATION_DISPATCHED,
+                caller_sid,
+                sid,
+                vendor,
+                &host,
+                Some(&turn_id),
+                title.as_deref(),
+                None,
+            );
+        }
+    }
+    let notification_route = CompletionNotificationRoute::resolve(
+        caller_sid,
+        notify,
+        parent_is_external,
+        peer_unsubscribed,
+    );
     if notification_route == CompletionNotificationRoute::Unavailable {
         tracing::warn!(
             tool,
             child_sid = %sid,
             turn_id = %turn_id,
-            notify = notify.as_str(),
+            notify = notify.mode.as_str(),
             parent_is_external,
             "ccteam MCP completion notification unavailable: caller has no managed parent session; poll session_collect"
+        );
+    } else if notification_route == CompletionNotificationRoute::PeerUnsubscribed {
+        tracing::info!(
+            tool,
+            caller_sid,
+            child_sid = %sid,
+            turn_id = %turn_id,
+            "ccteam MCP handoff to a session the caller did not delegate: ledger-only, no completion watch armed"
         );
     }
 
@@ -2789,6 +2921,9 @@ fn pending_dispatch_response(
             CompletionNotificationRoute::Disabled => "notifications are disabled.",
             CompletionNotificationRoute::Unavailable => {
                 "this caller has no completion notification channel."
+            }
+            CompletionNotificationRoute::PeerUnsubscribed => {
+                "the target is not a session you delegated — no completion notification."
             }
         };
         response.insert(
@@ -2932,7 +3067,8 @@ async fn dispatch_wait_for_completion(
     // Inline completion: the caller already holds the result → disarm the watch
     // so a delegation doesn't ALSO wake the parent with a redundant turn.
     if is_delegation {
-        gateway.lock().await.disarm_delegation_watch(child_sid);
+        crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), child_sid)
+            .await;
     }
 
     let mut m = serde_json::Map::new();
@@ -3144,25 +3280,19 @@ fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (u
 /// stream is unreadable. Best-effort: any read miss degrades to `None` (field
 /// omitted).
 fn classify_session_activity(
+    projection: Option<&crate::progress_projection::ProgressProjection>,
     slug: &str,
     sid: &str,
     live: Option<ccteam_core::stall::LiveTurn>,
 ) -> Option<String> {
-    let paths = ccteam_core::CcteamPaths::from_env().ok()?;
-    let silent_seconds = ccteam_core::collect_projects(&paths)
-        .ok()?
-        .into_iter()
-        .find(|p| p.state.slug == slug)
-        .map(|p| p.stall_silent_seconds)?;
-    let events =
-        ccteam_core::progress::read_all_events(&paths.progress_jsonl(slug)).unwrap_or_default();
-    let activity = ccteam_core::stall::classify_session_activity(
-        &events,
-        sid,
-        silent_seconds,
-        live,
-        chrono::Utc::now(),
-    );
+    let snapshot = projection?.project_snapshot(slug);
+    let now = chrono::Utc::now();
+    let silent_seconds = snapshot
+        .last_valid
+        .as_ref()
+        .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+        .unwrap_or(0);
+    let activity = snapshot.session_activity(sid, silent_seconds, live, now);
     Some(activity.status.activity.to_string())
 }
 
@@ -3178,7 +3308,7 @@ async fn run_session_collect(
     // Same gate as dispatch/stop: ccteam mirrors no transcript for a client it
     // never spawned, so the honest answer is what the session is — not an empty
     // page or an "unknown session" from the resolve below.
-    assert_target_is_driveable("session_collect", gateway, &sid).await?;
+    assert_target_is_driveable("session_collect", gateway, &sid, None).await?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
     let n = args
         .get("n")
@@ -3188,13 +3318,17 @@ async fn run_session_collect(
     let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
     let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
-    assert_caller_owns_session("session_collect", args, gateway, &sid, &caller).await?;
+    assert_caller_owns_session("session_collect", args, gateway, &sid, &caller, None).await?;
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
-    let (resolved, live) = {
+    let (resolved, live, projection) = {
         let gw = gateway.lock().await;
-        (gw.session_resolve(&sid), gw.live_turn_for(&sid))
+        (
+            gw.session_resolve(&sid),
+            gw.live_turn_for(&sid),
+            gw.progress_projection(),
+        )
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
     // A collectable session is one the gateway still tracks → "live" (the same
@@ -3263,7 +3397,12 @@ async fn run_session_collect(
     // v0.9.1 — honest per-sid activity (same resolver the web session list
     // uses): `working` = the child is mid-turn (keep polling), `idle` = the
     // turn is done. Best-effort: a read miss just omits the field.
-    if let Some(activity) = classify_session_activity(&resolved.project, &resolved.sid, live) {
+    if let Some(activity) = classify_session_activity(
+        projection.as_deref(),
+        &resolved.project,
+        &resolved.sid,
+        live,
+    ) {
         body["activity"] = serde_json::json!(activity);
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
@@ -3365,34 +3504,36 @@ async fn run_session_list_at(
         .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
 
     // Both halves of the activity answer come from under ONE lock hold, and
-    // both are cheap in-memory reads — the progress files are read below, after
-    // the guard drops (a fleet's streams are far too big to read under the
+    // both are cheap in-memory reads. Projection catch-ups happen below, after
+    // the guard drops (a fleet's streams are far too big to touch under the
     // gateway mutex).
-    let (views, live_turns) = {
+    let (views, live_turns, projection) = {
         let gw = gateway.lock().await;
-        (gw.session_views(), gw.live_turns())
+        (
+            gw.session_views(),
+            gw.live_turns(),
+            gw.progress_projection(),
+        )
     };
     // v0.9.1 — honest activity per row (same resolver as the web session
-    // list): one progress read per DISTINCT project, not per session.
-    let mut activity_ctx: std::collections::HashMap<String, (Vec<serde_json::Value>, u64)> =
-        std::collections::HashMap::new();
-    if let Some(paths) = paths {
-        if let Ok(projects) = ccteam_core::collect_projects(paths) {
-            for p in projects {
-                if caller_visible_projects
-                    .as_ref()
-                    .is_some_and(|visible| !visible.contains(&p.state.slug))
-                {
-                    continue;
-                }
-                if views.iter().any(|v| v.project == p.state.slug) {
-                    let events = ccteam_core::progress::read_all_events(
-                        &paths.progress_jsonl(&p.state.slug),
-                    )
-                    .unwrap_or_default();
-                    activity_ctx.insert(p.state.slug.clone(), (events, p.stall_silent_seconds));
-                }
+    // list): one incremental snapshot per DISTINCT project, not per session.
+    // Tests and daemonless callers may not have enabled the gateway projection;
+    // when explicit paths exist, construct the same byte-cursor reader locally.
+    let projection = projection.or_else(|| {
+        paths.map(|paths| crate::progress_projection::ProgressProjection::new(paths.clone()))
+    });
+    let mut activity_ctx = std::collections::HashMap::new();
+    if let Some(projection) = projection.as_ref() {
+        for view in &views {
+            if caller_visible_projects
+                .as_ref()
+                .is_some_and(|visible| !visible.contains(&view.project))
+            {
+                continue;
             }
+            activity_ctx
+                .entry(view.project.clone())
+                .or_insert_with(|| projection.project_snapshot(&view.project));
         }
     }
     let now = chrono::Utc::now();
@@ -3401,17 +3542,17 @@ async fn run_session_list_at(
     let classified: Vec<(&crate::gateway::SessionView, Option<String>)> = views
         .iter()
         .map(|v| {
-            let activity = activity_ctx.get(&v.project).map(|(events, silent)| {
-                ccteam_core::stall::classify_session_activity(
-                    events,
-                    &v.sid,
-                    *silent,
-                    live_turns.get(&v.sid).copied(),
-                    now,
-                )
-                .status
-                .activity
-                .to_string()
+            let activity = activity_ctx.get(&v.project).map(|snapshot| {
+                let silent = snapshot
+                    .last_valid
+                    .as_ref()
+                    .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+                    .unwrap_or(0);
+                snapshot
+                    .session_activity(&v.sid, silent, live_turns.get(&v.sid).copied(), now)
+                    .status
+                    .activity
+                    .to_string()
             });
             (v, activity)
         })
@@ -3558,10 +3699,10 @@ async fn run_session_stop(
     // Ahead of both scope checks: a hand-started client's process belongs to its
     // operator, and the descendant walk below would otherwise reject it as "not
     // a descendant" — true, but not the reason.
-    assert_target_is_driveable("session_stop", gateway, &sid).await?;
+    assert_target_is_driveable("session_stop", gateway, &sid, None).await?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
-    assert_caller_owns_session("session_stop", args, gateway, &sid, &caller).await?;
+    assert_caller_owns_session("session_stop", args, gateway, &sid, &caller, None).await?;
     // v0.9.0 W2 (F2) — an Ambient (agent) caller may only stop its OWN
     // descendants (walk the target's parent chain; it must reach the caller).
     // Admin/human callers are unrestricted (fleet-wide).
@@ -3635,8 +3776,17 @@ async fn assert_target_is_driveable(
     tool: &str,
     gateway: &GatewayHandle,
     sid: &str,
+    deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> std::result::Result<(), String> {
-    if gateway.lock().await.is_external_node(sid) {
+    let is_external = match deadline {
+        Some(deadline) => deadline
+            .lock(gateway)
+            .await
+            .map_err(|error| mcp_gateway_error(tool, &error))?
+            .is_external_node(sid),
+        None => gateway.lock().await.is_external_node(sid),
+    };
+    if is_external {
         return Err(crate::external_nodes::not_driveable_error(tool, sid));
     }
     Ok(())
@@ -3656,12 +3806,19 @@ async fn assert_caller_owns_session(
     gateway: &GatewayHandle,
     sid: &str,
     caller: &McpCaller,
+    deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> std::result::Result<(), String> {
     // v0.9 T4 review fix — the verified admin (local mcp.sock admin token)
     // operates fleet-wide (same semantics as the web admin Identity): no ambient
     // slug to bind to. Unknown sids still fail inside the op itself.
     let resolved = {
-        let gw = gateway.lock().await;
+        let gw = match deadline {
+            Some(deadline) => deadline
+                .lock(gateway)
+                .await
+                .map_err(|error| mcp_gateway_error(name, &error))?,
+            None => crate::latency::gateway_lock(gateway, "mcp.session.resolve").await,
+        };
         gw.session_resolve(sid)
     };
     match caller {
@@ -4056,8 +4213,9 @@ mod session_tool_tests {
                 "slow task".to_string(),
                 600,
                 1,
-                ccteam_harness::NotifyMode::Final,
+                NotifyRequest::defaulted(),
                 None,
+                crate::gateway::GatewayDeadline::start(),
             )
             .await
             .expect("a capped inline timeout is a normal pending response"),
@@ -4157,6 +4315,36 @@ mod session_tool_tests {
     // `Gateway` can mint per-session secrets + track project scope without
     // spawning a `claude` pane. `start_thread` records the `(sid, secret)` the
     // gateway minted so the test can present the real secret to the gate.
+    struct StubSpawnBarrier {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicUsize,
+        entered_notify: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for StubSpawnBarrier {
+        fn default() -> Self {
+            Self {
+                armed: std::sync::atomic::AtomicBool::new(false),
+                entered: std::sync::atomic::AtomicUsize::new(0),
+                entered_notify: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl StubSpawnBarrier {
+        async fn wait_for(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.entered.load(std::sync::atomic::Ordering::SeqCst) < count {
+                    self.entered_notify.notified().await;
+                }
+            })
+            .await
+            .expect("concurrent MCP spawns reach the vendor barrier");
+        }
+    }
+
     #[derive(Clone, Default)]
     struct StubAdapter {
         spawns: std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
@@ -4177,6 +4365,7 @@ mod session_tool_tests {
             tokio::sync::Mutex<std::collections::VecDeque<(String, ccteam_harness::ThreadEvent)>>,
         >,
         notify: std::sync::Arc<tokio::sync::Notify>,
+        spawn_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
     }
 
     #[async_trait::async_trait]
@@ -4197,6 +4386,20 @@ mod session_tool_tests {
                 .lock()
                 .await
                 .push((ctx.sid.clone(), ctx.secret.clone()));
+            if let Some(barrier) = self.spawn_barrier.as_ref() {
+                if barrier.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                    barrier
+                        .entered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    barrier.entered_notify.notify_waiters();
+                    barrier
+                        .release
+                        .acquire()
+                        .await
+                        .expect("test barrier stays open")
+                        .forget();
+                }
+            }
             Ok(ccteam_harness::ThreadHandle {
                 vendor: ccteam_harness::AgentVendor::Claude,
                 mode: ccteam_harness::ExecutionMode::Chat,
@@ -5355,7 +5558,10 @@ mod session_tool_tests {
             ccteam_harness::execution::session_meta::read_session_meta(tmp.path(), &child).unwrap();
         meta.cost_usd = Some(0.12);
         meta.tokens_total = Some(12_345);
-        ccteam_harness::execution::session_meta::write_session_meta(tmp.path(), &meta).unwrap();
+        gw.lock()
+            .await
+            .persist_session_meta(tmp.path(), &meta)
+            .unwrap();
 
         let frag = dispatch_task(
             &gw,
@@ -5365,8 +5571,9 @@ mod session_tool_tests {
             "quick question".to_string(),
             6,
             6,
-            ccteam_harness::NotifyMode::Final,
+            NotifyRequest::defaulted(),
             None,
+            crate::gateway::GatewayDeadline::start(),
         )
         .await
         .unwrap();
@@ -5889,7 +6096,7 @@ mod session_tool_tests {
         );
         assert!(error.contains("installed there: none"), "{error}");
         assert!(error.contains("observed just now"), "{error}");
-        assert!(error.contains("ccteam never installs a CLI"), "{error}");
+        assert!(error.contains("one-click install"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5926,6 +6133,54 @@ mod session_tool_tests {
             .filter(|s| s["parent_sid"] == json!(principal))
             .count();
         assert_eq!(children, 1, "no double-spawn: {list}");
+    }
+
+    /// Two independent MCP session_spawn calls must reach vendor startup at
+    /// the same time; only the post-spawn admission seam is serialized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn session_spawn_fanout_reaches_two_vendor_spawns_concurrently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let barrier = std::sync::Arc::new(StubSpawnBarrier::default());
+        let factory: crate::daemon::AdapterFactory = {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::sync::Arc::new(move |_, _| {
+                std::sync::Arc::new(StubAdapter {
+                    spawn_barrier: Some(std::sync::Arc::clone(&barrier)),
+                    ..Default::default()
+                })
+                    as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+            })
+        };
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", tmp.path());
+        mark_stub_vendors_installed(&mut gateway);
+        let gateway = std::sync::Arc::new(tokio::sync::Mutex::new(gateway));
+        barrier
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let spawn = |role: &'static str| {
+            let gateway = std::sync::Arc::clone(&gateway);
+            tokio::spawn(async move {
+                run_session_spawn(
+                    &json!({"project": "alpha", "vendor": "claude", "role": role}),
+                    &gateway,
+                    McpCaller::Admin,
+                )
+                .await
+            })
+        };
+        let first = spawn("first");
+        let second = spawn("second");
+        barrier.wait_for(2).await;
+        assert_eq!(
+            barrier.entered.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both fan-out branches reached phase-2 vendor startup"
+        );
+        barrier.release.add_permits(2);
+        let first = first.await.unwrap().expect("first spawn succeeds");
+        let second = second.await.unwrap().expect("second spawn succeeds");
+        assert_ne!(parse(&first)["sid"], parse(&second)["sid"]);
     }
 
     /// v0.9.5 feedback fix — `session_list` accepts `project`/`activity`/
@@ -7078,6 +7333,96 @@ mod session_tool_tests {
             ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
                 .unwrap();
         assert_eq!(watch.parent_sid, principal);
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+    }
+
+    /// v0.10.1 (issue #184) — a dispatch to a session the caller never
+    /// delegated is a HANDOFF, not a delegation: the target has its own parent,
+    /// or is a root with its own human. The default `notify` is a default, not a
+    /// request, so it must not subscribe the caller to a peer's conversation —
+    /// an edge `session_list` never draws and `session_stop` refuses to take
+    /// down. Naming `notify` explicitly still opts in (for exactly one task, per
+    /// the watch contract), and the caller's own children are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_to_a_peer_root_is_ledger_only_unless_notify_is_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        // An independent root in the same project — nobody's child.
+        let peer = {
+            let mut g = gw.lock().await;
+            g.create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+
+        let handoff = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": peer, "task": "take over the P0" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(handoff["notify_deliverable"], json!(false), "{handoff}");
+        let hint = handoff["hint"].as_str().unwrap();
+        assert!(hint.contains("did not delegate"), "{hint}");
+        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer)
+            .expect("the handoff edge is still recorded in the ledger");
+        assert_eq!(watch.parent_sid, principal);
+        assert_eq!(
+            watch.notify,
+            ccteam_harness::NotifyMode::Off,
+            "a peer handoff is ledger-only: {watch:?}"
+        );
+
+        // Explicit opt-in still arms the notification.
+        let explicit = parse(
+            &run_session_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": peer, "task": "and tell me when it lands", "notify": "final" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(explicit["notify_deliverable"], json!(true), "{explicit}");
+        let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer).unwrap();
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+
+        // The caller's OWN child keeps the default notification.
+        let child = parse(
+            &run_session_spawn(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "vendor": "claude", "task": "do the work" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(child["notify_deliverable"], json!(true), "{child}");
+        let watch =
+            ccteam_harness::read_delegation_watch(tmp.path(), child["sid"].as_str().unwrap())
+                .unwrap();
         assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
     }
 

@@ -161,6 +161,13 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::hosts::handle_register_mcp))
         // TEAM-5 — deregister a satellite (drop its registry record).
         .routes(routes!(super::hosts::handle_host_remove))
+        // VENDOR-INSTALL-1 — admin one-click vendor install/update jobs on
+        // the local host (202 + job; same-vendor running job dedups).
+        .routes(routes!(super::vendor_install::handle_vendor_install))
+        .routes(routes!(super::vendor_install::handle_vendor_install_job))
+        // VENDOR-QUOTA-1 — per-vendor subscription-quota snapshot (admin;
+        // standalone so the network probes never slow the host detail).
+        .routes(routes!(super::vendor_quota::handle_vendor_quota))
         // v0.8.24 Track D — multi-host join / mint. GET (read newest valid)
         // + POST (mint) share `/hosts/join-token`. (The satellite keepalive
         // is no longer HTTP: reports ride the reverse `ccteam-host.v1` WS

@@ -3,7 +3,7 @@
 // Inlined verbatim so the mark needs no fetch and stays crisp at any size;
 // geometry must stay in sync with assets/logo.svg (the single brand source).
 
-export function CcLogo({ className, onClick, title }: { className?: string; onClick?: () => void; title?: string }) {
+export function CcLogo({ className, onClick, title, testId }: { className?: string; onClick?: () => void; title?: string; testId?: string }) {
   return (
     <svg
       className={`${className ?? "logo-mark"}${onClick ? " clickable" : ""}`}
@@ -12,8 +12,12 @@ export function CcLogo({ className, onClick, title }: { className?: string; onCl
       onClick={onClick}
       role={onClick ? "button" : "img"}
       aria-label={title ?? "ccteam"}
+      data-testid={testId}
       style={onClick ? { cursor: "pointer" } : undefined}
     >
+      {/* SVG-native hover tooltip (the `title` ATTRIBUTE is not valid SVG in
+          React's typings — the child element is the standard mechanism). */}
+      {title ? <title>{title}</title> : null}
       {/* juggling trajectory */}
       <path
         d="M20 44 Q60 -4 100 44"

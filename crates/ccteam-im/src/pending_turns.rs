@@ -28,6 +28,13 @@ pub struct PendingTurn {
     /// message bodies are always literal normal user turns, including `/...`.
     #[serde(default)]
     pub literal: bool,
+    /// v0.10.1 — was this turn authored by ccteam (a delegation notification,
+    /// an internal re-submit) rather than by a human? The queue is the ONLY
+    /// place a turn survives its submit call, so without carrying this the
+    /// drain has to guess — and it guessed "internal" for everything, which
+    /// makes a human's queued question look like nobody asked it.
+    #[serde(default)]
+    pub internal: bool,
 }
 
 fn pending_path(project_dir: &Path, sid: &str) -> PathBuf {
@@ -45,6 +52,7 @@ pub fn enqueue_pending_turn(
     text: impl Into<String>,
     origin: Option<String>,
     literal: bool,
+    internal: bool,
 ) -> Result<()> {
     let path = pending_path(project_dir, sid);
     if let Some(parent) = path.parent() {
@@ -55,6 +63,7 @@ pub fn enqueue_pending_turn(
         enqueued_at: chrono::Utc::now().to_rfc3339(),
         origin,
         literal,
+        internal,
     };
     let mut f = OpenOptions::new()
         .create(true)
@@ -114,8 +123,8 @@ mod tests {
     #[test]
     fn enqueue_drain_fifo() {
         let tmp = TempDir::new().unwrap();
-        enqueue_pending_turn(tmp.path(), "s1", "first", Some("web".into()), false).unwrap();
-        enqueue_pending_turn(tmp.path(), "s1", "second", Some("web".into()), true).unwrap();
+        enqueue_pending_turn(tmp.path(), "s1", "first", Some("web".into()), false, false).unwrap();
+        enqueue_pending_turn(tmp.path(), "s1", "second", Some("web".into()), true, true).unwrap();
         assert_eq!(pending_turn_count(tmp.path(), "s1"), 2);
         let drained = drain_pending_turns(tmp.path(), "s1").unwrap();
         assert_eq!(drained.len(), 2);

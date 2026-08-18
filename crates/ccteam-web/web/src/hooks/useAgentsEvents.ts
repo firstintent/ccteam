@@ -27,6 +27,9 @@ import type { SessionActivity } from "./useSessionEvents";
  *  lifecycle transition (`kind: "delegation"`). Mirrors
  *  `session_event_payload`'s extended shape (`ccteam-web/src/routes/agents.rs`). */
 export interface AgentsEvent {
+  /** Monotonic within one subscriber's bounded ring. Assigned on append so
+   * consumers can keep a stable watermark even after older objects expire. */
+  seq?: number;
   id?: string;
   sid?: string;
   slug?: string;
@@ -112,10 +115,11 @@ export function parseAgentsEvent(raw: string): AgentsEvent | null {
 
 /** Append `event` to a capped ring buffer, returning a NEW array. */
 export function appendAgentsEvent(prev: AgentsEvent[], event: AgentsEvent): AgentsEvent[] {
+  const sequenced = { ...event, seq: (prev[prev.length - 1]?.seq ?? 0) + 1 };
   if (prev.length >= AGENTS_RING_CAP) {
-    return [...prev.slice(prev.length - AGENTS_RING_CAP + 1), event];
+    return [...prev.slice(prev.length - AGENTS_RING_CAP + 1), sequenced];
   }
-  return [...prev, event];
+  return [...prev, sequenced];
 }
 
 /** Connection health, broadcast to every subscriber of the shared stream. */

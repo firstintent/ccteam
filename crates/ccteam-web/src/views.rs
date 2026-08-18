@@ -26,6 +26,11 @@ use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
 pub struct DashboardRow {
+    /// Monotonic revision of the projection snapshot backing this response.
+    /// Repeated on every row to keep the long-standing top-level array wire
+    /// shape additive; the HTTP ETag carries it even when the array is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
     pub slug: String,
     /// The project's real working-tree path. The SPA shows it to disambiguate
     /// an auto-appended slug (demo2 vs demo): the dir is unambiguous.

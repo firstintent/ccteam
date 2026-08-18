@@ -110,7 +110,7 @@ describe("ChatConsole shell (prototype .app layout)", () => {
     expect(html).toContain('data-testid="side-backdrop"');
   });
 
-  it("collapsed icon rail keeps the expanded order: logo→expand→search→new→flow→blank→settings→avatar", () => {
+  it("collapsed icon rail keeps the expanded order: logo→expand→search→new→flow→blank→avatar→settings", () => {
     const html = routed("/");
     const mini = html.slice(html.indexOf('data-testid="side-mini"'));
     expect(mini.length).toBeGreaterThan(0);
@@ -121,8 +121,8 @@ describe("ChatConsole shell (prototype .app layout)", () => {
       "工作流",
       "团队",
       "mini-blank",
-      "设置",
       'class="avatar"',
+      "设置",
     ];
     let cursor = 0;
     for (const needle of order) {

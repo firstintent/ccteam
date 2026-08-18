@@ -116,6 +116,36 @@ describe("chatTranscript eventToRow", () => {
     expect(r!.id).toBe("e1");
   });
 
+  it("carries the server-side ts from the SSE frame onto the row (WEB-TS-1)", () => {
+    const ts = "2026-08-17T01:02:03Z";
+    const assistant = eventToRow(ev({ kind: "answer", content: "hi", id: "e1", ts }));
+    expect(assistant!.ts).toBe(ts);
+    const approval = eventToRow(
+      ev({ content: "needs ok", options: [{ label: "OK", id: "allow" }], ts }),
+    );
+    expect(approval!.ts).toBe(ts);
+    const system = eventToRow(ev({ kind: "progress", content: "turn done", done: true, ts }));
+    expect(system!.ts).toBe(ts);
+    // No ts on the frame ⇒ no ts on the row (old daemons stay timeless).
+    expect(eventToRow(ev({ kind: "answer", content: "hi" }))!.ts).toBeUndefined();
+  });
+
+  it("appendEvent stamps a fresh fold row with the frame ts (WEB-TS-1)", () => {
+    const rows = appendEvent([], {
+      kind: "activity",
+      content: "",
+      ts: "2026-08-17T01:02:03Z",
+      activity: {
+        kind: "tool_call",
+        name: "Bash",
+        summary: "Bash(ls)",
+        status: "started",
+        item_id: "t1",
+      },
+    });
+    expect(rows[0]!.ts).toBe("2026-08-17T01:02:03Z");
+  });
+
   it("maps an event with options to an approval row carrying token + ids (R-H1)", () => {
     const r = eventToRow(
       ev({
@@ -286,6 +316,14 @@ describe("chatTranscript historyToRows", () => {
     expect(rows[2]).toMatchObject({ kind: "assistant", content: "just a reply" });
   });
 
+  it("flows the turn ts onto both rows of the turn (WEB-TS-1)", () => {
+    const events: SessionHistoryEvent[] = [
+      { turn_id: "t1", ts: "2026-06-06T00:00:00Z", role: "cto", user: "hi", assistant: "hello" },
+    ];
+    const rows = historyToRows(events);
+    expect(rows.map((r) => r.ts)).toEqual(["2026-06-06T00:00:00Z", "2026-06-06T00:00:00Z"]);
+  });
+
   it("renders an attachment-only mirrored turn after reload", () => {
     const events: SessionHistoryEvent[] = [
       {
@@ -304,6 +342,7 @@ describe("chatTranscript historyToRows", () => {
         id: "t-file-a",
         kind: "assistant",
         content: "",
+        ts: "2026-08-02T00:00:00Z",
         attachments: [
           { id: "1780000000000-chart.png", name: "chart.png", kind: "image", size: 42 },
         ],

@@ -30,13 +30,13 @@ pub enum OutputFormat {
 /// Options passed from the `ccteam init` argument parser.
 #[derive(Debug, Clone, Default)]
 pub struct InitOptions {
-    /// V0.4.2 F72: install in this directory. `None` defaults to the
-    /// current working directory. (`slug` no longer affects the
-    /// location — it only names the registered project.)
+    /// Install in this directory. `None` defaults to the current
+    /// working directory. (`slug` does not affect the location — it only
+    /// names the registered project.)
     pub install_in: Option<std::path::PathBuf>,
-    /// V0.4.2 F72: slug override — sets the *registered project name*
-    /// only, never the install location. When absent we derive it from
-    /// the install target's dir basename.
+    /// Slug override — sets the *registered project name* only, never
+    /// the install location. When absent we derive it from the install
+    /// target's dir basename.
     pub slug: Option<String>,
     /// Team for new installs (default `dev`). On refresh the existing
     /// `state.json::team` is preserved unless `force`. No longer a CLI
@@ -48,11 +48,11 @@ pub struct InitOptions {
     /// re-runs preserve the user-edited workflow. Never touches
     /// `.claude/agents/*.md` — ccteam seeds no roles (roleless default).
     pub force: bool,
-    /// v0.8.20 F1: set the project owner identity (`ProjectState.owner`,
+    /// Set the project owner identity (`ProjectState.owner`,
     /// `"channel:chat_id"` — e.g. `user:<tenant>` / `telegram:<chat_id>`). A
-    /// bare value (no `:`) is scoped to the per-user identity namespace (`alice` →
-    /// `user:alice`). Present ⇒ override an existing owner on re-init (without
-    /// `--force`); absent ⇒ preserve. `None` = unspecified.
+    /// bare value (no `:`) is scoped to the per-user identity namespace
+    /// (`alice` → `user:alice`). Present ⇒ override an existing owner on
+    /// re-init (without `--force`); absent ⇒ preserve. `None` = unspecified.
     pub owner: Option<String>,
 }
 
@@ -275,17 +275,17 @@ fn resolve_install_target(opts: &InitOptions) -> Result<std::path::PathBuf> {
     std::env::current_dir().context("read cwd as install target")
 }
 
-/// V0.4.2 F72: heuristic to detect the ccteam source repo so we don't
-/// accidentally install ccteam inside ccteam (creates circular hook
-/// loops per CLAUDE.md §六).
+/// Heuristic to detect the ccteam source repo so we don't accidentally
+/// install ccteam inside ccteam (creates circular hook loops per
+/// CLAUDE.md §六).
 fn is_ccteam_repo(dir: &std::path::Path) -> bool {
     dir.join("Cargo.toml").is_file() && dir.join("crates").join("ccteam-cli").is_dir()
 }
 
-/// V0.4.2 F72: refuse to install at the filesystem root or at
-/// `$HOME` — installing there would spam the user's home with a
-/// `.ccteam/` + `.claude/` skeleton and register every dotfile-bearing
-/// directory as one project. `--force` overrides.
+/// Refuse to install at the filesystem root or at `$HOME` — installing
+/// there would spam the user's home with a `.ccteam/` + `.claude/`
+/// skeleton and register every dotfile-bearing directory as one project.
+/// `--force` overrides.
 fn refuse_sensitive_install_target(target: &std::path::Path, force: bool) -> Result<()> {
     let canonical = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let is_root = canonical.parent().is_none();
@@ -307,7 +307,7 @@ fn refuse_sensitive_install_target(target: &std::path::Path, force: bool) -> Res
 struct ProjectInstallReport {
     slug: String,
     team: String,
-    /// v0.8.20 F1 — the final `ProjectState.owner` after install (newly set by
+    /// The final `ProjectState.owner` after install (newly set by
     /// `--owner`, an override on re-init, or the preserved existing value).
     /// `None` when the project has no owner. Surfaced in the receipt.
     owner: Option<String>,
@@ -327,7 +327,7 @@ impl ProjectInstallReport {
     }
 }
 
-/// V0.4.2 F72: lay down (or refresh) a ccteam project at `target`.
+/// Lay down (or refresh) a ccteam project at `target`.
 fn install_project_at(
     paths: &CcteamPaths,
     target: &std::path::Path,
@@ -437,7 +437,7 @@ fn install_project_at(
     })
 }
 
-/// v0.8.20 F1 (`ccteam init --owner`): normalize a raw `--owner` value into the
+/// Normalize a raw `--owner` value (`ccteam init --owner`) into the
 /// `ProjectState.owner` convention. A value already containing `:` is taken
 /// verbatim (`user:u123`, `telegram:456`); a bare value is scoped to the
 /// per-user identity namespace (`alice` → `user:alice`). Whitespace-only ⇒ `None`.
@@ -466,11 +466,11 @@ pub fn run_ls(paths: &CcteamPaths, format: OutputFormat) -> Result<String> {
 /// `ccteam show <slug>`. Renders the full project view per
 /// interfaces.md §10.3 (json) or a human-readable summary (text).
 ///
-/// V0.4.6 F91 — cost figures come from `cost_summary` (progress.jsonl
-/// plus live claude state.json) instead of the retired
-/// `state.cost_used_usd` accumulator. The old `cost used: $X.XX` line
-/// is replaced with `cost (24h)` plus `cost (active)` so the user sees
-/// both windowed spend and what's burning right now.
+/// Cost figures come from `cost_summary` (progress.jsonl plus live
+/// claude state.json) instead of the retired `state.cost_used_usd`
+/// accumulator. The old `cost used: $X.XX` line is replaced with
+/// `cost (24h)` plus `cost (active)` so the user sees both windowed
+/// spend and what's burning right now.
 pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result<String> {
     let state_path = paths.project_state(slug);
     if !state_path.exists() {
@@ -492,21 +492,21 @@ pub fn run_show(paths: &CcteamPaths, slug: &str, format: OutputFormat) -> Result
 /// `ccteam attach <slug>`. Resolves the underlying session medium and
 /// dispatches:
 ///
-/// 1. V0.5.0 F93b — if the project's workflow.yaml has
+/// 1. If the project's workflow.yaml has
 ///    `mode: agent-team`, read the lead session id from
 ///    `.ccteam/team-snapshot.json::lead_session_id` and exec
 ///    `claude attach <id>`. Friendly-error if the snapshot is missing
 ///    or the lead id is not yet populated (lead not spawned).
 /// 2. If a tmux session named `ccteam-<slug>` exists → `tmux attach -t …`
-///    (V0.3.x meta-agent + legacy projects).
+///    (meta-agent + legacy projects).
 /// 3. Else if the project's latest `agent_spawn` event in
 ///    `progress.jsonl` carries a `claude --bg` `job_id` → `claude attach
-///    <job_id>` (V0.4.0 worker default).
+///    <job_id>` (worker default).
 /// 4. Else → fail-loud "no live session for <slug>".
 ///
 /// Always prints the underlying command before exec'ing so the operator
 /// learns the lower-level tool.
-/// V0.8 W5 — interactive attach to a session hosted by the
+/// Interactive attach to a session hosted by the
 /// ccteam-owned rmux daemon (`~/.ccteam/run/mux.sock`).
 ///
 /// Path A (use `rmux-client` directly): `connect` → `begin_attach`
@@ -648,9 +648,9 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
 /// project pane `ccteam-<slug>`); `Err` when `<slug>` is ambiguous across
 /// sessions. Shared by `attach` and `peek` so both resolve identically.
 ///
-/// v0.8.8 F1 — the disambiguator is now the **sid** (`s<N>`), not a role: the
-/// pane name's trailing segment is the sid, and the same `(project, role)` can
-/// host several independent sessions, so a role no longer uniquely names one.
+/// The disambiguator is the **sid** (`s<N>`), not a role: the pane name's
+/// trailing segment is the sid, and the same `(project, role)` can host
+/// several independent sessions, so a role no longer uniquely names one.
 pub fn resolve_chat_session_name(slug_or_name: &str, sid: Option<&str>) -> Result<Option<String>> {
     if slug_or_name.starts_with(ccteam_harness::CHAT_SESSION_PREFIX) {
         return Ok(Some(slug_or_name.to_string()));
@@ -696,16 +696,16 @@ pub fn try_attach_chat_session(slug_or_name: &str, sid: Option<&str>) -> Result<
 
 /// `ccteam session ls` — read-only snapshot of gateway chat-mode bot sessions.
 ///
-/// v0.8.8 B4 — the row source is now the daemon's **persisted** session records
-/// (sid · project · role · vendor · permission_mode) via
-/// [`ccteam_im::gateway::tracked_chat_sessions`], not a process-name enumeration.
-/// A tracked record means the daemon owns the session, so it shows **live** —
-/// this is the BUG-5 fix: codex sessions (which the process backend can't always
-/// confirm by name) are live whenever the gateway tracks them, instead of the
-/// old false "registered, not running". Live OS panes (`ccteam-chat-*`) that are
+/// The row source is the daemon's **persisted** session records (sid ·
+/// project · role · vendor · permission_mode) via
+/// [`ccteam_im::gateway::tracked_chat_sessions`], not a process-name
+/// enumeration. A tracked record means the daemon owns the session, so it
+/// shows **live**: codex sessions (which the process backend can't always
+/// confirm by name) are live whenever the gateway tracks them, instead of a
+/// false "registered, not running". Live OS panes (`ccteam-chat-*`) that are
 /// **not** in the tracked set are surfaced as orphans (a process that outlived
-/// the daemon that spawned it). Reading the mux backend is name-enumeration only
-/// (R6: never capture-pane); never spawns or kills.
+/// the daemon that spawned it). Reading the mux backend is name-enumeration
+/// only (never capture-pane); never spawns or kills.
 pub fn run_sessions() -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     let daemon_up = ccteam_core::daemon::daemon_reachable(&paths);
@@ -755,10 +755,9 @@ fn format_last_active(raw: &str) -> String {
 /// orphan has no role/vendor (the pane name only carries slug+sid post-F1) →
 /// `-`, and no `meta.json` to read a last-active time from → `-`.
 ///
-/// v0.8.22 P0-3 — rows sort by `last_active` desc (numeric sid desc tiebreak
-/// for equal/missing `last_active`, e.g. every orphan), replacing the old
-/// slug-then-sid order so the CLI view reads recency-first like the IM
-/// `/sessions` and REST session list.
+/// Rows sort by `last_active` desc (numeric sid desc tiebreak for
+/// equal/missing `last_active`, e.g. every orphan), so the CLI view reads
+/// recency-first like the IM `/sessions` and REST session list.
 fn render_sessions_table(
     tracked: &[ccteam_im::gateway::TrackedSessionRow],
     live_panes: &[String],
@@ -956,8 +955,8 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
     )
 }
 
-/// V0.5.0 F93b — probe whether a project is in agent-team mode and
-/// return its lead session id from `.ccteam/team-snapshot.json`.
+/// Probe whether a project is in agent-team mode and return its lead
+/// session id from `.ccteam/team-snapshot.json`.
 ///
 /// Returns:
 ///   - `Ok(Some(id))` — project is agent-team mode AND has been started
@@ -1072,10 +1071,10 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// `ccteam peek <slug>`. Returns the contents of the session's first
 /// pane via `tmux capture-pane -p`.
 ///
-/// V0.8 W1 — routes through `ccteam_core::capture_pane_tail_from_session`
+/// Routes through `ccteam_core::capture_pane_tail_from_session`
 /// (re-exported over `ccteam_harness::tmux_ops::capture_pane_tail_from_session`,
 /// the same primitive `TmuxBackend::capture` calls under the hood).
-/// Keeps the peek path sync per the W1 "sync sites stay sync" decision.
+/// Keeps the peek path sync (sync sites stay sync).
 ///
 /// `ccteam internal peek <slug> [sid]`. Resolves a live chat session
 /// (`ccteam-chat-<slug>-<sid>`) first — mirroring `attach` — and falls
@@ -1083,8 +1082,8 @@ fn latest_claude_bg_job_id(paths: &CcteamPaths, slug: &str) -> Option<String> {
 /// why a bare `peek <slug>` against a chat session used to fail with
 /// "rmux session not running: ccteam-<slug>" while `attach` worked.
 ///
-/// v0.8.8 F1 — the optional disambiguator is the session **sid** (`s<N>`),
-/// not a role (the pane's trailing segment is the sid post-F1).
+/// The optional disambiguator is the session **sid** (`s<N>`), not a
+/// role (the pane's trailing segment is the sid).
 pub fn run_peek_with_role(
     paths: &CcteamPaths,
     slug_or_name: &str,
@@ -1181,15 +1180,17 @@ pub fn run_progress(paths: &CcteamPaths, slug: &str, tail: bool) -> Result<()> {
 /// register, IM token, prefs — live in `ccteam config`.)
 #[derive(Debug, Clone, Default)]
 pub struct DoctorOptions {
-    /// V0.6.6 F171: assert the MCP tool surface is fully wired.
-    /// `main::run_doctor` short-circuits to `run_verify_mcp`, which counts
-    /// active + STUB tools (`mcp_tool_groups::STUB_TOOLS`) and exits 1
-    /// when any STUB is found.
+    /// Assert the MCP tool surface is fully wired. `main::run_doctor`
+    /// short-circuits to `run_verify_mcp`, which counts active + STUB
+    /// tools (`mcp_tool_groups::STUB_TOOLS`) and exits 1 when any STUB is
+    /// found.
     pub verify_mcp: bool,
-    /// V0.6.6 F171: pair with `verify_mcp = true` to emit a single
-    /// pretty-printed JSON object on stdout instead of the human-
-    /// friendly text report. Ignored when `verify_mcp == false`.
+    /// Pair with `verify_mcp = true` to emit a single pretty-printed
+    /// JSON object on stdout instead of the human-friendly text report.
+    /// Ignored when `verify_mcp == false`.
     pub verify_mcp_json: bool,
+    /// Repair corrupt progress journals after preserving byte-exact backups.
+    pub repair_progress: bool,
 }
 
 fn render_install_mcp_report() -> Result<String> {
@@ -1265,13 +1266,12 @@ fn render_install_mcp_body(
     out
 }
 
-/// V0.6.6 F171 — outcome of `ccteam doctor --verify-mcp`. Counts the
-/// MCP tool surface registered by `mcp_serve::tool_definitions()` and
-/// cross-checks against the `STUB_TOOLS` allow-list declared in
-/// `mcp_tool_groups`. `unexpected_stubs` is the set difference
-/// between live STUBs and the allow-list (today the allow-list is
-/// empty so any STUB is unexpected); `ok()` returns false when that
-/// set is non-empty.
+/// Outcome of `ccteam doctor --verify-mcp`. Counts the MCP tool surface
+/// registered by `mcp_serve::tool_definitions()` and cross-checks against
+/// the `STUB_TOOLS` allow-list declared in `mcp_tool_groups`.
+/// `unexpected_stubs` is the set difference between live STUBs and the
+/// allow-list (today the allow-list is empty so any STUB is unexpected);
+/// `ok()` returns false when that set is non-empty.
 #[derive(Debug, Clone)]
 pub struct VerifyMcpReport {
     /// Total number of MCP tools registered by `tool_definitions()`.
@@ -1292,7 +1292,7 @@ pub struct VerifyMcpReport {
     pub unexpected_stubs: Vec<String>,
 }
 
-/// V0.6.6 F171 — per-group active/stub split used by `VerifyMcpReport`.
+/// Per-group active/stub split used by `VerifyMcpReport`.
 #[derive(Debug, Clone)]
 pub struct GroupStats {
     pub active: usize,
@@ -1372,7 +1372,7 @@ impl VerifyMcpReport {
     }
 }
 
-/// V0.6.6 F171 — compute the report by introspecting
+/// Compute the report by introspecting
 /// `ccteam_im::mcp::tool_definitions()` (single source of truth for the
 /// registered MCP tool surface) and cross-checking against
 /// `ccteam_im::mcp::STUB_TOOLS`.
@@ -1747,9 +1747,9 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
-/// V0.3 M5.0: knobs forwarded by `ccteam web` clap struct → axum
-/// scaffold. Mirrors `ccteam_web::ServeOpts` 1:1 except `bind` is
-/// still a string here (parsed in `run_web`).
+/// Knobs forwarded by the `ccteam web` clap struct → axum scaffold.
+/// Mirrors `ccteam_web::ServeOpts` 1:1 except `bind` is still a string
+/// here (parsed in `run_web`).
 #[derive(Debug, Clone)]
 pub struct WebOptions {
     pub bind: String,
@@ -1811,7 +1811,7 @@ pub(crate) fn unroster_trigger_path(slug: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp").join(format!("ccteam-{user}.unroster.{slug}"))
 }
 
-/// V0.4.6 F81 — options for `ccteam remove <slug>`.
+/// Options for `ccteam remove <slug>`.
 #[derive(Debug, Clone, Default)]
 pub struct RemoveOptions {
     /// Also `rm -rf <project>/.ccteam/`, `<project>/.claude/agents/`,
@@ -1824,9 +1824,9 @@ pub struct RemoveOptions {
     pub force: bool,
 }
 
-/// V0.4.6 F81 — structured result of `run_remove`. Returned so MCP
-/// callers (a future `tool_remove` wire) can branch on the success
-/// shape; the CLI just `Display`s the text rendering.
+/// Structured result of `run_remove`. Returned so MCP callers (a
+/// future `tool_remove` wire) can branch on the success shape; the CLI
+/// just `Display`s the text rendering.
 #[derive(Debug, Clone, Default)]
 pub struct RemoveReport {
     pub slug: String,
@@ -2249,10 +2249,10 @@ fn run_config_lark_menu() -> Result<String> {
     run_config_set_lark_creds(&app_id, &app_secret, allowed_user_ids, use_feishu)
 }
 
-/// v0.8.7 W3 (DC.3) — resolve a `--project <slug>` (or, when `None`, the
-/// current working directory canonicalized) to an existing project dir.
-/// Used by role commands and project-local skill face commands. A `slug` that
-/// isn't a registered project (or a cwd that doesn't exist) is a loud error.
+/// Resolve a `--project <slug>` (or, when `None`, the current working
+/// directory canonicalized) to an existing project dir. Used by role
+/// commands and project-local skill face commands. A `slug` that isn't a
+/// registered project (or a cwd that doesn't exist) is a loud error.
 fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::path::PathBuf> {
     let dir = match slug {
         Some(s) => {
@@ -2268,7 +2268,7 @@ fn resolve_project_dir(paths: &CcteamPaths, slug: Option<&str>) -> Result<std::p
         .with_context(|| format!("canonicalize project dir `{}`", dir.display()))
 }
 
-/// v0.8.9 Phase 2 — `ccteam role search <q>`. Substring search over the
+/// `ccteam role search <q>`. Substring search over the
 /// curated ccteam-hub marketplace `index.json` (loaded via the
 /// `~/.ccteam/hub-cache/` cache; first run fetches it). Matches the
 /// (case-insensitive) query against each plugin's id / name / description /
@@ -2411,7 +2411,7 @@ pub fn run_role_add(
     Ok(out)
 }
 
-/// v0.8.7 W3 (DC.3) — `ccteam role list [--project <slug>]`. Wraps
+/// `ccteam role list [--project <slug>]`. Wraps
 /// [`ccteam_core::list_roles`] to show the roles already installed in the
 /// project's `.claude/agents/`. An uninitialized project (no `agents/` dir)
 /// is a normal "no roles yet" result, not an error.
@@ -3128,18 +3128,18 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
     ))
 }
 
-/// V0.4.6 F81 — `ccteam remove <slug>` implementation.
+/// `ccteam remove <slug>` implementation.
 ///
 /// Steps (in order):
 /// 1. Refusal gate. Calls [`ccteam_core::refuses_active_session`]; if
 ///    it returns `Some(refusal)` and `opts.force` is false, the command
 ///    halts before any mutation. `--dry-run` still walks the rest of
 ///    the plan (reporting all steps as "would run") so the user gets a
-///    full preview. Then (v0.8.6 W3) stop-then-delete: tear down the
-///    project's live chat-mode role sessions (`ccteam-chat-<slug>-*`)
-///    before deregistering — `--dry-run` lists what it would stop.
+///    full preview. Then stop-then-delete: tear down the project's
+///    live chat-mode role sessions (`ccteam-chat-<slug>-*`) before
+///    deregistering — `--dry-run` lists what it would stop.
 /// 2. Resolve project_dir via `~/.ccteam/config.yaml::projects[]` so
-///    arbitrary-path installs (V0.4.2 F77) are honoured.
+///    arbitrary-path installs are honoured.
 /// 3. Drop the slug from config.yaml::projects[] (atomic via
 ///    `config::save`'s tmp+rename). `--dry-run` prints the plan only.
 /// 4. Unroster the running daemon's in-memory state. **F81 stub: this
@@ -3156,9 +3156,9 @@ pub fn run_skill_migrate_project(paths: &CcteamPaths, project: Option<&str>) -> 
 ///    `<project>/.claude/settings.local.json` (surgically; file deleted
 ///    only if it collapses to empty). See [`purge_project_managed_paths`]
 ///    for the full KEEP/DELETE contract. Never touches `<project>/.env`,
-///    ANY `.claude/agents/*.md` (all user files since v0.9.0 — ccteam
-///    seeds no role), `CLAUDE.md` / `AGENTS.md`, or the user's
-///    `settings.json` (CLAUDE.md §三 red line).
+///    ANY `.claude/agents/*.md` (all user files — ccteam seeds no
+///    role), `CLAUDE.md` / `AGENTS.md`, or the user's `settings.json`
+///    (CLAUDE.md §三 red line).
 ///
 /// This is the reusable remove engine: the flat `ccteam remove` and the
 /// grouped `ccteam project rm` both route here (the structured
@@ -3417,7 +3417,7 @@ fn stop_project_chat_sessions(
     Ok(out)
 }
 
-/// v0.8.6 W3 — `ccteam project stop <slug>` handler.
+/// `ccteam project stop <slug>` handler.
 ///
 /// Stops ALL of the project's live chat-mode role sessions (the
 /// `ccteam-chat-<slug>-*` tmux sessions) WITHOUT removing the project.
@@ -3448,7 +3448,7 @@ pub fn run_project_stop(_paths: &CcteamPaths, slug: &str) -> Result<String> {
     Ok(out)
 }
 
-/// V0.6.5 F151 — purge `~/.ccteam/state/im/registry/<slug>/`.
+/// Purge `~/.ccteam/state/im/registry/<slug>/`.
 ///
 /// **Strategy:** for each registered role under the slug, call
 /// [`ccteam_im::unregister_bot_in`] first — this is the in-process
@@ -3545,8 +3545,8 @@ fn purge_imd_registry_for_slug(
 /// footprint inside `<project>/` (or, under `--dry-run`, just records
 /// the planned step). A project's on-disk ccteam footprint is `.ccteam/`
 /// (state.json + workflow.yaml) plus ccteam's hook section inside
-/// `.claude/settings.local.json`. (v0.9.0 W2: ccteam seeds NO role, so
-/// there is no ccteam-owned persona to purge.)
+/// `.claude/settings.local.json`. (ccteam seeds NO role, so there is
+/// no ccteam-owned persona to purge.)
 ///
 /// **DELETE** (ccteam-managed only):
 /// - `<project>/.ccteam/` — state.json + workflow.yaml live here (W2).
@@ -3661,9 +3661,6 @@ mod tests {
     /// `crates/*/tests/*.rs` (separate processes), but until that
     /// migration these tests can race against each other since they
     /// run in the same process. The mutex makes them deterministic.
-    /// V0.2 M0.16.2 widened the timing window with the extra
-    /// `write_all_global_team_templates` call before
-    /// `install_memory_bridge`.
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -3683,10 +3680,9 @@ mod tests {
         std::os::unix::net::UnixListener::bind(socket).unwrap()
     }
 
-    /// V0.4.2 F75: tests that previously used `run_new_t4` (the
-    /// Tier-4 deterministic slug wrapper) now bootstrap directly via
-    /// the core helper. Same effect for setup purposes — the
-    /// LLM/auto-slug path was removed with the rest of `run_new`.
+    /// Deterministic slug wrapper: bootstrap directly via the core
+    /// helper (the LLM/auto-slug path was removed with the rest of
+    /// `run_new`).
     fn run_new_t4(paths: &CcteamPaths, request: &str, team: &str) -> Result<String> {
         let slug = ccteam_core::pick_unused_slug(paths, request, team)?;
         ccteam_core::bootstrap_project(paths, &slug, request, team)?;
@@ -3742,14 +3738,14 @@ mod tests {
         );
     }
 
-    /// v0.8.8 B1 — `stop_project_chat_sessions` consults the *injected*
+    /// `stop_project_chat_sessions` consults the *injected*
     /// [`ProcessBackend`], not shell `tmux` directly. The deterministic
     /// list+kill+absent semantics (which need a single live tokio runtime
     /// across spawn→list→kill) are verified in the harness layer
     /// (`ccteam_harness::stop_chat_sessions_for_slug_kills_only_that_slug`);
     /// here we only assert the CLI bridge is wired to the backend — an empty
     /// backend yields an empty result with no `tmux list-sessions` shell-out
-    /// and no panic (the bug was the old tmux-only path returning nothing
+    /// and no panic (regression: the old tmux-only path returned nothing
     /// under the default rmux backend).
     ///
     /// (We can't drive the kill end-to-end here: `block_on_async` builds a
@@ -3768,10 +3764,10 @@ mod tests {
         assert!(stop.would_stop.is_empty() && stop.stopped.is_empty());
     }
 
-    /// v0.8.8 B4 — a tracked row from a fixture gateway state renders one row
-    /// per session with its VENDOR + SID, and a **codex** session shows
-    /// `live` (the BUG-5 fix: tracked ⇒ live regardless of vendor, no more
-    /// false "registered, not running").
+    /// A tracked row from a fixture gateway state renders one row per
+    /// session with its VENDOR + SID, and a **codex** session shows
+    /// `live` (tracked ⇒ live regardless of vendor, no false
+    /// "registered, not running").
     #[test]
     fn render_sessions_table_codex_tracked_is_live_with_vendor() {
         let tracked = vec![
@@ -3830,9 +3826,9 @@ mod tests {
         );
     }
 
-    /// v0.8.22 P1 — `ccteam session ls` surfaces the session-title system: a
-    /// titled session shows its title in a TITLE column; an untitled one
-    /// falls back to `-` (role/sid stay exactly as today alongside it).
+    /// `ccteam session ls` surfaces the session-title system: a titled
+    /// session shows its title in a TITLE column; an untitled one falls
+    /// back to `-` (role/sid stay exactly as today alongside it).
     #[test]
     fn render_sessions_table_shows_title_with_fallback() {
         let tracked = vec![
@@ -3873,7 +3869,7 @@ mod tests {
         );
     }
 
-    /// v0.8.8 B4 — a live `ccteam-chat-*` pane the daemon does not track is an
+    /// A live `ccteam-chat-*` pane the daemon does not track is an
     /// orphan (role/vendor `-`); daemon-down degrades tracked rows to
     /// `registered (daemon down)` rather than erroring.
     #[test]
@@ -3906,7 +3902,7 @@ mod tests {
         assert!(orphan_line.contains("orphan"), "{orphan_line}");
     }
 
-    /// v0.8.8 B4 — a tracked session's own live pane is reconciled (matched by
+    /// A tracked session's own live pane is reconciled (matched by
     /// canonical name), never re-listed as an orphan.
     #[test]
     fn render_sessions_table_tracked_pane_not_an_orphan() {
@@ -4076,9 +4072,9 @@ mod tests {
         assert!(format!("{err:#}").contains("ghost"));
     }
 
-    /// V0.4.2 F72: build `InitOptions` that targets a slug inside the
-    /// tempdir so tests don't accidentally try to install ccteam in
-    /// the ccteam repo cwd (which is fail-loud).
+    /// Build `InitOptions` that targets a slug inside the tempdir so
+    /// tests don't accidentally try to install ccteam in the ccteam repo
+    /// cwd (which is fail-loud).
     fn init_opts_targeting_tmp(tmp: &TempDir, slug: &str) -> InitOptions {
         InitOptions {
             install_in: Some(tmp.path().join(slug)),
@@ -4086,8 +4082,9 @@ mod tests {
         }
     }
 
-    /// v0.8.20 F1: bare values are scoped to the per-user identity namespace; `:`-bearing
-    /// values pass through verbatim; whitespace-only collapses to `None`.
+    /// Bare values are scoped to the per-user identity namespace;
+    /// `:`-bearing values pass through verbatim; whitespace-only
+    /// collapses to `None`.
     #[test]
     fn normalize_owner_scopes_bare_and_keeps_qualified() {
         assert_eq!(normalize_owner("alice").as_deref(), Some("user:alice"));
@@ -4104,9 +4101,10 @@ mod tests {
         assert_eq!(normalize_owner(""), None);
     }
 
-    /// v0.8.20 F1 acceptance: `--owner` stamps `ProjectState.owner`, normalizes
-    /// bare → `user:`, and overrides an existing owner on re-init WITHOUT
-    /// `--force`; a re-init without `--owner` preserves the existing owner.
+    /// `--owner` stamps `ProjectState.owner`, normalizes bare →
+    /// `user:`, and overrides an existing owner on re-init WITHOUT
+    /// `--force`; a re-init without `--owner` preserves the existing
+    /// owner.
     #[test]
     fn run_init_owner_sets_normalizes_and_overrides() {
         let tmp = TempDir::new().unwrap();
@@ -4162,7 +4160,7 @@ mod tests {
         );
     }
 
-    /// v0.8.20 F1: a plain `ccteam init` (no `--owner`) leaves `owner == None`.
+    /// A plain `ccteam init` (no `--owner`) leaves `owner == None`.
     #[test]
     fn run_init_without_owner_leaves_owner_none() {
         let tmp = TempDir::new().unwrap();
@@ -4206,11 +4204,11 @@ mod tests {
         assert!(report.contains("next"));
     }
 
-    /// v0.8.6 D1.1 regression: a brand-new `ccteam init` must not create
-    /// any top-level `~/.ccteam` directory outside the canonical manifest
-    /// (`canonical_home_dirs()`). Before D1.1, init stamped
-    /// `phases/templates/inbox/control` — so a fresh install reported
-    /// four self-inflicted drift dirs on the very next `ccteam doctor`.
+    /// Regression: a brand-new `ccteam init` must not create any
+    /// top-level `~/.ccteam` directory outside the canonical manifest
+    /// (`canonical_home_dirs()`). Init once stamped
+    /// `phases/templates/inbox/control` — a fresh install reported four
+    /// self-inflicted drift dirs on the very next `ccteam doctor`.
     #[test]
     fn run_init_leaves_no_home_layout_drift() {
         let tmp = TempDir::new().unwrap();
@@ -4261,8 +4259,8 @@ mod tests {
         assert_ne!(std::fs::read_to_string(&path).unwrap(), "USER EDIT");
     }
 
-    /// V0.4.2 F72: fresh install scaffolds the project skeleton AND
-    /// registers in config.yaml.
+    /// Fresh install scaffolds the project skeleton AND registers in
+    /// config.yaml.
     #[test]
     fn run_init_fresh_install_scaffolds_and_registers() {
         let tmp = TempDir::new().unwrap();
@@ -4346,8 +4344,8 @@ mod tests {
         }
     }
 
-    /// V0.5.0 F93b — `ccteam init` without `--mode` defaults to
-    /// artifact-driven; no `__lead.md` is scaffolded.
+    /// `ccteam init` without `--mode` defaults to artifact-driven; no
+    /// `__lead.md` is scaffolded.
     #[test]
     fn run_init_default_mode_does_not_scaffold_lead() {
         ensure_isolation();
@@ -4383,9 +4381,9 @@ mod tests {
         );
     }
 
-    /// V0.5.0 F93b — `ccteam attach <slug>` against an agent-team
-    /// project without a written snapshot returns a friendly error
-    /// telling the user to run `ccteam start <slug>` first.
+    /// `ccteam attach <slug>` against an agent-team project without a
+    /// written snapshot returns a friendly error telling the user to run
+    /// `ccteam start <slug>` first.
     #[test]
     fn run_attach_agent_team_missing_snapshot_errors_with_hint() {
         ensure_isolation();
@@ -4421,11 +4419,10 @@ mod tests {
         );
     }
 
-    /// V0.5.0 F93b — `ccteam attach <slug>` against an agent-team
-    /// project WITH a snapshot containing `lead_session_id` reads
-    /// the lead id and would exec `claude attach <id>`. We can't
-    /// actually exec here, but `read_agent_team_lead_session_id`
-    /// is testable directly.
+    /// `ccteam attach <slug>` against an agent-team project WITH a
+    /// snapshot containing `lead_session_id` reads the lead id and would
+    /// exec `claude attach <id>`. We can't actually exec here, but
+    /// `read_agent_team_lead_session_id` is testable directly.
     #[test]
     fn read_agent_team_lead_session_id_resolves_from_snapshot() {
         ensure_isolation();
@@ -4476,10 +4473,9 @@ mod tests {
         assert_eq!(lead_id, "deadbeef123");
     }
 
-    /// V0.5.0 F93b — for artifact-driven projects,
-    /// `read_agent_team_lead_session_id` returns Ok(None) so the
-    /// caller falls through to the tmux / bg path (V0.4.6 behavior
-    /// preserved).
+    /// For artifact-driven projects, `read_agent_team_lead_session_id`
+    /// returns Ok(None) so the caller falls through to the tmux / bg
+    /// path.
     #[test]
     fn read_agent_team_lead_session_id_returns_none_for_artifact_driven() {
         ensure_isolation();
@@ -4500,9 +4496,9 @@ mod tests {
         assert!(res.is_none(), "artifact-driven must return None");
     }
 
-    /// V0.4.2 F72: re-running on an existing ccteam project preserves
-    /// user-edited workflow.yaml + agents/*.md.
-    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
+    /// Re-running on an existing ccteam project preserves user-edited
+    /// workflow.yaml + agents/*.md. workflow.yaml lives in `.ccteam/`,
+    /// not the root.
     #[test]
     fn run_init_refresh_preserves_user_workflow_and_agents() {
         let tmp = TempDir::new().unwrap();
@@ -4545,8 +4541,8 @@ mod tests {
         );
     }
 
-    /// V0.4.2 F72: `--force` re-runs overwrite user files.
-    /// V0.4.6 F83: workflow.yaml lives in `.ccteam/`, not the root.
+    /// `--force` re-runs overwrite user files. workflow.yaml lives in
+    /// `.ccteam/`, not the root.
     #[test]
     fn run_init_force_overwrites_user_workflow_and_agents() {
         let tmp = TempDir::new().unwrap();
@@ -4577,8 +4573,8 @@ mod tests {
         );
     }
 
-    /// V0.4.3 F76: invalid slug grammar fails loud at the CLI
-    /// boundary, before any directory is created.
+    /// Invalid slug grammar fails loud at the CLI boundary, before any
+    /// directory is created.
     #[test]
     fn run_init_rejects_invalid_slug_grammar() {
         let tmp = TempDir::new().unwrap();
@@ -4603,9 +4599,9 @@ mod tests {
         );
     }
 
-    /// V0.4.2 F72 (reviewer-blocker fix): `ccteam init` rejects a slug
-    /// collision when the existing registry entry points at a different
-    /// physical path. Same slug + same path is OK (refresh).
+    /// `ccteam init` rejects a slug collision when the existing
+    /// registry entry points at a different physical path. Same slug +
+    /// same path is OK (refresh).
     #[test]
     fn run_init_rejects_slug_collision_at_different_path() {
         let tmp = TempDir::new().unwrap();
@@ -4666,8 +4662,8 @@ mod tests {
         .unwrap();
     }
 
-    /// V0.4.2 F72: installing in the ccteam source repo itself is
-    /// fail-loud (CLAUDE.md §六 — avoids circular hook setup).
+    /// Installing in the ccteam source repo itself is fail-loud
+    /// (CLAUDE.md §六 — avoids circular hook setup).
     #[test]
     fn run_init_refuses_to_install_in_ccteam_repo() {
         let tmp = TempDir::new().unwrap();
@@ -4696,9 +4692,9 @@ mod tests {
         );
     }
 
-    /// V0.6.8 F203 — `--force` overrides the ccteam-repo refusal so
-    /// self-hosting / dogfooding installs inside the ccteam source tree
-    /// can proceed when the user explicitly opts in.
+    /// `--force` overrides the ccteam-repo refusal so self-hosting /
+    /// dogfooding installs inside the ccteam source tree can proceed
+    /// when the user explicitly opts in.
     #[test]
     fn run_init_force_overrides_ccteam_repo_refusal() {
         let tmp = TempDir::new().unwrap();

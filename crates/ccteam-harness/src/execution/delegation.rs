@@ -5,7 +5,9 @@
 //! the same `atomic_write_durable` (tmp+fsync+rename) discipline as `meta.json`
 //! so a power-loss can never leave a half-written watch. There is at most ONE
 //! watch per child (a later dispatch to the same child overwrites/updates it —
-//! "one child has one pending parent" per the steer semantics). The gateway
+//! "one child has one pending parent" per the steer semantics), and it lives
+//! only until the dispatched task's turn boundary, which spends it (the file is
+//! removed). The gateway
 //! keeps an in-memory mirror for the hot path; this file is the SoT that a
 //! daemon-restart reconcile reads to deliver any completion notifications that
 //! were missed while the daemon was down (at-least-once, deduped by
@@ -22,11 +24,16 @@ use super::turns_mirror::chat_dir;
 /// When a delegation watch wakes the parent. The unit of the notification
 /// contract is the TASK (a vendor turn), not each mirrored assistant message —
 /// a chatty child (codex narrates checkpoints as separate messages inside one
-/// turn) must not flood the parent's context.
+/// turn) must not flood the parent's context. In every mode the watch covers
+/// exactly ONE task: the turn boundary that ends the dispatched task also
+/// spends the watch (v0.10.1), so a child that keeps living its own life after
+/// the task — an IM root, a session someone else drives — never keeps feeding
+/// the dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotifyMode {
-    /// Notify only at the vendor turn boundary — the child finished its task
-    /// and went idle (default; interim narration stays in the ledger).
+    /// Notify once, at the vendor turn boundary — the child finished the
+    /// dispatched task and went idle (default; interim narration stays in the
+    /// ledger).
     #[default]
     Final,
     /// Notify on EVERY mirrored assistant message (debug / firehose).
@@ -81,7 +88,8 @@ impl<'de> Deserialize<'de> for NotifyMode {
 }
 
 /// One child's completion watch — who to notify, and what has already been
-/// notified (dedup key = `(child_sid, turn_id)`).
+/// notified (dedup key = `(child_sid, turn_id)`). Lifetime = ONE dispatched
+/// task: armed by a dispatch, spent by that task's turn boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationWatch {
     /// The sid of the session to notify when a watched turn completes (the

@@ -599,6 +599,7 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "utoipa",
  "utoipa-axum",
  "utoipa-scalar",

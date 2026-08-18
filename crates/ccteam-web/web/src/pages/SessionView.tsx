@@ -25,7 +25,7 @@ import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
-import { useSessionEvents } from "../hooks/useSessionEvents";
+import { foldSessionLiveness, useSessionEvents } from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
 import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
 import {
@@ -58,6 +58,44 @@ function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** A row's server-side timestamp (WEB-TS-1, `row.ts` — RFC 3339) rendered as
+ *  local `HH:MM` for today, `MM-DD HH:MM` within the current year, and
+ *  `YYYY-MM-DD HH:MM` for older rows; the full date-time rides the tooltip.
+ *  Sits on its own line under the bubble, so it never squeezes the bubble on
+ *  narrow viewports. Absent/unparseable `ts` (old daemons, rows persisted
+ *  before this field) renders nothing. */
+function rowTimeParts(ts: string, now: Date): { date: boolean; year: boolean } | null {
+  const when = new Date(ts);
+  if (Number.isNaN(when.getTime())) return null;
+  return {
+    date: when.toDateString() !== now.toDateString(),
+    year: when.getFullYear() !== now.getFullYear(),
+  };
+}
+
+export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
+  if (!ts) return null;
+  const when = new Date(ts);
+  const parts = rowTimeParts(ts, new Date());
+  if (!parts) return null;
+  const locale = lang === "en" ? "en-US" : "zh-CN";
+  const text = when.toLocaleString(locale, {
+    ...(parts.date
+      ? parts.year
+        ? { year: "numeric" as const, month: "2-digit" as const, day: "2-digit" as const }
+        : { month: "2-digit" as const, day: "2-digit" as const }
+      : {}),
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return (
+    <time className="msg-time" dateTime={ts} title={when.toLocaleString(locale)}>
+      {text}
+    </time>
+  );
 }
 
 function OutboundAttachments({
@@ -125,7 +163,7 @@ export default function SessionView({
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
 
-  const { events, connected, lastError, gatewayUnavailable, connectionEpoch } =
+  const { events, lastError, gatewayUnavailable, connectionEpoch } =
     useSessionEvents(sid);
 
   // The SSE buffer survives reconnects. Keep both the fold cursor and a live
@@ -135,6 +173,11 @@ export default function SessionView({
   const foldedRef = useRef(0);
   const eventsRef = useRef(events);
   const historyRequestRef = useRef(0);
+  const [historyPage, setHistoryPage] = useState({
+    hasMore: false,
+    nextBefore: null as string | null,
+    loadingEarlier: false,
+  });
   useEffect(() => {
     eventsRef.current = events;
   }, [events]);
@@ -148,6 +191,11 @@ export default function SessionView({
         if (cancelled || request !== historyRequestRef.current) return;
         const seeded = historyToRows(h.events);
         if (seeded.length > 0) setRows(seeded);
+        setHistoryPage({
+          hasMore: h.has_more === true,
+          nextBefore: h.next_before ?? null,
+          loadingEarlier: false,
+        });
       })
       .catch(() => {
         /* best-effort — keep the localStorage rows (or empty) on error */
@@ -170,6 +218,11 @@ export default function SessionView({
         if (cancelled || request !== historyRequestRef.current) return;
         foldedRef.current = eventsRef.current.length;
         setRows(historyToRows(h.events));
+        setHistoryPage({
+          hasMore: h.has_more === true,
+          nextBefore: h.next_before ?? null,
+          loadingEarlier: false,
+        });
       })
       .catch(() => {
         /* best-effort — keep the current transcript on reseed failure */
@@ -178,6 +231,28 @@ export default function SessionView({
       cancelled = true;
     };
   }, [sid, connectionEpoch]);
+
+  const loadEarlier = useCallback(() => {
+    if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
+    const before = historyPage.nextBefore;
+    const request = historyRequestRef.current;
+    setHistoryPage((current) => ({ ...current, loadingEarlier: true }));
+    getHistory(sid, { before })
+      .then((history) => {
+        if (request !== historyRequestRef.current) return;
+        const earlier = historyToRows(history.events);
+        if (earlier.length > 0) setRows((current) => [...earlier, ...current]);
+        setHistoryPage({
+          hasMore: history.has_more === true,
+          nextBefore: history.next_before ?? null,
+          loadingEarlier: false,
+        });
+      })
+      .catch(() => {
+        if (request !== historyRequestRef.current) return;
+        setHistoryPage((current) => ({ ...current, loadingEarlier: false }));
+      });
+  }, [sid, historyPage]);
 
   // ---- live SSE → append into this sid's transcript ------------------------
   useEffect(() => {
@@ -372,14 +447,17 @@ export default function SessionView({
     }
   }, [rows, showTerminal]);
 
-  // conv-head status dot: busy amber › connection state.
-  const headDot = busy
-    ? "dot busy"
-    : gatewayUnavailable || lastError
-      ? "dot err"
-      : connected
-        ? "dot on"
-        : "dot off";
+  // conv-head status dot: busy amber › SESSION state. The base is the rail's
+  // REST `session.status`; this sid's live `session_lifecycle` frames fold on
+  // top, so a capacity eviction greys the dot immediately, without waiting
+  // for the rail's next REST reconcile. The SSE CONNECTION state is a
+  // different fact and no longer drives this dot (an open stream on a dead
+  // session is what made it "always green").
+  const sessionLive = foldSessionLiveness(session?.status === "live", events);
+  const headDot = busy ? "dot busy" : sessionLive ? "dot on" : "dot off";
+  // A broken stream (retries exhausted / no gateway) stays visible as its own
+  // red connection dot next to the status dot.
+  const connLost = gatewayUnavailable || lastError !== null;
 
   const serverTitle = session ? railSessionLabel(session) : sid;
   const title = pendingTitle ?? serverTitle;
@@ -408,6 +486,9 @@ export default function SessionView({
     <section className="view active" data-testid="conversation-view">
       <div className="conv-head">
         <span className={headDot} data-testid="conv-dot" />
+        {connLost ? (
+          <span className="dot err" data-testid="conn-dot" title={t("connLost")} />
+        ) : null}
         {editingTitle && onRename ? (
           <InlineRename
             className="title rename-input"
@@ -499,6 +580,23 @@ export default function SessionView({
               data-testid="chat-scroll"
             >
               <div className="chat-inner">
+                {historyPage.hasMore ? (
+                  <button
+                    type="button"
+                    className="btn ghost mini self-center"
+                    data-testid="load-earlier"
+                    disabled={historyPage.loadingEarlier}
+                    onClick={loadEarlier}
+                  >
+                    {historyPage.loadingEarlier
+                      ? lang === "en"
+                        ? "Loading…"
+                        : "加载中…"
+                      : lang === "en"
+                        ? "Load earlier"
+                        : "加载更早消息"}
+                  </button>
+                ) : null}
                 {rows.map((row) => {
                   if (row.kind === "approval") {
                     return (
@@ -526,6 +624,7 @@ export default function SessionView({
                             </div>
                           ) : null}
                         </div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -533,6 +632,7 @@ export default function SessionView({
                     return (
                       <div key={row.id} className="msg system fade-in">
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -540,6 +640,7 @@ export default function SessionView({
                     return (
                       <div key={row.id} className="msg activity">
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -548,6 +649,7 @@ export default function SessionView({
                       <div key={row.id} className="msg user fade-in">
                         <span className="who">you</span>
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -555,6 +657,7 @@ export default function SessionView({
                     return (
                       <div key={row.id} className="msg tool fade-in">
                         <div className="bubble">{row.content}</div>
+                        <RowTime ts={row.ts} lang={lang} />
                       </div>
                     );
                   }
@@ -569,6 +672,7 @@ export default function SessionView({
                           attachments={row.attachments}
                         />
                       </div>
+                      <RowTime ts={row.ts} lang={lang} />
                     </div>
                   );
                 })}

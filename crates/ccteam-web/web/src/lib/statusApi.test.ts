@@ -59,6 +59,27 @@ describe("getStatus", () => {
     expect(got.daemon_healthy).toBe(false);
   });
 
+  it("marks automatic store refreshes as background and forwards abort", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.mocked(globalThis.fetch);
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        daemon_healthy: true,
+        sessions_live: 0,
+        sessions_idle: 0,
+        cost_24h_usd: 0,
+        cost_24h_by_vendor: {},
+        budget_cap_24h: null,
+      }),
+    );
+
+    await getStatus({ signal: controller.signal, background: true });
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.signal).toBe(controller.signal);
+    expect(new Headers(init?.headers).get("X-Ccteam-Background")).toBe("1");
+  });
+
   it("maps 401 → UNAUTHENTICATED and a 500 → HTTP 500", async () => {
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(jsonResponse(401, { error: "auth" }));
     await expect(getStatus()).rejects.toThrow("UNAUTHENTICATED");

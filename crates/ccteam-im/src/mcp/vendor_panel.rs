@@ -402,9 +402,10 @@ pub(crate) fn spawn_unavailable_message(
     format!(
         "session_spawn: vendor `{vendor}` is not installed on host `{host}` \
          (installed there: {installed}; observed {freshness}). Spawn one of the installed \
-         vendors, or install `{vendor}` on that host and retry — ccteam never installs a CLI \
-         for you. Model ids stay advisory (ccteam does not validate them), so a genuinely fresh \
-         install can just retry."
+         vendors, or install `{vendor}` on that host and retry — the admin can one-click \
+         install npm-packaged vendors (claude/codex/grok/opencode/dsh) from the Ops & Hosts \
+         web page; kimi/pi install manually. Model ids stay advisory (ccteam does not \
+         validate them), so a genuinely fresh install can just retry."
     )
 }
 
@@ -671,9 +672,10 @@ fn build_project_panel(paths: &CcteamPaths, slug: &str) -> (PanelHeader, Vec<Pan
         .unwrap_or_else(|| LOCAL_HOST.to_string());
     let project_dir = entry.as_ref().map(|e| e.path.clone());
     let budgets = project_dir.as_deref().and_then(budgets_for_project);
-    let spend_24h = ccteam_core::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
-        .map(|s| s.cost_24h_by_vendor)
-        .unwrap_or_default();
+    let spend_24h = crate::progress_projection::ProgressProjection::new(paths.clone())
+        .project_snapshot(slug)
+        .cost
+        .cost_24h_by_vendor;
 
     if host == LOCAL_HOST {
         let availability = ccteam_core::host_registry::probe_availability(false);
@@ -711,10 +713,10 @@ fn build_local_panel(
                 .map(|e| e.path.clone())
                 .as_deref()
                 .and_then(budgets_for_project);
-            let spend =
-                ccteam_core::queries::cost_summary(slug, &paths.progress_jsonl(slug), paths)
-                    .map(|s| s.cost_24h_by_vendor)
-                    .unwrap_or_default();
+            let spend = crate::progress_projection::ProgressProjection::new(paths.clone())
+                .project_snapshot(slug)
+                .cost
+                .cost_24h_by_vendor;
             (budgets, spend)
         }
         None => (None, BTreeMap::new()),
@@ -1147,8 +1149,8 @@ mod tests {
         assert!(msg.contains("installed there: claude, codex"));
         assert!(msg.contains("observed just now"));
         assert!(msg.contains("advisory"));
-        // Never a local fallback; never installs.
-        assert!(msg.contains("never installs a CLI"));
+        // Never a local fallback; the admin one-click install is the pointer.
+        assert!(msg.contains("one-click install"));
     }
 
     #[test]
