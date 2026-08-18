@@ -71,6 +71,47 @@ describe('ccteam tools', () => {
     pool.close()
   })
 
+  it('dials the /mcp endpoint exactly once when _meta.mcpUrl already names it', async () => {
+    // The Rust side sends the ENDPOINT url (`http://…:7331/mcp`) in
+    // `_meta.ccteam.mcpUrl`. The pool must normalize it to a base — forwarding
+    // it verbatim double-suffixed every per-session call to `/mcp/mcp`, which
+    // is not the exempt MCP route: with web auth enabled the daemon answered a
+    // plain-text 401 `auth required` (owner-reported real-machine regression).
+    const urls: string[] = []
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      urls.push(url)
+      const body = JSON.parse(String(init.body)) as { method: string; id: string }
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: body.method === 'initialize'
+          ? {}
+          : { content: [{ type: 'text', text: 'pong' }], isError: false },
+      }))
+    })
+    const credentials = new SessionCredentialStore()
+    credentials.set('session-a', {
+      bearer: 'ccteam-sid:s1:aaa',
+      mcpUrl: 'http://127.0.0.1:7331/mcp',
+    })
+    const pool = new CcteamMcpClientPool({
+      daemonUrl: () => 'http://daemon.test',
+      enrollment: () => 'ccteam-enroll:e1:secret',
+      credentials,
+      clientName: 'test-client',
+      clientVersion: '0',
+      fetchImpl,
+    })
+
+    await pool.clientFor({ agent: { id: 'session-a' } }).callTool('status', {})
+
+    expect(urls.length).toBeGreaterThan(0)
+    for (const url of urls) {
+      expect(url).toBe('http://127.0.0.1:7331/mcp')
+    }
+    pool.close()
+  })
+
   it('initializes over streamable HTTP, captures Mcp-Session-Id, and echoes it on tool calls', async () => {
     const requests: RequestInit[] = []
     const methods: string[] = []
