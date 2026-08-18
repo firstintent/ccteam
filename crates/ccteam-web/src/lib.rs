@@ -191,15 +191,23 @@ pub async fn serve_with_shutdown<F>(opts: ServeOpts, shutdown: F) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    serve_with_state_factory_and_shutdown(opts, AppState::with_auth, shutdown).await
+    serve_with_state_factory_and_shutdown(opts, AppState::with_auth, None, shutdown).await
 }
 
 /// Embedded entry with caller-supplied state construction. `ccteam start`
 /// uses this to install the web-chat bridge while preserving the same bind
 /// and auth behavior as [`serve_with_shutdown`].
+///
+/// `dsh_runtime` is the daemon-wide DSH process manager: `ccteam start` builds
+/// ONE in its composition root and hands it in here, so web and every other
+/// consumer drive the same `dsh web` process per identity. `None` (standalone
+/// `ccteam web`) builds a private one. Either way THIS function is what
+/// configures it, once the bind is known — the daemon-owned instance is created
+/// long before any port exists.
 pub async fn serve_with_state_factory_and_shutdown<F, B>(
     opts: ServeOpts,
     build_state: B,
+    dsh_runtime: Option<std::sync::Arc<ccteam_harness::DshRuntimeManager>>,
     shutdown: F,
 ) -> Result<()>
 where
@@ -212,7 +220,7 @@ where
     // SIGKILLed. Sweep only init-parented processes carrying a DSH_HOME under
     // this resolved ccteam runtime before accepting new work. New children are
     // also protected by Linux PDEATHSIG at both DSH spawn sites.
-    dsh_web::sweep_legacy_dsh_orphans(&paths.root).await;
+    ccteam_harness::sweep_legacy_dsh_orphans(&paths.root).await;
 
     let listener = TcpListener::bind(opts.bind)
         .await
@@ -297,13 +305,13 @@ where
         .transpose()
         .context("read DSH web companion local_addr after bind")?;
 
-    let supervisor = std::sync::Arc::new(dsh_web::DshWebSupervisor::new(
-        dsh_web::DshWebRuntimeConfig {
-            enabled: companion_local.is_some(),
-            daemon_url: format!("http://127.0.0.1:{}", local.port()),
-            attach_url: None,
-        },
-    ));
+    let runtime = dsh_runtime.unwrap_or_else(|| dsh_web::new_runtime_manager(paths.root.clone()));
+    runtime.configure(ccteam_harness::DshRuntimeConfig {
+        enabled: companion_local.is_some(),
+        daemon_url: format!("http://127.0.0.1:{}", local.port()),
+        attach_url: None,
+    });
+    let supervisor = std::sync::Arc::new(dsh_web::DshWebSupervisor::new(runtime));
     if let Some(addr) = companion_local {
         supervisor.set_companion_addr(addr);
         println!("ccteam DSH web companion listening on http://{addr}");

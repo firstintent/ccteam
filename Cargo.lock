@@ -492,6 +492,7 @@ dependencies = [
  "nix 0.29.0",
  "notify",
  "regex",
+ "reqwest",
  "rmux-client",
  "rmux-proto",
  "rmux-sdk",

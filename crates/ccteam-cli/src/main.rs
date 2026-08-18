@@ -1562,6 +1562,13 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         // before the gateway so it can be baked into both.
         let host_hub = std::sync::Arc::new(ccteam_harness::HostChannelHub::default());
 
+        // v0.10.3 — ONE DSH runtime manager per daemon process, built here in
+        // the composition root: "one identity, one `dsh web` process" is a
+        // property of the SHARED instance, not a convention each consumer has
+        // to honor. Handed to the web task below (which `configure`s it once
+        // the bind is known); the DSH adapter takes the same Arc.
+        let dsh_runtime = ccteam_web::dsh_web::new_runtime_manager(paths.root.clone());
+
         let (shared_gateway, shared_claude_stream_json, shared_pi_rpc) = if web.disabled
             || imd.disabled
         {
@@ -1675,6 +1682,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         state = state.with_host_hub(web_host_hub);
                         state
                     },
+                    Some(dsh_runtime),
                     async move {
                         let _ = rx.changed().await;
                     },

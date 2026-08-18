@@ -38,7 +38,7 @@ pub(crate) async fn handle_dsh_start(
     State(app): State<AppState>,
     Extension(identity): Extension<Identity>,
 ) -> Response {
-    Json(app.dsh_web.start_for(&app, &identity).await).into_response()
+    Json(app.dsh_web.start_for(&identity).await).into_response()
 }
 
 /// `POST /api/v1/dsh/stop` — idempotently stop the owned managed instance.

@@ -57,9 +57,14 @@ getrandom = { workspace = true }
 vt100 = "0.15"
 
 # W2b — the refcounted `tmux pipe-pane` FIFO relay ported out of
-# `ccteam-web::pty` needs `mkfifo` + a 0600 `Mode`. `fs` is the only
-# feature required.
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+# `ccteam-web::pty` needs `mkfifo` + a 0600 `Mode`. `signal` is what
+# `dsh_runtime` graceful-stops a `dsh web` child with (SIGTERM, then kill).
+nix = { version = "0.29", default-features = false, features = ["fs", "signal"] }
+
+# v0.10.3 — `dsh_runtime` health/attach probes the loopback `dsh web` origin
+# (readiness + attach-if-detected). Same workspace pin ccteam-web uses; no
+# extra features needed (plain GET + text body).
+reqwest = { workspace = true }
 
 [dev-dependencies]
 ccteam-core.workspace = true

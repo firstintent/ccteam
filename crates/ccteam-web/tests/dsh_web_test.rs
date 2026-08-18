@@ -8,7 +8,8 @@ use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ccteam_core::CcteamPaths;
-use ccteam_web::dsh_web::{DshWebRuntimeConfig, DshWebSupervisor};
+use ccteam_harness::DshRuntimeConfig;
+use ccteam_web::dsh_web::DshWebSupervisor;
 use ccteam_web::{dsh_web, router_with_state, AppState, AuthState};
 use flate2::read::GzDecoder;
 use futures_util::{SinkExt, StreamExt};
@@ -22,6 +23,18 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
         root: root.join(".ccteam"),
         projects_root: root.join("projects"),
     }
+}
+
+/// Two-phase construction, exactly as the daemon does it: the runtime manager
+/// exists before any port is known, then `configure` installs the wiring.
+fn supervisor_for(root: &std::path::Path, attach_url: Option<String>) -> Arc<DshWebSupervisor> {
+    let runtime = dsh_web::new_runtime_manager(root.to_path_buf());
+    runtime.configure(DshRuntimeConfig {
+        enabled: true,
+        daemon_url: "http://127.0.0.1:7331".to_string(),
+        attach_url,
+    });
+    Arc::new(DshWebSupervisor::new(runtime))
 }
 
 async fn spawn_app(app: axum::Router) -> SocketAddr {
@@ -157,11 +170,7 @@ fn gunzip(bytes: &[u8]) -> String {
 async fn spawn_companion_for_origin(origin: SocketAddr) -> (SocketAddr, TempDir) {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
-    let supervisor = Arc::new(DshWebSupervisor::new(DshWebRuntimeConfig {
-        enabled: true,
-        daemon_url: "http://127.0.0.1:7331".to_string(),
-        attach_url: Some(format!("http://{origin}")),
-    }));
+    let supervisor = supervisor_for(&paths.root, Some(format!("http://{origin}")));
     let state = AppState::with_auth(paths, AuthState::disabled()).with_dsh_web(supervisor);
     (
         spawn_app(dsh_web::companion_router().with_state(state)).await,
@@ -293,13 +302,9 @@ async fn main_spa_javascript_is_compressed_for_the_browser_hop() {
 async fn repeated_start_on_an_already_attached_instance_never_deadlocks() {
     let attach_addr = spawn_fake_attached_dsh().await;
     let tmp = TempDir::new().unwrap();
-    let supervisor = Arc::new(DshWebSupervisor::new(DshWebRuntimeConfig {
-        enabled: true,
-        daemon_url: "http://127.0.0.1:7331".to_string(),
-        attach_url: Some(format!("http://{attach_addr}")),
-    }));
-    let state =
-        AppState::with_auth(fake_paths(tmp.path()), AuthState::disabled()).with_dsh_web(supervisor);
+    let paths = fake_paths(tmp.path());
+    let supervisor = supervisor_for(&paths.root, Some(format!("http://{attach_addr}")));
+    let state = AppState::with_auth(paths, AuthState::disabled()).with_dsh_web(supervisor);
     let addr = spawn_app(router_with_state(state)).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let start_url = format!("http://{addr}/api/v1/dsh/start");
@@ -346,13 +351,9 @@ async fn repeated_start_on_an_already_attached_instance_never_deadlocks() {
 async fn cancelled_start_request_still_reaches_attached() {
     let attach_addr = spawn_slow_attached_dsh(Duration::from_millis(400)).await;
     let tmp = TempDir::new().unwrap();
-    let supervisor = Arc::new(DshWebSupervisor::new(DshWebRuntimeConfig {
-        enabled: true,
-        daemon_url: "http://127.0.0.1:7331".to_string(),
-        attach_url: Some(format!("http://{attach_addr}")),
-    }));
-    let state =
-        AppState::with_auth(fake_paths(tmp.path()), AuthState::disabled()).with_dsh_web(supervisor);
+    let paths = fake_paths(tmp.path());
+    let supervisor = supervisor_for(&paths.root, Some(format!("http://{attach_addr}")));
+    let state = AppState::with_auth(paths, AuthState::disabled()).with_dsh_web(supervisor);
     let addr = spawn_app(router_with_state(state)).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let start_url = format!("http://{addr}/api/v1/dsh/start");

@@ -11,6 +11,7 @@ pub mod codex_jsonrpc;
 pub mod codex_typed_events;
 pub mod delegation;
 pub mod dsh_acp;
+pub mod dsh_runtime;
 pub mod experience;
 pub mod fs_atomic;
 pub mod grok_acp;
