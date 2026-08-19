@@ -137,6 +137,9 @@ pub struct AcpTransport {
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
     child: StdMutex<Option<Child>>,
+    /// `(project_dir, sid)` of the body record written by
+    /// [`Self::spawn_for_session`]; cleared by [`Self::shutdown`].
+    body_record: StdMutex<Option<(std::path::PathBuf, String)>>,
     closed: Arc<tokio::sync::Notify>,
 }
 
@@ -243,6 +246,12 @@ impl AcpTransport {
     /// pid recorded after the handshake returns misses the very `initialize`
     /// provenance auth exists to identify — this constructor makes the
     /// ordering impossible to get wrong at a call site.
+    ///
+    /// The same spawn also writes the session's durable **body record**
+    /// (`execution::session_body`, under `project_dir`) so a daemon that
+    /// restarts while this child is still alive finds it instead of spawning
+    /// a second body for the sid. `adapter` names the spawner in the record.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_for_session(
         program: &str,
         args: &[String],
@@ -250,10 +259,61 @@ impl AcpTransport {
         envs: &[(String, String)],
         inbound: InboundPolicy,
         sid: &str,
+        project_dir: &std::path::Path,
+        adapter: &str,
     ) -> Result<Self> {
         let transport = Self::spawn_command_full(program, args, cwd, envs, inbound).await?;
         crate::execution::vendor_pids::record(sid, transport.pid());
+        if let Err(err) =
+            crate::execution::session_body::record(project_dir, sid, transport.pid(), adapter)
+        {
+            tracing::warn!(
+                %sid,
+                error = %err,
+                "acp: body record write failed; a daemon restart cannot see this body"
+            );
+        }
+        transport.set_body_record(project_dir, sid);
         Ok(transport)
+    }
+
+    /// Remember where this transport's body record lives so [`Self::shutdown`]
+    /// (an observed, explicit end) can clear it.
+    fn set_body_record(&self, project_dir: &std::path::Path, sid: &str) {
+        if let Ok(mut slot) = self.body_record.lock() {
+            *slot = Some((project_dir.to_path_buf(), sid.to_string()));
+        }
+    }
+
+    /// Let go of the child WITHOUT stopping it (daemon shutdown): close our
+    /// stdin end, stop the pumps, drop the handle with no kill. The body
+    /// record stays for the next daemon. Returns the child's pid. (On Linux
+    /// the ACP children carry `PR_SET_PDEATHSIG`, so they still end when the
+    /// daemon process exits — this keeps the teardown honest and symmetric,
+    /// it does not promise the body outlives the daemon there.)
+    pub async fn detach(&self) -> Option<u32> {
+        let pid = self.pid();
+        {
+            let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, tx) in guard.drain() {
+                let _ = tx.send(Err(JsonRpcError {
+                    code: None,
+                    message: "transport detached (daemon shutdown)".into(),
+                    data: None,
+                }));
+            }
+        }
+        self._writer_task.abort();
+        self._reader_task.abort();
+        self.closed.notify_waiters();
+        if let Ok(mut guard) = self.child.lock() {
+            // `kill_on_drop(true)` would kill here — take it out and forget
+            // the handle instead; the process belongs to the session now.
+            if let Some(child) = guard.take() {
+                std::mem::forget(child);
+            }
+        }
+        pid
     }
 
     /// Connect to an ACP peer that is ALREADY listening on a unix socket.
@@ -327,6 +387,7 @@ impl AcpTransport {
             _writer_task: writer_task,
             _reader_task: reader_task,
             child: StdMutex::new(child),
+            body_record: StdMutex::new(None),
             closed,
         }
     }
@@ -480,6 +541,9 @@ impl AcpTransport {
                     let _ = child.kill().await;
                 }
             }
+        }
+        if let Some((project_dir, sid)) = self.body_record.lock().ok().and_then(|g| g.clone()) {
+            crate::execution::session_body::clear(&project_dir, &sid);
         }
         Ok(())
     }

@@ -38,6 +38,10 @@ pub struct PiTransport {
     alive: AtomicBool,
     closed: Notify,
     stderr_ring: Arc<StdMutex<VecDeque<u8>>>,
+    /// `(project_dir, sid)` of the body record written after spawn; cleared
+    /// by [`Self::close`] (an observed, explicit end), kept by
+    /// [`Self::detach`].
+    body_record: StdMutex<Option<(std::path::PathBuf, String)>>,
 }
 
 impl std::fmt::Debug for PiTransport {
@@ -102,6 +106,7 @@ impl PiTransport {
             alive: AtomicBool::new(true),
             closed: Notify::new(),
             stderr_ring: Arc::new(StdMutex::new(VecDeque::with_capacity(STDERR_RING_BYTES))),
+            body_record: StdMutex::new(None),
         });
         Self::spawn_stdout_reader(Arc::clone(&transport), reader);
         transport
@@ -283,6 +288,35 @@ impl PiTransport {
         }
     }
 
+    /// The child's OS pid while the transport still holds it.
+    pub async fn pid(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|child| child.id())
+    }
+
+    /// Remember where this transport's body record lives so [`Self::close`]
+    /// can clear it (and [`Self::detach`] can deliberately leave it).
+    pub fn set_body_record(&self, project_dir: &std::path::Path, sid: &str) {
+        if let Ok(mut slot) = self.body_record.lock() {
+            *slot = Some((project_dir.to_path_buf(), sid.to_string()));
+        }
+    }
+
+    /// Let go of the Pi child WITHOUT stopping it (daemon shutdown): close our
+    /// stdin end, stop reading, drop the handle with no kill (the child was
+    /// spawned with `kill_on_drop(false)`). The body record stays for the next
+    /// daemon. Returns the child's pid.
+    pub async fn detach(&self) -> Option<u32> {
+        let pid = self.pid().await;
+        self.writer.lock().await.take();
+        self.child.lock().await.take();
+        self.finish("Pi transport detached (daemon shutdown)".to_string());
+        pid
+    }
+
     pub async fn close(&self) -> Result<(), String> {
         self.writer.lock().await.take();
         if tokio::time::timeout(Duration::from_secs(2), self.wait_closed())
@@ -297,6 +331,9 @@ impl PiTransport {
                 let _ = child.wait().await;
             }
             self.finish("Pi child closed by adapter".to_string());
+        }
+        if let Some((project_dir, sid)) = self.body_record.lock().ok().and_then(|g| g.clone()) {
+            crate::execution::session_body::clear(&project_dir, &sid);
         }
         Ok(())
     }

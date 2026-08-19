@@ -25,6 +25,7 @@ pub mod process_inspect;
 pub mod progress_bridge;
 pub mod remote_exec;
 pub mod satellite_exec;
+pub mod session_body;
 pub mod session_meta;
 pub mod session_recovery;
 pub mod session_status;

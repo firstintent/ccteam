@@ -87,7 +87,7 @@ pi --version       # optional; only needed for Pi sessions (0.83.0 or newer)
 ccteam daemon status     # pid · ready · running-vs-binary version   (add --json for scripts)
 ccteam daemon logs -f    # follow ~/.ccteam/daemon.log
 ccteam daemon restart    # graceful SIGTERM stop + re-detach (also `make daemon-restart`)
-ccteam daemon stop       # graceful stop; sessions resume by id on the next start
+ccteam daemon stop       # graceful stop; agent processes are never killed — see "What a daemon restart does to live sessions" below
 ```
 
 Honest tradeoff: with no OS supervisor there is **no crash-restart and no auto-start at boot** — after a reboot, run `ccteam daemon start` again (`ccteam status` / `ccteam doctor` show a down daemon at a glance; a `@reboot ccteam daemon start` cron line covers boot-start if you want it). Uninstall with `make uninstall` (source) or `install.sh --uninstall` (prebuilt) — both stop the daemon and remove the binary but keep `~/.ccteam`.
@@ -443,7 +443,7 @@ ccteam session ls                  # Gateway session status; degrades when daemo
 ccteam doctor --verify-mcp         # MCP surface check: 8 tools / 0 stubs; drift exits 1.
 ```
 
-Restart daemon only; sessions reconnect by id afterward:
+Restart daemon only; sessions reconnect by id afterward (a session still mid-turn is waited for, never duplicated):
 
 ```bash
 ccteam daemon restart              # or: make daemon-restart (rebuilds release first)
@@ -459,7 +459,7 @@ ccteam update --now                # Skip the drain wait and restart immediately
 
 `ccteam update` detects how ccteam was installed and re-runs that install path — for the one-click / prebuilt install it replays `install.sh` (same download + SHA-256 verify + atomic swap; no second downloader). A from-source checkout is never recompiled for you: it prints `git pull && make install`. After the binary is swapped, if a managed daemon is running, `update` waits for in-flight turns to go idle (up to 5 minutes; `--now` skips the wait), gracefully restarts the daemon onto the new binary, and verifies the running version matches.
 
-What a daemon restart does to live sessions is the existing resume-by-id contract, stated plainly: `terminal`/tmux sessions keep running (separate process tree); a default `stream-json`/ACP session's child process ends with the daemon, its in-flight turn reports `stream_closed_in_flight`, and the session resumes its context by id on the next message. `ccteam status` and `ccteam doctor` show the install channel, the running-vs-binary version, and whether a newer release is available (a lazy check, at most once every ~20h; toggle with `check_for_update` in `preferences.toml`). **Satellites update themselves** — run `ccteam update` on each; the console's Hosts view and `ccteam status` flag any host whose version lags the daemon.
+What a daemon restart does to live sessions is the resume-by-id contract plus one rule — **one session, one process**: `terminal`/tmux sessions keep running (separate process tree); a default `stream-json` session's process is let go, not killed — an idle one exits on its own, a session mid-turn keeps working to the end of its turn. The new daemon finds such a survivor by its body record (`<project>/.ccteam/chat/<sid>/body.json`) and never starts a second process for the same session: the session shows as `detached` (web rail, `session_list activity:detached`, IM `/sessions`), messages sent to it queue and are delivered the moment that process exits, `/stop` / `session_stop` ends it now, and when it exits ccteam recovers the answer it gave in the meantime from Claude's own transcript and delivers it (IM/web reply, delegation notification) before rebuilding the session by id. ACP (grok/kimi/opencode) and codex processes end with the daemon; their in-flight turn is interrupted and the session resumes its context by id on the next message. `ccteam status` and `ccteam doctor` show the install channel, the running-vs-binary version, and whether a newer release is available (a lazy check, at most once every ~20h; toggle with `check_for_update` in `preferences.toml`). **Satellites update themselves** — run `ccteam update` on each; the console's Hosts view and `ccteam status` flag any host whose version lags the daemon.
 
 State file quick reference. `~/.ccteam` is grouped by responsibility: `secrets/` for credentials, `state/` for daemon-written state, `cache/` for disposable cache, and `run/` for sockets.
 

@@ -254,6 +254,12 @@ fn apply_progress_activity_status(
         .unwrap_or(0);
     let now = chrono::Utc::now();
     for view in views {
+        // A detached body (alive from before a daemon restart, not driven from
+        // here) is neither working nor idle in the activity sense — its own
+        // status word stands, so the rail can say exactly what it is.
+        if view.detached.is_some() {
+            continue;
+        }
         let activity = snapshot.session_activity_borrowed(
             &view.sid,
             silent_seconds,
@@ -1028,13 +1034,22 @@ pub(crate) async fn handle_session_turn(
         )
         .await
         {
-            tracing::warn!(%sid, %err, "auto-resume on web turn failed");
-            return create_gateway_error(
-                StatusCode::BAD_GATEWAY,
-                format!("session {sid} could not be resumed: {err}"),
-                &err,
-                mode,
+            // One sid, one body: the session's body from before a daemon
+            // restart is still running — not an error for a turn, which
+            // queues behind it (the submit below returns the queue handle).
+            let detached = matches!(
+                err.downcast_ref::<ccteam_im::gateway::GatewayRequestError>(),
+                Some(ccteam_im::gateway::GatewayRequestError::SessionBodyDetached { .. })
             );
+            if !detached {
+                tracing::warn!(%sid, %err, "auto-resume on web turn failed");
+                return create_gateway_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("session {sid} could not be resumed: {err}"),
+                    &err,
+                    mode,
+                );
+            }
         }
     }
     let text = {
@@ -1121,6 +1136,16 @@ pub(crate) async fn handle_session_turn(
     )
     .await;
     match result {
+        Ok(turn_id) if turn_id.starts_with("queued-behind-body:") => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "queued": true,
+                "queued_behind": "detached_body",
+                "turn_id": turn_id,
+            })),
+        )
+            .into_response(),
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "submit_to_sid failed");
@@ -2153,6 +2178,16 @@ fn create_gateway_error(
 
 fn gateway_json_error(default_status: StatusCode, err: &anyhow::Error) -> Response {
     match err.downcast_ref::<ccteam_im::gateway::GatewayRequestError>() {
+        // A detached body is a state conflict, not an upstream failure: the
+        // session exists and is alive, it just cannot be driven yet.
+        Some(kind @ ccteam_im::gateway::GatewayRequestError::SessionBodyDetached { .. }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": err.to_string(),
+                "error_code": kind.error_code()
+            })),
+        )
+            .into_response(),
         Some(kind) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({
@@ -2607,6 +2642,7 @@ mod tests {
     fn view(sid: &str) -> SessionView {
         SessionView {
             driveable: true,
+            detached: None,
             sid: sid.into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2685,6 +2721,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            detached: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2736,6 +2773,7 @@ mod tests {
         let mut views = vec![
             SessionView {
                 driveable: true,
+                detached: None,
                 sid: "s1".into(),
                 project: "demo".into(),
                 role: "cto".into(),
@@ -2759,6 +2797,7 @@ mod tests {
             },
             SessionView {
                 driveable: true,
+                detached: None,
                 sid: "s2".into(),
                 project: "demo".into(),
                 role: "qa".into(),
@@ -2817,6 +2856,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            detached: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2862,6 +2902,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            detached: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),

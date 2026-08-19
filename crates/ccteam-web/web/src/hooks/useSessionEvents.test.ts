@@ -410,4 +410,11 @@ describe("foldSessionLiveness (WEB-STATUS-1 head-dot state)", () => {
     expect(foldSessionLiveness(true, [lifecycle("evicted"), lifecycle("live")])).toBe(true);
     expect(foldSessionLiveness(false, [lifecycle("resumed"), lifecycle("evicted")])).toBe(false);
   });
+
+  it("a detached body turns the dot off until the session is resumed by sid", () => {
+    // One sid, one body: the body from before a daemon restart is still
+    // finishing its turn — the session exists but cannot be driven yet.
+    expect(foldSessionLiveness(true, [lifecycle("detached")])).toBe(false);
+    expect(foldSessionLiveness(false, [lifecycle("detached"), lifecycle("resumed")])).toBe(true);
+  });
 });

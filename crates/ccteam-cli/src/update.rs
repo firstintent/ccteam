@@ -410,7 +410,8 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
                 }),
                 &format!(
                     "updated to {expected} and gracefully restarted the daemon (running version \
-                     {v}). Agent sessions are not killed; stream-json in-flight turns resume by sid."
+                     {v}). Agent sessions are not killed; a session still mid-turn finishes it \
+                     and the new daemon picks it up by sid (never a second process)."
                 ),
             );
             Ok(())
@@ -542,7 +543,9 @@ fn installed_binary_version() -> Option<String> {
 /// [`IN_FLIGHT_POLL`]. Reads the SAME file-backed progress truth
 /// `ccteam status` uses (`tracked_chat_sessions` × `read_all_events` ×
 /// `classify_progress_activity_for_sid`). At the cap it proceeds anyway
-/// (an in-flight stream-json turn is interrupted and resumes by sid).
+/// (a stream-json body finishes its turn unobserved and the new daemon picks
+/// it up by its body record; an ACP/codex turn is interrupted and resumes by
+/// sid).
 fn wait_for_active_sessions_idle(paths: &CcteamPaths) {
     let deadline = Instant::now() + IN_FLIGHT_WAIT_CAP;
     loop {
@@ -553,7 +556,8 @@ fn wait_for_active_sessions_idle(paths: &CcteamPaths) {
         if Instant::now() >= deadline {
             eprintln!(
                 "ccteam update: proceeding after the {}-minute cap with {active} session(s) still \
-                 active; their in-flight turns will be interrupted and resume by sid",
+                 active; a stream-json session keeps finishing its turn and the new daemon waits \
+                 for it (one sid, one body); an ACP/codex turn is interrupted and resumes by sid",
                 IN_FLIGHT_WAIT_CAP.as_secs() / 60
             );
             return;

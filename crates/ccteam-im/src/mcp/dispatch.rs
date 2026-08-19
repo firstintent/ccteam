@@ -2889,6 +2889,26 @@ async fn dispatch_task(
     } else {
         let mut m = serde_json::Map::new();
         m.insert("turn_id".to_string(), serde_json::json!(turn_id));
+        if turn_id.starts_with("queued-behind-body:") {
+            // One sid, one body: the child's process from before a ccteam
+            // restart is still finishing its turn; the task is queued behind
+            // it and runs the moment that body exits (the notification then
+            // arrives as usual).
+            m.insert("status".to_string(), serde_json::json!("queued"));
+            m.insert(
+                "queued_behind".to_string(),
+                serde_json::json!("detached_body"),
+            );
+            m.insert(
+                "hint".to_string(),
+                serde_json::json!(
+                    "the session's body from before a ccteam restart is still finishing its \
+                     turn; your task is queued and runs next — session_stop ends that body \
+                     now, session_list shows it as activity:detached"
+                ),
+            );
+            return Ok(m);
+        }
         m.insert("status".to_string(), serde_json::json!("dispatched"));
         m.insert(
             "notify_deliverable".to_string(),
@@ -3552,6 +3572,11 @@ async fn run_session_list_at(
     let classified: Vec<(&crate::gateway::SessionView, Option<String>)> = views
         .iter()
         .map(|v| {
+            // A detached body (alive from before a daemon restart, not driven
+            // from here) is its own state: neither working nor idle.
+            if v.detached.is_some() {
+                return (v, Some("detached".to_string()));
+            }
             let activity = activity_ctx.get(&v.project).map(|snapshot| {
                 let silent = snapshot
                     .last_valid
@@ -3609,8 +3634,21 @@ async fn run_session_list_at(
                 row.insert("current".into(), serde_json::json!(true));
             }
             if let Some(a) = activity {
-                // v0.9.1 — the honest busy signal (`working|idle|stale|stuck`).
+                // v0.9.1 — the honest busy signal (`working|idle|stale|stuck`;
+                // `detached` = its body outlived a daemon restart and is
+                // finishing unobserved — dispatches queue behind it).
                 row.insert("activity".into(), serde_json::json!(a));
+            }
+            if let Some(d) = &v.detached {
+                row.insert(
+                    "detached".into(),
+                    serde_json::json!({
+                        "pid": d.pid,
+                        "since": d.since,
+                        "reason": d.reason,
+                        "hint": "body from before a ccteam restart is still finishing its turn; dispatch queues behind it, session_stop ends it now",
+                    }),
+                );
             }
             if !v.last_active.is_empty() {
                 row.insert("last_active".into(), serde_json::json!(v.last_active));

@@ -390,6 +390,63 @@ pub enum ToolSurfaceRebuild {
     RespawnRequired { reason: String },
 }
 
+/// What [`HarnessAdapter::detach_thread`] did with a session's body when the
+/// daemon let go of it WITHOUT stopping it (graceful daemon shutdown).
+///
+/// Detaching is the honest twin of `close_thread`: the daemon is exiting, the
+/// session is NOT — its body keeps its context and finishes whatever turn it
+/// is in, and the next daemon finds it through the body record
+/// (`execution::session_body`) instead of spawning a second body for the same
+/// sid. An adapter without a local per-session process (a shared runtime it
+/// only connects to, a remote satellite body, a tmux pane that survives on its
+/// own) answers [`DetachOutcome::NotApplicable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachOutcome {
+    /// The adapter released its local body without killing it. `pid` is the
+    /// body the next daemon will find recorded; `in_flight` says whether a
+    /// vendor turn was running at detach time (the body will finish it
+    /// unobserved).
+    Detached { pid: Option<u32>, in_flight: bool },
+    /// Nothing to detach: this adapter holds no local per-session process.
+    NotApplicable,
+}
+
+/// Context for [`HarnessAdapter::recover_unobserved_turn`]: a session body
+/// finished a turn (or several) while no daemon was reading it.
+#[derive(Debug, Clone)]
+pub struct UnobservedTurnCtx {
+    pub sid: String,
+    pub slug: String,
+    /// The session's working directory (the vendor transcript lives keyed by
+    /// it, e.g. Claude's `~/.claude/projects/<encoded cwd>/<uuid>.jsonl`).
+    pub cwd: PathBuf,
+    /// The vendor's own session id for this sid (empty when the vendor has
+    /// none — nothing can then be recovered).
+    pub vendor_uuid: String,
+    /// The last moment ccteam OBSERVED this session (the newest
+    /// `turns.jsonl` row). Vendor output newer than this is what went
+    /// unobserved.
+    pub observed_until: DateTime<Utc>,
+    /// The last assistant text ccteam recorded, so a recovery that finds the
+    /// same text again (a race at the cut) does not report it twice.
+    pub last_observed_assistant: Option<String>,
+}
+
+/// A turn recovered from the vendor's own durable record after its body
+/// finished unobserved (see [`HarnessAdapter::recover_unobserved_turn`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveredTurn {
+    /// The assistant text the vendor produced after `observed_until` (every
+    /// text block, in order, blank-line separated — the same concatenation
+    /// the live pump mirrors into `turns.jsonl`).
+    pub assistant: String,
+    /// Token usage summed over the recovered vendor turns, in the same
+    /// free-form shape the live path records (`Value::Null` when unknown).
+    pub usage: serde_json::Value,
+    /// Vendor timestamp of the last recovered message.
+    pub ended_at: DateTime<Utc>,
+}
+
 /// Cross-vendor thread handle, returned from
 /// [`HarnessAdapter::start_thread`] and consumed by every other trait
 /// method. Replaces the V0.5.x [`SessionHandle`] on the adapter surface
@@ -1437,6 +1494,37 @@ pub trait HarnessAdapter: Send + Sync {
                 self.name()
             ),
         })
+    }
+
+    /// Let go of a session's local body WITHOUT stopping it — the daemon is
+    /// shutting down, the session is not. Stdio adapters close their end of
+    /// the pipes (stdin EOF: an idle body exits by itself, a busy one finishes
+    /// its turn) and drop the child handle without a kill; the body record
+    /// written at spawn (`execution::session_body`) stays on disk so the next
+    /// daemon finds the body instead of spawning a second one.
+    ///
+    /// Default [`DetachOutcome::NotApplicable`]: an adapter with no local
+    /// per-session process has nothing to detach, and saying so is the honest
+    /// answer (a shared runtime the adapter merely connects to, a satellite
+    /// body, a tmux pane that already survives on its own).
+    async fn detach_thread(&self, h: &ThreadHandle) -> Result<DetachOutcome, HarnessError> {
+        let _ = h;
+        Ok(DetachOutcome::NotApplicable)
+    }
+
+    /// Recover what a body did while NO daemon was reading it — after a
+    /// daemon restart, a body that was mid-turn finishes unobserved; once it
+    /// has exited, the gateway asks the adapter whether the vendor's own
+    /// durable record (Claude's transcript jsonl) holds the answer, so the
+    /// user / parent session still receives it instead of a hole.
+    ///
+    /// Default `None` = "this vendor keeps no record ccteam may read"; the
+    /// gateway then reports the unobserved turn honestly instead of inventing
+    /// one. Never a prompt: this READS a vendor file, exactly like the
+    /// terminal protocol's transcript track.
+    async fn recover_unobserved_turn(&self, ctx: &UnobservedTurnCtx) -> Option<RecoveredTurn> {
+        let _ = ctx;
+        None
     }
 
     /// Push an explicit user rename to the VENDOR's own session-title surface,

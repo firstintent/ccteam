@@ -15,14 +15,15 @@ use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
+use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
     format_tokens, list_session_metas, parse_chat_session_name, truncate_title, AccountUsage,
-    AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, Directive, DirectiveOutcome,
-    EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError, PermissionMode,
-    ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol, SessionTitleTarget,
-    SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource, TitleSync,
-    TurnDisposition, TurnInput, TurnRouting,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
+    DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
+    PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
+    TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
@@ -408,6 +409,18 @@ pub struct Gateway {
     /// `load_state` (sync) for the async `resume_restored_sessions` step to
     /// cold-start rebuild from their `meta.json`. Drained once on startup.
     restore_pending: Vec<String>,
+    /// 2026-08-19 (one sid, one body) — sessions whose OS body is alive but
+    /// not driven by this daemon (it outlived the daemon that spawned it).
+    /// Never in `sessions` at the same time; the body watcher moves a sid
+    /// out of here (rebuild by sid) once the body has exited. See
+    /// [`DetachedBody`].
+    detached: BTreeMap<String, DetachedBody>,
+    /// Sids whose stale body record was found GONE at rebuild time: the body
+    /// exited while no daemon was watching, so the watcher runs a post-mortem
+    /// recovery (`recover_and_report`) for them on its next tick.
+    post_mortem_pending: Vec<(String, String, PathBuf, SessionBody)>,
+    /// Wakes the body watcher early (a new detached sid, a post-mortem).
+    body_watch_notify: Arc<tokio::sync::Notify>,
     projects: BTreeMap<String, PathBuf>,
     /// The chats that speak for the box OWNER, per platform (`"telegram"` →
     /// `{"339498819"}`, `"lark"` → `{"ou_…"}`). Fed from each global bot's
@@ -1071,11 +1084,79 @@ pub struct SessionView {
     /// the field existed, where every row was a managed session.
     #[serde(default = "session_view_driveable_default")]
     pub driveable: bool,
+    /// 2026-08-19 (one sid, one body) — present when the session's OS body
+    /// is alive but not driven by this daemon (it outlived the daemon that
+    /// spawned it). `status` is then `"detached"`, `driveable` is `false`:
+    /// messages queue behind the body; `/stop` ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached: Option<DetachedView>,
 }
 
 /// Pre-`driveable` payloads only ever described managed sessions.
 fn session_view_driveable_default() -> bool {
     true
+}
+
+/// The detached-body facts a session row carries (see [`SessionView::detached`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DetachedView {
+    /// The surviving body's OS pid.
+    pub pid: u32,
+    /// RFC3339 time this daemon first saw the body detached.
+    pub since: String,
+    /// `daemon_restart` (found alive at startup / first touch).
+    pub reason: String,
+}
+
+/// 2026-08-19 (one sid, one body) — a session whose OS body is alive but NOT
+/// driven by this daemon: it outlived the daemon that spawned it (a graceful
+/// stop left it finishing its turn; a crash orphaned it). The gateway never
+/// spawns a second body for the sid while this one lives; the body watcher
+/// waits for the exit, recovers what the body said from the vendor's own
+/// record where it can, then rebuilds the session by sid and drains the
+/// messages that queued behind it.
+#[derive(Debug, Clone)]
+pub struct DetachedBody {
+    /// Gateway session id.
+    pub sid: String,
+    /// Project slug the session runs in.
+    pub slug: String,
+    /// Project directory (where the session's chat dir + body record live).
+    pub cwd: PathBuf,
+    /// The surviving OS process.
+    pub body: SessionBody,
+    /// When this daemon first saw the body detached.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// `daemon_restart` today (found alive at startup / first touch).
+    pub reason: &'static str,
+}
+
+impl DetachedBody {
+    fn error(&self) -> GatewayRequestError {
+        GatewayRequestError::SessionBodyDetached {
+            sid: self.sid.clone(),
+            pid: self.body.pid,
+            since: self.since.to_rfc3339(),
+        }
+    }
+
+    fn view(&self) -> DetachedView {
+        DetachedView {
+            pid: self.body.pid,
+            since: self.since.to_rfc3339(),
+            reason: self.reason.to_string(),
+        }
+    }
+}
+
+/// What the body gate found for a sid about to be rebuilt.
+enum BodyGate {
+    /// No body record, or the record was cleared by an observed exit.
+    Clear,
+    /// A record was there but its process is gone: the body exited while no
+    /// daemon was watching. The rebuild proceeds; the watcher runs a
+    /// post-mortem recovery for whatever that body said unobserved.
+    PostMortem(SessionBody),
 }
 
 /// What [`Gateway::start_session`] reports back so a receipt can name the
@@ -1178,6 +1259,23 @@ pub enum GatewayRequestError {
     /// A session/watch was replaced while unlocked work was in flight.
     #[error("session generation changed while work was in flight: {0}")]
     SessionGenerationConflict(String),
+    /// 2026-08-19 (one sid, one body) — the session's OS body is still alive
+    /// from before a daemon restart and this daemon is not driving it; no
+    /// second body is spawned while it lives. Turns queue behind it; `/stop`
+    /// ends it now.
+    #[error(
+        "session {sid} is still finishing a turn that started before ccteam restarted \
+         (body pid {pid}, unobserved since {since}); no second body is started while it \
+         runs — messages queue behind it, `/stop` ends it now"
+    )]
+    SessionBodyDetached {
+        /// Gateway session id.
+        sid: String,
+        /// The surviving body's OS pid.
+        pid: u32,
+        /// RFC3339 time this daemon first saw the body detached.
+        since: String,
+    },
 }
 
 impl GatewayRequestError {
@@ -1192,6 +1290,7 @@ impl GatewayRequestError {
             Self::DshUpstreamUnready(_) => "dsh_upstream_unready",
             Self::StorageReadCorrupt(_) => "storage_read_corrupt",
             Self::SessionGenerationConflict(_) => "session_generation_conflict",
+            Self::SessionBodyDetached { .. } => "session_body_detached",
         }
     }
 }
@@ -1426,6 +1525,9 @@ struct MetaRebuildPlan {
     secret: String,
     cwd: PathBuf,
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    /// 2026-08-19 — the body record found GONE by the gate (exited unobserved);
+    /// `apply_rebuilt_session` hands it to the watcher for post-mortem recovery.
+    post_mortem: Option<SessionBody>,
     /// v0.9.0 W3 (G10) — snapshot of `Gateway::project_paths`/`remote_host_proxy`
     /// (cheap clones, taken sync under the lock) so [`Gateway::spawn_for_plan`]
     /// — self-less, runs OUTSIDE the lock in the batch-restore path — can
@@ -1840,6 +1942,9 @@ impl Gateway {
             next_sid_path: None,
             next_scheduled_path: None,
             restore_pending: Vec::new(),
+            detached: BTreeMap::new(),
+            post_mortem_pending: Vec::new(),
+            body_watch_notify: Arc::new(tokio::sync::Notify::new()),
             projects,
             operator_chats: BTreeMap::new(),
             current_project: BTreeMap::new(),
@@ -2057,6 +2162,21 @@ impl Gateway {
                 meta.sid
             );
         }
+        // One sid, one body (2026-08-19): never plan a second body while the
+        // sid's recorded body is provably alive. Every rebuild path funnels
+        // through here, so the rule is drawn once — a body that outlived the
+        // previous daemon is registered as DETACHED and the caller sees a
+        // typed error (queue behind it / report it), never a silent twin.
+        let post_mortem = match self.gate_session_body(
+            &meta.sid,
+            slug,
+            &cwd,
+            &meta.role,
+            meta.delegation_depth,
+        )? {
+            BodyGate::Clear => None,
+            BodyGate::PostMortem(body) => Some(body),
+        };
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
         let model_id = meta
@@ -2107,6 +2227,7 @@ impl Gateway {
             secret: rebuild_secret,
             cwd,
             adapter: (self.adapter_factory)(meta.vendor, meta.protocol),
+            post_mortem,
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
         })
@@ -2194,6 +2315,10 @@ impl Gateway {
         capacity_checked: bool,
     ) -> Result<()> {
         let sid = plan.sid.clone();
+        let post_mortem = plan
+            .post_mortem
+            .clone()
+            .map(|body| (plan.slug.clone(), plan.cwd.clone(), body));
         let reservation_matches = self
             .rebuild_reservations
             .get(&sid)
@@ -2251,6 +2376,14 @@ impl Gateway {
             },
         );
         self.spawn_event_pump(&sid);
+        if let Some((slug, cwd, body)) = post_mortem {
+            // The previous body exited unobserved: let the watcher recover
+            // what it said (vendor record) and report it — AFTER the session
+            // is live again, so the report lands on a driveable session.
+            self.post_mortem_pending
+                .push((sid.clone(), slug, cwd, body));
+            self.body_watch_notify.notify_one();
+        }
         Ok(())
     }
 
@@ -2287,9 +2420,13 @@ impl Gateway {
     fn drop_dead_session_routes(&self) {
         let mut memo = ProjectPrincipalMemo::new();
         self.current_session.write().unwrap().retain(|chat, sid| {
-            self.sessions
-                .get(sid)
-                .is_some_and(|session| self.chat_can_access_with(chat, session, &mut memo))
+            // A detached body is still this chat's session — it comes back
+            // (rebuilt by sid) the moment the body exits; keep the focus.
+            self.detached.contains_key(sid)
+                || self
+                    .sessions
+                    .get(sid)
+                    .is_some_and(|session| self.chat_can_access_with(chat, session, &mut memo))
         });
     }
 
@@ -2322,6 +2459,13 @@ impl Gateway {
                 .rebuild_session_from_meta(&slug, cwd, &meta, reply_to)
                 .await
             {
+                if is_body_detached_error(&err) {
+                    tracing::info!(
+                        session = %sid,
+                        "ccteam-im: restore deferred; the session's body from before the restart is still running (watched, not duplicated)"
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     session = %sid,
                     error = %err,
@@ -2346,65 +2490,644 @@ impl Gateway {
             std::mem::take(&mut g.restore_pending)
         };
         for sid in pending {
-            // Build the plan under the lock, then drop it before the spawn await.
-            let plan_and_reply = {
-                let mut g = gateway.lock().await;
-                if g.sessions.contains_key(&sid) {
-                    None
-                } else {
-                    match g.find_meta_for_sid(&sid) {
-                        Ok((slug, cwd, meta)) => {
-                            let reply_to = g
-                                .tenant_project_owner_reply_target(&slug)
-                                .or_else(|| {
-                                    ChatKey::from_identity(&meta.owner)
-                                        .map(|owner| reply_target_for_owner(&owner))
-                                })
-                                .unwrap_or_else(web_api_chat);
-                            match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
-                                Ok(plan) => Some((plan, reply_to)),
-                                Err(err) => {
-                                    tracing::warn!(session = %sid, error = %err, "ccteam-im: restore skipped; project host binding changed");
-                                    None
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
-                            None
-                        }
-                    }
-                }
-            };
-            let Some((plan, reply_to)) = plan_and_reply else {
-                continue;
-            };
-            // Spawn OUTSIDE the lock — the slow part.
-            match Self::spawn_for_plan(&plan).await {
-                Ok(thread) => {
-                    if let Err(err) = gateway
-                        .lock()
-                        .await
-                        .apply_rebuilt_session(plan, thread, reply_to, false)
-                        .await
-                    {
-                        tracing::warn!(session = %sid, error = %err, "ccteam-im: stale restored session discarded");
-                    }
-                }
-                Err(err) => {
-                    gateway.lock().await.forget_principal(&plan.sid);
-                    tracing::warn!(
-                        session = %plan.sid,
-                        error = %err,
-                        "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
-                    );
-                }
-            }
+            Self::restore_one_shared(&gateway, &sid).await;
         }
         let g = gateway.lock().await;
         g.drop_dead_session_routes();
         if let Err(err) = g.persist_routing() {
             tracing::warn!(error = %err, "ccteam-im: failed to persist restored routing");
+        }
+    }
+
+    // ──────────────────── one sid, one body (2026-08-19) ────────────────────
+    //
+    // A session's identity is its sid; its BODY is the vendor process that
+    // carries it right now. The daemon that spawned a stdio body owns its
+    // pipes, so a body that outlives that daemon (graceful stop left it
+    // finishing its turn; a crash orphaned it) is alive but unobservable.
+    // The old restore assumed "every child died with me" and spawned a second
+    // body for every sid — two processes per sid writing into one working
+    // tree (2026-08-19 incident). These methods hold the one rule instead:
+    // never spawn a body for a sid whose recorded body is provably alive;
+    // wait for it, recover what it said, then rebuild by sid.
+
+    /// The body gate — called by `plan_session_rebuild` (every rebuild path)
+    /// BEFORE any reservation. A live body registers the sid as DETACHED and
+    /// refuses with [`GatewayRequestError::SessionBodyDetached`]; a stale
+    /// record (body gone) is cleared and reported for post-mortem recovery;
+    /// no record lets the rebuild through.
+    fn gate_session_body(
+        &mut self,
+        sid: &str,
+        slug: &str,
+        cwd: &Path,
+        role: &str,
+        depth: u32,
+    ) -> Result<BodyGate, GatewayRequestError> {
+        if let Some(detached) = self.detached.get(sid) {
+            // Still tracked: even if the body died a moment ago, the watcher
+            // owns that transition (it recovers + rebuilds + drains), so the
+            // caller queues behind it rather than racing the watcher.
+            return Err(detached.error());
+        }
+        match session_body::probe(cwd, sid) {
+            BodyProbe::Absent => Ok(BodyGate::Clear),
+            BodyProbe::Gone(body) => {
+                session_body::clear(cwd, sid);
+                Ok(BodyGate::PostMortem(body))
+            }
+            BodyProbe::Alive(body) => {
+                let detached = self.register_detached_body(
+                    sid,
+                    slug,
+                    cwd,
+                    body,
+                    role,
+                    depth,
+                    "daemon_restart",
+                );
+                Err(detached.error())
+            }
+        }
+    }
+
+    /// Track a live body this daemon is not driving: remember it, re-arm the
+    /// principal its process is still calling `/mcp` with (the bearer baked
+    /// into the session's own `mcp.json`), record the lifecycle, and wake the
+    /// watcher.
+    #[allow(clippy::too_many_arguments)]
+    fn register_detached_body(
+        &mut self,
+        sid: &str,
+        slug: &str,
+        cwd: &Path,
+        body: SessionBody,
+        role: &str,
+        depth: u32,
+        reason: &'static str,
+    ) -> DetachedBody {
+        if let Some(secret) =
+            ccteam_harness::execution::mcp_config::read_session_mcp_secret(cwd, sid)
+        {
+            self.principals.promote(sid, &secret, slug, role, depth);
+        }
+        let detached = DetachedBody {
+            sid: sid.to_string(),
+            slug: slug.to_string(),
+            cwd: cwd.to_path_buf(),
+            body,
+            since: chrono::Utc::now(),
+            reason,
+        };
+        tracing::info!(
+            session = %sid,
+            slug = %slug,
+            pid = detached.body.pid,
+            reason,
+            "ccteam-im: session body detached — alive from before this daemon; watched, not duplicated"
+        );
+        self.append_progress_event(
+            slug,
+            ccteam_harness::execution::progress_bridge::build_session_body_detached_event(
+                sid,
+                slug,
+                reason,
+                Some(detached.body.pid),
+                None,
+            ),
+        );
+        self.emit_session_lifecycle(sid, slug, "detached", reason);
+        self.detached.insert(sid.to_string(), detached.clone());
+        self.body_watch_notify.notify_one();
+        detached
+    }
+
+    /// Append one durable progress event for `slug` off the hot path.
+    fn append_progress_event(&self, slug: &str, event: serde_json::Value) {
+        let Some(paths) = self.project_paths.as_ref() else {
+            return;
+        };
+        let path = paths.progress_jsonl(slug);
+        let slug = slug.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = ccteam_core::progress::append_event(&path, &event) {
+                tracing::warn!(%slug, %error, "ccteam-im: failed to append progress event");
+            }
+        });
+    }
+
+    /// Broadcast a `session_lifecycle` frame (live web surfaces; no IM
+    /// delivery). The durable twin is the progress event the caller appends.
+    fn emit_session_lifecycle(&self, sid: &str, slug: &str, state: &str, reason: &str) {
+        self.emit_user_signal(GatewayEvent {
+            id: format!(
+                "session-{state}-{sid}-{}",
+                chrono::Utc::now().timestamp_millis()
+            ),
+            channel: String::new(),
+            chat_id: String::new(),
+            thread_ts: None,
+            content: format!("session {state}: {sid}"),
+            kind: GatewayEventKind::SessionLifecycle {
+                state: state.to_string(),
+                reason: reason.to_string(),
+            },
+            attachments: Vec::new(),
+            options: Vec::new(),
+            sid: Some(sid.to_string()),
+            slug: Some(slug.to_string()),
+        });
+    }
+
+    /// The sessions whose body is alive but not driven by this daemon.
+    pub fn detached_bodies(&self) -> Vec<DetachedBody> {
+        self.detached.values().cloned().collect()
+    }
+
+    /// True while `sid`'s body from before a restart is still running.
+    pub fn is_session_detached(&self, sid: &str) -> bool {
+        self.detached.contains_key(sid)
+    }
+
+    /// Daemon shutdown: let go of every live local body WITHOUT stopping it.
+    /// Stdio bodies get stdin EOF (idle ones exit by themselves, busy ones
+    /// finish their turn); their body records stay on disk so the next daemon
+    /// finds them instead of spawning twins. Records the lifecycle for the
+    /// busy ones and returns what each adapter reported.
+    pub async fn detach_all_bodies_for_shutdown(&mut self) -> Vec<(String, DetachOutcome)> {
+        let targets: Vec<(
+            String,
+            String,
+            Arc<dyn HarnessAdapter + Send + Sync>,
+            ThreadHandle,
+        )> = self
+            .sessions
+            .values()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.project.clone(),
+                    Arc::clone(&s.adapter),
+                    s.thread.clone(),
+                )
+            })
+            .collect();
+        let mut outcomes = Vec::with_capacity(targets.len());
+        for (sid, slug, adapter, thread) in targets {
+            let outcome = match adapter.detach_thread(&thread).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(session = %sid, %error, "ccteam-im: detach_thread failed at shutdown");
+                    DetachOutcome::NotApplicable
+                }
+            };
+            if let DetachOutcome::Detached { pid, in_flight } = &outcome {
+                self.append_progress_event(
+                    &slug,
+                    ccteam_harness::execution::progress_bridge::build_session_body_detached_event(
+                        &sid,
+                        &slug,
+                        "daemon_shutdown",
+                        *pid,
+                        Some(*in_flight),
+                    ),
+                );
+            }
+            outcomes.push((sid, outcome));
+        }
+        let busy: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|(sid, o)| match o {
+                DetachOutcome::Detached {
+                    in_flight: true, ..
+                } => Some(sid.as_str()),
+                _ => None,
+            })
+            .collect();
+        tracing::info!(
+            detached = outcomes
+                .iter()
+                .filter(|(_, o)| matches!(o, DetachOutcome::Detached { .. }))
+                .count(),
+            mid_turn = ?busy,
+            "ccteam-im: shutdown let the session bodies go (not killed); the next `ccteam start` \
+             waits for any mid-turn body and recovers what it said"
+        );
+        outcomes
+    }
+
+    /// An EXPLICIT user stop of a detached body (`/stop`, `session_stop`,
+    /// project stop): SIGTERM → grace → SIGKILL, then forget it. Returns
+    /// `Ok(true)` when `sid` was detached and is now stopped; `Ok(false)` when
+    /// `sid` was not detached (the caller continues with its own path).
+    pub(crate) async fn stop_detached_body(&mut self, sid: &str) -> Result<bool> {
+        let Some(detached) = self.detached.remove(sid) else {
+            return Ok(false);
+        };
+        self.principals.forget(sid);
+        let body = detached.body.clone();
+        let sid_owned = sid.to_string();
+        let stopped = tokio::task::spawn_blocking(move || {
+            session_body::terminate(&body, &sid_owned, std::time::Duration::from_secs(5))
+        })
+        .await
+        .context("join body terminate")??;
+        session_body::clear(&detached.cwd, sid);
+        self.append_progress_event(
+            &detached.slug,
+            ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
+                sid,
+                &detached.slug,
+                "stopped",
+                detached.body.pid,
+                false,
+            ),
+        );
+        self.emit_session_lifecycle(sid, &detached.slug, "stopped", "user");
+        self.current_session
+            .write()
+            .unwrap()
+            .retain(|_, v| v != sid);
+        self.persist_routing()?;
+        tracing::info!(session = %sid, pid = detached.body.pid, stopped, "ccteam-im: detached body stopped by user");
+        Ok(true)
+    }
+
+    /// Queue a turn behind a detached body (the session is not driveable
+    /// until its body exits): the text goes into the session's file-backed
+    /// FIFO, which the watcher drains the moment the rebuilt session is live.
+    /// Returns the receipt line the caller shows and the synthetic turn id.
+    fn queue_behind_detached_body(
+        &self,
+        sid: &str,
+        text: &str,
+        reply_to: &ChatKey,
+        literal: bool,
+        internal: bool,
+    ) -> Result<(String, String)> {
+        let Some(detached) = self.detached.get(sid) else {
+            return Err(anyhow!("session {sid} is not detached"));
+        };
+        crate::pending_turns::enqueue_pending_turn(
+            &detached.cwd,
+            sid,
+            text,
+            Some(reply_to.channel.clone()),
+            literal,
+            internal,
+        )?;
+        let queued = crate::pending_turns::pending_turn_count(&detached.cwd, sid);
+        let since = detached.since.to_rfc3339();
+        let receipt = format!(
+            "⏳ {sid} is still finishing a turn that started before ccteam restarted \
+             (body pid {}, unobserved since {}). Your message is queued (#{queued}) and will be \
+             delivered as soon as that turn ends; `/stop` ends it now.",
+            detached.body.pid, since
+        );
+        Ok((receipt, format!("queued-behind-body:{sid}:{queued}")))
+    }
+
+    /// Wall-clock cadence of the body watcher between wake-ups.
+    const BODY_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The body watcher — the daemon's ONLY mover of detached sids. Every
+    /// tick (or on wake): re-verify each detached body against the OS; a body
+    /// that exited is recovered (what it said, from the vendor's own record),
+    /// reported (reply target + delegation parent), rebuilt by sid, and its
+    /// queued turns drained. Post-mortems for bodies found already gone at
+    /// rebuild time run here too. Never returns.
+    pub async fn run_body_watcher(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let notify = Arc::clone(&gateway.lock().await.body_watch_notify);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Self::BODY_WATCH_INTERVAL) => {}
+                _ = notify.notified() => {}
+            }
+            Self::body_watch_tick(&gateway).await;
+        }
+    }
+
+    /// One pass of the body watcher (what [`Self::run_body_watcher`] does per
+    /// wake-up): post-mortems first, then every detached body re-verified.
+    /// Public so a test — or a daemon that wants to flush before reporting —
+    /// can drive it deterministically.
+    pub async fn body_watch_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) {
+        let (detached, post_mortems) = {
+            let mut g = gateway.lock().await;
+            (
+                g.detached.values().cloned().collect::<Vec<_>>(),
+                std::mem::take(&mut g.post_mortem_pending),
+            )
+        };
+        for (sid, slug, cwd, body) in post_mortems {
+            Self::recover_and_report_shared(gateway, &sid, &slug, &cwd, body.pid, "exited").await;
+        }
+        for d in detached {
+            // Off the lock: a pure OS probe.
+            if session_body::body_is_alive(&d.body, &d.sid) {
+                continue;
+            }
+            Self::on_detached_body_exited_shared(gateway, d).await;
+        }
+    }
+
+    /// A detached body exited on its own: forget it, recover + report what it
+    /// said, rebuild the session by sid, drain the turns that queued behind it.
+    async fn on_detached_body_exited_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        d: DetachedBody,
+    ) {
+        {
+            let mut g = gateway.lock().await;
+            if g.detached.remove(&d.sid).is_none() {
+                // Stopped by a user between the snapshot and now.
+                return;
+            }
+            session_body::clear(&d.cwd, &d.sid);
+        }
+        tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
+        Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, "exited")
+            .await;
+        Self::restore_one_shared(gateway, &d.sid).await;
+        let mut g = gateway.lock().await;
+        if g.sessions.contains_key(&d.sid) {
+            g.emit_session_lifecycle(&d.sid, &d.slug, "resumed", "body_exited");
+            if let Err(error) = g.persist_routing() {
+                tracing::warn!(%error, "ccteam-im: persist routing after body exit failed");
+            }
+            g.drain_and_dispatch_pending_turns(&d.sid).await;
+        }
+    }
+
+    /// Recover what `sid`'s body said while unobserved (vendor record via the
+    /// adapter), then report it exactly where the live path would have: the
+    /// turns mirror, the session's reply target, the delegation parent. When
+    /// nothing can be recovered but a prompt was left unanswered, say so
+    /// honestly instead of leaving a hole. Returns whether an answer was
+    /// recovered.
+    async fn recover_and_report_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        slug: &str,
+        cwd: &Path,
+        pid: u32,
+        reason: &str,
+    ) -> bool {
+        // IO off the lock: the mirror tells us where observation stopped.
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(cwd, sid).unwrap_or_default();
+        let Ok(mut meta) = ccteam_harness::read_session_meta(cwd, sid) else {
+            return false;
+        };
+        let observed_until = turns
+            .last()
+            .map(|t| t.ts)
+            .or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(&meta.created_at)
+                    .ok()
+                    .map(|t| t.with_timezone(&chrono::Utc))
+            })
+            .unwrap_or_else(chrono::Utc::now);
+        let last_observed_assistant = turns
+            .iter()
+            .rev()
+            .find(|t| !t.assistant.is_empty())
+            .map(|t| t.assistant.clone());
+        // A trailing user-only row = a prompt ccteam delivered but never saw
+        // answered: the turn that ran unobserved.
+        let open_prompt = turns
+            .last()
+            .filter(|t| t.assistant.is_empty() && t.outcome.is_none() && !t.user.is_empty())
+            .map(|t| t.user.clone());
+        let (adapter, reply_to, delegation_tx) = {
+            let g = gateway.lock().await;
+            let adapter = (g.adapter_factory)(meta.vendor, meta.protocol);
+            let reply_to = g
+                .sessions
+                .get(sid)
+                .and_then(|s| s.reply_to.lock().ok().map(|c| c.clone()))
+                .or_else(|| g.tenant_project_owner_reply_target(slug))
+                .or_else(|| {
+                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
+                })
+                .unwrap_or_else(web_api_chat);
+            (adapter, reply_to, g.delegation_tx.clone())
+        };
+        let recovered = adapter
+            .recover_unobserved_turn(&UnobservedTurnCtx {
+                sid: sid.to_string(),
+                slug: slug.to_string(),
+                cwd: cwd.to_path_buf(),
+                vendor_uuid: meta.vendor_uuid.clone(),
+                observed_until,
+                last_observed_assistant,
+            })
+            .await;
+        if recovered.is_none() && open_prompt.is_none() {
+            // Nothing ran unobserved (an idle body) — nothing to report, and
+            // the lifecycle row still closes the detached window.
+            let g = gateway.lock().await;
+            g.append_progress_event(
+                slug,
+                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
+                    sid, slug, reason, pid, false,
+                ),
+            );
+            return false;
+        }
+        let now = chrono::Utc::now();
+        let turn_id = format!("{sid}-recovered-{}", now.timestamp_millis());
+        let (text, record, content, vendor_error) = match recovered.as_ref() {
+            Some(turn) => (
+                turn.assistant.clone(),
+                ccteam_harness::execution::turns_mirror::TurnRecord {
+                    turn_id: turn_id.clone(),
+                    ts: now,
+                    vendor: vendor_str(meta.vendor).to_string(),
+                    role: meta.role.clone(),
+                    user: String::new(),
+                    assistant: turn.assistant.clone(),
+                    usage: turn.usage.clone(),
+                    tool_calls: Vec::new(),
+                    attachments: Vec::new(),
+                    outcome: None,
+                    error_kind: None,
+                    error: None,
+                },
+                format!(
+                    "↩️ {sid} finished this turn while ccteam was restarting; its answer was \
+                     recovered from the vendor's own record:\n\n{}",
+                    turn.assistant
+                ),
+                false,
+            ),
+            None => {
+                let note = format!(
+                    "⚠️ {sid}'s turn ended while ccteam was restarting and its answer could not \
+                     be recovered (the vendor keeps no record ccteam may read). The session's \
+                     own context is intact — send a follow-up and it will report what it did."
+                );
+                (
+                    note.clone(),
+                    ccteam_harness::execution::turns_mirror::TurnRecord {
+                        turn_id: turn_id.clone(),
+                        ts: now,
+                        vendor: vendor_str(meta.vendor).to_string(),
+                        role: meta.role.clone(),
+                        user: String::new(),
+                        assistant: String::new(),
+                        usage: serde_json::Value::Null,
+                        tool_calls: Vec::new(),
+                        attachments: Vec::new(),
+                        outcome: Some("unobserved".to_string()),
+                        error_kind: Some("body_unobserved".to_string()),
+                        error: Some(note),
+                    },
+                    String::new(),
+                    true,
+                )
+            }
+        };
+        let content = if content.is_empty() {
+            text.clone()
+        } else {
+            content
+        };
+        if let Err(error) = ccteam_harness::execution::turns_mirror::append_turn(cwd, sid, &record)
+        {
+            tracing::warn!(session = %sid, %error, "ccteam-im: failed to mirror the recovered turn");
+        }
+        if recovered.is_some() {
+            meta.turn_count = meta.turn_count.saturating_add(1);
+            meta.last_active = now.to_rfc3339();
+            if let Some(usage) = recovered.as_ref().map(|t| &t.usage) {
+                let total: u64 = [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                ]
+                .iter()
+                .filter_map(|k| usage.get(*k).and_then(|v| v.as_u64()))
+                .sum();
+                if total > 0 {
+                    meta.tokens_total = Some(meta.tokens_total.unwrap_or(0) + total);
+                }
+            }
+        }
+        {
+            let g = gateway.lock().await;
+            if let Err(error) = g.persist_session_meta(cwd, &meta) {
+                tracing::warn!(session = %sid, %error, "ccteam-im: failed to persist meta after recovery");
+            }
+            g.append_progress_event(
+                slug,
+                ccteam_harness::execution::progress_bridge::build_session_body_exited_event(
+                    sid,
+                    slug,
+                    reason,
+                    pid,
+                    recovered.is_some(),
+                ),
+            );
+            g.emit_user_signal(GatewayEvent {
+                id: format!("gateway-recovered-{turn_id}"),
+                channel: reply_to.channel.clone(),
+                chat_id: reply_to.chat_id.clone(),
+                thread_ts: None,
+                content,
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: Vec::new(),
+                sid: Some(sid.to_string()),
+                slug: Some(slug.to_string()),
+            });
+        }
+        // The delegation parent (if any) gets its completion notification from
+        // the same boundary signal the live pump would have sent — it must not
+        // keep waiting on a turn that already ended.
+        if let Some(dtx) = delegation_tx {
+            let _ = dtx.send(crate::delegation::DelegationSignal {
+                child_sid: sid.to_string(),
+                turn_id: turn_id.clone(),
+                tail: text,
+                vendor: meta.vendor,
+                host: meta.host.clone(),
+                boundary: true,
+                vendor_error,
+                interim_notes: 0,
+                covered_turns: vec![turn_id],
+            });
+        }
+        tracing::info!(session = %sid, recovered = recovered.is_some(), "ccteam-im: unobserved turn reported");
+        recovered.is_some()
+    }
+
+    /// Rebuild ONE sid from its meta.json with the lock held only around the
+    /// plan and the apply (the spawn runs unlocked) — the batch restore's loop
+    /// body, also used by the body watcher after a body exits. A typed
+    /// detached refusal is an info (the watcher keeps it); anything else warns.
+    async fn restore_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
+        let plan_and_reply = {
+            let mut g = gateway.lock().await;
+            if g.sessions.contains_key(sid) {
+                None
+            } else {
+                match g.find_meta_for_sid(sid) {
+                    Ok((slug, cwd, meta)) => {
+                        let reply_to = g
+                            .tenant_project_owner_reply_target(&slug)
+                            .or_else(|| {
+                                ChatKey::from_identity(&meta.owner)
+                                    .map(|owner| reply_target_for_owner(&owner))
+                            })
+                            .unwrap_or_else(web_api_chat);
+                        match g.plan_session_rebuild(&slug, cwd, &meta, &reply_to) {
+                            Ok(plan) => Some((plan, reply_to)),
+                            Err(err) if is_body_detached_error(&err) => {
+                                tracing::info!(
+                                    session = %sid,
+                                    "ccteam-im: restore deferred; the session's body from before the restart is still running (watched, not duplicated)"
+                                );
+                                None
+                            }
+                            Err(err) => {
+                                tracing::warn!(session = %sid, error = %err, "ccteam-im: restore skipped; project host binding changed");
+                                None
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
+                        None
+                    }
+                }
+            }
+        };
+        let Some((plan, reply_to)) = plan_and_reply else {
+            return;
+        };
+        // Spawn OUTSIDE the lock — the slow part.
+        match Self::spawn_for_plan(&plan).await {
+            Ok(thread) => {
+                if let Err(err) = gateway
+                    .lock()
+                    .await
+                    .apply_rebuilt_session(plan, thread, reply_to, false)
+                    .await
+                {
+                    tracing::warn!(session = %sid, error = %err, "ccteam-im: stale restored session discarded");
+                }
+            }
+            Err(err) => {
+                let sid_owned = plan.sid.clone();
+                gateway.lock().await.forget_principal(&sid_owned);
+                tracing::warn!(
+                    session = %sid_owned,
+                    error = %err,
+                    "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
+                );
+            }
         }
     }
 
@@ -3007,15 +3730,25 @@ impl Gateway {
                     })?
                     .to_string();
                 // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
+                // A detached body (alive from before a restart) is stoppable
+                // through the same gate, resolved from its meta.json owner.
                 let accessible = self
                     .sessions
                     .get(&sid)
                     .map(|s| self.chat_can_access(chat, s))
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| {
+                        self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
+                    });
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
+                let was_detached = self.is_session_detached(&sid);
                 self.stop_session(&sid).await?;
+                if was_detached {
+                    return Ok(Some(format!(
+                        "stopped session {sid} (its body from before the restart was ended)"
+                    )));
+                }
                 Ok(Some(format!("stopped session {sid}")))
             }
             "/interrupt" => {
@@ -4543,6 +5276,11 @@ impl Gateway {
             {
                 Ok(SubmitResult::Turn { id, .. }) => ids.push(id),
                 Ok(SubmitResult::Directive(_)) => {}
+                Ok(SubmitResult::Queued { id, .. }) => {
+                    // The body came back between drain and submit (rare);
+                    // the turn is back in the FIFO, not lost.
+                    tracing::info!(sid = %session_id, %id, "pending turn re-queued behind a detached body");
+                }
                 Err(e) => {
                     tracing::warn!(
                         sid = %session_id,
@@ -6241,7 +6979,7 @@ impl Gateway {
             )
             .await?
         {
-            SubmitResult::Turn { .. } => Ok(()),
+            SubmitResult::Turn { .. } | SubmitResult::Queued { .. } => Ok(()),
             SubmitResult::Directive(_) => Err(anyhow!("scheduled body was parsed as a directive")),
         }
     }
@@ -6436,6 +7174,7 @@ impl Gateway {
         {
             SubmitResult::Directive(replies) => Ok(replies),
             SubmitResult::Turn { drained, .. } => Ok(drained),
+            SubmitResult::Queued { receipt, .. } => Ok(vec![receipt]),
         }
     }
 
@@ -6877,7 +7616,21 @@ impl Gateway {
         // it exactly as the in-map dead-child case below does (and symmetric with
         // the web turn / MCP dispatch, which funnel through this same core). Err
         // (→ caller) for a genuinely unknown sid; a no-op when already in the map.
-        self.cold_resume_absent_sid(session_id, chat).await?;
+        // One sid, one body: a session whose body from before a restart is
+        // still running is not driveable yet — the text queues behind it.
+        if let Err(err) = self.cold_resume_absent_sid(session_id, chat).await {
+            if is_body_detached_error(&err) {
+                let (receipt, id) = self.queue_behind_detached_body(
+                    session_id,
+                    &payload,
+                    chat,
+                    literal_user_text,
+                    origin == TurnOrigin::Internal,
+                )?;
+                return Ok(SubmitResult::Queued { receipt, id });
+            }
+            return Err(err);
+        }
         // v0.8.24 F5 — if the child is not live (starting/resuming/dead),
         // enqueue the user text (FIFO, file-backed) and revive; drain after
         // live so turns are not lost. Gateway remains the sole turns writer
@@ -8092,10 +8845,15 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
-        if visible.is_empty() {
-            if is_web {
-                return "no sessions".to_string();
-            }
+        let detached_here = self
+            .detached
+            .values()
+            .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
+            .count();
+        if visible.is_empty() && is_web {
+            return "no sessions".to_string();
+        }
+        if visible.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
                 return format!(
                     "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
@@ -8235,6 +8993,25 @@ impl Gateway {
             }
         }
         let mut out = format!("📁 当前项目: {cur}\n{}", tree_rows.join("\n"));
+        // One sid, one body: sessions whose body from before a restart is still
+        // finishing its turn are real and this chat's — list them, say what
+        // they are, and name the two things that can be done about them.
+        let detached_rows: Vec<String> = self
+            .detached
+            .values()
+            .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
+            .map(|d| {
+                format!(
+                    "⏳ {} detached — finishing a turn from before the ccteam restart (pid {}); \
+                     messages queue behind it, /stop {} ends it now",
+                    d.sid, d.body.pid, d.sid
+                )
+            })
+            .collect();
+        if !detached_rows.is_empty() {
+            out.push('\n');
+            out.push_str(&detached_rows.join("\n"));
+        }
         if elsewhere > 0 {
             out.push_str(&format!(
                 "\n↓ 其他项目还有 {elsewhere} 个会话 → /sessions all"
@@ -8777,6 +9554,7 @@ impl Gateway {
                     // Every row of the live map is by definition a session
                     // ccteam holds a thread for.
                     driveable: true,
+                    detached: None,
                 }
             })
             .collect();
@@ -8786,6 +9564,13 @@ impl Gateway {
         // hand-started client because it is merged HERE and nowhere else — so a
         // new consumer inherits it instead of having to remember a second map.
         views.extend(self.external_nodes.values().map(external_node_view));
+        // Detached bodies (2026-08-19): the session is real and alive — just
+        // not driven from here until its body exits. Merged HERE for the same
+        // reason external nodes are: every consumer inherits the row.
+        views.extend(self.detached.values().map(|d| {
+            let meta = self.session_catalog.get(&d.sid).map(|entry| entry.meta);
+            detached_body_view(d, meta.as_ref(), &current)
+        }));
         views.sort_by(|a, b| {
             b.last_active
                 .cmp(&a.last_active)
@@ -11137,14 +11922,33 @@ impl Gateway {
             }
         };
         if let Some(identity) = absent_resume_identity {
-            Self::resume_stopped_session_shared(
+            if let Err(err) = Self::resume_stopped_session_shared(
                 Arc::clone(&gateway),
                 sid,
                 &identity,
                 None,
                 deadline,
             )
-            .await?;
+            .await
+            {
+                if is_body_detached_error(&err) {
+                    // One sid, one body: queue behind the detached body and
+                    // tell the caller (receipt over the session's SSE, handle
+                    // back to the API/MCP caller).
+                    let guard = deadline.lock(&gateway).await?;
+                    let reply_to = ChatKey::from_identity(&identity).unwrap_or_else(web_api_chat);
+                    let (receipt, id) = guard.queue_behind_detached_body(
+                        sid,
+                        &text,
+                        &reply_to,
+                        false,
+                        origin == TurnOrigin::Internal,
+                    )?;
+                    guard.emit_sid_answer(sid, 0, receipt);
+                    return Ok(id);
+                }
+                return Err(err);
+            }
         }
 
         if let Some(directive) = parse_session_directive(&text) {
@@ -11588,6 +12392,12 @@ impl Gateway {
                 }
                 Ok(format!("directive:{sid}"))
             }
+            // Queued behind a detached body: the receipt goes over SSE like a
+            // directive receipt; the caller gets the queue handle.
+            SubmitResult::Queued { receipt, id } => {
+                self.emit_sid_answer(sid, 0, receipt);
+                Ok(id)
+            }
         }
     }
 
@@ -11721,6 +12531,12 @@ impl Gateway {
     /// `close_thread` is tolerated (adapter close is idempotent). Never
     /// file-purges — deregister-only, per the locked W5b decision.
     pub async fn stop_session(&mut self, sid: &str) -> Result<()> {
+        // A body that outlived the previous daemon is not in the live map but
+        // IS this sid's body: an explicit stop ends it (the one case the daemon
+        // signals such a process — on the user's word, never on its own).
+        if self.stop_detached_body(sid).await? {
+            return Ok(());
+        }
         let session = self
             .sessions
             .get(sid)
@@ -11912,6 +12728,62 @@ fn vendor_str(v: AgentVendor) -> &'static str {
 /// process), and `status` is never `working` — the only liveness ccteam has is
 /// when the client last spoke to `/mcp`, mirrored into `last_active`, so the row
 /// says `idle` and puts the honest silence in `last_activity_seconds`.
+/// The row a detached body contributes to [`Gateway::session_views`]:
+/// `status: "detached"`, `driveable: false`, the body facts in `detached`.
+fn detached_body_view(
+    d: &DetachedBody,
+    meta: Option<&SessionMeta>,
+    current: &std::collections::HashSet<String>,
+) -> SessionView {
+    let m = |f: &dyn Fn(&SessionMeta) -> String| meta.map(f).unwrap_or_default();
+    SessionView {
+        sid: d.sid.clone(),
+        project: d.slug.clone(),
+        role: m(&|m| m.role.clone()),
+        vendor: meta
+            .map(|m| vendor_str(m.vendor).to_string())
+            .unwrap_or_default(),
+        permission_mode: meta
+            .map(|m| m.permission_mode.as_str().to_string())
+            .unwrap_or_default(),
+        protocol: meta
+            .map(|m| m.protocol.as_str().to_string())
+            .unwrap_or_default(),
+        host: meta
+            .map(|m| {
+                if m.host.is_empty() {
+                    "local".to_string()
+                } else {
+                    m.host.clone()
+                }
+            })
+            .unwrap_or_else(|| "local".to_string()),
+        current: current.contains(&d.sid),
+        status: "detached".to_string(),
+        last_activity_seconds: None,
+        created_at: m(&|m| m.created_at.clone()),
+        last_active: m(&|m| m.last_active.clone()),
+        title: meta.and_then(|m| m.title.clone()),
+        turn_count: meta.map(|m| m.turn_count).unwrap_or(0),
+        cost_usd: meta.and_then(|m| m.cost_usd),
+        tokens_total: meta.and_then(|m| m.tokens_total),
+        model: meta.and_then(|m| m.model.clone().or_else(|| m.observed_model.clone())),
+        waiting_approval: false,
+        parent_sid: meta.and_then(|m| m.parent_sid.clone()),
+        delegation_depth: meta.map(|m| m.delegation_depth).unwrap_or(0),
+        driveable: false,
+        detached: Some(d.view()),
+    }
+}
+
+/// `anyhow` downcast for the body gate's typed refusal.
+fn is_body_detached_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<GatewayRequestError>(),
+        Some(GatewayRequestError::SessionBodyDetached { .. })
+    )
+}
+
 fn external_node_view(meta: &SessionMeta) -> SessionView {
     let silent_seconds = chrono::DateTime::parse_from_rfc3339(&meta.last_active)
         .ok()
@@ -11948,6 +12820,7 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
         parent_sid: meta.parent_sid.clone(),
         delegation_depth: meta.delegation_depth,
         driveable: false,
+        detached: None,
     }
 }
 
@@ -13080,6 +13953,12 @@ enum SubmitResult {
     /// (handed to `session_dispatch` for `session_collect{since}`); `drained`
     /// is the sink-less drained answer (empty in production — answers stream).
     Turn { id: String, drained: Vec<String> },
+    /// 2026-08-19 (one sid, one body) — the text was QUEUED behind the
+    /// session's detached body (alive from before a daemon restart, not
+    /// driveable until it exits). `receipt` tells the user so; `id` is the
+    /// synthetic `queued-behind-body:<sid>:<n>` handle. The body watcher
+    /// drains the queue the moment the rebuilt session is live.
+    Queued { receipt: String, id: String },
 }
 
 /// Parse a single-line `/command [args]` into a neutral [`Directive`].
@@ -14056,6 +14935,294 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("external"), "got: {err}");
         assert!(!restarted.is_session_live(&node), "nothing was spawned");
+    }
+
+    // ─────────────── one sid, one body (2026-08-19) ───────────────
+
+    /// Spawn a `sleep` carrying `CCTEAM_CHAT_SID=<sid>` and record it as the
+    /// sid's body: a process that "outlived the previous daemon".
+    fn plant_body(project_dir: &std::path::Path, sid: &str) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .env(ccteam_harness::execution::session_body::BODY_SID_ENV, sid)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        ccteam_harness::execution::session_body::record(project_dir, sid, Some(child.id()), "test")
+            .unwrap();
+        child
+    }
+
+    fn body_gone(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The restore after a daemon restart finds the session's body still
+    /// running: it does NOT spawn a twin (zero `start_thread`), keeps the chat's
+    /// focus on the sid, lists it as `detached`, queues a turn behind it, and —
+    /// once the body has exited — rebuilds the session by sid and drains the
+    /// queue on the very next watcher tick.
+    #[tokio::test]
+    async fn restart_waits_for_a_live_body_instead_of_spawning_a_twin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let chat = web_api_chat();
+
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            gateway.enable_persistence(tmp.path()).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+            gateway
+                .current_session
+                .write()
+                .unwrap()
+                .insert(chat.clone(), sid.clone());
+            gateway.persist_routing().unwrap();
+        }
+        // The previous daemon is gone; its body is not.
+        let mut child = plant_body(&project_dir, &sid);
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        assert_eq!(restarted.restore_pending, vec![sid.clone()]);
+        restarted.resume_restored_sessions().await;
+
+        assert!(!restarted.is_session_live(&sid), "no twin is spawned");
+        assert!(restarted.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0, "zero start_thread");
+        assert_eq!(
+            restarted.current_session.read().unwrap().get(&chat),
+            Some(&sid),
+            "the chat keeps its focus on the detached sid"
+        );
+        let views = restarted.session_views();
+        let row = views.iter().find(|v| v.sid == sid).expect("listed");
+        assert_eq!(row.status, "detached");
+        assert!(!row.driveable);
+        assert_eq!(row.detached.as_ref().map(|d| d.pid), Some(child.id()));
+
+        // A turn queues behind the body instead of spawning.
+        let id = restarted
+            .submit_to_sid(&sid, "hello after restart".into())
+            .await
+            .unwrap();
+        assert!(id.starts_with("queued-behind-body:"), "got {id}");
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            1
+        );
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 0, "still no twin");
+        // The IM leg gets the receipt as its reply.
+        let replies = restarted
+            .submit_to_current(&chat, "", "second message".into())
+            .await
+            .unwrap();
+        assert!(
+            replies.iter().any(|r| r.contains("queued")),
+            "receipt explains the queue: {replies:?}"
+        );
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            2
+        );
+        // A directive cannot run on a detached body — a readable refusal.
+        let err = restarted
+            .submit_to_sid(&sid, "/model opus".into())
+            .await
+            .unwrap_err();
+        assert!(is_body_detached_error(&err), "got {err}");
+
+        // The body exits; the watcher rebuilds by sid and drains the queue.
+        body_gone(&mut child);
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        Gateway::body_watch_tick(&gateway).await;
+        let g = gateway.lock().await;
+        assert!(
+            g.is_session_live(&sid),
+            "rebuilt by sid after the body exited"
+        );
+        assert!(!g.is_session_detached(&sid));
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1, "exactly one body");
+        assert_eq!(
+            crate::pending_turns::pending_turn_count(&project_dir, &sid),
+            0,
+            "queue drained into the rebuilt session"
+        );
+        let submitted: Vec<String> = fake
+            .submissions
+            .lock()
+            .await
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect();
+        assert_eq!(
+            submitted,
+            vec![
+                "hello after restart".to_string(),
+                "second message".to_string()
+            ]
+        );
+        assert_eq!(
+            ccteam_harness::execution::session_body::probe(&project_dir, &sid),
+            ccteam_harness::execution::session_body::BodyProbe::Absent,
+            "the old record is gone; the new body's record is the fake's business"
+        );
+    }
+
+    /// `/stop` / `session_stop` / project stop on a detached sid ENDS the body
+    /// (the one case the daemon signals such a process — on the user's word)
+    /// and forgets it; the sid is then a plain stopped session.
+    #[tokio::test]
+    async fn explicit_stop_ends_a_detached_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            gateway.enable_persistence(tmp.path()).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+        }
+        let mut child = plant_body(&project_dir, &sid);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.resume_restored_sessions().await;
+        assert!(restarted.is_session_detached(&sid));
+        let pid = child.id();
+
+        restarted.stop_session(&sid).await.unwrap();
+        assert!(!restarted.is_session_detached(&sid));
+        assert!(!restarted.is_session_live(&sid));
+        // The process is gone (reap it so the assertion is about the kill,
+        // not a zombie).
+        let status = child.wait().expect("stopped body is waitable");
+        assert!(
+            !status.success() || status.code().is_none(),
+            "signalled: {status:?}"
+        );
+        assert!(!ccteam_harness::execution::session_body::body_is_alive(
+            &ccteam_harness::execution::session_body::SessionBody {
+                pid,
+                fingerprint: String::new(),
+                adapter: String::new(),
+                recorded_at: String::new(),
+            },
+            &sid
+        ));
+        assert_eq!(
+            ccteam_harness::execution::session_body::probe(&project_dir, &sid),
+            ccteam_harness::execution::session_body::BodyProbe::Absent
+        );
+        // A later turn cold-resumes the sid like any stopped session (a fresh
+        // body, no queue).
+        let id = restarted
+            .submit_to_sid(&sid, "after stop".into())
+            .await
+            .unwrap();
+        assert!(!id.starts_with("queued-behind-body:"), "got {id}");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+    }
+
+    /// A body record whose process is already GONE at restore time means the
+    /// body finished (or died) while no daemon was watching. The session is
+    /// rebuilt at once; the watcher's post-mortem then reports the unanswered
+    /// prompt honestly (the fake vendor keeps no recoverable record): an
+    /// `unobserved` row in the mirror, an Answer to the reply target, and a
+    /// boundary signal so a delegation parent does not keep waiting.
+    #[tokio::test]
+    async fn stale_body_record_reports_the_unobserved_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let sid;
+        {
+            let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+            let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+            gateway.enable_persistence(tmp.path()).unwrap();
+            sid = spawn_managed(&mut gateway).await;
+        }
+        // The prompt ccteam delivered but never saw answered.
+        ccteam_harness::execution::turns_mirror::append_turn(
+            &project_dir,
+            &sid,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: "t-open".into(),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: "finish the task".into(),
+                assistant: String::new(),
+                usage: serde_json::Value::Null,
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                outcome: None,
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
+        // A body that already exited unobserved.
+        let mut child = plant_body(&project_dir, &sid);
+        body_gone(&mut child);
+
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
+        restarted.set_delegation_notifier_tx(dtx);
+        let mut events = restarted.subscribe_events();
+        restarted.resume_restored_sessions().await;
+        assert!(
+            restarted.is_session_live(&sid),
+            "rebuilt at once: nothing to wait for"
+        );
+        assert!(!restarted.is_session_detached(&sid));
+        assert_eq!(restarted.post_mortem_pending.len(), 1);
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
+        Gateway::body_watch_tick(&gateway).await;
+        assert!(gateway.lock().await.post_mortem_pending.is_empty());
+
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid).unwrap();
+        let last = turns.last().expect("a post-mortem row");
+        assert_eq!(last.outcome.as_deref(), Some("unobserved"));
+        assert_eq!(last.error_kind.as_deref(), Some("body_unobserved"));
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let ev = events.recv().await.expect("broadcast open");
+                if matches!(ev.kind, GatewayEventKind::Answer) && ev.sid.as_deref() == Some(&sid) {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the reply target is told");
+        assert!(
+            answer.content.contains("could not be recovered"),
+            "{}",
+            answer.content
+        );
+
+        let signal = drx
+            .try_recv()
+            .expect("boundary signal for the delegation notifier");
+        assert_eq!(signal.child_sid, sid);
+        assert!(signal.boundary);
+        assert!(
+            signal.vendor_error,
+            "an unanswered task is reported as not-ok"
+        );
     }
 
     /// Seed a `.claude/agents/<role>.md` under `project_dir` so the `/role`

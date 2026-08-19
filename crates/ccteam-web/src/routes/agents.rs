@@ -572,6 +572,7 @@ mod tests {
             "s1".to_string(),
             SessionView {
                 driveable: true,
+                detached: None,
                 sid: "s1".to_string(),
                 project: "demo".to_string(),
                 role: "brain".to_string(),
@@ -634,6 +635,7 @@ mod tests {
             "s1".to_string(),
             SessionView {
                 driveable: true,
+                detached: None,
                 sid: "s1".to_string(),
                 project: "demo".to_string(),
                 role: "brain".to_string(),

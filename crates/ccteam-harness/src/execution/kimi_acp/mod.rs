@@ -81,9 +81,9 @@ use crate::execution::claude_common::unique_prompt_token;
 use crate::execution::session_meta::read_session_meta;
 use crate::execution::session_status::read_status_file;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadHandle,
-    ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, DetachOutcome, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent,
+    ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use protocol::{
@@ -552,7 +552,14 @@ impl HarnessAdapter for KimiAcpAdapter {
         let (transport, session_id, info) = match try_resume {
             Some(uuid) => {
                 let transport = AcpTransport::spawn_for_session(
-                    &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                    &program,
+                    &args,
+                    &cwd,
+                    &envs,
+                    inbound,
+                    &ctx.sid,
+                    &ctx.project_dir,
+                    KIMI_ACP_ADAPTER_NAME,
                 )
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
@@ -567,7 +574,14 @@ impl HarnessAdapter for KimiAcpAdapter {
                         );
                         let _ = transport.shutdown().await;
                         let transport = AcpTransport::spawn_for_session(
-                            &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                            &program,
+                            &args,
+                            &cwd,
+                            &envs,
+                            inbound,
+                            &ctx.sid,
+                            &ctx.project_dir,
+                            KIMI_ACP_ADAPTER_NAME,
                         )
                         .await
                         .map_err(|e| {
@@ -582,7 +596,14 @@ impl HarnessAdapter for KimiAcpAdapter {
             }
             None => {
                 let transport = AcpTransport::spawn_for_session(
-                    &program, &args, &cwd, &envs, inbound, &ctx.sid,
+                    &program,
+                    &args,
+                    &cwd,
+                    &envs,
+                    inbound,
+                    &ctx.sid,
+                    &ctx.project_dir,
+                    KIMI_ACP_ADAPTER_NAME,
                 )
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn kimi acp: {e}")))?;
@@ -728,6 +749,35 @@ impl HarnessAdapter for KimiAcpAdapter {
                 "kimi cold resume of {persistent_id} needs project cwd — rebuild via start_thread (rebuild_session_from_meta)"
             ),
         })
+    }
+
+    /// Daemon shutdown: let go of the local ACP child without stopping it
+    /// (stdin EOF + no kill; the body record stays for the next daemon).
+    async fn detach_thread(&self, h: &ThreadHandle) -> Result<DetachOutcome, HarnessError> {
+        let live = {
+            let mut map = self
+                .live
+                .lock()
+                .map_err(|_| HarnessError::Io("live map poisoned".into()))?;
+            map.remove(&h.identity)
+        };
+        let Some(live) = live else {
+            return Ok(DetachOutcome::NotApplicable);
+        };
+        let in_flight = live
+            .state
+            .lock()
+            .map(|state| state.buffer.is_some() || state.vendor_started_buffer.is_some())
+            .unwrap_or(false);
+        let pid = live.transport.detach().await;
+        tracing::info!(
+            sid = %live.sid,
+            slug = %live.slug,
+            ?pid,
+            in_flight,
+            "kimi-acp: body detached (left running; record kept for the next daemon)"
+        );
+        Ok(DetachOutcome::Detached { pid, in_flight })
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {

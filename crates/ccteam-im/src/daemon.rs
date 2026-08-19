@@ -522,6 +522,15 @@ where
         let _ = restore_complete_tx.send(true);
         Gateway::run_scheduled_scheduler(restore_gateway).await;
     });
+    // One sid, one body (2026-08-19) — the body watcher: a session whose
+    // process outlived the previous daemon is WAITED for (never duplicated,
+    // never killed by the daemon); once it exits, what it said is recovered
+    // and the session is rebuilt by sid. Runs for the daemon's whole life —
+    // a detached body can also be found later, on first touch.
+    let body_watch_gateway = Arc::clone(&gateway);
+    let body_watcher = tokio::spawn(async move {
+        Gateway::run_body_watcher(body_watch_gateway).await;
+    });
     // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
     // notifications missed while the daemon was down) + live delivery of every
     // completed watched child turn. Owns its own gateway handle + the pump
@@ -640,6 +649,13 @@ where
     inbound_consumer.abort();
     gateway_event_consumer.abort();
     scheduled_scheduler.abort();
+    body_watcher.abort();
+    // One sid, one body: let every live local body go WITHOUT stopping it —
+    // stdin EOF (an idle body exits by itself, a busy one finishes its turn),
+    // no kill, body records kept — so the next daemon finds the bodies
+    // instead of spawning twins. Before the pumps are aborted: the adapters
+    // close their streams here and the pumps end on their own.
+    gateway.lock().await.detach_all_bodies_for_shutdown().await;
     // Per-session event pumps are gateway-owned tasks. `Drop for Gateway`
     // aborts them, but an `Arc` clone held elsewhere (restore/notifier tasks,
     // web AppState, MCP server) can outlive this future, so the Drop may never

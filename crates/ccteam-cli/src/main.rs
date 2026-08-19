@@ -1902,8 +1902,10 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         signal_task.abort();
 
         tracing::info!(
-            "graceful shutdown complete; agent sessions (if any) left running intentionally — \
-             `ccteam start` will reattach to them"
+            "graceful shutdown complete; agent session bodies were let go, not killed — idle ones \
+             exit on their own, a mid-turn one finishes its turn; the next `ccteam start` finds \
+             any survivor by its body record (one sid, one body), waits for it, and recovers \
+             what it said"
         );
 
         Ok(())

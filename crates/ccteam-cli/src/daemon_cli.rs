@@ -226,8 +226,10 @@ pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
                 json,
                 serde_json::json!({ "status": "stopped", "pid": pid }),
                 &format!(
-                    "ccteam daemon stopped (pid {pid}). Agent sessions are NOT killed — \
-                     the next `ccteam daemon start` reattaches to them."
+                    "ccteam daemon stopped (pid {pid}). Agent sessions are NOT killed: idle ones \
+                     exit on their own; a session mid-turn keeps working and the next `ccteam \
+                     daemon start` picks it up by its body record (waits for it, then recovers \
+                     its answer) — never a second process for the same session."
                 ),
             );
         }
@@ -246,7 +248,8 @@ pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
                 "even SIGKILL did not reap it; inspect the process manually"
             } else {
                 "retry with `ccteam daemon stop --force` to escalate to SIGKILL \
-                 (daemon process only; agent sessions are never touched)"
+                 (daemon process only; agent session bodies are never touched — the next \
+                 start finds them by their body records)"
             };
             fail(
                 json,
