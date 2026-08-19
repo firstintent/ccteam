@@ -1975,6 +1975,7 @@ impl Orchestrator {
             role: role.to_string(),
         };
         let ctx = SpawnCtx {
+            mode: None,
             slug: slug.to_string(),
             sid: sid.clone(),
             owner: "user:web-api".into(),

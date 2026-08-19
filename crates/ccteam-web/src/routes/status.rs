@@ -618,6 +618,7 @@ mod tests {
     fn view(sid: &str, project: &str, vendor: &str) -> ccteam_im::gateway::SessionView {
         ccteam_im::gateway::SessionView {
             driveable: true,
+            detached: None,
             sid: sid.into(),
             project: project.into(),
             role: "cto".into(),

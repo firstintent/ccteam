@@ -70,6 +70,7 @@ impl TestEnv {
 
     fn ctx(&self, permission_mode: PermissionMode) -> SpawnCtx {
         SpawnCtx {
+            mode: None,
             slug: "pi-bridge".into(),
             sid: "s901".into(),
             owner: "user:web-api".into(),

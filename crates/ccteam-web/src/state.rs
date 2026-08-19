@@ -171,6 +171,10 @@ impl AppState {
         let (chat_outbound, _) = broadcast::channel(256);
         let progress_projection =
             ccteam_im::progress_projection::ProgressProjection::new(paths.clone());
+        // An unconfigured runtime manager IS the disabled state: it answers
+        // `disabled` and spawns nothing until `serve` configures it (or hands
+        // in the daemon-wide one via `with_dsh_web`).
+        let dsh_runtime = crate::dsh_web::new_runtime_manager(paths.root.clone());
         Self {
             paths: Arc::new(paths),
             progress_projection,
@@ -190,7 +194,7 @@ impl AppState {
             mcp_sink: None,
             mcp_pending: None,
             host_hub: Arc::new(ccteam_harness::HostChannelHub::default()),
-            dsh_web: Arc::new(crate::dsh_web::DshWebSupervisor::disabled()),
+            dsh_web: Arc::new(crate::dsh_web::DshWebSupervisor::new(dsh_runtime)),
             dsh_proxy_client: reqwest::Client::new(),
             vendor_installs: Arc::new(
                 crate::routes::vendor_install::VendorInstallManager::default(),

@@ -20,7 +20,8 @@ use ccteam_harness::execution::{
     ClaudeStreamJsonAdapter, ClaudeTuiAdapter, CodexAppServerAdapter, DshAcpAdapter,
 };
 use ccteam_harness::{
-    AgentVendor, HarnessAdapter, PiRoleDocument, PiRoleReader, PiRpcAdapter, SessionProtocol,
+    AgentVendor, DshRuntimeManager, HarnessAdapter, PiRoleDocument, PiRoleReader, PiRpcAdapter,
+    SessionProtocol,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -78,6 +79,23 @@ pub fn default_adapter_factory() -> AdapterFactory {
     default_adapter_factory_with_stream_json_handle().0
 }
 
+/// A DSH runtime manager for processes that have none.
+///
+/// Unconfigured, so it answers `disabled` and spawns nothing: a DSH hire built
+/// through it fails with "this daemon has no DSH runtime" instead of quietly
+/// starting a second `dsh web` behind the one ccteam web already owns. The
+/// production path never lands here — `ccteam start` builds ONE manager in its
+/// composition root and threads it through
+/// [`adapter_factory_with_dsh_runtime`] / [`DaemonArgs::dsh_runtime`].
+fn dsh_runtime_without_a_web_host() -> Arc<DshRuntimeManager> {
+    Arc::new(DshRuntimeManager::new(
+        crate::default_ccteam_root_public(),
+        Arc::new(|_root, owner| {
+            anyhow::bail!("no DSH enrollment resolver in this process (owner {owner})")
+        }),
+    ))
+}
+
 fn pi_role_reader() -> PiRoleReader {
     Arc::new(|project_dir: &Path, role: &str| {
         ccteam_core::read_role(project_dir, role)
@@ -116,6 +134,24 @@ pub fn default_adapter_factory_with_stream_json_handle() -> (
     Arc<ClaudeStreamJsonAdapter>,
     Arc<PiRpcAdapter>,
 ) {
+    adapter_factory_with_dsh_runtime(dsh_runtime_without_a_web_host())
+}
+
+/// [`default_adapter_factory_with_stream_json_handle`] with the daemon's DSH
+/// runtime manager supplied — the production entry point.
+///
+/// DSH hires are CONNECTIONS to the identity's one `dsh web` runtime, so the
+/// adapter needs the very manager ccteam web drives. Passing it in (rather than
+/// letting the adapter find one) is what makes "one identity, one runtime" a
+/// property of the object graph instead of a convention every consumer has to
+/// remember.
+pub fn adapter_factory_with_dsh_runtime(
+    dsh_runtime: Arc<DshRuntimeManager>,
+) -> (
+    AdapterFactory,
+    Arc<ClaudeStreamJsonAdapter>,
+    Arc<PiRpcAdapter>,
+) {
     let claude_tui: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(ClaudeTuiAdapter::new());
     let claude_stream_json = Arc::new(ClaudeStreamJsonAdapter::new());
     let claude_stream: Arc<dyn HarnessAdapter + Send + Sync> = claude_stream_json.clone();
@@ -128,8 +164,9 @@ pub fn default_adapter_factory_with_stream_json_handle() -> (
         Arc::new(ccteam_harness::KimiAcpAdapter::new());
     let pi_rpc = Arc::new(PiRpcAdapter::new(pi_role_reader()));
     let pi: Arc<dyn HarnessAdapter + Send + Sync> = pi_rpc.clone();
-    // v0.9.15 P3 — DSH runs through ccteam's ACP Cordis plugin.
-    let dsh: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(DshAcpAdapter::new());
+    // v0.10.3 — DSH hires connect to the identity's shared `dsh web` runtime
+    // over its ccteam Cordis plugin's ACP socket; no per-hire child exists.
+    let dsh: Arc<dyn HarnessAdapter + Send + Sync> = Arc::new(DshAcpAdapter::new(dsh_runtime));
     // Vendor-first factory (v0.8.23 §3.E + v0.8.24 OpenCode): protocol is
     // Claude-only for stream-json/terminal; Grok/OpenCode/Kimi/Dsh always ACP.
     let factory: AdapterFactory = Arc::new(
@@ -239,6 +276,14 @@ pub struct DaemonArgs {
     /// Pi RPC singleton paired with `gateway`, used to wire the same shared
     /// IM/web interaction resolver as Claude HITL.
     pub pi_rpc_adapter: Option<Arc<PiRpcAdapter>>,
+    /// v0.10.3 — the daemon-wide DSH runtime manager, built ONCE by the
+    /// composition root (`ccteam start`) and shared with ccteam web. Only used
+    /// on the standalone path (`args.gateway` is `None`), where this daemon
+    /// builds its own adapter factory; when `gateway` is `Some`, the factory
+    /// baked into it already holds the same manager. `None` → this process has
+    /// no DSH runtime and DSH hires report it (see
+    /// `dsh_runtime_without_a_web_host`).
+    pub dsh_runtime: Option<Arc<DshRuntimeManager>>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -265,6 +310,7 @@ impl std::fmt::Debug for DaemonArgs {
                 &self.claude_stream_json_adapter.is_some(),
             )
             .field("pi_rpc_adapter", &self.pi_rpc_adapter.is_some())
+            .field("dsh_runtime", &self.dsh_runtime.is_some())
             .finish()
     }
 }
@@ -303,7 +349,11 @@ where
         match args.adapter_factory.clone() {
             Some(f) => (f, None, None),
             None => {
-                let (f, stream, pi) = default_adapter_factory_with_stream_json_handle();
+                let dsh_runtime = args
+                    .dsh_runtime
+                    .clone()
+                    .unwrap_or_else(dsh_runtime_without_a_web_host);
+                let (f, stream, pi) = adapter_factory_with_dsh_runtime(dsh_runtime);
                 (f, Some(stream), Some(pi))
             }
         };
@@ -472,6 +522,15 @@ where
         let _ = restore_complete_tx.send(true);
         Gateway::run_scheduled_scheduler(restore_gateway).await;
     });
+    // One sid, one body (2026-08-19) — the body watcher: a session whose
+    // process outlived the previous daemon is WAITED for (never duplicated,
+    // never killed by the daemon); once it exits, what it said is recovered
+    // and the session is rebuilt by sid. Runs for the daemon's whole life —
+    // a detached body can also be found later, on first touch.
+    let body_watch_gateway = Arc::clone(&gateway);
+    let body_watcher = tokio::spawn(async move {
+        Gateway::run_body_watcher(body_watch_gateway).await;
+    });
     // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
     // notifications missed while the daemon was down) + live delivery of every
     // completed watched child turn. Owns its own gateway handle + the pump
@@ -590,6 +649,13 @@ where
     inbound_consumer.abort();
     gateway_event_consumer.abort();
     scheduled_scheduler.abort();
+    body_watcher.abort();
+    // One sid, one body: let every live local body go WITHOUT stopping it —
+    // stdin EOF (an idle body exits by itself, a busy one finishes its turn),
+    // no kill, body records kept — so the next daemon finds the bodies
+    // instead of spawning twins. Before the pumps are aborted: the adapters
+    // close their streams here and the pumps end on their own.
+    gateway.lock().await.detach_all_bodies_for_shutdown().await;
     // Per-session event pumps are gateway-owned tasks. `Drop for Gateway`
     // aborts them, but an `Arc` clone held elsewhere (restore/notifier tasks,
     // web AppState, MCP server) can outlive this future, so the Drop may never
@@ -1121,10 +1187,15 @@ fn build_gateway(
 /// can wire the production HITL resolver onto the SAME adapter this gateway
 /// spawns stream-json sessions through (a fresh, unrelated adapter singleton
 /// would silently never receive the wiring).
+///
+/// `dsh_runtime` is the same requirement in the other direction: the DSH
+/// adapter baked into this gateway must hold the process-wide runtime manager
+/// ccteam web also drives, so both reach one `dsh web` per identity.
 pub fn build_gateway_for_daemon(
     registry: Option<PathBuf>,
+    dsh_runtime: Arc<DshRuntimeManager>,
 ) -> Result<(Gateway, Arc<ClaudeStreamJsonAdapter>, Arc<PiRpcAdapter>)> {
-    let (factory, claude_stream_json, pi_rpc) = default_adapter_factory_with_stream_json_handle();
+    let (factory, claude_stream_json, pi_rpc) = adapter_factory_with_dsh_runtime(dsh_runtime);
     let projects_root: PathBuf = registry.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/"))
@@ -2327,6 +2398,38 @@ mod tests {
         assert!(
             Arc::ptr_eq(&claude_a, &claude_b),
             "F10: claude arm must also be a singleton"
+        );
+        let dsh_a = factory(AgentVendor::Dsh, SessionProtocol::Acp);
+        let dsh_b = factory(AgentVendor::Dsh, SessionProtocol::Acp);
+        assert!(
+            Arc::ptr_eq(&dsh_a, &dsh_b),
+            "the dsh arm must be a singleton: hires for one identity share its runtime connection bookkeeping"
+        );
+    }
+
+    /// The DSH arm must come from the manager the composition root handed in —
+    /// the object-graph half of "one identity, one `dsh web` process" (a second
+    /// manager would supervise a second child for the same home). The
+    /// pass-through itself is asserted where the accessor lives:
+    /// `ccteam_harness::execution::dsh_acp::tests`.
+    #[test]
+    fn dsh_arm_is_built_from_the_supplied_runtime_manager() {
+        let manager = Arc::new(DshRuntimeManager::new(
+            PathBuf::from("/nonexistent/ccteam-home"),
+            Arc::new(|_root, _owner| anyhow::bail!("no enrollment in tests")),
+        ));
+        let (factory, _, _) = adapter_factory_with_dsh_runtime(Arc::clone(&manager));
+        assert!(
+            Arc::ptr_eq(
+                &factory(AgentVendor::Dsh, SessionProtocol::Acp),
+                &factory(AgentVendor::Dsh, SessionProtocol::default())
+            ),
+            "one DSH adapter regardless of the protocol asked for"
+        );
+        assert_eq!(
+            Arc::strong_count(&manager),
+            2,
+            "the factory kept the caller's manager (one clone), it did not build its own"
         );
     }
 

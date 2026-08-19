@@ -23,9 +23,9 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoicePrompt, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus, TurnId,
-    TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoicePrompt, DetachOutcome, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
+    TurnId, TurnInput, TurnRouting, TurnSubmission,
 };
 
 use crate::execution::acp::released_thread_status;
@@ -513,6 +513,13 @@ impl HarnessAdapter for GrokAcpAdapter {
         _spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Grok has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // v0.9.0 W3 (F3) — remote execution is claude-only in this version;
         // see `codex_app_server.rs`'s identical guard for the rationale.
         if ctx.remote.is_some() {
@@ -598,6 +605,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                     &envs,
                     InboundPolicy::DefaultDecline,
                     &ctx.sid,
+                    &ctx.project_dir,
+                    GROK_ACP_ADAPTER_NAME,
                 )
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;
@@ -617,6 +626,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                             &envs,
                             InboundPolicy::DefaultDecline,
                             &ctx.sid,
+                            &ctx.project_dir,
+                            GROK_ACP_ADAPTER_NAME,
                         )
                         .await
                         .map_err(|e| {
@@ -637,6 +648,8 @@ impl HarnessAdapter for GrokAcpAdapter {
                     &envs,
                     InboundPolicy::DefaultDecline,
                     &ctx.sid,
+                    &ctx.project_dir,
+                    GROK_ACP_ADAPTER_NAME,
                 )
                 .await
                 .map_err(|e| HarnessError::SpawnFailed(format!("spawn grok agent stdio: {e}")))?;
@@ -723,6 +736,35 @@ impl HarnessAdapter for GrokAcpAdapter {
                 "grok cold resume of {persistent_id} needs project cwd — rebuild via start_thread (rebuild_session_from_meta)"
             ),
         })
+    }
+
+    /// Daemon shutdown: let go of the local ACP child without stopping it
+    /// (stdin EOF + no kill; the body record stays for the next daemon).
+    async fn detach_thread(&self, h: &ThreadHandle) -> Result<DetachOutcome, HarnessError> {
+        let live = {
+            let mut map = self
+                .live
+                .lock()
+                .map_err(|_| HarnessError::Io("live map poisoned".into()))?;
+            map.remove(&h.identity)
+        };
+        let Some(live) = live else {
+            return Ok(DetachOutcome::NotApplicable);
+        };
+        let in_flight = live
+            .state
+            .lock()
+            .map(|state| state.buffer.is_some() || state.vendor_started_buffer.is_some())
+            .unwrap_or(false);
+        let pid = live.transport.detach().await;
+        tracing::info!(
+            sid = %live.sid,
+            slug = %live.slug,
+            ?pid,
+            in_flight,
+            "grok-acp: body detached (left running; record kept for the next daemon)"
+        );
+        Ok(DetachOutcome::Detached { pid, in_flight })
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {

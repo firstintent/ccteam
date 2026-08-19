@@ -477,13 +477,16 @@ pub struct RegisterMcpQuery {
     pub vendor: Option<String>,
 }
 
-/// `POST /api/v1/hosts/{host}/register-mcp` — register ccteam's OWN MCP
-/// server into the vendor config(s). **Idempotent** (merge, never clobber)
-/// and the only CONFIG write this surface performs. ccteam never writes a
-/// vendor login/key; vendor CLI installs live in the separate
-/// VENDOR-INSTALL-1 job surface (`.../vendors/{vendor}/install`). 404 for a
-/// non-`local` host; 400 for an unknown `vendor`; 500 if the vendor config or
-/// admin HTTP credential cannot be resolved.
+/// `POST /api/v1/hosts/{host}/register-mcp` — register ccteam's OWN entry
+/// into the vendor's config surface. For the five config-file vendors that is
+/// the MCP server entry; for `?vendor=dsh` it is ccteam's plugin bundle +
+/// patch row in the operator's `~/.dsh` web profile (which the human loads by
+/// restarting their `dsh web`). **Idempotent** (merge, never clobber), and
+/// only ccteam's own entries. ccteam never writes a vendor login/key; vendor
+/// CLI installs live in the separate VENDOR-INSTALL-1 job surface
+/// (`.../vendors/{vendor}/install`). 404 for a non-`local` host; 400 for an
+/// unknown `vendor`; 500 if the vendor config or credentials cannot be
+/// resolved.
 #[utoipa::path(
     post,
     path = "/api/v1/hosts/{host}/register-mcp",
@@ -520,6 +523,32 @@ pub(crate) async fn handle_register_mcp(
     }
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
+        // DSH's "register ccteam" is not a vendor-config write: its tool and
+        // transport surface is the `@ccteam/dsh-client` Cordis plugin. This
+        // action merges ccteam's OWN bundle entry + `ccteam-client` patch row
+        // (carrying this daemon's transportSocket/URL) into the operator's
+        // real `~/.dsh` web profile — gate ①, idempotent, merge-only — so a
+        // hand-started `dsh web` can serve hires after its owner restarts it.
+        // Deliberately NOT part of register-all: it only takes effect after
+        // the human restarts their own instance, so it stays an explicit ask.
+        Some("dsh") => {
+            return match app.dsh_web.runtime().register_operator_profile().await {
+                Ok(profile_dir) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "registered": ["dsh"],
+                        "paths": {"dsh": profile_dir},
+                        "note": "restart your DSH web instance to load the ccteam plugin",
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("register the ccteam DSH plugin: {e}")})),
+                )
+                    .into_response(),
+            };
+        }
         // A valid vendor whose tools arrive through a managed-session bridge:
         // Reject explicitly rather than pretending a config file was written,
         // so the UI/API never presents a register action that does nothing.

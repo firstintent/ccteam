@@ -54,6 +54,17 @@ pub const SESSION_STREAM_DETACHED: &str = "session_stream_detached";
 /// 2026-08-09 — the pump proved a rebuilt attachment by receiving an event on it.
 /// Pairs with [`SESSION_STREAM_DETACHED`]; `gap_ms` is the blind window.
 pub const SESSION_STREAM_REATTACHED: &str = "session_stream_reattached";
+/// 2026-08-19 (one sid, one body) — the daemon let go of a session's OS body
+/// without stopping it, or found it still running after a restart. The
+/// session is NOT over and NOT driveable by this daemon until the body exits:
+/// `reason` = `daemon_shutdown` (graceful stop left it finishing its turn) |
+/// `daemon_restart` (found alive by the next daemon).
+pub const SESSION_BODY_DETACHED: &str = "session_body_detached";
+/// 2026-08-19 — a detached body ended: `reason` = `exited` (finished on its
+/// own; `recovered` says whether its unobserved answer was recovered from the
+/// vendor's own record) | `stopped` (a user explicitly stopped it). The
+/// session is rebuilt by sid right after.
+pub const SESSION_BODY_EXITED: &str = "session_body_exited";
 /// v0.8.7 review-fix (R-L1) — a HITL session is PARKED awaiting a human
 /// approve/deny on a non-allowlist tool call. Emitted when the permission
 /// prompt is outstanding so an operator (status / dashboard / `progress`)
@@ -104,6 +115,8 @@ pub enum EventKind {
     SessionEvicted,
     SessionStreamDetached,
     SessionStreamReattached,
+    SessionBodyDetached,
+    SessionBodyExited,
     ChatPermissionPromptOutstanding,
     DelegationSpawned,
     DelegationDispatched,
@@ -142,6 +155,8 @@ impl EventKind {
         EventKind::SessionEvicted,
         EventKind::SessionStreamDetached,
         EventKind::SessionStreamReattached,
+        EventKind::SessionBodyDetached,
+        EventKind::SessionBodyExited,
         EventKind::ChatPermissionPromptOutstanding,
         EventKind::DelegationSpawned,
         EventKind::DelegationDispatched,
@@ -180,6 +195,8 @@ impl EventKind {
             EventKind::SessionEvicted => SESSION_EVICTED,
             EventKind::SessionStreamDetached => SESSION_STREAM_DETACHED,
             EventKind::SessionStreamReattached => SESSION_STREAM_REATTACHED,
+            EventKind::SessionBodyDetached => SESSION_BODY_DETACHED,
+            EventKind::SessionBodyExited => SESSION_BODY_EXITED,
             EventKind::ChatPermissionPromptOutstanding => CHAT_PERMISSION_PROMPT_OUTSTANDING,
             EventKind::DelegationSpawned => DELEGATION_SPAWNED,
             EventKind::DelegationDispatched => DELEGATION_DISPATCHED,
@@ -219,6 +236,8 @@ impl EventKind {
             SESSION_EVICTED => EventKind::SessionEvicted,
             SESSION_STREAM_DETACHED => EventKind::SessionStreamDetached,
             SESSION_STREAM_REATTACHED => EventKind::SessionStreamReattached,
+            SESSION_BODY_DETACHED => EventKind::SessionBodyDetached,
+            SESSION_BODY_EXITED => EventKind::SessionBodyExited,
             CHAT_PERMISSION_PROMPT_OUTSTANDING => EventKind::ChatPermissionPromptOutstanding,
             DELEGATION_SPAWNED => EventKind::DelegationSpawned,
             DELEGATION_DISPATCHED => EventKind::DelegationDispatched,
@@ -277,6 +296,8 @@ pub const fn class(kind: EventKind) -> EventClass {
         | EventKind::SessionEvicted
         | EventKind::SessionStreamDetached
         | EventKind::SessionStreamReattached
+        | EventKind::SessionBodyDetached
+        | EventKind::SessionBodyExited
         | EventKind::ChatPermissionPromptOutstanding
         | EventKind::DelegationSpawned
         | EventKind::DelegationDispatched
@@ -1525,6 +1546,48 @@ pub fn build_session_evicted_event(sid: &str, reason: &str) -> Value {
         "event": SESSION_EVICTED,
         "sid": sid,
         "reason": reason,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// 2026-08-19 — a session's body is running without this daemon reading it.
+/// `reason` = `daemon_shutdown` | `daemon_restart`; `pid` is the body; `in_flight`
+/// says whether a vendor turn was known to be running when the daemon let go
+/// (`None` = not known, e.g. found after a restart).
+pub fn build_session_body_detached_event(
+    sid: &str,
+    slug: &str,
+    reason: &str,
+    pid: Option<u32>,
+    in_flight: Option<bool>,
+) -> Value {
+    json!({
+        "event": SESSION_BODY_DETACHED,
+        "sid": sid,
+        "slug": slug,
+        "reason": reason,
+        "pid": pid,
+        "in_flight": in_flight,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// 2026-08-19 — a detached body ended. `reason` = `exited` | `stopped`;
+/// `recovered` = the unobserved answer was recovered from the vendor's record.
+pub fn build_session_body_exited_event(
+    sid: &str,
+    slug: &str,
+    reason: &str,
+    pid: u32,
+    recovered: bool,
+) -> Value {
+    json!({
+        "event": SESSION_BODY_EXITED,
+        "sid": sid,
+        "slug": slug,
+        "reason": reason,
+        "pid": pid,
+        "recovered": recovered,
         "ts": Utc::now().to_rfc3339(),
     })
 }

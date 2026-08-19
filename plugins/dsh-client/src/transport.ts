@@ -1,9 +1,22 @@
 import { randomUUID } from 'node:crypto'
-import { createUserTextMessage, type ContentBlock, type DshAgent } from './tools.js'
+import { mkdirSync, unlinkSync } from 'node:fs'
+import { createServer, type Server, type Socket } from 'node:net'
+import { dirname } from 'node:path'
+import { parseCcteamMeta, type SessionCredentialStore } from './credentials.js'
+import { createUserTextMessage, sessionIdOfAgent, type ContentBlock, type DshAgent } from './tools.js'
 
 export interface DshAgents {
-  create(options: { sessionId: string; meta?: { cwd?: string }; agentOptions?: unknown }): Promise<DshAgentHandle>
-  resume(options: { resumeSessionId: string; agentOptions?: unknown }): Promise<DshAgentHandle>
+  create(options: {
+    sessionId: string
+    meta?: { cwd?: string; agentPreset?: string }
+    agentOptions?: unknown
+    setup?: (agentCtx: unknown) => Promise<void>
+  }): Promise<DshAgentHandle>
+  resume(options: {
+    resumeSessionId: string
+    agentOptions?: unknown
+    setup?: (agentCtx: unknown) => Promise<void>
+  }): Promise<DshAgentHandle>
   get?(id: string): DshAgent | undefined
 }
 
@@ -12,8 +25,55 @@ export interface DshAgentHandle {
   dispose?(): Promise<void> | void
 }
 
+export interface DshWorkspace {
+  attachSession(sessionId: string): Promise<void>
+}
+
+/**
+ * DSH's agent-preset roster (Cordis service `agentPresets`,
+ * `@deepseek-ai/dsh-agent-presets`). The web bundle DISABLES the host-plane
+ * vendor tools and moves them behind presets, so an agent created without
+ * `setup: mount(...)` has no bash/read/write at all — only globally-registered
+ * tools like ccteam's own (real-machine `unknown tool "bash"` regression).
+ * Shipped ids: `standard` | `code` (PTC) | `minimal` | `cordis` (creator).
+ */
+export interface DshAgentPresets {
+  resolve(id?: string): Promise<{ id?: string } | undefined>
+  mount(agentCtx: unknown, id?: string): Promise<unknown>
+}
+
+interface DshSessionPersistence {
+  inspect(sessionId: string): Promise<{ meta?: unknown; events?: unknown[] }>
+}
+
+/**
+ * DSH's permission-preset roster (Cordis service `permissionPresets`).
+ * `set(session, name)` records the preset and rewrites the sandbox/approval
+ * knobs. ccteam hires default to `danger-full-access` (full file access, no
+ * approval prompts — the DSH counterpart of ccteam's `skip` posture); a
+ * `hitl` hire keeps the vendor's pinned default so approvals keep flowing.
+ */
+interface DshPermissionPresets {
+  set(session: unknown, name: string): void
+}
+
+const HIRE_PERMISSION_PRESET = 'danger-full-access'
+
+export interface DshWorkspaceRegistry {
+  create(path: string, title?: string): Promise<DshWorkspace>
+}
+
 export interface TransportContext {
   agents: DshAgents
+  /**
+   * Optional service lookup (`ctx.get`). Cordis THROWS on `ctx.workspaceRegistry`
+   * when the service is not in this plugin's `inject` list — and it cannot be:
+   * `dsh-workspace` ships in the web-app bundle only, so a hard inject would
+   * dead-lock plugin activation on every non-web profile (mode 2). `ctx.get`
+   * is the vendor's own optional accessor (dsh-host-apiproxy uses it for
+   * `sessionPersistence`).
+   */
+  get?(name: string): unknown
   agentDefaultModel?: {
     currentSelection(): { provider?: string; model?: string } | undefined
   }
@@ -24,11 +84,19 @@ export interface TransportContext {
   }
 }
 
+export interface DshSocketTransportOptions {
+  version: string
+  /** Unix socket path this plugin listens on for ccteam ACP peers. */
+  socketPath: string
+  credentials: SessionCredentialStore
+}
+
 export interface DshTransportOptions {
   version: string
-  input?: NodeJS.ReadableStream
-  output?: NodeJS.WritableStream
-  approvalMode?: 'skip' | 'hitl'
+  input: NodeJS.ReadableStream
+  output: NodeJS.WritableStream
+  credentials?: SessionCredentialStore
+  workspaces?: WorkspaceMounter
 }
 
 type JsonRpcId = string | number | null
@@ -42,15 +110,25 @@ interface JsonRpcRequest {
   error?: unknown
 }
 
+interface Inflight {
+  resolve: (value: PromptResult) => void
+  reject: (error: RpcError) => void
+  usage: Usage
+  /** Id of the user message this transport queued; attribution binds on it. */
+  messageId: string
+  /** The turn that claimed our message — the only turn we report on. */
+  ownedTurn?: number
+  /** Our message was seen with no turn open yet; bind the next `turn/start`. */
+  bindNextTurn: boolean
+  /** Tool calls of the owned turn, for `tool/result` correlation. */
+  toolCalls: Set<string>
+}
+
 interface SessionRecord {
   agent: DshAgent
-  dispose?: () => Promise<void> | void
-  inflight?: {
-    resolve: (value: PromptResult) => void
-    reject: (error: RpcError) => void
-    usage: Usage
-    endReason?: unknown
-  }
+  /** Turn currently open on this session, ccteam-owned or human-owned. */
+  openTurn?: number
+  inflight?: Inflight
 }
 
 interface PromptResult {
@@ -78,17 +156,147 @@ class RpcError extends Error {
   }
 }
 
-export function shouldStartTransport(env: NodeJS.ProcessEnv, bootBearer: string | undefined): boolean {
-  return env.CCTEAM_DSH_TRANSPORT === '1' && typeof bootBearer === 'string' && bootBearer.startsWith('ccteam-sid:')
+/**
+ * Serializes `workspaceRegistry.create` the way the DSH host does: concurrent
+ * creates of one path would otherwise race to own the same canonical directory.
+ */
+export class WorkspaceMounter {
+  private readonly ctx: TransportContext
+  private chain: Promise<unknown> = Promise.resolve()
+
+  constructor(ctx: TransportContext) {
+    this.ctx = ctx
+  }
+
+  async mount(cwd: string, sessionId: string): Promise<void> {
+    const registry =
+      typeof this.ctx.get === 'function'
+        ? (this.ctx.get('workspaceRegistry') as DshWorkspaceRegistry | undefined)
+        : undefined
+    if (registry === undefined) {
+      this.ctx.logger?.warn(`ccteam dsh transport: no workspaceRegistry, session ${sessionId} stays ungrouped`)
+      return
+    }
+    const operation = this.chain.then(() => registry.create(cwd))
+    this.chain = operation.then(() => undefined, () => undefined)
+    const workspace = await operation
+    await workspace.attachSession(sessionId)
+  }
 }
 
-export function startDshTransport(ctx: TransportContext, options: DshTransportOptions): void {
-  const server = new DshAcpServer(ctx, options)
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => server.start(), 'ccteam.dsh.transport')
-  } else {
-    server.start()
+/** Unix-socket ACP listener: one isolated {@link DshAcpServer} per connection. */
+export class DshSocketTransport {
+  private readonly ctx: TransportContext
+  private readonly options: DshSocketTransportOptions
+  private readonly workspaces: WorkspaceMounter
+  private readonly peers = new Set<{ socket: Socket; teardown: () => Promise<void> }>()
+  private server: Server | undefined
+  private offDisposed: (() => void) | undefined
+  private closed = false
+
+  constructor(ctx: TransportContext, options: DshSocketTransportOptions) {
+    this.ctx = ctx
+    this.options = options
+    this.workspaces = new WorkspaceMounter(ctx)
   }
+
+  /** Bind the socket. Never throws: a bind failure warns and leaves the plugin working. */
+  async listen(): Promise<void> {
+    if (this.closed || this.server !== undefined) return
+    const path = this.options.socketPath
+    try {
+      mkdirSync(dirname(path), { recursive: true })
+    } catch {
+      // the parent directory is the caller's business; listen reports the real failure
+    }
+    try {
+      unlinkSync(path)
+    } catch {
+      // no stale socket file to remove
+    }
+    const server = createServer(socket => this.accept(socket))
+    this.offDisposed = this.ctx.on?.('session/disposed', ((session: unknown) => {
+      const sessionId = sessionIdFromSession(session)
+      if (sessionId !== undefined) this.options.credentials.delete(sessionId)
+    }) as never)
+    await new Promise<void>(resolve => {
+      const onListenError = (error: unknown) => {
+        this.ctx.logger?.warn(`ccteam dsh transport cannot listen on ${path}: ${errorMessage(error)}`)
+        try {
+          server.close()
+        } catch {
+          // never bound
+        }
+        resolve()
+      }
+      server.once('error', onListenError)
+      server.listen(path, () => {
+        server.off('error', onListenError)
+        server.on('error', error => {
+          this.ctx.logger?.warn(`ccteam dsh transport socket error: ${errorMessage(error)}`)
+        })
+        this.server = server
+        resolve()
+      })
+    })
+  }
+
+  private accept(socket: Socket): void {
+    if (this.closed) {
+      socket.destroy()
+      return
+    }
+    const peer = new DshAcpServer(this.ctx, {
+      version: this.options.version,
+      input: socket,
+      output: socket,
+      credentials: this.options.credentials,
+      workspaces: this.workspaces,
+    })
+    const entry = { socket, teardown: peer.start() }
+    this.peers.add(entry)
+    const drop = () => {
+      if (!this.peers.delete(entry)) return
+      void entry.teardown().catch(() => undefined)
+    }
+    socket.on('close', drop)
+    socket.on('error', error => {
+      this.ctx.logger?.warn(`ccteam dsh transport peer error: ${errorMessage(error)}`)
+    })
+  }
+
+  async close(): Promise<void> {
+    this.closed = true
+    this.offDisposed?.()
+    this.offDisposed = undefined
+    const server = this.server
+    this.server = undefined
+    const peers = [...this.peers]
+    this.peers.clear()
+    for (const peer of peers) peer.socket.destroy()
+    await Promise.allSettled(peers.map(peer => peer.teardown()))
+    if (server !== undefined) {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  }
+}
+
+/**
+ * Start the socket transport, scoped to the plugin effect when available.
+ * @returns a teardown that closes the listener and its peers.
+ */
+export function startDshSocketTransport(ctx: TransportContext, options: DshSocketTransportOptions): () => Promise<void> {
+  const transport = new DshSocketTransport(ctx, options)
+  const setup = () => {
+    void transport.listen()
+    return () => transport.close()
+  }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(setup, 'ccteam.dsh.transport')
+  } else {
+    setup()
+  }
+  return () => transport.close()
 }
 
 export class DshAcpServer {
@@ -96,7 +304,8 @@ export class DshAcpServer {
   private readonly version: string
   private readonly input: NodeJS.ReadableStream
   private readonly output: NodeJS.WritableStream
-  private readonly approvalMode: 'skip' | 'hitl'
+  private readonly credentials: SessionCredentialStore | undefined
+  private readonly workspaces: WorkspaceMounter
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly pendingClientRequests = new Map<string, {
     resolve: (value: unknown) => void
@@ -108,9 +317,10 @@ export class DshAcpServer {
   constructor(ctx: TransportContext, options: DshTransportOptions) {
     this.ctx = ctx
     this.version = options.version
-    this.input = options.input ?? process.stdin
-    this.output = options.output ?? process.stdout
-    this.approvalMode = options.approvalMode ?? 'skip'
+    this.input = options.input
+    this.output = options.output
+    this.credentials = options.credentials
+    this.workspaces = options.workspaces ?? new WorkspaceMounter(ctx)
   }
 
   start(): () => Promise<void> {
@@ -138,12 +348,14 @@ export class DshAcpServer {
       offSession?.()
       offError?.()
       offApproval?.()
+      // Agents stay live and un-cancelled: the human at the DSH UI owns them too.
       const records = [...this.sessions.values()]
       this.sessions.clear()
-      await Promise.allSettled(records.map(async record => {
-        record.agent.cancel?.({ kind: 'user' })
-        await record.dispose?.()
-      }))
+      for (const record of records) {
+        const inflight = record.inflight
+        record.inflight = undefined
+        inflight?.reject(new RpcError('ccteam transport connection closed', -32603))
+      }
     }
   }
 
@@ -208,9 +420,16 @@ export class DshAcpServer {
       if (sessionId === undefined) return
       const record = this.sessions.get(sessionId)
       if (record === undefined) return
-      record.agent.cancel?.({ kind: 'user' })
-      record.inflight?.resolve({ stopReason: 'cancelled', _meta: { stopReason: 'cancelled' } })
+      const inflight = record.inflight
+      if (inflight === undefined) return
       record.inflight = undefined
+      if (this.ownsActiveTurn(record, inflight)) {
+        record.agent.cancel?.({ kind: 'user' })
+      } else if (record.agent.inbox?.remove?.(inflight.messageId) !== true) {
+        // Not still queued (or no inbox surface): fall back to aborting the agent.
+        record.agent.cancel?.({ kind: 'user' })
+      }
+      inflight.resolve({ stopReason: 'cancelled', _meta: { stopReason: 'cancelled' } })
     }
   }
 
@@ -237,46 +456,181 @@ export class DshAcpServer {
     }
   }
 
+  private presetService(): DshAgentPresets | undefined {
+    const svc = typeof this.ctx.get === 'function' ? this.ctx.get('agentPresets') : undefined
+    const candidate = svc as DshAgentPresets | undefined
+    return typeof candidate?.resolve === 'function' && typeof candidate?.mount === 'function'
+      ? candidate
+      : undefined
+  }
+
+  /**
+   * Preset for a NEW session: the ccteam-requested id when present, else the
+   * vendor's own default. Without the roster service, an explicit request is a
+   * hard error (silently creating a toolless agent is the exact bug this
+   * exists to prevent), while no request degrades to a bare create with a
+   * warning — an ACP-bundle-style runtime keeps its host-plane tools.
+   */
+  private async composeCreatePreset(
+    requested: string | undefined,
+    sessionId: string,
+  ): Promise<{ id?: string; setup?: (agentCtx: unknown) => Promise<void> }> {
+    const presets = this.presetService()
+    if (presets === undefined) {
+      if (requested !== undefined) {
+        throw new RpcError(
+          `agent preset "${requested}" was requested but this DSH runtime has no agentPresets service`,
+          -32602,
+        )
+      }
+      this.ctx.logger?.warn(
+        `ccteam dsh transport: no agentPresets service, session ${sessionId} gets host-plane tools only`,
+      )
+      return {}
+    }
+    let id: string | undefined
+    try {
+      const resolved = await presets.resolve(requested)
+      id = typeof resolved?.id === 'string' && resolved.id.trim() !== '' ? resolved.id : requested
+    } catch (error) {
+      throw errorToRpc(error, `resolve DSH agent preset "${requested ?? '(default)'}"`)
+    }
+    return {
+      id,
+      setup: async agentCtx => {
+        await presets.mount(agentCtx, id)
+      },
+    }
+  }
+
+  /** Re-mount the STORED preset when resuming a persisted session. */
+  private async composeResumeSetup(
+    sessionId: string,
+  ): Promise<((agentCtx: unknown) => Promise<void>) | undefined> {
+    const presets = this.presetService()
+    if (presets === undefined) return undefined
+    const stored = await this.storedPreset(sessionId)
+    return async agentCtx => {
+      await presets.mount(agentCtx, stored)
+    }
+  }
+
+  /**
+   * The preset a persisted session was using: the newest
+   * `agent-preset/selected` event wins (a blank-session switch in the DSH UI),
+   * else the creation header's `agentPreset`; `undefined` mounts the vendor
+   * default. Mirrors the vendor's own `resolveSessionPreset` fold — the
+   * package is not importable from this plugin, so the two-field fold is
+   * reimplemented against the same durable data.
+   */
+  private async storedPreset(sessionId: string): Promise<string | undefined> {
+    const svc = typeof this.ctx.get === 'function' ? this.ctx.get('sessionPersistence') : undefined
+    const persistence = svc as DshSessionPersistence | undefined
+    if (typeof persistence?.inspect !== 'function') return undefined
+    try {
+      const inspected = await persistence.inspect(sessionId)
+      const events = Array.isArray(inspected?.events) ? inspected.events : []
+      for (let i = events.length - 1; i >= 0; i--) {
+        const event = asRecord(events[i])
+        if (event.type !== 'agent-preset/selected') continue
+        const chosen = asRecord(event.data).agentPreset
+        if (typeof chosen === 'string' && chosen.trim() !== '') return chosen
+      }
+      const header = asRecord(inspected?.meta).agentPreset
+      return typeof header === 'string' && header.trim() !== '' ? header : undefined
+    } catch (error) {
+      this.ctx.logger?.warn(
+        `ccteam dsh transport could not read the stored preset of ${sessionId}: ${errorMessage(error)}`,
+      )
+      return undefined
+    }
+  }
+
   private async newSession(params: unknown): Promise<{ sessionId: string }> {
     const body = requireRecord(params, 'session/new params')
     const cwd = requireString(body, 'cwd')
     const sessionId = randomUUID()
     const agentOptions = this.resolveAgentOptions(body.agentOptions)
+    const meta = parseCcteamMeta(body)
+    if (meta !== undefined) this.credentials?.set(sessionId, meta)
     let handle: DshAgentHandle
     try {
-      const request: { sessionId: string; meta: { cwd: string }; agentOptions?: unknown } = {
+      const preset = await this.composeCreatePreset(meta?.agentPreset, sessionId)
+      const request: {
+        sessionId: string
+        meta: { cwd: string; agentPreset?: string }
+        agentOptions?: unknown
+        setup?: (agentCtx: unknown) => Promise<void>
+      } = {
         sessionId,
-        meta: { cwd },
+        meta: { cwd, ...(preset.id === undefined ? {} : { agentPreset: preset.id }) },
       }
       if (agentOptions !== undefined) request.agentOptions = agentOptions
+      if (preset.setup !== undefined) request.setup = preset.setup
       handle = await this.ctx.agents.create(request)
     } catch (error) {
+      this.credentials?.delete(sessionId)
       throw errorToRpc(error)
     }
-    this.sessions.set(sessionId, {
-      agent: handle.agent,
-      dispose: handle.dispose?.bind(handle),
-    })
+    this.sessions.set(sessionId, { agent: handle.agent })
+    if ((meta?.approvalMode ?? 'skip') !== 'hitl') {
+      this.applyHirePermissionPreset(sessionId, handle.agent)
+    }
+    try {
+      await this.workspaces.mount(cwd, sessionId)
+    } catch (error) {
+      this.ctx.logger?.warn(`ccteam dsh transport could not mount ${cwd}: ${errorMessage(error)}`)
+    }
     return { sessionId, ...modelInfoFromAgentOptions(agentOptions) }
+  }
+
+  /** Full access for a `skip`-posture hire; best-effort, never fails the create. */
+  private applyHirePermissionPreset(sessionId: string, agent: DshAgent): void {
+    const svc = typeof this.ctx.get === 'function' ? this.ctx.get('permissionPresets') : undefined
+    const presets = svc as DshPermissionPresets | undefined
+    if (typeof presets?.set !== 'function') {
+      this.ctx.logger?.warn(
+        `ccteam dsh transport: no permissionPresets service, session ${sessionId} keeps the runtime default`,
+      )
+      return
+    }
+    try {
+      presets.set(agent.session, HIRE_PERMISSION_PRESET)
+    } catch (error) {
+      this.ctx.logger?.warn(
+        `ccteam dsh transport could not set ${HIRE_PERMISSION_PRESET} on ${sessionId}: ${errorMessage(error)}`,
+      )
+    }
   }
 
   private async loadSession(params: unknown): Promise<{ sessionId: string }> {
     const body = requireRecord(params, 'session/load params')
     const sessionId = requireString(body, 'sessionId')
     const agentOptions = this.resolveAgentOptions(body.agentOptions)
-    let handle: DshAgentHandle
+    const meta = parseCcteamMeta(body)
+    if (meta !== undefined) this.credentials?.set(sessionId, meta)
+    let agent: DshAgent
     try {
-      handle = await this.ctx.agents.resume({
-        resumeSessionId: sessionId,
-        ...agentOptions === undefined ? {} : { agentOptions },
-      })
+      // Reuse-live-first: `agents.resume` rejects while the session is already live.
+      const live = this.ctx.agents.get?.(sessionId)
+      if (live !== undefined) {
+        agent = live
+      } else {
+        // The stored preset is authoritative on resume (the human may have
+        // switched it in the DSH UI); `_meta.ccteam.agentPreset` is a
+        // creation-only field and deliberately ignored here.
+        const setup = await this.composeResumeSetup(sessionId)
+        const handle = await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          ...agentOptions === undefined ? {} : { agentOptions },
+          ...setup === undefined ? {} : { setup },
+        })
+        agent = handle.agent
+      }
     } catch (error) {
       throw errorToRpc(error)
     }
-    this.sessions.set(sessionId, {
-      agent: handle.agent,
-      dispose: handle.dispose?.bind(handle),
-    })
+    this.sessions.set(sessionId, { agent })
     return { sessionId, ...modelInfoFromAgentOptions(agentOptions) }
   }
 
@@ -288,34 +642,27 @@ export class DshAcpServer {
     if (record.inflight !== undefined) throw new RpcError('a prompt is already in flight for this session', -32602)
     const text = acpPromptToText(body.prompt)
     if (text.trim() === '') throw new RpcError('empty prompt', -32602)
+    const message = createUserTextMessage(text)
 
-    const result = await new Promise<PromptResult>((resolve, reject) => {
+    return new Promise<PromptResult>((resolve, reject) => {
       record.inflight = {
         resolve,
         reject,
         usage: {},
+        messageId: message.id,
+        bindNextTurn: false,
+        toolCalls: new Set(),
       }
       try {
-        if (typeof record.agent.followup !== 'function' || typeof record.agent.whenIdle !== 'function') {
+        if (typeof record.agent.followup !== 'function') {
           throw new Error('agent cannot accept prompts')
         }
-        record.agent.followup(createUserTextMessage(text))
+        record.agent.followup(message)
       } catch (error) {
         record.inflight = undefined
         reject(errorToRpc(error, 'prompt was not queued'))
-        return
       }
-      void record.agent.whenIdle().then(() => {
-        const inflight = record.inflight
-        if (inflight === undefined) return
-        record.inflight = undefined
-        resolve(promptResultFromReason(inflight.endReason, inflight.usage))
-      }, error => {
-        record.inflight = undefined
-        reject(errorToRpc(error, 'turn failed'))
-      })
     })
-    return result
   }
 
   private onSessionEvent(session: unknown, event: unknown): void {
@@ -328,18 +675,44 @@ export class DshAcpServer {
     const data = asRecord(ev.data)
 
     switch (type) {
+      case 'turn/start': {
+        const turn = numberField(data, 'turn')
+        record.openTurn = turn
+        const inflight = record.inflight
+        if (inflight !== undefined && inflight.bindNextTurn && turn !== undefined) {
+          inflight.bindNextTurn = false
+          inflight.ownedTurn = turn
+        }
+        break
+      }
+      case 'user/message': {
+        const inflight = record.inflight
+        if (inflight === undefined || inflight.ownedTurn !== undefined) break
+        if (stringField(data, 'id') !== inflight.messageId) break
+        if (record.openTurn === undefined) {
+          inflight.bindNextTurn = true
+          break
+        }
+        inflight.ownedTurn = record.openTurn
+        break
+      }
       case 'assistant/message':
+        if (!this.ownsTurn(record, numberField(data, 'turn'))) break
         this.onAssistantMessage(sessionId, data, record)
         break
       case 'assistant/chunk':
+        if (!this.ownsTurn(record, numberField(data, 'turn'))) break
         this.onAssistantChunk(sessionId, data, record)
         break
-      case 'tool/call':
+      case 'tool/call': {
+        if (!this.ownsTurn(record, numberField(data, 'turn'))) break
+        const callId = stringField(data, 'callId')
+        if (callId !== undefined) record.inflight?.toolCalls.add(callId)
         this.notify({
           sessionId,
           update: {
             sessionUpdate: 'tool_call',
-            toolCallId: stringField(data, 'callId') ?? 'tool',
+            toolCallId: callId ?? 'tool',
             name: stringField(data, 'name') ?? 'tool',
             title: stringField(data, 'name') ?? 'tool',
             rawInput: parseMaybeJson(data.arguments),
@@ -347,35 +720,60 @@ export class DshAcpServer {
           },
         })
         break
-      case 'tool/result':
+      }
+      case 'tool/result': {
+        const callId = stringField(asRecord(asRecord(data.message).source), 'callId')
+        if (!this.ownsToolResult(record, numberField(data, 'turn'), callId)) break
         this.notify({
           sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
-            toolCallId: stringField(asRecord(asRecord(data.message).source), 'callId') ?? 'tool',
+            toolCallId: callId ?? 'tool',
             status: 'completed',
             content: toolResultText(data),
             isError: toolResultIsError(data),
           },
         })
         break
-      case 'turn/end':
+      }
+      case 'turn/end': {
+        const turn = numberField(data, 'turn')
+        if (turn === undefined || record.openTurn === turn) record.openTurn = undefined
+        const inflight = record.inflight
+        if (inflight === undefined || !this.ownsTurn(record, turn)) break
+        record.inflight = undefined
         this.notify({
           sessionId,
           update: { sessionUpdate: 'turn_completed' },
         })
-        if (record.inflight !== undefined) {
-          const reason = asRecord(data).reason
-          if (isErrorReason(reason)) {
-            const failure = asRecord(reason).error
-            record.inflight.reject(new RpcError(`turn failed: ${failureMessage(failure)}`, -32603, failure))
-            record.inflight = undefined
-          } else {
-            record.inflight.endReason = reason
-          }
+        const reason = data.reason
+        if (isErrorReason(reason)) {
+          const failure = asRecord(reason).error
+          inflight.reject(new RpcError(`turn failed: ${failureMessage(failure)}`, -32603, failure))
+        } else {
+          inflight.resolve(promptResultFromReason(reason, inflight.usage))
         }
         break
+      }
     }
+  }
+
+  /** True while `turn` is the turn that claimed this transport's queued message. */
+  private ownsTurn(record: SessionRecord, turn: number | undefined): boolean {
+    const owned = record.inflight?.ownedTurn
+    return owned !== undefined && turn !== undefined && owned === turn
+  }
+
+  /** True while the owned turn is also the turn currently running on the agent. */
+  private ownsActiveTurn(record: SessionRecord, inflight?: Inflight): boolean {
+    const owned = (inflight ?? record.inflight)?.ownedTurn
+    return owned !== undefined && record.openTurn === owned
+  }
+
+  private ownsToolResult(record: SessionRecord, turn: number | undefined, callId: string | undefined): boolean {
+    if (this.ownsTurn(record, turn)) return true
+    if (turn !== undefined) return false
+    return callId !== undefined && record.inflight?.toolCalls.has(callId) === true
   }
 
   private onAssistantMessage(sessionId: string, data: Record<string, unknown>, record: SessionRecord): void {
@@ -425,24 +823,30 @@ export class DshAcpServer {
   private onAgentError(payload: unknown): void {
     const body = asRecord(payload)
     const agent = body.agent as DshAgent | undefined
-    const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : undefined
+    const sessionId = sessionIdOfAgent(agent)
     if (sessionId === undefined) return
     const record = this.sessions.get(sessionId)
-    if (record === undefined) return
+    if (record === undefined || record.agent !== agent) return
     const inflight = record.inflight
     if (inflight === undefined) return
+    const turn = numberField(body, 'turn')
+    if (inflight.ownedTurn !== undefined && turn !== undefined && inflight.ownedTurn !== turn) return
     record.inflight = undefined
+    record.openTurn = undefined
     inflight.reject(errorToRpc(body.error, 'turn failed'))
   }
 
   private onApprovalRequest(request: unknown, next: () => unknown): unknown {
     const body = asRecord(request)
     const agent = body.agent as DshAgent | undefined
-    const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : undefined
-    if (sessionId === undefined || this.sessions.get(sessionId)?.agent !== agent) {
+    const sessionId = sessionIdOfAgent(agent)
+    if (sessionId === undefined) return next()
+    const record = this.sessions.get(sessionId)
+    // A human-initiated turn on a hired session keeps its own approval route.
+    if (record === undefined || record.agent !== agent || !this.ownsActiveTurn(record)) {
       return next()
     }
-    if (this.approvalMode !== 'hitl') {
+    if ((this.credentials?.get(sessionId)?.approvalMode ?? 'skip') !== 'hitl') {
       return 'allowed-once'
     }
     return this.requestPermission(sessionId, stringField(body, 'callId') ?? 'tool').then(result => {

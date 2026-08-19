@@ -79,6 +79,7 @@ fn write_one_tracked_session(root: &std::path::Path) {
     ccteam_harness::write_session_meta(
         &project_dir,
         &ccteam_harness::SessionMeta {
+            mode: None,
             managed_by: Default::default(),
             sid: "s1".to_string(),
             slug: "outside".to_string(),

@@ -248,11 +248,13 @@ export function appendSessionEvent(
   return [...prev, event];
 }
 
-/** Lifecycle states that END liveness: `evicted` (capacity stop) is the only
- *  one on today's wire; `stopped` is reserved for an explicit-stop frame. */
-const LIFECYCLE_OFF_STATES = new Set(["evicted", "stopped"]);
-/** Lifecycle states that ASSERT liveness — reserved for a future resume/spawn
- *  frame; none are emitted today (a cold-resume currently emits none). */
+/** Lifecycle states that END liveness: `evicted` (capacity stop), `stopped`
+ *  (an explicit stop, incl. of a detached body), and `detached` — the
+ *  session's OS body outlived a daemon restart and is finishing its turn
+ *  unobserved: alive, but NOT driveable from here until it exits. */
+const LIFECYCLE_OFF_STATES = new Set(["evicted", "stopped", "detached"]);
+/** Lifecycle states that ASSERT liveness: `resumed` is emitted once a
+ *  detached body has exited and the session was rebuilt by sid. */
 const LIFECYCLE_ON_STATES = new Set(["live", "resumed"]);
 
 /** Fold one sid's `session_lifecycle` frames (oldest → newest) over the REST

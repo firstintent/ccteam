@@ -1,7 +1,8 @@
 import Schema from '@deepseek-ai/schemastery';
-import { CcteamCompletionNotifier, CcteamMcpClient, registerCcteamTools } from './tools.js';
+import { SessionCredentialStore } from './credentials.js';
+import { CcteamCompletionNotifier, CcteamMcpClientPool, registerCcteamTools } from './tools.js';
 import { DEFAULT_DAEMON_URL, registerCcteamSettings } from './settings.js';
-import { shouldStartTransport, startDshTransport } from './transport.js';
+import { startDshSocketTransport } from './transport.js';
 export const name = 'ccteam-client';
 export const inject = ['agents', 'tools', 'settings', 'agentDefaultModel'];
 export const Config = Schema.object({
@@ -11,11 +12,10 @@ export const Config = Schema.object({
     boundProject: Schema.string().default(''),
     completionPollIntervalMs: Schema.number().default(5000),
     completionMaxPolls: Schema.number().default(720),
+    transportSocket: Schema.string().description('Unix socket path this plugin serves ACP on for ccteam. Empty = tool surface only.'),
 });
-const PACKAGE_VERSION = '0.9.15-alpha.0';
+const PACKAGE_VERSION = '0.10.3-alpha.0';
 export function apply(ctx, config = {}) {
-    const bootBearer = process.env.CCTEAM_MCP_BEARER;
-    delete process.env.CCTEAM_MCP_BEARER;
     const settings = registerCcteamSettings(ctx, {
         daemonUrl: config.daemonUrl,
         enrollment: config.enrollment,
@@ -23,31 +23,35 @@ export function apply(ctx, config = {}) {
         boundProject: config.boundProject,
     });
     const daemonUrl = () => config.daemonUrl ?? settings.get().daemonUrl ?? DEFAULT_DAEMON_URL;
-    const credential = () => {
-        if (bootBearer !== undefined && bootBearer.trim() !== '')
-            return bootBearer;
+    const enrollment = () => {
         const enrolled = config.enrollment ?? settings.get().enrollment;
         return enrolled === undefined || enrolled.trim() === '' ? undefined : enrolled;
     };
-    const client = new CcteamMcpClient({
-        daemonUrl: daemonUrl(),
-        credential,
+    // One identity per ccteam session, never one per process: this runtime serves
+    // many hires plus the human at the DSH UI.
+    const credentials = new SessionCredentialStore();
+    const clients = new CcteamMcpClientPool({
+        daemonUrl,
+        enrollment,
+        credentials,
         clientName: 'ccteam-dsh-client',
         clientVersion: PACKAGE_VERSION,
     });
-    const notifier = new CcteamCompletionNotifier(client, {
+    const notifier = new CcteamCompletionNotifier({
         pollIntervalMs: config.completionPollIntervalMs,
         maxPolls: config.completionMaxPolls,
     });
     ctx.effect?.(() => () => {
         notifier.close();
-        client.close();
+        clients.close();
     }, 'ccteam.mcp.client');
-    registerCcteamTools(ctx, client, notifier);
-    if (shouldStartTransport(process.env, bootBearer)) {
-        startDshTransport(ctx, {
+    registerCcteamTools(ctx, exec => clients.clientFor(exec), notifier);
+    const socketPath = (config.transportSocket ?? '').trim();
+    if (socketPath !== '') {
+        startDshSocketTransport(ctx, {
             version: PACKAGE_VERSION,
-            approvalMode: process.env.CCTEAM_DSH_APPROVAL === 'hitl' ? 'hitl' : 'skip',
+            socketPath,
+            credentials,
         });
     }
 }

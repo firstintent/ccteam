@@ -388,6 +388,9 @@ describe("dot / chip classes", () => {
   it("maps live status to prototype dot states", () => {
     expect(statusDotClass("working")).toBe("dot busy");
     expect(statusDotClass("stale")).toBe("dot busy");
+    // A detached body (alive from before a daemon restart, finishing its
+    // turn unobserved) is work in progress — amber, not green.
+    expect(statusDotClass("detached")).toBe("dot busy");
     expect(statusDotClass("stuck")).toBe("dot err");
     expect(statusDotClass("idle")).toBe("dot on");
     expect(statusDotClass(undefined)).toBe("dot on");

@@ -7,7 +7,10 @@
 // plus the management actions that exist server-side —
 //   · register-mcp — write ccteam's own MCP server into a LOCAL vendor
 //     config (never a vendor login; the backend 404s non-local, so
-//     satellites render the state without a CTA).
+//     satellites render the state without a CTA). The same endpoint with
+//     `?vendor=dsh` registers ccteam's DSH plugin into the operator's
+//     ~/.dsh web profile instead (ADMIN-only CTA on the dsh row; takes
+//     effect when the human restarts their own `dsh web`).
 //   · install / update (VENDOR-INSTALL-1) — ADMIN-only one-click npm
 //     install/update on the local host (recipe argv is pinned server-side in
 //     `AgentProbeSpec::install_recipe` and runs shell-free; kimi/pi have no
@@ -649,6 +652,22 @@ function VendorManageRow({
             // the write (satellite): state without a dead-end CTA.
             <span>{t("mcpNotRegistered")}</span>
           )
+        ) : agent.vendor === "dsh" && agent.installed && isLocal && isAdmin ? (
+          // DSH's "register ccteam" writes ccteam's plugin bundle + patch row
+          // into the operator's ~/.dsh web profile (server-side gate ①); the
+          // human then restarts their own `dsh web` to load it. Idempotent, so
+          // the CTA stays available; the row hint explains the restart.
+          <button
+            type="button"
+            className="btn primary mini"
+            data-testid="register-dsh-plugin"
+            disabled={busy !== null}
+            onClick={() => onRegister(agent.vendor)}
+          >
+            {busy === registerKey(hostId, agent.vendor)
+              ? t("registeringMcp")
+              : t("registerDshPlugin")}
+          </button>
         ) : null}
       </span>
       {cta.kind !== "none" ? (

@@ -46,10 +46,10 @@ use crate::execution::mcp_config::SessionMcpEndpoint;
 use crate::execution::session_status::write_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind, ApprovalScope, ChoiceOption,
-    ChoicePrompt, ContextSource, ContextUsage, Directive, DirectiveOutcome, ExecutionMode,
-    HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadErrorEvent, ThreadEvent,
-    ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId, TurnInput, TurnRouting,
-    TurnSubmission,
+    ChoicePrompt, ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome,
+    ExecutionMode, HarnessAdapter, HarnessError, SessionTitleTarget, SpawnCtx, ThreadErrorEvent,
+    ThreadEvent, ThreadHandle, ThreadStatus, TitleSync, TurnDisposition, TurnId, TurnInput,
+    TurnRouting, TurnSubmission,
 };
 
 pub const PI_RPC_ADAPTER_NAME: &str = "pi-rpc";
@@ -219,11 +219,13 @@ impl PiRpcAdapter {
         self.live.lock().unwrap().get(identity).cloned()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_ready(
         &self,
         spec: PiSpawnSpec,
         expected_identity: &str,
         sid: &str,
+        project_dir: &Path,
         expected_session_file: Option<&Path>,
         expected_model: Option<&str>,
         expected_effort: Option<&str>,
@@ -232,6 +234,21 @@ impl PiRpcAdapter {
         let transport = PiTransport::connect_stdio(&spec)
             .await
             .map_err(HarnessError::SpawnFailed)?;
+        // One sid, one body: record the child before the handshake so a
+        // daemon restart finds it instead of spawning a second one.
+        if let Err(err) = crate::execution::session_body::record(
+            project_dir,
+            sid,
+            transport.pid().await,
+            PI_RPC_ADAPTER_NAME,
+        ) {
+            tracing::warn!(
+                %sid,
+                error = %err,
+                "pi-rpc: body record write failed; a daemon restart cannot see this body"
+            );
+        }
+        transport.set_body_record(project_dir, sid);
         let mut events = transport.take_startup_events();
         let resolver = self.interaction_resolver.lock().unwrap().clone();
         let handshake = async {
@@ -534,6 +551,7 @@ impl PiRpcAdapter {
                 spawn,
                 &identity,
                 &ctx.sid,
+                &ctx.project_dir,
                 expected_session_file.as_deref(),
                 model.as_deref(),
                 effort.as_deref(),
@@ -676,6 +694,7 @@ impl PiRpcAdapter {
                 candidate_spec,
                 &live.identity,
                 &live.sid,
+                &live.project_dir,
                 Some(&config.session_file),
                 config.model.as_deref(),
                 config.effort.as_deref(),
@@ -721,6 +740,7 @@ impl PiRpcAdapter {
                         rollback_spec,
                         &live.identity,
                         &live.sid,
+                        &live.project_dir,
                         Some(&old.session_file),
                         old.model.as_deref(),
                         old.effort.as_deref(),
@@ -1137,6 +1157,13 @@ impl HarnessAdapter for PiRpcAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Pi has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         self.start_impl(spec, ctx).await
     }
 
@@ -1292,6 +1319,31 @@ impl HarnessAdapter for PiRpcAdapter {
                 ),
             })?;
         self.start_impl(&recipe.spec, &recipe.ctx).await
+    }
+
+    /// Daemon shutdown: let go of the Pi child without stopping it (stdin
+    /// EOF + no kill; body record kept for the next daemon).
+    async fn detach_thread(&self, h: &ThreadHandle) -> Result<DetachOutcome, HarnessError> {
+        let live = self.live.lock().unwrap().remove(&h.identity);
+        let Some(live) = live else {
+            return Ok(DetachOutcome::NotApplicable);
+        };
+        if let Some(task) = live.event_task.lock().unwrap().take() {
+            task.abort();
+        }
+        let transport = live.transport.read().await.clone();
+        let pid = transport.detach().await;
+        tracing::info!(
+            sid = %live.sid,
+            ?pid,
+            "pi-rpc: body detached (left running; record kept for the next daemon)"
+        );
+        // Pi's rpc turn state lives in the sidecar; whether a turn was mid-flight
+        // at detach is not tracked here, so report it conservatively.
+        Ok(DetachOutcome::Detached {
+            pid,
+            in_flight: false,
+        })
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {

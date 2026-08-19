@@ -127,6 +127,20 @@ pub fn session_mcp_bearer(sid: &str, secret: &str) -> String {
     format!("ccteam-sid:{sid}:{secret}")
 }
 
+/// Read back the per-session secret from the curated `mcp.json` the daemon
+/// wrote for `sid` (the `ccteam-sid:<sid>:<secret>` bearer). Used to re-arm
+/// the principal of a body that outlived a daemon restart: the process is
+/// still calling `/mcp` with the bearer baked into that file. `None` when
+/// the file is absent, unparseable, or names another sid.
+pub fn read_session_mcp_secret(project_dir: &Path, sid: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(session_mcp_config_path(project_dir, sid)).ok()?;
+    let prefix = format!("Bearer ccteam-sid:{sid}:");
+    raw.split('"')
+        .find_map(|piece| piece.strip_prefix(prefix.as_str()))
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_string)
+}
+
 // =====================================================================
 // Resolution — ONE chain, shared by managed spawn and global registration
 // =====================================================================
@@ -477,6 +491,13 @@ mod tests {
             write_session_mcp_config(tmp.path(), "s9", &ep("http://127.0.0.1:9/mcp", "s9", "x"))
                 .unwrap();
         assert!(path.exists());
+        // The secret reads back from the same file (re-arming a body that
+        // outlived a daemon restart), and only for the sid it was written for.
+        assert_eq!(
+            read_session_mcp_secret(tmp.path(), "s9").as_deref(),
+            Some("x")
+        );
+        assert_eq!(read_session_mcp_secret(tmp.path(), "s10"), None);
         assert!(path.ends_with("mcp.json"));
         let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(body["mcpServers"]["ccteam"]["type"], "http");

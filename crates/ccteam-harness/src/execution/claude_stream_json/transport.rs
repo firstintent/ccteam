@@ -65,6 +65,10 @@ pub struct StreamJsonTransport {
     init: Arc<InitSlot>,
     pending: PendingControls,
     close: Arc<CloseSignal>,
+    /// Set by [`Self::detach`]: the daemon let go of the body WITHOUT stopping
+    /// it. Readers that would otherwise treat "closed" as "the child exited"
+    /// (the body-record clearer) must check this first.
+    detached: AtomicBool,
     child: StdMutex<Option<Child>>,
     writer_task: StdMutex<Option<JoinHandle<()>>>,
     reader_task: StdMutex<Option<JoinHandle<()>>>,
@@ -92,7 +96,13 @@ impl StreamJsonTransport {
         cmd.args(&argv[1..])
             .current_dir(cwd)
             .envs(env.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .kill_on_drop(true)
+            // The body's life is decided EXPLICITLY: `shutdown` kills it (a
+            // user stop), `detach` lets it go on living (daemon shutdown).
+            // A dropped handle must never decide by itself — with
+            // kill_on_drop the outcome of a daemon exit depended on which
+            // Arc happened to be released first, and a body that should
+            // have finished its turn could be SIGKILLed mid-write.
+            .kill_on_drop(false)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -143,6 +153,7 @@ impl StreamJsonTransport {
             init,
             pending,
             close,
+            detached: AtomicBool::new(false),
             child: StdMutex::new(child),
             writer_task: StdMutex::new(Some(writer_task)),
             reader_task: StdMutex::new(Some(reader_task)),
@@ -258,6 +269,45 @@ impl StreamJsonTransport {
     /// Graceful stop: abort the writer task (drops `ChildStdin` → EOF →
     /// claude exits), then kill the child as a safety net and abort the
     /// reader/stderr tasks. Idempotent.
+    /// The child's OS pid, while the transport still holds it (`None` for a
+    /// remote / test transport, or after `shutdown` / `detach`).
+    pub fn pid(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|child| child.id()))
+    }
+
+    /// True once [`Self::detach`] ran: the session is closed for THIS daemon
+    /// but the body lives on.
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    /// Let go of the body WITHOUT stopping it (daemon shutdown): close our
+    /// end of stdin (EOF — an idle `claude` exits on it, a busy one finishes
+    /// its turn first), stop reading, and drop the child handle with no kill.
+    /// Returns the pid the next daemon will find in the body record.
+    pub async fn detach(&self) -> Option<u32> {
+        self.detached.store(true, Ordering::Release);
+        let pid = self.pid();
+        self.close.closed.store(true, Ordering::Release);
+        self.close.notify.notify_waiters();
+        if let Some(h) = self.writer_task.lock().unwrap().take() {
+            h.abort();
+        }
+        // Dropping a tokio `Child` spawned with `kill_on_drop(false)` only
+        // hands it to tokio's orphan reaper (no signal is sent).
+        let _ = self.child.lock().unwrap().take();
+        if let Some(h) = self.reader_task.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(h) = self.stderr_task.lock().unwrap().take() {
+            h.abort();
+        }
+        pid
+    }
+
     pub async fn shutdown(&self) {
         // Mark closed first so any `events()` task ends promptly even if
         // the child lingers past the stdin-EOF window.

@@ -1612,6 +1612,13 @@ impl HarnessAdapter for CodexAppServerAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Codex has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // v0.9.0 W3 (F3) — remote execution is claude-only in this version
         // (PRD §五 explicit non-goal: codex/opencode/grok remote is
         // best-effort, verified only by compiling). Fail clean + readable

@@ -166,6 +166,14 @@ while True:
     emit({"type":"result","subtype":"success","result":reply,"is_error":False,
           "total_cost_usd":0.001,"usage":{"input_tokens":7,"output_tokens":4},
           "session_id":sid})
+# Real claude keeps working after stdin EOF while a turn is in flight and only
+# exits once idle. `FAKE_SJ_LINGER_SECS` models that body: stay alive for N
+# seconds after EOF, then exit — the daemon-restart "body outlives the daemon"
+# shape the session_body gate exists for.
+linger = os.environ.get("FAKE_SJ_LINGER_SECS")
+if linger:
+    import time
+    time.sleep(float(linger))
 "#;
 
 fn write_fake(tmp: &Path) -> PathBuf {
@@ -193,11 +201,13 @@ fn setup(tmp: &Path) -> PathBuf {
     std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
     std::env::remove_var("FAKE_SJ_INIT_MCP_FAILED");
     std::env::remove_var("FAKE_SJ_CTL_LOG");
+    std::env::remove_var("FAKE_SJ_LINGER_SECS");
     fake
 }
 
 fn ctx(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        mode: None,
         slug: slug.to_string(),
         sid: sid.to_string(),
         owner: "user:web-api".into(),
@@ -1280,4 +1290,198 @@ async fn resume_failure_emits_reset_event_with_sid_and_reason() {
     std::env::remove_var("FAKE_SJ_DIE_ON_RESUME");
     std::env::remove_var("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS");
     adapter.close_thread(&h).await.unwrap();
+}
+
+// ─────────────── one sid, one body (2026-08-19) ───────────────
+
+/// A spawn records its body (`<project>/.ccteam/chat/<sid>/body.json`, pid +
+/// start fingerprint) BEFORE the handshake; an explicit `close_thread` ends
+/// the process and clears the record; a `detach_thread` (daemon shutdown)
+/// leaves the process running AND keeps the record — the facts the next
+/// daemon's gate needs to wait for this body instead of spawning a twin.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn body_record_follows_spawn_close_and_detach() {
+    use ccteam_harness::execution::session_body::{self, BodyProbe};
+    use ccteam_harness::DetachOutcome;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    // Linger 30s after stdin EOF: this body "outlives the daemon".
+    std::env::set_var("FAKE_SJ_LINGER_SECS", "30");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let spec = AgentSpecBrief {
+        role: String::new(),
+    };
+
+    // spawn → recorded + alive
+    let h = adapter
+        .start_thread(&spec, &ctx(tmp.path(), "proj", "s41"))
+        .await
+        .unwrap();
+    let body = session_body::read(tmp.path(), "s41").expect("body.json written at spawn");
+    assert_eq!(body.adapter, "claude-stream-json");
+    assert!(matches!(
+        session_body::probe(tmp.path(), "s41"),
+        BodyProbe::Alive(_)
+    ));
+
+    // detach → process still alive, record kept, session no longer live here
+    match adapter.detach_thread(&h).await.unwrap() {
+        DetachOutcome::Detached { pid, in_flight } => {
+            assert_eq!(pid, Some(body.pid));
+            assert!(!in_flight, "no turn was in flight");
+        }
+        other => panic!("expected Detached, got {other:?}"),
+    }
+    assert!(!adapter.thread_is_live(&h));
+    assert!(
+        matches!(session_body::probe(tmp.path(), "s41"), BodyProbe::Alive(_)),
+        "the detached body keeps running and keeps its record"
+    );
+    // A second detach is a no-op (nothing held any more).
+    assert_eq!(
+        adapter.detach_thread(&h).await.unwrap(),
+        DetachOutcome::NotApplicable
+    );
+    // Tidy: end the lingering fake so it does not outlive the test.
+    session_body::terminate(&body, "s41", Duration::from_secs(3)).unwrap();
+    assert!(matches!(
+        session_body::probe(tmp.path(), "s41"),
+        BodyProbe::Gone(_)
+    ));
+    session_body::clear(tmp.path(), "s41");
+
+    // spawn again → close → process gone AND record cleared
+    std::env::remove_var("FAKE_SJ_LINGER_SECS");
+    let h2 = adapter
+        .start_thread(&spec, &ctx(tmp.path(), "proj", "s41"))
+        .await
+        .unwrap();
+    let body2 = session_body::read(tmp.path(), "s41").expect("re-spawn re-records");
+    assert_ne!(body2.pid, body.pid);
+    adapter.close_thread(&h2).await.unwrap();
+    // close = explicit kill + clear (the clear-on-exit task may race; wait briefly)
+    for _ in 0..50 {
+        if matches!(session_body::probe(tmp.path(), "s41"), BodyProbe::Absent) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(session_body::probe(tmp.path(), "s41"), BodyProbe::Absent);
+    assert!(
+        !session_body::process_exists(body2.pid) || {
+            // killed but maybe not yet reaped by tokio: a zombie is not a body
+            !session_body::body_is_alive(&body2, "s41")
+        }
+    );
+}
+
+/// The body's own exit (no detach, no close — it just ended) clears the record
+/// too: the clear-on-close task watches the transport, so a crash / idle exit
+/// never leaves a stale record behind while THIS daemon is alive.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn body_record_clears_when_the_child_exits_on_its_own() {
+    use ccteam_harness::execution::session_body::{self, BodyProbe};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let spec = AgentSpecBrief {
+        role: String::new(),
+    };
+    let h = adapter
+        .start_thread(&spec, &ctx(tmp.path(), "proj", "s42"))
+        .await
+        .unwrap();
+    let body = session_body::read(tmp.path(), "s42").unwrap();
+    assert!(matches!(
+        session_body::probe(tmp.path(), "s42"),
+        BodyProbe::Alive(_)
+    ));
+    // End the child from outside (a crash): the transport sees EOF.
+    session_body::terminate(&body, "s42", Duration::from_secs(3)).unwrap();
+    for _ in 0..100 {
+        if matches!(session_body::probe(tmp.path(), "s42"), BodyProbe::Absent) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        session_body::probe(tmp.path(), "s42"),
+        BodyProbe::Absent,
+        "observed exit clears the record"
+    );
+    assert!(!adapter.thread_is_live(&h));
+}
+
+/// `recover_unobserved_turn` reads claude's own transcript jsonl for the
+/// session's deterministic uuid under the pinned HOME: end_turn text newer
+/// than `observed_until` comes back as the recovered answer (+ usage).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn recover_unobserved_turn_reads_the_vendor_transcript() {
+    use ccteam_harness::UnobservedTurnCtx;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let uuid = deterministic_session_uuid("proj", "s43");
+    let dir = anthropic_project_dir(tmp.path()).expect("HOME is pinned");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lines = [
+        serde_json::json!({"type":"assistant","timestamp":"2026-08-19T02:00:00.000Z",
+            "message":{"role":"assistant","stop_reason":"end_turn",
+                "content":[{"type":"text","text":"observed"}],
+                "usage":{"input_tokens":1,"output_tokens":1}}}),
+        serde_json::json!({"type":"assistant","timestamp":"2026-08-19T02:30:00.000Z",
+            "message":{"role":"assistant","stop_reason":"tool_use",
+                "content":[{"type":"text","text":"working on it"},{"type":"tool_use","name":"Bash","input":{}}],
+                "usage":{"input_tokens":10,"output_tokens":20}}}),
+        serde_json::json!({"type":"assistant","timestamp":"2026-08-19T02:40:00.000Z",
+            "message":{"role":"assistant","stop_reason":"end_turn",
+                "content":[{"type":"text","text":"DONE after restart"}],
+                "usage":{"input_tokens":5,"output_tokens":6}}}),
+    ];
+    let body = lines
+        .iter()
+        .map(|l| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.join(format!("{uuid}.jsonl")), body).unwrap();
+
+    let observed_until = chrono::DateTime::parse_from_rfc3339("2026-08-19T02:09:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let recovered = adapter
+        .recover_unobserved_turn(&UnobservedTurnCtx {
+            sid: "s43".into(),
+            slug: "proj".into(),
+            cwd: tmp.path().to_path_buf(),
+            vendor_uuid: uuid.clone(),
+            observed_until,
+            last_observed_assistant: Some("observed".into()),
+        })
+        .await
+        .expect("the unobserved end_turn is recovered");
+    assert_eq!(recovered.assistant, "DONE after restart");
+    assert_eq!(recovered.usage["input_tokens"], 15);
+    assert_eq!(recovered.usage["output_tokens"], 26);
+
+    // Nothing newer than the cut → None (an idle body has nothing to report).
+    let later = chrono::DateTime::parse_from_rfc3339("2026-08-19T03:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(adapter
+        .recover_unobserved_turn(&UnobservedTurnCtx {
+            sid: "s43".into(),
+            slug: "proj".into(),
+            cwd: tmp.path().to_path_buf(),
+            vendor_uuid: uuid,
+            observed_until: later,
+            last_observed_assistant: None,
+        })
+        .await
+        .is_none());
 }

@@ -185,6 +185,12 @@ pub struct SessionMeta {
     /// stopped committing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Explicit vendor session-mode pick (DSH agent preset today), same
+    /// replay contract as [`Self::effort`]: `None` = ccteam's per-vendor
+    /// default, replayed verbatim on every re-spawn so a resume or role
+    /// switch never silently resets the axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub host: String,
     pub created_at: String,
     /// Updated only on turn completion — not on every event.
@@ -498,6 +504,7 @@ mod title_tests {
 
     fn blank_meta() -> SessionMeta {
         SessionMeta {
+            mode: None,
             managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),

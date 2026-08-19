@@ -29,6 +29,7 @@
 
 pub mod bridge;
 pub mod protocol;
+pub mod recovery;
 pub mod spawn_spec;
 pub mod translate;
 pub mod transport;
@@ -52,9 +53,10 @@ use crate::execution::progress_bridge::{
 use crate::execution::session_status::{read_status_file, write_status_file};
 use crate::execution::transcript_tail::anthropic_project_dir;
 use crate::{
-    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, Directive, DirectiveOutcome,
-    ExecutionMode, HarnessAdapter, HarnessError, SpawnCtx, ThreadEvent, ThreadHandle, ThreadStatus,
-    TurnId, TurnInput, TurnRouting, TurnSubmission,
+    AgentSpecBrief, AgentVendor, ChoiceOption, ChoicePrompt, DetachOutcome, Directive,
+    DirectiveOutcome, ExecutionMode, HarnessAdapter, HarnessError, RecoveredTurn, SpawnCtx,
+    ThreadEvent, ThreadHandle, ThreadStatus, TurnId, TurnInput, TurnRouting, TurnSubmission,
+    UnobservedTurnCtx,
 };
 
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
@@ -1025,10 +1027,27 @@ impl ClaudeStreamJsonAdapter {
         argv: &[String],
         env: &[(String, String)],
         cwd: &Path,
+        body: Option<(&Path, &str)>,
     ) -> Result<(Arc<StreamJsonTransport>, protocol::SystemMsg), HarnessError> {
         let transport = StreamJsonTransport::connect_stdio(argv, env, cwd)
             .await
             .map_err(|e| HarnessError::SpawnFailed(format!("stream-json connect: {e:#}")))?;
+        // One sid, one body: record the child BEFORE the handshake, so the
+        // next daemon can find this process even if this one dies right now.
+        if let Some((project_dir, sid)) = body {
+            if let Err(err) = crate::execution::session_body::record(
+                project_dir,
+                sid,
+                transport.pid(),
+                STREAM_JSON_ADAPTER_NAME,
+            ) {
+                tracing::warn!(
+                    sid = %sid,
+                    error = %err,
+                    "claude-stream-json: body record write failed; a daemon restart cannot see this body"
+                );
+            }
+        }
         Self::init_transport(transport).await
     }
 
@@ -1159,6 +1178,13 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Claude has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // v0.8.11 E2 — pin-point isolate the official Telegram plugin (its
         // bot-token getUpdates poll structurally collides with ccteam's IM
         // gateway). Same managed layer the tmux path uses; only this one
@@ -1257,7 +1283,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 Err(e) => return Err(e),
             }
         } else {
-            match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd).await {
+            let body = Some((ctx.project_dir.as_path(), ctx.sid.as_str()));
+            match Self::spawn_and_init(&make_argv(resume), &env, &ctx.cwd, body).await {
                 Ok(ok) => ok,
                 Err(resume_err) if resume => {
                     tracing::warn!(
@@ -1266,7 +1293,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                         error = %resume_err,
                         "claude-stream-json: --resume spawn failed; falling back to fresh --session-id"
                     );
-                    let fresh = Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd).await?;
+                    let fresh =
+                        Self::spawn_and_init(&make_argv(false), &env, &ctx.cwd, body).await?;
                     if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
                         let ev = build_chat_session_reset_event_with_reason(
                             &spec.role,
@@ -1394,6 +1422,21 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             running_tasks,
             active_turn,
         };
+        // Body record lifecycle: the record written at spawn is cleared the
+        // moment THIS daemon observes the child's exit (stdout EOF). A
+        // `detach` (daemon shutdown) closes the transport too, but leaves the
+        // body alive — the record must then stay for the next daemon.
+        if ctx.remote.is_none() {
+            let transport = Arc::clone(&live.transport);
+            let project_dir = ctx.project_dir.clone();
+            let sid = ctx.sid.clone();
+            tokio::spawn(async move {
+                transport.wait_closed().await;
+                if !transport.is_detached() {
+                    crate::execution::session_body::clear(&project_dir, &sid);
+                }
+            });
+        }
         self.live
             .lock()
             .unwrap()
@@ -1652,8 +1695,57 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let live = self.live.lock().unwrap().remove(&h.identity);
         if let Some(live) = live {
             live.transport.shutdown().await;
+            if live.identity.host == "local" {
+                crate::execution::session_body::clear(&live.project_dir, &live.identity.sid);
+            }
         }
         Ok(())
+    }
+
+    /// Daemon shutdown: release the local body without stopping it (stdin
+    /// EOF + no kill). The body record stays on disk; a remote body is the
+    /// satellite's to keep, so it is left exactly as it was.
+    async fn detach_thread(&self, h: &ThreadHandle) -> Result<DetachOutcome, HarnessError> {
+        let is_local = self
+            .lookup(&h.identity)
+            .map(|live| live.identity.host == "local")
+            .unwrap_or(false);
+        if !is_local {
+            return Ok(DetachOutcome::NotApplicable);
+        }
+        let live = self.live.lock().unwrap().remove(&h.identity);
+        let Some(live) = live else {
+            return Ok(DetachOutcome::NotApplicable);
+        };
+        let in_flight = live.active_turn.load(Ordering::SeqCst);
+        let pid = live.transport.detach().await;
+        tracing::info!(
+            sid = %live.identity.sid,
+            slug = %live.slug,
+            ?pid,
+            in_flight,
+            "claude-stream-json: body detached (left running; record kept for the next daemon)"
+        );
+        Ok(DetachOutcome::Detached { pid, in_flight })
+    }
+
+    /// Claude keeps its own durable transcript (`~/.claude/projects/<encoded
+    /// cwd>/<uuid>.jsonl`); read what the body wrote there after ccteam
+    /// stopped observing it. Local bodies only — a satellite transcript is
+    /// not on this filesystem.
+    async fn recover_unobserved_turn(&self, ctx: &UnobservedTurnCtx) -> Option<RecoveredTurn> {
+        if ctx.vendor_uuid.is_empty() {
+            return None;
+        }
+        let path = anthropic_project_dir(&ctx.cwd)?.join(format!("{}.jsonl", ctx.vendor_uuid));
+        let observed_until = ctx.observed_until;
+        let last = ctx.last_observed_assistant.clone();
+        tokio::task::spawn_blocking(move || {
+            recovery::recover_after(&path, observed_until, last.as_deref())
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn handle_directive(

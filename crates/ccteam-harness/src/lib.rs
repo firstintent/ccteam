@@ -50,14 +50,14 @@ pub use adapter::{
     parse_pid_from_state, pluck, pluck_f64, pluck_pct, pluck_str, sigkill_pid, sigterm_pid,
     state_json_path, AccountUsage, AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind,
     ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection,
-    ContextSource, ContextUsage, Directive, DirectiveOutcome, EventAttachment, ExecutionMode,
-    GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope, PermissionMode,
-    RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts,
-    SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails,
-    ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId, TurnInput, TurnRouting,
-    TurnSubmission, UnifiedTokenUsage, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
-    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
-    KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+    ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome, EventAttachment,
+    ExecutionMode, GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope,
+    PermissionMode, RecoveredTurn, RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget,
+    SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId,
+    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV,
+    CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
+    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -71,9 +71,14 @@ pub use execution::delegation::{
     NotifyMode,
 };
 pub use execution::dsh_acp::{
-    build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, is_ccteam_managed_dsh_orphan,
-    resolve_dsh_default_bin, tenant_home_segment, DshAcpAdapter, DshConfigSource,
-    DshWebSpawnOptions, DSH_ACP_ADAPTER_NAME, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE, DSH_WEB_PROFILE,
+    build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, identity_socket_path,
+    resolve_dsh_default_bin, socket_path_for_identity, tenant_home_segment, DshAcpAdapter,
+    DshConfigSource, DshWebSpawnOptions, DSH_ACP_ADAPTER_NAME, DSH_BIN_ENV, DSH_NATIVE_WEB_PROFILE,
+    DSH_SOCKET_ENV, DSH_WEB_PROFILE,
+};
+pub use execution::dsh_runtime::{
+    is_ccteam_managed_dsh_orphan, sweep_legacy_dsh_orphans, DshEnrollmentResolver,
+    DshRuntimeConfig, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState, DshRuntimeStatus,
 };
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};

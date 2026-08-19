@@ -1,6 +1,6 @@
 {
   "name": "@ccteam/dsh-client",
-  "version": "0.9.15-alpha.0",
+  "version": "0.10.3-alpha.0",
   "description": "ccteam client bundle for DeepSeek Harness",
   "type": "module",
   "main": "dist/index.js",

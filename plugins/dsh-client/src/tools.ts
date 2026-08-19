@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import type { SessionCredentialStore } from './credentials.js'
 
 export interface ContentBlock {
   type: string
@@ -164,6 +165,111 @@ export class CcteamMcpClient {
   }
 }
 
+/**
+ * One MCP client per distinct daemon credential: a bearer IS an identity on the
+ * daemon, so two hires sharing one `Mcp-Session-Id` would share one ledger node.
+ * The enrollment client (mode 2, hand-installed plugin) stays shared.
+ */
+export class CcteamMcpClientPool {
+  private readonly daemonUrl: () => string
+  private readonly enrollment: () => string | undefined
+  private readonly credentials: SessionCredentialStore | undefined
+  private readonly clientName: string
+  private readonly clientVersion: string
+  private readonly fetchImpl: typeof fetch | undefined
+  private readonly byCredential = new Map<string, CcteamMcpClient>()
+  private enrollmentClient: CcteamMcpClient | undefined
+  private readonly offRemoved: (() => void) | undefined
+
+  constructor(options: {
+    daemonUrl: () => string
+    enrollment: () => string | undefined
+    credentials?: SessionCredentialStore
+    clientName: string
+    clientVersion: string
+    fetchImpl?: typeof fetch
+  }) {
+    this.daemonUrl = options.daemonUrl
+    this.enrollment = options.enrollment
+    this.credentials = options.credentials
+    this.clientName = options.clientName
+    this.clientVersion = options.clientVersion
+    this.fetchImpl = options.fetchImpl
+    this.offRemoved = options.credentials?.onRemoved((_sessionId, removed) => {
+      if (removed.bearer === undefined) return
+      const key = this.key(this.urlFor(removed.mcpUrl), removed.bearer)
+      this.byCredential.get(key)?.close()
+      this.byCredential.delete(key)
+    })
+  }
+
+  /** Resolve the caller: its own session bearer when known, else enrollment. */
+  clientFor(exec: ToolRunContext): CcteamMcpClient {
+    const meta = this.credentials?.get(sessionIdOfAgent(exec.agent))
+    const bearer = meta?.bearer
+    if (bearer === undefined || bearer.trim() === '') return this.forEnrollment()
+    return this.forCredential(this.urlFor(meta?.mcpUrl), bearer)
+  }
+
+  private forEnrollment(): CcteamMcpClient {
+    if (this.enrollmentClient === undefined) {
+      this.enrollmentClient = this.build(this.daemonUrl(), this.enrollment)
+    }
+    return this.enrollmentClient
+  }
+
+  private forCredential(daemonUrl: string, bearer: string): CcteamMcpClient {
+    const key = this.key(daemonUrl, bearer)
+    const cached = this.byCredential.get(key)
+    if (cached !== undefined) return cached
+    const client = this.build(daemonUrl, () => bearer)
+    this.byCredential.set(key, client)
+    return client
+  }
+
+  private build(daemonUrl: string, credential: () => string | undefined): CcteamMcpClient {
+    return new CcteamMcpClient({
+      daemonUrl,
+      credential,
+      clientName: this.clientName,
+      clientVersion: this.clientVersion,
+      ...(this.fetchImpl === undefined ? {} : { fetchImpl: this.fetchImpl }),
+    })
+  }
+
+  private urlFor(mcpUrl: string | undefined): string {
+    const explicit = mcpUrl === undefined ? '' : mcpUrl.trim()
+    if (explicit === '') return this.daemonUrl()
+    // `_meta.ccteam.mcpUrl` is the ENDPOINT url (`http://…:7331/mcp`), the same
+    // shape ccteam writes into every vendor's curated MCP config. The client
+    // appends `/mcp` to its base itself, so keep the base here — forwarding the
+    // endpoint verbatim double-suffixed every per-session call to `/mcp/mcp`,
+    // which is not the exempt MCP route: with web auth enabled the daemon
+    // answered a plain-text 401 `auth required` (owner-reported real-machine
+    // regression, v0.10.3).
+    return explicit.replace(/\/+$/, '').replace(/\/mcp$/, '')
+  }
+
+  private key(daemonUrl: string, bearer: string): string {
+    return `${daemonUrl} ${bearer}`
+  }
+
+  close(): void {
+    this.offRemoved?.()
+    this.enrollmentClient?.close()
+    this.enrollmentClient = undefined
+    for (const client of this.byCredential.values()) client.close()
+    this.byCredential.clear()
+  }
+}
+
+export function sessionIdOfAgent(agent: DshAgent | undefined): string | undefined {
+  if (agent === undefined) return undefined
+  if (typeof agent.id === 'string' && agent.id !== '') return agent.id
+  const sessionId = agent.session?.id
+  return typeof sessionId === 'string' && sessionId !== '' ? sessionId : undefined
+}
+
 export interface ToolRunContext {
   agent?: DshAgent
   signal?: AbortSignal
@@ -173,9 +279,10 @@ export interface ToolRunContext {
 export interface DshAgent {
   id?: string
   session?: { id?: string; events?: unknown[] }
+  inbox?: { remove?(messageId: string): boolean }
   followup?(message: unknown): void
   whenIdle?(): Promise<void>
-  cancel?(cause: { kind: string }): void
+  cancel?(cause: { kind: string }, options?: { keepInbox?: boolean }): void
   [key: string]: unknown
 }
 
@@ -198,8 +305,11 @@ export interface DshToolDefinition {
 }
 
 export interface DelegationNotifier {
-  maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext): void
+  maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext, client: CcteamMcpClient): void
 }
+
+/** Resolves which daemon identity a tool call runs under. */
+export type McpClientForExec = (exec: ToolRunContext) => CcteamMcpClient
 
 interface McpToolDefinition {
   name: string
@@ -326,9 +436,9 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
 ]
 
-export function registerCcteamTools(ctx: ToolRegistryContext, client: CcteamMcpClient, notifier?: DelegationNotifier): void {
+export function registerCcteamTools(ctx: ToolRegistryContext, clientFor: McpClientForExec, notifier?: DelegationNotifier): void {
   for (const definition of CCTEAM_TOOL_DEFINITIONS) {
-    const tool = toDshTool(definition, client, notifier)
+    const tool = toDshTool(definition, clientFor, notifier)
     if (typeof ctx.effect === 'function') {
       ctx.effect(() => ctx.tools.register(tool), `ccteam.tool.${definition.name}`)
     } else {
@@ -337,7 +447,7 @@ export function registerCcteamTools(ctx: ToolRegistryContext, client: CcteamMcpC
   }
 }
 
-function toDshTool(definition: McpToolDefinition, client: CcteamMcpClient, notifier?: DelegationNotifier): DshToolDefinition {
+function toDshTool(definition: McpToolDefinition, clientFor: McpClientForExec, notifier?: DelegationNotifier): DshToolDefinition {
   return {
     name: definition.name,
     description: definition.description,
@@ -349,28 +459,27 @@ function toDshTool(definition: McpToolDefinition, client: CcteamMcpClient, notif
       },
     },
     async execute(args, exec) {
+      const client = clientFor(exec)
       const result = await client.callTool(definition.name, args)
-      notifier?.maybeNotify(definition.name, args, result, exec)
+      notifier?.maybeNotify(definition.name, args, result, exec, client)
       return result
     },
   }
 }
 
 export class CcteamCompletionNotifier implements DelegationNotifier {
-  private readonly client: CcteamMcpClient
   private readonly pollIntervalMs: number
   private readonly maxPolls: number
   private readonly sleep: (ms: number) => Promise<void>
   private closed = false
 
-  constructor(client: CcteamMcpClient, options?: { pollIntervalMs?: number; maxPolls?: number; sleep?: (ms: number) => Promise<void> }) {
-    this.client = client
+  constructor(options?: { pollIntervalMs?: number; maxPolls?: number; sleep?: (ms: number) => Promise<void> }) {
     this.pollIntervalMs = options?.pollIntervalMs ?? 5000
     this.maxPolls = options?.maxPolls ?? 720
     this.sleep = options?.sleep ?? ((ms) => new Promise(resolve => setTimeout(resolve, ms)))
   }
 
-  maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext): void {
+  maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext, client: CcteamMcpClient): void {
     if (this.closed) return
     if (toolName !== 'session_spawn' && toolName !== 'session_dispatch') return
     if (toolName === 'session_spawn' && (!isRecord(args) || typeof args.task !== 'string' || args.task.trim() === '')) return
@@ -378,17 +487,17 @@ export class CcteamCompletionNotifier implements DelegationNotifier {
     if (!isAgentWithSession(origin)) return
     const sid = extractDelegatedSid(toolName, args, result)
     if (sid === undefined) return
-    void this.pollAndFollowup(origin, sid, result).catch(() => undefined)
+    void this.pollAndFollowup(origin, sid, result, client).catch(() => undefined)
   }
 
-  private async pollAndFollowup(origin: DshAgent, sid: string, initial: McpToolResult): Promise<void> {
+  private async pollAndFollowup(origin: DshAgent, sid: string, initial: McpToolResult, client: CcteamMcpClient): Promise<void> {
     let latest = resultJson(initial)
     if (!isTerminalDispatch(latest)) {
       for (let i = 0; i < this.maxPolls; i++) {
         if (this.closed) return
         await this.sleep(this.pollIntervalMs)
         if (this.closed) return
-        const collected = await this.client.callTool('session_collect', {
+        const collected = await client.callTool('session_collect', {
           sid,
           tail: true,
           n: 1,
@@ -412,13 +521,21 @@ export class CcteamCompletionNotifier implements DelegationNotifier {
   }
 }
 
-export function createUserTextMessage(text: string): unknown {
+/** A ccteam-minted user turn; its `id` is what turn attribution binds on. */
+export interface UserTextMessage {
+  readonly id: string
+  readonly role: 'user'
+  readonly content: readonly [{ readonly type: 'text'; readonly text: string }]
+  readonly source: { readonly kind: 'user' }
+}
+
+export function createUserTextMessage(text: string): UserTextMessage {
   return Object.freeze({
     id: randomUUID(),
     role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'user' },
-  })
+    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+    source: Object.freeze({ kind: 'user' }),
+  }) as UserTextMessage
 }
 
 function extractDelegatedSid(toolName: string, args: unknown, result: McpToolResult): string | undefined {

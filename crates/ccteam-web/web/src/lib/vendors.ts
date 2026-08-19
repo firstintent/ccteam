@@ -318,12 +318,16 @@ export function vendorChipClass(vendor: string): string {
 }
 
 /** Session status → prototype dot state (`on` green / `busy` amber / `off`
- *  gray / `err` red). Live-but-unknown statuses read green (idle/live). */
+ *  gray / `err` red). Live-but-unknown statuses read green (idle/live).
+ *  `detached` (the body from before a daemon restart is still finishing its
+ *  turn unobserved — alive, not driveable from here) reads amber like any
+ *  busy session: work is happening, it just is not ours to drive yet. */
 export function statusDotClass(status: string | null | undefined, opts?: { off?: boolean }): string {
   if (opts?.off) return "dot off";
   switch (status) {
     case "working":
     case "stale":
+    case "detached":
       return "dot busy";
     case "stuck":
       return "dot err";

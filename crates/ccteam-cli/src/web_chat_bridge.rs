@@ -811,13 +811,15 @@ mod tests {
         drop(socket);
         stop_stack(second).await;
 
-        // A daemon restart kills every child process, so there is nothing to
-        // re-attach to: since v0.8.21 the restore RE-SPAWNS each persisted
-        // session through the resume-aware `start_thread` (same sid →
-        // deterministic vendor uuid → `--resume`, conversation preserved),
-        // and `HarnessAdapter::resume_thread` is NOT on that path. So the
-        // evidence that "restart resumed both sessions" is two MORE starts —
-        // exactly one per persisted session — not a `resume_thread` count.
+        // The restore RE-SPAWNS each persisted session through the
+        // resume-aware `start_thread` (same sid → deterministic vendor uuid →
+        // `--resume`, conversation preserved); `HarnessAdapter::resume_thread`
+        // is NOT on that path. (A real stdio body that outlived the daemon is
+        // gated by its body record first — `session_body` — and waited for
+        // instead; this recording fake spawns no process, so every persisted
+        // session restores at once.) So the evidence that "restart resumed
+        // both sessions" is two MORE starts — exactly one per persisted
+        // session — not a `resume_thread` count.
         assert_eq!(
             adapter_state.starts.load(Ordering::SeqCst),
             4,

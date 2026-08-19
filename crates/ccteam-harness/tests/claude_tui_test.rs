@@ -46,6 +46,7 @@ fn kill_session_quiet(name: &str) {
 async fn spawn_time_effort_is_refused_rather_than_ignored() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ctx = SpawnCtx {
+        mode: None,
         slug: "tui-effort".into(),
         sid: "s-effort".into(),
         owner: "user:web-api".into(),
@@ -94,6 +95,7 @@ async fn start_thread_spawns_tmux_and_returns_handle() {
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
+        mode: None,
         slug: slug.clone(),
         sid: sid.clone(),
         owner: "user:web-api".into(),
@@ -144,6 +146,7 @@ async fn submit_turn_sends_literal_text_to_tmux_pane() {
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
+        mode: None,
         slug: slug.clone(),
         sid: sid.clone(),
         owner: "user:web-api".into(),
@@ -209,6 +212,7 @@ async fn submit_turn_artifact_uses_read_protocol() {
 
     let brief = AgentSpecBrief { role: role.clone() };
     let ctx = SpawnCtx {
+        mode: None,
         slug: slug.clone(),
         sid: sid.clone(),
         owner: "user:web-api".into(),
@@ -494,6 +498,7 @@ async fn claude_directive_bare_model_passes_through_to_native_picker() {
         role: "alice".to_string(),
     };
     let ctx = SpawnCtx {
+        mode: None,
         slug: slug.clone(),
         sid: sid.clone(),
         owner: "user:web-api".into(),

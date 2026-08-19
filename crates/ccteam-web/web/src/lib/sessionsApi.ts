@@ -437,6 +437,10 @@ export interface CreateSessionOpts {
    *  `max` — see `lib/vendors.ts` / `GET /api/v1/models`); omit for the
    *  vendor default. */
   effort?: string;
+  /** Vendor session-mode token. DSH only today: its agent preset —
+   *  `standard` | `ptc` | `minimal` | `creator`; omitted → DSH hires default
+   *  to `standard`. Other vendors refuse a non-empty mode. */
+  mode?: string;
 }
 
 export interface CreateSessionResult {
@@ -454,6 +458,7 @@ export function createSession(
   if (opts.protocol) body.protocol = opts.protocol;
   if (opts.model) body.model = opts.model;
   if (opts.effort) body.effort = opts.effort;
+  if (opts.mode) body.mode = opts.mode;
   return postJson<CreateSessionResult>(sessionsUrl(slug), body);
 }
 

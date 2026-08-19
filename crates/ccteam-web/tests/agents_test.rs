@@ -232,6 +232,7 @@ fn idle_meta(
     observed_model: Option<&str>,
 ) {
     let m = ccteam_harness::SessionMeta {
+        mode: None,
         managed_by: Default::default(),
         sid: sid.to_string(),
         slug: "demo".to_string(),

@@ -254,6 +254,12 @@ fn apply_progress_activity_status(
         .unwrap_or(0);
     let now = chrono::Utc::now();
     for view in views {
+        // A detached body (alive from before a daemon restart, not driven from
+        // here) is neither working nor idle in the activity sense — its own
+        // status word stands, so the rail can say exactly what it is.
+        if view.detached.is_some() {
+            continue;
+        }
         let activity = snapshot.session_activity_borrowed(
             &view.sid,
             silent_seconds,
@@ -304,6 +310,13 @@ pub struct CreateSessionForm {
     /// the live ladders with `GET /api/v1/models`.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Explicit vendor session-mode token, forwarded verbatim and validated
+    /// by the vendor adapter. DSH only today: its agent preset — `standard` |
+    /// `ptc` (alias `code`) | `minimal` | `creator` (alias `cordis`);
+    /// omitted → DSH hires default to `standard`. Other vendors refuse a non-empty
+    /// mode.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Map the create form's model/effort into a [`SpawnTuning`] — the ONE place
@@ -323,8 +336,13 @@ fn spawn_tuning_from_form(
     _vendor: AgentVendor,
     model: Option<String>,
     effort: Option<String>,
+    mode: Option<String>,
 ) -> ccteam_im::gateway::SpawnTuning {
-    ccteam_im::gateway::SpawnTuning { model, effort }
+    ccteam_im::gateway::SpawnTuning {
+        model,
+        effort,
+        mode,
+    }
 }
 
 /// `POST /api/v1/projects/{slug}/sessions`
@@ -403,7 +421,12 @@ pub(crate) async fn handle_create_session(
     };
 
     // v0.8.24 A-U3 — explicit model/effort from the composer menu.
-    let tuning = spawn_tuning_from_form(vendor, form.model.clone(), form.effort.clone());
+    let tuning = spawn_tuning_from_form(
+        vendor,
+        form.model.clone(),
+        form.effort.clone(),
+        form.mode.clone(),
+    );
     let created = ccteam_im::gateway::Gateway::create_session_api_tuned_shared(
         Arc::clone(gw),
         slug.clone(),
@@ -1011,13 +1034,22 @@ pub(crate) async fn handle_session_turn(
         )
         .await
         {
-            tracing::warn!(%sid, %err, "auto-resume on web turn failed");
-            return create_gateway_error(
-                StatusCode::BAD_GATEWAY,
-                format!("session {sid} could not be resumed: {err}"),
-                &err,
-                mode,
+            // One sid, one body: the session's body from before a daemon
+            // restart is still running — not an error for a turn, which
+            // queues behind it (the submit below returns the queue handle).
+            let detached = matches!(
+                err.downcast_ref::<ccteam_im::gateway::GatewayRequestError>(),
+                Some(ccteam_im::gateway::GatewayRequestError::SessionBodyDetached { .. })
             );
+            if !detached {
+                tracing::warn!(%sid, %err, "auto-resume on web turn failed");
+                return create_gateway_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("session {sid} could not be resumed: {err}"),
+                    &err,
+                    mode,
+                );
+            }
         }
     }
     let text = {
@@ -1104,6 +1136,16 @@ pub(crate) async fn handle_session_turn(
     )
     .await;
     match result {
+        Ok(turn_id) if turn_id.starts_with("queued-behind-body:") => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "queued": true,
+                "queued_behind": "detached_body",
+                "turn_id": turn_id,
+            })),
+        )
+            .into_response(),
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "submit_to_sid failed");
@@ -2136,6 +2178,16 @@ fn create_gateway_error(
 
 fn gateway_json_error(default_status: StatusCode, err: &anyhow::Error) -> Response {
     match err.downcast_ref::<ccteam_im::gateway::GatewayRequestError>() {
+        // A detached body is a state conflict, not an upstream failure: the
+        // session exists and is alive, it just cannot be driven yet.
+        Some(kind @ ccteam_im::gateway::GatewayRequestError::SessionBodyDetached { .. }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": err.to_string(),
+                "error_code": kind.error_code()
+            })),
+        )
+            .into_response(),
         Some(kind) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({
@@ -2590,6 +2642,7 @@ mod tests {
     fn view(sid: &str) -> SessionView {
         SessionView {
             driveable: true,
+            detached: None,
             sid: sid.into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2668,6 +2721,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            detached: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2719,6 +2773,7 @@ mod tests {
         let mut views = vec![
             SessionView {
                 driveable: true,
+                detached: None,
                 sid: "s1".into(),
                 project: "demo".into(),
                 role: "cto".into(),
@@ -2742,6 +2797,7 @@ mod tests {
             },
             SessionView {
                 driveable: true,
+                detached: None,
                 sid: "s2".into(),
                 project: "demo".into(),
                 role: "qa".into(),
@@ -2800,6 +2856,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            detached: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2845,6 +2902,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            detached: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -3303,7 +3361,12 @@ mod tests {
             (AgentVendor::Kimi, "kimi-code/k3", "max"),
             (AgentVendor::Pi, "anthropic/claude-sonnet-4-5", "high"),
         ] {
-            let t = spawn_tuning_from_form(vendor, Some(model.into()), Some(effort.into()));
+            let t = spawn_tuning_from_form(
+                vendor,
+                Some(model.into()),
+                Some(effort.into()),
+                Some("ptc".into()),
+            );
             assert_eq!(t.model.as_deref(), Some(model), "{vendor:?} dropped model");
             assert_eq!(
                 t.effort.as_deref(),
@@ -3315,7 +3378,7 @@ mod tests {
 
         // Omitted stays omitted: absence is how a caller asks for the vendor
         // default, and it must never be back-filled here either.
-        let t = spawn_tuning_from_form(AgentVendor::Grok, None, None);
+        let t = spawn_tuning_from_form(AgentVendor::Grok, None, None, None);
         assert_eq!(t.model, None);
         assert_eq!(t.effort, None);
     }

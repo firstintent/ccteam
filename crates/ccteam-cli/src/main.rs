@@ -1562,12 +1562,19 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         // before the gateway so it can be baked into both.
         let host_hub = std::sync::Arc::new(ccteam_harness::HostChannelHub::default());
 
+        // v0.10.3 — ONE DSH runtime manager per daemon process, built here in
+        // the composition root: "one identity, one `dsh web` process" is a
+        // property of the SHARED instance, not a convention each consumer has
+        // to honor. Handed to the web task below (which `configure`s it once
+        // the bind is known); the DSH adapter takes the same Arc.
+        let dsh_runtime = ccteam_web::dsh_web::new_runtime_manager(paths.root.clone());
+
         let (shared_gateway, shared_claude_stream_json, shared_pi_rpc) = if web.disabled
             || imd.disabled
         {
             (None, None, None)
         } else {
-            match ccteam_im::build_gateway_for_daemon(None) {
+            match ccteam_im::build_gateway_for_daemon(None, std::sync::Arc::clone(&dsh_runtime)) {
                 Ok((mut g, adapter, pi_rpc)) => {
                     g.set_remote_host_proxy(std::sync::Arc::new(
                         ccteam_im::remote_host::HubRemoteHostProxy::new(host_hub.clone()),
@@ -1660,6 +1667,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
             let web_mcp_sink = gw_event_tx.clone();
             let web_mcp_pending = pending_registry.clone();
             let web_host_hub = host_hub.clone();
+            let web_dsh_runtime = std::sync::Arc::clone(&dsh_runtime);
             Some(tokio::spawn(async move {
                 ccteam_web::serve_with_state_factory_and_shutdown(
                     opts,
@@ -1675,6 +1683,7 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                         state = state.with_host_hub(web_host_hub);
                         state
                     },
+                    Some(web_dsh_runtime),
                     async move {
                         let _ = rx.changed().await;
                     },
@@ -1702,6 +1711,10 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
                 // the EXACT adapter this gateway spawns sessions through.
                 claude_stream_json_adapter: shared_claude_stream_json.clone(),
                 pi_rpc_adapter: shared_pi_rpc.clone(),
+                // v0.10.3 — same reasoning for DSH: when the daemon has to
+                // build its own gateway (web off), its DSH adapter must still
+                // hold THIS process's one runtime manager.
+                dsh_runtime: Some(std::sync::Arc::clone(&dsh_runtime)),
                 ..Default::default()
             };
             if let Some(bridge) = web_chat_bridge.as_ref() {
@@ -1889,8 +1902,10 @@ fn run_start(web: StartWebOpts, imd: StartImdOpts) -> Result<()> {
         signal_task.abort();
 
         tracing::info!(
-            "graceful shutdown complete; agent sessions (if any) left running intentionally — \
-             `ccteam start` will reattach to them"
+            "graceful shutdown complete; agent session bodies were let go, not killed — idle ones \
+             exit on their own, a mid-turn one finishes its turn; the next `ccteam start` finds \
+             any survivor by its body record (one sid, one body), waits for it, and recovers \
+             what it said"
         );
 
         Ok(())

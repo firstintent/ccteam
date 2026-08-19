@@ -556,6 +556,7 @@ mod tests {
         let project = tmp.path();
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
+            mode: None,
             managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),
@@ -626,6 +627,7 @@ mod tests {
         // Seed meta + turns for s1.
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
+            mode: None,
             managed_by: Default::default(),
             sid: "s1".into(),
             slug: "demo".into(),

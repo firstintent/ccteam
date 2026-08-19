@@ -620,6 +620,13 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         spec: &AgentSpecBrief,
         ctx: &SpawnCtx,
     ) -> Result<ThreadHandle, HarnessError> {
+        if let Some(mode) = ctx.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            return Err(crate::execution::acp::spawn_pick_refused(
+                "mode",
+                mode,
+                "Claude (terminal) has no session-mode axis (DSH agent presets only today)",
+            ));
+        }
         // The terminal protocol is frozen (maintenance-only, 规划淘汰), so it
         // does not carry the effort axis the stream-json path does. Say that
         // instead of ignoring the pick: every other vendor/protocol now either
