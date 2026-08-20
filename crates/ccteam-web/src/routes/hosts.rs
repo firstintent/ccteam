@@ -152,7 +152,7 @@ pub struct HostProjectView {
 
 /// Is the ccteam MCP server registered in this vendor's config? Read-only,
 /// best-effort (a missing / unreadable config reads as `false`).
-fn mcp_registered(vendor: &str) -> bool {
+fn mcp_registered(vendor: &str, ccteam_root: &std::path::Path) -> bool {
     match vendor {
         "claude" => ccteam_core::projects::resolve_claude_json_path()
             .map(|p| ccteam_core::mcp_register::claude_mcp_registered(&p))
@@ -169,16 +169,38 @@ fn mcp_registered(vendor: &str) -> bool {
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path()
             .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
             .unwrap_or(false),
+        // DSH has no vendor MCP config file: "registered" means ccteam's
+        // Cordis plugin (bundle + configured `ccteam-client` patch row) is
+        // present in the operator's own `~/.dsh` web profile — exactly what
+        // `register-mcp?vendor=dsh` writes. Read-only; a home we cannot
+        // resolve or read is `false`.
+        "dsh" => ccteam_harness::execution::dsh_acp::spawn_spec::dsh_home_for_identity(
+            true,
+            "",
+            ccteam_root,
+        )
+        .map(|home| {
+            ccteam_harness::execution::dsh_acp::materialize::dsh_client_registered_in_profile(
+                &home,
+                ccteam_harness::DSH_NATIVE_WEB_PROFILE,
+            )
+        })
+        .unwrap_or(false),
         _ => false,
     }
 }
 
 /// Build one agent's health row (probe + MCP-registration check + tri-state).
-fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
+fn agent_health(
+    spec: &AgentProbeSpec,
+    refresh: bool,
+    ccteam_root: &std::path::Path,
+) -> AgentHealth {
     let bin = resolve_bin(spec);
     let (installed, version) = probe_bin_cached(&bin, refresh);
-    let native_mcp = spec.tool_surface.uses_native_mcp_config();
-    let registered = native_mcp && mcp_registered(spec.vendor);
+    // `mcp_registered` answers per vendor (bridge vendors without a
+    // registration surface answer `false`), so no tool-surface gate here.
+    let registered = mcp_registered(spec.vendor, ccteam_root);
     let status = classify_status(installed, registered, spec.tool_surface);
     let hint: Option<String> = match status {
         // VENDOR-INSTALL-1 — recipe-backed vendors get the one-click pointer
@@ -253,11 +275,11 @@ fn local_hostname() -> String {
 }
 
 /// Probe every spec (off the async runtime — each shells out).
-async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
+async fn probe_all_agents(refresh: bool, ccteam_root: std::path::PathBuf) -> Vec<AgentHealth> {
     tokio::task::spawn_blocking(move || {
         AGENT_PROBE_SPECS
             .iter()
-            .map(|spec| agent_health(spec, refresh))
+            .map(|spec| agent_health(spec, refresh, &ccteam_root))
             .collect::<Vec<_>>()
     })
     .await
@@ -284,7 +306,7 @@ async fn probe_npm_available(refresh: bool) -> bool {
     responses((status = 200, description = "Hosts ccteam drives (today one: `local`)", body = HostsResponse)),
 )]
 pub(crate) async fn handle_hosts(State(app): State<crate::state::AppState>) -> Response {
-    let agents = probe_all_agents(false).await;
+    let agents = probe_all_agents(false, app.paths.root.clone()).await;
     let agents_ready = agents.iter().filter(|a| a.status == "ready").count();
     let mut hosts = vec![HostSummary {
         host: LOCAL_HOST.to_string(),
@@ -345,7 +367,7 @@ pub(crate) async fn handle_host_detail(
     Query(q): Query<HostDetailQuery>,
 ) -> Response {
     if host == LOCAL_HOST {
-        let agents = probe_all_agents(q.refresh).await;
+        let agents = probe_all_agents(q.refresh, app.paths.root.clone()).await;
         let npm_available = probe_npm_available(q.refresh).await;
         let projects = ccteam_core::config::load(&app.paths.root)
             .map(|cfg| {
@@ -1349,7 +1371,11 @@ mod tests {
             manual_install_url: None,
             quota_probe: None,
         };
-        let h = agent_health(&spec, true);
+        let h = agent_health(
+            &spec,
+            true,
+            std::path::Path::new("/nonexistent/ccteam-home-zzz"),
+        );
         assert!(!h.installed);
         assert_eq!(h.status, "not_installed");
         assert!(h.hint.is_some());

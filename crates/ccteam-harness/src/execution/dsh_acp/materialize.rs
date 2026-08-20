@@ -27,6 +27,7 @@ const EMPTY_PATCH_YAML: &str = "[]\n";
 const CLIENT_SCOPE: &str = "@ccteam";
 const CLIENT_PACKAGE: &str = "dsh-client";
 const CCTEAM_CLIENT_ROW_ID: &str = "ccteam-client";
+const PATCH_FILE: &str = "cordis.patch.yml";
 
 #[derive(Debug, Clone)]
 pub struct MaterializedDshProfile {
@@ -59,6 +60,51 @@ pub fn register_dsh_client_into_profile(
             manifest: ManifestPolicy::MergeOnly,
         },
     )
+}
+
+/// Read-only, best-effort: is ccteam's client already registered in this
+/// profile? True only when BOTH halves gate ① writes are present — our bundle
+/// in `dsh.profile.bundles` AND a `ccteam-client` override row carrying a
+/// `transportSocket` (the bundle alone installs files but leaves the plugin
+/// with no ACP listener, which is not a working registration). Any missing or
+/// unparseable file reads as `false`; this never writes.
+pub fn dsh_client_registered_in_profile(dsh_home: &Path, profile: &str) -> bool {
+    let profile_dir = dsh_home.join("profiles").join(profile);
+    let bundled = fs::read_to_string(profile_dir.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("dsh")?
+                .get("profile")?
+                .get("bundles")?
+                .as_array()
+                .map(|bundles| {
+                    bundles
+                        .iter()
+                        .any(|b| b.as_str() == Some(CCTEAM_CLIENT_BUNDLE))
+                })
+        })
+        .unwrap_or(false);
+    if !bundled {
+        return false;
+    }
+    fs::read_to_string(profile_dir.join(PATCH_FILE))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .and_then(|patch| {
+            let rows = patch.as_sequence()?.clone();
+            Some(rows.iter().any(|row| {
+                row.get("id").and_then(serde_yaml::Value::as_str) == Some(CCTEAM_CLIENT_ROW_ID)
+                    && row.get("insert").is_none()
+                    && row
+                        .get("config")
+                        .and_then(|c| c.get("transportSocket"))
+                        .and_then(serde_yaml::Value::as_str)
+                        .is_some_and(|socket| !socket.trim().is_empty())
+            }))
+        })
+        .unwrap_or(false)
 }
 
 pub fn materialize_profile_in(
@@ -266,7 +312,7 @@ fn materialize_profile_files(
 
     let package_json = merged_profile_package_json(&profile_dir, spec)?;
     write_if_changed(&profile_dir.join("package.json"), package_json.as_bytes())?;
-    let patch_path = profile_dir.join("cordis.patch.yml");
+    let patch_path = profile_dir.join(PATCH_FILE);
     if let Some(patch_yaml) = merged_profile_patch_yaml(&patch_path, spec)? {
         write_if_changed(&patch_path, patch_yaml.as_bytes())?;
     }
@@ -790,6 +836,58 @@ mod tests {
                 "@ccteam/dsh-client"
             ]),
             "a scaffolded manifest must be bootable, vendor bundles first"
+        );
+    }
+
+    /// The Hosts page shows "register the DSH plugin" until this reads true,
+    /// so it must answer for a profile ccteam actually registered — and must
+    /// NOT claim registration for a half-written one (bundle present but no
+    /// configured row leaves the plugin with no ACP listener).
+    #[test]
+    fn registration_detection_needs_both_the_bundle_and_a_configured_row() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+
+        assert!(
+            !dsh_client_registered_in_profile(dsh_home.path(), "web"),
+            "no profile at all -> not registered"
+        );
+
+        // Bundle installed by hand (`dsh plugin add`) but no config row.
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "dsh": { "profile": { "bundles": ["@ccteam/dsh-client"] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(profile_dir.join("cordis.patch.yml"), "[]\n").unwrap();
+        assert!(
+            !dsh_client_registered_in_profile(dsh_home.path(), "web"),
+            "bundle without a configured transport row -> not registered"
+        );
+
+        register_dsh_client_into_profile(
+            root.path(),
+            dsh_home.path(),
+            "web",
+            DshClientConfig {
+                transport_socket: Some(SOCKET),
+                daemon_url: Some("http://127.0.0.1:7331"),
+                ..DshClientConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            dsh_client_registered_in_profile(dsh_home.path(), "web"),
+            "after gate (1) registration -> registered"
+        );
+        assert!(
+            !dsh_client_registered_in_profile(dsh_home.path(), "headless"),
+            "registration is per profile"
         );
     }
 
