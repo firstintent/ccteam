@@ -248,8 +248,19 @@ jobs:
           case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
           # Only ship the user-facing archives + the aggregated SHA256SUMS;
           # the per-asset .sha256 files are intermediate.
-          gh release create "${TAG}" ${PRERELEASE} \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "ccteam ${TAG}" \
-            --notes-file ../release-notes.md \
-            ccteam-*.tar.gz SHA256SUMS
+          # Idempotent: a release may already exist for this tag (e.g. someone
+          # cut it by hand before the build finished). Creating it again is a
+          # 422 that used to fail the whole job and leave the release with NO
+          # binaries. Upload into the existing release instead.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber \
+              ccteam-*.tar.gz SHA256SUMS
+          else
+            gh release create "${TAG}" ${PRERELEASE} \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "ccteam ${TAG}" \
+              --notes-file ../release-notes.md \
+              ccteam-*.tar.gz SHA256SUMS
+          fi
