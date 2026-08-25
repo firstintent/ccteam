@@ -506,7 +506,7 @@ async fn handle_enroll_post(
     // against it rather than silently ignored.
     let binding = match bind_named_project(app, credential, binding, &req).await {
         Ok(binding) => binding,
-        Err(refusal) => return refusal,
+        Err(refusal) => return *refusal,
     };
     match binding.principal() {
         // The binding speaks for a session — a node it minted, or a managed
@@ -694,13 +694,14 @@ async fn try_provenance_attach(
 /// untouched — discovery and `status` must keep working unbound.
 ///
 /// `Ok` = the binding as it stands afterwards (freshly noded, or unchanged);
-/// `Err` = the refusal to answer with.
+/// `Err` = the refusal to answer with (boxed: the `Err` variant must stay
+/// small — `clippy::result_large_err`).
 async fn bind_named_project(
     app: &AppState,
     credential: &EnrollCredential,
     binding: NativeBinding,
     req: &Value,
-) -> Result<NativeBinding, Response> {
+) -> Result<NativeBinding, Box<Response>> {
     let Some(tool) = called_tool(req) else {
         return Ok(binding);
     };
@@ -713,10 +714,10 @@ async fn bind_named_project(
         return Ok(binding);
     };
     if !may_bind_project(app, credential, &slug) {
-        return Err(mcp_tool_error(
+        return Err(Box::new(mcp_tool_error(
             req,
             unaddressable_project(app, credential, tool, &slug),
-        ));
+        )));
     }
     // The registry is the arbiter of "one session, one workspace": a binding
     // already pinned elsewhere refuses HERE, before anything is minted.
@@ -724,7 +725,7 @@ async fn bind_named_project(
         .native_bindings
         .bind_project(&binding.mcp_session_id, &slug)
     {
-        return Err(mcp_tool_error(req, format!("{tool}: {err}")));
+        return Err(Box::new(mcp_tool_error(req, format!("{tool}: {err}"))));
     }
     if binding.principal().is_some() {
         // Already the node for this very project (that is what `bind_project`
@@ -733,7 +734,12 @@ async fn bind_named_project(
     }
     let (sid, secret) = mint_ledger_node(app, credential, &slug, &binding.client)
         .await
-        .map_err(|err| mcp_tool_error(req, format!("{tool}: cannot work in `{slug}`: {err}")))?;
+        .map_err(|err| {
+            Box::new(mcp_tool_error(
+                req,
+                format!("{tool}: cannot work in `{slug}`: {err}"),
+            ))
+        })?;
     // Attach ONCE: a client may fire two tool calls in parallel and both would
     // see a nodeless binding. The registry decides which node the binding keeps;
     // the loser retires the one it minted instead of overwriting an identity that
@@ -755,7 +761,7 @@ async fn bind_named_project(
     let bound = app
         .native_bindings
         .resolve(&binding.mcp_session_id, &credential.id)
-        .ok_or_else(|| no_such_mcp_session(req))?;
+        .ok_or_else(|| Box::new(no_such_mcp_session(req)))?;
     tracing::info!(
         enroll = %credential.id, mcp_session = %binding.mcp_session_id,
         sid = bound.sid.as_deref().unwrap_or("-"), project = %slug,

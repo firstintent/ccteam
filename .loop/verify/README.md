@@ -63,6 +63,8 @@
 
 ## 运行纪律(教训固化区;新教训从卡面「经验」行蒸馏进来)
 
+- **本地 toolchain 必须跟上 CI 的最新 stable,否则 clippy 门禁失明**(实锤 2026-08-26):`rust-toolchain.toml` 钉 `channel = "stable"`、CI `dtolnay/rust-toolchain@stable` 每次装**当天最新** stable;本地 rustup 若不更新就停在旧版(1.95 vs CI 1.98),新 lint(`result_large_err` on `Result<_, axum::Response>`)本地 `make check` 全绿、CI clippy 连红 4 次无人察觉。收口前核 `rustc --version` = CI run 日志里的版本;落后就 `rustup update stable`(全量重编译,进 worktree 跑,勿在主仓);修 lint 按仓库约定「小 Err」(返回 `String`/小枚举,调用点再包 Response),不用 `#[allow]` 盖。
+
 - **控制会话需要 telegram/MCP 存活时,勿在主仓跑 cargo**:control 会话的 MCP 跑在 `target/debug/ccteam` 上,
   cargo build/test/clippy 重建二进制即掉线(实锤 ~25min 断联)。重活进独立 worktree 跑;docs-only 改动不需重跑门禁。
 - **测试隔离必须同时 pin `HOME` + `CCTEAM_HOME`**(只指 HOME 不够,实锤 fixture 污染真实 registry;AGENTS.md §六)。
