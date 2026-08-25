@@ -5394,8 +5394,14 @@ impl Gateway {
                 .and_then(|dir| {
                     ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
                 })
-                .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
-                .unwrap_or(0);
+                .map(|turns| {
+                    turns
+                        .iter()
+                        .filter(|turn| !turn.user.is_empty())
+                        .count()
+                        .saturating_sub(1) as u64
+                })
+                .unwrap_or(0); // boundary re-read accounts for a row already appended
             let mut epoch: u64 = 0; // status epoch → one per turn
             let mut fold = crate::progress::ProgressFold::new();
             let mut dirty = false;
@@ -6075,7 +6081,27 @@ impl Gateway {
                                 | ThreadEvent::Error(_)
                         );
                         if is_turn_boundary {
-                            vendor_turn = vendor_turn.saturating_add(1);
+                            let fallback = vendor_turn.saturating_add(1);
+                            vendor_turn = project_dir
+                                .as_ref()
+                                .and_then(|dir| {
+                                    ccteam_harness::execution::turns_mirror::read_all_turns(
+                                        dir,
+                                        &session_id,
+                                    )
+                                    .ok()
+                                })
+                                .map(|turns| {
+                                    turns
+                                        .iter()
+                                        .filter(|turn| !turn.user.is_empty())
+                                        .count() as u64
+                                })
+                                // The durable user-row count is authoritative:
+                                // a resumed pump may have sampled it either
+                                // before or after this turn's row was appended.
+                                .map(|count| count.max(fallback))
+                                .unwrap_or(fallback);
                         }
                         if !answer_texts.is_empty() {
                             turn_had_answer = true;
@@ -17622,9 +17648,24 @@ mod tests {
     /// enqueue→resume→drain path (same end state: turn lands, sid stable).
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary()
+                .with_turn_boundary_status(ThreadStatus {
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        19,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    ..Default::default()
+                }),
+        );
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let (tx, _sink) = tokio::sync::mpsc::unbounded_channel();
+        gateway.set_event_sink(tx);
+        let mut events = gateway.subscribe_events();
 
         let sid = gateway
             .create_session_api(
@@ -17639,6 +17680,14 @@ mod tests {
 
         // First turn lands on the freshly-spawned child (one start_thread).
         gateway.submit_to_sid("s1", "first".into()).await.unwrap();
+        assert_eq!(
+            recv_answer(&mut events)
+                .await
+                .status
+                .as_ref()
+                .map(|status| status.turn),
+            Some(1)
+        );
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
 
         // The child dies out from under the handle.
@@ -17660,12 +17709,29 @@ mod tests {
             fake.live.load(Ordering::SeqCst),
             "the resume revived the child"
         );
+        assert_eq!(
+            recv_answer(&mut events)
+                .await
+                .status
+                .as_ref()
+                .map(|status| status.turn),
+            Some(2),
+            "resume turn ordinal follows durable user rows regardless of pump scheduling"
+        );
         assert_eq!(gateway.session_views().len(), 1, "still one session");
         assert_eq!(gateway.session_views()[0].sid, "s1");
 
         // Repeatable: kill it again, drive another turn — a 3rd start_thread.
         fake.live.store(false, Ordering::SeqCst);
         gateway.submit_to_sid("s1", "third".into()).await.unwrap();
+        assert_eq!(
+            recv_answer(&mut events)
+                .await
+                .status
+                .as_ref()
+                .map(|status| status.turn),
+            Some(3)
+        );
         assert_eq!(fake.starts.load(Ordering::SeqCst), 3, "resumed again");
 
         // Every turn reached the adapter against the stable identity (and a
