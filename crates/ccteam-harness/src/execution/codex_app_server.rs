@@ -2000,6 +2000,20 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                 loop {
                                     match rx.recv().await {
                                         Ok(notif) => {
+                                            // Apply the same notification in
+                                            // this ordered subscriber before
+                                            // translating a terminal event.
+                                            // The connection-wide dispatcher
+                                            // remains for live status reads,
+                                            // but can otherwise lag the event
+                                            // consumer by one notification.
+                                            if notif.method == "thread/tokenUsage/updated" {
+                                                apply_notification_to_tracker(
+                                                    &bridge.tracker,
+                                                    &notif,
+                                                )
+                                                .await;
+                                            }
                                             if notif.method == "turn/started" {
                                                 turn_usage = None;
                                             }
