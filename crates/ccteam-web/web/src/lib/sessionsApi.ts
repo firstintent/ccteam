@@ -80,6 +80,7 @@ export interface SessionHistoryEvent {
   assistant: string;
   /** Reference metadata only — never bytes, base64, daemon paths, or URLs. */
   attachments?: OutboundAttachmentRef[];
+  status?: TurnStatus;
 }
 
 export interface SessionHistory {
@@ -115,6 +116,14 @@ export interface SessionContext {
    *  `derived` (computed from per-turn tokens) / `probed` (pulled from the
    *  vendor's own status command) / `unknown`. */
   source?: "reported" | "derived" | "probed" | "unknown";
+}
+
+export interface TurnStatus {
+  model?: string | null;
+  context?: SessionContext | null;
+  turn: number;
+  cost_usd?: number | null;
+  tokens_total?: number | null;
 }
 
 /** Per-session statusline payload from `GET /api/v1/sessions/{sid}/status`

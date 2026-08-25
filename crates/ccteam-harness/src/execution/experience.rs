@@ -603,6 +603,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap(),
+                status: None,
                 tool_calls: Vec::new(),
                 attachments: Vec::new(),
                 outcome: Some("failed".into()),
@@ -668,6 +669,7 @@ mod tests {
                 user: "hi".into(),
                 assistant: "hello".into(),
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: vec![],
                 attachments: vec![],
                 outcome: None,

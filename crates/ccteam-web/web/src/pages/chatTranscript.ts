@@ -14,7 +14,7 @@ import type {
   SessionEvent,
   SessionEventOption,
 } from "../hooks/useSessionEvents";
-import type { OutboundAttachmentRef, SessionHistoryEvent } from "../lib/sessionsApi";
+import type { OutboundAttachmentRef, SessionHistoryEvent, TurnStatus } from "../lib/sessionsApi";
 
 export type RowKind = "user" | "assistant" | "tool" | "system" | "approval" | "activity";
 
@@ -32,6 +32,7 @@ export interface TranscriptRow {
    *  live SSE frame's `ts` (WEB-TS-1). Rows of one turn legitimately share
    *  it; rows persisted before this field existed simply have none. */
   ts?: string;
+  status?: TurnStatus;
   /** Project asset references only; rendering constructs a fixed same-origin
    * URL from `id` and never accepts a URL or byte payload from this state. */
   attachments?: OutboundAttachmentRef[];
@@ -115,6 +116,7 @@ export function eventToRow(ev: SessionEvent): TranscriptRow | null {
       kind: "assistant",
       content: ev.content,
       ts: ev.ts,
+      status: ev.status,
       attachments: ev.attachments,
     };
   }
@@ -283,6 +285,7 @@ export function historyToRows(events: SessionHistoryEvent[]): TranscriptRow[] {
         kind: "assistant",
         content: ev.assistant,
         ts: ev.ts,
+        status: ev.status,
         attachments: ev.attachments,
       });
     }

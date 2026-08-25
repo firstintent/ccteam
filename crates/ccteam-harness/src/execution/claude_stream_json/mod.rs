@@ -254,6 +254,15 @@ fn spawn_status_tap(
                             .get("model")
                             .and_then(|v| v.as_str())
                             .filter(|m| !m.is_empty());
+                        // Publish the observed model before any awaited
+                        // context probe. The event translator has its own
+                        // broadcast subscriber and may reach TurnResult
+                        // while this tap is still waiting on the probe.
+                        if let Some(m) = api_model {
+                            if let Ok(mut s) = status.lock() {
+                                s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
+                            }
+                        }
                         // v0.8.20 — ALSO refresh the live context window mid-turn
                         // (throttled) so `/sessions` reflects a long working turn's
                         // GROWING context, not only the value frozen at the last
@@ -286,9 +295,6 @@ fn spawn_status_tap(
                         };
                         if api_model.is_some() || fresh_ctx.is_some() || fresh_effort.is_some() {
                             let snapshot = if let Ok(mut s) = status.lock() {
-                                if let Some(m) = api_model {
-                                    s.model = Some(preserve_1m_tag(s.model.as_deref(), m));
-                                }
                                 if let Some(e) = fresh_effort {
                                     s.effort = Some(e);
                                 }
@@ -332,11 +338,6 @@ fn spawn_status_tap(
                         if let Ok(mut t) = running_tasks.lock() {
                             t.tasks.retain(task_outlives_turn);
                         }
-                        // Context is read STRICTLY from claude's OWN accounting
-                        // (`get_context_usage` → real totalTokens + maxTokens). No
-                        // heuristic estimate: if the vendor build doesn't answer, the
-                        // context is cleared (None) and the statusline shows none.
-                        let real = get_context_usage(&transport).await;
                         // The vendor's runtime-resolved reasoning effort (Opus
                         // 4.6+ / Codex), e.g. `xhigh`. None on an older CLI
                         // without `get_settings` or a model with no effort axis.
@@ -345,14 +346,6 @@ fn spawn_status_tap(
                             if let Some(e) = effort {
                                 s.effort = Some(e);
                             }
-                            // ONLY claude's own number; otherwise no context at all.
-                            s.context = real.map(|(used, window)| {
-                                crate::ContextUsage::known(
-                                    used,
-                                    window,
-                                    crate::ContextSource::Derived,
-                                )
-                            });
                             // Show the FULL model id (…[1m]) when the real window
                             // is 1M — both statusline surfaces tag the 1M id the
                             // same way (rmux derives the window FROM the [1m];
@@ -949,6 +942,38 @@ async fn forward(
         tx.send(ev).await.map_err(|_| ())?;
     }
     Ok(())
+}
+
+/// Refresh Claude's authoritative context accounting before a terminal event
+/// is made visible to the gateway. The status tap is a separate broadcast
+/// subscriber and may still be awaiting its own probe when the translator
+/// receives `TurnResult`, so the consumer needs an explicit adapter barrier.
+async fn refresh_context_after_turn(
+    transport: &StreamJsonTransport,
+    status: &Arc<StdMutex<ThreadStatus>>,
+    project_dir: &Path,
+    sid: &str,
+) {
+    let real = get_context_usage(transport).await;
+    let snapshot = if let Ok(mut s) = status.lock() {
+        s.context = real.map(|(used, window)| {
+            crate::ContextUsage::known(used, window, crate::ContextSource::Derived)
+        });
+        let is_1m = matches!(&s.context, Some(c) if c.window_tokens >= 1_000_000);
+        if is_1m {
+            if let Some(m) = s.model.as_mut() {
+                if !m.to_ascii_lowercase().ends_with("[1m]") {
+                    m.push_str("[1m]");
+                }
+            }
+        }
+        Some(s.clone())
+    } else {
+        None
+    };
+    if let Some(snapshot) = snapshot {
+        write_status_file(project_dir, sid, &snapshot);
+    }
 }
 
 /// How long to wait for `system:init` before declaring the spawn failed.
@@ -1559,6 +1584,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         };
         let mut sub = live.transport.subscribe();
         let transport = Arc::clone(&live.transport);
+        let status = Arc::clone(&live.status);
+        let project_dir = live.project_dir.clone();
+        let sid = live.identity.sid.clone();
         let (tx, rx) = mpsc::channel::<ThreadEvent>(64);
         tokio::spawn(async move {
             let mut translator = StreamTranslator::new();
@@ -1566,6 +1594,15 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 tokio::select! {
                     msg = sub.recv() => match msg {
                         Ok(out) => {
+                            if matches!(out, Outbound::TurnResult(_)) {
+                                refresh_context_after_turn(
+                                    &transport,
+                                    &status,
+                                    &project_dir,
+                                    &sid,
+                                )
+                                .await;
+                            }
                             if forward(&mut translator, &tx, out).await.is_err() {
                                 return;
                             }
@@ -1589,6 +1626,15 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     // in-flight-loss signal before ending the stream (E3).
                     _ = transport.wait_closed() => {
                         while let Ok(out) = sub.try_recv() {
+                            if matches!(out, Outbound::TurnResult(_)) {
+                                refresh_context_after_turn(
+                                    &transport,
+                                    &status,
+                                    &project_dir,
+                                    &sid,
+                                )
+                                .await;
+                            }
                             if forward(&mut translator, &tx, out).await.is_err() {
                                 return;
                             }

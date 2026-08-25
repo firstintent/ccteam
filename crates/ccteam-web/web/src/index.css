@@ -682,6 +682,8 @@ html.dark .dot.off { background: #4b4e57; }
 .msg.user .bubble { background: var(--bg-soft); border-radius: 14px 14px 4px 14px; }
 .msg.agent .bubble { background: transparent; padding-left: 0; }
 .msg.agent { max-width: 100%; }
+.turn-status { font: 11px var(--font-mono); color: var(--text-faint); margin-left: 8px; white-space: nowrap; }
+.turn-status.warn { color: var(--accent, #b45309); }
 .msg.tool .bubble { background: var(--bg-soft); font-family: var(--font-mono); font-size: 12.5px; color: var(--text-muted); }
 .msg.activity { max-width: 100%; }
 .msg.activity .bubble {

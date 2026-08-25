@@ -2100,6 +2100,7 @@ mod tests {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some("s1".to_string()),
             slug: None,
         };
@@ -2163,6 +2164,7 @@ mod tests {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: None,
         };

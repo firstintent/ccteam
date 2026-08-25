@@ -270,6 +270,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: None,
         }
