@@ -32,7 +32,7 @@
 - **DoD**:vitest 绿(面板状态机 / 徽标计数 / 版本门降级 / api client 注入 mock;+1 个「client CSS 零硬编码色值」grep 守卫测试);typecheck 绿;零 ccteam-web import(grep=0);writeback 绿。
 
 ### DSH2-RUST 方式一物化 + Hosts 注册面(v0.10.4 P2,HOST/UI 合入后)
-- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/dsh_acp/materialize.rs + assets + crates/ccteam-web/src/routes` · **建议入口**:subagent(opus)
+- **状态**:进行中(opus subagent·2026-08-25) · **冲突域**:`crates/ccteam-harness/src/execution/dsh_acp/(materialize.rs + assets)+ crates/ccteam-harness/src/execution/dsh_runtime.rs + crates/ccteam-web/src(dsh 面)` · **建议入口**:subagent(opus,worktree)
 - **规格**:仿插件 1 K25 链路 —— `assets/dsh-team.tgz` 内嵌 + MergeOnly 注册(**恒 override 非 insert**,v0.10.0 boot 教训)+ 该身份个人 REST token 缺则铸、有则复用,写进 profile patch 扁平 config;`register-mcp?vendor=dsh` 同按钮顺带注册插件 2;方式二零 Rust 改动。
 - **DoD**:materialize 单测(结构断言 patch 形状);`dsh_register_test` 扩展;baseline 只增;真机双模式走 PRD §七核心动线。
 

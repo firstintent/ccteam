@@ -135,6 +135,8 @@ An identity runs **one** DSH runtime, and ccteam is its second client: sessions 
 
 When running ccteam behind HTTPS, proxy the DSH companion listener as well as the main web listener. DSH Web has no base-path support, so use a second HTTPS port or subdomain; proxying only `:7331` leaves the iframe on plain HTTP and browsers block it as mixed content.
 
+For the opposite direction — installing ccteam's plugins into a `dsh web` you run yourself, and using the ccteam panel inside DSH's own console — see [dsh-plugin.md](dsh-plugin.md) ([中文](dsh-plugin-cn.md)).
+
 ### Create a Project
 
 In the new-session dialog, choose **+ New project...**, enter a slug and directory path, and ccteam registers that directory as a project. If the same slug already exists, ccteam appends a number such as `demo2` or `demo3`.
