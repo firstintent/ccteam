@@ -21,7 +21,7 @@ import {
   writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ApiClient } from './api.js'
-import { dotState, findNode } from './store.js'
+import { dotState, findNode, planSpawnOutcome, projectSlugs } from './store.js'
 import type { ConsoleState, ConsoleStore, View } from './store.js'
 import type { ConsoleInjected, T } from './slots.js'
 import { SessionTree } from './SessionTree.js'
@@ -39,7 +39,8 @@ const PANEL_EXIT_MS = 320
  * @returns settled promise (results land as dispatches).
  */
 export async function refreshStatus(store: ConsoleStore, api: ApiClient): Promise<void> {
-  store.dispatch({ type: 'status_loading' })
+  // The 'checking' phase exists only before the FIRST result: re-probes
+  // (retry button, stream reconnects) must not flicker the state screen.
   try {
     const status = await api.call('status', {})
     store.dispatch({ type: 'status_loaded', status })
@@ -169,6 +170,7 @@ function PanelBody({ state, view, store, api, t }: {
   if (view.kind === 'chat') {
     return (
       <SessionChat
+        key={view.sid}
         sid={view.sid}
         chat={state.chats[view.sid] ?? { rows: [], activity: undefined, loading: false, error: null, notices: [] }}
         node={findNode(state.graph, view.sid)}
@@ -182,21 +184,32 @@ function PanelBody({ state, view, store, api, t }: {
     return (
       <SpawnForm
         vendors={state.connection.vendors}
+        projects={projectSlugs(state.graph)}
+        lastProject={state.spawnProject}
         busy={state.spawn.busy}
         error={state.spawn.error}
         t={t}
         onCreate={(request) => {
+          if (request.project !== undefined) {
+            store.dispatch({ type: 'set_spawn_project', project: request.project })
+          }
           store.dispatch({ type: 'spawn_started' })
           api
             .call('session.spawn', request)
             .then((response) => {
-              if (response.ok && response.sid !== undefined) {
-                store.dispatch({ type: 'spawn_done' })
-                store.dispatch({ type: 'open_chat', sid: response.sid })
-                void refreshGraph(store, api)
-              } else {
-                store.dispatch({ type: 'spawn_failed', message: response.error ?? 'unknown' })
+              const outcome = planSpawnOutcome(response)
+              if (outcome.kind === 'form_error') {
+                store.dispatch({ type: 'spawn_failed', message: outcome.message })
+                return
               }
+              // A sid exists upstream even when the first task failed: enter
+              // the session and state the failure inside its chat.
+              store.dispatch({ type: 'spawn_done' })
+              store.dispatch({ type: 'open_chat', sid: outcome.sid })
+              if (outcome.errorMessage !== undefined) {
+                store.dispatch({ type: 'send_failed', sid: outcome.sid, message: outcome.errorMessage })
+              }
+              void refreshGraph(store, api)
             })
             .catch((error: unknown) => {
               store.dispatch({
@@ -348,6 +361,9 @@ export function Panel({ store, api, t }: PanelProps) {
         }}
         onPointerUp={(event) => {
           event.currentTarget.releasePointerCapture(event.pointerId)
+          setDragging(false)
+        }}
+        onPointerCancel={() => {
           setDragging(false)
         }}
       />

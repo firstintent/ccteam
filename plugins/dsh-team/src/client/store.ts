@@ -32,6 +32,7 @@ export const STORAGE_KEYS = {
   open: 'ccteam.console.open',
   width: 'ccteam.console.width',
   recents: 'ccteam.console.recents',
+  project: 'ccteam.console.project',
 } as const
 
 /** Connection phase driving the panel's state screens and the entry dot. */
@@ -76,6 +77,8 @@ export interface ConsoleState {
   recents: string[]
   collapsed: Record<string, boolean>
   spawn: { busy: boolean; error: string | null }
+  /** Last project the user spawned into (persisted; preselects the form). */
+  spawnProject: string | null
   nextNoticeId: number
   nextLocalId: number
 }
@@ -91,7 +94,6 @@ export type Action =
   | { type: 'open_spawn' }
   | { type: 'set_width'; width: number }
   | { type: 'toggle_project'; slug: string }
-  | { type: 'status_loading' }
   | { type: 'status_loaded'; status: StatusResponse }
   | { type: 'status_failed' }
   | { type: 'graph_loading' }
@@ -110,12 +112,14 @@ export type Action =
   | { type: 'spawn_started' }
   | { type: 'spawn_failed'; message: string }
   | { type: 'spawn_done' }
+  | { type: 'set_spawn_project'; project: string }
 
 /** Persisted slice loaded at store creation. */
 export interface Persisted {
   open?: boolean
   width?: number
   recents?: string[]
+  project?: string
 }
 
 /**
@@ -148,6 +152,7 @@ export function initialState(persisted: Persisted = {}): ConsoleState {
     recents: (persisted.recents ?? []).filter(sid => typeof sid === 'string').slice(0, MAX_RECENTS),
     collapsed: {},
     spawn: { busy: false, error: null },
+    spawnProject: persisted.project ?? null,
     nextNoticeId: 1,
     nextLocalId: 1,
   }
@@ -209,8 +214,10 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
     case 'show_tree':
       return { ...state, stack: [{ kind: 'tree' }] }
     case 'open_chat': {
+      // A non-tree top (a previous chat, or the spawn form that just created
+      // this session) is replaced: Esc from the new chat returns to the tree.
       const top = state.stack[state.stack.length - 1]
-      const stack = top !== undefined && top.kind === 'chat'
+      const stack = top !== undefined && top.kind !== 'tree'
         ? [...state.stack.slice(0, -1), { kind: 'chat', sid: action.sid } as View]
         : [...state.stack, { kind: 'chat', sid: action.sid } as View]
       return { ...state, stack, recents: pushRecent(state.recents, action.sid) }
@@ -227,8 +234,6 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
         ...state,
         collapsed: { ...state.collapsed, [action.slug]: !state.collapsed[action.slug] },
       }
-    case 'status_loading':
-      return { ...state, connection: { ...state.connection, phase: 'checking' } }
     case 'status_loaded': {
       const phase: ConnectionPhase = action.status.connected
         ? 'ok'
@@ -323,6 +328,9 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
       return { ...state, spawn: { busy: false, error: action.message } }
     case 'spawn_done':
       return { ...state, spawn: { busy: false, error: null }, graphStale: true }
+    case 'set_spawn_project':
+      if (state.spawnProject === action.project) return state
+      return { ...state, spawnProject: action.project }
   }
 }
 
@@ -382,6 +390,8 @@ export function loadPersisted(storage: StorageLike | undefined): Persisted {
       const parsed: unknown = JSON.parse(recentsRaw)
       if (Array.isArray(parsed)) persisted.recents = parsed.filter((s): s is string => typeof s === 'string')
     }
+    const project = storage.getItem(STORAGE_KEYS.project)
+    if (project !== null && project !== '') persisted.project = project
     return persisted
   } catch {
     // Swallows storage/JSON failures: private-mode denials or corrupt values
@@ -403,6 +413,7 @@ export function attachPersistence(store: ConsoleStore, storage: StorageLike): ()
       storage.setItem(STORAGE_KEYS.open, state.open ? '1' : '0')
       storage.setItem(STORAGE_KEYS.width, String(state.width))
       storage.setItem(STORAGE_KEYS.recents, JSON.stringify(state.recents))
+      if (state.spawnProject !== null) storage.setItem(STORAGE_KEYS.project, state.spawnProject)
     } catch {
       // Swallows quota/private-mode write failures: persistence is a
       // convenience, never worth breaking the live panel over.
@@ -410,7 +421,12 @@ export function attachPersistence(store: ConsoleStore, storage: StorageLike): ()
   }
   return store.subscribe(() => {
     const state = store.getState()
-    if (state.open === last.open && state.width === last.width && state.recents === last.recents) {
+    if (
+      state.open === last.open
+      && state.width === last.width
+      && state.recents === last.recents
+      && state.spawnProject === last.spawnProject
+    ) {
       last = state
       return
     }
@@ -502,4 +518,35 @@ export function findNode(graph: TeamGraph | null, sid: string): TeamNode | undef
  */
 export function vendorGlyph(vendor: string): string {
   return vendor.slice(0, 2)
+}
+
+/**
+ * Known project slugs, in graph order (the spawn form's choices).
+ * @param graph - the team graph (null while unloaded).
+ * @returns slugs (empty while the graph is unknown).
+ */
+export function projectSlugs(graph: TeamGraph | null): string[] {
+  return graph === null ? [] : graph.projects.map(project => project.slug)
+}
+
+/** What the panel does with one SpawnResponse. */
+export type SpawnOutcome =
+  /** A session exists upstream — enter its chat (surfacing the error there when the first task failed). */
+  | { kind: 'chat'; sid: string; errorMessage?: string }
+  /** Nothing was created — keep the form up with the (actionable) error. */
+  | { kind: 'form_error'; message: string }
+
+/**
+ * Decide the navigation for a spawn response. A sid may be present even on
+ * `ok: false` (the session spawned but its first task failed) — the session
+ * is real, so the user lands in its chat with the error stated there.
+ * @param response - the SpawnResponse.
+ * @returns the outcome plan.
+ */
+export function planSpawnOutcome(response: { ok: boolean; sid?: string; error?: string }): SpawnOutcome {
+  if (response.sid !== undefined && response.sid !== '') {
+    if (response.ok) return { kind: 'chat', sid: response.sid }
+    return { kind: 'chat', sid: response.sid, errorMessage: response.error ?? 'unknown' }
+  }
+  return { kind: 'form_error', message: response.error ?? 'unknown' }
 }

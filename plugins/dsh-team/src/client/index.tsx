@@ -88,7 +88,9 @@ export function apply(ctx: CcteamClientContext): void {
         void refreshStatus(store, api)
       },
       onError() {
-        store.dispatch({ type: 'status_failed' })
+        // Ask, don't assume: a dropped stream re-probes status — the daemon
+        // may be fine (proxy hiccup) or truly down (the probe fails too).
+        void refreshStatus(store, api)
       },
     })
     return () => {

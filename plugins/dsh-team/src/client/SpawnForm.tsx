@@ -15,6 +15,10 @@ import css from './panel.module.css'
 /** Spawn view props. */
 export interface SpawnFormProps {
   vendors: VendorAvailability[]
+  /** Known project slugs (team.graph order). One = auto-picked and hidden. */
+  projects: string[]
+  /** Last project spawned into (persisted); preselects when still known. */
+  lastProject: string | null
   busy: boolean
   error: string | null
   t: T
@@ -31,10 +35,15 @@ function installedSet(vendors: VendorAvailability[]): ReadonlySet<string> | unde
  * @param props - availability + busy/error state + the create action.
  * @returns the spawn view body.
  */
-export function SpawnForm({ vendors, busy, error, t, onCreate }: SpawnFormProps) {
+export function SpawnForm({ vendors, projects, lastProject, busy, error, t, onCreate }: SpawnFormProps) {
   const installed = installedSet(vendors)
   const known = VENDORS.filter(v => installed === undefined || installed.has(v))
   const [vendor, setVendor] = useState<string>(() => known[0] ?? VENDORS[0]!)
+  // Exactly one known project: auto-picked, control hidden. Several: the
+  // remembered project preselects when still known; none picked = the host
+  // decides (its configured default, or an actionable error shown below).
+  const [project, setProject] = useState<string | undefined>(() =>
+    projects.length === 1 ? projects[0] : lastProject !== null && projects.includes(lastProject) ? lastProject : undefined)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [model, setModel] = useState('')
   const [effort, setEffort] = useState('')
@@ -44,6 +53,8 @@ export function SpawnForm({ vendors, busy, error, t, onCreate }: SpawnFormProps)
   const submit = (): void => {
     if (busy) return
     const request: SpawnRequest = { vendor }
+    const chosen = projects.length === 1 ? projects[0] : project
+    if (chosen !== undefined) request.project = chosen
     if (model.trim() !== '') request.model = model.trim()
     if (effort.trim() !== '') request.effort = effort.trim()
     if (mode.trim() !== '') request.mode = mode.trim()
@@ -61,6 +72,24 @@ export function SpawnForm({ vendors, busy, error, t, onCreate }: SpawnFormProps)
   return (
     <div className={css.scroll}>
       <div className={css.form}>
+        {projects.length > 1 && (
+          <div>
+            <div className={css.fieldLabel}>{t('spawn.project')}</div>
+            <div className={css.vendorPills}>
+              {projects.map(slug => (
+                <Pill
+                  key={slug}
+                  active={slug === project}
+                  onClick={() => {
+                    setProject(slug)
+                  }}
+                >
+                  {slug}
+                </Pill>
+              ))}
+            </div>
+          </div>
+        )}
         <div>
           <div className={css.fieldLabel}>{t('spawn.vendor')}</div>
           <div className={css.vendorPills}>

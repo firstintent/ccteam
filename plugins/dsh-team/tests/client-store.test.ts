@@ -15,6 +15,8 @@ import {
   formatCost,
   initialState,
   loadPersisted,
+  planSpawnOutcome,
+  projectSlugs,
   reduce,
   vendorGlyph,
 } from '../src/client/store.js'
@@ -208,21 +210,24 @@ describe('store + persistence', () => {
     expect(ticks).toBe(1)
   })
 
-  it('round-trips open/width/recents through storage', () => {
+  it('round-trips open/width/recents/project through storage', () => {
     const storage = memoryStorage()
     const store = createStore(initialState())
     attachPersistence(store, storage)
     store.dispatch({ type: 'open_panel' })
     store.dispatch({ type: 'set_width', width: 500 })
     store.dispatch({ type: 'open_chat', sid: 's3' })
+    store.dispatch({ type: 'set_spawn_project', project: 'acme' })
     expect(storage.data[STORAGE_KEYS.open]).toBe('1')
     expect(storage.data[STORAGE_KEYS.width]).toBe('500')
     expect(JSON.parse(storage.data[STORAGE_KEYS.recents]!)).toEqual(['s3'])
+    expect(storage.data[STORAGE_KEYS.project]).toBe('acme')
 
     const restored = initialState(loadPersisted(storage))
     expect(restored.open).toBe(true)
     expect(restored.width).toBe(500)
     expect(restored.recents).toEqual(['s3'])
+    expect(restored.spawnProject).toBe('acme')
   })
 
   it('survives poisoned storage', () => {
@@ -276,5 +281,38 @@ describe('tree utilities', () => {
   it('monograms vendors as text glyphs', () => {
     expect(vendorGlyph('claude')).toBe('cl')
     expect(vendorGlyph('dsh')).toBe('ds')
+  })
+
+  it('lists project slugs in graph order', () => {
+    const graph: TeamGraph = {
+      projects: [
+        { slug: 'alpha', nodes: [] },
+        { slug: 'beta', nodes: [] },
+      ],
+    }
+    expect(projectSlugs(graph)).toEqual(['alpha', 'beta'])
+    expect(projectSlugs(null)).toEqual([])
+  })
+})
+
+describe('spawn outcome', () => {
+  it('a clean spawn goes straight into the chat', () => {
+    expect(planSpawnOutcome({ ok: true, sid: 's9' })).toEqual({ kind: 'chat', sid: 's9' })
+  })
+
+  it('a sid on a FAILED spawn still navigates in — the session exists upstream — with the error stated', () => {
+    expect(planSpawnOutcome({ ok: false, sid: 's9', error: 'first task rejected' })).toEqual({
+      kind: 'chat',
+      sid: 's9',
+      errorMessage: 'first task rejected',
+    })
+  })
+
+  it('no sid keeps the form up with the actionable error', () => {
+    expect(planSpawnOutcome({ ok: false, error: 'name a project: alpha, beta' })).toEqual({
+      kind: 'form_error',
+      message: 'name a project: alpha, beta',
+    })
+    expect(planSpawnOutcome({ ok: false })).toEqual({ kind: 'form_error', message: 'unknown' })
   })
 })
