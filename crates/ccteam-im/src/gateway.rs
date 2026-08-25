@@ -15754,10 +15754,19 @@ mod tests {
         routings: Arc<Mutex<Vec<TurnRouting>>>,
         degrade_inject_to_queue: bool,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
-        /// Notified whenever an event is pushed so `events()` can wait rather
-        /// than terminate when the queue is momentarily empty (fixes the
+        /// Per-thread-identity wakeups. `events()` waits here rather than
+        /// terminating when the queue is momentarily empty (that fixes the
         /// multi-thread runtime race where the pump polls before `submit_turn`).
-        events_notify: Arc<tokio::sync::Notify>,
+        ///
+        /// Keyed by identity because ONE shared `Notify` hands its single
+        /// permit to an ARBITRARY waiter: a pump for a different session wakes,
+        /// finds nothing matching its own identity, consumes the permit and
+        /// goes back to sleep — stalling the pump the event was actually for.
+        /// That is the `turn_answer_*_context_echo_*` flake registered in
+        /// `.loop/verify/README.md` (a test-double race, never a gateway bug).
+        /// One wakeup per identity means a permit can only reach its target.
+        events_notify:
+            Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>>,
         event_delay: std::time::Duration,
         resume_delay: std::time::Duration,
         /// v0.8.21 Wave-2 — delay inside `start_thread` so a test can assert the
@@ -15830,14 +15839,19 @@ mod tests {
     /// predicates are instance methods because privilege is CONFIGURATION (a
     /// named chat), not a property of the chat's shape: an unnamed chat is a
     /// guest, so a test that means "the owner's phone" must say so.
-    fn acl_gateway() -> Gateway {
+    ///
+    /// Hands back the project root alongside the gateway: it is a per-call
+    /// tempdir (a shared literal path let parallel tests stomp each other's
+    /// on-disk session state), so the caller must keep it alive.
+    fn acl_gateway() -> (Gateway, tempfile::TempDir) {
+        let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(
             Arc::new(FakeAdapter::new(AgentVendor::Claude)),
             "alpha",
-            "/tmp/alpha-acl",
+            proj.path(),
         );
         gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
-        gateway
+        (gateway, proj)
     }
 
     impl FakeAdapter {
@@ -15849,7 +15863,7 @@ mod tests {
                 routings: Arc::new(Mutex::new(Vec::new())),
                 degrade_inject_to_queue: false,
                 events: Arc::new(Mutex::new(VecDeque::new())),
-                events_notify: Arc::new(tokio::sync::Notify::new()),
+                events_notify: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 event_delay: std::time::Duration::ZERO,
                 resume_delay: std::time::Duration::ZERO,
                 start_delay: std::time::Duration::ZERO,
@@ -15870,6 +15884,24 @@ mod tests {
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
             }
+        }
+
+        /// The wakeup channel for ONE thread identity, minted on first use.
+        /// Producer (`submit_turn` / a test's hand-pushed event) and consumer
+        /// (`events`) both route through here, so a permit can never land on a
+        /// foreign session's pump.
+        fn notify_for(&self, identity: &str) -> Arc<tokio::sync::Notify> {
+            let mut waiters = self
+                .events_notify
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(waiters.entry(identity.to_string()).or_default())
+        }
+
+        /// Wake `identity`'s pump after a test pushed onto `events` by hand
+        /// (the scripted-event path, which bypasses `submit_turn`).
+        fn wake(&self, identity: &str) {
+            self.notify_for(identity).notify_one();
         }
 
         /// Opt into emitting a `TurnCompleted` boundary after the answer
@@ -16059,8 +16091,10 @@ mod tests {
                     ));
                 }
             }
-            // Wake any pump task that is waiting in `events()` for new work.
-            self.events_notify.notify_one();
+            // Wake THIS thread's pump if it is waiting in `events()` for new
+            // work. Per-identity so the permit cannot be stolen by another
+            // session's pump (see `events_notify`).
+            self.wake(&h.identity);
             Ok(TurnId::new(turn_id))
         }
 
@@ -16106,7 +16140,7 @@ mod tests {
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             let events = Arc::clone(&self.events);
-            let notify = Arc::clone(&self.events_notify);
+            let notify = self.notify_for(&h.identity);
             let wanted = h.identity.clone();
             let delay = self.event_delay;
             Box::pin(futures::stream::unfold((), move |_| {
@@ -16269,7 +16303,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_plain_message_submits_to_current_session_and_echoes() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let created = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -16418,12 +16453,12 @@ mod tests {
         let identity = gateway.sessions[&sid].thread.identity.clone();
         *gateway.sessions[&sid].turn_started_at.lock().unwrap() = None;
         fake.events.lock().await.push_back((
-            identity,
+            identity.clone(),
             ThreadEvent::TurnStarted {
                 turn_id: "queued-2".into(),
             },
         ));
-        fake.events_notify.notify_one();
+        fake.wake(&identity);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -16494,12 +16529,12 @@ mod tests {
 
         // …and when it really starts, the pump arms it by its own turn id.
         fake.events.lock().await.push_back((
-            identity,
+            identity.clone(),
             ThreadEvent::TurnStarted {
                 turn_id: "queued-2".into(),
             },
         ));
-        fake.events_notify.notify_one();
+        fake.wake(&identity);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let armed = gateway.sessions[&sid].watched_turn.lock().unwrap().clone();
@@ -16521,7 +16556,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_resource_api_create_view_submit_stop() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         // Create by API → s1, tracked, role/vendor/project as supplied.
         let sid = gateway
@@ -16576,7 +16612,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_session_views_reports_waiting_approval() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-waiting-approval");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -16623,7 +16660,8 @@ mod tests {
     #[tokio::test]
     async fn resume_dead_session_three_phase_round_trip() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let sid = gateway
             .create_session_api(
@@ -16733,11 +16771,23 @@ mod tests {
         assert_eq!(current.generation, newer_generation);
         assert_eq!(current.thread.identity, "newer-live-thread");
         drop(guard);
-        assert!(
-            fake.closes.load(Ordering::SeqCst) >= 1,
-            "the discarded vendor result must be closed, got {} closes",
-            fake.closes.load(Ordering::SeqCst)
-        );
+        // The close is fire-and-forget BY DESIGN: `apply_resume_dead_session`
+        // detaches it with `tokio::spawn` and returns the conflict error
+        // without awaiting it. Sampling the counter the instant that error
+        // arrives is therefore a pure scheduling race — poll it to the same
+        // expected value instead, bounded so a genuine regression still fails.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fake.closes.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the discarded vendor result must be closed, got {} closes",
+                fake.closes.load(Ordering::SeqCst)
+            )
+        });
     }
 
     /// A cold resume on one sid must not freeze a different live sid or the
@@ -17269,7 +17319,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let sid = gateway
             .create_session_api(
@@ -17334,7 +17385,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_resumes_dead_session_before_directive() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let sid = gateway
             .create_session_api(
@@ -17379,7 +17431,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_interrupt_stops_turn_but_keeps_session_and_is_own_only() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         // chat-1 creates a session (its current).
         gateway
@@ -17463,7 +17516,8 @@ mod tests {
     #[tokio::test]
     async fn submit_to_sid_routes_slash_command_as_directive() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-directive");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17514,7 +17568,8 @@ mod tests {
     #[tokio::test]
     async fn submit_web_sid_handles_gateway_status_command() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-webstatus");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17555,7 +17610,8 @@ mod tests {
     #[tokio::test]
     async fn submit_web_sid_passes_turns_and_vendor_directives_through() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-webthru");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17608,7 +17664,8 @@ mod tests {
     #[tokio::test]
     async fn create_session_mints_unique_secret_and_injects_into_env() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-secret");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let s1 = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17682,7 +17739,8 @@ mod tests {
     #[tokio::test]
     async fn verify_session_principal_authenticates_by_sid_and_secret() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17718,7 +17776,8 @@ mod tests {
     #[tokio::test]
     async fn verify_session_principal_isolates_two_same_role_sessions() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify2");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid1 = gateway
             .create_session_api(
                 "alpha".into(),
@@ -18046,7 +18105,8 @@ mod tests {
     #[tokio::test]
     async fn web_turn_emits_no_reaction() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-web-noreact");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let mut rx = gateway.subscribe_events();
         // Wire a sink too (emit_user_signal prefers it) so we'd SEE a stray
         // reaction if one were emitted; subscribe_events tees the broadcast.
@@ -18154,7 +18214,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_answer_carries_context_echo_for_focused_im_session() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-focused");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
@@ -18174,23 +18235,35 @@ mod tests {
             "answer still carries the real reply text: {}",
             ev.content
         );
+        // The echo is the LAST block of the answer. Split it off rather than
+        // matching the whole tail: `context_echo_line` also renders the session
+        // TITLE when one exists, and the first message's auto-title is written
+        // to meta.json asynchronously — so an `ends_with` on the bare
+        // "→ slug/sid (role)" form silently asserts "…and the title write has
+        // not landed yet", which is a race, not a contract.
+        let (body, echo) = ev
+            .content
+            .rsplit_once("\n\n")
+            .unwrap_or_else(|| panic!("context echo is the trailing block: {:?}", ev.content));
         assert!(
-            ev.content.ends_with("\n\n→ alpha/s1 (reviewer)"),
-            "context echo suffix present: {:?}",
-            ev.content
+            body.contains("echo: hello"),
+            "the reply text precedes the echo: {body:?}"
+        );
+        assert!(
+            echo.starts_with("→ alpha/s1 (reviewer)"),
+            "context echo names slug/sid/role: {echo:?}"
         );
     }
 
     /// v0.8.23 review §3.2-5 (item 2a) — a roleless session's echo omits the
-    /// `(role)` parens (own `FakeAdapter`/gateway — the fake's `events()`
-    /// shares ONE `Notify` across every identity, so driving two live
-    /// sessions' pumps to completion in the SAME test can misdirect a wakeup
-    /// to the wrong session's still-parked pump; one live session per test
-    /// sidesteps that test-double-only race entirely).
+    /// `(role)` parens. One live session per test (the fake's `events()` now
+    /// wakes per identity, so this is isolation for its own sake, not a
+    /// workaround).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_answer_context_echo_omits_role_when_roleless() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-roleless");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
@@ -18204,10 +18277,20 @@ mod tests {
             .await
             .unwrap();
         let im_ev = recv_answer(&mut im_events).await;
+        // Same title race as the focused case: the echo may carry a trailing
+        // 「title」 once the first message's async auto-title lands, so match
+        // the trailing block's head rather than the whole tail.
+        let (_, echo) = im_ev
+            .content
+            .rsplit_once("\n\n")
+            .unwrap_or_else(|| panic!("context echo is the trailing block: {:?}", im_ev.content));
         assert!(
-            im_ev.content.ends_with("\n\n→ alpha/s1"),
-            "roleless echo carries no (role) parens: {:?}",
-            im_ev.content
+            echo.starts_with("→ alpha/s1"),
+            "roleless echo names slug/sid: {echo:?}"
+        );
+        assert!(
+            !echo.contains('('),
+            "roleless echo carries no (role) parens: {echo:?}"
         );
     }
 
@@ -18221,8 +18304,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn out_of_focus_internal_answer_stays_out_of_the_im_thread() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // A FRESH fake per spawn: one shared `events_notify` could wake the
-        // wrong session's pump (test-double race, see `delegation_gateway`).
+        // A FRESH fake per spawn so each session also gets its own event queue
+        // (`FakeAdapter::events_notify` is per-identity, so wakeups no longer
+        // cross sessions — see `delegation_gateway`).
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
                 as Arc<dyn HarnessAdapter + Send + Sync>
@@ -18302,7 +18386,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_answer_context_echo_skips_web_channel() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-web");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
@@ -18368,7 +18453,7 @@ mod tests {
                 ),
             ));
             queued.push_back((
-                identity,
+                identity.clone(),
                 ThreadEvent::TurnCompleted {
                     turn_id: "background-turn".into(),
                     usage: Default::default(),
@@ -18376,7 +18461,7 @@ mod tests {
                 },
             ));
         }
-        fake.events_notify.notify_one();
+        fake.wake(&identity);
 
         let answers = recv_sink_answers(&mut events, 3).await;
         assert_eq!(answers.len(), 3, "two web answers + one final IM mirror");
@@ -18791,7 +18876,7 @@ mod tests {
             .submit_to_sid(&sid, "delegated task done".into())
             .await
             .unwrap();
-        fake.events_notify.notify_waiters();
+        fake.wake(&format!("alpha-reviewer-{sid}"));
 
         let answers = recv_sink_answers(&mut events, 1).await;
         wait_for_turn_idle(&gateway, &sid).await;
@@ -19684,8 +19769,10 @@ mod tests {
     #[tokio::test]
     async fn session_resolve_reports_owning_project_for_scope_check() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-scope");
-        gateway.register_project("beta", "/tmp/beta-scope");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        gateway.register_project("beta", beta_dir.path());
         let sa = gateway
             .create_session_api(
                 "alpha".into(),
@@ -19774,7 +19861,8 @@ mod tests {
         // on this (and the session_spawn tool description was updated to
         // "always mints a new sid").
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let a = gateway
             .create_session_api(
                 "alpha".into(),
@@ -19815,7 +19903,8 @@ mod tests {
     #[tokio::test]
     async fn new_command_parses_hitl_token_and_threads_mode() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let created = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer hitl")
@@ -19849,7 +19938,8 @@ mod tests {
     #[tokio::test]
     async fn new_hitl_after_live_skip_spawns_second_honest_hitl_session() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         // First message auto-spawns the default cto in SKIP mode (s1).
         gateway
@@ -19892,7 +19982,8 @@ mod tests {
     #[tokio::test]
     async fn new_hitl_fresh_spawn_receipt_reports_hitl() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2b");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let receipt = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
             .await
@@ -19910,7 +20001,8 @@ mod tests {
     #[tokio::test]
     async fn new_command_defaults_to_skip() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -19926,7 +20018,8 @@ mod tests {
     #[tokio::test]
     async fn new_command_rejects_bad_permission_token() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // A bad trailing token is a command error (surfaces the typo); no
         // session is spawned.
         let res = gateway
@@ -19986,7 +20079,8 @@ mod tests {
     #[tokio::test]
     async fn session_sid_for_maps_project_role_to_sid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -20009,7 +20103,8 @@ mod tests {
     #[tokio::test]
     async fn reply_target_for_resolves_live_session_without_registry() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-fix1");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // Create + drive a session from a specific chat (sets reply_to → chat).
         gateway
             .handle_text("telegram", "chat-99", "alice", "/new claude reviewer")
@@ -20132,7 +20227,8 @@ mod tests {
     #[tokio::test]
     async fn create_session_skips_validation_without_agents_dir() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-no-agents");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -20155,7 +20251,8 @@ mod tests {
     #[tokio::test]
     async fn request_im_reload_signals_only_when_trigger_wired() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gw = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gw = Gateway::new(fake, "alpha", proj.path());
         // Standalone (no daemon): a reload request is a safe no-op, never panics.
         assert!(
             !gw.request_im_reload(),
@@ -20842,7 +20939,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_renders_idle_working_stuck() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -21139,7 +21237,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_roleless_and_no_context() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // Roleless: `/new claude` with no role token.
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude")
@@ -21166,7 +21265,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_leads_with_where_am_i_header() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-status-header");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -21185,7 +21285,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_empty_is_friendly() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let out = gateway
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
@@ -21302,7 +21403,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_acl_is_own_only() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // tg-1 owns s1.
         gateway
             .handle_text("telegram", "tg-1", "rob", "/new claude reviewer")
@@ -21340,7 +21442,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_shows_real_vendor_resume_uuid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -21375,7 +21478,8 @@ mod tests {
             "/status must be registered in GATEWAY_COMMANDS"
         );
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let out = gateway
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
@@ -21420,7 +21524,7 @@ mod tests {
     /// bot keeps the operator "own + all web" view.
     #[test]
     fn session_owner_visibility_converges_tenant_web_and_im() {
-        let gw = acl_gateway();
+        let (gw, _proj) = acl_gateway();
         // A web-created session's OWNER is the canonical user identity
         // (`user:<id>`), derived by `canonical_owner` from the web frontend chat.
         let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")).identity(); // user:uaaa
@@ -21485,7 +21589,7 @@ mod tests {
         let stranger = ChatKey::new("lark", "oc_other", "ou_stranger");
 
         // `"*"` — an explicit "anyone may talk" — names nobody.
-        let mut gw = acl_gateway();
+        let (mut gw, _proj) = acl_gateway();
         assert_eq!(
             gw.bind_operator_allowlist("lark", ["*".to_string()]),
             OperatorBindingKind::Wildcard
@@ -21505,7 +21609,7 @@ mod tests {
 
         // Naming the owner takes the bot back: Lark authorizes by SENDER
         // open_id, Telegram by chat id — either field may carry the name.
-        let mut named = acl_gateway();
+        let (mut named, _proj) = acl_gateway();
         assert_eq!(
             named.bind_operator_allowlist("lark", ["ou_owner".to_string()]),
             OperatorBindingKind::Named
@@ -21520,7 +21624,7 @@ mod tests {
         // An UNCONFIGURED platform keeps the legacy single-operator assumption
         // (a half-configured owner must not be locked out of their own bot);
         // the daemon warns about it at startup instead.
-        let plain = acl_gateway();
+        let (plain, _proj) = acl_gateway();
         assert_eq!(plain.principal(&owner), Principal::Operator);
     }
 
@@ -21593,7 +21697,7 @@ mod tests {
     /// the sender's `user_id`) was wrongly DENIED resume of its OWN session.
     #[test]
     fn owner_identity_visible_matches_live_acl_on_strings() {
-        let gw = acl_gateway();
+        let (gw, _proj) = acl_gateway();
         // meta.owner is the canonical identity STRING (user_id dropped).
         let admin_tg = ChatKey::new("telegram", "339", "rob"); // user_id ≠ chat_id
         let admin_owns = canonical_owner(&admin_tg).identity(); // "telegram:339"
@@ -21647,7 +21751,7 @@ mod tests {
     /// rule), keyed on PROJECT owners instead of session owners.
     #[test]
     fn project_acl_isolates_tenants_from_admin_and_each_other() {
-        let gw = acl_gateway();
+        let (gw, _proj) = acl_gateway();
         // Project owner tags, as `/newproject` + web `POST /projects` stamp
         // them: a tenant's project is `user:<id>`, the admin's is the shared web
         // pool `user:web-api` or its own IM `telegram:<chat_id>`, a legacy
@@ -22082,7 +22186,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_resolves_unambiguous_role() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-happy");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22109,7 +22214,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_ambiguous_picks_most_recent() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-ambiguous");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22134,7 +22240,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_unknown_role_lists_available_roles() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-unknown");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22155,7 +22262,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_respects_chat_acl() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-acl");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // tg-1 owns a `reviewer` session.
         gateway
             .handle_text("telegram", "tg-1", "rob", "/new claude reviewer")
@@ -22446,7 +22554,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_new_without_role_is_roleless() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         gateway
             .handle_text("tg", "c1", "u1", "/new claude")
@@ -22480,7 +22589,8 @@ mod tests {
             AgentVendor::Claude,
             std::time::Duration::from_millis(25),
         ));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -22667,7 +22777,8 @@ mod tests {
                 },
             )
         };
-        let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -22754,7 +22865,8 @@ mod tests {
         ] {
             let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
             fake.directive_script.lock().await.push_back(outcome);
-            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+            let proj = tempfile::TempDir::new().unwrap();
+            let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
             gateway
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
@@ -22776,7 +22888,8 @@ mod tests {
             .push_back(DirectiveOutcome::Done {
                 receipt: "已切换 model → opus（live）".into(),
             });
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-im");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22801,7 +22914,8 @@ mod tests {
             .push_back(DirectiveOutcome::Done {
                 receipt: "已切换 model → opus（live）".into(),
             });
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-web");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway
             .handle_text("web", "web-api", "web-api", "/new claude reviewer")
             .await
@@ -22839,7 +22953,8 @@ mod tests {
                 ],
                 multi: false,
             }));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22907,7 +23022,8 @@ mod tests {
                 ],
                 multi: false,
             }));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22937,7 +23053,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_multiline_slash_is_user_text() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22956,7 +23073,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_at_bot_switches_session_without_cross_chat_leakage() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -23437,7 +23555,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_registered_bot_template_spawns_on_demand() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "default", proj.path());
         gateway.register_bot_template(
             &BotRegistration {
                 workflow_slug: "alpha".to_string(),
@@ -23450,7 +23569,7 @@ mod tests {
                 project_dir: None,
                 created_at: chrono::Utc::now(),
             },
-            "/tmp/alpha",
+            proj.path().join("alpha"),
         );
 
         let reply = gateway
@@ -23465,7 +23584,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_registered_bot_templates_keep_ambiguous_dm_out_of_sessions() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "default", proj.path());
         for role in ["lead", "reviewer"] {
             gateway.register_bot_template(
                 &BotRegistration {
@@ -23479,7 +23599,7 @@ mod tests {
                     project_dir: None,
                     created_at: chrono::Utc::now(),
                 },
-                format!("/tmp/alpha-{role}"),
+                proj.path().join(format!("alpha-{role}")),
             );
         }
 
@@ -23531,7 +23651,8 @@ mod tests {
         .unwrap();
 
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.enable_project_creation(paths);
@@ -23584,7 +23705,8 @@ mod tests {
         .unwrap();
 
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.enable_project_creation(paths);
 
         // Before the fix this returned Err "unknown project: dev-delta".
@@ -23661,10 +23783,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_cd_adopts_existing_session_in_target_project() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
-        gateway.register_project("beta", "/tmp/beta");
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        gateway.register_project("beta", beta_dir.path());
 
         // s1 in alpha; then /cd beta + /new makes s2 in beta.
         gateway
@@ -23700,10 +23824,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_cd_overrides_single_template_project() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "default", proj.path());
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
-        gateway.register_project("beta", "/tmp/beta");
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        gateway.register_project("beta", beta_dir.path());
         gateway.register_bot_template(
             &BotRegistration {
                 workflow_slug: "alpha".to_string(),
@@ -23716,7 +23842,7 @@ mod tests {
                 project_dir: None,
                 created_at: chrono::Utc::now(),
             },
-            "/tmp/alpha",
+            proj.path().join("alpha"),
         );
 
         // /cd to a different project than the bot's: the explicit target wins,
@@ -23741,7 +23867,8 @@ mod tests {
         use std::path::PathBuf;
 
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj2 = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj2.path());
 
         // v0.8.8 F1 — the tracked pane is keyed by sid: s1 = alpha/lead →
         // ccteam-chat-alpha-s1 (NOT ...-lead). The first /new mints s1.
@@ -23796,7 +23923,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_newproject_validates_args_and_requires_path_context() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         // Missing path → usage error (parsed before any path-context check).
         let usage = gateway
             .handle_text("mock", "chat-1", "alice", "/newproject demo")
@@ -24118,7 +24246,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_rename_with_no_active_session_errors() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rename-noop");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let err = gateway
             .handle_text("mock", "chat-1", "alice", "/rename hello")
@@ -24433,7 +24562,8 @@ mod tests {
     #[tokio::test]
     async fn d6_external_origin_inbound_click_resolves_oneshot() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
 
         // The shared registry the daemon hands to BOTH the gateway and the
         // mcp.sock handler. Here the test plays the handler: register the
@@ -24496,7 +24626,8 @@ mod tests {
     #[tokio::test]
     async fn d6_external_stale_token_click_is_benign() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24551,7 +24682,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_approve_delivers_allow_over_oneshot() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24586,7 +24718,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_deny_delivers_deny_over_oneshot() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24612,7 +24745,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_delivers_pi_free_text_without_fabricating_an_option() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24646,7 +24780,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_unknown_token_and_bad_option_are_errors() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24708,7 +24843,8 @@ mod tests {
     #[tokio::test]
     async fn expired_pending_is_drained_before_resolve() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24779,9 +24915,9 @@ mod tests {
     }
 
     async fn delegation_gateway(project_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<Gateway>> {
-        // A FRESH fake per spawn so each session's pump has its OWN
-        // `events_notify` — a single shared fake's `notify_one` could wake the
-        // wrong pump when two sessions (parent + child) run concurrently.
+        // A FRESH fake per spawn so each session's pump has its OWN event
+        // queue when two sessions (parent + child) run concurrently. Wakeups
+        // are already per-identity (`FakeAdapter::events_notify`).
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
             // `with_turn_boundary` mirrors every current adapter (all emit
             // `TurnCompleted`) — required since v0.9.5: the delegation
