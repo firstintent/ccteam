@@ -64,7 +64,7 @@ export function SessionTree({ graph, recents, collapsed, t, onOpenChat, onToggle
                   onOpenChat(sid)
                 }}
               >
-                {node?.title ?? sid}
+                <span className={css.recentPillText}>{node?.title ?? sid}</span>
               </Pill>
             ))}
           </div>

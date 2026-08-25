@@ -320,6 +320,14 @@
   gap: 6px;
 }
 
+.recentPillText {
+  display: inline-block;
+  max-width: 150px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .projects {
   padding: 12px 8px 16px;
 }

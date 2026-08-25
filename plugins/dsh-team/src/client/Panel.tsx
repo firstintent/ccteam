@@ -189,6 +189,9 @@ function PanelBody({ state, view, store, api, t }: {
         busy={state.spawn.busy}
         error={state.spawn.error}
         t={t}
+        onCancel={() => {
+          store.dispatch({ type: 'back' })
+        }}
         onCreate={(request) => {
           if (request.project !== undefined) {
             store.dispatch({ type: 'set_spawn_project', project: request.project })

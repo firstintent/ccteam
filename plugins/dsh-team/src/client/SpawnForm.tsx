@@ -23,6 +23,7 @@ export interface SpawnFormProps {
   error: string | null
   t: T
   onCreate(request: SpawnRequest): void
+  onCancel(): void
 }
 
 function installedSet(vendors: VendorAvailability[]): ReadonlySet<string> | undefined {
@@ -35,7 +36,7 @@ function installedSet(vendors: VendorAvailability[]): ReadonlySet<string> | unde
  * @param props - availability + busy/error state + the create action.
  * @returns the spawn view body.
  */
-export function SpawnForm({ vendors, projects, lastProject, busy, error, t, onCreate }: SpawnFormProps) {
+export function SpawnForm({ vendors, projects, lastProject, busy, error, t, onCreate, onCancel }: SpawnFormProps) {
   const installed = installedSet(vendors)
   const known = VENDORS.filter(v => installed === undefined || installed.has(v))
   const [vendor, setVendor] = useState<string>(() => known[0] ?? VENDORS[0]!)
@@ -174,6 +175,9 @@ export function SpawnForm({ vendors, projects, lastProject, busy, error, t, onCr
         {error !== null && <div className={css.formError} role="alert">{`${t('spawn.error')} — ${error}`}</div>}
 
         <div className={css.formFoot}>
+          <Button variant="outline" size="md" onClick={onCancel}>
+            {t('spawn.cancel')}
+          </Button>
           <Button variant="primary" size="md" disabled={busy} onClick={submit}>
             {t('spawn.create')}
           </Button>

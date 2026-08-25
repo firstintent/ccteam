@@ -8,7 +8,7 @@
  * scrolls up.
  */
 import { useEffect, useRef, useState } from 'react'
-import { IconSendOutline14, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconSendOutline16, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TeamNode } from '../shared/contract.js'
 import type { ApiClient } from './api.js'
 import type { ChatNotice, ChatState, ConsoleStore } from './store.js'
@@ -186,7 +186,7 @@ export function SessionChat({ sid, chat, node, store, api, t }: SessionChatProps
             disabled={draft.trim().length === 0}
             onClick={send}
           >
-            <IconSendOutline14 size={16} />
+            <IconSendOutline16 size={16} />
           </button>
         </div>
         <div className={css.composerHint}>{t('chat.hint')}</div>
