@@ -116,6 +116,18 @@ describe("chatTranscript eventToRow", () => {
     expect(r!.id).toBe("e1");
   });
 
+  it("does not render an empty status-only answer as a bubble", () => {
+    expect(
+      eventToRow(
+        ev({
+          kind: "answer",
+          content: "",
+          status: { model: "m", context: null, turn: 2, cost_usd: null, tokens_total: null },
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("carries the server-side ts from the SSE frame onto the row (WEB-TS-1)", () => {
     const ts = "2026-08-17T01:02:03Z";
     const assistant = eventToRow(ev({ kind: "answer", content: "hi", id: "e1", ts }));

@@ -309,8 +309,15 @@ export default function SessionView({
   const latestTurnStatus = [...rows]
     .reverse()
     .find((row) => row.kind === "assistant" && row.status)?.status;
-  const displayStatusModel = latestTurnStatus?.model ?? statusModel;
-  const displayCtxPct = latestTurnStatus ? contextPct(latestTurnStatus.context) : ctxPct;
+  const latestEventStatus = [...events]
+    .reverse()
+    .find((event) => event.kind === "answer" && event.status)?.status;
+  const displayStatusModel = latestEventStatus?.model ?? latestTurnStatus?.model ?? statusModel;
+  const displayCtxPct = latestEventStatus
+    ? contextPct(latestEventStatus.context)
+    : latestTurnStatus
+      ? contextPct(latestTurnStatus.context)
+      : ctxPct;
 
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
     setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
