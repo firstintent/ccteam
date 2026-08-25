@@ -102,6 +102,7 @@
 1. **扇出** —— 同一个自足的问题 `session_spawn` 给 2+ 个 vendor(异步、一次一事、`title` 标注这场对局)。
 2. **各自独立作答** —— 各自独立会话,互不串味。
 3. **在 turn 边界收集** —— 每个子会话转 idle 时完成通知各来一条;还缺的用 `session_collect` 补(缺席/失败的成员标记出来,绝不 kill)。
+   每条完成通知和每个 `session_collect` 信封都带子会话的状态行 —— `→ cct/s42 · codex gpt-5.6-sol · ctx 19% · turn 7 · $0.42` —— 上下文压力(85% 起标 `⚠`)和花费不用再多调一次;`session_list` 行同样给 `context_pct`。
 4. **综合裁决你自己来** —— 共识、分歧、你的拍板。可选:把收来的答案回投给某个子会话互驳,或再起一个会话当裁判。
 
 **账单始终可见。** `session_list` / `session_collect` 每行带 model 和累计 `cost_usd` / `tokens_total`,一场扇出花多少钱是可加总的数字,不是惊喜。

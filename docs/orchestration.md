@@ -102,6 +102,7 @@ Default: omit `model` — vendor defaults track their latest releases.
 1. **Fan out** — `session_spawn` the same self-contained question to 2+ vendors (async, one task each, `title` labels the matchup).
 2. **Let each answer independently** — separate sessions, no cross-contamination.
 3. **Collect at the turn boundary** — the completion notification fires as each child goes idle; `session_collect` picks up anything you're still missing (an absent or failed member is noted, never killed).
+   Every completion notification and every `session_collect` envelope carries the child's status line — `→ cct/s42 · codex gpt-5.6-sol · ctx 19% · turn 7 · $0.42` — so context pressure (`⚠` from 85%) and spend are visible without another call; `session_list` rows expose the same `context_pct`.
 4. **Synthesize the verdict yourself** — consensus, disagreements, and your call. Optionally dispatch the collected answers back to one child for rebuttal, or spawn a third session as tie-breaker.
 
 **The bill stays visible.** `session_list` and `session_collect` rows carry the model and the accrued `cost_usd` / `tokens_total` per member, so a fan-out's cost is a sum you can read, not a surprise.
