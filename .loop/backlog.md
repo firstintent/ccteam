@@ -15,6 +15,26 @@
 
 ## 当前卡
 
+> **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/dsh-team` —— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名 `@ccteam/dsh-team`(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
+
+### DSH2-HOST 第二插件 host 半:BFF 代理 + settings 卡 + 双 entry 构建(v0.10.4 P1)★ 可并行
+- **状态**:进行中(opus subagent·2026-08-25) · **冲突域**:`plugins/dsh-team(除 src/client/)` · **建议入口**:subagent(opus,worktree,briefing 自包含)
+- **规格**:PRD §3.3 —— 单条 `webServer.register({kind:'prefix', path:'/ccteam/api'})`(重复 (kind,path) 抛错,disposer 交 effect);POST `/<method>` 按 `contract.ts` 分发,上游 = ccteam REST(端点/认证形状读 `crates/ccteam-web/src/routes/` 与 auth 层为准);`GET /events` SSE fan-out(上游每类一条,浏览器 N 路,断线退避重连);token 只活闭包(D19);settings 卡同插件 1 套路;`tsdown.config.ts` 双 entry(host ESM + client closure-factory,格式复刻 `references/deepseek-harness/packages/client/tsdown.client.ts`,另参考 dsh 探索产出 `docs-local/versions/v0-10-4/build-contract.md`)。`src/shared/contract.ts` 只读,确需改 = 偏差申报(只许 additive)。
+- **DoD**:vitest 绿(方法分发注入 fake fetch / settings 形状 / SSE fan-out 基本面,零真网络);typecheck 绿;`npm pack --dry-run` 可打;不碰 `src/client/**`;writeback 绿。
+
+### DSH2-UI 第二插件 client 半:面板 UI(v0.10.4 P1)★ 可并行
+- **状态**:进行中(fable subagent·2026-08-25) · **冲突域**:`plugins/dsh-team/src/client + plugins/dsh-team/tests/client*` · **建议入口**:subagent(fable,worktree;owner 令「ui 设计派审美更好的 fable」)
+- **规格**:PRD §3.2/§3.5 全文 —— 入口 = `sidebar.footer.action` 槽(owner props 读 `references/.../ui-sidebar/src/client/contract/slots.ts`);面板 = `shell.overlay` 槽;两槽任一缺席整体降级 body-portal(版本门,不白屏);树/聊天/新建三态单栏进出,Enter 发送 · Shift+Enter 换行 · Esc 逐级返回;空态/错态/离线态每态给下一步;侧栏按钮完成徽标;数据只经 `contract.ts` 契约打本插件 BFF(`api.ts` 归本卡);组件只用 primitives、token 只引语义层、文案走 DSH locale(中英)、CSS Modules + `data-ccteam-console` 零泄漏。**不改** `package.json`/`tsconfig`/契约(缺依赖用本地 type shim + mock,需求走偏差申报)。
+- **DoD**:vitest 绿(面板状态机 / 徽标计数 / 版本门降级 / api client 注入 mock;+1 个「client CSS 零硬编码色值」grep 守卫测试);typecheck 绿;零 ccteam-web import(grep=0);writeback 绿。
+
+### DSH2-RUST 方式一物化 + Hosts 注册面(v0.10.4 P2,HOST/UI 合入后)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/dsh_acp/materialize.rs + assets + crates/ccteam-web/src/routes` · **建议入口**:subagent(opus)
+- **规格**:仿插件 1 K25 链路 —— `assets/dsh-team.tgz` 内嵌 + MergeOnly 注册(**恒 override 非 insert**,v0.10.0 boot 教训)+ 该身份个人 REST token 缺则铸、有则复用,写进 profile patch 扁平 config;`register-mcp?vendor=dsh` 同按钮顺带注册插件 2;方式二零 Rust 改动。
+- **DoD**:materialize 单测(结构断言 patch 形状);`dsh_register_test` 扩展;baseline 只增;真机双模式走 PRD §七核心动线。
+
+### DSH2-CHIP 聊天内联「↗ 派给 X」(P2 可选,owner 拍板后排)
+- **状态**:待排 · **冲突域**:`plugins/dsh-team/src/client/turnActions*` · 槽位 = `conversation.chat.assistant-actions`(list,R4 定)。
+
 ### RESTART-1 一 sid 一 body:daemon 重启后孤儿体识别 / 跟踪 / 回收,杜绝同 sid 双进程(owner 直驱 2026-08-19)
 - **状态**:完成(905e4a9) · **冲突域**:`crates/ccteam-harness/src/execution(session_body 新 + claude_stream_json + acp/transport + pi_rpc + adapter.rs + progress_bridge)+ crates/ccteam-im/src(gateway + daemon + mcp/dispatch)+ crates/ccteam-web(sessions_api + web lifecycle)+ crates/ccteam-cli/src(main 停机 + daemon_cli 文案)+ crates/ccteam-core/src(progress re-export + daemon 指纹委托)+ docs` · **建议入口**:规划(控制)会话亲自(owner「从 ccteam 代码本身解决,需要一个完善的方案,之后执行」)
 - **背景**:2026-08-19 本机实锤(分析留痕 `docs-local/bugs/2026-08-19-daemon-restart-duplicate-session-bodies.md`):`ccteam stop`(02:09:23)优雅停机把 agent 子进程「left running intentionally」,`ccteam start`(02:09:28)的启动恢复却假设「every child died」,对 live-set 22 个 sid 逐个 `--resume` 重生;忙碌的 stream-json 真身(s989,stdin EOF 后把手头 turn 跑完才退出,本机实测 claude 行为)与影子同时写 `wt/MM-154` → 双写;孤儿体不可观测 / 不可停 / 不计容量。两层假设互相矛盾 = 病根;补在症状点(kill 名单、单个 vendor)= 债。
