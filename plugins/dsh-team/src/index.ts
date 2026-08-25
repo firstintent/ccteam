@@ -1,35 +1,30 @@
 import Schema from '@deepseek-ai/schemastery'
+import { registerBff, type BffContext } from './bff.js'
+import {
+  DEFAULT_DAEMON_URL,
+  UNCHECKED_STATUS,
+  registerCcteamTeamSettings,
+  type CcteamTeamSettings,
+} from './settings.js'
 
 export const name = 'ccteam-team'
 export const inject = ['webServer', 'settings']
 
-export interface Config {
-  daemonUrl?: string
-  restToken?: string
-  connectionStatus?: string
-}
+export interface Config extends Partial<CcteamTeamSettings> {}
 
 export const Config: Schema<Config> = Schema.object({
-  daemonUrl: Schema.string()
-    .default('http://127.0.0.1:7331')
-    .description('ccteam daemon URL.'),
+  daemonUrl: Schema.string().default(DEFAULT_DAEMON_URL).description('ccteam daemon URL.'),
   restToken: Schema.string()
     .default('')
     .role('secret')
-    .description('Personal ccteam REST API token (web console → Account).'),
-  connectionStatus: Schema.string().default(
-    'Not checked. If the daemon is unreachable, run: ccteam start',
-  ),
+    .description('Personal ccteam REST API token (ccteam web console → Account).'),
+  defaultProject: Schema.string()
+    .default('')
+    .description('Project slug new sessions land in when the panel does not name one.'),
+  connectionStatus: Schema.string().default(UNCHECKED_STATUS),
 })
 
-export interface ApplyContext {
-  webServer: {
-    register(route: {
-      kind: 'exact' | 'prefix'
-      path: string
-      handler: (req: unknown, res: unknown) => void | Promise<void>
-    }): () => void
-  }
+export interface ApplyContext extends BffContext {
   settings?: {
     register<T>(
       ns: string,
@@ -37,18 +32,28 @@ export interface ApplyContext {
       options?: { applies?: 'live' | 'restart'; base?: Partial<T> },
     ): { get(): T }
   }
-  effect?<T extends (() => void | Promise<void>) | void>(
-    setup: () => T,
-    label?: string,
-  ): () => void
-  logger?: { warn(message: string): void }
 }
 
 /**
- * Host half: one prefix route under API_PREFIX serving the BFF (method
- * dispatch + SSE fan-out; see src/shared/contract.ts) plus the settings card.
- * Implementation lands in bff.ts — this stub only fixes the wiring shape.
+ * Host half: the settings card plus ONE prefix route under API_PREFIX serving
+ * the BFF (method dispatch + SSE fan-out; see src/shared/contract.ts).
+ *
+ * Precedence is config-over-settings, matching @ccteam/dsh-client: a value
+ * pinned in cordis.yml wins, otherwise the user's settings card decides. Both
+ * are read through closures on every request, so editing the card takes effect
+ * without a restart. The token never leaves this closure.
  */
-export function apply(_ctx: ApplyContext, _config: Config = {}): void {
-  // TODO(DSH2-HOST): registerCcteamSettings + registerBff(ctx, config)
+export function apply(ctx: ApplyContext, config: Config = {}): void {
+  const settings = registerCcteamTeamSettings(ctx, {
+    daemonUrl: config.daemonUrl,
+    restToken: config.restToken,
+    defaultProject: config.defaultProject,
+    connectionStatus: config.connectionStatus,
+  })
+  registerBff(ctx, {
+    daemonUrl: () => config.daemonUrl ?? settings.get().daemonUrl ?? DEFAULT_DAEMON_URL,
+    restToken: () => config.restToken ?? settings.get().restToken ?? '',
+    defaultProject: () => config.defaultProject ?? settings.get().defaultProject ?? '',
+    logger: ctx.logger,
+  })
 }

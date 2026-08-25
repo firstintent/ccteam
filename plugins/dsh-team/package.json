@@ -32,20 +32,25 @@
     }
   },
   "scripts": {
+    "prebuild": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\"",
     "build": "tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run typecheck && vitest run"
+    "test": "npm run typecheck && npm run build && vitest run",
+    "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-primitives": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.8",
     "@types/node": "^22.13.0",
     "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
     "react": "^18.3.0",
+    "react-dom": "^18.3.0",
     "tsdown": "^0.22.2",
     "typescript": "^5.7.3",
     "vitest": "^3.2.4"

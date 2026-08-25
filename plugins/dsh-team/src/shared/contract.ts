@@ -71,6 +71,13 @@ export interface SendReceipt {
 }
 
 export interface SpawnRequest {
+  /**
+   * Project slug the session is created in. ccteam's create-session endpoint
+   * is project-scoped and never infers a project, so the host falls back to
+   * the configured default and reports an actionable error when neither is
+   * set. Optional: existing callers keep compiling.
+   */
+  project?: string
   vendor: string
   model?: string
   effort?: string
