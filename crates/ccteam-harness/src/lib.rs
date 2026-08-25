@@ -105,7 +105,9 @@ pub use execution::session_meta::{
     touch_last_active, truncate_title, write_session_meta, ExternalClaudeSession, SessionMeta,
     SessionOrigin, TitleSource,
 };
-pub use execution::turn_status::{render_status_line, StatusIdentity, TurnStatus};
+pub use execution::turn_status::{
+    render_status_line, render_status_metrics, StatusIdentity, TurnStatus,
+};
 pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};
 pub use inproc_backend::InProcBackend;

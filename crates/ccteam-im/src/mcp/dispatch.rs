@@ -3038,7 +3038,8 @@ async fn dispatch_wait_for_completion(
         match tokio::time::timeout(wait_slice, rx.recv()).await {
             Ok(Ok(ev)) => {
                 let hit = ev.sid.as_deref() == Some(child_sid)
-                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer);
+                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer)
+                    && ev.status.is_some();
                 if hit {
                     saw_answer = true;
                 }
@@ -3140,17 +3141,24 @@ async fn dispatch_wait_for_completion(
     if let Some(t) = tokens_total {
         m.insert("tokens_total".to_string(), serde_json::json!(t));
     }
-    if let (Some(resolved), Some(record)) = (resolved.as_ref(), result_record.as_ref()) {
-        if let Some(line) = status_line_for(
-            &resolved.project,
-            &resolved.sid,
-            &resolved.role,
-            &resolved.vendor,
-            None,
-            record.status.as_ref(),
-        ) {
-            m.insert("status_line".to_string(), serde_json::json!(line));
-        }
+    if let Some(pct) = result_record
+        .as_ref()
+        .and_then(|record| record.status.as_ref())
+        .and_then(|status| status.context.as_ref())
+        .and_then(|context| context.pct())
+    {
+        m.insert(
+            "context_pct".to_string(),
+            serde_json::json!(pct.round() as u64),
+        );
+    }
+    if let Some(model) = result_record
+        .as_ref()
+        .and_then(|record| record.status.as_ref())
+        .and_then(|status| status.model.as_deref())
+        .filter(|model| !model.trim().is_empty())
+    {
+        m.insert("model".to_string(), serde_json::json!(model));
     }
     m
 }
@@ -3342,28 +3350,6 @@ fn classify_session_activity(
     Some(activity.status.activity.to_string())
 }
 
-fn status_line_for(
-    project: &str,
-    sid: &str,
-    role: &str,
-    vendor: &str,
-    title: Option<&str>,
-    status: Option<&ccteam_harness::TurnStatus>,
-) -> Option<String> {
-    status.map(|status| {
-        ccteam_harness::render_status_line(
-            &ccteam_harness::StatusIdentity {
-                slug: project,
-                sid,
-                vendor,
-                role,
-                title,
-            },
-            status,
-        )
-    })
-}
-
 /// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
 /// Polled MVP: resolve sid → role + project_dir under the lock, drop the
 /// guard, then read the ccteam-owned mirror. `since` is a turn_id cursor.
@@ -3425,7 +3411,9 @@ async fn run_session_collect(
         .unwrap_or_default();
     let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
     let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
-    let model = meta.as_ref().and_then(|m| m.model.as_deref());
+    let model = meta
+        .as_ref()
+        .and_then(|m| m.observed_model.as_deref().or(m.model.as_deref()));
     let latest_status = all.iter().rev().find_map(|turn| turn.status.clone());
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
@@ -3452,16 +3440,6 @@ async fn run_session_collect(
         // max_chars excerpts were applied.
         "total_chars": total_chars,
     });
-    if let Some(status) = status_line_for(
-        &resolved.project,
-        &resolved.sid,
-        &resolved.role,
-        &resolved.vendor,
-        meta.as_ref().and_then(|m| m.title.as_deref()),
-        latest_status.as_ref(),
-    ) {
-        body["status_line"] = serde_json::json!(status);
-    }
     if let Some(pct) = latest_status
         .as_ref()
         .and_then(|status| status.context.as_ref())
@@ -3476,6 +3454,10 @@ async fn run_session_collect(
         // v0.9.5 — honest token ledger for vendors with no USD price table.
         body["tokens_total"] = serde_json::json!(t);
     }
+    let model = latest_status
+        .as_ref()
+        .and_then(|status| status.model.as_deref())
+        .or(model);
     if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
         body["model"] = serde_json::json!(model);
     }
@@ -4544,6 +4526,12 @@ mod session_tool_tests {
                     _ => String::new(),
                 };
                 let mut q = self.events.lock().await;
+                q.push_back((
+                    h.identity.clone(),
+                    ccteam_harness::ThreadEvent::TurnStarted {
+                        turn_id: format!("turn-{}", h.identity),
+                    },
+                ));
                 if self.narrate {
                     q.push_back((
                         h.identity.clone(),
@@ -4684,7 +4672,15 @@ mod session_tool_tests {
             _h: &ccteam_harness::ThreadHandle,
         ) -> std::result::Result<ccteam_harness::ThreadStatus, ccteam_harness::HarnessError>
         {
-            Ok(ccteam_harness::ThreadStatus::default())
+            Ok(ccteam_harness::ThreadStatus {
+                model: Some("stub-model".into()),
+                context: Some(ccteam_harness::ContextUsage::known(
+                    19,
+                    100,
+                    ccteam_harness::ContextSource::Reported,
+                )),
+                ..Default::default()
+            })
         }
     }
 
@@ -5707,11 +5703,11 @@ mod session_tool_tests {
         assert_eq!(response["tokens_total"], 12_345, "{response}");
         assert_eq!(response["cost_usd"], 0.12, "{response}");
         assert!(
-            response["status_line"]
-                .as_str()
-                .is_some_and(|line| line.contains(&format!("alpha/{child}"))),
-            "inline completion carries the child's status line: {response}"
+            response.get("status_line").is_none(),
+            "MCP stays numeric: {response}"
         );
+        assert_eq!(response["context_pct"], 19, "{response}");
+        assert_eq!(response["model"], "stub-model", "{response}");
         let elapsed = response["elapsed_seconds"].as_f64().unwrap();
         assert!(
             (0.0..=6.0).contains(&elapsed),
@@ -6753,11 +6749,11 @@ mod session_tool_tests {
         assert!(result.contains("truncated"));
         assert!(result.contains("session_collect{sid:"));
         assert!(
-            r["status_line"]
-                .as_str()
-                .is_some_and(|line| line.contains("turn 1")),
-            "spawn inline response carries status: {r}"
+            r.get("status_line").is_none(),
+            "spawn MCP envelope has no text status: {r}"
         );
+        assert_eq!(r["context_pct"], 19, "{r}");
+        assert_eq!(r["model"], "stub-model", "{r}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -6824,11 +6820,11 @@ mod session_tool_tests {
         assert_eq!(collected["turns"][0]["error_kind"], "server_overloaded");
         assert_eq!(collected["turns"][0]["error"], CAPACITY_ERROR);
         assert!(
-            collected["status_line"]
-                .as_str()
-                .is_some_and(|line| line.contains("turn 1")),
-            "collect envelope carries current status: {collected}"
+            collected.get("status_line").is_none(),
+            "collect MCP envelope has no text status: {collected}"
         );
+        assert_eq!(collected["context_pct"], 19, "{collected}");
+        assert_eq!(collected["model"], "stub-model", "{collected}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7056,11 +7052,11 @@ mod session_tool_tests {
         assert!(result.ends_with("TAIL"));
         assert!(result.contains("truncated"));
         assert!(
-            r["status_line"]
-                .as_str()
-                .is_some_and(|line| line.contains("turn 1")),
-            "dispatch inline response carries status: {r}"
+            r.get("status_line").is_none(),
+            "dispatch MCP envelope has no text status: {r}"
         );
+        assert_eq!(r["context_pct"], 19, "{r}");
+        assert_eq!(r["model"], "stub-model", "{r}");
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();

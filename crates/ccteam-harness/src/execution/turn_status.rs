@@ -62,6 +62,32 @@ pub fn render_status_line(id: &StatusIdentity<'_>, st: &TurnStatus) -> String {
     line
 }
 
+/// Render only the compact turn metrics used by agent-to-agent notifications.
+/// Identity and model stay out of this form to minimize the parent session's
+/// token cost; omission and fallback rules match [`render_status_line`].
+pub fn render_status_metrics(st: &TurnStatus) -> String {
+    let mut segments = Vec::new();
+    if let Some(context) = st.context.as_ref() {
+        if let Some(pct) = context.pct() {
+            let pct = pct.round() as u64;
+            let warning = if pct >= 85 { "⚠" } else { "" };
+            segments.push(format!("ctx {pct}%{warning}"));
+        }
+    }
+    segments.push(format!("turn {}", st.turn));
+    if let Some(cost) = st.cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+        let rendered = if cost > 0.0 && cost < 0.005 {
+            "<0.01".to_string()
+        } else {
+            format!("{cost:.2}")
+        };
+        segments.push(format!("${rendered}"));
+    } else if let Some(tokens) = st.tokens_total {
+        segments.push(format!("{:.1}k tok", tokens as f64 / 1000.0));
+    }
+    segments.join(" · ")
+}
+
 fn truncate_title(title: &str) -> String {
     let mut chars = title.chars();
     let first: String = chars.by_ref().take(24).collect();
@@ -172,5 +198,33 @@ mod tests {
             ..id()
         };
         assert!(render_status_line(&id, &status()).ends_with("「abcdefghijklmnopqrstuvwx…」"));
+    }
+
+    #[test]
+    fn renders_metrics_full_without_identity_or_model() {
+        assert_eq!(render_status_metrics(&status()), "ctx 19% · turn 7 · $0.42");
+    }
+
+    #[test]
+    fn renders_metrics_omissions_warning_and_token_fallback() {
+        let omitted = TurnStatus {
+            model: Some("ignored".into()),
+            context: None,
+            turn: 2,
+            cost_usd: None,
+            tokens_total: None,
+        };
+        assert_eq!(render_status_metrics(&omitted), "turn 2");
+
+        let warning = TurnStatus {
+            context: Some(ContextUsage::known(85, 100, ContextSource::Reported)),
+            cost_usd: None,
+            tokens_total: Some(12_345),
+            ..status()
+        };
+        assert_eq!(
+            render_status_metrics(&warning),
+            "ctx 85%⚠ · turn 7 · 12.3k tok"
+        );
     }
 }

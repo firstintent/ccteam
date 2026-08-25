@@ -3080,7 +3080,7 @@ impl Gateway {
                 vendor_error,
                 interim_notes: 0,
                 covered_turns: vec![turn_id],
-                status_line: None,
+                status_metrics: None,
             });
         }
         tracing::info!(session = %sid, recovered = recovered.is_some(), "ccteam-im: unobserved turn reported");
@@ -5389,6 +5389,13 @@ impl Gateway {
                         .count() as u64
                 })
                 .unwrap_or(0); // assistant-row count → monotonic turn number
+            let mut vendor_turn: u64 = project_dir
+                .as_ref()
+                .and_then(|dir| {
+                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
+                })
+                .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
+                .unwrap_or(0);
             let mut epoch: u64 = 0; // status epoch → one per turn
             let mut fold = crate::progress::ProgressFold::new();
             let mut dirty = false;
@@ -5408,7 +5415,13 @@ impl Gateway {
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
             let mut pending_answers: Vec<String> = Vec::new();
-            let mut turn_last_status_line: Option<String> = None;
+            let mut turn_last_status_metrics: Option<String> = None;
+            // Immediate-flush protocols can deliver one or more assistant
+            // messages before their terminal boundary arrives. Remember that
+            // the current vendor turn already produced visible text so an
+            // otherwise-empty TurnCompleted does not create a duplicate web
+            // status-only Answer.
+            let mut turn_had_answer = false;
             // The final text + the reply target used by its ordinary web
             // Answer. Held independently from delegation bookkeeping so an
             // IM mirror never depends on the turns.jsonl append succeeding.
@@ -6055,10 +6068,84 @@ impl Gateway {
                             }
                             _ => Vec::new(),
                         };
+                        let is_turn_boundary = matches!(
+                            &evt,
+                            ThreadEvent::TurnCompleted { .. }
+                                | ThreadEvent::TurnFailed { .. }
+                                | ThreadEvent::Error(_)
+                        );
+                        if is_turn_boundary {
+                            vendor_turn = vendor_turn.saturating_add(1);
+                        }
+                        if !answer_texts.is_empty() {
+                            turn_had_answer = true;
+                        }
+                        if is_turn_boundary && answer_texts.is_empty() {
+                            let live_status = resolved_thread_status(
+                                Arc::clone(&session.adapter),
+                                session.thread.clone(),
+                                &session_id,
+                            )
+                            .await;
+                            let meta_status = session_catalog.get(&session_id).map(|entry| entry.meta);
+                            let projected = progress_projection.as_ref().and_then(|projection| {
+                                projection.session_snapshot(&session.project, &session_id)
+                            });
+                            let current_usage = turn_terminal_accounting(&evt).map(|(_, usage, _)| *usage);
+                            let status = ccteam_harness::TurnStatus {
+                                model: live_status.model.clone().or_else(|| {
+                                    projected.as_ref().and_then(|snapshot| snapshot.observed_model.clone())
+                                }).or_else(|| meta_status.as_ref().and_then(|meta| {
+                                    meta.observed_model.clone().or_else(|| meta.model.clone())
+                                })),
+                                context: live_status.context,
+                                turn: vendor_turn,
+                                cost_usd: projected.as_ref().and_then(|snapshot| snapshot.pricing(session.vendor).cost_usd).or_else(|| {
+                                    let base = meta_status.as_ref().and_then(|meta| meta.cost_usd);
+                                    current_usage.and_then(|usage| ccteam_cost::resolve_turn_cost(
+                                        &usage,
+                                        session.vendor.cost_vendor(),
+                                        live_status.model.as_deref().unwrap_or(""),
+                                    ).map(|cost| base.unwrap_or(0.0) + cost)).or(base)
+                                }),
+                                tokens_total: projected.as_ref().and_then(|snapshot| snapshot.tokens_total).or_else(|| {
+                                    let base = meta_status.as_ref().and_then(|meta| meta.tokens_total);
+                                    current_usage.map(|usage| base.unwrap_or(0).saturating_add(usage.total())).or(base)
+                                }),
+                            };
+                            turn_last_status_metrics =
+                                Some(ccteam_harness::render_status_metrics(&status));
+                            let chat_key = session
+                                .reply_to
+                                .lock()
+                                .map(|key| key.clone())
+                                .unwrap_or_else(|_| session.owner.clone());
+                            if chat_key.channel == "web" && !turn_had_answer {
+                                let status_only = GatewayEvent {
+                                    id: format!("gateway-event-{session_id}-status-{vendor_turn}"),
+                                    channel: chat_key.channel,
+                                    chat_id: chat_key.chat_id,
+                                    thread_ts: None,
+                                    content: String::new(),
+                                    kind: GatewayEventKind::Answer,
+                                    attachments: Vec::new(),
+                                    options: Vec::new(),
+                                    status: Some(status),
+                                    sid: Some(session_id.clone()),
+                                    slug: Some(session.project.clone()),
+                                };
+                                if !tx.send(status_only) {
+                                    break;
+                                }
+                            }
+                        }
                         if !answer_texts.is_empty()
                             || matches!(&evt, ThreadEvent::TurnCompleted { .. })
                         {
-                          for text in answer_texts {
+                          let answer_count = answer_texts.len();
+                          for (answer_index, text) in answer_texts.into_iter().enumerate() {
+                            let is_final_answer = is_turn_boundary
+                                && answer_index.saturating_add(1) == answer_count;
                             let boundary_origin = match &evt {
                                 ThreadEvent::TurnFailed { turn_id, .. } => {
                                     Some(take_turn_origin(&session, Some(turn_id)))
@@ -6085,59 +6172,92 @@ impl Gateway {
 
                             seq = seq.saturating_add(1);
                             session.visible_events.fetch_add(1, Ordering::SeqCst);
-                            let live_status = resolved_thread_status(
-                                Arc::clone(&session.adapter),
-                                session.thread.clone(),
-                                &session_id,
-                            )
-                            .await;
-                            let meta_status = session_catalog.get(&session_id).map(|entry| entry.meta);
-                            let projected = progress_projection
-                                .as_ref()
-                                .and_then(|projection| projection.session_snapshot(&session.project, &session_id));
-                            let projected_pricing = projected.as_ref().map(|snapshot| snapshot.pricing(session.vendor));
-                            let current_usage = turn_terminal_accounting(&evt).map(|(_, usage, _)| *usage);
-                            let projected_tokens = projected.as_ref().and_then(|snapshot| snapshot.tokens_total);
-                            let projected_cost = projected_pricing.and_then(|pricing| pricing.cost_usd);
-                            let status = ccteam_harness::TurnStatus {
-                                model: live_status.model.clone().or_else(|| projected.as_ref().and_then(|snapshot| snapshot.observed_model.clone())).or_else(|| {
-                                    meta_status
-                                        .as_ref()
-                                        .and_then(|meta| {
-                                            meta.observed_model
-                                                .clone()
-                                                .or_else(|| meta.model.clone())
+                            let (status, meta_status) = if is_final_answer {
+                                let live_status = resolved_thread_status(
+                                    Arc::clone(&session.adapter),
+                                    session.thread.clone(),
+                                    &session_id,
+                                )
+                                .await;
+                                let meta_status =
+                                    session_catalog.get(&session_id).map(|entry| entry.meta);
+                                let projected = progress_projection.as_ref().and_then(|projection| {
+                                    projection.session_snapshot(&session.project, &session_id)
+                                });
+                                let projected_pricing = projected
+                                    .as_ref()
+                                    .map(|snapshot| snapshot.pricing(session.vendor));
+                                let current_usage =
+                                    turn_terminal_accounting(&evt).map(|(_, usage, _)| *usage);
+                                let projected_tokens =
+                                    projected.as_ref().and_then(|snapshot| snapshot.tokens_total);
+                                let projected_cost =
+                                    projected_pricing.and_then(|pricing| pricing.cost_usd);
+                                let status = ccteam_harness::TurnStatus {
+                                    model: live_status
+                                        .model
+                                        .clone()
+                                        .or_else(|| {
+                                            projected.as_ref().and_then(|snapshot| {
+                                                snapshot.observed_model.clone()
+                                            })
                                         })
-                                }),
-                                context: live_status.context,
-                                turn: seq,
-                                cost_usd: projected_cost.or_else(|| {
-                                    let base = meta_status.as_ref().and_then(|meta| meta.cost_usd);
-                                    current_usage.and_then(|usage| {
-                                        ccteam_cost::resolve_turn_cost(
-                                            &usage,
-                                            session.vendor.cost_vendor(),
-                                            live_status.model.as_deref().unwrap_or(""),
-                                        )
-                                        .map(|cost| base.unwrap_or(0.0) + cost)
-                                    }).or(base)
-                                }),
-                                tokens_total: projected_tokens.or_else(|| {
-                                    let base = meta_status.as_ref().and_then(|meta| meta.tokens_total);
-                                    current_usage.map(|usage| base.unwrap_or(0).saturating_add(usage.total())).or(base)
-                                }),
+                                        .or_else(|| {
+                                            meta_status.as_ref().and_then(|meta| {
+                                                meta.observed_model
+                                                    .clone()
+                                                    .or_else(|| meta.model.clone())
+                                            })
+                                        }),
+                                    context: live_status.context,
+                                    turn: vendor_turn,
+                                    cost_usd: projected_cost.or_else(|| {
+                                        let base =
+                                            meta_status.as_ref().and_then(|meta| meta.cost_usd);
+                                        current_usage
+                                            .and_then(|usage| {
+                                                ccteam_cost::resolve_turn_cost(
+                                                    &usage,
+                                                    session.vendor.cost_vendor(),
+                                                    live_status.model.as_deref().unwrap_or(""),
+                                                )
+                                                .map(|cost| base.unwrap_or(0.0) + cost)
+                                            })
+                                            .or(base)
+                                    }),
+                                    tokens_total: projected_tokens.or_else(|| {
+                                        let base = meta_status
+                                            .as_ref()
+                                            .and_then(|meta| meta.tokens_total);
+                                        current_usage
+                                            .map(|usage| {
+                                                base.unwrap_or(0).saturating_add(usage.total())
+                                            })
+                                            .or(base)
+                                    }),
+                                };
+                                (Some(status), meta_status)
+                            } else {
+                                (None, None)
                             };
-                            let status_line = ccteam_harness::render_status_line(
-                                &ccteam_harness::StatusIdentity {
-                                    slug: &session.project,
-                                    sid: &session_id,
-                                    vendor: vendor_str(session.vendor),
-                                    role: &session.role,
-                                    title: meta_status.as_ref().and_then(|meta| meta.title.as_deref()),
-                                },
-                                &status,
-                            );
-                            turn_last_status_line = Some(status_line.clone());
+                            let status_line = status.as_ref().map(|status| {
+                                ccteam_harness::render_status_line(
+                                    &ccteam_harness::StatusIdentity {
+                                        slug: &session.project,
+                                        sid: &session_id,
+                                        vendor: vendor_str(session.vendor),
+                                        role: &session.role,
+                                        title: meta_status
+                                            .as_ref()
+                                            .and_then(|meta| meta.title.as_deref()),
+                                    },
+                                    status,
+                                )
+                            });
+                            if let Some(status) = status.as_ref() {
+                                turn_last_status_metrics =
+                                    Some(ccteam_harness::render_status_metrics(status));
+                            }
                             // v0.8.8 F1 — 落盘这条 assistant 回复到
                             // `.ccteam/chat/<sid>/turns.jsonl`(生产唯一 live
                             // writer)。这是 SPA / cto session_collect 历史读侧的
@@ -6158,10 +6278,14 @@ impl Gateway {
                                     role: session.role.clone(),
                                     user: String::new(),
                                     assistant: text.clone(),
-                                    usage: turn_terminal_accounting(&evt)
-                                        .map(|(_, usage, _)| ccteam_harness::execution::turn_status::usage_value(usage))
-                                        .unwrap_or(serde_json::Value::Null),
-                                    status: Some(status.clone()),
+                                    usage: if is_final_answer {
+                                        turn_terminal_accounting(&evt)
+                                            .map(|(_, usage, _)| ccteam_harness::execution::turn_status::usage_value(usage))
+                                            .unwrap_or(serde_json::Value::Null)
+                                    } else {
+                                        serde_json::Value::Null
+                                    },
+                                    status: status.clone(),
                                     tool_calls: Vec::new(),
                                     attachments: Vec::new(),
                                     outcome: failure.map(|_| "failed".to_string()),
@@ -6212,7 +6336,9 @@ impl Gateway {
                                                     vendor_error: true,
                                                     interim_notes: notes,
                                                     covered_turns: covered,
-                                                    status_line: Some(status_line.clone()),
+                                                    status_metrics: status
+                                                        .as_ref()
+                                                        .map(ccteam_harness::render_status_metrics),
                                                 });
                                             }
                                         } else {
@@ -6232,7 +6358,7 @@ impl Gateway {
                                                     vendor_error: false,
                                                     interim_notes: 0,
                                                     covered_turns: vec![record.turn_id.clone()],
-                                                    status_line: Some(status_line.clone()),
+                                                    status_metrics: None,
                                                 });
                                             }
                                         }
@@ -6297,18 +6423,25 @@ impl Gateway {
                                 if channel == "web" {
                                     text.clone()
                                 } else {
-                                    format!("{text}\n\n{status_line}")
+                                    status_line
+                                        .as_ref()
+                                        .map(|line| format!("{text}\n\n{line}"))
+                                        .unwrap_or_else(|| text.clone())
                                 }
                             } else {
                                 format!(
-                                    "{}\n\n{status_line}",
+                                    "{}{}",
                                     contextual_answer(
                                     &session_id,
                                     &session.project,
                                     session.vendor,
                                     &session.role,
                                     &text,
-                                    )
+                                    ),
+                                    status_line
+                                        .as_ref()
+                                        .map(|line| format!("\n\n{line}"))
+                                        .unwrap_or_default(),
                                 )
                             };
                             // v0.10.1 — a shared IM thread needs an ADDRESSEE,
@@ -6337,7 +6470,7 @@ impl Gateway {
                                 kind: GatewayEventKind::Answer,
                                 attachments: Vec::new(),
                                 options: Vec::new(),
-                                status: Some(status),
+                                status,
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             };
@@ -6384,7 +6517,7 @@ impl Gateway {
                                     vendor_error: false,
                                     interim_notes: notes.saturating_sub(1),
                                     covered_turns: covered,
-                                    status_line: turn_last_status_line.clone(),
+                                    status_metrics: turn_last_status_metrics.take(),
                                 });
                             }
                             if let Some((final_text, reply_to)) = mirror_answer {
@@ -6403,6 +6536,9 @@ impl Gateway {
                           }
                           if matches!(&evt, ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)) {
                             structured_turn_open = false;
+                          }
+                          if is_turn_boundary {
+                            turn_had_answer = false;
                           }
                         } else if progress_on {
                             // ----- PROGRESS (IM, unchanged) -----
@@ -11737,7 +11873,7 @@ impl Gateway {
                 &signal.tail,
                 signal.interim_notes,
                 signal.vendor_error,
-                signal.status_line.as_deref(),
+                signal.status_metrics.as_deref(),
             )
         });
         Some(DelegationDeliveryPlan {
@@ -11952,18 +12088,10 @@ impl Gateway {
                         })
                         .collect();
                 if let Some(last) = missed.last() {
-                    let status_line = last.status.as_ref().map(|status| {
-                        ccteam_harness::render_status_line(
-                            &ccteam_harness::StatusIdentity {
-                                slug,
-                                sid: &child_sid,
-                                vendor: crate::delegation::vendor_key(vendor),
-                                role: "",
-                                title: watch.title.as_deref(),
-                            },
-                            status,
-                        )
-                    });
+                    let status_metrics = last
+                        .status
+                        .as_ref()
+                        .map(ccteam_harness::render_status_metrics);
                     pending.push(crate::delegation::DelegationSignal {
                         child_sid: child_sid.clone(),
                         turn_id: last.turn_id.clone(),
@@ -11981,7 +12109,7 @@ impl Gateway {
                             || last.error.is_some(),
                         interim_notes: missed.len().saturating_sub(1),
                         covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
-                        status_line,
+                        status_metrics,
                     });
                 }
             }
@@ -13071,8 +13199,8 @@ fn render_rename_receipt(r: &SessionRename) -> String {
 
 /// v0.8.22 P1 — one read-modify-write refreshing meta.json's activity trio
 /// when paneless work starts or an assistant/error row lands: `last_active`
-/// (as `touch_last_active` always did), `turn_count` (the turns.jsonl line
-/// count), and `cost_usd` (this sid's priced `chat_turn_completed` events in
+/// (as `touch_last_active` always did), `turn_count` (vendor turn ordinal from
+/// user rows), and `cost_usd` (this sid's priced `chat_turn_completed` events in
 /// progress.jsonl — the same
 /// deterministic per-turn accounting `GET /api/v1/status`'s
 /// `build_session_cost_rows` uses, scoped to one sid). Best-effort, like the
@@ -13093,12 +13221,7 @@ fn refresh_session_activity_meta(
     };
     meta.last_active = chrono::Utc::now().to_rfc3339();
     meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
-        .map(|turns| {
-            turns
-                .iter()
-                .filter(|turn| !turn.assistant.is_empty())
-                .count() as u64
-        })
+        .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
         .unwrap_or(meta.turn_count);
     if let Some(session) = projection.and_then(|projection| projection.session_snapshot(slug, sid))
     {
@@ -15953,6 +16076,8 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// Number of assistant messages emitted inside one vendor turn.
+        assistant_messages: usize,
         /// Emit the structured paneless turn-start boundary before reply data.
         /// Opt-in so timing-sensitive tests can pause between start/completion.
         emit_turn_started: bool,
@@ -16031,6 +16156,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                assistant_messages: 1,
                 emit_turn_started: false,
                 turn_failure: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -16068,6 +16194,11 @@ mod tests {
 
         fn with_turn_started(mut self) -> Self {
             self.emit_turn_started = true;
+            self
+        }
+
+        fn with_assistant_messages(mut self, count: usize) -> Self {
+            self.assistant_messages = count.max(1);
             self
         }
 
@@ -16215,18 +16346,22 @@ mod tests {
                     },
                 ));
             } else {
-                self.events.lock().await.push_back((
-                    h.identity.clone(),
-                    ThreadEvent::ItemCompleted {
-                        item: ThreadItem {
-                            id: "msg-1".to_string(),
-                            details: ThreadItemDetails::AgentMessage(format!(
-                                "{} echo: {text}",
-                                h.identity
-                            )),
+                for index in 0..self.assistant_messages {
+                    let content = if index.saturating_add(1) == self.assistant_messages {
+                        format!("{} echo: {text}", h.identity)
+                    } else {
+                        format!("{} checkpoint {}", h.identity, index.saturating_add(1))
+                    };
+                    self.events.lock().await.push_back((
+                        h.identity.clone(),
+                        ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: format!("msg-{}", index.saturating_add(1)),
+                                details: ThreadItemDetails::AgentMessage(content),
+                            },
                         },
-                    },
-                ));
+                    ));
+                }
                 // A real adapter also emits a turn boundary (carrying usage); the
                 // stream-json pump mirrors it to progress.jsonl for paneless
                 // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
@@ -18387,6 +18522,7 @@ mod tests {
             FakeAdapter::new(AgentVendor::Claude)
                 .with_turn_started()
                 .with_turn_boundary()
+                .with_assistant_messages(3)
                 .with_turn_boundary_status(ThreadStatus {
                     model: Some("claude-sonnet-4-6".into()),
                     context: Some(ccteam_harness::ContextUsage::known(
@@ -18398,26 +18534,6 @@ mod tests {
                 }),
         );
         let proj = tempfile::TempDir::new().unwrap();
-        ccteam_harness::execution::turns_mirror::append_turn(
-            proj.path(),
-            "s1",
-            &ccteam_harness::execution::turns_mirror::TurnRecord {
-                turn_id: "s1-before-resume".into(),
-                ts: chrono::Utc::now(),
-                vendor: "claude".into(),
-                role: "reviewer".into(),
-                user: String::new(),
-                assistant: "older answer".into(),
-                usage: serde_json::Value::Null,
-                status: None,
-                tool_calls: Vec::new(),
-                attachments: Vec::new(),
-                outcome: None,
-                error_kind: None,
-                error: None,
-            },
-        )
-        .unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
@@ -18432,7 +18548,19 @@ mod tests {
             .await
             .unwrap();
 
-        let ev = recv_answer(&mut events).await;
+        let first_turn = [
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+        ];
+        assert!(first_turn[..2].iter().all(|event| event.status.is_none()));
+        assert!(
+            first_turn[..2]
+                .iter()
+                .all(|event| !event.content.contains("\n\n→ ")),
+            "interim messages carry no status tail: {first_turn:?}"
+        );
+        let ev = &first_turn[2];
         assert!(
             ev.content.contains("echo: hello"),
             "answer still carries the real reply text: {}",
@@ -18454,7 +18582,7 @@ mod tests {
         );
         assert!(
             echo.starts_with(
-                "→ alpha/s1 (reviewer) · claude claude-sonnet-4-6 · ctx 19% · turn 2 · $"
+                "→ alpha/s1 (reviewer) · claude claude-sonnet-4-6 · ctx 19% · turn 1 · $"
             ),
             "status line carries post-turn ctx, model, turn, and current cost: {echo:?}"
         );
@@ -18467,16 +18595,44 @@ mod tests {
             Some(19)
         );
         assert_eq!(ev.status.as_ref().and_then(|s| s.tokens_total), Some(1_500));
-        assert_eq!(ev.status.as_ref().map(|status| status.turn), Some(2));
+        assert_eq!(ev.status.as_ref().map(|status| status.turn), Some(1));
         let turns =
             ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
-        let mirrored = turns
+        let assistant: Vec<_> = turns
             .iter()
-            .rev()
-            .find(|turn| !turn.assistant.is_empty())
-            .expect("current assistant row mirrored");
-        assert_eq!(mirrored.status.as_ref().map(|status| status.turn), Some(2));
-        assert_ne!(mirrored.usage, serde_json::Value::Null);
+            .filter(|turn| !turn.assistant.is_empty())
+            .collect();
+        assert_eq!(assistant.len(), 3);
+        assert!(assistant[..2].iter().all(|turn| turn.status.is_none()));
+        assert_eq!(
+            assistant[2].status.as_ref().map(|status| status.turn),
+            Some(1)
+        );
+        assert_ne!(assistant[2].usage, serde_json::Value::Null);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "second")
+            .await
+            .unwrap();
+        let second_turn = [
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+        ];
+        assert!(second_turn[..2].iter().all(|event| event.status.is_none()));
+        assert_eq!(
+            second_turn[2].status.as_ref().map(|status| status.turn),
+            Some(2),
+            "three assistant messages still count as one vendor turn"
+        );
+        assert_eq!(
+            second_turn
+                .iter()
+                .filter(|event| event.content.contains("\n\n→ "))
+                .count(),
+            1,
+            "one IM status tail per vendor turn"
+        );
     }
 
     /// v0.8.23 review §3.2-5 (item 2a) — a roleless session's echo omits the
@@ -25443,7 +25599,7 @@ mod tests {
             vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
-            status_line: None,
+            status_metrics: None,
         };
         // Three interim narration messages inside the running turn → silence.
         for n in 1..=3 {
@@ -25465,7 +25621,7 @@ mod tests {
             vendor_error: false,
             interim_notes: 3,
             covered_turns: (1..=4).map(|n| format!("{child_sid}-{n}")).collect(),
-            status_line: None,
+            status_metrics: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
@@ -25548,7 +25704,7 @@ mod tests {
             vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
-            status_line: None,
+            status_metrics: None,
         };
         Gateway::deliver_delegation_signal_shared(
             Arc::clone(&gateway),
@@ -25661,7 +25817,7 @@ mod tests {
             vendor_error: false,
             interim_notes: if boundary { n as usize - 1 } else { 0 },
             covered_turns: vec![format!("{child_sid}-{n}")],
-            status_line: None,
+            status_metrics: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(1, false)).await;
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(2, false)).await;
@@ -25720,7 +25876,7 @@ mod tests {
                 vendor_error: false,
                 interim_notes: 0,
                 covered_turns: vec![format!("{child2}-1")],
-                status_line: None,
+                status_metrics: None,
             },
         )
         .await;
