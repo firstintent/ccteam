@@ -64,10 +64,7 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::turns_mirror::{turns_jsonl_path, TurnRecord};
-use ccteam_harness::{
-    AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
-    ThreadStatus,
-};
+use ccteam_harness::{AgentVendor, ChoicePrompt, PermissionMode, SessionProtocol};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use ccteam_im::transport::MessageOption;
 use futures::stream::StreamExt;
@@ -698,6 +695,9 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
         event["attachments"] =
             serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
     }
+    if let Some(status) = &turn.status {
+        event["status"] = serde_json::to_value(status).unwrap_or(json!(null));
+    }
     event
 }
 
@@ -710,21 +710,6 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
 /// truth for a session's live statusline: shared by `GET
 /// /sessions/{sid}/status` and the team graph's per-live-node model join
 /// ([`super::agents::handle_agents_graph`]), so both report the same model.
-pub(crate) async fn resolved_thread_status(
-    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
-    thread: ThreadHandle,
-    sid: &str,
-) -> ThreadStatus {
-    match adapter.thread_status(&thread).await {
-        Ok(s) => s,
-        Err(err) => {
-            // A statusless answer is valid — degrade to empty, never a 5xx.
-            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
-            ThreadStatus::default()
-        }
-    }
-}
-
 /// `GET /api/v1/sessions/{sid}/status`
 ///
 /// The session's live statusline — model + context-window usage — for the
@@ -769,7 +754,7 @@ pub(crate) async fn handle_session_status(
     let Some((adapter, thread)) = resolved else {
         return unknown_session(&sid);
     };
-    let status = resolved_thread_status(adapter, thread, &sid).await;
+    let status = ccteam_im::gateway::resolved_thread_status(adapter, thread, &sid).await;
     let context = status.context.map(|c| {
         json!({
             // `used_tokens` / `pct` are null when no channel reports occupancy
@@ -1478,6 +1463,7 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
                 id: opt.id.clone(),
             })
             .collect(),
+        status: None,
         sid: Some(sid.to_string()),
         // Not resolvable from a bare `(sid, prompt)` pair; the reseed just
         // won't ACL-filter into the team view's global SSE for a tenant
@@ -2070,6 +2056,9 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     if done {
         payload["done"] = serde_json::Value::Bool(true);
     }
+    if let Some(status) = &ev.status {
+        payload["status"] = serde_json::to_value(status).unwrap_or(json!(null));
+    }
     let attachments = ev
         .attachments
         .iter()
@@ -2288,6 +2277,7 @@ mod tests {
             user: user.into(),
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![],
             outcome: None,
@@ -2332,6 +2322,7 @@ mod tests {
             user: String::new(),
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![],
             outcome: None,
@@ -2370,6 +2361,7 @@ mod tests {
             user: "spawn a reviewer".into(),
             assistant: "done — s2".into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![ccteam_harness::execution::turns_mirror::AttachmentRef {
                 id: "1780000000000-chart.png".into(),
@@ -2403,6 +2395,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -3294,6 +3287,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: None,
         };

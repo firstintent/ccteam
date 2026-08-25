@@ -978,6 +978,7 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
                 user: format!("user {index}"),
                 assistant: format!("assistant {index}"),
                 usage: Value::Null,
+                status: None,
                 tool_calls: vec![],
                 attachments: vec![],
                 outcome: None,

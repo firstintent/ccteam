@@ -2918,6 +2918,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
             kind: OutboundFileKind::Photo,
         }],
         options: Vec::new(),
+        status: None,
         sid: None,
         slug: None,
     })

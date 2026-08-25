@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::journal;
+use super::turn_status::TurnStatus;
 
 /// A browser-safe reference to one project-scoped outbound attachment.
 ///
@@ -82,6 +83,9 @@ pub struct TurnRecord {
     /// stays aligned with whatever `UnifiedTokenUsage` evolves to.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub usage: Value,
+    /// Post-turn status snapshot, absent on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TurnStatus>,
     /// Brief summaries of any tool calls the assistant emitted this
     /// turn. Keeps the mirror useful for F118 recovery without bloating
     /// the file with full tool-input bodies.
@@ -197,6 +201,7 @@ mod tests {
             user: user.to_string(),
             assistant: assistant.to_string(),
             usage: Value::Null,
+            status: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
             outcome: None,

@@ -23,7 +23,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createAuthedEventSource } from "../lib/authedEventSource";
-import type { OutboundAttachmentRef } from "../lib/sessionsApi";
+import type { OutboundAttachmentRef, TurnStatus } from "../lib/sessionsApi";
 
 /** One selectable option on an approval ChoicePrompt (the SSE frame's
  *  `options[]`). `label` is the button text; `id` is the stable decision
@@ -80,6 +80,7 @@ export interface SessionEvent {
    *  branch (`ccteam-web/src/routes/sessions_api.rs`). */
   state?: string;
   reason?: string;
+  status?: TurnStatus;
 }
 
 export interface UseSessionEventsResult {
@@ -176,6 +177,9 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   if (typeof obj.id === "string") event.id = obj.id;
   if (typeof obj.sid === "string") event.sid = obj.sid;
   if (typeof obj.ts === "string") event.ts = obj.ts;
+  if (typeof obj.status === "object" && obj.status !== null) {
+    event.status = obj.status as TurnStatus;
+  }
   if (obj.done === true) event.done = true;
   // v0.8.19 — the structured per-step activity object (DOM-free, defensive:
   // a malformed `activity` is simply dropped, leaving a bare "activity" event

@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SessionStatus } from "./sessionsApi";
-import { formatContext, formatStatusLine, humanizeTokens } from "./statusLine";
+import { contextPct, formatContext, formatStatusLine, formatTurnStatus, humanizeTokens } from "./statusLine";
 
 function status(over: Partial<SessionStatus> = {}): SessionStatus {
   return {
@@ -123,5 +123,36 @@ describe("formatStatusLine", () => {
   it("treats an empty / whitespace status_line as absent (falls through)", () => {
     expect(formatStatusLine(status({ status_line: "   " }))).toBeNull();
     expect(formatStatusLine(status({ status_line: "", model: "m" }))).toBe("m");
+  });
+});
+
+describe("formatTurnStatus", () => {
+  it("renders the compact footer and warning", () => {
+    expect(
+      formatTurnStatus({
+        model: "gpt-5.3-codex",
+        context: { used_tokens: 85, window_tokens: 100, pct: 85 },
+        turn: 7,
+        cost_usd: 0.42,
+      }),
+    ).toEqual({ text: "ctx 85%⚠ · gpt-5.3-codex · turn 7 · $0.42", warn: true });
+  });
+
+  it("derives context percentage from serialized token counts", () => {
+    expect(
+      formatTurnStatus({
+        context: { used_tokens: 19, window_tokens: 100 },
+        turn: 1,
+      }),
+    ).toEqual({ text: "ctx 19% · turn 1", warn: false });
+    expect(contextPct({ used_tokens: 19, window_tokens: 100 })).toBe(19);
+  });
+
+  it("omits unknown fields and falls back to tokens", () => {
+    expect(formatTurnStatus({ turn: 2, tokens_total: 12_345 })).toEqual({
+      text: "turn 2 · 12.3k tok",
+      warn: false,
+    });
+    expect(formatTurnStatus()).toBeNull();
   });
 });

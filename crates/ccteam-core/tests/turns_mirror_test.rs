@@ -16,6 +16,7 @@ fn turn(id: &str, user: &str, assistant: &str) -> TurnRecord {
         user: user.into(),
         assistant: assistant.into(),
         usage: Value::Null,
+        status: None,
         tool_calls: vec![],
         attachments: vec![],
         outcome: None,

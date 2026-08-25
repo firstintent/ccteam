@@ -52,6 +52,8 @@ pub struct DelegationSignal {
     /// boundary these are recorded into `notified_turns` in one batch so a
     /// daemon-restart reconcile never re-delivers folded interim messages.
     pub covered_turns: Vec<String>,
+    /// Gateway-rendered child status line, carried into the parent turn.
+    pub status_line: Option<String>,
 }
 
 /// The `notified_turns` key recording that a turn's BOUNDARY notification was
@@ -163,6 +165,7 @@ pub fn build_notification_text(
         assistant_text,
         interim_notes,
         false,
+        None,
     )
 }
 
@@ -170,6 +173,7 @@ pub fn build_notification_text(
 /// ordinary public builder as a success wrapper makes its existing output a
 /// byte-for-byte compatibility contract while structured vendor failures get
 /// an unmistakable leading marker.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_notification_text_with_outcome(
     child_sid: &str,
     vendor: AgentVendor,
@@ -178,6 +182,7 @@ pub(crate) fn build_notification_text_with_outcome(
     assistant_text: &str,
     interim_notes: usize,
     vendor_error: bool,
+    status_line: Option<&str>,
 ) -> String {
     let label = title
         .filter(|t| !t.is_empty())
@@ -190,7 +195,7 @@ pub(crate) fn build_notification_text_with_outcome(
     );
     let folded = if interim_notes > 0 {
         format!(
-            " {interim_notes} interim note(s) from this turn stayed in the ledger \
+            "\n {interim_notes} interim note(s) from this turn stayed in the ledger \
              (session_collect{{sid:{child_sid}}} pages the full trail)."
         )
     } else {
@@ -201,8 +206,11 @@ pub(crate) fn build_notification_text_with_outcome(
     } else {
         ""
     };
+    let status = status_line
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default();
     format!(
-        "[ccteam] {outcome}delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{folded}\n\
+        "[ccteam] {outcome}delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{status}{folded}\n\
          --- final answer ---\n{}\n\
          (child is idle: if the task is not actually finished, follow up with session_dispatch{{sid:{child_sid}, task:…}}; run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
         vendor_key(vendor),
@@ -219,6 +227,7 @@ pub fn build_interim_notification_text(
     title: Option<&str>,
     turn_id: &str,
     assistant_text: &str,
+    status_line: Option<&str>,
 ) -> String {
     let label = title
         .filter(|t| !t.is_empty())
@@ -229,8 +238,11 @@ pub fn build_interim_notification_text(
         NOTIFICATION_ANSWER_MAX_CHARS,
         |omitted| full_answer_marker(omitted, child_sid),
     );
+    let status = status_line
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default();
     format!(
-        "[ccteam] delegated session {child_sid} ({}{label}) posted an interim note (turn {turn_id}) — still WORKING, no action needed.\n\
+        "[ccteam] delegated session {child_sid} ({}{label}) posted an interim note (turn {turn_id}) — still WORKING, no action needed.{status}\n\
          --- note ---\n{}",
         vendor_key(vendor),
         excerpt.text,
@@ -430,8 +442,18 @@ mod tests {
 
     #[test]
     fn notification_text_folds_interim_notes() {
-        let t = build_notification_text("s69", AgentVendor::Codex, None, "s69-54", "wave done", 53);
+        let t = build_notification_text_with_outcome(
+            "s69",
+            AgentVendor::Codex,
+            None,
+            "s69-54",
+            "wave done",
+            53,
+            false,
+            Some("→ cct/s69 · codex gpt-5 · ctx 19% · turn 7 · $0.42"),
+        );
         assert!(t.contains("is now IDLE, waiting for the next dispatch"));
+        assert!(t.lines().nth(1).unwrap().starts_with("→ cct/s69"));
         assert!(t.contains("53 interim note(s) from this turn stayed in the ledger"));
         assert!(t.contains("session_dispatch{sid:s69"));
     }
@@ -444,10 +466,12 @@ mod tests {
             Some("wave"),
             "s69-3",
             "reading queue",
+            Some("→ cct/s69 · codex · ctx 20% · turn 3"),
         );
         assert!(t.starts_with("[ccteam] delegated session s69 (codex \"wave\") posted an interim note (turn s69-3) — still WORKING"));
         assert!(t.contains("no action needed"));
         assert!(t.contains("reading queue"));
+        assert!(t.lines().nth(1).unwrap().starts_with("→ cct/s69"));
     }
 
     #[test]

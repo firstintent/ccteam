@@ -783,6 +783,7 @@ fn stage_web_outbound_file(
         user: String::new(),
         assistant: event.content.clone(),
         usage: serde_json::Value::Null,
+        status: None,
         tool_calls: Vec::new(),
         attachments: references,
         outcome: None,
@@ -867,6 +868,7 @@ fn build_send_file_event(
             kind,
         }],
         options: Vec::new(),
+        status: None,
         // Web staging replaces this with the server-resolved caller sid so
         // the current per-session SSE can render the reference live. IM-only
         // delivery keeps the historical `None`.
@@ -1052,6 +1054,7 @@ async fn execute_interaction_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            status: None,
             // The D6 `interaction/ask` hook prompt has no gateway session.
             sid: None,
             slug: if slug.is_empty() {
@@ -1281,6 +1284,7 @@ async fn execute_permission_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            status: None,
             // sid set so a per-session web UI stream can show the approval
             // (None would route to IM fine but be filtered out of SSE).
             sid: sid_label.clone(),
@@ -3136,6 +3140,18 @@ async fn dispatch_wait_for_completion(
     if let Some(t) = tokens_total {
         m.insert("tokens_total".to_string(), serde_json::json!(t));
     }
+    if let (Some(resolved), Some(record)) = (resolved.as_ref(), result_record.as_ref()) {
+        if let Some(line) = status_line_for(
+            &resolved.project,
+            &resolved.sid,
+            &resolved.role,
+            &resolved.vendor,
+            None,
+            record.status.as_ref(),
+        ) {
+            m.insert("status_line".to_string(), serde_json::json!(line));
+        }
+    }
     m
 }
 
@@ -3326,6 +3342,28 @@ fn classify_session_activity(
     Some(activity.status.activity.to_string())
 }
 
+fn status_line_for(
+    project: &str,
+    sid: &str,
+    role: &str,
+    vendor: &str,
+    title: Option<&str>,
+    status: Option<&ccteam_harness::TurnStatus>,
+) -> Option<String> {
+    status.map(|status| {
+        ccteam_harness::render_status_line(
+            &ccteam_harness::StatusIdentity {
+                slug: project,
+                sid,
+                vendor,
+                role,
+                title,
+            },
+            status,
+        )
+    })
+}
+
 /// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
 /// Polled MVP: resolve sid → role + project_dir under the lock, drop the
 /// guard, then read the ccteam-owned mirror. `since` is a turn_id cursor.
@@ -3388,7 +3426,7 @@ async fn run_session_collect(
     let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
     let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
     let model = meta.as_ref().and_then(|m| m.model.as_deref());
-
+    let latest_status = all.iter().rev().find_map(|turn| turn.status.clone());
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
     // `page_collected_turns`.
@@ -3414,6 +3452,23 @@ async fn run_session_collect(
         // max_chars excerpts were applied.
         "total_chars": total_chars,
     });
+    if let Some(status) = status_line_for(
+        &resolved.project,
+        &resolved.sid,
+        &resolved.role,
+        &resolved.vendor,
+        meta.as_ref().and_then(|m| m.title.as_deref()),
+        latest_status.as_ref(),
+    ) {
+        body["status_line"] = serde_json::json!(status);
+    }
+    if let Some(pct) = latest_status
+        .as_ref()
+        .and_then(|status| status.context.as_ref())
+        .and_then(|context| context.pct())
+    {
+        body["context_pct"] = serde_json::json!(pct.round() as u64);
+    }
     if let Some(c) = cost_usd {
         body["cost_usd"] = serde_json::json!(c);
     }
@@ -3537,14 +3592,33 @@ async fn run_session_list_at(
     // both are cheap in-memory reads. Projection catch-ups happen below, after
     // the guard drops (a fleet's streams are far too big to touch under the
     // gateway mutex).
-    let (views, live_turns, projection) = {
+    let (views, live_turns, projection, status_roots) = {
         let gw = gateway.lock().await;
+        let views = gw.session_views();
+        let status_roots = views
+            .iter()
+            .filter_map(|view| {
+                gw.session_resolve(&view.sid)
+                    .map(|resolved| (view.sid.clone(), resolved.project_dir))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         (
-            gw.session_views(),
+            views,
             gw.live_turns(),
             gw.progress_projection(),
+            status_roots,
         )
     };
+    let context_pcts = status_roots
+        .iter()
+        .filter_map(|(sid, dir)| {
+            ccteam_harness::execution::turns_mirror::read_all_turns(dir, sid)
+                .ok()
+                .and_then(|turns| turns.into_iter().rev().find_map(|turn| turn.status))
+                .and_then(|status| status.context.and_then(|context| context.pct()))
+                .map(|pct| (sid.clone(), pct.round() as u64))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     // v0.9.1 — honest activity per row (same resolver as the web session
     // list): one incremental snapshot per DISTINCT project, not per session.
     // Tests and daemonless callers may not have enabled the gateway projection;
@@ -3673,6 +3747,9 @@ async fn run_session_list_at(
             if let Some(t) = v.tokens_total {
                 // v0.9.5 — honest token ledger for unpriced vendors.
                 row.insert("tokens_total".into(), serde_json::json!(t));
+            }
+            if let Some(pct) = context_pcts.get(&v.sid) {
+                row.insert("context_pct".into(), serde_json::json!(pct));
             }
             if let Some(model) = v.model.as_deref().filter(|model| !model.trim().is_empty()) {
                 row.insert("model".into(), serde_json::json!(model));
@@ -5629,6 +5706,12 @@ mod session_tool_tests {
         assert_eq!(response["status"], "completed", "{response}");
         assert_eq!(response["tokens_total"], 12_345, "{response}");
         assert_eq!(response["cost_usd"], 0.12, "{response}");
+        assert!(
+            response["status_line"]
+                .as_str()
+                .is_some_and(|line| line.contains(&format!("alpha/{child}"))),
+            "inline completion carries the child's status line: {response}"
+        );
         let elapsed = response["elapsed_seconds"].as_f64().unwrap();
         assert!(
             (0.0..=6.0).contains(&elapsed),
@@ -5915,6 +5998,7 @@ mod session_tool_tests {
             user: "q".to_string(),
             assistant: format!("a-{id}"),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
             outcome: None,
@@ -6404,6 +6488,36 @@ mod session_tool_tests {
             .unwrap(),
         );
         let child_sid = spawned["sid"].as_str().unwrap();
+        ccteam_harness::execution::turns_mirror::append_turn(
+            tmp.path(),
+            child_sid,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: format!("{child_sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: "done".into(),
+                usage: serde_json::Value::Null,
+                status: Some(ccteam_harness::TurnStatus {
+                    model: Some("future-model-verbatim".into()),
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        19,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    turn: 1,
+                    cost_usd: None,
+                    tokens_total: Some(123),
+                }),
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                outcome: None,
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
 
         let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
         let child = list["sessions"]
@@ -6413,6 +6527,7 @@ mod session_tool_tests {
             .find(|row| row["sid"] == child_sid)
             .unwrap();
         assert_eq!(child["model"], json!("future-model-verbatim"));
+        assert_eq!(child["context_pct"], json!(19));
         let parent = list["sessions"]
             .as_array()
             .unwrap()
@@ -6637,6 +6752,12 @@ mod session_tool_tests {
         assert!(result.ends_with("TAIL"));
         assert!(result.contains("truncated"));
         assert!(result.contains("session_collect{sid:"));
+        assert!(
+            r["status_line"]
+                .as_str()
+                .is_some_and(|line| line.contains("turn 1")),
+            "spawn inline response carries status: {r}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -6702,6 +6823,12 @@ mod session_tool_tests {
         assert_eq!(collected["turns"][0]["outcome"], "failed");
         assert_eq!(collected["turns"][0]["error_kind"], "server_overloaded");
         assert_eq!(collected["turns"][0]["error"], CAPACITY_ERROR);
+        assert!(
+            collected["status_line"]
+                .as_str()
+                .is_some_and(|line| line.contains("turn 1")),
+            "collect envelope carries current status: {collected}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6736,6 +6863,7 @@ mod session_tool_tests {
                 user: "question".into(),
                 assistant: answer,
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: Vec::new(),
                 attachments: Vec::new(),
                 outcome: None,
@@ -6927,6 +7055,12 @@ mod session_tool_tests {
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
         assert!(result.contains("truncated"));
+        assert!(
+            r["status_line"]
+                .as_str()
+                .is_some_and(|line| line.contains("turn 1")),
+            "dispatch inline response carries status: {r}"
+        );
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();

@@ -319,7 +319,7 @@ pub(crate) async fn handle_agents_graph(
             |(sid, adapter, thread)| async move {
                 match tokio::time::timeout(
                     LIVE_STATUS_DEADLINE,
-                    super::sessions_api::resolved_thread_status(adapter, thread, &sid),
+                    ccteam_im::gateway::resolved_thread_status(adapter, thread, &sid),
                 )
                 .await
                 {
@@ -708,6 +708,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: None,
         };
@@ -743,6 +744,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: None,
         };
@@ -764,6 +766,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: Some("demo".to_string()),
         };
