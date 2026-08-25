@@ -30,12 +30,13 @@ pub fn render_status_line(id: &StatusIdentity<'_>, st: &TurnStatus) -> String {
     if !id.role.is_empty() {
         segments[0].push_str(&format!(" ({})", id.role));
     }
-    let mut vendor = id.vendor.to_string();
-    if let Some(model) = st.model.as_deref().filter(|model| !model.is_empty()) {
-        vendor.push(' ');
-        vendor.push_str(model);
+    let model = st.model.as_deref().filter(|model| !model.is_empty());
+    match (id.vendor.is_empty(), model) {
+        (false, Some(model)) => segments.push(format!("{} {model}", id.vendor)),
+        (false, None) => segments.push(id.vendor.to_string()),
+        (true, Some(model)) => segments.push(model.to_string()),
+        (true, None) => {}
     }
-    segments.push(vendor);
     if let Some(context) = st.context.as_ref() {
         if let Some(pct) = context.pct() {
             let pct = pct.round() as u64;
@@ -121,6 +122,23 @@ mod tests {
             tokens_total: None,
         };
         assert_eq!(render_status_line(&id, &st), "→ cct/s42 · codex · turn 1");
+    }
+
+    #[test]
+    fn omits_empty_vendor_and_model_segment() {
+        let id = StatusIdentity {
+            vendor: "",
+            role: "",
+            ..id()
+        };
+        let st = TurnStatus {
+            model: None,
+            context: None,
+            turn: 1,
+            cost_usd: None,
+            tokens_total: None,
+        };
+        assert_eq!(render_status_line(&id, &st), "→ cct/s42 · turn 1");
     }
 
     #[test]
