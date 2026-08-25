@@ -13,7 +13,9 @@ import { en, zh } from '../src/client/locales.js'
 const CLIENT_DIR = join(__dirname, '..', 'src', 'client')
 
 function clientFiles(extension: string): string[] {
-  return readdirSync(CLIENT_DIR)
+  // Recursive: a future subdirectory under src/client must not escape the decree.
+  return readdirSync(CLIENT_DIR, { recursive: true })
+    .map(entry => String(entry))
     .filter(name => name.endsWith(extension))
     .map(name => join(CLIENT_DIR, name))
 }
