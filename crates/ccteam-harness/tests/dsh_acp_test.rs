@@ -19,10 +19,11 @@ use ccteam_harness::execution::dsh_acp::handshake::{
     DEFAULT_DSH_MODEL, DEFAULT_DSH_PROVIDER, MIN_DSH_CLIENT_VERSION,
 };
 use ccteam_harness::execution::dsh_acp::spawn_spec::{
-    build_web_spawn_spec, dsh_bin, dsh_config_source, identity_dsh_home, identity_socket_path,
-    tenant_home_segment, DshConfigSource, DshWebSpawnOptions, DEEPSEEK_API_KEY_ENV,
-    DEEPSEEK_BASE_URL_ENV, DSH_HOME_ENV, DSH_NATIVE_WEB_PROFILE, DSH_SOCKET_ENV,
-    DSH_SYSTEM_PROMPT_ENV, DSH_TELEMETRY_DISABLED_ENV, DSH_TELEMETRY_MODE_ENV, DSH_WEB_PROFILE,
+    build_web_spawn_spec, dsh_bin, dsh_config_source, dsh_home_for_identity, identity_dsh_home,
+    identity_socket_path, tenant_home_segment, DshConfigSource, DshWebSpawnOptions,
+    DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV, DSH_HOME_ENV, DSH_NATIVE_WEB_PROFILE,
+    DSH_SOCKET_ENV, DSH_SYSTEM_PROMPT_ENV, DSH_TELEMETRY_DISABLED_ENV, DSH_TELEMETRY_MODE_ENV,
+    DSH_WEB_PROFILE,
 };
 use ccteam_harness::execution::mcp_config::BRIDGE_MCP_URL_ENV;
 use ccteam_harness::{
@@ -449,6 +450,33 @@ fn dsh_config_source_resolves_all_authorized_arms() {
     assert_eq!(dsh_config_source("user:alice", &root), DshConfigSource::Env);
 }
 
+/// A tenant who has their own credentials is served from their own home; a
+/// tenant who does not falls back to the operator's.
+#[test]
+#[serial(dsh_env)]
+fn config_source_prefers_tenant_home_with_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    let root = ccteam_home(&tmp);
+
+    let operator_home = operator_dsh_home(&tmp);
+    write_config_pair(&operator_home, b"operator", Some(b"operator-settings"));
+    let tenant_home = tenant_web_home(&tmp, "alice");
+    write_config_pair(&tenant_home, b"tenant", None);
+
+    assert_eq!(
+        dsh_config_source("user:alice", &root),
+        DshConfigSource::TenantHome(tenant_home)
+    );
+    assert_eq!(
+        dsh_config_source("user:bob", &root),
+        DshConfigSource::OperatorHome(operator_home)
+    );
+}
+
 /// The identity home resolver and the socket path are what make the adapter and
 /// the runtime manager meet in the same place.
 #[test]
@@ -479,6 +507,44 @@ fn identity_home_and_socket_agree_with_the_managed_tenant_layout() {
         identity_socket_path("telegram:123", &root),
         identity_socket_path("user:web-api", &root),
         "operator-shaped owners share one runtime, so one socket"
+    );
+}
+
+/// One person, one DSH home — and the same one no matter which key shape
+/// the caller holds (`owner_tag` on the adapter path, `operator` + `id` on
+/// the runtime-manager path). A drift here would put the adapter's socket
+/// in one home and the runtime's process in another.
+#[test]
+#[serial(dsh_env)]
+fn identity_home_maps_tenants_managed_and_everyone_else_to_the_operator_home() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let root = ccteam_home(&tmp);
+
+    let tenant = identity_dsh_home("user:alice", &root).unwrap();
+    assert_eq!(tenant, root.join("runtime/dsh/web/alice"));
+    assert_eq!(
+        identity_dsh_home("user:alice", &root).unwrap(),
+        tenant,
+        "same owner must always resolve to the same home"
+    );
+    assert_eq!(
+        dsh_home_for_identity(false, "alice", &root).unwrap(),
+        tenant,
+        "the runtime manager's key shape must agree with the owner tag"
+    );
+
+    let operator = operator_dsh_home(&tmp);
+    for tag in ["user:web-api", "user:", "telegram:123", ""] {
+        assert_eq!(
+            identity_dsh_home(tag, &root).unwrap(),
+            operator,
+            "`{tag}` is the operator and owns ~/.dsh"
+        );
+    }
+    assert_eq!(
+        dsh_home_for_identity(true, "admin", &root).unwrap(),
+        operator
     );
 }
 
@@ -790,6 +856,71 @@ fn web_profile_refreshes_seeded_files_that_tenant_did_not_touch() {
     assert_eq!(
         marker["settings_sha256"].as_str(),
         Some(file_sha256(b"seed-settings-v2").as_str())
+    );
+}
+
+/// The seed-then-refresh ladder observed at BOTH stops: the marker must be
+/// right after the first seed (not just after a later refresh), because that
+/// first marker is what the refresh arm compares against to decide the tenant
+/// has not touched the file.
+///
+/// Reaches `seed_or_refresh_tenant_web_config_home` (private) through the same
+/// public door as its neighbours: `build_web_spawn_spec` with
+/// `materialize_profile: true` calls it with exactly these three arguments.
+#[test]
+#[serial(dsh_env)]
+fn tenant_web_seed_refreshes_unmodified_files_from_operator_home() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    let operator_home = operator_dsh_home(&tmp);
+    let tenant_home = tenant_web_home(&tmp, "alice");
+    let seed_or_refresh = || {
+        build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: "user:alice",
+            ccteam_home: ccteam_home(&tmp),
+            dsh_home: tenant_home.clone(),
+            profile: DSH_WEB_PROFILE,
+            materialize_profile: true,
+            enrollment: Some("ccteam-enroll:abc:secret"),
+            daemon_url: Some("http://127.0.0.1:7331"),
+            transport_socket: None,
+            rest_token: None,
+        })
+        .expect("web spawn spec");
+    };
+    write_config_pair(&operator_home, b"creds-v1", Some(b"settings-v1"));
+
+    seed_or_refresh();
+    assert_eq!(
+        std::fs::read(tenant_home.join(".credentials.yaml")).unwrap(),
+        b"creds-v1"
+    );
+    assert_eq!(
+        std::fs::read(tenant_home.join("settings.yaml")).unwrap(),
+        b"settings-v1"
+    );
+    let marker = read_seed_marker(&tenant_home);
+    assert_eq!(
+        marker["credentials_sha256"].as_str(),
+        Some(file_sha256(b"creds-v1").as_str())
+    );
+    assert_eq!(
+        marker["settings_sha256"].as_str(),
+        Some(file_sha256(b"settings-v1").as_str())
+    );
+
+    write_config_pair(&operator_home, b"creds-v2", Some(b"settings-v2"));
+    seed_or_refresh();
+    assert_eq!(
+        std::fs::read(tenant_home.join(".credentials.yaml")).unwrap(),
+        b"creds-v2"
+    );
+    assert_eq!(
+        std::fs::read(tenant_home.join("settings.yaml")).unwrap(),
+        b"settings-v2"
     );
 }
 

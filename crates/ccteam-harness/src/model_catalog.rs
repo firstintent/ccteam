@@ -176,7 +176,6 @@ fn pinned_efforts(vendor: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     fn model(id: &str) -> CatalogModel {
         CatalogModel {
@@ -275,37 +274,5 @@ mod tests {
             load_model_catalog_in(root.path()).0["kimi"].models[0].id,
             "k2"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn env_resolution_prefers_ccteam_home_and_falls_back_to_home() {
-        let old_home = std::env::var_os("HOME");
-        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
-        let home = tempfile::tempdir().unwrap();
-        let override_root = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", home.path());
-        std::env::set_var("CCTEAM_HOME", override_root.path());
-
-        record_vendor_models_best_effort("grok", "ACP availableModels", vec![model("grok-4")]);
-        assert!(model_catalog_path_in(override_root.path()).is_file());
-        assert!(!model_catalog_path_in(&home.path().join(".ccteam")).exists());
-
-        std::env::remove_var("CCTEAM_HOME");
-        record_vendor_models_best_effort(
-            "opencode",
-            "ACP configOptions",
-            vec![model("open-model")],
-        );
-        assert!(model_catalog_path_in(&home.path().join(".ccteam")).is_file());
-
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match old_ccteam_home {
-            Some(value) => std::env::set_var("CCTEAM_HOME", value),
-            None => std::env::remove_var("CCTEAM_HOME"),
-        }
     }
 }

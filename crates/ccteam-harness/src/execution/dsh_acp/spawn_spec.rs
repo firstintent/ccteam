@@ -654,88 +654,11 @@ fn reject_demo_bin(bin: &str) -> Result<(), HarnessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    use serial_test::serial;
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn capture(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .copied()
-                    .map(|key| (key, std::env::var_os(key)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.iter().rev() {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
-
-    fn write_config_pair(home: &Path, credentials: &[u8], settings: Option<&[u8]>) {
-        std::fs::create_dir_all(home).unwrap();
-        std::fs::write(home.join(CREDENTIALS_FILE), credentials).unwrap();
-        if let Some(settings) = settings {
-            std::fs::write(home.join(SETTINGS_FILE), settings).unwrap();
-        }
-    }
-
-    /// One person, one DSH home — and the same one no matter which key shape
-    /// the caller holds (`owner_tag` on the adapter path, `operator` + `id` on
-    /// the runtime-manager path). A drift here would put the adapter's socket
-    /// in one home and the runtime's process in another.
-    #[test]
-    #[serial(dsh_config_env)]
-    fn identity_home_maps_tenants_managed_and_everyone_else_to_the_operator_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::capture(&["HOME"]);
-        let home = tmp.path().join("home");
-        let ccteam_home = tmp.path().join("ccteam-home");
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-
-        let tenant = identity_dsh_home("user:alice", &ccteam_home).unwrap();
-        assert_eq!(tenant, ccteam_home.join("runtime/dsh/web/alice"));
-        assert_eq!(
-            identity_dsh_home("user:alice", &ccteam_home).unwrap(),
-            tenant,
-            "same owner must always resolve to the same home"
-        );
-        assert_eq!(
-            dsh_home_for_identity(false, "alice", &ccteam_home).unwrap(),
-            tenant,
-            "the runtime manager's key shape must agree with the owner tag"
-        );
-
-        let operator = home.join(USER_DSH_DIR);
-        for tag in ["user:web-api", "user:", "telegram:123", ""] {
-            assert_eq!(
-                identity_dsh_home(tag, &ccteam_home).unwrap(),
-                operator,
-                "`{tag}` is the operator and owns ~/.dsh"
-            );
-        }
-        assert_eq!(
-            dsh_home_for_identity(true, "admin", &ccteam_home).unwrap(),
-            operator
-        );
-    }
+    // Every env-mutating DSH spawn-spec test lives in
+    // `tests/dsh_acp_test.rs` (AGENTS.md §六): the lib target is one process
+    // at full parallelism, so a `HOME`/`DEEPSEEK_API_KEY` write here is
+    // visible to every other lib test. What stays below is pure or injected.
 
     #[test]
     fn identity_socket_path_is_one_short_path_per_identity() {
@@ -854,80 +777,5 @@ mod tests {
         make_executable(&newer);
         let found = find_cached_dsh_bin_under(&home).unwrap();
         assert_eq!(found, newer);
-    }
-
-    #[test]
-    #[serial(dsh_config_env)]
-    fn config_source_prefers_tenant_home_with_credentials() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::capture(&["HOME", DEEPSEEK_API_KEY_ENV]);
-        let home = tmp.path().join("home");
-        let ccteam_home = tmp.path().join("ccteam-home");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::remove_var(DEEPSEEK_API_KEY_ENV);
-        }
-
-        let operator_home = home.join(USER_DSH_DIR);
-        write_config_pair(&operator_home, b"operator", Some(b"operator-settings"));
-        let tenant_home = ccteam_home
-            .join("runtime")
-            .join("dsh")
-            .join("web")
-            .join(tenant_home_segment("alice"));
-        write_config_pair(&tenant_home, b"tenant", None);
-
-        assert_eq!(
-            dsh_config_source("user:alice", &ccteam_home),
-            DshConfigSource::TenantHome(tenant_home)
-        );
-        assert_eq!(
-            dsh_config_source("user:bob", &ccteam_home),
-            DshConfigSource::OperatorHome(operator_home)
-        );
-    }
-
-    #[test]
-    #[serial(dsh_config_env)]
-    fn tenant_web_seed_refreshes_unmodified_files_from_operator_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::capture(&["HOME", DEEPSEEK_API_KEY_ENV]);
-        let home = tmp.path().join("home");
-        let ccteam_home = tmp.path().join("ccteam-home");
-        let operator_home = home.join(USER_DSH_DIR);
-        let tenant_home = ccteam_home
-            .join("runtime")
-            .join("dsh")
-            .join("web")
-            .join(tenant_home_segment("alice"));
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::remove_var(DEEPSEEK_API_KEY_ENV);
-        }
-        write_config_pair(&operator_home, b"creds-v1", Some(b"settings-v1"));
-
-        seed_or_refresh_tenant_web_config_home("user:alice", &ccteam_home, &tenant_home).unwrap();
-        assert_eq!(
-            std::fs::read(tenant_home.join(CREDENTIALS_FILE)).unwrap(),
-            b"creds-v1"
-        );
-        assert_eq!(
-            std::fs::read(tenant_home.join(SETTINGS_FILE)).unwrap(),
-            b"settings-v1"
-        );
-        let marker = read_seed_marker(&tenant_home.join(SEED_MARKER_FILE)).unwrap();
-        assert_eq!(marker.credentials_sha256, sha256_hex(b"creds-v1"));
-        assert_eq!(marker.settings_sha256, Some(sha256_hex(b"settings-v1")));
-
-        write_config_pair(&operator_home, b"creds-v2", Some(b"settings-v2"));
-        seed_or_refresh_tenant_web_config_home("user:alice", &ccteam_home, &tenant_home).unwrap();
-        assert_eq!(
-            std::fs::read(tenant_home.join(CREDENTIALS_FILE)).unwrap(),
-            b"creds-v2"
-        );
-        assert_eq!(
-            std::fs::read(tenant_home.join(SETTINGS_FILE)).unwrap(),
-            b"settings-v2"
-        );
     }
 }
