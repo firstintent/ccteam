@@ -90,24 +90,65 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
     let bundles = manifest["dsh"]["profile"]["bundles"].as_array().unwrap();
     let names: Vec<&str> = bundles.iter().filter_map(|v| v.as_str()).collect();
     assert!(names.contains(&"@ccteam/dsh-client"), "own bundle added");
+    assert!(
+        names.contains(&"@ccteam/dsh-team"),
+        "the team panel is registered by the same click: {names:?}"
+    );
     assert!(names.contains(&"@user/my-plugin"), "user bundle preserved");
 
     let patch = std::fs::read_to_string(profile.join("cordis.patch.yml")).unwrap();
     assert!(patch.contains("my-plugin"), "user patch row preserved");
-    assert!(patch.contains("ccteam-client"), "own row present");
+    let rows: Vec<serde_yaml::Value> = serde_yaml::from_str(&patch).unwrap();
+    let row_of = |id: &str| -> serde_yaml::Mapping {
+        let row = rows
+            .iter()
+            .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(id))
+            .unwrap_or_else(|| panic!("no {id} row in {patch}"));
+        assert!(
+            row.get("insert").is_none(),
+            "ccteam rows OVERRIDE the bundle-inserted entry; a duplicate id \
+             aborts the whole Cordis boot: {patch}"
+        );
+        row.get("config")
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("flat plugin config")
+            .clone()
+    };
+
+    let client_row = row_of("ccteam-client");
     assert!(
-        patch.contains("transportSocket"),
+        client_row
+            .get("transportSocket")
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|socket| !socket.is_empty()),
         "row carries the socket path: {patch}"
     );
-    assert!(
-        profile
-            .join("node_modules")
-            .join("@ccteam")
-            .join("dsh-client")
-            .join("package.json")
-            .exists(),
-        "plugin package materialized into the profile"
+    let team = row_of("ccteam-team");
+    assert_eq!(
+        team["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+        "the panel is pointed at this daemon"
     );
+    assert!(
+        team.get("restToken").is_none(),
+        "ccteam writes no credential into the operator's own home: {patch}"
+    );
+    assert!(
+        !patch.contains(ADMIN_HEX),
+        "the admin token must never reach a profile ccteam does not own: {patch}"
+    );
+
+    for package in ["dsh-client", "dsh-team"] {
+        assert!(
+            profile
+                .join("node_modules")
+                .join("@ccteam")
+                .join(package)
+                .join("package.json")
+                .exists(),
+            "{package} materialized into the profile"
+        );
+    }
 
     // Idempotent: a second click neither errors nor duplicates the row.
     let resp = client
@@ -118,9 +159,22 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let patch_again = std::fs::read_to_string(profile.join("cordis.patch.yml")).unwrap();
+    let rows_again: Vec<serde_yaml::Value> = serde_yaml::from_str(&patch_again).unwrap();
+    for id in ["ccteam-client", "ccteam-team"] {
+        assert_eq!(
+            rows_again
+                .iter()
+                .filter(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(id))
+                .count(),
+            1,
+            "re-registration must not duplicate {id}: {patch_again}"
+        );
+    }
+    let manifest_again: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(profile.join("package.json")).unwrap())
+            .unwrap();
     assert_eq!(
-        patch_again.matches("ccteam-client").count(),
-        patch.matches("ccteam-client").count(),
-        "re-registration must not duplicate ccteam's row"
+        manifest_again["dsh"]["profile"]["bundles"], manifest["dsh"]["profile"]["bundles"],
+        "re-registration must not grow the bundle list"
     );
 }

@@ -11,7 +11,7 @@
 //! local vendor web servers keyed by the authenticated web identity.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU16, Ordering},
     Arc,
@@ -28,8 +28,12 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 use ccteam_core::enroll::ensure_user_credential_in;
+use ccteam_core::identity::{is_tenant_owned, WEB_OWNER_PREFIX};
+use ccteam_core::tenants::TenantRegistry;
+use ccteam_core::CcteamPaths;
 use ccteam_harness::{
-    DshEnrollmentResolver, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState, DshRuntimeStatus,
+    DshEnrollmentResolver, DshRestTokenResolver, DshRuntimeIdentity, DshRuntimeManager,
+    DshRuntimeState, DshRuntimeStatus,
 };
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde::Serialize;
@@ -93,7 +97,11 @@ pub struct DshStatusResponse {
 /// daemon's own port, which is why `ccteam start` can build the manager in its
 /// composition root long before the web listener binds.
 pub fn new_runtime_manager(ccteam_home: PathBuf) -> Arc<DshRuntimeManager> {
-    Arc::new(DshRuntimeManager::new(ccteam_home, enrollment_resolver()))
+    Arc::new(DshRuntimeManager::new(
+        ccteam_home,
+        enrollment_resolver(),
+        rest_token_resolver(),
+    ))
 }
 
 fn enrollment_resolver() -> DshEnrollmentResolver {
@@ -102,6 +110,56 @@ fn enrollment_resolver() -> DshEnrollmentResolver {
             .map(|credential| credential.bearer())
             .with_context(|| format!("ensure enrollment credential for {owner}"))
     })
+}
+
+fn rest_token_resolver() -> DshRestTokenResolver {
+    Arc::new(|root, owner| {
+        rest_token_for_owner(root, owner)
+            .with_context(|| format!("resolve ccteam REST token for {owner}"))
+    })
+}
+
+/// The identity's OWN ccteam REST bearer, in the wire form the API accepts.
+///
+/// Reuse before mint, through the existing stores — no new token kind and no
+/// new ACL surface: a tenant's `web_token` is the very token they signed in
+/// with, and the operator's is the admin token file `ccteam start` already
+/// manages. Minting only happens where the store itself would mint: an unknown
+/// tenant is an error (this must never create a user), and the admin file is
+/// get-or-mint exactly as elsewhere.
+///
+/// The returned value is a credential: it is written only into that identity's
+/// own DSH profile and never logged or reported.
+fn rest_token_for_owner(root: &Path, owner: &str) -> Result<String> {
+    let paths = CcteamPaths {
+        root: root.to_path_buf(),
+        // Unused by the `secrets/` accessors below and never escapes here.
+        projects_root: root.join("projects"),
+    };
+    let hex = match owner
+        .strip_prefix(WEB_OWNER_PREFIX)
+        .filter(|_| is_tenant_owned(Some(owner)))
+    {
+        Some(id) => {
+            let dir = paths.users_dir();
+            let mut registry = TenantRegistry::load(&dir);
+            let existing = registry
+                .by_id(id)
+                .map(|tenant| tenant.web_token.clone())
+                .ok_or_else(|| anyhow!("no ccteam user {id}"))?;
+            if existing.trim().is_empty() {
+                let minted = registry
+                    .rotate_token(id)
+                    .ok_or_else(|| anyhow!("no ccteam user {id}"))?;
+                registry.save_one(&dir, id)?;
+                minted
+            } else {
+                existing
+            }
+        }
+        None => crate::token::generate_or_load_token(&paths.web_token_path())?,
+    };
+    Ok(format!("{}{hex}", crate::auth::TOKEN_PREFIX))
 }
 
 /// The web face of the DSH runtime: identity mapping, the companion port, and
@@ -500,6 +558,61 @@ async fn proxy_websocket(socket: axum::extract::ws::WebSocket, port: u16, uri: a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel's token is REUSED, never a second credential: what lands in a
+    /// tenant's DSH profile must be the very token they sign in with, in the
+    /// wire form the REST API accepts.
+    ///
+    /// Root-injected, so no env pinning is needed — nothing here can reach the
+    /// real `~/.ccteam`.
+    #[test]
+    fn tenant_rest_token_is_the_one_the_tenant_already_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let users = root.join("secrets").join("users");
+        let mut registry = TenantRegistry::default();
+        let tenant = registry.add("alice");
+        registry.save(&users).unwrap();
+
+        let resolved = rest_token_for_owner(root, &format!("user:{}", tenant.id)).unwrap();
+        assert_eq!(resolved, format!("ccteam:{}", tenant.web_token));
+        assert_eq!(
+            rest_token_for_owner(root, &format!("user:{}", tenant.id)).unwrap(),
+            resolved,
+            "resolving twice must not rotate the tenant's login token"
+        );
+    }
+
+    /// An identity with no user row is an error, never a silently minted new
+    /// user: this resolver runs on a spawn path, not an admin one.
+    #[test]
+    fn unknown_tenant_is_refused_rather_than_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = rest_token_for_owner(tmp.path(), "user:u00000000").unwrap_err();
+        assert!(err.to_string().contains("u00000000"), "got {err}");
+        assert!(
+            !tmp.path().join("secrets").join("users").exists(),
+            "a failed lookup must not create a user store"
+        );
+    }
+
+    /// Operator-ish tags all collapse to the admin token file, get-or-mint —
+    /// the same value `ccteam start` manages, not a new one.
+    #[test]
+    fn operator_rest_token_is_the_admin_web_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let first = rest_token_for_owner(root, "user:web-api").unwrap();
+        let on_disk =
+            std::fs::read_to_string(root.join("secrets").join("web-token")).expect("token file");
+        assert_eq!(first, format!("ccteam:{}", on_disk.trim()));
+        assert_eq!(
+            rest_token_for_owner(root, "telegram:42").unwrap(),
+            first,
+            "every operator-ish tag resolves to the one admin token"
+        );
+    }
 
     #[test]
     fn strips_sensitive_and_hop_by_hop_headers() {

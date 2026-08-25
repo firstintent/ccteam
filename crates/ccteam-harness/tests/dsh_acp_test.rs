@@ -101,6 +101,10 @@ struct FakeRuntime {
 
 static SOCKET_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// A tenant's own ccteam REST bearer, in the wire form the API accepts. Only
+/// ever reaches that tenant's own profile.
+const TENANT_REST_TOKEN: &str = "ccteam:0123456789abcdef0123456789abcdef";
+
 #[derive(Default)]
 struct FakeRuntimeBuilder {
     env: Vec<(&'static str, String)>,
@@ -231,6 +235,7 @@ fn adapter() -> DshAcpAdapter {
     DshAcpAdapter::new(Arc::new(DshRuntimeManager::new(
         PathBuf::from("/nonexistent/ccteam-home"),
         Arc::new(|_root, _owner| anyhow::bail!("no enrollment resolver in tests")),
+        Arc::new(|_root, _owner| anyhow::bail!("no REST token resolver in tests")),
     )))
 }
 
@@ -353,15 +358,24 @@ fn find_method<'a>(records: &'a [Value], method: &str) -> &'a Value {
 }
 
 fn patch_config(profile_dir: &Path) -> serde_yaml::Mapping {
+    patch_config_for(profile_dir, "ccteam-client")
+}
+
+fn patch_config_for(profile_dir: &Path, row_id: &str) -> serde_yaml::Mapping {
     let raw = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap();
     let patch: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
-    patch
+    let row = patch
         .as_sequence()
         .expect("patch is a sequence")
         .iter()
-        .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some("ccteam-client"))
-        .unwrap_or_else(|| panic!("no ccteam-client row in {raw}"))
-        .get("config")
+        .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(row_id))
+        .unwrap_or_else(|| panic!("no {row_id} row in {raw}"));
+    assert!(
+        row.get("insert").is_none(),
+        "ccteam rows OVERRIDE the bundle-inserted entry; a duplicate id aborts \
+         the Cordis boot: {raw}"
+    );
+    row.get("config")
         .and_then(serde_yaml::Value::as_mapping)
         .expect("flat plugin config")
         .clone()
@@ -488,6 +502,7 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: Some(&socket),
+        rest_token: Some(TENANT_REST_TOKEN),
     })
     .expect("web spawn spec");
 
@@ -536,6 +551,27 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
         serde_yaml::Value::String("ccteam-enroll:abc:secret".into())
     );
 
+    // Zero user steps: the team panel is installed AND credentialed in the
+    // tenant's own home by the same start.
+    let team = patch_config_for(&profile_dir, "ccteam-team");
+    assert_eq!(
+        team["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into())
+    );
+    assert_eq!(
+        team["restToken"],
+        serde_yaml::Value::String(TENANT_REST_TOKEN.into())
+    );
+    assert!(
+        profile_dir
+            .join("node_modules")
+            .join("@ccteam")
+            .join("dsh-team")
+            .join("package.json")
+            .is_file(),
+        "the panel package is materialized into the tenant profile"
+    );
+
     let socket_dir = socket.parent().unwrap();
     assert!(
         socket_dir.is_dir(),
@@ -581,6 +617,7 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
         enrollment: None,
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: Some(&socket),
+        rest_token: None,
     })
     .expect("operator web spawn spec");
 
@@ -589,8 +626,12 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     assert_eq!(package["name"], "dsh-web-profile");
     assert_eq!(
         package["dsh"]["profile"]["bundles"],
-        serde_json::json!(["@deepseek-ai/dsh-web-app", "@ccteam/dsh-client"]),
-        "only ccteam's own bundle is appended"
+        serde_json::json!([
+            "@deepseek-ai/dsh-web-app",
+            "@ccteam/dsh-client",
+            "@ccteam/dsh-team"
+        ]),
+        "only ccteam's own bundles are appended"
     );
     let raw_patch = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap();
     assert!(
@@ -605,6 +646,18 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     assert!(
         config.get("enrollment").is_none(),
         "ccteam never injects enrollment into the operator's own home: {config:?}"
+    );
+
+    // The panel is registered and pointed at this daemon, but its credential
+    // is the operator's to paste — same line as `enrollment` above.
+    let team = patch_config_for(&profile_dir, "ccteam-team");
+    assert_eq!(
+        team["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into())
+    );
+    assert!(
+        team.get("restToken").is_none(),
+        "no credential in a home ccteam does not own: {team:?}"
     );
 }
 
@@ -632,6 +685,7 @@ fn web_profile_factory_seeds_operator_credentials_and_marker_for_tenant_home() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: None,
+        rest_token: None,
     })
     .expect("web spawn spec");
 
@@ -674,6 +728,7 @@ fn web_profile_factory_empty_without_source_writes_no_marker() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: None,
+        rest_token: None,
     })
     .expect("web spawn spec");
 
@@ -706,6 +761,7 @@ fn web_profile_refreshes_seeded_files_that_tenant_did_not_touch() {
             enrollment: Some("ccteam-enroll:abc:secret"),
             daemon_url: Some("http://127.0.0.1:7331"),
             transport_socket: None,
+            rest_token: None,
         })
         .expect("web spawn spec");
     };
@@ -761,6 +817,7 @@ fn web_profile_keeps_tenant_modified_seeded_files() {
             enrollment: Some("ccteam-enroll:abc:secret"),
             daemon_url: Some("http://127.0.0.1:7331"),
             transport_socket: None,
+            rest_token: None,
         })
         .expect("web spawn spec");
     };
@@ -814,6 +871,7 @@ fn web_profile_keeps_preexisting_files_without_marker() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: None,
+        rest_token: None,
     })
     .expect("web spawn spec");
 

@@ -78,7 +78,8 @@ pub use execution::dsh_acp::{
 };
 pub use execution::dsh_runtime::{
     is_ccteam_managed_dsh_orphan, sweep_legacy_dsh_orphans, DshEnrollmentResolver,
-    DshRuntimeConfig, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState, DshRuntimeStatus,
+    DshRestTokenResolver, DshRuntimeConfig, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState,
+    DshRuntimeStatus,
 };
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};

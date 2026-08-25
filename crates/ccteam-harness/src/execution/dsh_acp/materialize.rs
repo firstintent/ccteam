@@ -1,11 +1,15 @@
-//! Put `@ccteam/dsh-client` into a DSH profile — the ccteam-owned tenant
+//! Put ccteam's DSH plugins into a DSH profile — the ccteam-owned tenant
 //! profile, or (merge-only) the operator's own `~/.dsh/profiles/web`.
 //!
-//! The embedded `assets/dsh-client.tgz` is a manual asset for now. When the
-//! plugin changes, run `npm run build && npm pack` in `plugins/dsh-client/`,
-//! replace this file with the resulting tarball, and commit it with the Rust
-//! change. This mirrors the checked-in Pi bridge asset: Rust builds must not
-//! require npm or node.
+//! Two plugins ship embedded, and every profile ccteam writes gets BOTH (see
+//! [`CCTEAM_PLUGINS`]): `@ccteam/dsh-client` (tool + ACP transport surface) and
+//! `@ccteam/dsh-team` (the ccteam team panel in the DSH web console). Adding a
+//! third means one row in that table, not a new code path.
+//!
+//! The embedded `assets/*.tgz` are checked-in assets: run
+//! `plugins/pack-assets.sh` to rebuild them from `plugins/<name>/` and commit
+//! the result with the Rust change. This mirrors the checked-in Pi bridge
+//! asset: Rust builds must not require npm or node.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -13,98 +17,158 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
+use serde_yaml::Mapping;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::HarnessError;
 
 const CLIENT_TGZ: &[u8] = include_bytes!("assets/dsh-client.tgz");
+const TEAM_TGZ: &[u8] = include_bytes!("assets/dsh-team.tgz");
 pub const WEB_PROFILE: &str = "ccteam-web";
 const DSH_BASE_BUNDLE: &str = "@deepseek-ai/dsh-base";
 const DSH_WEB_APP_BUNDLE: &str = "@deepseek-ai/dsh-web-app";
 const CCTEAM_CLIENT_BUNDLE: &str = "@ccteam/dsh-client";
+const CCTEAM_TEAM_BUNDLE: &str = "@ccteam/dsh-team";
 const EMPTY_PATCH_YAML: &str = "[]\n";
-const CLIENT_SCOPE: &str = "@ccteam";
-const CLIENT_PACKAGE: &str = "dsh-client";
+const CCTEAM_SCOPE: &str = "@ccteam";
 const CCTEAM_CLIENT_ROW_ID: &str = "ccteam-client";
+const CCTEAM_TEAM_ROW_ID: &str = "ccteam-team";
 const PATCH_FILE: &str = "cordis.patch.yml";
+
+/// One embedded ccteam plugin package.
+#[derive(Debug, Clone, Copy)]
+struct PluginAsset {
+    /// npm name, as it appears in the profile's `dsh.profile.bundles`.
+    bundle: &'static str,
+    /// Directory under the profile's `node_modules/@ccteam/`.
+    package: &'static str,
+    /// Cordis loader entry id — the one its OWN `cordis.patch.yml` inserts, so
+    /// ccteam only ever overrides it (see [`merged_profile_patch_yaml`]).
+    row_id: &'static str,
+    /// Extraction-cache namespace under `<ccteam_home>/runtime/dsh/`. Separate
+    /// per plugin so one plugin's sha never invalidates another's cache.
+    cache_ns: &'static str,
+    tgz: &'static [u8],
+}
+
+const CLIENT_PLUGIN: PluginAsset = PluginAsset {
+    bundle: CCTEAM_CLIENT_BUNDLE,
+    package: "dsh-client",
+    row_id: CCTEAM_CLIENT_ROW_ID,
+    cache_ns: "client",
+    tgz: CLIENT_TGZ,
+};
+
+const TEAM_PLUGIN: PluginAsset = PluginAsset {
+    bundle: CCTEAM_TEAM_BUNDLE,
+    package: "dsh-team",
+    row_id: CCTEAM_TEAM_ROW_ID,
+    cache_ns: "team",
+    tgz: TEAM_TGZ,
+};
+
+/// Every ccteam plugin, installed into every profile ccteam writes.
+///
+/// Materialization is per-plugin but the SET is not a per-call-site choice: a
+/// tenant home and the operator's merge-only registration install the same
+/// plugins, so a new plugin reaches both by adding a row here.
+const CCTEAM_PLUGINS: [PluginAsset; 2] = [CLIENT_PLUGIN, TEAM_PLUGIN];
 
 #[derive(Debug, Clone)]
 pub struct MaterializedDshProfile {
-    pub cache_dir: PathBuf,
+    /// Extraction cache of each plugin in [`CCTEAM_PLUGINS`], same order.
+    pub cache_dirs: Vec<PathBuf>,
     pub profile_dir: PathBuf,
+    /// `true` when at least one plugin cache had to be re-extracted.
     pub cache_rebuilt: bool,
 }
 
-/// Register `@ccteam/dsh-client` into a profile ccteam does NOT own — the
+/// Register ccteam's plugins into a profile ccteam does NOT own — the
 /// operator's real `~/.dsh/profiles/<name>` (gate ①).
 ///
 /// Strictly additive: the profile's `package.json` keeps every key it already
-/// has (only our bundle is appended to `dsh.profile.bundles`), and the
-/// profile's `cordis.patch.yml` keeps every row it already has (only the
-/// `ccteam-client` row is written). Unparseable JSON/YAML is an error, never a
-/// clobber.
-pub fn register_dsh_client_into_profile(
+/// has (only our bundles are appended to `dsh.profile.bundles`), and the
+/// profile's `cordis.patch.yml` keeps every row it already has (only ccteam's
+/// own rows are written). Unparseable JSON/YAML is an error, never a clobber.
+pub fn register_ccteam_plugins_into_profile(
     ccteam_root: &Path,
     dsh_home: &Path,
     profile: &str,
     config: DshClientConfig<'_>,
+    team: DshTeamConfig<'_>,
 ) -> Result<MaterializedDshProfile, HarnessError> {
     materialize_profile_in(
         ccteam_root,
         dsh_home,
         ProfileSpec {
             name: profile,
-            required_bundles: &[CCTEAM_CLIENT_BUNDLE],
+            vendor_bundles: &[],
             config,
+            team,
             manifest: ManifestPolicy::MergeOnly,
         },
     )
 }
 
-/// Read-only, best-effort: is ccteam's client already registered in this
-/// profile? True only when BOTH halves gate ① writes are present — our bundle
-/// in `dsh.profile.bundles` AND a `ccteam-client` override row carrying a
-/// `transportSocket` (the bundle alone installs files but leaves the plugin
-/// with no ACP listener, which is not a working registration). Any missing or
-/// unparseable file reads as `false`; this never writes.
-pub fn dsh_client_registered_in_profile(dsh_home: &Path, profile: &str) -> bool {
+/// Read-only, best-effort: are ccteam's plugins already registered in this
+/// profile? True only when BOTH halves of gate ①'s writes are present for
+/// EVERY plugin — the bundle in `dsh.profile.bundles` AND a configured
+/// override row (a bundle alone installs files but leaves the plugin inert,
+/// which is not a working registration). Any missing or unparseable file reads
+/// as `false`; this never writes.
+///
+/// "Configured" is per plugin: the client needs its `transportSocket` (no
+/// socket, no ACP listener) and the team panel needs its `daemonUrl` (no URL,
+/// nothing to talk to). The panel's `restToken` is deliberately NOT required —
+/// ccteam never writes a credential into a profile it does not own.
+pub fn ccteam_plugins_registered_in_profile(dsh_home: &Path, profile: &str) -> bool {
     let profile_dir = dsh_home.join("profiles").join(profile);
-    let bundled = fs::read_to_string(profile_dir.join("package.json"))
+    let bundles: Vec<String> = fs::read_to_string(profile_dir.join("package.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|manifest| {
-            manifest
-                .get("dsh")?
-                .get("profile")?
-                .get("bundles")?
-                .as_array()
-                .map(|bundles| {
-                    bundles
-                        .iter()
-                        .any(|b| b.as_str() == Some(CCTEAM_CLIENT_BUNDLE))
-                })
+            Some(
+                manifest
+                    .get("dsh")?
+                    .get("profile")?
+                    .get("bundles")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b.as_str().map(str::to_string))
+                    .collect(),
+            )
         })
-        .unwrap_or(false);
-    if !bundled {
+        .unwrap_or_default();
+    if !CCTEAM_PLUGINS
+        .iter()
+        .all(|plugin| bundles.iter().any(|b| b == plugin.bundle))
+    {
         return false;
     }
-    fs::read_to_string(profile_dir.join(PATCH_FILE))
+    let Some(rows) = fs::read_to_string(profile_dir.join(PATCH_FILE))
         .ok()
         .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
-        .and_then(|patch| {
-            let rows = patch.as_sequence()?.clone();
-            Some(rows.iter().any(|row| {
-                row.get("id").and_then(serde_yaml::Value::as_str) == Some(CCTEAM_CLIENT_ROW_ID)
-                    && row.get("insert").is_none()
-                    && row
-                        .get("config")
-                        .and_then(|c| c.get("transportSocket"))
-                        .and_then(serde_yaml::Value::as_str)
-                        .is_some_and(|socket| !socket.trim().is_empty())
-            }))
+        .and_then(|patch| patch.as_sequence().cloned())
+    else {
+        return false;
+    };
+    CCTEAM_PLUGINS.iter().all(|plugin| {
+        let required_key = if plugin.row_id == CCTEAM_TEAM_ROW_ID {
+            "daemonUrl"
+        } else {
+            "transportSocket"
+        };
+        rows.iter().any(|row| {
+            row.get("id").and_then(serde_yaml::Value::as_str) == Some(plugin.row_id)
+                && row.get("insert").is_none()
+                && row
+                    .get("config")
+                    .and_then(|c| c.get(required_key))
+                    .and_then(serde_yaml::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
         })
-        .unwrap_or(false)
+    })
 }
 
 pub fn materialize_profile_in(
@@ -112,22 +176,17 @@ pub fn materialize_profile_in(
     dsh_home: &Path,
     spec: ProfileSpec<'_>,
 ) -> Result<MaterializedDshProfile, HarnessError> {
-    let cache_base = ccteam_root.join("runtime").join("dsh").join("client");
-    fs::create_dir_all(&cache_base).map_err(|e| {
-        HarnessError::SpawnFailed(format!(
-            "create DSH client cache {}: {e}",
-            cache_base.display()
-        ))
-    })?;
-    set_private_dir(&cache_base)?;
-
-    let hash = client_tgz_sha256();
-    let cache_dir = cache_base.join(&hash);
-    let cache_rebuilt = ensure_client_cache(&cache_base, &cache_dir, &hash)?;
-    let profile_dir = materialize_profile_files(dsh_home, &cache_dir, &spec)?;
+    let mut cache_dirs = Vec::with_capacity(CCTEAM_PLUGINS.len());
+    let mut cache_rebuilt = false;
+    for plugin in CCTEAM_PLUGINS.iter() {
+        let (cache_dir, rebuilt) = ensure_plugin_cache_dir(ccteam_root, plugin)?;
+        cache_rebuilt |= rebuilt;
+        cache_dirs.push(cache_dir);
+    }
+    let profile_dir = materialize_profile_files(dsh_home, &cache_dirs, &spec)?;
 
     Ok(MaterializedDshProfile {
-        cache_dir,
+        cache_dirs,
         profile_dir,
         cache_rebuilt,
     })
@@ -148,6 +207,41 @@ impl DshClientConfig<'_> {
     fn is_empty(&self) -> bool {
         self.enrollment.is_none() && self.daemon_url.is_none() && self.transport_socket.is_none()
     }
+
+    fn entries(&self) -> [(&'static str, Option<&str>); 3] {
+        [
+            ("enrollment", self.enrollment),
+            ("daemonUrl", self.daemon_url),
+            ("transportSocket", self.transport_socket),
+        ]
+    }
+}
+
+/// The `ccteam-team` row's own plugin config — the team panel's `daemonUrl` +
+/// personal REST bearer. FLAT, for the same reason as [`DshClientConfig`].
+///
+/// `restToken` is a credential: it is written ONLY into the identity's own
+/// ccteam-managed profile, never into a profile ccteam does not own, and never
+/// logged or reported. `defaultProject` is deliberately absent — ccteam has no
+/// per-identity default worth pinning, so the panel asks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DshTeamConfig<'a> {
+    pub daemon_url: Option<&'a str>,
+    /// Full wire form the REST API accepts (`ccteam:<hex>`).
+    pub rest_token: Option<&'a str>,
+}
+
+impl DshTeamConfig<'_> {
+    fn is_empty(&self) -> bool {
+        self.daemon_url.is_none() && self.rest_token.is_none()
+    }
+
+    fn entries(&self) -> [(&'static str, Option<&str>); 2] {
+        [
+            ("daemonUrl", self.daemon_url),
+            ("restToken", self.rest_token),
+        ]
+    }
 }
 
 /// Who owns the profile's `package.json`.
@@ -163,18 +257,23 @@ pub enum ManifestPolicy {
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileSpec<'a> {
     pub name: &'a str,
-    pub required_bundles: &'static [&'static str],
+    /// Vendor bundles this profile needs. ccteam's own bundles are NOT listed
+    /// here — [`CCTEAM_PLUGINS`] is always installed, so a new ccteam plugin
+    /// never needs a second edit at the call sites.
+    pub vendor_bundles: &'static [&'static str],
     pub config: DshClientConfig<'a>,
+    pub team: DshTeamConfig<'a>,
     pub manifest: ManifestPolicy,
 }
 
 impl<'a> ProfileSpec<'a> {
     /// The ccteam-owned `dsh web` profile in a managed tenant home.
-    pub fn web(config: DshClientConfig<'a>) -> Self {
+    pub fn web(config: DshClientConfig<'a>, team: DshTeamConfig<'a>) -> Self {
         Self {
             name: WEB_PROFILE,
-            required_bundles: &[DSH_BASE_BUNDLE, DSH_WEB_APP_BUNDLE, CCTEAM_CLIENT_BUNDLE],
+            vendor_bundles: &[DSH_BASE_BUNDLE, DSH_WEB_APP_BUNDLE],
             config,
+            team,
             manifest: ManifestPolicy::Owned,
         }
     }
@@ -184,10 +283,39 @@ pub fn client_tgz_sha256() -> String {
     format!("{:x}", Sha256::digest(CLIENT_TGZ))
 }
 
-fn ensure_client_cache(
+pub fn team_tgz_sha256() -> String {
+    format!("{:x}", Sha256::digest(TEAM_TGZ))
+}
+
+/// `<ccteam_home>/runtime/dsh/<ns>/<sha>/` for one plugin, extracting it on a
+/// cache miss. Returns the cache dir and whether this call rebuilt it.
+fn ensure_plugin_cache_dir(
+    ccteam_root: &Path,
+    plugin: &PluginAsset,
+) -> Result<(PathBuf, bool), HarnessError> {
+    let cache_base = ccteam_root
+        .join("runtime")
+        .join("dsh")
+        .join(plugin.cache_ns);
+    fs::create_dir_all(&cache_base).map_err(|e| {
+        HarnessError::SpawnFailed(format!(
+            "create DSH plugin cache {}: {e}",
+            cache_base.display()
+        ))
+    })?;
+    set_private_dir(&cache_base)?;
+
+    let hash = format!("{:x}", Sha256::digest(plugin.tgz));
+    let cache_dir = cache_base.join(&hash);
+    let rebuilt = ensure_plugin_cache(&cache_base, &cache_dir, &hash, plugin)?;
+    Ok((cache_dir, rebuilt))
+}
+
+fn ensure_plugin_cache(
     cache_base: &Path,
     cache_dir: &Path,
     hash: &str,
+    plugin: &PluginAsset,
 ) -> Result<bool, HarnessError> {
     if cache_looks_usable(cache_dir) {
         return Ok(false);
@@ -202,19 +330,20 @@ fn ensure_client_cache(
     remove_existing(&tmp)?;
     fs::create_dir_all(&tmp).map_err(|e| {
         HarnessError::SpawnFailed(format!(
-            "create temp DSH client cache {}: {e}",
+            "create temp DSH plugin cache {}: {e}",
             tmp.display()
         ))
     })?;
 
-    let result = extract_client_tgz(&tmp)
+    let result = extract_plugin_tgz(&tmp, plugin)
         .and_then(|_| {
             if cache_looks_usable(&tmp) {
                 Ok(())
             } else {
-                Err(HarnessError::SpawnFailed(
-                    "embedded DSH client archive did not produce a package root".into(),
-                ))
+                Err(HarnessError::SpawnFailed(format!(
+                    "embedded archive for {} did not produce a package root",
+                    plugin.bundle
+                )))
             }
         })
         .and_then(|_| {
@@ -224,7 +353,7 @@ fn ensure_client_cache(
                     Ok(())
                 } else {
                     Err(HarnessError::SpawnFailed(format!(
-                        "publish DSH client cache {} -> {}: {e}",
+                        "publish DSH plugin cache {} -> {}: {e}",
                         tmp.display(),
                         cache_dir.display()
                     )))
@@ -241,18 +370,19 @@ fn ensure_client_cache(
     Ok(true)
 }
 
-fn extract_client_tgz(dst: &Path) -> Result<(), HarnessError> {
-    let reader = GzDecoder::new(CLIENT_TGZ);
+fn extract_plugin_tgz(dst: &Path, plugin: &PluginAsset) -> Result<(), HarnessError> {
+    let reader = GzDecoder::new(plugin.tgz);
     let mut archive = Archive::new(reader);
+    let bundle = plugin.bundle;
     let entries = archive
         .entries()
-        .map_err(|e| HarnessError::SpawnFailed(format!("read embedded DSH client archive: {e}")))?;
+        .map_err(|e| HarnessError::SpawnFailed(format!("read embedded {bundle} archive: {e}")))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| {
-            HarnessError::SpawnFailed(format!("read embedded DSH client archive entry: {e}"))
+            HarnessError::SpawnFailed(format!("read embedded {bundle} archive entry: {e}"))
         })?;
         let raw_path = entry.path().map_err(|e| {
-            HarnessError::SpawnFailed(format!("read embedded DSH client archive path: {e}"))
+            HarnessError::SpawnFailed(format!("read embedded {bundle} archive path: {e}"))
         })?;
         let Some(rel) = strip_npm_package_prefix(&raw_path) else {
             continue;
@@ -260,20 +390,20 @@ fn extract_client_tgz(dst: &Path) -> Result<(), HarnessError> {
         let out = dst.join(rel);
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(&out).map_err(|e| {
-                HarnessError::SpawnFailed(format!("create DSH client dir {}: {e}", out.display()))
+                HarnessError::SpawnFailed(format!("create DSH plugin dir {}: {e}", out.display()))
             })?;
             continue;
         }
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 HarnessError::SpawnFailed(format!(
-                    "create DSH client parent {}: {e}",
+                    "create DSH plugin parent {}: {e}",
                     parent.display()
                 ))
             })?;
         }
         entry.unpack(&out).map_err(|e| {
-            HarnessError::SpawnFailed(format!("unpack DSH client file {}: {e}", out.display()))
+            HarnessError::SpawnFailed(format!("unpack DSH plugin file {}: {e}", out.display()))
         })?;
     }
     Ok(())
@@ -302,7 +432,7 @@ fn strip_npm_package_prefix(path: &Path) -> Option<PathBuf> {
 
 fn materialize_profile_files(
     dsh_home: &Path,
-    cache_dir: &Path,
+    cache_dirs: &[PathBuf],
     spec: &ProfileSpec<'_>,
 ) -> Result<PathBuf, HarnessError> {
     let profile_dir = dsh_home.join("profiles").join(spec.name);
@@ -317,15 +447,16 @@ fn materialize_profile_files(
         write_if_changed(&patch_path, patch_yaml.as_bytes())?;
     }
 
-    let scope_dir = profile_dir.join("node_modules").join(CLIENT_SCOPE);
+    let scope_dir = profile_dir.join("node_modules").join(CCTEAM_SCOPE);
     fs::create_dir_all(&scope_dir).map_err(|e| {
         HarnessError::SpawnFailed(format!(
             "create DSH profile package scope {}: {e}",
             scope_dir.display()
         ))
     })?;
-    let link = scope_dir.join(CLIENT_PACKAGE);
-    ensure_symlink(&link, cache_dir)?;
+    for (plugin, cache_dir) in CCTEAM_PLUGINS.iter().zip(cache_dirs) {
+        ensure_symlink(&scope_dir.join(plugin.package), cache_dir)?;
+    }
     Ok(profile_dir)
 }
 
@@ -368,7 +499,7 @@ fn merged_profile_package_json(
     }
 
     // Registering into a profile that does not exist yet CREATES it, and a
-    // profile whose bundles are only `@ccteam/dsh-client` cannot boot: the
+    // profile whose bundles are only ccteam's cannot boot: the
     // plugin waits forever for the host services (`agents`, `tools`, …) the
     // vendor bundles provide, and `dsh web` dies before readiness (real-machine
     // v0.10.3 DoD). Scaffold the vendor's own defaults first — exactly what a
@@ -408,9 +539,15 @@ fn merged_profile_package_json(
         *bundles = serde_json::json!([]);
     }
     let bundles = bundles.as_array_mut().expect("bundles coerced to array");
-    for required in scaffold.iter().chain(spec.required_bundles) {
+    let ours = CCTEAM_PLUGINS.iter().map(|plugin| plugin.bundle);
+    for required in scaffold
+        .iter()
+        .copied()
+        .chain(spec.vendor_bundles.iter().copied())
+        .chain(ours)
+    {
         if !bundles.iter().any(|v| v.as_str() == Some(required)) {
-            bundles.push(serde_json::Value::String((*required).to_string()));
+            bundles.push(serde_json::Value::String(required.to_string()));
         }
     }
 
@@ -422,15 +559,15 @@ fn merged_profile_package_json(
         .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile package: {e}")))
 }
 
-/// Upsert ONLY ccteam's own row into the profile's patch list, preserving
+/// Upsert ONLY ccteam's own rows into the profile's patch list, preserving
 /// every other row byte-for-byte in meaning. `Ok(None)` = nothing to write.
 ///
-/// An OVERRIDE patch, never an `insert` one. `@ccteam/dsh-client` is in the
-/// profile's `dsh.profile.bundles`, and that bundle's own patch layer
-/// (`plugins/dsh-client/cordis.patch.yml`) inserts the `ccteam-client` row —
-/// inserting it a second time here makes Cordis abort the whole boot with
-/// `duplicate loader entry id: ccteam-client`. That shipped once (v0.10.0) and
-/// killed every tenant instance before readiness; it holds identically for the
+/// An OVERRIDE patch, never an `insert` one. Each ccteam bundle is in the
+/// profile's `dsh.profile.bundles`, and each bundle's own patch layer
+/// (`plugins/<name>/cordis.patch.yml`) inserts its row — inserting it a second
+/// time here makes Cordis abort the whole boot with `duplicate loader entry
+/// id: <row>`. That shipped once (v0.10.0) and killed every tenant instance
+/// before readiness; it holds identically for `ccteam-team` and for the
 /// operator's own profile, so this writer has no `insert` arm at all.
 ///
 /// dsh-app-boot's patch semantics (applyPatches): a patch carrying `insert`
@@ -476,18 +613,74 @@ fn merged_profile_patch_yaml(
         Vec::new()
     };
 
-    if spec.config.is_empty() {
+    // Each plugin whose config this call carries. A plugin with nothing to
+    // configure is left alone entirely — its own bundle patch layer already
+    // inserted the row, and an empty override would say nothing.
+    let mut ours: Vec<(&PluginAsset, serde_yaml::Mapping)> = Vec::new();
+    if !spec.config.is_empty() {
+        ours.push((&CLIENT_PLUGIN, flat_config(spec.config.entries())));
+    }
+    if !spec.team.is_empty() {
+        ours.push((&TEAM_PLUGIN, flat_config(spec.team.entries())));
+    }
+    if ours.is_empty() {
         // No config of ours to install: leave an existing file exactly as it
         // is, and only create the empty list when the profile has none.
         return Ok((!path.exists()).then(|| EMPTY_PATCH_YAML.to_string()));
     }
 
-    let mut config = serde_yaml::Mapping::new();
-    for (key, value) in [
-        ("enrollment", spec.config.enrollment),
-        ("daemonUrl", spec.config.daemon_url),
-        ("transportSocket", spec.config.transport_socket),
-    ] {
+    let mut rows = existing;
+    for (plugin, config) in ours {
+        let existing_row = rows.iter_mut().find(|row| {
+            row.get("id").and_then(serde_yaml::Value::as_str) == Some(plugin.row_id)
+                && row.get("insert").is_none()
+        });
+        match existing_row {
+            Some(row) => {
+                let row = row.as_mapping_mut().ok_or_else(|| {
+                    HarnessError::SpawnFailed(format!(
+                        "DSH profile patch {} row `{}` must be a mapping",
+                        path.display(),
+                        plugin.row_id
+                    ))
+                })?;
+                row.insert(
+                    serde_yaml::Value::String("name".to_string()),
+                    serde_yaml::Value::String(plugin.bundle.to_string()),
+                );
+                row.insert(
+                    serde_yaml::Value::String("config".to_string()),
+                    serde_yaml::Value::Mapping(config),
+                );
+            }
+            None => {
+                let mut row = serde_yaml::Mapping::new();
+                row.insert(
+                    serde_yaml::Value::String("id".to_string()),
+                    serde_yaml::Value::String(plugin.row_id.to_string()),
+                );
+                row.insert(
+                    serde_yaml::Value::String("name".to_string()),
+                    serde_yaml::Value::String(plugin.bundle.to_string()),
+                );
+                row.insert(
+                    serde_yaml::Value::String("config".to_string()),
+                    serde_yaml::Value::Mapping(config),
+                );
+                rows.push(serde_yaml::Value::Mapping(row));
+            }
+        }
+    }
+
+    serde_yaml::to_string(&serde_yaml::Value::Sequence(rows))
+        .map(Some)
+        .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile patch: {e}")))
+}
+
+/// A row's `config` mapping: present keys only, FLAT, in declaration order.
+fn flat_config<'a>(entries: impl IntoIterator<Item = (&'static str, Option<&'a str>)>) -> Mapping {
+    let mut config = Mapping::new();
+    for (key, value) in entries {
         if let Some(value) = value {
             config.insert(
                 serde_yaml::Value::String(key.to_string()),
@@ -495,50 +688,7 @@ fn merged_profile_patch_yaml(
             );
         }
     }
-
-    let mut rows = existing;
-    let ours = rows.iter_mut().find(|row| {
-        row.get("id").and_then(serde_yaml::Value::as_str) == Some(CCTEAM_CLIENT_ROW_ID)
-            && row.get("insert").is_none()
-    });
-    match ours {
-        Some(row) => {
-            let row = row.as_mapping_mut().ok_or_else(|| {
-                HarnessError::SpawnFailed(format!(
-                    "DSH profile patch {} row `{CCTEAM_CLIENT_ROW_ID}` must be a mapping",
-                    path.display()
-                ))
-            })?;
-            row.insert(
-                serde_yaml::Value::String("name".to_string()),
-                serde_yaml::Value::String(CCTEAM_CLIENT_BUNDLE.to_string()),
-            );
-            row.insert(
-                serde_yaml::Value::String("config".to_string()),
-                serde_yaml::Value::Mapping(config),
-            );
-        }
-        None => {
-            let mut row = serde_yaml::Mapping::new();
-            row.insert(
-                serde_yaml::Value::String("id".to_string()),
-                serde_yaml::Value::String(CCTEAM_CLIENT_ROW_ID.to_string()),
-            );
-            row.insert(
-                serde_yaml::Value::String("name".to_string()),
-                serde_yaml::Value::String(CCTEAM_CLIENT_BUNDLE.to_string()),
-            );
-            row.insert(
-                serde_yaml::Value::String("config".to_string()),
-                serde_yaml::Value::Mapping(config),
-            );
-            rows.push(serde_yaml::Value::Mapping(row));
-        }
-    }
-
-    serde_yaml::to_string(&serde_yaml::Value::Sequence(rows))
-        .map(Some)
-        .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile patch: {e}")))
+    config
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
@@ -634,17 +784,62 @@ mod tests {
     use std::io::Read;
 
     const SOCKET: &str = "/srv/ccteam-home/runtime/dsh/acp/alice.sock";
+    const REST_TOKEN: &str = "ccteam:0123456789abcdef0123456789abcdef";
 
     fn plain_web() -> ProfileSpec<'static> {
-        ProfileSpec::web(DshClientConfig::default())
+        ProfileSpec::web(DshClientConfig::default(), DshTeamConfig::default())
     }
 
     fn wired_web() -> ProfileSpec<'static> {
-        ProfileSpec::web(DshClientConfig {
-            enrollment: Some("ccteam-enroll:abc:secret"),
-            daemon_url: Some("http://127.0.0.1:7331"),
-            transport_socket: Some(SOCKET),
-        })
+        ProfileSpec::web(
+            DshClientConfig {
+                enrollment: Some("ccteam-enroll:abc:secret"),
+                daemon_url: Some("http://127.0.0.1:7331"),
+                transport_socket: Some(SOCKET),
+            },
+            DshTeamConfig {
+                daemon_url: Some("http://127.0.0.1:7331"),
+                rest_token: Some(REST_TOKEN),
+            },
+        )
+    }
+
+    /// The operator's merge-only registration: transport for the client, URL
+    /// for the panel, and NO credential for either.
+    fn operator_register(
+        root: &Path,
+        dsh_home: &Path,
+        socket: &str,
+    ) -> Result<MaterializedDshProfile, HarnessError> {
+        register_ccteam_plugins_into_profile(
+            root,
+            dsh_home,
+            "web",
+            DshClientConfig {
+                transport_socket: Some(socket),
+                daemon_url: Some("http://127.0.0.1:7331"),
+                ..DshClientConfig::default()
+            },
+            DshTeamConfig {
+                daemon_url: Some("http://127.0.0.1:7331"),
+                rest_token: None,
+            },
+        )
+    }
+
+    fn plugin_link(profile_dir: &Path, plugin: &PluginAsset) -> PathBuf {
+        profile_dir
+            .join("node_modules")
+            .join(CCTEAM_SCOPE)
+            .join(plugin.package)
+    }
+
+    fn cache_of(out: &MaterializedDshProfile, plugin: &PluginAsset) -> PathBuf {
+        let index = CCTEAM_PLUGINS
+            .iter()
+            .position(|p| p.package == plugin.package)
+            .expect("plugin is in the table");
+        out.cache_dirs[index].clone()
     }
 
     fn read_patch(profile_dir: &Path) -> serde_yaml::Value {
@@ -656,14 +851,18 @@ mod tests {
         serde_json::from_slice(&fs::read(profile_dir.join("package.json")).unwrap()).unwrap()
     }
 
-    fn ccteam_row(patch: &serde_yaml::Value) -> serde_yaml::Value {
+    fn row_with_id(patch: &serde_yaml::Value, id: &str) -> serde_yaml::Value {
         patch
             .as_sequence()
             .expect("patch is a sequence")
             .iter()
-            .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some("ccteam-client"))
-            .expect("ccteam row present")
+            .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(id))
+            .unwrap_or_else(|| panic!("row {id} present in {patch:?}"))
             .clone()
+    }
+
+    fn ccteam_row(patch: &serde_yaml::Value) -> serde_yaml::Value {
+        row_with_id(patch, CCTEAM_CLIENT_ROW_ID)
     }
 
     #[test]
@@ -673,15 +872,50 @@ mod tests {
 
         let first = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
         assert!(first.cache_rebuilt);
+        let client = cache_of(&first, &CLIENT_PLUGIN);
         assert_eq!(
-            first.cache_dir.file_name().unwrap().to_string_lossy(),
+            client.file_name().unwrap().to_string_lossy(),
             client_tgz_sha256()
         );
-        assert!(first.cache_dir.join("package.json").is_file());
+        assert!(client.join("package.json").is_file());
 
         let second = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
         assert!(!second.cache_rebuilt);
-        assert_eq!(second.cache_dir, first.cache_dir);
+        assert_eq!(second.cache_dirs, first.cache_dirs);
+    }
+
+    /// Each plugin caches under its OWN sha, in its own namespace: bumping one
+    /// plugin must not invalidate (or, worse, collide with) the other's cache.
+    #[test]
+    fn every_plugin_extracts_into_its_own_sha_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+
+        let out = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
+        assert_eq!(out.cache_dirs.len(), CCTEAM_PLUGINS.len());
+        let team = cache_of(&out, &TEAM_PLUGIN);
+        let client = cache_of(&out, &CLIENT_PLUGIN);
+        assert_eq!(
+            team,
+            root.path()
+                .join("runtime")
+                .join("dsh")
+                .join("team")
+                .join(team_tgz_sha256())
+        );
+        assert!(
+            team.join("package.json").is_file(),
+            "the team plugin is extracted, not just named"
+        );
+        assert_ne!(team, client, "one cache per plugin");
+        assert_eq!(
+            fs::read_to_string(team.join("package.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|manifest| manifest["name"].as_str().map(str::to_string)),
+            Some(CCTEAM_TEAM_BUNDLE.to_string()),
+            "the team cache holds the team package"
+        );
     }
 
     #[test]
@@ -698,7 +932,8 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "@ccteam/dsh-client"
+                "@ccteam/dsh-client",
+                "@ccteam/dsh-team"
             ])
         );
         assert_eq!(
@@ -735,8 +970,8 @@ mod tests {
         //      only a hire (never a boot log) would notice.
         let patch: serde_yaml::Value = serde_yaml::from_str(&patch_raw).unwrap();
         let rows = patch.as_sequence().expect("patch is a sequence");
-        assert_eq!(rows.len(), 1, "one patch row: {patch_raw}");
-        let row = &rows[0];
+        assert_eq!(rows.len(), 2, "one row per configured plugin: {patch_raw}");
+        let row = ccteam_row(&patch);
         assert!(
             row.get("insert").is_none(),
             "must OVERRIDE the bundle-inserted row, never insert a duplicate: {patch_raw}"
@@ -763,6 +998,100 @@ mod tests {
         assert!(
             config.get("ccteam-client").is_none(),
             "config keys are flat, not nested under the namespace: {patch_raw}"
+        );
+    }
+
+    /// The team panel's row, under the same three failure modes as the
+    /// client's — plus the one that is specific to it: the panel is useless
+    /// without the identity's own REST bearer, and that bearer belongs ONLY in
+    /// this file.
+    #[test]
+    fn team_row_carries_the_flat_daemon_url_and_rest_token() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+
+        let out = materialize_profile_in(root.path(), dsh_home.path(), wired_web()).unwrap();
+        let patch_raw = fs::read_to_string(out.profile_dir.join("cordis.patch.yml")).unwrap();
+        let patch: serde_yaml::Value = serde_yaml::from_str(&patch_raw).unwrap();
+        let row = row_with_id(&patch, CCTEAM_TEAM_ROW_ID);
+        assert!(
+            row.get("insert").is_none(),
+            "`@ccteam/dsh-team`'s own bundle patch already inserted this id; a \
+             second insert aborts the Cordis boot: {patch_raw}"
+        );
+        assert_eq!(
+            row["name"],
+            serde_yaml::Value::String(CCTEAM_TEAM_BUNDLE.into()),
+            "name guards against patching some other plugin's row"
+        );
+        let config = row["config"].as_mapping().expect("flat plugin config");
+        assert_eq!(
+            config["daemonUrl"],
+            serde_yaml::Value::String("http://127.0.0.1:7331".into())
+        );
+        assert_eq!(
+            config["restToken"],
+            serde_yaml::Value::String(REST_TOKEN.into()),
+            "the wire form the REST API accepts, prefix included"
+        );
+        assert!(
+            config.get("ccteam-team").is_none(),
+            "config keys are flat, not nested under the namespace: {patch_raw}"
+        );
+        assert!(
+            config.get("defaultProject").is_none(),
+            "ccteam pins no default project — the panel asks: {patch_raw}"
+        );
+
+        // The credential is in the identity's own profile and nowhere else.
+        assert!(
+            !fs::read_to_string(out.profile_dir.join("package.json"))
+                .unwrap()
+                .contains(REST_TOKEN),
+            "the manifest is not a place for credentials"
+        );
+    }
+
+    /// Zero user steps means the panel is installed AND wired on the first
+    /// start, and stays exactly once-installed on every later one.
+    #[test]
+    fn repeated_tenant_materialization_keeps_one_team_row_and_one_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+
+        let first = materialize_profile_in(root.path(), dsh_home.path(), wired_web()).unwrap();
+        let second = materialize_profile_in(root.path(), dsh_home.path(), wired_web()).unwrap();
+        assert_eq!(second.profile_dir, first.profile_dir);
+
+        let patch = read_patch(&second.profile_dir);
+        let rows = patch.as_sequence().unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.get("id").and_then(serde_yaml::Value::as_str)
+                    == Some(CCTEAM_TEAM_ROW_ID))
+                .count(),
+            1,
+            "exactly one team row after re-materializing: {patch:?}"
+        );
+        let package = read_package(&second.profile_dir);
+        let bundles = package["dsh"]["profile"]["bundles"].as_array().unwrap();
+        assert_eq!(
+            bundles
+                .iter()
+                .filter(|b| b.as_str() == Some(CCTEAM_TEAM_BUNDLE))
+                .count(),
+            1,
+            "exactly one team bundle entry: {bundles:?}"
+        );
+        assert!(
+            second
+                .profile_dir
+                .join("node_modules")
+                .join(CCTEAM_SCOPE)
+                .join(TEAM_PLUGIN.package)
+                .join("package.json")
+                .is_file(),
+            "the panel package is materialized into the profile"
         );
     }
 
@@ -801,7 +1130,8 @@ mod tests {
                 "tenant-plugin",
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "@ccteam/dsh-client"
+                "@ccteam/dsh-client",
+                "@ccteam/dsh-team"
             ])
         );
     }
@@ -815,17 +1145,7 @@ mod tests {
     fn registering_into_a_missing_profile_scaffolds_the_vendor_web_bundles() {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
-        register_dsh_client_into_profile(
-            root.path(),
-            dsh_home.path(),
-            "web",
-            DshClientConfig {
-                transport_socket: Some(SOCKET),
-                daemon_url: Some("http://127.0.0.1:7331"),
-                ..DshClientConfig::default()
-            },
-        )
-        .unwrap();
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
         let profile_dir = dsh_home.path().join("profiles").join("web");
         let package_json = read_package(&profile_dir);
         assert_eq!(
@@ -833,7 +1153,8 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "@ccteam/dsh-client"
+                "@ccteam/dsh-client",
+                "@ccteam/dsh-team"
             ]),
             "a scaffolded manifest must be bootable, vendor bundles first"
         );
@@ -850,7 +1171,7 @@ mod tests {
         let profile_dir = dsh_home.path().join("profiles").join("web");
 
         assert!(
-            !dsh_client_registered_in_profile(dsh_home.path(), "web"),
+            !ccteam_plugins_registered_in_profile(dsh_home.path(), "web"),
             "no profile at all -> not registered"
         );
 
@@ -866,27 +1187,38 @@ mod tests {
         .unwrap();
         fs::write(profile_dir.join("cordis.patch.yml"), "[]\n").unwrap();
         assert!(
-            !dsh_client_registered_in_profile(dsh_home.path(), "web"),
+            !ccteam_plugins_registered_in_profile(dsh_home.path(), "web"),
             "bundle without a configured transport row -> not registered"
         );
 
-        register_dsh_client_into_profile(
-            root.path(),
-            dsh_home.path(),
-            "web",
-            DshClientConfig {
-                transport_socket: Some(SOCKET),
-                daemon_url: Some("http://127.0.0.1:7331"),
-                ..DshClientConfig::default()
-            },
+        // Every plugin counts: a profile carrying the whole client half but
+        // none of the panel is a partial registration, and the Hosts page must
+        // keep offering the button rather than claim the panel is installed.
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "dsh": { "profile": { "bundles": ["@ccteam/dsh-client"] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            profile_dir.join("cordis.patch.yml"),
+            format!("- id: ccteam-client\n  config:\n    transportSocket: {SOCKET}\n"),
         )
         .unwrap();
         assert!(
-            dsh_client_registered_in_profile(dsh_home.path(), "web"),
+            !ccteam_plugins_registered_in_profile(dsh_home.path(), "web"),
+            "client registered but no team panel -> not fully registered"
+        );
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+        assert!(
+            ccteam_plugins_registered_in_profile(dsh_home.path(), "web"),
             "after gate (1) registration -> registered"
         );
         assert!(
-            !dsh_client_registered_in_profile(dsh_home.path(), "headless"),
+            !ccteam_plugins_registered_in_profile(dsh_home.path(), "headless"),
             "registration is per profile"
         );
     }
@@ -910,17 +1242,7 @@ mod tests {
         let user_patch = "- id: my-own-plugin\n  config:\n    keepMe: true\n";
         fs::write(profile_dir.join("cordis.patch.yml"), user_patch).unwrap();
 
-        let out = register_dsh_client_into_profile(
-            root.path(),
-            dsh_home.path(),
-            "web",
-            DshClientConfig {
-                transport_socket: Some(SOCKET),
-                daemon_url: Some("http://127.0.0.1:7331"),
-                ..DshClientConfig::default()
-            },
-        )
-        .unwrap();
+        let out = operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
         assert_eq!(out.profile_dir, profile_dir);
 
         // package.json: every user key survives, ONLY the bundle is appended.
@@ -937,16 +1259,18 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "@ccteam/dsh-client"
+                "@ccteam/dsh-client",
+                "@ccteam/dsh-team"
             ])
         );
 
-        // cordis.patch.yml: the user's row is untouched, ours is appended as an
-        // override (no `insert`), and enrollment is NEVER injected into the
-        // operator's home — their own Settings owns that.
+        // cordis.patch.yml: the user's row is untouched, ours are appended as
+        // overrides (no `insert`), and NO credential is injected into the
+        // operator's home — their own Settings owns enrollment and the panel's
+        // REST token alike.
         let patch = read_patch(&profile_dir);
         let rows = patch.as_sequence().unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3, "the user's row plus one per ccteam plugin");
         assert_eq!(
             rows[0],
             serde_yaml::from_str::<serde_yaml::Value>(user_patch)
@@ -966,31 +1290,47 @@ mod tests {
             config.get("enrollment").is_none(),
             "the operator's enrollment is theirs to set: {config:?}"
         );
-        assert!(profile_dir
-            .join("node_modules")
-            .join(CLIENT_SCOPE)
-            .join(CLIENT_PACKAGE)
-            .join("dist")
-            .join("index.js")
-            .is_file());
+
+        let team = row_with_id(&patch, CCTEAM_TEAM_ROW_ID);
+        assert!(
+            team.get("insert").is_none(),
+            "the panel row is an override here too: {team:?}"
+        );
+        let team_config = team["config"].as_mapping().unwrap();
+        assert_eq!(
+            team_config["daemonUrl"],
+            serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+            "the panel is pointed at this daemon"
+        );
+        assert!(
+            team_config.get("restToken").is_none(),
+            "ccteam never writes a credential into a home it does not own — the \
+             operator pastes it into DSH Settings: {team_config:?}"
+        );
+
+        for (plugin, entry) in [
+            (&CLIENT_PLUGIN, "dist/index.js"),
+            (&TEAM_PLUGIN, "package.json"),
+        ] {
+            assert!(
+                profile_dir
+                    .join("node_modules")
+                    .join(CCTEAM_SCOPE)
+                    .join(plugin.package)
+                    .join(entry)
+                    .is_file(),
+                "{} is materialized into the operator profile",
+                plugin.bundle
+            );
+        }
     }
 
     #[test]
     fn operator_registration_is_idempotent_and_reconfigurable() {
         let root = tempfile::tempdir().unwrap();
         let dsh_home = tempfile::tempdir().unwrap();
-        let register = |socket: &str| {
-            register_dsh_client_into_profile(
-                root.path(),
-                dsh_home.path(),
-                "web",
-                DshClientConfig {
-                    transport_socket: Some(socket),
-                    ..DshClientConfig::default()
-                },
-            )
-            .unwrap()
-        };
+        let register =
+            |socket: &str| operator_register(root.path(), dsh_home.path(), socket).unwrap();
 
         let first = register(SOCKET);
         let package_after_first = fs::read(first.profile_dir.join("package.json")).unwrap();
@@ -1013,7 +1353,7 @@ mod tests {
         // second one — a duplicate id kills the whole Cordis boot.
         let third = register("/srv/other/acp/operator.sock");
         let patch = read_patch(&third.profile_dir);
-        assert_eq!(patch.as_sequence().unwrap().len(), 1);
+        assert_eq!(patch.as_sequence().unwrap().len(), CCTEAM_PLUGINS.len());
         assert_eq!(
             ccteam_row(&patch)["config"]["transportSocket"],
             serde_yaml::Value::String("/srv/other/acp/operator.sock".into())
@@ -1034,16 +1374,7 @@ mod tests {
         .unwrap();
         fs::write(profile_dir.join("cordis.patch.yml"), broken_patch).unwrap();
 
-        let err = register_dsh_client_into_profile(
-            root.path(),
-            dsh_home.path(),
-            "web",
-            DshClientConfig {
-                transport_socket: Some(SOCKET),
-                ..DshClientConfig::default()
-            },
-        )
-        .unwrap_err();
+        let err = operator_register(root.path(), dsh_home.path(), SOCKET).unwrap_err();
         assert!(
             err.to_string().contains("parse DSH profile patch"),
             "got {err}"
@@ -1061,16 +1392,15 @@ mod tests {
         let wrong_target = tempfile::tempdir().unwrap();
 
         let first = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        let link = first
-            .profile_dir
-            .join("node_modules")
-            .join(CLIENT_SCOPE)
-            .join(CLIENT_PACKAGE);
+        let link = plugin_link(&first.profile_dir, &CLIENT_PLUGIN);
         remove_existing(&link).unwrap();
         ensure_symlink(&link, wrong_target.path()).unwrap();
 
         let second = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        assert_eq!(fs::read_link(&link).unwrap(), second.cache_dir);
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            cache_of(&second, &CLIENT_PLUGIN)
+        );
     }
 
     #[test]
@@ -1079,16 +1409,25 @@ mod tests {
         let dsh_home = tempfile::tempdir().unwrap();
 
         let out = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        let link = out
-            .profile_dir
-            .join("node_modules")
-            .join(CLIENT_SCOPE)
-            .join(CLIENT_PACKAGE);
-
-        let meta = fs::symlink_metadata(&link).unwrap();
-        assert!(meta.file_type().is_symlink());
-        assert_eq!(fs::read_link(&link).unwrap(), out.cache_dir);
-        assert!(link.join("dist").join("index.js").is_file());
+        for plugin in CCTEAM_PLUGINS.iter() {
+            let link = plugin_link(&out.profile_dir, plugin);
+            let meta = fs::symlink_metadata(&link).unwrap();
+            assert!(
+                meta.file_type().is_symlink(),
+                "{} is linked, not copied",
+                plugin.bundle
+            );
+            assert_eq!(fs::read_link(&link).unwrap(), cache_of(&out, plugin));
+            assert!(link.join("package.json").is_file());
+        }
+        assert!(plugin_link(&out.profile_dir, &CLIENT_PLUGIN)
+            .join("dist")
+            .join("index.js")
+            .is_file());
+        assert!(plugin_link(&out.profile_dir, &TEAM_PLUGIN)
+            .join("lib")
+            .join("index.js")
+            .is_file());
     }
 
     #[test]
@@ -1106,23 +1445,17 @@ mod tests {
             serde_json::json!([
                 "@deepseek-ai/dsh-base",
                 "@deepseek-ai/dsh-web-app",
-                "@ccteam/dsh-client"
+                "@ccteam/dsh-client",
+                "@ccteam/dsh-team"
             ])
         );
         assert_eq!(
             read_patch(&first.profile_dir).as_sequence().unwrap().len(),
-            1
+            CCTEAM_PLUGINS.len()
         );
         assert_eq!(
-            fs::read_link(
-                first
-                    .profile_dir
-                    .join("node_modules")
-                    .join(CLIENT_SCOPE)
-                    .join(CLIENT_PACKAGE)
-            )
-            .unwrap(),
-            first.cache_dir
+            fs::read_link(plugin_link(&first.profile_dir, &CLIENT_PLUGIN)).unwrap(),
+            cache_of(&first, &CLIENT_PLUGIN)
         );
     }
 
@@ -1132,13 +1465,14 @@ mod tests {
         let dsh_home = tempfile::tempdir().unwrap();
 
         let first = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        fs::remove_dir_all(&first.cache_dir).unwrap();
-        fs::create_dir_all(&first.cache_dir).unwrap();
+        let client = cache_of(&first, &CLIENT_PLUGIN);
+        fs::remove_dir_all(&client).unwrap();
+        fs::create_dir_all(&client).unwrap();
 
         let second = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
         assert!(second.cache_rebuilt);
-        assert!(second.cache_dir.join("package.json").is_file());
-        assert!(second.cache_dir.join("dist").join("index.js").is_file());
+        assert!(client.join("package.json").is_file());
+        assert!(client.join("dist").join("index.js").is_file());
     }
 
     #[test]
@@ -1157,13 +1491,19 @@ mod tests {
         let dsh_home = tempfile::tempdir().unwrap();
 
         let out = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        let package_json: serde_json::Value =
-            serde_json::from_slice(&fs::read(out.cache_dir.join("package.json")).unwrap()).unwrap();
-        assert_eq!(package_json["name"], "@ccteam/dsh-client");
-        assert_eq!(
-            package_json["dsh"]["bundle"]["patch"],
-            serde_json::json!("./cordis.patch.yml")
-        );
+        for plugin in CCTEAM_PLUGINS.iter() {
+            let package_json: serde_json::Value = serde_json::from_slice(
+                &fs::read(cache_of(&out, plugin).join("package.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(package_json["name"], plugin.bundle);
+            assert_eq!(
+                package_json["dsh"]["bundle"]["patch"],
+                serde_json::json!("./cordis.patch.yml"),
+                "{} must ship the bundle patch that inserts its loader row",
+                plugin.bundle
+            );
+        }
     }
 
     #[test]
@@ -1173,23 +1513,51 @@ mod tests {
         let wrong_target = tempfile::tempdir().unwrap();
 
         let first = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        let link = first
-            .profile_dir
-            .join("node_modules")
-            .join(CLIENT_SCOPE)
-            .join(CLIENT_PACKAGE);
+        let link = plugin_link(&first.profile_dir, &CLIENT_PLUGIN);
         remove_existing(&link).unwrap();
         ensure_symlink(&link, wrong_target.path()).unwrap();
 
         let second = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
-        assert_eq!(fs::read_link(&link).unwrap(), second.cache_dir);
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            cache_of(&second, &CLIENT_PLUGIN)
+        );
     }
 
     #[test]
     fn read_embedded_tgz_bytes_without_consuming_build_tools() {
-        let mut decoder = GzDecoder::new(CLIENT_TGZ);
-        let mut decoded = Vec::new();
-        decoder.read_to_end(&mut decoded).unwrap();
-        assert!(!decoded.is_empty());
+        for plugin in CCTEAM_PLUGINS.iter() {
+            let mut decoder = GzDecoder::new(plugin.tgz);
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).unwrap();
+            assert!(!decoded.is_empty(), "{} archive is empty", plugin.bundle);
+        }
+    }
+
+    /// `npm pack` folds `bundledDependencies` in from `node_modules`, so a
+    /// tarball packed without installing first extracts fine and then fails at
+    /// runtime on `import Schema from '@deepseek-ai/schemastery'`. Assert the
+    /// dependency is actually inside each embedded archive
+    /// (`plugins/pack-assets.sh` refuses to publish one that is not).
+    #[test]
+    fn embedded_archives_carry_their_bundled_runtime_dependency() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+
+        let out = materialize_profile_in(root.path(), dsh_home.path(), plain_web()).unwrap();
+        for plugin in CCTEAM_PLUGINS.iter() {
+            assert!(
+                cache_of(&out, plugin)
+                    .join("node_modules")
+                    .join("@deepseek-ai")
+                    .join("schemastery")
+                    .join("package.json")
+                    .is_file(),
+                "{} must bundle its runtime dependency: the profile links this \
+                 cache dir straight into node_modules, so nothing else can \
+                 resolve it",
+                plugin.bundle
+            );
+        }
     }
 }

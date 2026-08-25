@@ -170,17 +170,18 @@ fn mcp_registered(vendor: &str, ccteam_root: &std::path::Path) -> bool {
             .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
             .unwrap_or(false),
         // DSH has no vendor MCP config file: "registered" means ccteam's
-        // Cordis plugin (bundle + configured `ccteam-client` patch row) is
-        // present in the operator's own `~/.dsh` web profile — exactly what
-        // `register-mcp?vendor=dsh` writes. Read-only; a home we cannot
-        // resolve or read is `false`.
+        // Cordis plugins (each bundle + its configured patch row) are present
+        // in the operator's own `~/.dsh` web profile — exactly what
+        // `register-mcp?vendor=dsh` writes. A profile carrying only some of
+        // them reads as `false`, so the button is offered until every plugin
+        // is in. Read-only; a home we cannot resolve or read is `false`.
         "dsh" => ccteam_harness::execution::dsh_acp::spawn_spec::dsh_home_for_identity(
             true,
             "",
             ccteam_root,
         )
         .map(|home| {
-            ccteam_harness::execution::dsh_acp::materialize::dsh_client_registered_in_profile(
+            ccteam_harness::execution::dsh_acp::materialize::ccteam_plugins_registered_in_profile(
                 &home,
                 ccteam_harness::DSH_NATIVE_WEB_PROFILE,
             )
@@ -501,9 +502,10 @@ pub struct RegisterMcpQuery {
 
 /// `POST /api/v1/hosts/{host}/register-mcp` — register ccteam's OWN entry
 /// into the vendor's config surface. For the five config-file vendors that is
-/// the MCP server entry; for `?vendor=dsh` it is ccteam's plugin bundle +
-/// patch row in the operator's `~/.dsh` web profile (which the human loads by
-/// restarting their `dsh web`). **Idempotent** (merge, never clobber), and
+/// the MCP server entry; for `?vendor=dsh` it is ccteam's plugin bundles +
+/// patch rows (tool/transport client and team panel alike) in the operator's
+/// `~/.dsh` web profile, which the human loads by restarting their `dsh web`.
+/// **Idempotent** (merge, never clobber), and
 /// only ccteam's own entries. ccteam never writes a vendor login/key; vendor
 /// CLI installs live in the separate VENDOR-INSTALL-1 job surface
 /// (`.../vendors/{vendor}/install`). 404 for a non-`local` host; 400 for an
@@ -545,11 +547,12 @@ pub(crate) async fn handle_register_mcp(
     }
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
-        // DSH's "register ccteam" is not a vendor-config write: its tool and
-        // transport surface is the `@ccteam/dsh-client` Cordis plugin. This
-        // action merges ccteam's OWN bundle entry + `ccteam-client` patch row
-        // (carrying this daemon's transportSocket/URL) into the operator's
-        // real `~/.dsh` web profile — gate ①, idempotent, merge-only — so a
+        // DSH's "register ccteam" is not a vendor-config write: ccteam reaches
+        // DSH through Cordis plugins — `@ccteam/dsh-client` (tool + transport)
+        // and `@ccteam/dsh-team` (the team panel). This action merges ccteam's
+        // OWN bundle entries + patch rows (carrying this daemon's
+        // transportSocket/URL, never a credential) into the operator's real
+        // `~/.dsh` web profile — gate ①, idempotent, merge-only — so a
         // hand-started `dsh web` can serve hires after its owner restarts it.
         // Deliberately NOT part of register-all: it only takes effect after
         // the human restarts their own instance, so it stays an explicit ask.
@@ -560,7 +563,7 @@ pub(crate) async fn handle_register_mcp(
                     Json(serde_json::json!({
                         "registered": ["dsh"],
                         "paths": {"dsh": profile_dir},
-                        "note": "restart your DSH web instance to load the ccteam plugin",
+                        "note": "restart your DSH web instance to load the ccteam plugins",
                     })),
                 )
                     .into_response(),

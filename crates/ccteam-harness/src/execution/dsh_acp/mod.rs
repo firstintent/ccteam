@@ -697,6 +697,7 @@ mod tests {
         DshAcpAdapter::new(Arc::new(DshRuntimeManager::new(
             PathBuf::from("/nonexistent/ccteam-home"),
             Arc::new(|_root, _owner| Err(anyhow::anyhow!("no enrollment in tests"))),
+            Arc::new(|_root, _owner| Err(anyhow::anyhow!("no REST token in tests"))),
         )))
     }
 
@@ -718,6 +719,7 @@ mod tests {
         let manager = Arc::new(DshRuntimeManager::new(
             PathBuf::from("/nonexistent/ccteam-home"),
             Arc::new(|_root, _owner| anyhow::bail!("no enrollment in tests")),
+            Arc::new(|_root, _owner| anyhow::bail!("no REST token in tests")),
         ));
         let adapter = DshAcpAdapter::new(Arc::clone(&manager));
         assert!(Arc::ptr_eq(adapter.runtime(), &manager));

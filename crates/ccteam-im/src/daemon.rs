@@ -93,6 +93,9 @@ fn dsh_runtime_without_a_web_host() -> Arc<DshRuntimeManager> {
         Arc::new(|_root, owner| {
             anyhow::bail!("no DSH enrollment resolver in this process (owner {owner})")
         }),
+        Arc::new(|_root, owner| {
+            anyhow::bail!("no DSH REST token resolver in this process (owner {owner})")
+        }),
     ))
 }
 
@@ -2417,6 +2420,7 @@ mod tests {
         let manager = Arc::new(DshRuntimeManager::new(
             PathBuf::from("/nonexistent/ccteam-home"),
             Arc::new(|_root, _owner| anyhow::bail!("no enrollment in tests")),
+            Arc::new(|_root, _owner| anyhow::bail!("no REST token in tests")),
         ));
         let (factory, _, _) = adapter_factory_with_dsh_runtime(Arc::clone(&manager));
         assert!(

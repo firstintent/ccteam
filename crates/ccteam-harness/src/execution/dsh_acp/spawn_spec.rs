@@ -15,7 +15,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::materialize::{materialize_profile_in, DshClientConfig, ProfileSpec, WEB_PROFILE};
+use super::materialize::{
+    materialize_profile_in, DshClientConfig, DshTeamConfig, ProfileSpec, WEB_PROFILE,
+};
 use crate::{ccteam_root_from_env, HarnessError, SpawnCtx};
 
 pub const DSH_BIN_ENV: &str = "CCTEAM_DSH_BIN";
@@ -342,6 +344,11 @@ pub struct DshWebSpawnOptions<'a> {
     pub daemon_url: Option<&'a str>,
     /// ACP socket the embedded ccteam plugin serves on for this identity.
     pub transport_socket: Option<&'a Path>,
+    /// This identity's own ccteam REST bearer (`ccteam:<hex>`), for the team
+    /// panel. `None` on the operator branch: ccteam writes credentials only
+    /// into homes it owns, so the operator pastes it into DSH Settings once —
+    /// the same line `@ccteam/dsh-client` draws for `enrollment`.
+    pub rest_token: Option<&'a str>,
 }
 
 /// Build a `dsh web` child command for one identity's DSH runtime.
@@ -370,6 +377,14 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
         daemon_url: options.daemon_url,
         transport_socket: socket.as_deref(),
     };
+    // The team panel's own row. `rest_token` is `None` on the operator branch
+    // by construction (see `DshWebSpawnOptions::rest_token`), so the panel is
+    // registered and pointed at the daemon there, and the human supplies the
+    // credential from the DSH Settings card.
+    let team = DshTeamConfig {
+        daemon_url: options.daemon_url,
+        rest_token: options.rest_token,
+    };
     if options.materialize_profile {
         seed_or_refresh_tenant_web_config_home(
             options.owner_tag,
@@ -379,14 +394,15 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
         materialize_profile_in(
             &options.ccteam_home,
             &options.dsh_home,
-            ProfileSpec::web(config),
+            ProfileSpec::web(config, team),
         )?;
     } else {
-        super::materialize::register_dsh_client_into_profile(
+        super::materialize::register_ccteam_plugins_into_profile(
             &options.ccteam_home,
             &options.dsh_home,
             options.profile,
             config,
+            team,
         )?;
     }
 
