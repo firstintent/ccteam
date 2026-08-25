@@ -90,7 +90,7 @@
 - **DoD**:vitest 三态;`make web-check` 绿;writeback 绿。
 
 ### TEST-HYG-1 两族并行测试卫生修复(`/tmp/alpha` 共享路径 + harness env-mutating lib 对)
-- **状态**:待排 · **冲突域**:`crates/ccteam-im/src/gateway.rs(tests mod)+ crates/ccteam-harness/src(model_catalog tests + dsh_acp/spawn_spec tests 迁移)` · **建议入口**:dev 会话
+- **状态**:进行中(opus subagent·2026-08-25) · **冲突域**:`crates/ccteam-im/src/gateway.rs(tests mod)+ crates/ccteam-harness/src(model_catalog tests + dsh_acp/spawn_spec tests 迁移)` · **建议入口**:dev 会话
 - **背景**:2026-08-18 v0.10.3 A/B 收口实锤升级(登记详情 = `.loop/verify/README.md` env-flake 族):①`gateway::tests` 的 `/tmp/alpha` 字面共享路径族(`gateway_resumes_dead_session_on_next_turn` 等)在本机全并行 baseline 已**近确定性红**(pristine origin/dev 双复现),不再是偶发;②`ccteam-harness` lib 内 `model_catalog::env_resolution_*` 与 `spawn_spec::tenant_web_seed_refreshes_*` 同进程互踩 `HOME`/`CCTEAM_HOME`(AGENTS §六 违例),成对红 3/10。两族隔离/串行恒绿 = 测试卫生缺陷,非生产 bug。
 - **规格**:①`/tmp/alpha` 族测试改 per-test tempdir(sid 命名空间随根隔离);②env-mutating 两测搬 `crates/ccteam-harness/tests/*.rs` integration(各独立进程)或改注入式 `_in(root)` API,不 env 突变;生产代码零改动。
 - **DoD**:全并行 `make test-baseline` 连续 3 轮 0 失败;两族原断言语义不减;writeback 绿。
