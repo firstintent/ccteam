@@ -17,6 +17,15 @@
 
 > **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/dsh-team` —— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名 `@ccteam/dsh-team`(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
 
+### NOTIFY-1 委派完成通知瘦身 + 与 `wait_seconds` 内联返回同源(owner 反馈 2026-08-26,进行中)
+- **状态**:进行中(codex maker) · **冲突域**:`crates/ccteam-im/src/delegation.rs` + `crates/ccteam-im/src/mcp/dispatch.rs` + `crates/ccteam-im/src/mcp/protocol.rs`(+ `gateway.rs` 测试夹具串)· **建议入口**:codex maker,规划复核。
+- **病根**:通知文本(`build_notification_text_with_outcome`)与内联等待 JSON(`dispatch.rs` inline map)各自拼装 —— 通知头一句 30+ 词、`--- final answer ---` 分隔、每条都重复「(child is idle: … session_dispatch … session_collect …)」尾巴;内联 JSON 有 `context_pct/tokens_total/cost_usd` 但无 interim 计数,措辞/顺序与通知不对齐。owner:「太长、要省 token;wait_seconds 返回格式与 notify 不统一」。
+- **规格**(一个家):`delegation.rs` 新增 `DelegationSummary { sid, vendor, title, turn_id, outcome(Done|Failed{kind}), context_pct, tokens_total, cost_usd, interim_notes, answer }`,两种渲染同源同序:
+  - **通知文本**(仍是普通 user turn):首行 `[ccteam] s442 "probe: notify-only" · turn s442-1 done · ctx 3% · 24.4k tok`(无 title 时身份写 `s442 (claude)`;失败 `FAILED (<error_kind|vendor error>)`;折叠 interim 时追加 ` · +N interim`;metrics 复用 `turn_status` 的省略规则但**不带 `turn N`/model**,已在头里),第二行起直接是答案节选(沿用 4000 字截断 marker —— marker 已说明如何取全文);**删** `--- final answer ---` 与尾巴提示;答案为空只留首行。interim 通知同形:`[ccteam] s69 "wave" · turn s69-3 interim (still working)` + 注记。
+  - **内联 JSON**(`wait_seconds` / spawn+task 同路):`turn_id, status(completed|failed|pending), context_pct, tokens_total, cost_usd, interim_notes(>0 才出), result_text, elapsed_seconds, notify_deliverable, error_kind/error`,值与通知**逐字段一致**(同一 summary 生成)。`result_turn`/`model` 维持。
+  - 工具自描述(`protocol.rs` `session_dispatch`/`session_spawn`):一句话说明通知形状「一行头 + 答案;`session_collect{tail:true}` 取全文」,替代被删的尾巴提示(改进 ≠ 加法,不加长)。
+- **DoD**:`delegation.rs` 契约测试改为新字面(首行精确断言 + 「无 `--- final answer ---`、无 `child is idle`」);dispatch 内联测试断言 `interim_notes` 与通知 `+N interim` 同值;`make check` / `make test-baseline` ≥ 1985/0;fmt / writeback 绿;handoff 附真机一条通知原文。
+
 ### LEDGER-1 codex 累计 token 不上账 + 新模型无价目(真机探针 2026-08-26 发现,待排)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/codex_app_server.rs` + `crates/ccteam-cost/src/pricing.rs` + `crates/ccteam-im/src/progress_projection.rs` · **建议入口**:codex maker(小卡)。
 - **现象**(STATUS-LINE 真机探针 s434/s435):codex 子会话 `context_pct` 正常(tracker 吃 `thread/tokenUsage/updated`,20717/258400),但 `tokens_total` 恒 0 —— codex 的 `TurnCompleted.usage` 为空(app-server `turn/completed` 无 usage 字段),账本只折 `chat_turn_completed.usage`,tokenUsage 通知里的 `total`/`last` 从未进 ledger;两家新模型 `gpt-5.6-sol` / `claude-sonnet-5` 无价目 → `cost_usd` null(状态行诚实回落 `k tok`,codex 连 tok 也没有)。
