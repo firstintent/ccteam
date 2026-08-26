@@ -17,6 +17,12 @@
 
 > **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/dsh-team` —— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名 `@ccteam/dsh-team`(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
 
+### LEDGER-1 codex 累计 token 不上账 + 新模型无价目(真机探针 2026-08-26 发现,待排)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/codex_app_server.rs` + `crates/ccteam-cost/src/pricing.rs` + `crates/ccteam-im/src/progress_projection.rs` · **建议入口**:codex maker(小卡)。
+- **现象**(STATUS-LINE 真机探针 s434/s435):codex 子会话 `context_pct` 正常(tracker 吃 `thread/tokenUsage/updated`,20717/258400),但 `tokens_total` 恒 0 —— codex 的 `TurnCompleted.usage` 为空(app-server `turn/completed` 无 usage 字段),账本只折 `chat_turn_completed.usage`,tokenUsage 通知里的 `total`/`last` 从未进 ledger;两家新模型 `gpt-5.6-sol` / `claude-sonnet-5` 无价目 → `cost_usd` null(状态行诚实回落 `k tok`,codex 连 tok 也没有)。
+- **规格**:①codex adapter 在 turn 边界把 tracker 的 `last`(本 turn)token 明细填进 `TurnCompleted.usage`(一处,不动 ledger 折叠逻辑),使 `tokens_total`/成本估算与其他 vendor 同路;②价目表补 `gpt-5.6-*` 与 `claude-sonnet-5`/`claude-opus-5`/`claude-fable-5`(价格以官方页为准,owner 核),缺价仍 None 不兜底。
+- **DoD**:fixture 测试 codex 一 turn 后 `tokens_total > 0`;`make check` / `make test-baseline` ≥ 1985/0 只增不减;fmt / writeback 绿。
+
 ### STATUS-LINE-2 状态行节流:只挂 vendor turn 边界 + MCP 面改数字字段(owner 反馈 2026-08-26)
 - **状态**:完成(fc98ca9) · **冲突域**:同 STATUS-LINE-1(`crates/ccteam-harness/src/execution/turn_status.rs` + `crates/ccteam-im/src/{gateway.rs,delegation.rs,mcp/dispatch.rs}`) · **建议入口**:codex maker(worktree),规划自审 diff + 复跑目标测试,不派 checker(改动窄、省 token)。
 - **场景**(owner 原话):「注意不要太浪费 token,特别是 codex 回复来频繁。这个场景主要是给 Claude 开了很多子会话,父会话根据子会话已使用上下文多少决定复用还是新开会话。」
