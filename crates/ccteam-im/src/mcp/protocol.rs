@@ -194,7 +194,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi | pi | dsh — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex/pi/dsh = coding agents; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch. Completion notification = first line `s<N> done · turn N · ctx N%` (or `FAILED (...)`) then the answer excerpt; inline completion returns `{status, turn, context_pct?, result_text, error_kind?, error?, cost_usd?}`; `session_collect{sid, tail:true}` returns the full text. A hand-started caller gets `notify_deliverable:false` and must poll. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`.",
+            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi | pi | dsh — in YOUR OWN project; always mints a NEW s{n} sid. Pass `task` to dispatch the first task in the same call and tell the child to answer tersely with a structured summary, never code/diff dumps. Spawn-only returns `{sid}`; async task returns `{sid,turn_id,status}`; inline completion adds `{turn,context_pct?,result_text,error_kind?,error?,cost_usd?}`. Completion notification starts `s<N> done · turn N · ctx N%`; `session_collect{sid, tail:true}` returns full text. A hand-started caller also gets `notify_deliverable:false` and must poll. Auth: your per-session principal; host follows the project binding; status shows availability.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -225,7 +225,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_dispatch",
-            "description": "Dispatch a task to a session by `sid` (from session_spawn / session_list); the target must run in YOUR OWN project. `task` is forwarded VERBATIM as a user turn (NO system-prompt injection). Completion notification = first line `s<N> done · turn N · ctx N%` (or `FAILED (...)`) then the answer excerpt; inline completion returns `{status, turn, context_pct?, result_text, error_kind?, error?, cost_usd?}`; `session_collect{sid, tail:true}` returns the full text. Timeout returns `{status:\"pending\"}` and never cancels the child. Dispatch to yourself or an ancestor is rejected (cycle). A dispatch to a session you did NOT delegate is a handoff: it runs and is recorded, but arms no completion watch unless you pass `notify` explicitly. Explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a verbatim user task to a session in YOUR OWN project; tell the child to answer tersely with a structured summary, never code/diff dumps. Async returns `{turn_id,status}`; inline completion adds `{turn,context_pct?,result_text,error_kind?,error?,cost_usd?}`. Completion notification starts `s<N> done · turn N · ctx N%`; `session_collect{sid, tail:true}` returns full text. Timeout returns `pending` and never cancels. Self/ancestor cycles are rejected. A peer handoff arms no watch unless `notify` is explicit. Explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -241,7 +241,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_collect",
-            "description": "Collect (poll) a session's transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns with per-turn `status`; the envelope also includes `context_pct` when known, the child's context-window usage for deciding reuse vs. a fresh session. A terminal failure carries `outcome:\"failed\"`, `error_kind`, and `error`. Also returns the child's `vendor_session_id` (native resume key), `activity` (`working` = mid-turn / `idle` = turn done / `stale` / `stuck`), and accrued ledger (`cost_usd` when priced, `tokens_total` when reported). Pass `since` to return only turns AFTER that turn id. Default paging is OLDEST-first; pass `tail:true` for the NEWEST `n` turns. Returns an empty `turns` array when the target hasn't answered yet.",
+            "description": "Collect a session transcript in YOUR OWN project. Returns `{activity,context_pct?,cursor?,truncated?,turns:[{turn_id,content,outcome?,error_kind?,error?}],cost_usd?,tokens_total?}` and `status:\"stopped\"` only when not live. Pass `since` for turns after a cursor; default paging is oldest-first, `tail:true` selects the newest `n`. Empty `turns` means no answer yet.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -256,20 +256,21 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_list",
-            "description": "List the gateway's live sessions (the same `s{n}` namespace session_spawn allocates), most recently active first, capped at `limit` (default 30; `truncated`/`total` say when the cap bit). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `vendor`, `activity` (`working` = mid-turn / `idle` / `stale` / `stuck` — the honest busy signal), `last_active`, plus — when set — `role`, `is_self` (YOUR OWN row — the only way to find yourself here), `current` (that session is the active one of some chat — NOT you), `waiting_approval` (hitl blocked on a human), the delegation `parent_sid`/`delegation_depth`, non-local `host`, `cost_usd`, `tokens_total` (raw token ledger, present even for vendors with no USD price table), `context_pct`, and `title` (null/empty fields are omitted). The response also includes a `tree` field (roots → children by `parent_sid`, over the filtered set) so you can see the delegation topology. Filter with `project` / `activity` to keep the listing small. Use this to find a `sid` to dispatch to or collect from.",
+            "description": "List live sessions, most recently active first. Rows are `{sid,vendor,role?,title?,activity,context_pct?,parent_sid?,is_self?,waiting_approval?,host?,cost_usd?,tokens_total?}`; host is non-local only. Filter with `project`/`activity`; cap with `limit` (default 30). `truncated:true`, `total`, and a hint appear only when capped. Pass `tree:true` to add delegation topology over the filtered rows. Use `is_self` to find your own sid.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
                     "project": { "type": "string", "description": "Only list sessions of this project slug." },
                     "activity": { "type": "string", "enum": ["working", "idle", "stale", "stuck", "all"], "description": "Only list sessions with this activity state (default `all`)." },
-                    "limit": { "type": "integer", "description": "Max rows returned, most recently active first (default 30, clamped to 1–500)." }
+                    "limit": { "type": "integer", "description": "Max rows returned, most recently active first (default 30, clamped to 1–500)." },
+                    "tree": { "type": "boolean", "description": "When true, include delegation topology over the filtered rows (default false)." }
                 },
                 "required": [],
             }),
         }),
         json!({
             "name": "session_stop",
-            "description": "Stop a session by `sid` (deregister + close it). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project stop is rejected). This is an EXPLICIT command, NOT a proactive kill — it never file-purges the transcript, so a later session_collect of an already-recorded `turns.jsonl` still works until cleanup. An unknown sid is an error.",
+            "description": "Stop a session by `sid`; returns `{sid,stopped:true}`. The target must run in YOUR OWN project. This is an EXPLICIT command, never a proactive kill, and it does not purge the transcript; session_collect can still read recorded turns. Unknown sid is an error.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -478,7 +479,11 @@ mod tests {
                 .unwrap();
             assert!(description.contains("s<N> done · turn N · ctx N%"));
             assert!(description.contains("session_collect{sid, tail:true}"));
+            assert!(description.contains("structured summary"));
+            assert!(description.contains("never code/diff dumps"));
         }
+        let list = defs.iter().find(|t| t["name"] == "session_list").unwrap();
+        assert_eq!(list["inputSchema"]["properties"]["tree"]["type"], "boolean");
     }
 
     #[test]
