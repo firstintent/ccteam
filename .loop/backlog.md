@@ -21,11 +21,24 @@
 - **状态**:进行中(codex maker,二版规格) · **冲突域**:`crates/ccteam-im/src/delegation.rs` + `crates/ccteam-im/src/mcp/dispatch.rs` + `crates/ccteam-im/src/mcp/protocol.rs`(+ `gateway.rs` 测试夹具串)· **建议入口**:codex maker,规划复核。
 - **病根**:通知文本与内联等待 JSON 各自拼装;通知头一句 30+ 词、`--- final answer ---` 分隔、每条重复「(child is idle: …)」尾巴。owner 两次反馈:「太长、要省 token;wait_seconds 返回与 notify 不统一」→「还是太长,这个通知要塞进父会话的上下文,要精简」。**原则**:进父会话上下文的每个字都要有决策用途;父会话只需 = 哪个子会话、完成还是失败、ctx%(复用 vs 新开)、答案。
 - **规格**(一个家 `DelegationSummary`,两种渲染同源):
-  - **通知文本**(普通 user turn)首行精确为 `s442 done · ctx 3%`(失败 `s442 FAILED (<error_kind|vendor error>) · ctx 3%`;ctx 未知则整段省略),第二行起直接是答案节选;**无** `[ccteam]` 前缀、title、turn id、tokens/cost、interim 计数、分隔线、操作提示。答案为空只留首行。interim 通知(仅 `notify:all`):`s69 interim` + 换行 + 注记。截断 marker 缩为 `…[+N chars: session_collect{sid:s442,tail:true}]…`(4000 字上限不变)。
-  - **内联 JSON**(`wait_seconds`,dispatch 与 spawn+task 同路)与通知同字段:`turn_id, status(completed|failed|pending), context_pct, result_text`(失败加 `error_kind/error`;`cost_usd` 仅有价时出;`notify_deliverable` 仅为 false 时出);**删** `tokens_total, elapsed_seconds, model, result_turn`(全在 `session_list`/`session_collect` 账本面)。
+  - **通知文本**(普通 user turn)首行精确为 `s442 done · turn 3 · ctx 3%`(owner 2026-08-26 令加 turn;turn = 子会话 turn **序号**,与状态行同一个数、各 vendor 一致,不是 codex 的 UUID turn id;失败 `s442 FAILED (<error_kind|vendor error>) · turn 3 · ctx 3%`;ctx 未知则整段省略),第二行起直接是答案节选;**无** `[ccteam]` 前缀、title、turn id、tokens/cost、interim 计数、分隔线、操作提示。答案为空只留首行。interim 通知(仅 `notify:all`):`s69 interim` + 换行 + 注记。截断 marker 缩为 `…[+N chars: session_collect{sid:s442,tail:true}]…`(4000 字上限不变)。
+  - **内联 JSON**(`wait_seconds`,dispatch 与 spawn+task 同路)与通知同字段:`turn_id, turn, status(completed|failed|pending), context_pct, result_text`(失败加 `error_kind/error`;`cost_usd` 仅有价时出;`notify_deliverable` 仅为 false 时出);**删** `tokens_total, elapsed_seconds, model, result_turn`(全在 `session_list`/`session_collect` 账本面)。
   - 工具自描述(`session_dispatch`/`session_spawn`)一句话:通知 = 首行 `s<N> done · ctx N%` + 答案节选,`session_collect{sid,tail:true}` 取全文;总长度不增。
 - **DoD**:`delegation.rs` 契约测试断言新首行精确字面 + 不含旧字样;dispatch 内联测试断言字段集合恰为规格所列;`make check` / `make test-baseline` ≥ 1985/0;fmt / writeback 绿;handoff 附契约测试渲染出的 done/FAILED 两例原文。
-- **后续候选(未立卡,owner 定)**:spawn/dispatch 成功响应目前 18 个字段(`caller/hint/host/protocol/project_source/permission_mode/…`),同样进父会话上下文,可按同一原则缩到 `sid, turn_id, status`。
+- **后续**:其余四面 = MCP-DX-2(owner 确认开发 2026-08-26),同冲突域,串行在本卡之后。
+
+### MCP-DX-2 `session_*` 回执极简化:推面只带决策字段、拉面按需(owner 确认开发 2026-08-26,待排)
+- **状态**:待排(串行在 NOTIFY-1 之后,同冲突域)· **冲突域**:`crates/ccteam-im/src/mcp/dispatch.rs` + `crates/ccteam-im/src/mcp/protocol.rs`(+ `docs/orchestration.md`(+cn)字段描述 = 规划改)· **建议入口**:codex maker(优先复用 NOTIFY-1 会话,按 ctx% 定),规划复核。
+- **原则**(架构,三条):①**推 vs 拉**:不请自来进父会话上下文的面(spawn/dispatch 回执、内联结果、通知)只带决策字段;账本/遥测(`cost_usd/tokens_total/model/vendor_session_id/host/last_active`)只住按需拉的 `session_list`/`session_collect`/`status`。②**不回显不装饰**:调用方传入的(project/role/vendor/title/permission_mode/parent_sid)不回;`ok:true` 全删(错误走 MCP `isError` + `{error,code,…}`);`hint` 只在需行动的非成功态(queued/pending/truncated/`notify_deliverable:false`)。③**同名同型一处定义**:`context_pct` 整数、`cost_usd`、`status` 枚举、`turn_id`/`turn` 全面同名同义;list 行与 collect 信封共用一个 `SessionRow` 序列化器。
+- **规格**(逐面,`?` = 有值才出):
+  - `session_spawn`:只 spawn → `{sid}`;带 task → `{sid, turn_id, status: dispatched|queued}`;带 wait → `{sid}` + 内联结果(同 NOTIFY-1:`turn_id, turn, status, context_pct?, result_text, error_kind?, error?, cost_usd?`);`notify_deliverable` 仅 false 时出;删 `ok/project/project_source/role/vendor/protocol/host/vendor_session_id/permission_mode/parent_sid/delegation_depth/caller/hint`。
+  - `session_dispatch`:`{turn_id, status}`(queued 时加一句 hint);带 wait 同内联结果。
+  - `session_collect`:`{activity, context_pct?, cursor?, truncated?(仅 true), turns:[{turn_id, content, outcome?, error_kind?, error?}], cost_usd?, tokens_total?}`;`status:"stopped"` 仅非 live 时出;删 `ok/sid/role/model/vendor_session_id/total_chars/turns[].ts`。
+  - `session_list`:行 = `{sid, vendor, role?, title?, activity, context_pct?, parent_sid?, is_self?, waiting_approval?, host?(非本机), cost_usd?, tokens_total?}`;删 `last_active/project/current/model/ok`;`tree` 改 opt-in 参数 `tree:true` 且只覆盖过滤后的行;`truncated` 仅 true 时出(带 `total` + 一句 hint)。
+  - `session_stop`:`{sid, stopped:true}`。
+  - `status` / 裸名别名 / `chat_send_file`:不动。
+  - 错误统一:`{error, code, …}` + `isError`(已如此,只确认不回 `ok:false` 之外的装饰)。
+- **DoD**:每个面一条「键集合精确等于规格」的测试(含 `notify_deliverable` 仅 false 出、`tree` 默认不出);工具自描述同步且总长不增;`plugins/dsh-client` 透传不需改但跑其测试;`make check` / `make test-baseline` ≥ 1985/0;fmt / writeback 绿;handoff 附 spawn/list 真实回执各一例(token 数前后对比)。
 
 ### LEDGER-1 codex 累计 token 不上账 + 新模型无价目(真机探针 2026-08-26 发现,待排)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/codex_app_server.rs` + `crates/ccteam-cost/src/pricing.rs` + `crates/ccteam-im/src/progress_projection.rs` · **建议入口**:codex maker(小卡)。
