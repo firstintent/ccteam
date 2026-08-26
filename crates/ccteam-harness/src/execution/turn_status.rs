@@ -53,7 +53,7 @@ pub fn render_status_line(id: &StatusIdentity<'_>, st: &TurnStatus) -> String {
         };
         segments.push(format!("${rendered}"));
     } else if let Some(tokens) = st.tokens_total.filter(|tokens| *tokens > 0) {
-        segments.push(format!("{:.1}k tok", tokens as f64 / 1000.0));
+        segments.push(format_tokens(tokens));
     }
     let mut line = segments.join(" · ");
     if let Some(title) = id.title.filter(|title| !title.is_empty()) {
@@ -83,9 +83,18 @@ pub fn render_status_metrics(st: &TurnStatus) -> String {
         };
         segments.push(format!("${rendered}"));
     } else if let Some(tokens) = st.tokens_total.filter(|tokens| *tokens > 0) {
-        segments.push(format!("{:.1}k tok", tokens as f64 / 1000.0));
+        segments.push(format_tokens(tokens));
     }
     segments.join(" · ")
+}
+
+/// Compact token count: `12.3k tok` below one million, `22.0M tok` above.
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M tok", tokens as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}k tok", tokens as f64 / 1000.0)
+    }
 }
 
 fn truncate_title(title: &str) -> String {
@@ -244,5 +253,17 @@ mod tests {
             "→ cct/s42 (reviewer) · codex · turn 1"
         );
         assert_eq!(render_status_metrics(&st), "turn 1");
+    }
+
+    #[test]
+    fn million_token_ledger_uses_m_unit() {
+        let st = TurnStatus {
+            model: None,
+            context: None,
+            turn: 9,
+            cost_usd: None,
+            tokens_total: Some(22_008_310),
+        };
+        assert_eq!(render_status_metrics(&st), "turn 9 · 22.0M tok");
     }
 }

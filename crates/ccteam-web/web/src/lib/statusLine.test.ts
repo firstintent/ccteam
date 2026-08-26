@@ -156,3 +156,12 @@ describe("formatTurnStatus", () => {
     expect(formatTurnStatus()).toBeNull();
   });
 });
+
+describe("formatTurnStatus token ledger units", () => {
+  it("omits a zero ledger and reads millions in M", () => {
+    const base = { model: null, context: null, turn: 9, cost_usd: null };
+    expect(formatTurnStatus({ ...base, tokens_total: 0 })?.text).toBe("turn 9");
+    expect(formatTurnStatus({ ...base, tokens_total: 22_008_310 })?.text).toBe("turn 9 · 22.0M tok");
+    expect(formatTurnStatus({ ...base, tokens_total: 12_345 })?.text).toBe("turn 9 · 12.3k tok");
+  });
+});
