@@ -3080,7 +3080,9 @@ impl Gateway {
                 vendor_error,
                 interim_notes: 0,
                 covered_turns: vec![turn_id],
-                status_metrics: None,
+                context_pct: None,
+                turn: meta.turn_count,
+                error_kind: record.error_kind.clone(),
             });
         }
         tracing::info!(session = %sid, recovered = recovered.is_some(), "ccteam-im: unobserved turn reported");
@@ -5421,7 +5423,7 @@ impl Gateway {
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
             let mut pending_answers: Vec<String> = Vec::new();
-            let mut turn_last_status_metrics: Option<String> = None;
+            let mut turn_last_context_pct: Option<u64> = None;
             // Immediate-flush protocols can deliver one or more assistant
             // messages before their terminal boundary arrives. Remember that
             // the current vendor turn already produced visible text so an
@@ -6139,8 +6141,8 @@ impl Gateway {
                                     current_usage.map(|usage| base.unwrap_or(0).saturating_add(usage.total())).or(base)
                                 }),
                             };
-                            turn_last_status_metrics =
-                                Some(ccteam_harness::render_status_metrics(&status));
+                            turn_last_context_pct =
+                                crate::delegation::context_pct(Some(&status));
                             let chat_key = session
                                 .reply_to
                                 .lock()
@@ -6281,8 +6283,8 @@ impl Gateway {
                                 )
                             });
                             if let Some(status) = status.as_ref() {
-                                turn_last_status_metrics =
-                                    Some(ccteam_harness::render_status_metrics(status));
+                                turn_last_context_pct =
+                                    crate::delegation::context_pct(Some(status));
                             }
                             // v0.8.8 F1 — 落盘这条 assistant 回复到
                             // `.ccteam/chat/<sid>/turns.jsonl`(生产唯一 live
@@ -6362,9 +6364,14 @@ impl Gateway {
                                                     vendor_error: true,
                                                     interim_notes: notes,
                                                     covered_turns: covered,
-                                                    status_metrics: status
+                                                    context_pct: crate::delegation::context_pct(
+                                                        status.as_ref(),
+                                                    ),
+                                                    turn: status
                                                         .as_ref()
-                                                        .map(ccteam_harness::render_status_metrics),
+                                                        .map(|status| status.turn)
+                                                        .unwrap_or(vendor_turn),
+                                                    error_kind: record.error_kind.clone(),
                                                 });
                                             }
                                         } else {
@@ -6384,7 +6391,9 @@ impl Gateway {
                                                     vendor_error: false,
                                                     interim_notes: 0,
                                                     covered_turns: vec![record.turn_id.clone()],
-                                                    status_metrics: None,
+                                                    context_pct: None,
+                                                    turn: vendor_turn,
+                                                    error_kind: None,
                                                 });
                                             }
                                         }
@@ -6543,7 +6552,9 @@ impl Gateway {
                                     vendor_error: false,
                                     interim_notes: notes.saturating_sub(1),
                                     covered_turns: covered,
-                                    status_metrics: turn_last_status_metrics.take(),
+                                    context_pct: turn_last_context_pct.take(),
+                                    turn: vendor_turn,
+                                    error_kind: None,
                                 });
                             }
                             if let Some((final_text, reply_to)) = mirror_answer {
@@ -11877,14 +11888,22 @@ impl Gateway {
         }
         let notification = (mirror.notify != NotifyMode::Off).then(|| {
             crate::delegation::build_notification_text_with_outcome(
-                &signal.child_sid,
-                signal.vendor,
-                mirror.title.as_deref(),
-                &signal.turn_id,
-                &signal.tail,
-                signal.interim_notes,
-                signal.vendor_error,
-                signal.status_metrics.as_deref(),
+                &crate::delegation::DelegationSummary {
+                    sid: &signal.child_sid,
+                    turn_id: &signal.turn_id,
+                    outcome: if signal.vendor_error {
+                        crate::delegation::DelegationOutcome::Failed {
+                            kind: signal.error_kind.clone(),
+                            error: None,
+                        }
+                    } else {
+                        crate::delegation::DelegationOutcome::Done
+                    },
+                    context_pct: signal.context_pct,
+                    turn: signal.turn,
+                    cost_usd: None,
+                    answer: &signal.tail,
+                },
             )
         });
         Some(DelegationDeliveryPlan {
@@ -12099,10 +12118,7 @@ impl Gateway {
                         })
                         .collect();
                 if let Some(last) = missed.last() {
-                    let status_metrics = last
-                        .status
-                        .as_ref()
-                        .map(ccteam_harness::render_status_metrics);
+                    let context_pct = crate::delegation::context_pct(last.status.as_ref());
                     pending.push(crate::delegation::DelegationSignal {
                         child_sid: child_sid.clone(),
                         turn_id: last.turn_id.clone(),
@@ -12120,7 +12136,13 @@ impl Gateway {
                             || last.error.is_some(),
                         interim_notes: missed.len().saturating_sub(1),
                         covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
-                        status_metrics,
+                        context_pct,
+                        turn: last
+                            .status
+                            .as_ref()
+                            .map(|status| status.turn)
+                            .unwrap_or_default(),
+                        error_kind: last.error_kind.clone(),
                     });
                 }
             }
@@ -18772,10 +18794,7 @@ mod tests {
 
         // A completion notification wakes the out-of-focus s1.
         gateway
-            .submit_to_sid(
-                "s1",
-                "[ccteam] delegated session s9 completed turn s9-1".into(),
-            )
+            .submit_to_sid("s1", "s9 done · turn 1\nanswer".into())
             .await
             .unwrap();
         let seen = recv_answer(&mut broadcast).await;
@@ -25365,7 +25384,7 @@ mod tests {
     }
 
     /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
-    /// notifying dispatch wakes the parent with a `[ccteam]` turn; the child's
+    /// notifying dispatch wakes the parent with a minimal completion turn; the child's
     /// turn is durably on disk by the time the notification lands (ordering).
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn delegation_e2e_spawn_dispatch_notifies_parent_and_ordering() {
@@ -25438,19 +25457,16 @@ mod tests {
         let mut notified = false;
         for _ in 0..200 {
             let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
-            if turns.iter().any(|t| {
-                t.user.contains("[ccteam] delegated session")
-                    || t.assistant.contains("[ccteam] delegated session")
-            }) {
+            if turns
+                .iter()
+                .any(|turn| turn.user.starts_with(&format!("{child_sid} done · turn ")))
+            {
                 notified = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(
-            notified,
-            "parent must receive the `[ccteam]` completion notification"
-        );
+        assert!(notified, "parent must receive the completion notification");
         let progress = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
             .unwrap_or_default();
         assert!(
@@ -25472,7 +25488,7 @@ mod tests {
         );
     }
 
-    /// Count the `[ccteam]` notification turns delivered to `sid`.
+    /// Count minimal completion notification turns delivered to `sid`.
     fn ccteam_notification_turns(
         project_dir: &std::path::Path,
         sid: &str,
@@ -25480,7 +25496,7 @@ mod tests {
         ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.user.contains("[ccteam] delegated session"))
+            .filter(|turn| turn.user.contains(" done · turn ") || turn.user.contains(" FAILED ("))
             .collect()
     }
 
@@ -25556,17 +25572,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let notification = notification.expect("parent receives vendor-fatal notification");
-        assert!(
-            notification
-                .user
-                .starts_with("[ccteam] [delegation completed with VENDOR ERROR]"),
-            "vendor-fatal notification must lead with an explicit marker: {}",
-            notification.user
-        );
+        assert!(notification.user.contains(" FAILED (turn_failed) · turn "));
         assert!(notification.user.contains(CAPACITY_ERROR));
-        assert!(notification
-            .user
-            .contains(&format!("session_collect{{sid:{child_sid}, tail:true}}")));
 
         let child_failure =
             ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &child_sid)
@@ -25642,7 +25649,9 @@ mod tests {
             vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
-            status_metrics: None,
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
         };
         // Three interim narration messages inside the running turn → silence.
         for n in 1..=3 {
@@ -25664,23 +25673,16 @@ mod tests {
             vendor_error: false,
             interim_notes: 3,
             covered_turns: (1..=4).map(|n| format!("{child_sid}-{n}")).collect(),
-            status_metrics: None,
+            context_pct: None,
+            turn: 4,
+            error_kind: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
-        assert!(
-            notes[0]
-                .user
-                .contains("is now IDLE, waiting for the next dispatch"),
-            "notification states the child went idle: {}",
-            notes[0].user
-        );
-        assert!(
-            notes[0].user.contains("3 interim note(s)"),
-            "notification folds the interim count: {}",
-            notes[0].user
-        );
+        assert!(notes[0]
+            .user
+            .starts_with(&format!("{child_sid} done · turn 4")));
         assert!(notes[0].user.contains("wave finished: 3 cards done"));
 
         // Replay (at-least-once upstream) → deduped, still one notification.
@@ -25747,7 +25749,9 @@ mod tests {
             vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
-            status_metrics: None,
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
         };
         Gateway::deliver_delegation_signal_shared(
             Arc::clone(&gateway),
@@ -25860,7 +25864,9 @@ mod tests {
             vendor_error: false,
             interim_notes: if boundary { n as usize - 1 } else { 0 },
             covered_turns: vec![format!("{child_sid}-{n}")],
-            status_metrics: None,
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(1, false)).await;
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(2, false)).await;
@@ -25869,7 +25875,9 @@ mod tests {
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "all-mode narration remains ledger-only");
-        assert!(notes[0].user.contains("is now IDLE"));
+        assert!(notes[0]
+            .user
+            .starts_with(&format!("{child_sid} done · turn 2")));
 
         // `off` mode: nothing notifies, but the boundary still lands
         // delegation_completed in progress.jsonl.
@@ -25919,7 +25927,9 @@ mod tests {
                 vendor_error: false,
                 interim_notes: 0,
                 covered_turns: vec![format!("{child2}-1")],
-                status_metrics: None,
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
             },
         )
         .await;
@@ -26178,7 +26188,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|turn| turn.user.contains(" done · turn "))
                 .count()
         };
         let mut delivered = 0;
@@ -26267,7 +26277,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|turn| turn.user.contains(" done · turn "))
                 .collect::<Vec<_>>()
         };
         let mut got: Vec<TurnRecord> = vec![];
@@ -26284,7 +26294,9 @@ mod tests {
             "the folded notification carries the LATEST text: {}",
             got[0].user
         );
-        assert!(got[0].user.contains("2 interim note(s)"));
+        assert!(got[0]
+            .user
+            .starts_with(&format!("{child_sid} done · turn ")));
 
         Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;

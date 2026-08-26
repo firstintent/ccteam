@@ -194,7 +194,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "session_spawn",
-            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi | pi | dsh — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex/pi/dsh = coding agents; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch. Async managed-parent calls get ONE completion notification when the child's turn ends; a hand-started (enrolled) caller has no return transport, gets `notify_deliverable:false`, and must poll `session_collect` (or use `wait_seconds`). The response adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` and `context_pct` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.",
+            "description": "Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi | pi | dsh — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex/pi/dsh = coding agents; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch. Completion notification = first line `s<N> done · turn N · ctx N%` (or `FAILED (...)`) then the answer excerpt; inline completion returns `{status, turn, context_pct?, result_text, error_kind?, error?, cost_usd?}`; `session_collect{sid, tail:true}` returns the full text. A hand-started caller gets `notify_deliverable:false` and must poll. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -225,7 +225,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_dispatch",
-            "description": "Dispatch a task to a session by `sid` (from session_spawn / session_list); the target must run in YOUR OWN project. `task` is forwarded VERBATIM as a user turn (NO system-prompt injection). Async managed-parent calls get ONE completion notification at the vendor turn boundary; a hand-started (enrolled) caller has no return transport, gets `notify_deliverable:false`, and must poll `session_collect` (or use `wait_seconds`). Inline completion returns `{status:\"completed\"|\"failed\", result_text, error_kind?, error?, elapsed_seconds, cost_usd?, tokens_total?, context_pct?}`. Timeout returns `{status:\"pending\"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Dispatch to yourself or an ancestor is rejected (cycle). A dispatch to a session you did NOT delegate is a handoff: it runs and is recorded, but arms no completion watch unless you pass `notify` explicitly (`notify_deliverable:false` says so). Explicit dispatch, never a proactive kill.",
+            "description": "Dispatch a task to a session by `sid` (from session_spawn / session_list); the target must run in YOUR OWN project. `task` is forwarded VERBATIM as a user turn (NO system-prompt injection). Completion notification = first line `s<N> done · turn N · ctx N%` (or `FAILED (...)`) then the answer excerpt; inline completion returns `{status, turn, context_pct?, result_text, error_kind?, error?, cost_usd?}`; `session_collect{sid, tail:true}` returns the full text. Timeout returns `{status:\"pending\"}` and never cancels the child. Dispatch to yourself or an ancestor is rejected (cycle). A dispatch to a session you did NOT delegate is a handoff: it runs and is recorded, but arms no completion watch unless you pass `notify` explicitly. Explicit dispatch, never a proactive kill.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -476,8 +476,8 @@ mod tests {
             let description = defs.iter().find(|t| t["name"] == name).unwrap()["description"]
                 .as_str()
                 .unwrap();
-            assert!(description.contains("answer tersely with a structured summary"));
-            assert!(description.contains("no code or diff dumps"));
+            assert!(description.contains("s<N> done · turn N · ctx N%"));
+            assert!(description.contains("session_collect{sid, tail:true}"));
         }
     }
 

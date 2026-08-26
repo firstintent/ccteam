@@ -405,7 +405,7 @@ const SESSION_COLLECT_DEFAULT_N: usize = 20;
 const SESSION_COLLECT_DEFAULT_MAX_CHARS: usize = 10_000;
 const SESSION_COLLECT_MIN_MAX_CHARS: usize = 500;
 const SESSION_COLLECT_MAX_MAX_CHARS: usize = 50_000;
-const INLINE_RESULT_MAX_CHARS: usize = 10_000;
+use crate::delegation::{DelegationOutcome, DelegationSummary};
 
 /// Keep inline waits below the shortest common MCP client deadline (~300s),
 /// leaving 60s for spawn/submit work around the wait itself. The wire still
@@ -2657,7 +2657,6 @@ enum CompletionNotificationRoute {
 
 #[derive(Debug, Clone, Copy)]
 struct InlineWaitWindow {
-    requested_seconds: u64,
     effective_seconds: u64,
 }
 
@@ -2705,23 +2704,6 @@ impl CompletionNotificationRoute {
             }
         }
     }
-
-    fn pending_hint(self) -> &'static str {
-        match self {
-            Self::ParentSession => {
-                "still running; you will be notified on completion, or poll session_collect{sid}."
-            }
-            Self::Disabled => {
-                "still running; notifications are disabled; poll session_collect{sid}."
-            }
-            Self::Unavailable => {
-                "still running; this caller has no completion notification channel; poll session_collect{sid}."
-            }
-            Self::PeerUnsubscribed => {
-                "still running; the target is not a session you delegated, so no completion notification will fire; poll session_collect{sid}."
-            }
-        }
-    }
 }
 
 /// Derive a short ledger/display label from a spawn's first task: first
@@ -2753,7 +2735,7 @@ async fn dispatch_task(
     caller_sid: &str,
     sid: &str,
     task: String,
-    requested_wait_seconds: u64,
+    _requested_wait_seconds: u64,
     effective_wait_seconds: u64,
     notify: NotifyRequest,
     title: Option<String>,
@@ -2882,7 +2864,6 @@ async fn dispatch_task(
             sid,
             &turn_id,
             InlineWaitWindow {
-                requested_seconds: requested_wait_seconds,
                 effective_seconds: effective_wait_seconds,
             },
             rx,
@@ -2930,48 +2911,15 @@ async fn dispatch_task(
 /// an over-ceiling request actually reaches its shorter effective deadline.
 fn pending_dispatch_response(
     turn_id: &str,
-    wait: InlineWaitWindow,
-    hit_effective_deadline: bool,
+    _wait: InlineWaitWindow,
+    _hit_effective_deadline: bool,
     notification_route: CompletionNotificationRoute,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut response = serde_json::Map::new();
     response.insert("turn_id".to_string(), serde_json::json!(turn_id));
     response.insert("status".to_string(), serde_json::json!("pending"));
-    response.insert(
-        "notify_deliverable".to_string(),
-        serde_json::json!(notification_route.deliverable()),
-    );
-    if hit_effective_deadline && wait.requested_seconds > wait.effective_seconds {
-        response.insert(
-            "requested_wait_seconds".to_string(),
-            serde_json::json!(wait.requested_seconds),
-        );
-        response.insert(
-            "effective_wait_seconds".to_string(),
-            serde_json::json!(wait.effective_seconds),
-        );
-        let notification = match notification_route {
-            CompletionNotificationRoute::ParentSession => "or await the completion notification.",
-            CompletionNotificationRoute::Disabled => "notifications are disabled.",
-            CompletionNotificationRoute::Unavailable => {
-                "this caller has no completion notification channel."
-            }
-            CompletionNotificationRoute::PeerUnsubscribed => {
-                "the target is not a session you delegated — no completion notification."
-            }
-        };
-        response.insert(
-            "hint".to_string(),
-            serde_json::json!(format!(
-                "inline wait capped at {}s; task continues — poll session_collect{{sid, since:turn_id}} {notification}",
-                wait.effective_seconds
-            )),
-        );
-    } else {
-        response.insert(
-            "hint".to_string(),
-            serde_json::json!(notification_route.pending_hint()),
-        );
+    if !notification_route.deliverable() {
+        response.insert("notify_deliverable".into(), serde_json::json!(false));
     }
     response
 }
@@ -3068,7 +3016,7 @@ async fn dispatch_wait_for_completion(
         let gw = gateway.lock().await;
         gw.session_resolve(child_sid)
     };
-    let (result_record, cost_usd, tokens_total) = resolved
+    let (result_record, cost_usd, meta_turn) = resolved
         .as_ref()
         .map(|r| {
             let last =
@@ -3078,26 +3026,14 @@ async fn dispatch_wait_for_completion(
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
             // tokens, same semantics as session_list/collect (tokens present
             // even for vendors with no USD price table).
-            let (cost, tokens) =
+            let (cost, turn) =
                 ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &r.sid)
                     .ok()
-                    .map(|m| (m.cost_usd, m.tokens_total))
-                    .unwrap_or((None, None));
-            (last, cost, tokens)
+                    .map(|m| (m.cost_usd, m.turn_count))
+                    .unwrap_or((None, 0));
+            (last, cost, turn)
         })
-        .unwrap_or((None, None, None));
-    let raw_result_text = result_record
-        .as_ref()
-        .map(|turn| turn.assistant.as_str())
-        .unwrap_or_default();
-    let result_text = crate::delegation::truncate_head_tail_with_marker(
-        raw_result_text,
-        INLINE_RESULT_MAX_CHARS,
-        |omitted| crate::delegation::full_answer_marker(omitted, child_sid),
-    )
-    .text;
-    let result_turn = result_record.as_ref().map(|turn| turn.turn_id.clone());
-    let failed = result_record.as_ref().is_some_and(|turn| turn.failed());
+        .unwrap_or((None, None, 0));
 
     // Inline completion: the caller already holds the result → disarm the watch
     // so a delegation doesn't ALSO wake the parent with a redundant turn.
@@ -3106,59 +3042,29 @@ async fn dispatch_wait_for_completion(
             .await;
     }
 
-    let mut m = serde_json::Map::new();
-    m.insert("turn_id".to_string(), serde_json::json!(turn_id));
-    m.insert(
-        "status".to_string(),
-        serde_json::json!(if failed { "failed" } else { "completed" }),
-    );
-    m.insert(
-        "notify_deliverable".to_string(),
-        serde_json::json!(notification_route.deliverable()),
-    );
-    m.insert("result_text".to_string(), serde_json::json!(result_text));
-    m.insert("result_turn".to_string(), serde_json::json!(result_turn));
-    if let Some(kind) = result_record
-        .as_ref()
-        .and_then(|turn| turn.error_kind.as_deref())
-    {
-        m.insert("error_kind".to_string(), serde_json::json!(kind));
+    let record = result_record.as_ref();
+    let mut m = DelegationSummary {
+        sid: child_sid,
+        turn_id,
+        turn: record
+            .and_then(|turn| turn.status.as_ref().map(|status| status.turn))
+            .unwrap_or(meta_turn),
+        outcome: match record {
+            Some(turn) if turn.failed() => DelegationOutcome::Failed {
+                kind: turn.error_kind.clone(),
+                error: turn.error.clone(),
+            },
+            _ => DelegationOutcome::Done,
+        },
+        context_pct: record.and_then(|turn| crate::delegation::context_pct(turn.status.as_ref())),
+        cost_usd,
+        answer: record
+            .map(|turn| turn.assistant.as_str())
+            .unwrap_or_default(),
     }
-    if let Some(error) = result_record
-        .as_ref()
-        .and_then(|turn| turn.error.as_deref())
-    {
-        m.insert("error".to_string(), serde_json::json!(error));
-    }
-    // Additive telemetry (MCP-DX-1): submit→completion duration (0.1s
-    // resolution) + the child's session ledger, so a waiting caller can log
-    // per-vendor speed/cost without a second collect round-trip.
-    let elapsed = (wait_started.elapsed().as_millis() as f64 / 100.0).round() / 10.0;
-    m.insert("elapsed_seconds".to_string(), serde_json::json!(elapsed));
-    if let Some(c) = cost_usd {
-        m.insert("cost_usd".to_string(), serde_json::json!(c));
-    }
-    if let Some(t) = tokens_total {
-        m.insert("tokens_total".to_string(), serde_json::json!(t));
-    }
-    if let Some(pct) = result_record
-        .as_ref()
-        .and_then(|record| record.status.as_ref())
-        .and_then(|status| status.context.as_ref())
-        .and_then(|context| context.pct())
-    {
-        m.insert(
-            "context_pct".to_string(),
-            serde_json::json!(pct.round() as u64),
-        );
-    }
-    if let Some(model) = result_record
-        .as_ref()
-        .and_then(|record| record.status.as_ref())
-        .and_then(|status| status.model.as_deref())
-        .filter(|model| !model.trim().is_empty())
-    {
-        m.insert("model".to_string(), serde_json::json!(model));
+    .inline_result();
+    if !notification_route.deliverable() {
+        m.insert("notify_deliverable".into(), serde_json::json!(false));
     }
     m
 }
@@ -4258,6 +4164,7 @@ mod chat_send_file_tests {
 #[cfg(test)]
 mod session_tool_tests {
     use super::*;
+    use crate::delegation::INLINE_RESULT_MAX_CHARS;
     use serde_json::json;
 
     fn call(name: &str, args: serde_json::Value) -> serde_json::Value {
@@ -4329,16 +4236,9 @@ mod session_tool_tests {
         );
         assert_eq!(response["status"], "pending");
         assert!(response["turn_id"].as_str().is_some());
-        assert_eq!(response["requested_wait_seconds"], 600);
-        assert_eq!(response["effective_wait_seconds"], 1);
-        let hint = response["hint"].as_str().unwrap();
-        assert!(hint.contains("inline wait capped at 1s"), "{hint}");
-        assert!(hint.contains("task continues"), "{hint}");
-        assert!(
-            hint.contains("session_collect{sid, since:turn_id}"),
-            "{hint}"
-        );
-        assert!(hint.contains("completion notification"), "{hint}");
+        assert!(response.get("requested_wait_seconds").is_none());
+        assert!(response.get("effective_wait_seconds").is_none());
+        assert!(response.get("hint").is_none());
         assert!(
             gateway.lock().await.session_turn_in_flight(&child),
             "a capped pending response must not cancel the child turn"
@@ -5700,19 +5600,27 @@ mod session_tool_tests {
         .unwrap();
         let response = serde_json::Value::Object(frag);
         assert_eq!(response["status"], "completed", "{response}");
-        assert_eq!(response["tokens_total"], 12_345, "{response}");
         assert_eq!(response["cost_usd"], 0.12, "{response}");
         assert!(
             response.get("status_line").is_none(),
             "MCP stays numeric: {response}"
         );
         assert_eq!(response["context_pct"], 19, "{response}");
-        assert_eq!(response["model"], "stub-model", "{response}");
-        let elapsed = response["elapsed_seconds"].as_f64().unwrap();
-        assert!(
-            (0.0..=6.0).contains(&elapsed),
-            "elapsed within the wait window: {response}"
+        let keys: Vec<_> = response.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "context_pct",
+                "cost_usd",
+                "result_text",
+                "status",
+                "turn",
+                "turn_id"
+            ]
         );
+        for obsolete in ["tokens_total", "elapsed_seconds", "model", "result_turn"] {
+            assert!(response.get(obsolete).is_none(), "{obsolete}: {response}");
+        }
     }
 
     #[tokio::test]
@@ -6746,14 +6654,14 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("…[+"));
         assert!(result.contains("session_collect{sid:"));
         assert!(
             r.get("status_line").is_none(),
             "spawn MCP envelope has no text status: {r}"
         );
         assert_eq!(r["context_pct"], 19, "{r}");
-        assert_eq!(r["model"], "stub-model", "{r}");
+        assert!(r.get("model").is_none(), "{r}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -7050,13 +6958,13 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("…[+"));
         assert!(
             r.get("status_line").is_none(),
             "dispatch MCP envelope has no text status: {r}"
         );
         assert_eq!(r["context_pct"], 19, "{r}");
-        assert_eq!(r["model"], "stub-model", "{r}");
+        assert!(r.get("model").is_none(), "{r}");
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();
@@ -7180,7 +7088,7 @@ mod session_tool_tests {
                 ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &principal)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|t| t.user.contains("[ccteam] delegated session"))
+                    .filter(|t| t.user.contains(" done · turn "))
                     .collect();
             if !notes.is_empty() {
                 break;
@@ -7188,12 +7096,7 @@ mod session_tool_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(notes.len(), 1, "one boundary notification, no flood");
-        assert!(notes[0].user.contains("is now IDLE"), "{}", notes[0].user);
-        assert!(
-            notes[0].user.contains("1 interim note(s)"),
-            "pump folds the narration count: {}",
-            notes[0].user
-        );
+        assert!(notes[0].user.contains(" done · turn "), "{}", notes[0].user);
         assert!(notes[0].user.contains("echo: second wave"));
     }
 
