@@ -52,7 +52,7 @@ pub fn render_status_line(id: &StatusIdentity<'_>, st: &TurnStatus) -> String {
             format!("{cost:.2}")
         };
         segments.push(format!("${rendered}"));
-    } else if let Some(tokens) = st.tokens_total {
+    } else if let Some(tokens) = st.tokens_total.filter(|tokens| *tokens > 0) {
         segments.push(format!("{:.1}k tok", tokens as f64 / 1000.0));
     }
     let mut line = segments.join(" · ");
@@ -82,7 +82,7 @@ pub fn render_status_metrics(st: &TurnStatus) -> String {
             format!("{cost:.2}")
         };
         segments.push(format!("${rendered}"));
-    } else if let Some(tokens) = st.tokens_total {
+    } else if let Some(tokens) = st.tokens_total.filter(|tokens| *tokens > 0) {
         segments.push(format!("{:.1}k tok", tokens as f64 / 1000.0));
     }
     segments.join(" · ")
@@ -226,5 +226,23 @@ mod tests {
             render_status_metrics(&warning),
             "ctx 85%⚠ · turn 7 · 12.3k tok"
         );
+    }
+
+    #[test]
+    fn zero_token_ledger_is_unknown_not_rendered() {
+        // Codex accrues no per-turn usage on `TurnCompleted`, so a zero ledger
+        // means "unknown", never "0.0k tok".
+        let st = TurnStatus {
+            model: None,
+            context: None,
+            turn: 1,
+            cost_usd: None,
+            tokens_total: Some(0),
+        };
+        assert_eq!(
+            render_status_line(&id(), &st),
+            "→ cct/s42 (reviewer) · codex · turn 1"
+        );
+        assert_eq!(render_status_metrics(&st), "turn 1");
     }
 }
