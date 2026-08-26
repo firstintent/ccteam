@@ -29,7 +29,7 @@
 - **后续**:其余四面 = MCP-DX-2(owner 确认开发 2026-08-26),同冲突域,串行在本卡之后。
 
 ### MCP-DX-2 `session_*` 回执极简化:推面只带决策字段、拉面按需(owner 确认开发 2026-08-26,待排)
-- **状态**:进行中(codex s445·2026-08-26) · **冲突域**:`crates/ccteam-im/src/mcp/dispatch.rs` + `crates/ccteam-im/src/mcp/protocol.rs`(+ `docs/orchestration.md`(+cn)字段描述 = 规划改)· **建议入口**:codex maker,串行在 NOTIFY-1 之后(同冲突域);实际 = 新会话 s445(s444 ctx 74% 不复用),规划复核。
+- **状态**:完成(6d1dc475) · **冲突域**:`crates/ccteam-im/src/mcp/dispatch.rs` + `crates/ccteam-im/src/mcp/protocol.rs`(+ `docs/orchestration.md`(+cn)字段描述 = 规划改)· **建议入口**:codex maker,串行在 NOTIFY-1 之后(同冲突域);实际 = 新会话 s445(s444 ctx 74% 不复用),规划复核。
 - **原则**(架构,三条):①**推 vs 拉**:不请自来进父会话上下文的面(spawn/dispatch 回执、内联结果、通知)只带决策字段;账本/遥测(`cost_usd/tokens_total/model/vendor_session_id/host/last_active`)只住按需拉的 `session_list`/`session_collect`/`status`。②**不回显不装饰**:调用方传入的(project/role/vendor/title/permission_mode/parent_sid)不回;`ok:true` 全删(错误走 MCP `isError` + `{error,code,…}`);`hint` 只在需行动的非成功态(queued/pending/truncated/`notify_deliverable:false`)。③**同名同型一处定义**:`context_pct` 整数、`cost_usd`、`status` 枚举、`turn_id`/`turn` 全面同名同义;list 行与 collect 信封共用一个 `SessionRow` 序列化器。
 - **规格**(逐面,`?` = 有值才出):
   - `session_spawn`:只 spawn → `{sid}`;带 task → `{sid, turn_id, status: dispatched|queued}`;带 wait → `{sid}` + 内联结果(同 NOTIFY-1:`turn_id, turn, status, context_pct?, result_text, error_kind?, error?, cost_usd?`);`notify_deliverable` 仅 false 时出;删 `ok/project/project_source/role/vendor/protocol/host/vendor_session_id/permission_mode/parent_sid/delegation_depth/caller/hint`。
@@ -40,6 +40,7 @@
   - `status` / 裸名别名 / `chat_send_file`:不动。
   - 错误统一:`{error, code, …}` + `isError`(已如此,只确认不回 `ok:false` 之外的装饰)。
 - **DoD**:每个面一条「键集合精确等于规格」的测试(含 `notify_deliverable` 仅 false 出、`tree` 默认不出);工具自描述同步且总长不增;`plugins/dsh-client` 透传不需改但跑其测试;`make check` / `make test-baseline` ≥ 1985/0;fmt / writeback 绿;handoff 附 spawn/list 真实回执各一例(token 数前后对比)。
+- **验证**:codex maker s445 → `6d1dc475`(2026-08-26):fmt 净 · clippy 0 · ccteam-im 629/0 · `make test-baseline` 1989/0 · web MCP enroll/bearer 19/0(1 ignored)· dsh-client 34/0;spawn+task 回执 65 → 8 token,2 行 `session_list` ≈ 18 token;规划复核:成功路径无 `ok/caller/hint`,`notify_deliverable` 仅 false,`tree` opt-in,工具描述缩短(949→761 / 810→594 / 1005→398 / 1100→463)且「简洁回答」提示恢复。文档同步 = 规划改 `docs/orchestration.md`(+cn)。
 
 ### LEDGER-1 codex 累计 token 不上账 + 新模型无价目(真机探针 2026-08-26 发现,待排)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/codex_app_server.rs` + `crates/ccteam-cost/src/pricing.rs` + `crates/ccteam-im/src/progress_projection.rs` · **建议入口**:codex maker(小卡)。
