@@ -9526,7 +9526,6 @@ impl Gateway {
             ),
         };
 
-        let role = if s.role.is_empty() { "—" } else { &s.role };
         // v0.8.23 review §3.2-5 (item 2c) — "你在哪": a standalone header line
         // giving the project slug + current session (sid/role/title) ahead of
         // the existing deep-view body, so the two-pointer (project × session)
@@ -9548,8 +9547,10 @@ impl Gateway {
             cost_usd: meta.as_ref().and_then(|meta| meta.cost_usd),
             tokens_total: meta.as_ref().and_then(|meta| meta.tokens_total),
         };
+        // Line 1 is the shared status line (identity + model + ctx + turn +
+        // ledger); line 2 carries ONLY the run state — every fact once.
         let mut out = format!(
-            "🧭 {}\n📍 当前会话 {} · {} · {} · {role} · {state} {detail}",
+            "🧭 {}\n📍 {state} {detail}",
             ccteam_harness::render_status_line(
                 &ccteam_harness::StatusIdentity {
                     slug: &s.project,
@@ -9560,9 +9561,6 @@ impl Gateway {
                 },
                 &turn_status,
             ),
-            s.id,
-            s.project,
-            vendor_str(s.vendor)
         );
 
         // Project working-tree PATH — disambiguates an auto-appended slug
@@ -9572,33 +9570,20 @@ impl Gateway {
             out.push_str(&format!("\n   📁 {}", dir.display()));
         }
 
-        // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
-        // their own line for the deep view). Statusless/failed → `—` placeholder.
-        let model = status
-            .as_ref()
-            .and_then(|st| st.model.as_deref())
-            .filter(|m| !m.is_empty())
-            .unwrap_or("—");
+        // Deep-view line: effort · resume — model and ctx already sit on the
+        // status line above, so they are NOT repeated here. Unknown → `—`.
         let effort = status
             .as_ref()
             .and_then(|st| st.effort.as_deref())
             .filter(|e| !e.is_empty())
             .unwrap_or("—");
-        let ctx = match status
-            .as_ref()
-            .and_then(|st| st.context.as_ref())
-            .and_then(|c| c.pct())
-        {
-            Some(pct) => format!("ctx {pct:.0}%"),
-            None => "ctx —".to_string(),
-        };
         // The REAL `--resume` id (Anthropic session uuid), shown in full so it
         // can be matched against `tmux ls` / `claude --resume`; `—` for a
         // tmux/codex session that carries no stream-json uuid (never fabricated).
         let resume = thread_vendor_uuid(&s.thread)
             .map(|u| format!("resume {u}"))
             .unwrap_or_else(|| "resume —".to_string());
-        out.push_str(&format!("\n   {model} · {effort} · {ctx} · {resume}"));
+        out.push_str(&format!("\n   effort {effort} · {resume}"));
 
         // Running subagents / background workflows — straight from claude's task
         // lifecycle (NOT a fold). Subagents only exist while a turn is working;
@@ -21426,11 +21411,11 @@ mod tests {
         // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
         // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            idle[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            idle[0].contains("📍 🟢 idle"),
             "current-session header: {idle:?}"
         );
         assert!(
-            idle[0].contains("claude-opus-4-8 · max · ctx 41% · resume —"),
+            idle[0].contains("effort max · resume —"),
             "model·effort·ctx·resume line: {idle:?}"
         );
         // Owner req — /status ends by pointing at the full project list with a
@@ -21454,7 +21439,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            working[0].contains("📍 🔵 working "),
             "working state: {working:?}"
         );
         assert!(
@@ -21480,10 +21465,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert!(
-            stuck[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔴 STUCK "),
-            "stuck state: {stuck:?}"
-        );
+        assert!(stuck[0].contains("📍 🔴 STUCK "), "stuck state: {stuck:?}");
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
 
         // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
@@ -21501,7 +21483,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            fresh[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            fresh[0].contains("📍 🔵 working "),
             "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
         );
     }
@@ -21684,7 +21666,7 @@ mod tests {
         assert_eq!(
             out,
             vec![format!(
-                "🧭 → alpha/s1 (reviewer) · claude · turn 0\n📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
+                "🧭 → alpha/s1 (reviewer) · claude · turn 0\n📍 🟢 idle\n   📁 {}\n   effort — · resume —\n   ↓ 所有 1 个项目 → /projects",
                 proj.path().display()
             )]
         );
@@ -21708,19 +21690,20 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · — · 🟢 idle"),
+            out[0].contains("📍 🟢 idle"),
             "roleless → role shows —, vendor still shown: {out:?}"
         );
         assert!(
-            out[0].contains("— · — · ctx — · resume —"),
+            out[0].contains("effort — · resume —"),
             "statusless + no-uuid → placeholders, never fabricated: {out:?}"
         );
     }
 
     /// v0.8.23 review §3.2-5 (item 2c) — `/status` leads with a standalone
     /// "你在哪" header line (project slug + current session sid/role) ahead
-    /// of the existing `📍 当前会话` deep-view body, so the two-pointer
-    /// (project × session) mental model has one line answering both.
+    /// of the run-state line (`📍 🟢 idle`), so the two-pointer (project ×
+    /// session) mental model has one line answering both — and every fact
+    /// (identity / model / ctx) appears exactly once.
     #[tokio::test]
     async fn gateway_status_leads_with_where_am_i_header() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -21735,7 +21718,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1 (reviewer) · claude · turn 0\n📍 当前会话"),
+            out[0].starts_with("🧭 → alpha/s1 (reviewer) · claude · turn 0\n📍 🟢 idle"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -21887,10 +21870,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner.len(), 1);
-        assert!(
-            owner[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
-            "got: {owner:?}"
-        );
+        assert!(owner[0].contains("📍 🟢 idle"), "got: {owner:?}");
     }
 
     /// v0.8.19 `/status` — when the session's handle carries a stream-json
@@ -21922,10 +21902,7 @@ mod tests {
             out[0].contains(&format!("resume {uuid}")),
             "the real --resume uuid must show in the deep view: {out:?}"
         );
-        assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
-            "got: {out:?}"
-        );
+        assert!(out[0].contains("📍 🟢 idle"), "got: {out:?}");
     }
 
     /// v0.8.19 `/status` — registered in the command set + dispatches via
