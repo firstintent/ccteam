@@ -128,6 +128,8 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 - **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/ccteam-client`;从 ccteam 雇的 DSH 会话也住这个家,所以会出现在 DSH 页里。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件物化每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
 - **模型密钥**:在 DSH 原生 **Settings → Models** 里配置自己的 provider。同身份的所有 DSH 会话——你在这页打开的和在 ccteam 里雇出来的——都跑在同一个运行时、用同一份配置,改一次全体生效。ccteam 只逐字节复制和 hash 这些 DSH 配置文件,不解析 vendor YAML。
 - **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;同一条规则在雇出来的会话里同样成立——你从 DSH 侧直接输入的 turn 是 vendor 原生 turn,ccteam 的 transcript 与账本只记 ccteam 路由的部分,完整对话以 DSH 家为准。从 DSH 通过 ccteam 插件委派出去的工作照常入账。
+- **局域网明文 HTTP**:DSH Web 是按 loopback 源写的,浏览器只在安全上下文里给它 `crypto.randomUUID` 等 API;把 UI 搬离 loopback 的是 ccteam,所以伴生监听会在它下发的 HTML 里补回这一个 API(真 `crypto.getRandomValues` 生成的 UUID v4),浏览器自带时则不介入。走 HTTPS 或在 daemon 本机打开都不需要这些。
+- **局域网浏览器改设置**:DSH 把设置文档(所有 Settings 页,含「插件配置」)当作「操作者本机」才可触及的特权面,而且由客户端按页面地址判断——原生 `dsh web` 从局域网地址打开时,「插件配置」页一片空白、设置只读。经伴生监听访问时这个「本机」就是你的 ccteam 身份:实例只属于你,页面已经过 ccteam 鉴权,所以伴生监听用 DSH 自己的传输钩子(`__DSH_TRANSPORT__.ownsHost`)声明「本页拥有其 Host」,任何浏览器都能改设置。DSH 从 0.1.1-rc.2 之后的版本才读这个钩子(已在 DSH main 上);rc.2 及更早版本里这条声明不起作用,经伴生监听访问时设置同样只读——此时用 SSH 隧道走 `127.0.0.1:<伴生端口>`。钩子生效后的一个连带后果:DSH 的产出文件动作会作用在 daemon 所在机器(即工作区机器)上。
 - **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。同一个 OS 用户下的配置可见性只是便利边界,不是硬安全边界。
 - **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
 

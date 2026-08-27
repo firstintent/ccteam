@@ -356,16 +356,61 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
 /// daemon host), which keeps it inert on the paths that never needed it.
 const CRYPTO_RANDOM_UUID_POLYFILL: &str = r#"<script>(function(){var c=window.crypto;if(!c||typeof c.getRandomValues!=="function")return;if(typeof c.randomUUID==="function")return;var h=[];for(var i=0;i<256;i++)h.push((i+256).toString(16).slice(1));Object.defineProperty(c,"randomUUID",{configurable:true,writable:true,value:function(){var b=new Uint8Array(16);c.getRandomValues(b);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;return h[b[0]]+h[b[1]]+h[b[2]]+h[b[3]]+"-"+h[b[4]]+h[b[5]]+"-"+h[b[6]]+h[b[7]]+"-"+h[b[8]]+h[b[9]]+"-"+h[b[10]]+h[b[11]]+h[b[12]]+h[b[13]]+h[b[14]]+h[b[15]]}})})();</script>"#;
 
-/// Splice the polyfill in as the first thing inside `<head>` so it runs before
-/// the boot script and every client plugin module. Returns `None` when there
-/// is no head to open, leaving the body untouched rather than guessing.
+/// Declares that the page owns its Host, through DSH's own transport hook.
+///
+/// DSH keeps its **privileged surface** — the settings document (every
+/// Settings page: General, Models, Plugin configuration), and the deliverables
+/// file actions — reachable only from "the operator's own machine". The client
+/// decides that from the page authority (`dsh-client-connection`:
+/// `isLoopback = transport.ownsHost || page hostname is loopback`), and a
+/// non-loopback page gets every settings scope in `memory` mode: the describe
+/// mirror never asks the Host, so the Plugin configuration tab renders nothing
+/// at all — not the cards, not even the "no settings" line — while the same
+/// instance opened from `127.0.0.1` shows everything. Real-machine v0.10.4: a
+/// LAN browser on ccteam web → DSH saw an empty tab and had nowhere to paste a
+/// REST token.
+///
+/// Through the companion port that stand-in is ccteam's authenticated
+/// identity: the page reaches an instance that belongs to that identity alone
+/// (the operator's own `~/.dsh`, or the tenant's isolated home), after ccteam
+/// auth, and the server-side Host/Origin fence is already satisfied by the
+/// loopback rewrite in [`proxy_request_headers`]. `__DSH_TRANSPORT__.ownsHost`
+/// is the hook DSH documents for exactly this ("a shell that assembles its
+/// own transport"); the companion port is that shell.
+///
+/// Version-safe by construction, because the two published shapes of the hook
+/// differ and a served page carries the global for both:
+/// - DSH ≤ 0.1.1-rc.2 has no `ownsHost` and reads
+///   `transport?.createApiClient() ?? new WebApiClient()` — a global WITHOUT
+///   `createApiClient` aborts the whole boot ("transport?.createApiClient is
+///   not a function", real-machine), so the declaration ships a
+///   `createApiClient` that answers `undefined` and lets the default carrier
+///   through. On those versions the flag is simply not read: settings stay
+///   loopback-only there (a `127.0.0.1` tunnel is the way in), nothing else
+///   changes.
+/// - DSH after rc.2 reads `ownsHost`, ignores `createApiClient`, and takes
+///   `fetch` / `openStream` / `loadBundle` from the global only when present —
+///   none are, so HTTP + WebSocket + HTTP bundles stay the defaults.
+///
+/// An existing global (a shell that brought its own transport) is left alone
+/// except for the missing flag. Consequence to know once the flag is read:
+/// deliverables actions then act on the daemon host — the workspace machine.
+const DSH_TRANSPORT_OWNS_HOST: &str = r#"<script>(function(){var g=window,t=g.__DSH_TRANSPORT__;if(t===undefined){g.__DSH_TRANSPORT__={ownsHost:true,createApiClient:function(){return undefined}};return}if(t!==null&&typeof t==="object"&&t.ownsHost===undefined){t.ownsHost=true}})();</script>"#;
+
+/// Splice the companion head scripts in as the first thing inside `<head>` so
+/// they run before the boot script and every client plugin module. Returns
+/// `None` when there is no head to open, leaving the body untouched rather
+/// than guessing.
 fn inject_polyfill(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let head = lower.find("<head")?;
     let open_end = lower[head..].find('>')? + head + 1;
-    let mut out = String::with_capacity(html.len() + CRYPTO_RANDOM_UUID_POLYFILL.len());
+    let mut out = String::with_capacity(
+        html.len() + CRYPTO_RANDOM_UUID_POLYFILL.len() + DSH_TRANSPORT_OWNS_HOST.len(),
+    );
     out.push_str(&html[..open_end]);
     out.push_str(CRYPTO_RANDOM_UUID_POLYFILL);
+    out.push_str(DSH_TRANSPORT_OWNS_HOST);
     out.push_str(&html[open_end..]);
     Some(out)
 }
@@ -644,6 +689,31 @@ mod tests {
         assert!(at < patched.find("__DSH_BOOT__").unwrap());
         assert!(at < patched.find("/assets/index.js").unwrap());
         assert!(patched.starts_with("<!doctype html>"));
+    }
+
+    /// The privileged-surface declaration rides the same splice, ahead of the
+    /// boot script: `dsh-client-connection` reads `__DSH_TRANSPORT__` once, at
+    /// plugin boot, so a declaration placed after it is one that never counted.
+    #[test]
+    fn owns_host_declaration_lands_before_the_boot_script() {
+        let html =
+            "<html><head><script>window.__DSH_BOOT__ = {}</script></head><body></body></html>";
+        let patched = inject_polyfill(html).expect("head present");
+        let at = patched
+            .find("__DSH_TRANSPORT__")
+            .expect("declaration present");
+        assert!(at < patched.find("__DSH_BOOT__").unwrap());
+        assert!(patched.contains("ownsHost:true"));
+        // No transport override: `fetch` / `openStream` / `loadBundle` are
+        // absent so HTTP + WebSocket + HTTP bundles stay the defaults, and a
+        // shell that brought its own hooks keeps them.
+        assert!(!patched.contains("fetch:"));
+        assert!(!patched.contains("openStream"));
+        assert!(patched.contains("t.ownsHost===undefined"));
+        // DSH ≤ 0.1.1-rc.2 calls `transport?.createApiClient()` unconditionally
+        // and `??`-falls through to its default carrier on `undefined`; a
+        // global without it aborts the boot.
+        assert!(patched.contains("createApiClient:function(){return undefined}"));
     }
 
     #[test]

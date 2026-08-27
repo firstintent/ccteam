@@ -58,7 +58,12 @@ shortcut registers both plugins; restart the DSH process yourself.
 
 Open DSH **Settings → Plugins → Plugin configuration**. `ccteam-ui`
 contributes one card per ccteam plugin (a card only appears once its plugin
-is installed); fill in the card, then **Save**:
+is installed); fill in the card, then **Save**. DSH shows this tab only to a
+browser it considers the operator's own machine: open a hand-started `dsh web`
+from `127.0.0.1`, or go through ccteam's DSH page, which declares the page
+owns its Host (see usage.md → DSH Web; DSH reads that from the release after
+0.1.1-rc.2 — on rc.2 use an SSH tunnel to the companion port); a native
+`dsh web` opened over a LAN address leaves the tab empty.
 
 | Card | Set | Where to get it |
 |---|---|---|
