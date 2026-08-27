@@ -127,15 +127,16 @@ describe("formatStatusLine", () => {
 });
 
 describe("formatTurnStatus", () => {
-  it("renders the compact footer and warning", () => {
+  it("renders turn and context only — model and ledger never repeat in the footer", () => {
     expect(
       formatTurnStatus({
         model: "gpt-5.3-codex",
         context: { used_tokens: 85, window_tokens: 100, pct: 85 },
         turn: 7,
         cost_usd: 0.42,
+        tokens_total: 22_008_310,
       }),
-    ).toEqual({ text: "ctx 85%⚠ · gpt-5.3-codex · turn 7 · $0.42", warn: true });
+    ).toEqual({ text: "turn 7 · ctx 85%⚠", warn: true });
   });
 
   it("derives context percentage from serialized token counts", () => {
@@ -144,24 +145,12 @@ describe("formatTurnStatus", () => {
         context: { used_tokens: 19, window_tokens: 100 },
         turn: 1,
       }),
-    ).toEqual({ text: "ctx 19% · turn 1", warn: false });
+    ).toEqual({ text: "turn 1 · ctx 19%", warn: false });
     expect(contextPct({ used_tokens: 19, window_tokens: 100 })).toBe(19);
   });
 
-  it("omits unknown fields and falls back to tokens", () => {
-    expect(formatTurnStatus({ turn: 2, tokens_total: 12_345 })).toEqual({
-      text: "turn 2 · 12.3k tok",
-      warn: false,
-    });
+  it("omits unknown context and renders nothing without a status", () => {
+    expect(formatTurnStatus({ turn: 2, tokens_total: 12_345 })).toEqual({ text: "turn 2", warn: false });
     expect(formatTurnStatus()).toBeNull();
-  });
-});
-
-describe("formatTurnStatus token ledger units", () => {
-  it("omits a zero ledger and reads millions in M", () => {
-    const base = { model: null, context: null, turn: 9, cost_usd: null };
-    expect(formatTurnStatus({ ...base, tokens_total: 0 })?.text).toBe("turn 9");
-    expect(formatTurnStatus({ ...base, tokens_total: 22_008_310 })?.text).toBe("turn 9 · 22.0M tok");
-    expect(formatTurnStatus({ ...base, tokens_total: 12_345 })?.text).toBe("turn 9 · 12.3k tok");
   });
 });

@@ -62,30 +62,12 @@ export function formatStatusLine(status: SessionStatus): string | null {
 
 export function formatTurnStatus(status?: TurnStatus): { text: string; warn: boolean } | null {
   if (!status) return null;
-  const parts: string[] = [];
+  // Bubble footer = `turn N · ctx N%` only: the model sits in the bubble header
+  // and the ledger lives on the session pages — every fact once.
+  const parts: string[] = [`turn ${status.turn}`];
   const pct = contextPct(status.context);
   const roundedPct = typeof pct === "number" && Number.isFinite(pct) ? Math.round(pct) : null;
   if (roundedPct !== null) parts.push(`ctx ${roundedPct}%${roundedPct >= 85 ? "⚠" : ""}`);
-  if (typeof status.model === "string" && status.model.trim()) parts.push(status.model);
-  parts.push(`turn ${status.turn}`);
-  if (
-    typeof status.cost_usd === "number" &&
-    Number.isFinite(status.cost_usd) &&
-    status.cost_usd >= 0
-  ) {
-    parts.push(status.cost_usd > 0 && status.cost_usd < 0.005 ? "$<0.01" : `$${status.cost_usd.toFixed(2)}`);
-  } else if (
-    typeof status.tokens_total === "number" &&
-    Number.isFinite(status.tokens_total) &&
-    status.tokens_total > 0
-  ) {
-    // Mirrors the Rust renderer: a zero ledger is unknown (omitted); ≥1M reads in M.
-    parts.push(
-      status.tokens_total >= 1_000_000
-        ? `${(status.tokens_total / 1_000_000).toFixed(1)}M tok`
-        : `${(status.tokens_total / 1000).toFixed(1)}k tok`,
-    );
-  }
   return { text: parts.join(" · "), warn: roundedPct !== null && roundedPct >= 85 };
 }
 

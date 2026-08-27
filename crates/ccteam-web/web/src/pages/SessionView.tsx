@@ -691,12 +691,19 @@ export default function SessionView({
                           attachments={row.attachments}
                         />
                       </div>
-                      <RowTime ts={row.ts} lang={lang} />
                       {(() => {
+                        // One footer line: `HH:MM · s12 · turn N · ctx N%` — the
+                        // model already heads the bubble, the ledger lives on
+                        // the session pages.
                         const footer = formatTurnStatus(row.status);
-                        return footer ? (
-                          <span className={`turn-status${footer.warn ? " warn" : ""}`}>{footer.text}</span>
-                        ) : null;
+                        const tail = footer ? `${sid} · ${footer.text}` : null;
+                        if (!row.ts && !tail) return null;
+                        return (
+                          <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
+                            <RowTime ts={row.ts} lang={lang} />
+                            {tail ? (row.ts ? ` · ${tail}` : tail) : null}
+                          </span>
+                        );
                       })()}
                     </div>
                   );

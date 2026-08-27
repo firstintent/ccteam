@@ -9558,21 +9558,29 @@ impl Gateway {
             cost_usd: meta.as_ref().and_then(|meta| meta.cost_usd),
             tokens_total: meta.as_ref().and_then(|meta| meta.tokens_total),
         };
-        // Line 1 is the shared status line (identity + model + ctx + turn +
-        // ledger); line 2 carries ONLY the run state — every fact once.
-        let mut out = format!(
-            "🧭 {}\n📍 {state} {detail}",
-            ccteam_harness::render_status_line(
-                &ccteam_harness::StatusIdentity {
-                    slug: &s.project,
-                    sid: &s.id,
-                    vendor: vendor_str(s.vendor),
-                    role: &s.role,
-                    title: title.as_deref(),
-                },
-                &turn_status,
-            ),
-        );
+        // Line 1 = where am I (slug/sid + title), nothing else; line 2 = run
+        // state · vendor model · role · metrics — every fact exactly once.
+        let mut head = format!("🧭 → {}/{}", s.project, s.id);
+        if let Some(title) = title.as_deref().filter(|title| !title.is_empty()) {
+            head.push_str(&format!(
+                " 「{}」",
+                ccteam_harness::truncate_status_title(title)
+            ));
+        }
+        let mut second: Vec<String> = vec![format!("{state} {detail}").trim_end().to_string()];
+        match turn_status
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            Some(model) => second.push(format!("{} {model}", vendor_str(s.vendor))),
+            None => second.push(vendor_str(s.vendor).to_string()),
+        }
+        if !s.role.is_empty() {
+            second.push(s.role.clone());
+        }
+        second.push(ccteam_harness::render_status_metrics(&turn_status));
+        let mut out = format!("{head}\n📍 {}", second.join(" · "));
 
         // Project working-tree PATH — disambiguates an auto-appended slug
         // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
@@ -21685,7 +21693,7 @@ mod tests {
         assert_eq!(
             out,
             vec![format!(
-                "🧭 → alpha/s1 (reviewer) · claude · turn 0\n📍 🟢 idle\n   📁 {}\n   effort — · resume —\n   ↓ 所有 1 个项目 → /projects",
+                "🧭 → alpha/s1\n📍 🟢 idle · claude · reviewer · turn 0\n   📁 {}\n   effort — · resume —\n   ↓ 所有 1 个项目 → /projects",
                 proj.path().display()
             )]
         );
@@ -21737,7 +21745,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1 (reviewer) · claude · turn 0\n📍 🟢 idle"),
+            out[0].starts_with("🧭 → alpha/s1\n📍 🟢 idle · claude · reviewer · turn 0"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }

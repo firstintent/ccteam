@@ -97,6 +97,11 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// Title as the status line shows it (whitespace-collapsed, 60-char cap).
+pub fn truncate_status_title(title: &str) -> String {
+    truncate_title(title)
+}
+
 fn truncate_title(title: &str) -> String {
     let mut chars = title.chars();
     let first: String = chars.by_ref().take(24).collect();

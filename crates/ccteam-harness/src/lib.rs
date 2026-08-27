@@ -106,7 +106,7 @@ pub use execution::session_meta::{
     SessionOrigin, TitleSource,
 };
 pub use execution::turn_status::{
-    render_status_line, render_status_metrics, StatusIdentity, TurnStatus,
+    render_status_line, render_status_metrics, truncate_status_title, StatusIdentity, TurnStatus,
 };
 pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};

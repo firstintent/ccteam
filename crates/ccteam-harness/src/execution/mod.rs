@@ -46,4 +46,6 @@ pub use grok_acp::GrokAcpAdapter;
 pub use kimi_acp::KimiAcpAdapter;
 pub use opencode_acp::OpencodeAcpAdapter;
 pub use pi_rpc::PiRpcAdapter;
-pub use turn_status::{render_status_line, render_status_metrics, StatusIdentity, TurnStatus};
+pub use turn_status::{
+    render_status_line, render_status_metrics, truncate_status_title, StatusIdentity, TurnStatus,
+};
