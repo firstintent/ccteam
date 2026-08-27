@@ -326,7 +326,7 @@ impl DshRuntimeManager {
 
     /// Hosts-page "register the ccteam DSH plugins" action (gate ①): merge
     /// ccteam's OWN bundle entries and patch rows — `ccteam-client` carrying
-    /// this daemon's `transportSocket` and URL, `ccteam-team` carrying the URL
+    /// this daemon's `transportSocket` and URL, `ccteam-ui` carrying the URL
     /// — into the operator's real `~/.dsh` web profile, WITHOUT starting or
     /// attaching a runtime. This is how an operator whose hand-started `dsh
     /// web` lacks the plugins gets them: register here, then restart that
@@ -356,7 +356,7 @@ impl DshRuntimeManager {
                         daemon_url: Some(&daemon_url),
                         transport_socket: Some(&socket.to_string_lossy()),
                     },
-                    crate::execution::dsh_acp::materialize::DshTeamConfig {
+                    crate::execution::dsh_acp::materialize::DshUiConfig {
                         daemon_url: Some(&daemon_url),
                         rest_token: None,
                     },

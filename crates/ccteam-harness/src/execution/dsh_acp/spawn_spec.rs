@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::materialize::{
-    materialize_profile_in, DshClientConfig, DshTeamConfig, ProfileSpec, WEB_PROFILE,
+    materialize_profile_in, DshClientConfig, DshUiConfig, ProfileSpec, WEB_PROFILE,
 };
 use crate::{ccteam_root_from_env, HarnessError, SpawnCtx};
 
@@ -338,7 +338,7 @@ pub struct DshWebSpawnOptions<'a> {
     pub profile: &'a str,
     /// `true` = ccteam owns this whole profile (managed tenant home).
     /// `false` = the operator's own `~/.dsh`: ccteam merges ONLY its own
-    /// `@ccteam/dsh-client` entries in (gate ①), never a whole profile.
+    /// `@ccteam/ccteam-client` entries in (gate ①), never a whole profile.
     pub materialize_profile: bool,
     pub enrollment: Option<&'a str>,
     pub daemon_url: Option<&'a str>,
@@ -347,7 +347,7 @@ pub struct DshWebSpawnOptions<'a> {
     /// This identity's own ccteam REST bearer (`ccteam:<hex>`), for the team
     /// panel. `None` on the operator branch: ccteam writes credentials only
     /// into homes it owns, so the operator pastes it into DSH Settings once —
-    /// the same line `@ccteam/dsh-client` draws for `enrollment`.
+    /// the same line `@ccteam/ccteam-client` draws for `enrollment`.
     pub rest_token: Option<&'a str>,
 }
 
@@ -381,7 +381,7 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
     // by construction (see `DshWebSpawnOptions::rest_token`), so the panel is
     // registered and pointed at the daemon there, and the human supplies the
     // credential from the DSH Settings card.
-    let team = DshTeamConfig {
+    let ui = DshUiConfig {
         daemon_url: options.daemon_url,
         rest_token: options.rest_token,
     };
@@ -394,7 +394,7 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
         materialize_profile_in(
             &options.ccteam_home,
             &options.dsh_home,
-            ProfileSpec::web(config, team),
+            ProfileSpec::web(config, ui),
         )?;
     } else {
         super::materialize::register_ccteam_plugins_into_profile(
@@ -402,7 +402,7 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
             &options.dsh_home,
             options.profile,
             config,
-            team,
+            ui,
         )?;
     }
 

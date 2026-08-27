@@ -89,9 +89,9 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
             .unwrap();
     let bundles = manifest["dsh"]["profile"]["bundles"].as_array().unwrap();
     let names: Vec<&str> = bundles.iter().filter_map(|v| v.as_str()).collect();
-    assert!(names.contains(&"@ccteam/dsh-client"), "own bundle added");
+    assert!(names.contains(&"@ccteam/ccteam-client"), "own bundle added");
     assert!(
-        names.contains(&"@ccteam/dsh-team"),
+        names.contains(&"@ccteam/ccteam-ui"),
         "the team panel is registered by the same click: {names:?}"
     );
     assert!(names.contains(&"@user/my-plugin"), "user bundle preserved");
@@ -123,7 +123,7 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
             .is_some_and(|socket| !socket.is_empty()),
         "row carries the socket path: {patch}"
     );
-    let team = row_of("ccteam-team");
+    let team = row_of("ccteam-ui");
     assert_eq!(
         team["daemonUrl"],
         serde_yaml::Value::String("http://127.0.0.1:7331".into()),
@@ -138,7 +138,7 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
         "the admin token must never reach a profile ccteam does not own: {patch}"
     );
 
-    for package in ["dsh-client", "dsh-team"] {
+    for package in ["ccteam-client", "ccteam-ui"] {
         assert!(
             profile
                 .join("node_modules")
@@ -160,7 +160,7 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
     assert_eq!(resp.status(), 200);
     let patch_again = std::fs::read_to_string(profile.join("cordis.patch.yml")).unwrap();
     let rows_again: Vec<serde_yaml::Value> = serde_yaml::from_str(&patch_again).unwrap();
-    for id in ["ccteam-client", "ccteam-team"] {
+    for id in ["ccteam-client", "ccteam-ui"] {
         assert_eq!(
             rows_again
                 .iter()

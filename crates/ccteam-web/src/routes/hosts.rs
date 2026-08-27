@@ -548,8 +548,8 @@ pub(crate) async fn handle_register_mcp(
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
         // DSH's "register ccteam" is not a vendor-config write: ccteam reaches
-        // DSH through Cordis plugins — `@ccteam/dsh-client` (tool + transport)
-        // and `@ccteam/dsh-team` (the team panel). This action merges ccteam's
+        // DSH through Cordis plugins — `@ccteam/ccteam-client` (tool + transport)
+        // and `@ccteam/ccteam-ui` (the team panel). This action merges ccteam's
         // OWN bundle entries + patch rows (carrying this daemon's
         // transportSocket/URL, never a credential) into the operator's real
         // `~/.dsh` web profile — gate ①, idempotent, merge-only — so a

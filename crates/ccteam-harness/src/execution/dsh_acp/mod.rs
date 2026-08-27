@@ -214,7 +214,7 @@ impl DshAcpAdapter {
             // `dsh web` predates the registration.
             message.push_str(
                 ". That instance was started outside ccteam — register the plugin \
-                 (`dsh plugin add @ccteam/dsh-client`) and restart your DSH web",
+                 (`dsh plugin add @ccteam/ccteam-client`) and restart your DSH web",
             );
         }
         message.push_str(&format!(": {error}"));

@@ -125,7 +125,7 @@ pub enum AgentVendor {
     Opencode,
     Kimi,
     Pi,
-    /// DSH — DeepSeek Harness. ACP over a Cordis plugin (`@ccteam/dsh-client`);
+    /// DSH — DeepSeek Harness. ACP over a Cordis plugin (`@ccteam/ccteam-client`);
     /// v0.9.15 ships a minimal stub adapter (real handshake lands later this
     /// cycle, see `execution/dsh_acp`).
     Dsh,

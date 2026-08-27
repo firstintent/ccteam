@@ -2,8 +2,8 @@
 # Rebuild the embedded plugin tarballs that `execution/dsh_acp/materialize.rs`
 # ships with `include_bytes!`.
 #
-#   plugins/dsh-client -> crates/ccteam-harness/src/execution/dsh_acp/assets/dsh-client.tgz
-#   plugins/dsh-team   -> crates/ccteam-harness/src/execution/dsh_acp/assets/dsh-team.tgz
+#   plugins/ccteam-client -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-client.tgz
+#   plugins/ccteam-ui  -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz
 #
 # Rust builds must never require npm or node (same rule as the checked-in Pi
 # bridge asset), so the tarballs are produced here and committed alongside the
@@ -28,7 +28,7 @@ assets="$repo/crates/ccteam-harness/src/execution/dsh_acp/assets"
 
 plugins=("$@")
 if [ ${#plugins[@]} -eq 0 ]; then
-  plugins=(dsh-client dsh-team)
+  plugins=(ccteam-client ccteam-ui)
 fi
 
 mkdir -p "$assets"

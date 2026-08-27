@@ -619,7 +619,7 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
 
     // Zero user steps: the team panel is installed AND credentialed in the
     // tenant's own home by the same start.
-    let team = patch_config_for(&profile_dir, "ccteam-team");
+    let team = patch_config_for(&profile_dir, "ccteam-ui");
     assert_eq!(
         team["daemonUrl"],
         serde_yaml::Value::String("http://127.0.0.1:7331".into())
@@ -632,7 +632,7 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
         profile_dir
             .join("node_modules")
             .join("@ccteam")
-            .join("dsh-team")
+            .join("ccteam-ui")
             .join("package.json")
             .is_file(),
         "the panel package is materialized into the tenant profile"
@@ -694,8 +694,8 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
         package["dsh"]["profile"]["bundles"],
         serde_json::json!([
             "@deepseek-ai/dsh-web-app",
-            "@ccteam/dsh-client",
-            "@ccteam/dsh-team"
+            "@ccteam/ccteam-client",
+            "@ccteam/ccteam-ui"
         ]),
         "only ccteam's own bundles are appended"
     );
@@ -716,7 +716,7 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
 
     // The panel is registered and pointed at this daemon, but its credential
     // is the operator's to paste — same line as `enrollment` above.
-    let team = patch_config_for(&profile_dir, "ccteam-team");
+    let team = patch_config_for(&profile_dir, "ccteam-ui");
     assert_eq!(
         team["daemonUrl"],
         serde_yaml::Value::String("http://127.0.0.1:7331".into())
@@ -1408,7 +1408,7 @@ async fn version_gate_refuses_a_plugin_older_than_the_socket_transport() {
     assert!(message.contains("0.10.2"), "got {message}");
     assert!(message.contains(MIN_DSH_CLIENT_VERSION), "got {message}");
     assert!(
-        message.contains("dsh plugin add @ccteam/dsh-client"),
+        message.contains("dsh plugin add @ccteam/ccteam-client"),
         "the error must name the remedy: {message}"
     );
 }

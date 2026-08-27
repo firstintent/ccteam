@@ -15,7 +15,16 @@
 
 ## 当前卡
 
-> **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/dsh-team` —— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名 `@ccteam/dsh-team`(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
+> **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/ccteam-ui`(2026-08-28 起,原名 `@ccteam/dsh-team`;插件 1 同日改名 `@ccteam/ccteam-client`,原 `@ccteam/dsh-client`)—— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)+ 双插件设置卡。**定位(owner 2026-08-28)**:ccteam-ui = 在 DSH 的 UI 里用多种 harness,把 ccteam 最核心的体验带进 DSH(DSH 的 UI 风格优于 ccteam web),**未来可能整体取代现有 ccteam web**;故一切按 DSH 客户端插件机制构建,零 ccteam-web 移植。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
+
+### DSH2-UI-2 ccteam-ui 重设计:双插件改名显示全称 + 严格按 DSH 插件机制重写 client 半(owner 直驱 2026-08-28,规划亲自)
+- **状态**:进行中(规划·2026-08-28) · **冲突域**:`plugins/`(两包整体改名)+ `crates/ccteam-harness/src/execution/dsh_acp/(materialize.rs + assets + spawn_spec.rs)+ dsh_runtime.rs` + `crates/ccteam-web/src/routes/hosts.rs` + 两 crate 的 dsh 测试 + `docs/dsh-plugin*.md` · **建议入口**:规划(控制)会话亲自(owner「fable 亲自来开发」)。
+- **需求**(owner 原话):①两个插件名称显示要全称(DSH 插件列表只显示 `client`/`team`);②`ccteam-team` 改名 `ccteam-ui`;③ccteam-ui 现在样式是乱的,要严格按照 DSH 的插件机制设计,fable 亲自开发。定位:ccteam-ui = 在 DSH 的 UI 里用多种 harness,未来可能整体取代 ccteam web。
+- **病根(两处,均实锤)**:①DSH 插件列表的 `moduleShortName()` 先去 scope 再剥 `^dsh-(host-|client-)?` 前缀 → `@ccteam/dsh-client`→`client`、`@ccteam/dsh-team`→`team`;修在名字本身:`@ccteam/ccteam-client` / `@ccteam/ccteam-ui`(`ccteam-` 不在剥除表,完整显示;沿用 DSH `@scope/<product>-<name>` 惯例)。②「样式乱」= 手搓 CSS Modules 编译器用 sha256 前 8 位 hex 当 `[hash]`,十次有六次以数字开头(`.9a3484fd_entry`)= 非法选择器,浏览器整张样式表丢弃,面板以裸 DOM 渲染(playwright 实测 `rules:1`、元素 UA 默认灰底);全部单测通过是因为没有一条测「选择器能被解析」。修在机制:改用 DSH 预设同款 lightningcss(`cssModules.pattern='[hash]_[local]'` + minify,hash 以数字开头时自动前缀 `_`),删手搓编译器。
+- **client 半按 DSH 机制重写**:`dsh.client.inject` 列出所依赖的官方包(runtime/locale/ui-layout/ui-sidebar/ui-settings/ui-settings-plugins);三个座位一律 `ctx.slots.inject(<slot>, () => ctx.slots.register(...))`(框架等待声明方、拥有生命周期),删版本门 + body-portal 兜底(非 DSH 机制);上游 SlotMap/Context 合并改为 type-only 引入 npm `next` 标签 0.1.1-rc.2 的官方类型包(删手工镜像);业务状态经 inject face 的 `hooks` 舱以框架合成的 `useConsole/useCard` selector hook 到达组件(非手写 useSyncExternalStore);**新增 `settings.plugin.item` 设置卡**(rc.7 真机证实:无客户端卡的 namespace 在「插件配置」页什么都不显示,docs 承诺的「设置卡」此前并不存在)—— ccteam-ui 为 `ccteam-ui` 与 `ccteam-client` 两个 namespace 各出一张卡(卡按 namespace 配对,仅在该插件已装时出现),凭据字段只写不回显。
+- **Rust 通用解**:`CCTEAM_PLUGINS` 表新增 `required_config_key`(去掉 row_id 特判);物化器接管 `@ccteam/` 整个 scope —— 不在表内的 `@ccteam/*` bundle / patch 行(按 name)/ `node_modules/@ccteam/<x>` 链接一律清除(改名后老包残留会让老 patch 层再插一次同 id → Cordis `duplicate loader entry id` 整机拒启,v0.10.0 教训),scope 之外一字不动;新单测 2(清理 + 「仅陈旧行也触发重写」)。
+- **DoD**:两包 vitest 绿(ccteam-ui 124/124 含新 apply/settings-form/lightningcss 标识符安全回归;ccteam-client 34/34);`cargo fmt` 干净 + `make check` 0 warning;materialize 单测 + `dsh_acp_test` + `dsh_register_test` 绿;`make test-baseline` ≥ 1989/0;真机沙箱 DoD(隔离 HOME/CCTEAM_HOME + debug 二进制 + 真 dsh rc.7 + playwright):侧栏按钮/面板按 token 渲染、插件列表显示 `ccteam-client`/`ccteam-ui`、插件配置页出现两张卡并能保存进 settings.yaml,截图留痕 `docs-local/versions/v0-10-4/`。
+- **验证**:__VERIFY__
 
 ### NOTIFY-1 委派完成通知极简化 + 与 `wait_seconds` 内联返回同源(owner 反馈 2026-08-26 ×2,进行中)
 - **状态**:完成(ac95cab6) · **冲突域**:`crates/ccteam-im/src/delegation.rs` + `crates/ccteam-im/src/mcp/dispatch.rs` + `crates/ccteam-im/src/mcp/protocol.rs`(+ `gateway.rs` 测试夹具串)· **建议入口**:codex maker,规划复核。
@@ -92,7 +101,7 @@
 - **DoD**:materialize 单测(结构断言 patch 形状);`dsh_register_test` 扩展;baseline 只增;真机双模式走 PRD §七核心动线。
 
 ### DSH2-CHIP 聊天内联「↗ 派给 X」(P2 可选,owner 拍板后排)
-- **状态**:待排 · **冲突域**:`plugins/dsh-team/src/client/turnActions*` · 槽位 = `conversation.chat.assistant-actions`(list,R4 定)。
+- **状态**:待排 · **冲突域**:`plugins/ccteam-ui/src/client/turnActions*` · 槽位 = `conversation.chat.assistant-actions`(list,R4 定)。
 
 ### RESTART-1 一 sid 一 body:daemon 重启后孤儿体识别 / 跟踪 / 回收,杜绝同 sid 双进程(owner 直驱 2026-08-19)
 - **状态**:完成(905e4a9) · **冲突域**:`crates/ccteam-harness/src/execution(session_body 新 + claude_stream_json + acp/transport + pi_rpc + adapter.rs + progress_bridge)+ crates/ccteam-im/src(gateway + daemon + mcp/dispatch)+ crates/ccteam-web(sessions_api + web lifecycle)+ crates/ccteam-cli/src(main 停机 + daemon_cli 文案)+ crates/ccteam-core/src(progress re-export + daemon 指纹委托)+ docs` · **建议入口**:规划(控制)会话亲自(owner「从 ccteam 代码本身解决,需要一个完善的方案,之后执行」)

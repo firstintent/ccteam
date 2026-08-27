@@ -126,17 +126,17 @@
 
 ## 8. 装一次
 
-对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `session_spawn {vendor:"dsh", ...}`)——雇出来的会话就跑在该身份自己的 DSH web 运行时里,实时出现在 DSH 页侧栏,插件已预载;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
+对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `session_spawn {vendor:"dsh", ...}`)——雇出来的会话就跑在该身份自己的 DSH web 运行时里,实时出现在 DSH 页侧栏,插件已预载;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/ccteam-client`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
 
 - 本机 `ccteam start` 起着 daemon。
 - 你有一个**已注册的 ccteam 项目**并知道它的 slug;可写配置的 CLI 会话也可以从工作目录识别项目。
-- 对可写配置的 vendor,用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证);对 DSH,用已连接 `@ccteam/dsh-client` 的 DSH Web UI。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §9。)
+- 对可写配置的 vendor,用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证);对 DSH,用已连接 `@ccteam/ccteam-client` 的 DSH Web UI。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §9。)
 
 ## 9. 出问题时(人话)
 
 | 现象 | 怎么回事 → 怎么办 |
 |---|---|
-| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;DSH 则安装 `@ccteam/dsh-client` 并在 DSH Settings 粘贴 Access 凭据。SDK 会话可直接调 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam-enroll:<id>:<secret>`(设置 → 接入 里签发,并带上 `initialize` 返回的 `Mcp-Session-Id`)——同一套工具,而且 caller 在账本里有自己的行,它 spawn 出来的是它的子会话而不是一堆根节点。 |
+| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;DSH 则安装 `@ccteam/ccteam-client` 并在 DSH Settings 粘贴 Access 凭据。SDK 会话可直接调 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam-enroll:<id>:<secret>`(设置 → 接入 里签发,并带上 `initialize` 返回的 `Mcp-Session-Id`)——同一套工具,而且 caller 在账本里有自己的行,它 spawn 出来的是它的子会话而不是一堆根节点。 |
 | 「它半天没动静」 | 它在**干活(working)**,不是卡住。去干别的,一会儿回来看结论。 |
 | 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或把项目名说出来让会话带上 `project:"<slug>"`。 |
 | 「grok 用不了」 | 这台机器没装 grok CLI。`ccteam status` / capabilities 看这台机器实际有哪些 vendor。 |
