@@ -17,6 +17,14 @@
 
 > **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/ccteam-ui`(2026-08-28 起,原名 `@ccteam/dsh-team`;插件 1 同日改名 `@ccteam/ccteam-client`,原 `@ccteam/dsh-client`)—— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)+ 双插件设置卡。**定位(owner 2026-08-28)**:ccteam-ui = 在 DSH 的 UI 里用多种 harness,把 ccteam 最核心的体验带进 DSH(DSH 的 UI 风格优于 ccteam web),**未来可能整体取代现有 ccteam web**;故一切按 DSH 客户端插件机制构建,零 ccteam-web 移植。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
 
+### DSH-WEB-LAN-1 伴生端口下 DSH 设置面在非 loopback 页面一片空白(owner 回报 2026-08-28,规划亲自)
+- **状态**:完成(1bc5613c) · **冲突域**:`crates/ccteam-web/src/dsh_web.rs` + `docs/usage*.md` + `docs/dsh-plugin*.md` · **建议入口**:规划亲自。
+- **现象**:owner 经 `http://<公网IP>:7331/app/dsh`(SPA keep-alive iframe → 伴生端口)打开 DSH 设置 → 插件 → 插件配置为空;SSH 隧道走 `127.0.0.1:7332` 正常。playwright 按 owner 原路径复现:iframe 页 `isSecureContext=false`,`settings.plugins.tab` 槽空;同实例 `127.0.0.1` 五张卡俱全。
+- **病根(DSH 设计,非 ccteam-ui)**:`dsh-client-connection` 客户端 `isLoopback = transport.ownsHost || isLoopbackHostname(location.hostname)`,`ui-settings` 据此把 describe mirror 设为 `memory`(非 loopback 页「保持进程内」),`ConfigurablePluginsTab` 在未 loaded 时什么都不画;General / Models / deliverables 同受影响。
+- **修法**:伴生端口 HTML 注入 `window.__DSH_TRANSPORT__={ownsHost:true,createApiClient:()=>undefined}`——DSH 给「拥有传输的 shell」留的钩子,伴生端口就是那个 shell(实例只属于该身份、页面已过 ccteam 鉴权、服务端 Host/Origin 栅栏 v0.10.0 已由 loopback 改写满足)。**两版通吃**:owner 已升 DSH 0.1.1-rc.2,rc.2 已发布 client 无 `ownsHost` 且无条件调 `transport?.createApiClient()`(只给旗子 → 整机 "Failed to load plugins",真机截图留痕),故带一个回 `undefined` 的 `createApiClient` 让默认 carrier 落地;`ownsHost` 在 DSH main 已有,下个发布版生效。
+- **验证**:`dsh_web` 单测 10/10(新增声明先于 boot 脚本 + 形状断言);`cargo clippy -p ccteam-web -D warnings` 0;fmt 干净;rc.2 沙箱(0.0.0.0 绑定 + 局域网 IP 页)复测:正常 boot、面板在、零错误、tab 仍空(rc.2 不读旗子,预期);新版本行为按 references HEAD 源码推定,待 DSH 发版后真机复核。
+- **偏差 / 待 owner 拍板**:rc.2 上 owner 今天的路 = SSH 隧道粘一次 REST token(存 `~/.dsh/settings.yaml`,之后局域网可用面板);若要零操作,需推翻「真 `~/.dsh` 不写凭据」策略、把 operator 自己的 REST token 物化进 operator profile。
+
 ### DSH2-UI-2 ccteam-ui 重设计:双插件改名显示全称 + 严格按 DSH 插件机制重写 client 半(owner 直驱 2026-08-28,规划亲自)
 - **状态**:完成(3c2e3510) · **冲突域**:`plugins/`(两包整体改名)+ `crates/ccteam-harness/src/execution/dsh_acp/(materialize.rs + assets + spawn_spec.rs)+ dsh_runtime.rs` + `crates/ccteam-web/src/routes/hosts.rs` + 两 crate 的 dsh 测试 + `docs/dsh-plugin*.md` · **建议入口**:规划(控制)会话亲自(owner「fable 亲自来开发」)。
 - **需求**(owner 原话):①两个插件名称显示要全称(DSH 插件列表只显示 `client`/`team`);②`ccteam-team` 改名 `ccteam-ui`;③ccteam-ui 现在样式是乱的,要严格按照 DSH 的插件机制设计,fable 亲自开发。定位:ccteam-ui = 在 DSH 的 UI 里用多种 harness,未来可能整体取代 ccteam web。
