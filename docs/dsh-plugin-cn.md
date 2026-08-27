@@ -61,7 +61,7 @@ DSH 进程仍需你自己重启。
 | 卡片 | 需要填写 | 从哪里获取 |
 |---|---|---|
 | **ccteam-client** | ccteam daemon 地址，以及 `ccteam-enroll:<id>:<secret>` enrollment 凭据 | ccteam web → **Settings → Access**，复制 enrollment 值 |
-| **ccteam-ui** | ccteam daemon 地址，以及个人 REST API token（可选：默认项目） | ccteam web → **Settings → Account** 的开发者 REST 卡片（可直接粘贴不带前缀的 token） |
+| **ccteam-ui** | ccteam daemon 地址，以及个人 REST API token（可选：默认项目） | ccteam web → **Settings → Account** 的开发者 REST 卡片（可直接粘贴不带前缀的 token）。只有手起的 `dsh web` 才需要填：由 ccteam 启动或注册（Hosts → 注册 DSH 插件）的实例已经带上你自己的 token。 |
 
 凭据字段是只写的：卡片只显示 **已配置** / **未配置**，从不回显值；凭据
 留空即保持现值。如果你只安装了 `ccteam-client`，请改用 DSH 设置文件里的

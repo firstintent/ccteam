@@ -40,6 +40,10 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
     std::fs::create_dir_all(&home).unwrap();
     std::env::set_var("HOME", &home);
     std::env::set_var("CCTEAM_HOME", &ccteam_root);
+    // The admin web token as `ccteam start` keeps it: the same file the
+    // runtime's REST token resolver reads for the operator.
+    std::fs::create_dir_all(ccteam_root.join("secrets")).unwrap();
+    std::fs::write(ccteam_root.join("secrets").join("web-token"), ADMIN_HEX).unwrap();
 
     // A pre-existing user profile with the user's OWN bundle and patch row:
     // registration must merge around them, never clobber.
@@ -129,14 +133,23 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
         serde_yaml::Value::String("http://127.0.0.1:7331".into()),
         "the panel is pointed at this daemon"
     );
-    assert!(
-        team.get("restToken").is_none(),
-        "ccteam writes no credential into the operator's own home: {patch}"
+    // The operator's OWN admin web token rides the panel row (owner decision
+    // 2026-08-28: pasting a token is for a hand-started `dsh web` only), and a
+    // patch carrying a credential is private to the OS user.
+    assert_eq!(
+        team["restToken"],
+        serde_yaml::Value::String(format!("ccteam:{ADMIN_HEX}")),
+        "the panel row carries the operator's own REST token: {patch}"
     );
-    assert!(
-        !patch.contains(ADMIN_HEX),
-        "the admin token must never reach a profile ccteam does not own: {patch}"
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(profile.join("cordis.patch.yml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the patch file is 0600");
+    }
 
     for package in ["ccteam-client", "ccteam-ui"] {
         assert!(

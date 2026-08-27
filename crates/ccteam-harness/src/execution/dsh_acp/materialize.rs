@@ -98,7 +98,9 @@ pub struct MaterializedDshProfile {
 /// Strictly additive: the profile's `package.json` keeps every key it already
 /// has (only our bundles are appended to `dsh.profile.bundles`), and the
 /// profile's `cordis.patch.yml` keeps every row it already has (only ccteam's
-/// own rows are written). Unparseable JSON/YAML is an error, never a clobber.
+/// own rows are written — and, since 2026-08-28, the panel row may carry the
+/// operator's OWN REST token, so the patch file is kept private, 0600).
+/// Unparseable JSON/YAML is an error, never a clobber.
 pub fn register_ccteam_plugins_into_profile(
     ccteam_root: &Path,
     dsh_home: &Path,
@@ -128,8 +130,8 @@ pub fn register_ccteam_plugins_into_profile(
 ///
 /// "Configured" is per plugin — each row of [`CCTEAM_PLUGINS`] names the one
 /// config key it cannot work without. The panel's `restToken` is deliberately
-/// NOT required — ccteam never writes a credential into a profile it does not
-/// own.
+/// NOT required: a resolver failure leaves the panel asking for one, which is
+/// still a working registration.
 pub fn ccteam_plugins_registered_in_profile(dsh_home: &Path, profile: &str) -> bool {
     let profile_dir = dsh_home.join("profiles").join(profile);
     let bundles: Vec<String> = fs::read_to_string(profile_dir.join("package.json"))
@@ -223,10 +225,12 @@ impl DshClientConfig<'_> {
 /// The `ccteam-ui` row's own plugin config — the team panel's `daemonUrl` +
 /// personal REST bearer. FLAT, for the same reason as [`DshClientConfig`].
 ///
-/// `restToken` is a credential: it is written ONLY into the identity's own
-/// ccteam-managed profile, never into a profile ccteam does not own, and never
-/// logged or reported. `defaultProject` is deliberately absent — ccteam has no
-/// per-identity default worth pinning, so the panel asks.
+/// `restToken` is a credential: it is the identity's OWN token (a tenant's
+/// web token in the tenant's managed home; the operator's admin web token in
+/// the operator's own `~/.dsh`, owner decision 2026-08-28 — pasting is for a
+/// hand-started `dsh web` only), written 0600 and never logged or reported.
+/// `defaultProject` is deliberately absent — ccteam has no per-identity
+/// default worth pinning, so the panel asks.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DshUiConfig<'a> {
     pub daemon_url: Option<&'a str>,
@@ -448,6 +452,12 @@ fn materialize_profile_files(
     let patch_path = profile_dir.join(PATCH_FILE);
     if let Some(patch_yaml) = merged_profile_patch_yaml(&patch_path, spec)? {
         write_if_changed(&patch_path, patch_yaml.as_bytes())?;
+    }
+    // The patch may carry this identity's credentials (`restToken`, and a
+    // tenant's `enrollment`): private to the OS user, whatever the umask made
+    // it — including a file ccteam wrote before it carried any.
+    if patch_path.is_file() {
+        set_private_file(&patch_path)?;
     }
 
     let scope_dir = profile_dir.join("node_modules").join(CCTEAM_SCOPE);
@@ -798,6 +808,17 @@ fn remove_existing(path: &Path) -> Result<(), HarnessError> {
     .map_err(|e| HarnessError::SpawnFailed(format!("remove {}: {e}", path.display())))
 }
 
+fn set_private_file(path: &Path) -> Result<(), HarnessError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            HarnessError::SpawnFailed(format!("chmod 0600 {}: {e}", path.display()))
+        })?;
+    }
+    Ok(())
+}
+
 fn set_private_dir(path: &Path) -> Result<(), HarnessError> {
     #[cfg(unix)]
     {
@@ -848,8 +869,9 @@ mod tests {
         )
     }
 
-    /// The operator's merge-only registration: transport for the client, URL
-    /// for the panel, and NO credential for either.
+    /// The operator's merge-only registration as the runtime issues it:
+    /// transport for the client, URL + the operator's own REST token for the
+    /// panel, and no enrollment.
     fn operator_register(
         root: &Path,
         dsh_home: &Path,
@@ -866,7 +888,7 @@ mod tests {
             },
             DshUiConfig {
                 daemon_url: Some("http://127.0.0.1:7331"),
-                rest_token: None,
+                rest_token: Some(REST_TOKEN),
             },
         )
     }
@@ -1309,9 +1331,9 @@ mod tests {
         );
 
         // cordis.patch.yml: the user's row is untouched, ours are appended as
-        // overrides (no `insert`), and NO credential is injected into the
-        // operator's home — their own Settings owns enrollment and the panel's
-        // REST token alike.
+        // overrides (no `insert`); enrollment is not injected into the
+        // operator's home (their own Settings owns it), while the panel row
+        // carries the operator's own REST token and the file goes private.
         let patch = read_patch(&profile_dir);
         let rows = patch.as_sequence().unwrap();
         assert_eq!(rows.len(), 3, "the user's row plus one per ccteam plugin");
@@ -1346,11 +1368,25 @@ mod tests {
             serde_yaml::Value::String("http://127.0.0.1:7331".into()),
             "the panel is pointed at this daemon"
         );
-        assert!(
-            team_config.get("restToken").is_none(),
-            "ccteam never writes a credential into a home it does not own — the \
-             operator pastes it into DSH Settings: {team_config:?}"
+        assert_eq!(
+            team_config["restToken"],
+            serde_yaml::Value::String(REST_TOKEN.into()),
+            "the operator's own REST token rides ccteam's panel row (owner \
+             decision 2026-08-28: pasting is for a hand-started dsh web only)"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(profile_dir.join(PATCH_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a patch carrying a credential is private"
+            );
+        }
 
         for (plugin, entry) in [
             (&CLIENT_PLUGIN, "dist/index.js"),

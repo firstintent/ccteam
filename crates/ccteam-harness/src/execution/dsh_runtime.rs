@@ -330,9 +330,9 @@ impl DshRuntimeManager {
     /// — into the operator's real `~/.dsh` web profile, WITHOUT starting or
     /// attaching a runtime. This is how an operator whose hand-started `dsh
     /// web` lacks the plugins gets them: register here, then restart that
-    /// instance themselves. Idempotent and merge-only; never touches
-    /// enrollment, the panel's `restToken`, or any other row — credentials in
-    /// a home ccteam does not own stay the human's to paste.
+    /// instance themselves. Idempotent and merge-only; touches only ccteam's
+    /// own rows. The panel row carries the operator's own REST token (owner
+    /// decision 2026-08-28); enrollment stays the human's to paste.
     pub async fn register_operator_profile(&self) -> Result<PathBuf> {
         let daemon_url = self
             .inner
@@ -343,6 +343,7 @@ impl DshRuntimeManager {
         let home = self.inner.home_for(&identity)?;
         let socket = self.inner.socket_for(&identity);
         let ccteam_home = self.inner.ccteam_home.clone();
+        let rest_token = self.inner.rest_token_for(OPERATOR_OWNER_TAG);
         tokio::task::spawn_blocking(move || -> Result<PathBuf> {
             crate::execution::dsh_acp::spawn_spec::ensure_socket_dir(&socket)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -358,7 +359,7 @@ impl DshRuntimeManager {
                     },
                     crate::execution::dsh_acp::materialize::DshUiConfig {
                         daemon_url: Some(&daemon_url),
-                        rest_token: None,
+                        rest_token: rest_token.as_deref(),
                     },
                 )
                 .map_err(|e| anyhow!("{e}"))?;
@@ -715,19 +716,24 @@ impl Inner {
         // only on this branch: an ATTACHED instance is the human's process, and
         // ccteam does not edit the home of a `dsh web` it did not start.
         let socket = self.socket_for(identity);
+        // The panel's REST bearer travels with ccteam's own rows into the
+        // operator's profile too (owner decision 2026-08-28: pasting a token
+        // is for a hand-started `dsh web` only). It is the operator's own
+        // admin web token, written into the operator's own home, 0600. A
+        // resolver failure is not fatal: the panel just starts unconfigured.
+        let rest_token = self.rest_token_for(&identity.owner_tag);
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
             owner_tag: &identity.owner_tag,
             ccteam_home: self.ccteam_home.clone(),
             dsh_home: home.clone(),
             profile: DSH_NATIVE_WEB_PROFILE,
             materialize_profile: false,
+            // Enrollment stays the human's to paste: it is a session-level
+            // MCP principal for hand-driven DSH agents, not the panel's token.
             enrollment: None,
             daemon_url: self.config().map(|config| config.daemon_url.as_str()),
             transport_socket: Some(&socket),
-            // Merge-only home: ccteam registers its plugins and points them at
-            // this daemon, and leaves BOTH credentials to the human's Settings
-            // card — exactly what `enrollment: None` above already means.
-            rest_token: None,
+            rest_token: rest_token.as_deref(),
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -745,6 +751,23 @@ impl Inner {
         })
     }
 
+    /// This identity's own ccteam REST bearer for the panel row, or `None`
+    /// when it cannot be resolved. A convenience, not a precondition: a
+    /// runtime that cannot resolve one still serves DSH, with the panel
+    /// asking for a token. Never logs the value.
+    fn rest_token_for(&self, owner: &str) -> Option<String> {
+        match (self.rest_token)(&self.ccteam_home, owner) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                tracing::warn!(
+                    owner = %owner,
+                    "no ccteam REST token for this identity; DSH team panel starts unconfigured: {error:#}"
+                );
+                None
+            }
+        }
+    }
+
     async fn start_tenant(
         &self,
         identity: &DshRuntimeIdentity,
@@ -757,19 +780,7 @@ impl Inner {
             .ok_or_else(|| anyhow!("DSH web runtime is not configured"))?;
         let bearer = (self.enrollment)(&self.ccteam_home, owner)
             .with_context(|| format!("ensure enrollment credential for {owner}"))?;
-        // The team panel's REST bearer is a convenience, not a precondition:
-        // a runtime that cannot resolve one still serves DSH, with the panel
-        // asking for a token. Never log the value.
-        let rest_token = match (self.rest_token)(&self.ccteam_home, owner) {
-            Ok(token) => Some(token),
-            Err(error) => {
-                tracing::warn!(
-                    owner = %owner,
-                    "no ccteam REST token for this identity; DSH team panel starts unconfigured: {error:#}"
-                );
-                None
-            }
-        };
+        let rest_token = self.rest_token_for(owner);
         let socket = self.socket_for(identity);
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
             owner_tag: owner,

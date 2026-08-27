@@ -344,10 +344,12 @@ pub struct DshWebSpawnOptions<'a> {
     pub daemon_url: Option<&'a str>,
     /// ACP socket the embedded ccteam plugin serves on for this identity.
     pub transport_socket: Option<&'a Path>,
-    /// This identity's own ccteam REST bearer (`ccteam:<hex>`), for the team
-    /// panel. `None` on the operator branch: ccteam writes credentials only
-    /// into homes it owns, so the operator pastes it into DSH Settings once —
-    /// the same line `@ccteam/ccteam-client` draws for `enrollment`.
+    /// This identity's own ccteam REST bearer (`ccteam:<hex>`), for the ccteam
+    /// panel — on both branches (owner decision 2026-08-28: the operator's own
+    /// admin web token goes into the operator's own profile; pasting a token
+    /// is for a hand-started `dsh web` only). `None` = nothing written and the
+    /// panel asks. Enrollment keeps the older line: `None` on the operator
+    /// branch.
     pub rest_token: Option<&'a str>,
 }
 
@@ -377,10 +379,9 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
         daemon_url: options.daemon_url,
         transport_socket: socket.as_deref(),
     };
-    // The team panel's own row. `rest_token` is `None` on the operator branch
-    // by construction (see `DshWebSpawnOptions::rest_token`), so the panel is
-    // registered and pointed at the daemon there, and the human supplies the
-    // credential from the DSH Settings card.
+    // The ccteam panel's own row: pointed at this daemon and, when the runtime
+    // resolved one, carrying this identity's REST bearer (see
+    // `DshWebSpawnOptions::rest_token`).
     let ui = DshUiConfig {
         daemon_url: options.daemon_url,
         rest_token: options.rest_token,

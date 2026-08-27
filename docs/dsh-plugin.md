@@ -68,7 +68,7 @@ owns its Host (see usage.md → DSH Web; DSH reads that from the release after
 | Card | Set | Where to get it |
 |---|---|---|
 | **ccteam-client** | the ccteam daemon URL and the enrollment credential `ccteam-enroll:<id>:<secret>` | ccteam web → **Settings → Access** (copy the enrollment value) |
-| **ccteam-ui** | the ccteam daemon URL and your personal REST API token (optionally a default project) | ccteam web → **Settings → Account**, developer REST card (a prefix-less paste is accepted) |
+| **ccteam-ui** | the ccteam daemon URL and your personal REST API token (optionally a default project) | ccteam web → **Settings → Account**, developer REST card (a prefix-less paste is accepted). Only a hand-started `dsh web` needs this: an instance ccteam starts or registers (Hosts → Register DSH plugin) already carries your own token. |
 
 Credentials are write-only in the cards: they show **Configured** or **Not
 configured**, never the value. Leaving a credential field blank keeps the

@@ -714,8 +714,9 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
         "ccteam never injects enrollment into the operator's own home: {config:?}"
     );
 
-    // The panel is registered and pointed at this daemon, but its credential
-    // is the operator's to paste — same line as `enrollment` above.
+    // The panel is registered and pointed at this daemon; the spec writes
+    // exactly the token the runtime resolved (none was given here), so the
+    // row carries none.
     let team = patch_config_for(&profile_dir, "ccteam-ui");
     assert_eq!(
         team["daemonUrl"],
@@ -723,7 +724,7 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     );
     assert!(
         team.get("restToken").is_none(),
-        "no credential in a home ccteam does not own: {team:?}"
+        "no token given, none written: {team:?}"
     );
 }
 
