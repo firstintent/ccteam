@@ -162,22 +162,26 @@ describe('method dispatch', () => {
       activity: 'working',
       title: 'root',
       role: 'cto',
+      host: 'local',
       costUsd: 1.5,
       tokensTotal: 42,
       lastActive: '2026-08-25T10:00:00Z',
+      turnCount: 3,
       children: [{
         sid: 's2',
         project: 'ccteam',
         vendor: 'codex',
         activity: 'idle',
+        host: 'local',
         parentSid: 's1',
         lastActive: '2026-08-25T10:05:00Z',
+        turnCount: 1,
         children: [],
       }],
     }])
   })
 
-  it('session.history splits each two-sided turn into contract rows and honours since', async () => {
+  it('session.history splits each two-sided turn into contract rows and pages by cursor', async () => {
     const page = {
       json: {
         sid: 's1',
@@ -192,9 +196,10 @@ describe('method dispatch', () => {
     const fake = new FakeFetch().on('/api/v1/sessions/s1?', page)
     const all = (await post(bff(fake), 'session.history', { sid: 's1' })).json()
 
-    expect(fake.calls[0]!.url).toBe('http://127.0.0.1:7331/api/v1/sessions/s1?limit=200')
+    expect(fake.calls[0]!.url).toBe('http://127.0.0.1:7331/api/v1/sessions/s1?limit=100')
     expect(all).toEqual({
       sid: 's1',
+      hasMore: false,
       rows: [
         { turnId: 's1-1:user', role: 'user', content: 'hi', ts: '2026-08-25T10:00:00Z' },
         { turnId: 's1-1:assistant', role: 'assistant', content: 'hello', ts: '2026-08-25T10:00:00Z' },
@@ -202,14 +207,19 @@ describe('method dispatch', () => {
       ],
     })
 
-    const since = new FakeFetch().on('/api/v1/sessions/s1?', page)
-    const tail = (await post(bff(since), 'session.history', {
+    // An older page rides the opaque cursor and reports the next one.
+    const paged = new FakeFetch().on('/api/v1/sessions/s1?', {
+      json: { ...page.json, next_before: 'cursor-2', has_more: true },
+    })
+    const older = (await post(bff(paged), 'session.history', {
       sid: 's1',
-      since: 's1-1:assistant',
-    })).json() as { rows: unknown[] }
-    expect(tail.rows).toEqual([
-      { turnId: 's1-2:user', role: 'user', content: 'again', ts: '2026-08-25T10:01:00Z' },
-    ])
+      before: 'cursor-1',
+      limit: 50,
+    })).json() as { rows: unknown[]; hasMore: boolean; nextBefore?: string }
+    expect(paged.calls[0]!.url).toBe('http://127.0.0.1:7331/api/v1/sessions/s1?limit=50&before=cursor-1')
+    expect(older.rows).toHaveLength(3)
+    expect(older.hasMore).toBe(true)
+    expect(older.nextBefore).toBe('cursor-2')
   })
 
   it('session.send posts JSON to the turn route and reports a plain acceptance', async () => {

@@ -29,8 +29,8 @@ describe('CSS material', () => {
 
   it('guards every stylesheet under src/client, subdirectories included', () => {
     expect(cssFiles.map(file => file.slice(CLIENT_DIR.length + 1)).sort()).toEqual([
-      'panel.module.css',
       'settings/settings.module.css',
+      'workbench.module.css',
     ])
   })
 

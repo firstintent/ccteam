@@ -3,13 +3,13 @@
  * Settings trigger, drawn with that trigger's geometry in both column states
  * (42px foot row wide, 36px circle on the 56px rail — ui-settings-general
  * SettingsRoot.module.css `.trigger` / `.trigger.rail`). Carries the
- * completed-turns badge while the panel is closed and a muted dot while
- * ccteam is not reachable; toggles the panel through the one store.
+ * completed-turns badge while the workbench is closed and a muted dot while
+ * ccteam is not reachable; toggles the workbench through the one store.
  */
 import clsx from 'clsx'
 import { IconBranchOutline16, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { EntryButtonProps } from './slots.js'
-import css from './panel.module.css'
+import css from './workbench.module.css'
 
 /**
  * Render the sidebar-foot entry button.

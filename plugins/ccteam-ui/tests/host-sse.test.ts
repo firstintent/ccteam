@@ -86,8 +86,9 @@ describe('SSE fan-out', () => {
     server.streams[0]!.push({ id: '1', sid: 's1', slug: 'ccteam', kind: 'session_lifecycle', content: '', state: 'stopped' }, 'session_lifecycle')
     await settle()
 
-    expect(first.res.frames()).toEqual([{ kind: 'graph' }])
-    expect(second.res.frames()).toEqual([{ kind: 'graph' }])
+    const expected = [{ kind: 'graph' }, { kind: 'session', sid: 's1', event: { kind: 'lifecycle', state: 'stopped' } }]
+    expect(first.res.frames()).toEqual(expected)
+    expect(second.res.frames()).toEqual(expected)
     bff.close()
   })
 
@@ -113,13 +114,7 @@ describe('SSE fan-out', () => {
     expect(watcher.res.frames()).toEqual([{
       kind: 'session',
       sid: 's1',
-      row: {
-        turnId: 'e9:assistant',
-        role: 'assistant',
-        content: 'done',
-        ts: '2026-08-25T10:00:00Z',
-      },
-      activity: 'idle',
+      event: { kind: 'answer', id: 'e9', content: 'done', ts: '2026-08-25T10:00:00Z' },
     }])
     bff.close()
   })
@@ -248,7 +243,12 @@ describe('frame translation', () => {
       token: 'abc',
     })
     expect(translateGlobal(prompt)).toEqual([])
-    expect(translateSession('s1', prompt)).toEqual([])
+    // The session stream carries it as a choice: options + the resolution token.
+    expect(translateSession('s1', prompt)).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: { kind: 'answer', id: '', content: 'approve?', options: [{ id: 'y', label: 'yes' }], token: 'abc' },
+    }])
   })
 
   it('ignores control frames and unparseable payloads', () => {
@@ -258,11 +258,29 @@ describe('frame translation', () => {
     expect(translateSession('s1', { data: 'not json' })).toEqual([])
   })
 
-  it('reports activity from progress frames and does not double-count turn_done', () => {
-    expect(translateSession('s1', frame({ kind: 'progress', sid: 's1', content: '' })))
-      .toEqual([{ kind: 'session', sid: 's1', activity: 'working' }])
+  it('carries progress snapshots and structured steps, and does not double-count turn_done', () => {
+    expect(translateSession('s1', frame({ kind: 'progress', sid: 's1', content: 'reading' })))
+      .toEqual([{ kind: 'session', sid: 's1', event: { kind: 'progress', content: 'reading', done: false } }])
     expect(translateSession('s1', frame({ kind: 'progress', sid: 's1', content: '', done: true })))
-      .toEqual([{ kind: 'session', sid: 's1', activity: 'idle' }])
+      .toEqual([{ kind: 'session', sid: 's1', event: { kind: 'progress', content: '', done: true } }])
+    expect(translateSession('s1', frame({
+      kind: 'activity',
+      sid: 's1',
+      content: 'Bash(ls)',
+      activity: { kind: 'tool_call', name: 'Bash', summary: 'Bash(ls)', status: 'started', item_id: 't1' },
+    }))).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'Bash(ls)', status: 'started' } },
+    }])
+    expect(translateGlobal(frame({ kind: 'session_lifecycle', sid: 's1', state: 'evicted', reason: 'capacity' }))).toEqual([
+      { kind: 'graph' },
+      { kind: 'session', sid: 's1', event: { kind: 'lifecycle', state: 'evicted', reason: 'capacity' } },
+    ])
+    expect(translateGlobal(frame({ kind: 'delegation', relation: 'spawned', parent_sid: 's1', child_sid: 's2', title: 'child' }))).toEqual([
+      { kind: 'graph' },
+      { kind: 'delegation', relation: 'spawned', parentSid: 's1', childSid: 's2', title: 'child' },
+    ])
     // turn_done comes from the global stream only.
     const answer = frame({ kind: 'answer', sid: 's1', id: 'e1', content: 'done' })
     expect(translateSession('s1', answer).some(event => event.kind === 'turn_done')).toBe(false)

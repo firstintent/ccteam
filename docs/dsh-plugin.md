@@ -17,7 +17,7 @@ DSH settings cards), never as a port of the ccteam web console.
 | Plugin | Audience | What it provides |
 |---|---|---|
 | `@ccteam/ccteam-client` | DSH agents (the LLM) | The eight ccteam MCP tools inside DSH sessions, plus the transport that lets ccteam hire DSH sessions. |
-| `@ccteam/ccteam-ui` | People using DSH Web | The ccteam panel in DSH — a cross-vendor session tree, embedded chat, and one-click spawn, opened with the ccteam button at the bottom of DSH’s own sidebar — plus the **ccteam-ui** and **ccteam-client** cards in DSH Settings → Plugins. |
+| `@ccteam/ccteam-ui` | People using DSH Web | The ccteam workbench in DSH — a whole-page surface with the cross-vendor team tree, a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, interrupt) and a details column, opened with the ccteam button at the bottom of DSH’s own sidebar — plus the **ccteam-ui** and **ccteam-client** cards in DSH Settings → Plugins. |
 
 The two packages are independent. You can install either one or both.
 
@@ -46,7 +46,7 @@ dsh plugin --profile web add @ccteam/ccteam-ui
 
 Restart that `dsh web` process, then hard-refresh the browser (Ctrl+Shift+R or
 Cmd+Shift+R). Install `ccteam-client` when a DSH agent should call ccteam
-tools; install `ccteam-ui` when you want the human panel. Install both for the
+tools; install `ccteam-ui` when you want the human workbench. Install both for the
 full connection. DSH’s Settings → Plugins → **Plugin list** shows them as
 `ccteam-client` and `ccteam-ui`.
 
@@ -78,42 +78,62 @@ configuration file**).
 
 Use the same daemon URL for both, commonly `http://127.0.0.1:7331`. These are
 different credentials: enrollment identifies the DSH process for MCP, while
-the REST token identifies your ccteam account for the panel. Do not substitute
+the REST token identifies your ccteam account for the workbench. Do not substitute
 one for the other.
 
-## 4. Using the panel
+## 4. Using the workbench
 
-The normal loop is:
+The ccteam button at the bottom of DSH’s sidebar opens the workbench: a
+whole-page section of DSH (not a popup) with three columns.
 
-1. Click the ccteam button in DSH’s sidebar footer.
-2. Browse the session tree, grouped by project. Activity dots show working,
-   idle, or stale sessions; delegated children are indented below their parent.
-3. Select a session to open its embedded chat.
-4. Type a turn and press **Enter**. **Shift+Enter** inserts a newline; **Esc**
-   returns to the tree (and closes the panel from the tree view).
+- **Team** (left): **New session**, a search box, and every session grouped
+  by project — vendor monogram, title, `vendor · model · when`, the activity
+  dot and the accumulated cost; delegated children are indented under their
+  parent. Project headers fold and show the project’s total cost.
+- **Main** (center): the selected session’s conversation, or the new-session
+  hero when nothing is selected.
+- **Details** (right, toggle in the header): identity (sid, project, vendor,
+  model, effort, role, host), state, usage (cost, tokens, context window from
+  the live statusline), delegation links, and actions — rename, interrupt the
+  running turn, stop the session (two-step confirm), copy the sid. Clicking a
+  step row in the conversation shows that step here.
 
-Receipts are deliberately explicit. A queued turn says it is queued (including
-what it is behind when available); a failed turn shows its error kind. If a
-new session is created but its first task fails, the session still opens so you
-can inspect it and try again.
+**New session** is DSH’s own empty-conversation shape: pick the **project**,
+**vendor** (not-installed vendors are greyed) and optional **role** (the
+project’s `.claude/agents/*.md`), choose a **model** and **effort** from the
+vendor’s catalog in the composer bar (blank = vendor default), type the first
+task and press **Enter**. The title comes from the task’s first line; the
+session opens as soon as it exists. Validation is inline and the daemon’s own
+error is shown verbatim under the box.
 
-To hire another vendor, choose **+** in the tree header. The vendor picker
-greys out vendors that are not installed on the relevant host. The project
-picker is hidden when you have only one visible project. **Advanced** contains
-model, effort, and mode controls; **Enter** creates the session and opens its
-chat, while **Esc** cancels.
+**Conversation**: user turns are bubbles; assistant turns render Markdown with
+DSH’s own renderer, streaming while the turn runs, with the turn’s steps
+(tool calls, commands, file edits, searches, thinking) as compact rows above
+the text — spinning while running, green when done. Human-in-the-loop prompts
+appear as a card with the choices; pick one to answer. Queued turns say what
+they are queued behind; failures show their error kind; session lifecycle and
+delegation events show as small notes. While a turn runs the send button
+becomes **stop** (a non-destructive interrupt — the session keeps its
+context). **Enter** sends, **Shift+Enter** inserts a newline, `/` at the start
+lists the pass-through commands (`/compact`, `/new`, `/clear`, `/role`,
+`/model`), the paper-clip adds attachments (images render inline).
+**Load earlier messages** pages the transcript back. ccteam records a step’s
+name and summary only; the full tool input/output stays in the vendor’s own
+session, and steps are shown live, not replayed from history.
 
-When the panel is closed, the ccteam button carries a completion count for
-turns finished since the last open. Opening the panel clears the badge.
+**Esc** leaves a text field first, then closes the details column, then
+returns to DSH. When the workbench is closed, the ccteam button carries a
+completion count for turns finished since the last open; opening it clears
+the badge.
 
-The panel needs the native sidebar-footer and overlay seats DSH ships since
-0.1.0-rc.7.
+The workbench needs the native sidebar-footer and overlay seats DSH ships
+since 0.1.0-rc.7.
 
 ## 5. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| **Not connected** | Run `ccteam start`; the panel also shows a copyable command. |
+| **Not connected** | Run `ccteam start`; the workbench also shows a copyable command. |
 | **401** | A REST request on the wire uses `Bearer ccteam:<hex>`. Plugin 1’s setting is the `ccteam-enroll:<id>:<secret>` enrollment string; plugin 2’s setting is the personal REST token. They are different credentials. In the panel settings, paste the REST token without `Bearer`. |
 | **`duplicate loader entry id` at boot** | The same plugin was inserted twice (for example, registry plus bundle patch, or a hand-edited `cordis.patch.yml`). Keep exactly one entry and remove the duplicate. |
 | **No ccteam button in the sidebar** | The plugin needs DSH 0.1.0-rc.7 or newer (the native sidebar footer and overlay seats). Update DSH; then check Settings → Plugins → Plugin list shows `ccteam-ui` as Enabled. |

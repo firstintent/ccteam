@@ -1,5 +1,5 @@
 /**
- * Client half of `@ccteam/ccteam-ui`: the ccteam surfaces inside the DSH web
+ * Client half of `@ccteam/ccteam-ui`: the ccteam workbench inside the DSH web
  * console, composed exclusively from DSH-native material — components from
  * `@deepseek-ai/dsh-client-ui-primitives`, semantic `--dsw-alias-*` /
  * `--dsw-specific-*` tokens only, copy through the DSH locale service. Zero
@@ -17,7 +17,7 @@
  *
  * Seats:
  *   1. `sidebar.footer.action` — the entry button beside DSH's Settings trigger
- *   2. `shell.overlay`         — the console column (tree / chat / spawn)
+ *   2. `shell.overlay`         — the workbench (team tree / conversation / details)
  *   3. `settings.plugin.item`  — one card per ccteam settings namespace
  *
  * All network traffic goes through the host BFF (src/shared/contract.ts).
@@ -30,7 +30,7 @@ import { NS } from './slots.js'
 import type { CcteamClientContext, ConsoleFace } from './slots.js'
 import { en, zh } from './locales.js'
 import { EntryButton } from './EntryButton.js'
-import { Panel, refreshStatus } from './Panel.js'
+import { Workbench, refreshStatus } from './Workbench.js'
 import { SettingsCard } from './settings/SettingsCard.js'
 import { CLIENT_CARD, SettingsCardController, UI_CARD } from './settings/form.js'
 
@@ -43,8 +43,8 @@ function browserStorage(): StorageLike | undefined {
   try {
     return typeof localStorage === 'undefined' ? undefined : localStorage
   } catch {
-    // Storage access itself can throw (privacy modes); the panel just runs
-    // unpersisted then.
+    // Storage access itself can throw (privacy modes); the workbench just
+    // runs unpersisted then.
     return undefined
   }
 }
@@ -66,8 +66,9 @@ export function apply(ctx: CcteamClientContext): void {
   }, 'ccteam-ui: persistence')
 
   // Always-on team stream: feeds the entry badge (`turn_done` while the
-  // panel is closed) and marks the tree stale on `graph` frames. Per-sid
-  // subscriptions live with the chat view.
+  // workbench is closed), marks the tree stale on `graph` frames, narrates
+  // delegation into open parent chats, and routes lifecycle frames to the
+  // chats that are open. Per-sid subscriptions live with the chat view.
   ctx.effect(() => {
     const stream = api.events({
       onEvent(event: PanelEvent) {
@@ -75,6 +76,21 @@ export function apply(ctx: CcteamClientContext): void {
           store.dispatch({ type: 'turn_done', ...(event.sid !== undefined ? { sid: event.sid } : {}) })
         } else if (event.kind === 'graph') {
           store.dispatch({ type: 'graph_stale' })
+        } else if (event.kind === 'delegation') {
+          store.dispatch({
+            type: 'delegation',
+            relation: event.relation,
+            ...(event.parentSid === undefined ? {} : { parentSid: event.parentSid }),
+            ...(event.childSid === undefined ? {} : { childSid: event.childSid }),
+            ...(event.title === undefined ? {} : { title: event.title }),
+            ...(event.reason === undefined ? {} : { reason: event.reason }),
+          })
+        } else if (event.kind === 'session' && event.event.kind === 'lifecycle') {
+          // Only chats that were opened get lifecycle rows (the tree shows
+          // everyone's state through the graph).
+          if (store.getSnapshot().chats[event.sid] !== undefined) {
+            store.dispatch({ type: 'session_event', sid: event.sid, event: event.event, now: Date.now() })
+          }
         }
         // Unknown kinds: ignored (forward-compat contract).
       },
@@ -107,7 +123,7 @@ export function apply(ctx: CcteamClientContext): void {
     order: 0,
     locale: NS,
     inject: face,
-  }, Panel))
+  }, Workbench))
 
   // One card per ccteam settings namespace. The configurable-plugins tab
   // dispatches by namespace and renders nothing for one the Host does not

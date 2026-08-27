@@ -1,30 +1,49 @@
 /**
- * BFF client: the panel's only network face. Speaks the shared contract to
- * the host half (`POST {API_PREFIX}/{method}` JSON + `GET {API_PREFIX}/events`
- * SSE) — the browser never sees a ccteam URL or credential. Both transports
- * are injectable so tests run without fetch/EventSource.
+ * BFF client: the workbench's only network face. Speaks the shared contract
+ * to the host half (`POST {API_PREFIX}/{method}` JSON, `GET {API_PREFIX}/events`
+ * SSE, `POST {API_PREFIX}/upload` bytes) — the browser never sees a ccteam
+ * URL or credential. Both transports are injectable so tests run without
+ * fetch/EventSource.
  */
-import { API_PREFIX } from '../shared/contract.js'
+import { API_PREFIX, ATTACHMENT_PATH, EVENTS_PATH, UPLOAD_PATH } from '../shared/contract.js'
 import type {
   ApiMethod,
   HistoryRequest,
   HistoryResponse,
+  ModelsCatalog,
   PanelEvent,
+  ProjectInfo,
+  RenameRequest,
+  ResolveRequest,
+  RolesRequest,
+  RolesResponse,
   SendReceipt,
   SendRequest,
+  SessionRef,
+  SessionStatus,
+  SimpleReceipt,
   SpawnRequest,
   SpawnResponse,
   StatusResponse,
   TeamGraph,
+  UploadResponse,
 } from '../shared/contract.js'
 
 /** Request/response pair per contract method. */
 export interface MethodMap {
   'status': { req: Record<string, never>; res: StatusResponse }
   'team.graph': { req: Record<string, never>; res: TeamGraph }
+  'catalog.projects': { req: Record<string, never>; res: { projects: ProjectInfo[] } }
+  'catalog.models': { req: Record<string, never>; res: ModelsCatalog }
+  'catalog.roles': { req: RolesRequest; res: RolesResponse }
   'session.history': { req: HistoryRequest; res: HistoryResponse }
+  'session.status': { req: SessionRef; res: SessionStatus }
   'session.send': { req: SendRequest; res: SendReceipt }
   'session.spawn': { req: SpawnRequest; res: SpawnResponse }
+  'session.interrupt': { req: SessionRef; res: SimpleReceipt }
+  'session.stop': { req: SessionRef; res: SimpleReceipt }
+  'session.resolve': { req: ResolveRequest; res: SimpleReceipt }
+  'session.rename': { req: RenameRequest; res: SimpleReceipt }
 }
 
 // Compile-time proof that MethodMap covers ApiMethod exactly.
@@ -68,12 +87,16 @@ export interface ApiDeps {
   prefix?: string
 }
 
-/** The panel-side BFF client. */
+/** The workbench-side BFF client. */
 export interface ApiClient {
   /** POST one contract method; rejects on transport or non-2xx status. */
   call<M extends ApiMethod>(method: M, body: MethodMap[M]['req']): Promise<MethodMap[M]['res']>
   /** Subscribe to the event stream (whole team, or one sid when given). */
   events(callbacks: EventStreamCallbacks, sid?: string): EventStreamHandle
+  /** Upload one file into a project's attachment store. */
+  upload(project: string, file: { name: string; type?: string; body: Blob | ArrayBuffer | Uint8Array }): Promise<UploadResponse>
+  /** Workbench-relative URL of a stored attachment. */
+  attachmentUrl(project: string, name: string): string
 }
 
 /**
@@ -83,7 +106,31 @@ export interface ApiClient {
  * @returns the subscription URL.
  */
 export function eventsUrl(prefix: string, sid?: string): string {
-  return sid === undefined ? `${prefix}/events` : `${prefix}/events?sid=${encodeURIComponent(sid)}`
+  return sid === undefined
+    ? `${prefix}${EVENTS_PATH}`
+    : `${prefix}${EVENTS_PATH}?sid=${encodeURIComponent(sid)}`
+}
+
+/**
+ * Build the upload URL.
+ * @param prefix - API prefix.
+ * @param project - project slug.
+ * @param name - original file name.
+ * @returns the URL.
+ */
+export function uploadUrl(prefix: string, project: string, name: string): string {
+  return `${prefix}${UPLOAD_PATH}?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`
+}
+
+/**
+ * Build the attachment URL.
+ * @param prefix - API prefix.
+ * @param project - project slug.
+ * @param name - stored basename.
+ * @returns the URL.
+ */
+export function attachmentUrl(prefix: string, project: string, name: string): string {
+  return `${prefix}${ATTACHMENT_PATH}?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`
 }
 
 /**
@@ -98,7 +145,7 @@ export function createApi(deps: ApiDeps = {}): ApiClient {
     ?? ((url: string): EventSourceLike =>
       typeof EventSource === 'undefined'
         // Non-DOM run (node boot of the client tree): a dead stream — the
-        // panel still works over fetch, it just gets no live frames.
+        // workbench still works over fetch, it just gets no live frames.
         ? { onmessage: null, onopen: null, onerror: null, close: () => {} }
         : new EventSource(url) as unknown as EventSourceLike)
 
@@ -127,7 +174,7 @@ export function createApi(deps: ApiDeps = {}): ApiClient {
           // subscription; nothing else can throw in this handler.
           return
         }
-        if (parsed !== null && typeof parsed === 'object' && typeof (parsed as PanelEvent).kind === 'string') {
+        if (parsed !== null && typeof parsed === 'object' && typeof (parsed as { kind?: unknown }).kind === 'string') {
           callbacks.onEvent(parsed as PanelEvent)
         }
       }
@@ -142,6 +189,22 @@ export function createApi(deps: ApiDeps = {}): ApiClient {
           source.close()
         },
       }
+    },
+
+    async upload(project, file) {
+      const response = await fetchFn(uploadUrl(prefix, project, file.name), {
+        method: 'POST',
+        headers: { 'content-type': file.type === undefined || file.type === '' ? 'application/octet-stream' : file.type },
+        body: file.body as BodyInit,
+      })
+      if (!response.ok) {
+        throw new Error(`ccteam bff upload: HTTP ${response.status}`)
+      }
+      return (await response.json()) as UploadResponse
+    },
+
+    attachmentUrl(project, name) {
+      return attachmentUrl(prefix, project, name)
     },
   }
 }

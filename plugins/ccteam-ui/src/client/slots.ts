@@ -38,8 +38,8 @@ export const NS = 'ccteam'
 export type T = TranslateNS<'ccteam'>
 
 /**
- * The panel's injected business face, shared by its two seats: the one store
- * under the reserved `hooks` compartment (the framework binds it as the
+ * The workbench's injected business face, shared by its two seats: the one
+ * store under the reserved `hooks` compartment (the framework binds it as the
  * `useConsole` selector hook), the store's write path, and the BFF client.
  */
 export interface ConsoleFace {
@@ -52,7 +52,7 @@ export interface ConsoleFace {
 export type EntryButtonProps = PropsRuntime<'sidebar.footer.action'> & InjectFace<ConsoleFace> & PropsLocale<'ccteam'>
 
 /** Composed props of the `shell.overlay` entry: face + `t` (the layer passes no owner props). */
-export type PanelProps = PropsRuntime<'shell.overlay'> & InjectFace<ConsoleFace> & PropsLocale<'ccteam'>
+export type WorkbenchProps = PropsRuntime<'shell.overlay'> & InjectFace<ConsoleFace> & PropsLocale<'ccteam'>
 
 /** Composed props of one `settings.plugin.item` card: the card face + `t`. */
 export type SettingsCardProps = PropsRuntime<'settings.plugin.item'> & InjectFace<SettingsCardFace> & PropsLocale<'ccteam'>

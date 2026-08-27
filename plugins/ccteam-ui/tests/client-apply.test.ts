@@ -37,7 +37,7 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
 
 const { apply, inject, name } = await import('../src/client/index.js')
 const { EntryButton } = await import('../src/client/EntryButton.js')
-const { Panel } = await import('../src/client/Panel.js')
+const { Workbench } = await import('../src/client/Workbench.js')
 const { SettingsCard } = await import('../src/client/settings/SettingsCard.js')
 
 interface Registration {
@@ -164,7 +164,7 @@ describe('apply', () => {
     expect(entry?.options).toMatchObject({ id: 'ccteam', order: 0, locale: 'ccteam' })
 
     const [panel] = byName('shell.overlay')
-    expect(panel?.component).toBe(Panel)
+    expect(panel?.component).toBe(Workbench)
     expect(panel?.options).toMatchObject({ id: 'ccteam', order: 0, locale: 'ccteam' })
 
     const cards = byName('settings.plugin.item')
@@ -193,9 +193,9 @@ describe('apply', () => {
     expect(typeof entryFace.hooks.console.subscribe).toBe('function')
     expect(typeof entryFace.dispatch).toBe('function')
     expect(typeof (entryFace.api as { call: unknown }).call).toBe('function')
-    const snapshot = entryFace.hooks.console.getSnapshot() as { open: boolean; stack: unknown[] }
+    const snapshot = entryFace.hooks.console.getSnapshot() as { open: boolean; selection: unknown }
     expect(snapshot.open).toBe(false)
-    expect(snapshot.stack).toEqual([{ kind: 'tree' }])
+    expect(snapshot.selection).toEqual({ kind: 'none' })
   })
 
   it('injects each card face with its namespace spec and a bare observable under hooks.card', () => {

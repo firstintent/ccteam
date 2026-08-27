@@ -1,318 +1,356 @@
-/** Store reducers: view stack + Esc, badge, recents, receipts, persistence, tree utils. */
+/** Store reducers: selection, chats (canonical/live/choice), badge, recents, persistence, tree utils. */
 import { describe, expect, it } from 'vitest'
-import type { TeamGraph, TeamNode } from '../src/shared/contract.js'
 import {
   MAX_RECENTS,
-  MAX_WIDTH,
-  MIN_WIDTH,
   STORAGE_KEYS,
   attachPersistence,
-  clampWidth,
+  chatOf,
   createStore,
   dotState,
+  effortsFor,
+  filterRows,
   findNode,
   flattenNodes,
-  formatCost,
   initialState,
   loadPersisted,
   planSpawnOutcome,
-  projectSlugs,
   reduce,
-  vendorGlyph,
 } from '../src/client/store.js'
 import type { Action, ConsoleState, StorageLike } from '../src/client/store.js'
+import { formatCost, formatElapsed, formatTokens, relativeTime, titleFromTask, vendorGlyph } from '../src/client/format.js'
+import type { TeamGraph, TeamNode } from '../src/shared/contract.js'
 
-function run(actions: Action[], start: ConsoleState = initialState()): ConsoleState {
+function run(actions: Action[], start = initialState()): ConsoleState {
   return actions.reduce(reduce, start)
 }
 
-describe('view stack', () => {
-  it('starts at the tree and drills into chat and spawn', () => {
-    const state = run([{ type: 'open_panel' }, { type: 'open_chat', sid: 's1' }])
-    expect(state.stack).toEqual([{ kind: 'tree' }, { kind: 'chat', sid: 's1' }])
+const NOW = 1_700_000_000_000
+
+describe('selection', () => {
+  it('selecting a session records it as a recent and clears the step selection', () => {
+    let state = run([{ type: 'open_panel' }, { type: 'select_step', sid: 's0', itemId: 'x' }])
+    state = reduce(state, { type: 'select_session', sid: 's1' })
+    expect(state.selection).toEqual({ kind: 'session', sid: 's1' })
+    expect(state.recents).toEqual(['s1'])
+    expect(state.details.step).toBeNull()
+    expect(state.details.open).toBe(true)
   })
 
-  it('Esc walks back: chat -> tree -> closed', () => {
-    let state = run([{ type: 'open_panel' }, { type: 'open_chat', sid: 's1' }])
-    state = reduce(state, { type: 'back' })
-    expect(state.stack).toEqual([{ kind: 'tree' }])
-    expect(state.open).toBe(true)
-    state = reduce(state, { type: 'back' })
-    expect(state.open).toBe(false)
-    // Esc while closed is inert.
-    expect(reduce(state, { type: 'back' })).toBe(state)
+  it('re-selecting the current session is a no-op', () => {
+    const state = run([{ type: 'select_session', sid: 's1' }])
+    expect(reduce(state, { type: 'select_session', sid: 's1' })).toBe(state)
   })
 
-  it('opening a chat from spawn replaces the spawn view (Esc returns to the tree, not the form)', () => {
-    const state = run([
-      { type: 'open_panel' },
-      { type: 'open_spawn' },
-      { type: 'open_chat', sid: 's9' },
-    ])
-    expect(state.stack).toEqual([{ kind: 'tree' }, { kind: 'chat', sid: 's9' }])
+  it('new-session and clear switch the main column', () => {
+    let state = run([{ type: 'select_session', sid: 's1' }, { type: 'select_new' }])
+    expect(state.selection).toEqual({ kind: 'new' })
+    state = reduce(state, { type: 'clear_selection' })
+    expect(state.selection).toEqual({ kind: 'none' })
   })
 
-  it('switching chats replaces the top instead of stacking chats', () => {
-    const state = run([
-      { type: 'open_panel' },
-      { type: 'open_chat', sid: 's1' },
-      { type: 'open_chat', sid: 's2' },
-    ])
-    expect(state.stack).toEqual([{ kind: 'tree' }, { kind: 'chat', sid: 's2' }])
+  it('details open on toggle and close on Esc-path actions', () => {
+    let state = run([{ type: 'toggle_details' }])
+    expect(state.details.open).toBe(true)
+    state = reduce(state, { type: 'close_details' })
+    expect(state.details.open).toBe(false)
+    expect(reduce(state, { type: 'close_details' })).toBe(state)
   })
 })
 
 describe('badge', () => {
-  it('increments on turn_done while closed and clears on open', () => {
-    let state = run([{ type: 'turn_done' }, { type: 'turn_done', sid: 's1' }])
+  it('counts completed turns only while closed and resets on open', () => {
+    let state = run([{ type: 'turn_done' }, { type: 'turn_done' }])
     expect(state.badge).toBe(2)
     state = reduce(state, { type: 'open_panel' })
     expect(state.badge).toBe(0)
-  })
-
-  it('does not count turns completing while the panel is open', () => {
-    const state = run([{ type: 'open_panel' }, { type: 'turn_done' }])
+    state = reduce(state, { type: 'turn_done' })
     expect(state.badge).toBe(0)
   })
 
-  it('toggle_panel opening clears the badge too', () => {
-    const state = run([{ type: 'turn_done' }, { type: 'toggle_panel' }])
-    expect(state.open).toBe(true)
-    expect(state.badge).toBe(0)
-  })
-
-  it('turn_done settles the working session back to idle', () => {
-    const state = run([
-      { type: 'activity', sid: 's1', activity: 'working' },
-      { type: 'turn_done', sid: 's1' },
+  it('turn_done settles a working chat without content back to idle', () => {
+    let state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'progress', content: '', done: false }, now: NOW },
     ])
-    expect(state.chats['s1']?.activity).toBe('idle')
+    expect(chatOf(state, 's1').activity).toBe('working')
+    state = reduce(state, { type: 'turn_done', sid: 's1' })
+    expect(chatOf(state, 's1').activity).toBe('idle')
+    expect(chatOf(state, 's1').live).toBeNull()
   })
 })
 
 describe('recents', () => {
-  it('dedupes to the front and caps the strip', () => {
+  it('keeps the most recent first, deduped, capped', () => {
     const state = run([
-      { type: 'open_chat', sid: 's1' },
-      { type: 'open_chat', sid: 's2' },
-      { type: 'open_chat', sid: 's3' },
-      { type: 'open_chat', sid: 's1' },
-      { type: 'open_chat', sid: 's4' },
+      { type: 'select_session', sid: 's1' },
+      { type: 'select_session', sid: 's2' },
+      { type: 'select_session', sid: 's3' },
+      { type: 'select_session', sid: 's1' },
+      { type: 'select_session', sid: 's4' },
+      { type: 'select_session', sid: 's5' },
+      { type: 'select_session', sid: 's6' },
     ])
-    expect(state.recents).toEqual(['s4', 's1', 's3'])
-    expect(state.recents.length).toBe(MAX_RECENTS)
+    expect(state.recents.length).toBeLessThanOrEqual(MAX_RECENTS)
+    expect(state.recents[0]).toBe('s6')
+    expect(new Set(state.recents).size).toBe(state.recents.length)
   })
 })
 
-describe('connection + width', () => {
-  it('maps StatusResponse onto the phase', () => {
-    expect(run([{ type: 'status_loaded', status: { connected: true } }]).connection.phase).toBe('ok')
-    expect(
-      run([{ type: 'status_loaded', status: { connected: false, reason: 'unconfigured' } }]).connection.phase,
-    ).toBe('unconfigured')
-    expect(
-      run([{ type: 'status_loaded', status: { connected: false, reason: 'unreachable' } }]).connection.phase,
-    ).toBe('unreachable')
-    expect(run([{ type: 'status_failed' }]).connection.phase).toBe('unreachable')
+describe('chat: live turn', () => {
+  it('progress content is a snapshot, steps upsert by item id and complete on done', () => {
+    let state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'progress', content: 'looking', done: false }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'progress', content: 'looking at files', done: false }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'completed' } }, now: NOW },
+    ])
+    const live = chatOf(state, 's1').live
+    expect(live?.content).toBe('looking at files')
+    expect(live?.steps).toHaveLength(1)
+    expect(live?.steps[0]?.status).toBe('completed')
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't2', kind: 'command_exec', name: 'cargo', summary: 'cargo test', status: 'started' } }, now: NOW })
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'progress', content: '', done: true }, now: NOW })
+    expect(chatOf(state, 's1').live?.steps.every(s => s.status === 'completed')).toBe(true)
   })
 
-  it('clamps the dragged width to the band', () => {
-    expect(run([{ type: 'set_width', width: 10 }]).width).toBe(MIN_WIDTH)
-    expect(run([{ type: 'set_width', width: 5000 }]).width).toBe(MAX_WIDTH)
-    expect(run([{ type: 'set_width', width: 444 }]).width).toBe(444)
-    expect(clampWidth(Number.NaN)).toBeGreaterThan(0)
+  it('an answer settles the live turn into an ephemeral row carrying its steps', () => {
+    let state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.' }, now: NOW },
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.live).toBeNull()
+    expect(chat.activity).toBe('idle')
+    const settled = chat.rows[0]
+    expect(settled?.kind).toBe('assistant')
+    if (settled?.kind === 'assistant') {
+      expect(settled.ephemeral).toBe(true)
+      expect(settled.content).toBe('done.')
+      expect(settled.steps).toHaveLength(1)
+      expect(settled.steps[0]?.status).toBe('completed')
+    }
+    // The canonical page then absorbs the ephemeral row: same text, steps kept.
+    state = reduce(state, { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:user', role: 'user', content: 'go' }, { turnId: 'u1:assistant', role: 'assistant', content: 'done.' }], hasMore: false })
+    const rows = chatOf(state, 's1').rows
+    expect(rows.map(r => r.kind)).toEqual(['user', 'assistant'])
+    const canon = rows[1]
+    if (canon?.kind === 'assistant') {
+      expect(canon.ephemeral).toBeUndefined()
+      expect(canon.steps).toHaveLength(1)
+    }
+  })
+
+  it('an answer with options becomes a choice row that waits, and resolving it resumes work', () => {
+    let state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'p1', content: 'Allow?', options: [{ id: 'y', label: 'Yes' }, { id: 'n', label: 'No' }], token: 'tok' }, now: NOW },
+    ])
+    let chat = chatOf(state, 's1')
+    expect(chat.waiting).toBe(true)
+    expect(chat.rows[0]?.kind).toBe('choice')
+    state = reduce(state, { type: 'choice_resolving', sid: 's1', id: 'choice-p1' })
+    state = reduce(state, { type: 'choice_resolved', sid: 's1', id: 'choice-p1', selection: 'y' })
+    chat = chatOf(state, 's1')
+    expect(chat.waiting).toBe(false)
+    expect(chat.activity).toBe('working')
+    const row = chat.rows[0]
+    if (row?.kind === 'choice') expect(row.resolved).toBe('y')
+    // A resolved choice does not survive the next canonical page.
+    state = reduce(state, { type: 'history_loaded', sid: 's1', rows: [], hasMore: false })
+    expect(chatOf(state, 's1').rows).toEqual([])
+  })
+
+  it('a duplicate answer id is not appended twice', () => {
+    const state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'a' }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'a' }, now: NOW },
+    ])
+    expect(chatOf(state, 's1').rows).toHaveLength(1)
+  })
+
+  it('bookkeeping lifecycle states (renamed) add no row', () => {
+    const state = run([
+      { type: 'send_started', sid: 's1', text: 'x' },
+      { type: 'session_event', sid: 's1', event: { kind: 'lifecycle', state: 'renamed', reason: 'user' }, now: NOW },
+    ])
+    expect(chatOf(state, 's1').rows.map(r => r.kind)).toEqual(['user'])
+  })
+
+  it('lifecycle end states drop the live turn', () => {
+    const state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'progress', content: 'x', done: false }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'lifecycle', state: 'evicted' }, now: NOW },
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.live).toBeNull()
+    expect(chat.activity).toBe('idle')
+    expect(chat.rows.at(-1)?.kind).toBe('system')
   })
 })
 
-describe('transcript merging + receipts', () => {
-  it('send_started appends an optimistic row that the canonical server row replaces', () => {
+describe('chat: sending and history', () => {
+  it('an optimistic user row is replaced by its canonical row', () => {
     let state = run([{ type: 'send_started', sid: 's1', text: 'hello' }])
-    expect(state.chats['s1']?.rows).toEqual([{ turnId: 'local-1', role: 'user', content: 'hello' }])
-    state = reduce(state, { type: 'event_row', sid: 's1', row: { turnId: 't9', role: 'user', content: 'hello' } })
-    expect(state.chats['s1']?.rows).toEqual([{ turnId: 't9', role: 'user', content: 'hello' }])
+    expect(chatOf(state, 's1').rows[0]).toMatchObject({ kind: 'user', content: 'hello', local: true })
+    state = reduce(state, { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:user', role: 'user', content: 'hello' }], hasMore: false })
+    const rows = chatOf(state, 's1').rows
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toMatchObject({ kind: 'user', id: 'u1:user' })
   })
 
-  it('rows dedupe by turnId (history + stream double-delivery)', () => {
-    const row = { turnId: 't1', role: 'assistant', content: 'hi' } as const
-    const state = run([
-      { type: 'history_loaded', sid: 's1', rows: [row] },
-      { type: 'event_row', sid: 's1', row },
-    ])
-    expect(state.chats['s1']?.rows).toEqual([row])
-  })
-
-  it('history_loaded keeps in-flight optimistic rows', () => {
-    const state = run([
-      { type: 'send_started', sid: 's1', text: 'pending' },
-      { type: 'history_loaded', sid: 's1', rows: [{ turnId: 't1', role: 'assistant', content: 'old' }] },
-    ])
-    expect(state.chats['s1']?.rows).toEqual([
-      { turnId: 't1', role: 'assistant', content: 'old' },
-      { turnId: 'local-1', role: 'user', content: 'pending' },
-    ])
-  })
-
-  it('a queued receipt surfaces queuedBehind and clears when the turn starts flowing', () => {
+  it('queued and failed receipts become notices; an answer clears queued ones', () => {
     let state = run([
-      { type: 'send_started', sid: 's1', text: 'x' },
-      { type: 'send_settled', sid: 's1', receipt: { ok: true, queued: true, queuedBehind: 's7' } },
+      { type: 'send_started', sid: 's1', text: 'a' },
+      { type: 'send_settled', sid: 's1', receipt: { ok: true, queued: true, queuedBehind: 's0' } },
     ])
-    expect(state.chats['s1']?.notices).toEqual([{ id: 1, kind: 'queued', queuedBehind: 's7' }])
-    state = reduce(state, {
-      type: 'event_row',
-      sid: 's1',
-      row: { turnId: 't2', role: 'assistant', content: 'on it' },
-    })
-    expect(state.chats['s1']?.notices).toEqual([])
+    expect(chatOf(state, 's1').notices).toEqual([{ id: 1, kind: 'queued', queuedBehind: 's0' }])
+    state = reduce(state, { type: 'send_settled', sid: 's1', receipt: { ok: false, errorKind: 'bad_request', error: 'nope' } })
+    expect(chatOf(state, 's1').notices).toHaveLength(2)
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'ok' }, now: NOW })
+    expect(chatOf(state, 's1').notices.map(n => n.kind)).toEqual(['error'])
+    expect(reduce(state, { type: 'send_settled', sid: 's1', receipt: { ok: true } })).toBe(state)
   })
 
-  it('a failed receipt surfaces errorKind and is never swallowed; the next send resets notices', () => {
+  it('older pages prepend without duplicating rows and keep the cursor', () => {
     let state = run([
-      { type: 'send_started', sid: 's1', text: 'x' },
-      { type: 'send_settled', sid: 's1', receipt: { ok: false, errorKind: 'SESSION_BUSY', error: 'try later' } },
+      { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u2:user', role: 'user', content: 'second' }], hasMore: true, nextBefore: 'c1' },
     ])
-    expect(state.chats['s1']?.notices).toEqual([
-      { id: 1, kind: 'error', errorKind: 'SESSION_BUSY', message: 'try later' },
-    ])
-    state = reduce(state, { type: 'send_started', sid: 's1', text: 'again' })
-    expect(state.chats['s1']?.notices).toEqual([])
+    state = reduce(state, { type: 'history_loading', sid: 's1', older: true })
+    expect(chatOf(state, 's1').loadingOlder).toBe(true)
+    state = reduce(state, { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:user', role: 'user', content: 'first' }, { turnId: 'u2:user', role: 'user', content: 'second' }], hasMore: false, older: true })
+    const chat = chatOf(state, 's1')
+    expect(chat.rows.map(r => r.id)).toEqual(['u1:user', 'u2:user'])
+    expect(chat.hasMore).toBe(false)
+    expect(chat.loadingOlder).toBe(false)
   })
 
-  it('a clean ok receipt leaves no notice', () => {
-    const state = run([
-      { type: 'send_started', sid: 's1', text: 'x' },
-      { type: 'send_settled', sid: 's1', receipt: { ok: true } },
-    ])
-    expect(state.chats['s1']?.notices).toEqual([])
+  it('a delegation frame narrates into an open parent chat only', () => {
+    let state = run([{ type: 'delegation', relation: 'spawned', parentSid: 's1', childSid: 's2', title: 'child' }])
+    expect(state.chats['s1']).toBeUndefined()
+    state = run([{ type: 'send_started', sid: 's1', text: 'x' }, { type: 'delegation', relation: 'done', parentSid: 's1', childSid: 's2', title: 'child' }])
+    expect(chatOf(state, 's1').notices[0]).toMatchObject({ kind: 'info', message: 'done:child' })
+    expect(state.graphStale).toBe(true)
   })
 })
 
-describe('store + persistence', () => {
+describe('spawn draft', () => {
+  it('a vendor switch clears model/effort and a project switch clears the role', () => {
+    let state = run([{ type: 'set_draft', draft: { vendor: 'claude', model: 'm', effort: 'high', project: 'p', role: 'cto' } }])
+    state = reduce(state, { type: 'set_draft', draft: { vendor: 'codex' } })
+    expect(state.spawn.draft).toMatchObject({ vendor: 'codex', model: null, effort: null, role: 'cto' })
+    state = reduce(state, { type: 'set_draft', draft: { project: 'q' } })
+    expect(state.spawn.draft.role).toBeNull()
+  })
+
+  it('spawn outcomes: sid present wins even on failure', () => {
+    expect(planSpawnOutcome({ ok: true, sid: 's1' })).toEqual({ kind: 'chat', sid: 's1' })
+    expect(planSpawnOutcome({ ok: false, sid: 's1', error: 'task failed' })).toEqual({ kind: 'chat', sid: 's1', errorMessage: 'task failed' })
+    expect(planSpawnOutcome({ ok: false, error: 'no project' })).toEqual({ kind: 'form_error', message: 'no project' })
+  })
+
+  it('efforts come from the model row, else the vendor ladder', () => {
+    const catalog = { vendors: [{ vendor: 'claude', efforts: ['low', 'high'], models: [{ id: 'a', efforts: ['max'] }, { id: 'b', efforts: [] }] }] }
+    expect(effortsFor(catalog, 'claude', 'a')).toEqual(['max'])
+    expect(effortsFor(catalog, 'claude', 'b')).toEqual(['low', 'high'])
+    expect(effortsFor(catalog, 'claude', null)).toEqual(['low', 'high'])
+    expect(effortsFor(catalog, 'codex', null)).toEqual([])
+    expect(effortsFor(null, 'claude', null)).toEqual([])
+  })
+})
+
+describe('persistence', () => {
   function memoryStorage(seed: Record<string, string> = {}): StorageLike & { data: Record<string, string> } {
     const data = { ...seed }
     return {
       data,
-      getItem: key => (key in data ? data[key]! : null),
+      getItem: key => data[key] ?? null,
       setItem: (key, value) => {
         data[key] = value
       },
     }
   }
 
-  it('notifies subscribers only on real transitions', () => {
-    const store = createStore(initialState())
-    let ticks = 0
-    store.subscribe(() => {
-      ticks += 1
-    })
-    store.dispatch({ type: 'close_panel' }) // already closed: no-op
-    store.dispatch({ type: 'open_panel' })
-    expect(ticks).toBe(1)
-  })
-
-  it('round-trips open/width/recents/project through storage', () => {
+  it('mirrors open, recents, draft project/vendor and column prefs', () => {
     const storage = memoryStorage()
     const store = createStore(initialState())
     attachPersistence(store, storage)
     store.dispatch({ type: 'open_panel' })
-    store.dispatch({ type: 'set_width', width: 500 })
-    store.dispatch({ type: 'open_chat', sid: 's3' })
-    store.dispatch({ type: 'set_spawn_project', project: 'acme' })
+    store.dispatch({ type: 'select_session', sid: 's1' })
+    store.dispatch({ type: 'set_draft', draft: { project: 'p', vendor: 'grok' } })
+    store.dispatch({ type: 'toggle_team' })
     expect(storage.data[STORAGE_KEYS.open]).toBe('1')
-    expect(storage.data[STORAGE_KEYS.width]).toBe('500')
-    expect(JSON.parse(storage.data[STORAGE_KEYS.recents]!)).toEqual(['s3'])
-    expect(storage.data[STORAGE_KEYS.project]).toBe('acme')
+    expect(JSON.parse(storage.data[STORAGE_KEYS.recents]!)).toEqual(['s1'])
+    expect(storage.data[STORAGE_KEYS.project]).toBe('p')
+    expect(storage.data[STORAGE_KEYS.vendor]).toBe('grok')
+    expect(storage.data[STORAGE_KEYS.team]).toBe('0')
 
-    const restored = initialState(loadPersisted(storage))
-    expect(restored.open).toBe(true)
-    expect(restored.width).toBe(500)
-    expect(restored.recents).toEqual(['s3'])
-    expect(restored.spawnProject).toBe('acme')
+    const loaded = initialState(loadPersisted(storage))
+    expect(loaded.open).toBe(true)
+    expect(loaded.recents).toEqual(['s1'])
+    expect(loaded.spawn.draft.project).toBe('p')
+    expect(loaded.spawn.draft.vendor).toBe('grok')
+    expect(loaded.teamOpen).toBe(false)
   })
 
-  it('survives poisoned storage', () => {
-    const storage = memoryStorage({ [STORAGE_KEYS.recents]: '{not json', [STORAGE_KEYS.width]: 'wat' })
+  it('poisoned storage still boots with defaults', () => {
+    const storage = memoryStorage({ [STORAGE_KEYS.recents]: '{not json', [STORAGE_KEYS.open]: '1' })
     expect(loadPersisted(storage)).toEqual({})
     expect(loadPersisted(undefined)).toEqual({})
   })
 })
 
-describe('tree utilities', () => {
-  const node = (sid: string, children: TeamNode[] = []): TeamNode => ({
+describe('tree utils', () => {
+  const node = (sid: string, children: TeamNode[] = [], extra: Partial<TeamNode> = {}): TeamNode => ({
     sid,
     project: 'p',
     vendor: 'claude',
     activity: 'idle',
     children,
+    ...extra,
+  })
+  const graph: TeamGraph = { projects: [{ slug: 'p', nodes: [node('s1', [node('s2', [node('s3')])], { title: 'root' }), node('s4', [], { vendor: 'codex', model: 'gpt-5' })] }] }
+
+  it('flattens parents before children with depth', () => {
+    expect(flattenNodes(graph.projects[0]!.nodes).map(r => [r.node.sid, r.depth])).toEqual([['s1', 0], ['s2', 1], ['s3', 2], ['s4', 0]])
   })
 
-  it('flattens delegation children under their parents with depth', () => {
-    const rows = flattenNodes([node('s1', [node('s2', [node('s3')]), node('s4')]), node('s5')])
-    expect(rows.map(row => [row.node.sid, row.depth])).toEqual([
-      ['s1', 0],
-      ['s2', 1],
-      ['s3', 2],
-      ['s4', 1],
-      ['s5', 0],
-    ])
+  it('filters by title/sid/vendor/model keeping ancestors', () => {
+    const rows = flattenNodes(graph.projects[0]!.nodes)
+    expect(filterRows(rows, 's3').map(r => r.node.sid)).toEqual(['s1', 's2', 's3'])
+    expect(filterRows(rows, 'GPT').map(r => r.node.sid)).toEqual(['s4'])
+    expect(filterRows(rows, '')).toBe(rows)
+    expect(filterRows(rows, 'zzz')).toEqual([])
   })
 
-  it('finds nodes anywhere in the graph', () => {
-    const graph: TeamGraph = { projects: [{ slug: 'p', nodes: [node('s1', [node('s2')])] }] }
-    expect(findNode(graph, 's2')?.sid).toBe('s2')
+  it('finds nodes anywhere and maps activity to dot states', () => {
+    expect(findNode(graph, 's3')?.sid).toBe('s3')
     expect(findNode(graph, 'nope')).toBeUndefined()
     expect(findNode(null, 's1')).toBeUndefined()
-  })
-
-  it('maps activity onto StateDot states', () => {
     expect(dotState('working')).toBe('ongoing')
-    expect(dotState('idle')).toBe('done')
     expect(dotState('stale')).toBe('warning')
     expect(dotState('stuck')).toBe('error')
     expect(dotState(undefined)).toBe('done')
   })
-
-  it('formats cost compactly and hides the unknown', () => {
-    expect(formatCost(0.4219)).toBe('$0.42')
-    expect(formatCost(12.34)).toBe('$12.3')
-    expect(formatCost(undefined)).toBeNull()
-  })
-
-  it('monograms vendors as text glyphs', () => {
-    expect(vendorGlyph('claude')).toBe('cl')
-    expect(vendorGlyph('dsh')).toBe('ds')
-  })
-
-  it('lists project slugs in graph order', () => {
-    const graph: TeamGraph = {
-      projects: [
-        { slug: 'alpha', nodes: [] },
-        { slug: 'beta', nodes: [] },
-      ],
-    }
-    expect(projectSlugs(graph)).toEqual(['alpha', 'beta'])
-    expect(projectSlugs(null)).toEqual([])
-  })
 })
 
-describe('spawn outcome', () => {
-  it('a clean spawn goes straight into the chat', () => {
-    expect(planSpawnOutcome({ ok: true, sid: 's9' })).toEqual({ kind: 'chat', sid: 's9' })
-  })
-
-  it('a sid on a FAILED spawn still navigates in — the session exists upstream — with the error stated', () => {
-    expect(planSpawnOutcome({ ok: false, sid: 's9', error: 'first task rejected' })).toEqual({
-      kind: 'chat',
-      sid: 's9',
-      errorMessage: 'first task rejected',
-    })
-  })
-
-  it('no sid keeps the form up with the actionable error', () => {
-    expect(planSpawnOutcome({ ok: false, error: 'name a project: alpha, beta' })).toEqual({
-      kind: 'form_error',
-      message: 'name a project: alpha, beta',
-    })
-    expect(planSpawnOutcome({ ok: false })).toEqual({ kind: 'form_error', message: 'unknown' })
+describe('format', () => {
+  it('cost, tokens, elapsed, relative time, title, glyph', () => {
+    expect(formatCost(undefined)).toBeNull()
+    expect(formatCost(0.004)).toBeNull()
+    expect(formatCost(0.123)).toBe('$0.12')
+    expect(formatCost(12.34)).toBe('$12.3')
+    expect(formatTokens(999)).toBe('999')
+    expect(formatTokens(1234)).toBe('1.2k')
+    expect(formatTokens(45_000)).toBe('45k')
+    expect(formatTokens(2_500_000)).toBe('2.5M')
+    expect(formatElapsed(12_000)).toBe('12s')
+    expect(formatElapsed(65_000)).toBe('1m 05s')
+    expect(formatElapsed(3_720_000)).toBe('1h 02m')
+    expect(relativeTime(undefined, NOW)).toBeNull()
+    expect(relativeTime(new Date(NOW - 10_000).toISOString(), NOW)).toEqual({ unit: 'now' })
+    expect(relativeTime(new Date(NOW - 120_000).toISOString(), NOW)).toEqual({ unit: 'minutes', value: 2 })
+    expect(relativeTime(new Date(NOW - 2 * 86_400_000).toISOString(), NOW)).toEqual({ unit: 'days', value: 2 })
+    expect(titleFromTask('\n  Fix the login bug\nmore')).toBe('Fix the login bug')
+    expect(titleFromTask('   ')).toBeUndefined()
+    expect(titleFromTask('x'.repeat(80))).toHaveLength(60)
+    expect(vendorGlyph('claude')).toBe('cl')
   })
 })
