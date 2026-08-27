@@ -317,6 +317,7 @@ async fn handle_companion_request(
 
 async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> Response {
     let (parts, body) = req.into_parts();
+    let plugin_bundle = is_plugin_bundle_path(parts.uri.path());
     let target = format!(
         "http://127.0.0.1:{port}{}",
         parts
@@ -330,7 +331,7 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
     builder = builder.headers(headers);
     builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     match builder.send().await {
-        Ok(resp) => response_from_reqwest(resp).await,
+        Ok(resp) => response_from_reqwest(resp, plugin_bundle).await,
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": err.to_string() })),
@@ -395,6 +396,9 @@ const CRYPTO_RANDOM_UUID_POLYFILL: &str = r#"<script>(function(){var c=window.cr
 /// An existing global (a shell that brought its own transport) is left alone
 /// except for the missing flag. Consequence to know once the flag is read:
 /// deliverables actions then act on the daemon host — the workspace machine.
+/// For DSH ≤ 0.1.1-rc.2, whose client never reads the flag, the companion
+/// port back-ports that read into the served client-connection bundle
+/// (`backport_owns_host`), so the declaration is effective on every version.
 const DSH_TRANSPORT_OWNS_HOST: &str = r#"<script>(function(){var g=window,t=g.__DSH_TRANSPORT__;if(t===undefined){g.__DSH_TRANSPORT__={ownsHost:true,createApiClient:function(){return undefined}};return}if(t!==null&&typeof t==="object"&&t.ownsHost===undefined){t.ownsHost=true}})();</script>"#;
 
 /// Splice the companion head scripts in as the first thing inside `<head>` so
@@ -415,30 +419,94 @@ fn inject_polyfill(html: &str) -> Option<String> {
     Some(out)
 }
 
-fn is_html_response(headers: &HeaderMap) -> bool {
+/// The one line DSH ≤ 0.1.1-rc.2 decides `isLoopback` on: page hostname
+/// alone. Upstream added the `__DSH_TRANSPORT__.ownsHost` read after rc.2
+/// shipped, and the client-connection bundle is served verbatim
+/// (`/plugins/<id>/client.js`), so the companion port back-ports exactly that
+/// read: the rc.2 line gains the same branch newer DSH evaluates natively.
+/// Anything else — another version, a minified build — passes through
+/// byte-for-byte, which is also how this retires: the first DSH release that
+/// reads the flag itself no longer carries the line.
+const RC2_IS_LOOPBACK_LINE: &str =
+    "isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),";
+const RC2_IS_LOOPBACK_OWNS_HOST: &str = "isLoopback: pageLocation === void 0 || \
+     globalThis.__DSH_TRANSPORT__?.ownsHost === true || \
+     isLoopbackHostname(pageLocation.hostname),";
+
+fn backport_owns_host(bundle: &str) -> Option<String> {
+    bundle
+        .contains(RC2_IS_LOOPBACK_LINE)
+        .then(|| bundle.replacen(RC2_IS_LOOPBACK_LINE, RC2_IS_LOOPBACK_OWNS_HOST, 1))
+}
+
+/// `/plugins/<id>/client.js` — DSH client-modules' bundle route (the rev rides
+/// the query string, which is not part of the path).
+fn is_plugin_bundle_path(path: &str) -> bool {
+    path.strip_prefix("/plugins/")
+        .is_some_and(|rest| !rest.starts_with('/') && rest.ends_with("/client.js"))
+}
+
+fn content_type_starts_with(headers: &HeaderMap, prefixes: &[&str]) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/html"))
+        .is_some_and(|v| {
+            let value = v.trim_start().to_ascii_lowercase();
+            prefixes.iter().any(|prefix| value.starts_with(prefix))
+        })
 }
 
-async fn response_from_reqwest(resp: reqwest::Response) -> Response {
+fn is_html_response(headers: &HeaderMap) -> bool {
+    content_type_starts_with(headers, &["text/html"])
+}
+
+fn is_javascript_response(headers: &HeaderMap) -> bool {
+    content_type_starts_with(headers, &["text/javascript", "application/javascript"])
+}
+
+/// What the companion port splices into a buffered upstream body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Splice {
+    /// The document: head scripts (secure-context polyfill + `ownsHost`).
+    Html,
+    /// A plugin client bundle: the rc.2 `ownsHost` back-port.
+    PluginBundle,
+}
+
+fn splice_for(headers: &HeaderMap, plugin_bundle: bool) -> Option<Splice> {
+    if is_html_response(headers) {
+        Some(Splice::Html)
+    } else if plugin_bundle && is_javascript_response(headers) {
+        Some(Splice::PluginBundle)
+    } else {
+        None
+    }
+}
+
+async fn response_from_reqwest(resp: reqwest::Response, plugin_bundle: bool) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
 
-    // HTML is buffered (documents are small) so the polyfill can be spliced
-    // in; everything else — assets, RPC payloads, downloads — keeps streaming
-    // untouched. `accept-encoding` is stripped on the way out (see
+    // HTML (small) and plugin client bundles (a few hundred KB, browser-cached
+    // per rev) are buffered so their splice can be applied; everything else —
+    // assets, RPC payloads, downloads — keeps streaming untouched.
+    // `accept-encoding` is stripped on the way out (see
     // `should_strip_request_header`), so the body here is always identity and
     // splicing can never corrupt a compressed stream.
-    if is_html_response(&headers) {
+    if let Some(splice) = splice_for(&headers, plugin_bundle) {
         match resp.bytes().await {
             Ok(bytes) => {
                 let body = match std::str::from_utf8(&bytes) {
-                    Ok(html) => match inject_polyfill(html) {
-                        Some(patched) => Body::from(patched),
-                        None => Body::from(bytes),
-                    },
+                    Ok(text) => {
+                        let patched = match splice {
+                            Splice::Html => inject_polyfill(text),
+                            Splice::PluginBundle => backport_owns_host(text),
+                        };
+                        match patched {
+                            Some(patched) => Body::from(patched),
+                            None => Body::from(bytes),
+                        }
+                    }
                     // Not UTF-8 → not something to splice; pass it through.
                     Err(_) => Body::from(bytes),
                 };
@@ -720,6 +788,82 @@ mod tests {
     fn polyfill_injection_is_inert_without_a_head() {
         assert!(inject_polyfill("{\"json\":true}").is_none());
         assert!(inject_polyfill("plain text").is_none());
+    }
+
+    #[test]
+    fn rc2_connection_bundle_gains_the_owns_host_branch() {
+        let bundle = format!(
+            "\t\t\tconst handle = {{\n\t\t\t\tapi,\n\t\t\t\t{RC2_IS_LOOPBACK_LINE}\n\t\t\t\thostDescription: {{}}\n"
+        );
+        let patched = backport_owns_host(&bundle).expect("the rc.2 line is back-ported");
+        assert_eq!(
+            patched
+                .matches("__DSH_TRANSPORT__?.ownsHost === true")
+                .count(),
+            1,
+            "exactly one ownsHost read is added"
+        );
+        assert!(
+            !patched.contains(RC2_IS_LOOPBACK_LINE),
+            "the hostname-only line is replaced, not duplicated"
+        );
+        assert!(
+            patched.contains("isLoopbackHostname(pageLocation.hostname),"),
+            "the hostname read stays as the fallback"
+        );
+        let (before, after) = bundle.split_once(RC2_IS_LOOPBACK_LINE).unwrap();
+        assert!(patched.starts_with(before) && patched.ends_with(after));
+    }
+
+    #[test]
+    fn other_bundles_pass_through_untouched() {
+        for js in [
+            "",
+            "export const x = 1;",
+            // The post-rc.2 shape already reads the flag: nothing to back-port.
+            "isLoopback: transport?.ownsHost === true || isLoopbackHostname(pageLocation.hostname),",
+        ] {
+            assert!(backport_owns_host(js).is_none(), "{js:?}");
+        }
+    }
+
+    #[test]
+    fn only_plugin_bundle_paths_are_back_port_candidates() {
+        assert!(is_plugin_bundle_path(
+            "/plugins/@deepseek-ai/dsh-client-connection/client.js"
+        ));
+        assert!(is_plugin_bundle_path("/plugins/x/client.js"));
+        for path in [
+            "/",
+            "/plugins",
+            "/plugins/",
+            "/plugins/client.js",
+            "/plugins//client.js",
+            "/assets/index-abc.js",
+            "/ccteam/api/tree",
+        ] {
+            assert!(!is_plugin_bundle_path(path), "{path}");
+        }
+        let js = |ct: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+            h
+        };
+        assert_eq!(
+            splice_for(&js("text/javascript; charset=utf-8"), true),
+            Some(Splice::PluginBundle)
+        );
+        assert_eq!(
+            splice_for(&js("application/javascript"), true),
+            Some(Splice::PluginBundle)
+        );
+        assert_eq!(
+            splice_for(&js("text/javascript"), false),
+            None,
+            "a JS asset off the bundle route streams through"
+        );
+        assert_eq!(splice_for(&js("text/html"), true), Some(Splice::Html));
+        assert_eq!(splice_for(&js("application/json"), true), None);
     }
 
     #[test]
