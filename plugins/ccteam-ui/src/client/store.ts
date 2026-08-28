@@ -32,6 +32,14 @@ export const VENDORS: readonly string[] = ['claude', 'codex', 'grok', 'opencode'
 /** Recents strip capacity. */
 export const MAX_RECENTS = 5
 
+/** Docked pane width bounds (px) and the room always left to DSH beside it. */
+export const MIN_DOCK_WIDTH = 360
+export const DEFAULT_DOCK_WIDTH = 520
+export const DOCK_RESERVE = 480
+
+/** Docked beside DSH (the default), or expanded over the whole page. */
+export type LayoutMode = 'docked' | 'full'
+
 /** localStorage keys (decree: everything under `ccteam.console.*`). */
 export const STORAGE_KEYS = {
   open: 'ccteam.console.open',
@@ -40,6 +48,8 @@ export const STORAGE_KEYS = {
   vendor: 'ccteam.console.vendor',
   team: 'ccteam.console.team',
   details: 'ccteam.console.details',
+  mode: 'ccteam.console.mode',
+  dockWidth: 'ccteam.console.dockWidth',
 } as const
 
 /** Connection phase driving the state screens and the entry dot. */
@@ -139,6 +149,7 @@ export interface ConsoleState {
   chats: Record<string, ChatState>
   teamOpen: boolean
   details: { open: boolean; step: { sid: string; itemId: string } | null }
+  layout: { mode: LayoutMode; dockWidth: number }
   spawn: { busy: boolean; error: string | null; draft: SpawnDraft }
   badge: number
   nextNoticeId: number
@@ -160,6 +171,9 @@ export type Action =
   | { type: 'open_details' }
   | { type: 'close_details' }
   | { type: 'select_step'; sid: string; itemId: string }
+  | { type: 'set_dock_width'; width: number; viewport?: number }
+  | { type: 'set_mode'; mode: LayoutMode }
+  | { type: 'toggle_mode' }
   | { type: 'status_loaded'; status: StatusResponse }
   | { type: 'status_failed' }
   | { type: 'graph_loading' }
@@ -196,6 +210,21 @@ export interface Persisted {
   vendor?: string
   teamOpen?: boolean
   detailsOpen?: boolean
+  mode?: LayoutMode
+  dockWidth?: number
+}
+
+/**
+ * Clamp a docked pane width: never narrower than the pane can lay out, never
+ * so wide that DSH beside it drops under {@link DOCK_RESERVE}.
+ * @param width - requested width in px.
+ * @param viewport - window width when known.
+ * @returns the clamped width.
+ */
+export function clampDockWidth(width: number, viewport?: number): number {
+  if (!Number.isFinite(width)) return DEFAULT_DOCK_WIDTH
+  const max = viewport === undefined ? 1600 : Math.max(MIN_DOCK_WIDTH, viewport - DOCK_RESERVE)
+  return Math.min(max, Math.max(MIN_DOCK_WIDTH, Math.round(width)))
 }
 
 /**
@@ -219,6 +248,10 @@ export function initialState(persisted: Persisted = {}): ConsoleState {
     chats: {},
     teamOpen: persisted.teamOpen ?? true,
     details: { open: persisted.detailsOpen ?? false, step: null },
+    layout: {
+      mode: persisted.mode === 'full' ? 'full' : 'docked',
+      dockWidth: clampDockWidth(persisted.dockWidth ?? DEFAULT_DOCK_WIDTH),
+    },
     spawn: {
       busy: false,
       error: null,
@@ -482,6 +515,16 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
       return { ...state, details: { ...state.details, open: false } }
     case 'select_step':
       return { ...state, details: { open: true, step: { sid: action.sid, itemId: action.itemId } } }
+    case 'set_dock_width': {
+      const dockWidth = clampDockWidth(action.width, action.viewport)
+      if (dockWidth === state.layout.dockWidth) return state
+      return { ...state, layout: { ...state.layout, dockWidth } }
+    }
+    case 'set_mode':
+      if (state.layout.mode === action.mode) return state
+      return { ...state, layout: { ...state.layout, mode: action.mode } }
+    case 'toggle_mode':
+      return { ...state, layout: { ...state.layout, mode: state.layout.mode === 'full' ? 'docked' : 'full' } }
     case 'status_loaded': {
       const phase: ConnectionPhase = action.status.connected
         ? 'ok'
@@ -717,6 +760,10 @@ export function loadPersisted(storage: StorageLike | undefined): Persisted {
     if (team === '0') persisted.teamOpen = false
     const details = storage.getItem(STORAGE_KEYS.details)
     if (details === '1') persisted.detailsOpen = true
+    const mode = storage.getItem(STORAGE_KEYS.mode)
+    if (mode === 'full' || mode === 'docked') persisted.mode = mode
+    const dockWidth = Number(storage.getItem(STORAGE_KEYS.dockWidth))
+    if (Number.isFinite(dockWidth) && dockWidth > 0) persisted.dockWidth = dockWidth
     return persisted
   } catch {
     // Swallows storage/JSON failures: private-mode denials or corrupt values
@@ -741,6 +788,8 @@ export function attachPersistence(store: ConsoleStore, storage: StorageLike): ()
       if (state.spawn.draft.vendor !== null) storage.setItem(STORAGE_KEYS.vendor, state.spawn.draft.vendor)
       storage.setItem(STORAGE_KEYS.team, state.teamOpen ? '1' : '0')
       storage.setItem(STORAGE_KEYS.details, state.details.open ? '1' : '0')
+      storage.setItem(STORAGE_KEYS.mode, state.layout.mode)
+      storage.setItem(STORAGE_KEYS.dockWidth, String(state.layout.dockWidth))
     } catch {
       // Swallows quota/private-mode write failures: persistence is a
       // convenience, never worth breaking the live workbench over.
@@ -755,6 +804,7 @@ export function attachPersistence(store: ConsoleStore, storage: StorageLike): ()
       && state.spawn.draft.vendor === last.spawn.draft.vendor
       && state.teamOpen === last.teamOpen
       && state.details.open === last.details.open
+      && state.layout === last.layout
     ) {
       last = state
       return

@@ -102,25 +102,136 @@
   margin: 0;
 }
 
-/* ------------------------------------------------------------ workbench */
+/* ----------------------------------------------------------------- dock */
 
-/* The whole-viewport surface: a page section of DSH, not a popup — no
- * shadow, no slide, a short fade. */
-.workbench {
-  position: absolute;
-  inset: 0;
+/* The pane: a fixed right-hand column beside DSH (its width is reserved as
+ * a body margin, so DSH re-lays out next to it), resizable, and expandable
+ * to the full page. One width, transitioned, is the whole choreography. */
+.dock {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
   display: flex;
   flex-direction: column;
+  box-sizing: border-box;
   background: var(--dsw-alias-bg-base);
+  border-left: 1px solid var(--dsw-alias-border-l1);
   color: var(--dsw-alias-label-primary);
   font: var(--dsw-font-s-14);
-  animation: wb-in var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+  overflow: hidden;
+  transition: width var(--ds-transition-duration-slow) var(--ds-ease-in-out);
 }
 
-@keyframes wb-in {
+.dock[data-mode='full'] {
+  border-left: none;
+}
+
+.dock[data-closing] {
+  width: 0 !important;
+}
+
+.dock[data-dragging] {
+  transition: none;
+  user-select: none;
+}
+
+/* Width drag: AppFrame's handle verbatim — 8px strip straddling the border,
+ * a 12x32 pill appearing on approach. */
+.dockHandle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 5;
+  touch-action: none;
+}
+
+.dockHandle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 12px;
+  height: 32px;
+  border-radius: 10px;
+  box-sizing: border-box;
+  background: var(--dsw-alias-button-floating-fill);
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  opacity: 0;
+  transition:
+    opacity var(--ds-transition-duration-slow) var(--ds-ease-in-out),
+    background var(--ds-transition-duration-slow) var(--ds-ease-in-out);
+}
+
+.dock:hover .dockHandle::after,
+.dock[data-dragging] .dockHandle::after {
+  opacity: 1;
+}
+
+.dockHandle:hover::after,
+.dock[data-dragging] .dockHandle::after {
+  background: var(--dsw-alias-button-floating-hover);
+  border-color: var(--dsw-alias-border-l3);
+}
+
+/* Single-column mode: the team fills the pane; drawer + sheet slide over
+ * the conversation. */
+.team.teamFill {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  border-right: none;
+}
+
+.sheet {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  z-index: 4;
+  display: flex;
+  width: min(360px, 100%);
+  box-shadow: var(--dsw-shadow-lv2);
+  animation: wb-sheet-in var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.sheet > aside {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  background: var(--dsw-alias-bg-base);
+}
+
+@keyframes wb-sheet-in {
   from {
-    opacity: 0;
+    transform: translateX(100%);
   }
+}
+
+/* Narrow pane: tighter gutters, pickers show their value only. */
+.dock[data-tier='narrow'] .chatColumn {
+  padding: 16px 16px 8px;
+}
+
+.dock[data-tier='narrow'] .composerWrap {
+  padding: 6px 12px 12px;
+}
+
+.dock[data-tier='narrow'] .hero {
+  padding: 16px;
+}
+
+.dock[data-tier='narrow'] .pickerBtn > span:not(.pickerValue) {
+  display: none;
+}
+
+.dock[data-tier='narrow'] .bubble {
+  max-width: 88%;
 }
 
 /* --------------------------------------------------------------- header */
@@ -417,6 +528,7 @@
 }
 
 .main {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
@@ -1121,7 +1233,12 @@
 /* --------------------------------------------------------------- motion */
 
 @media (prefers-reduced-motion: reduce) {
-  .workbench {
+  .dock,
+  .dockHandle::after {
+    transition: none;
+  }
+
+  .sheet {
     animation: none;
   }
 

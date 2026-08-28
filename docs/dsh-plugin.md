@@ -83,8 +83,16 @@ one for the other.
 
 ## 4. Using the workbench
 
-The ccteam button at the bottom of DSH’s sidebar opens the workbench: a
-whole-page section of DSH (not a popup) with three columns.
+The ccteam button at the bottom of DSH’s sidebar opens the workbench as a
+pane **docked beside DSH**: DSH’s own sidebar, conversation and details keep
+working on the left while ccteam runs on the right (to DSH the pane is
+simply a narrower window). Drag the pane’s left edge to resize it, press
+**⤢** to expand it over the full page and again to dock it back; one
+animated width is the whole transition. Inside, the layout follows the
+pane’s width — three columns from about 1240px, two columns (details as a
+slide-over sheet) from about 880px, and a single column below that, where
+the team fills the pane until a session is chosen, a back control returns
+to it, and the details sheet slides over the conversation.
 
 - **Team** (left): **New session**, a search box, and every session grouped
   by project — vendor monogram, title, `vendor · model · when`, the activity
@@ -121,8 +129,8 @@ lists the pass-through commands (`/compact`, `/new`, `/clear`, `/role`,
 name and summary only; the full tool input/output stays in the vendor’s own
 session, and steps are shown live, not replayed from history.
 
-**Esc** leaves a text field first, then closes the details column, then
-returns to DSH. When the workbench is closed, the ccteam button carries a
+**Esc** leaves a text field first, then closes the details, then docks a
+full-page pane, then closes the pane. When the workbench is closed, the ccteam button carries a
 completion count for turns finished since the last open; opening it clears
 the badge.
 

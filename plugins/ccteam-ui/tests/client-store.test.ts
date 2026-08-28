@@ -256,6 +256,26 @@ describe('spawn draft', () => {
   })
 })
 
+describe('layout', () => {
+  it('docks by default, clamps the width to the pane and to DSH\'s reserve, toggles full', () => {
+    let state = initialState()
+    expect(state.layout).toEqual({ mode: 'docked', dockWidth: 520 })
+    state = reduce(state, { type: 'set_dock_width', width: 100 })
+    expect(state.layout.dockWidth).toBe(360)
+    state = reduce(state, { type: 'set_dock_width', width: 5000 })
+    expect(state.layout.dockWidth).toBe(1600)
+    state = reduce(state, { type: 'set_dock_width', width: 1000, viewport: 1200 })
+    expect(state.layout.dockWidth).toBe(720)
+    expect(reduce(state, { type: 'set_dock_width', width: 720, viewport: 1200 })).toBe(state)
+    state = reduce(state, { type: 'toggle_mode' })
+    expect(state.layout.mode).toBe('full')
+    state = reduce(state, { type: 'set_mode', mode: 'docked' })
+    expect(state.layout.mode).toBe('docked')
+    expect(reduce(state, { type: 'set_mode', mode: 'docked' })).toBe(state)
+    expect(initialState({ mode: 'full', dockWidth: 640 }).layout).toEqual({ mode: 'full', dockWidth: 640 })
+  })
+})
+
 describe('persistence', () => {
   function memoryStorage(seed: Record<string, string> = {}): StorageLike & { data: Record<string, string> } {
     const data = { ...seed }
@@ -276,6 +296,10 @@ describe('persistence', () => {
     store.dispatch({ type: 'select_session', sid: 's1' })
     store.dispatch({ type: 'set_draft', draft: { project: 'p', vendor: 'grok' } })
     store.dispatch({ type: 'toggle_team' })
+    store.dispatch({ type: 'set_dock_width', width: 600 })
+    store.dispatch({ type: 'toggle_mode' })
+    expect(storage.data[STORAGE_KEYS.mode]).toBe('full')
+    expect(storage.data[STORAGE_KEYS.dockWidth]).toBe('600')
     expect(storage.data[STORAGE_KEYS.open]).toBe('1')
     expect(JSON.parse(storage.data[STORAGE_KEYS.recents]!)).toEqual(['s1'])
     expect(storage.data[STORAGE_KEYS.project]).toBe('p')
@@ -288,6 +312,7 @@ describe('persistence', () => {
     expect(loaded.spawn.draft.project).toBe('p')
     expect(loaded.spawn.draft.vendor).toBe('grok')
     expect(loaded.teamOpen).toBe(false)
+    expect(loaded.layout).toEqual({ mode: 'full', dockWidth: 600 })
   })
 
   it('poisoned storage still boots with defaults', () => {

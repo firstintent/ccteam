@@ -29,6 +29,8 @@ export interface TeamColumnProps {
   /** Live activity overrides from open chats (sid → activity). */
   liveActivity: Record<string, TeamNode['activity'] | undefined>
   canSpawn: boolean
+  /** Fill the container (narrow pane / drawer) instead of the fixed column width. */
+  fill?: boolean
   now: number
   t: T
   onSelect(sid: string): void
@@ -114,7 +116,7 @@ export function TeamColumn(props: TeamColumnProps) {
   const noMatch = graph !== null && !empty && groups.every(group => group.rows.length === 0)
 
   return (
-    <aside className={css.team} aria-label={t('panel.team')}>
+    <aside className={props.fill === true ? `${css.team} ${css.teamFill}` : css.team} aria-label={t('panel.team')}>
       <div className={css.teamTop}>
         <Button
           variant="outline"
