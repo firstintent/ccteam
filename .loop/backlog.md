@@ -18,12 +18,13 @@
 > **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/ccteam-ui`(2026-08-28 起,原名 `@ccteam/dsh-team`;插件 1 同日改名 `@ccteam/ccteam-client`,原 `@ccteam/dsh-client`)—— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)+ 双插件设置卡。**定位(owner 2026-08-28)**:ccteam-ui = 在 DSH 的 UI 里用多种 harness,把 ccteam 最核心的体验带进 DSH(DSH 的 UI 风格优于 ccteam web),**未来可能整体取代现有 ccteam web**;故一切按 DSH 客户端插件机制构建,零 ccteam-web 移植。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
 
 ### DSH2-UI-3 ccteam-ui 整页工作台 + 原生级 chat(owner 直驱 2026-08-28,规划亲自)
-- **状态**:完成(870e16e4) · **冲突域**:`plugins/ccteam-ui` + `crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz` + `docs/dsh-plugin*.md` + `docs/usage*.md` · **建议入口**:规划亲自(UI 归 Fable)。
+- **状态**:完成(a9b930cb) · **冲突域**:`plugins/ccteam-ui` + `crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz` + `docs/dsh-plugin*.md` + `docs/usage*.md` · **建议入口**:规划亲自(UI 归 Fable)。
 - **owner 原话**:「这个 ccteam-ui 插件弹窗不太好,新建会话很简陋。弹窗的 chat 和 dsh 原生 chat 差距还很大,重新设计开发:整体布局、chat。」
 - **设计**(全文 `docs-local/versions/v0-10-4/ccteam-ui-v2-design.md`):DSH 原生会话组件零导出、页面级座位只有 `shell.overlay` → 工作台画成**整页**(52px 头 + 团队树 280 | 主栏 | 详情 320);新建会话 = DSH 空会话页同形(项目/vendor/角色选择器 + 模型·effort 在输入框底栏 + Enter 创建并发送);chat 用 DSH 自己的 `MarkdownText` 流式渲染 + 结构化步骤行 + HITL 选择卡 + 打断 + `/` 透传命令菜单 + 附件 + 游标翻页;详情栏含 statusline 上下文进度条与操作。
 - **数据层**:BFF 新增目录/状态/打断/停止/resolve/重命名方法与 upload/attachment 路由(凭据仍只在 host 半边);SSE 翻译改全量(progress 快照 / activity 步骤 / answer 选项+token / lifecycle / delegation)。
 - **验证**:vitest 121/121;沙箱真机(DSH rc.2 + fake stream-json claude)playwright 走全流程截图(`/tmp/ccteam-ui-dod/wb/W*.png`):Hero → 创建 → 直播步骤转圈→绿点 → Markdown 终答 → 步骤详情 → 第二回合 → Esc,零控制台报错。真机抓出并修掉:IM 进度状态行被当正文渲染、自动改标题触发的 lifecycle 噪音行、$0.00 成本、新建按钮应为描边样式。
 - **诚实边界**:步骤只有名称+摘要(无完整输入输出),且只在直播期可见(历史不回放);这是 ccteam 数据面的边界,已写进 UI 提示与文档。
+- **二改 `a9b930cb`(owner:「并排工作、平滑切换,不是非此即彼」)**:工作台改为 portal 到 body 的固定右侧窗格,宽度以 `body margin-right` 预留——DSH AppFrame 是流式块级 + ResizeObserver 自量宽,对它就是「窗口窄了」,侧栏/会话/详情全部照常,不碰 DSH DOM;左缘拖宽(≥360,给 DSH 留 480)、⤢ 展开整页/停靠回,一条宽度过渡;窗格内按自身宽度 1/2/3 栏自适应(单栏:团队占满→返回键回团队,详情为滑出面板)。沙箱复测:停靠 520 时 DSH 自己的空会话页可用,展开 1440 三栏,停靠回,拖到 723,单栏内建会话/聊天/步骤详情,零报错。
 
 ### DSH-WEB-LAN-1 伴生端口下 DSH 设置面在非 loopback 页面一片空白(owner 回报 2026-08-28,规划亲自)
 - **状态**:完成(96f08474) · **冲突域**:`crates/ccteam-web/src/dsh_web.rs` + `crates/ccteam-harness/src/execution/{dsh_runtime.rs,dsh_acp/materialize.rs,dsh_acp/spawn_spec.rs}` + `docs/usage*.md` + `docs/dsh-plugin*.md` + `AGENTS.md` · **建议入口**:规划亲自。
