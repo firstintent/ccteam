@@ -17,6 +17,13 @@
 
 > **v0.10.5 已 ship(2026-08-29,owner「ship」;合并 v0.10.4 周期 + v0.10.5 波)**。本段只持现势:完成卡已蒸馏进 `.loop/history.md` 一行 + 原文归档 `docs-local/versions/v0-10-5/backlog-archive.md`(gitignored);下一波未拍板,待排卡按优先级取(候选:ACP-DISCONNECT-1 / LIFE-2 / DSH2-CHIP / DSH1-MODE-UI / LEDGER-1 / TD-SYNC-1)。需求 SoT = `docs-local/versions/v0-10-5/prd.md`。 **UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
 
+### PLUG-6 零配置默认态:设置卡「未配置」误导 + 面板无限转圈 + 版本错位可见性(owner Telegram 反馈 2026-08-29,规划立卡)
+- **状态**:待排 · **冲突域**:`plugins/ccteam-ui/src/client/*` + `plugins/ccteam-ui/src/{bff,index,settings}.ts` + `crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz` · **建议入口**:UI 半规划亲自(Fable 子会话),host 半 opus maker。
+- **owner 原话**:「现在这些配置用户根本不会,最好默认安装好就能用的状态」「ccteam 菜单打开后啥也没有,也无法创建项目」(截图:设置卡 REST API token / Enrollment 凭据 两栏显示「未配置」且下面是手填说明;工作台团队栏只有一个转圈)。
+- **病根**:①真机是旧 daemon(0.10.3 进程,无 `/health` 身份、无 `enroll ensure`)× 新插件(0.10.4-alpha)错位 → bootstrap 拿不到凭据;插件的版本锁步横幅(D5)没能盖过团队栏的加载态,用户看到的是「空 + 转圈」而不是「引擎旧了 → 更新」;②设置卡把「由 daemon 自动提供」的凭据显示成「未配置」+ 手填指引,让零配置看起来像必填;③BFF 拉团队图失败(401/网络)时客户端停在 loading,不落到可操作状态;④零项目时「添加工作区」被加载态挡住 → 「无法创建项目」。
+- **规格**:①设置卡凭据字段三态:`自动(daemon 提供)` / `手填覆盖` / `未配置(daemon 不可达)`,只有第三态才显示手填指引;②工作台加载态有上限(≤3s)与失败态:BFF 4xx/5xx/超时 → 落到首启面板(引擎面板或「添加工作区」),错误原文可展开;③版本错位(引擎旧 / 插件旧 / `/health` 缺身份字段 = 引擎早于 0.10.5)一律以横幅 + 首启面板呈现,团队栏不再转圈;④`/health` 无 `home` 字段 → 状态 `Mismatch{version}` 文案「引擎早于 0.10.5,更新引擎」而非「家目录不一致」;⑤docs `dsh-plugin*.md` §5 configure 段改成「默认零配置,何时才需要手填」。
+- **DoD**:vitest 新增 ≥ 8(三态渲染 / 加载上限与失败态 / 错位横幅优先级 / 零项目 + 拉取失败仍现「添加工作区」);沙箱真机:故意用旧 daemon(0.10.3 release 二进制)+ 新插件 → 首屏是「引擎早于 0.10.5 → 更新引擎」而非转圈;正常 0.10.5 → 设置卡两栏显示「自动」。
+
 ### ACP-DISCONNECT-1 常驻 ACP 会话的对端进程被 SIGKILL 后,下一 turn 卡满 300s 才判 `stuck`(DSH2-MERGE maker 自报 2026-08-29,待排)
 - **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/acp/`(共享 ACP 门:kimi/grok/dsh 同门)+ `crates/ccteam-harness/tests/dsh_acp_test.rs` · **建议入门**:opus maker(引擎面;PLUG-2 后串行,同 crate 不同目录可并行)。
 - **现象**:daemon 持有 **live** ACP 连接时对端(真 DSH 进程)被 SIGKILL,下一条消息不立即失败,而是等满 `chat_turn_timeout`(300s)才记 `chat_turn_timeout{stuck:true}`(两次复现);会话非常驻(released)时按 sid 冷 resume 正常。
