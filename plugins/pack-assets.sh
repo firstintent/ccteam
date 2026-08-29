@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Rebuild the embedded plugin tarballs that `execution/dsh_acp/materialize.rs`
+# Rebuild the embedded plugin tarball that `execution/dsh_acp/materialize.rs`
 # ships with `include_bytes!`.
 #
-#   plugins/ccteam-client -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-client.tgz
-#   plugins/ccteam-ui  -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz
+#   plugins/ccteam-ui -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz
 #
 # Rust builds must never require npm or node (same rule as the checked-in Pi
 # bridge asset), so the tarballs are produced here and committed alongside the
@@ -19,7 +18,7 @@
 # because they only assert the archive extracts. Refuse to publish such a
 # tarball instead.
 #
-# Usage: plugins/pack-assets.sh [plugin ...]   (default: both)
+# Usage: plugins/pack-assets.sh [plugin ...]   (default: every embedded plugin)
 set -euo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +27,7 @@ assets="$repo/crates/ccteam-harness/src/execution/dsh_acp/assets"
 
 plugins=("$@")
 if [ ${#plugins[@]} -eq 0 ]; then
-  plugins=(ccteam-client ccteam-ui)
+  plugins=(ccteam-ui)
 fi
 
 mkdir -p "$assets"

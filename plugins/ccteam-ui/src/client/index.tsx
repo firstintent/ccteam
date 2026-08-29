@@ -18,7 +18,7 @@
  * Seats:
  *   1. `sidebar.footer.action` — the entry button beside DSH's Settings trigger
  *   2. `shell.overlay`         — the workbench (team tree / conversation / details)
- *   3. `settings.plugin.item`  — one card per ccteam settings namespace
+ *   3. `settings.plugin.item`  — the ccteam settings card
  *
  * All network traffic goes through the host BFF (src/shared/contract.ts).
  */
@@ -32,7 +32,7 @@ import { en, zh } from './locales.js'
 import { EntryButton } from './EntryButton.js'
 import { Workbench, refreshStatus } from './Workbench.js'
 import { SettingsCard } from './settings/SettingsCard.js'
-import { CLIENT_CARD, SettingsCardController, UI_CARD } from './settings/form.js'
+import { CCTEAM_CARD, SettingsCardController } from './settings/form.js'
 
 export const name = 'ccteam-ui'
 
@@ -125,19 +125,18 @@ export function apply(ctx: CcteamClientContext): void {
     inject: face,
   }, Workbench))
 
-  // One card per ccteam settings namespace. The configurable-plugins tab
-  // dispatches by namespace and renders nothing for one the Host does not
-  // serve, so the client card is inert wherever that plugin is absent.
-  const cards = [UI_CARD, CLIENT_CARD].map(spec =>
-    new SettingsCardController(ctx.settingsScope.bind({ namespace: spec.namespace }), spec))
-  ctx.slots.inject('settings.plugin.item', function* () {
-    for (const card of cards) {
-      yield ctx.slots.register({
-        name: 'settings.plugin.item',
-        key: card.spec.namespace,
-        locale: NS,
-        inject: () => card.inject(),
-      }, SettingsCard)
-    }
-  })
+  // One card for the one ccteam settings namespace — every face of this plugin
+  // is configured from it. The configurable-plugins tab dispatches by namespace
+  // and renders nothing for one the Host does not serve, so the card is inert
+  // wherever the host half did not load.
+  const card = new SettingsCardController(
+    ctx.settingsScope.bind({ namespace: CCTEAM_CARD.namespace }),
+    CCTEAM_CARD,
+  )
+  ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
+    name: 'settings.plugin.item',
+    key: card.spec.namespace,
+    locale: NS,
+    inject: () => card.inject(),
+  }, SettingsCard))
 }

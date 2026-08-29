@@ -4,10 +4,10 @@ import { apply } from '../src/index.js'
 import {
   DEFAULT_DAEMON_URL,
   SETTINGS_NAMESPACE,
-  registerCcteamUiSettings,
-  type CcteamUiSettings,
+  registerCcteamSettings,
+  type CcteamSettings,
 } from '../src/settings.js'
-import { FakeFetch, FakeRequest, FakeResponse, FakeWebServer } from './host-fakes.js'
+import { FakeFetch, FakeRequest, FakeResponse, FakeWebServer, hostCtx } from './host-fakes.js'
 
 interface Registration {
   ns: string
@@ -39,7 +39,7 @@ function describeSchema(schema: Schema<unknown>): {
   return { type: root.type, fields }
 }
 
-function fakeSettings(stored: Partial<CcteamUiSettings> = {}) {
+function fakeSettings(stored: Partial<CcteamSettings> = {}) {
   const registrations: Registration[] = []
   const service = {
     register<T>(
@@ -55,6 +55,7 @@ function fakeSettings(stored: Partial<CcteamUiSettings> = {}) {
       return {
         get: () => ({
           daemonUrl: DEFAULT_DAEMON_URL,
+          enrollment: '',
           restToken: '',
           defaultProject: '',
           connectionStatus: '',
@@ -69,7 +70,7 @@ function fakeSettings(stored: Partial<CcteamUiSettings> = {}) {
 describe('settings registration', () => {
   it('registers one namespace whose schema carries the documented fields', () => {
     const { service, registrations } = fakeSettings()
-    registerCcteamUiSettings({ settings: service })
+    registerCcteamSettings({ settings: service })
 
     expect(registrations).toHaveLength(1)
     const [registration] = registrations
@@ -84,29 +85,33 @@ describe('settings registration', () => {
       'connectionStatus',
       'daemonUrl',
       'defaultProject',
+      'enrollment',
       'restToken',
     ])
     expect(fields.daemonUrl!.type).toBe('string')
     expect(fields.daemonUrl!.meta!.default).toBe(DEFAULT_DAEMON_URL)
   })
 
-  it('marks the token secret so the settings UI never renders it in the clear', () => {
+  it('marks both credentials secret so the settings UI never renders them in the clear', () => {
     const { service, registrations } = fakeSettings()
-    registerCcteamUiSettings({ settings: service })
+    registerCcteamSettings({ settings: service })
 
     const { fields } = describeSchema(registrations[0]!.schema)
-    expect(fields.restToken!.meta!.role).toBe('secret')
-    expect(fields.restToken!.meta!.default).toBe('')
-    // No other field claims the secret role.
+    for (const field of ['restToken', 'enrollment'] as const) {
+      expect(fields[field]!.meta!.role).toBe('secret')
+      expect(fields[field]!.meta!.default).toBe('')
+    }
+    // Exactly the credentials claim the secret role — nothing else, and nothing missing.
     const secrets = Object.entries(fields)
       .filter(([, field]) => field.meta?.role === 'secret')
       .map(([key]) => key)
-    expect(secrets).toEqual(['restToken'])
+      .sort()
+    expect(secrets).toEqual(['enrollment', 'restToken'])
   })
 
   it('passes plugin config through as the settings base', () => {
     const { service, registrations } = fakeSettings()
-    registerCcteamUiSettings({ settings: service }, {
+    registerCcteamSettings({ settings: service }, {
       daemonUrl: 'http://10.0.0.4:7331',
       restToken: 'ccteam:abc',
     })
@@ -118,7 +123,7 @@ describe('settings registration', () => {
   })
 
   it('still resolves values when the settings service is absent', () => {
-    const scope = registerCcteamUiSettings({}, { daemonUrl: 'http://elsewhere:1234' })
+    const scope = registerCcteamSettings({}, { daemonUrl: 'http://elsewhere:1234' })
     const value = scope.get()
 
     expect(value.daemonUrl).toBe('http://elsewhere:1234')
@@ -127,7 +132,7 @@ describe('settings registration', () => {
   })
 
   it('defaults the daemon URL when neither config nor settings supply one', () => {
-    expect(registerCcteamUiSettings({}).get().daemonUrl).toBe(DEFAULT_DAEMON_URL)
+    expect(registerCcteamSettings({}).get().daemonUrl).toBe(DEFAULT_DAEMON_URL)
   })
 })
 
@@ -138,8 +143,8 @@ describe('config-over-settings precedence', () => {
    * exercises the precedence closures rather than restating them.
    */
   async function probe(
-    config: Partial<CcteamUiSettings>,
-    stored: Partial<CcteamUiSettings>,
+    config: Partial<CcteamSettings>,
+    stored: Partial<CcteamSettings>,
     payload: unknown = {},
     method = 'status',
   ): Promise<FakeFetch> {
@@ -150,7 +155,7 @@ describe('config-over-settings precedence', () => {
     try {
       const server = new FakeWebServer()
       const { service } = fakeSettings(stored)
-      apply({ webServer: server, settings: service } as never, config)
+      apply(hostCtx({ webServer: server, settings: service }) as never, config)
       const res = new FakeResponse()
       await server.handler()(
         new FakeRequest('POST', `/ccteam/api/${method}`, payload).asIncomingMessage(),
@@ -200,7 +205,7 @@ describe('config-over-settings precedence', () => {
   it('apply() wires the settings card and the BFF route together, once', () => {
     const server = new FakeWebServer()
     const { service, registrations } = fakeSettings({ restToken: 'ccteam:stored' })
-    apply({ webServer: server, settings: service } as never)
+    apply(hostCtx({ webServer: server, settings: service }) as never)
 
     expect(registrations).toHaveLength(1)
     expect(server.routes).toHaveLength(1)

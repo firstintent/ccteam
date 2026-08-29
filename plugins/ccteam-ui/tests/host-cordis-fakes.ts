@@ -109,8 +109,9 @@ export function makeFakeCtx(options?: {
         get: () => ({
           daemonUrl: 'http://daemon.test',
           enrollment: '',
+          restToken: '',
+          defaultProject: '',
           connectionStatus: '',
-          boundProject: '',
           ...options?.settings,
         }),
       })),
@@ -164,6 +165,31 @@ export function makeFakeCtx(options?: {
     },
   })
 
+  /**
+   * Cordis-faithful `ctx.inject`: the body runs only once EVERY named service
+   * exists (vendor/cordis `Fiber._refresh` — a missing dependency parks the
+   * fiber instead of running it). This fake runtime has no `webServer`, so a
+   * face injecting it never activates here, which is exactly the behaviour the
+   * merged plugin relies on to stay usable on a non-web profile.
+   *
+   * Defined after the literal so the callback can close over `ctx` without
+   * making its own type circular.
+   */
+  const inject = vi.fn((deps: readonly string[], body: (injected: unknown) => void) => {
+    for (const dep of deps) {
+      let value: unknown
+      try {
+        value = (ctx as Record<string, unknown>)[dep]
+      } catch {
+        // Cordis throws on a service read outside `inject`; treat it as absent.
+        return
+      }
+      if (value === undefined || value === null) return
+    }
+    body(ctx)
+  })
+  Object.defineProperty(ctx, 'inject', { value: inject, enumerable: true })
+
   const emit = (event: string, ...args: unknown[]): void => {
     for (const handler of [...(listeners.get(event) ?? [])]) {
       (handler as (...rest: unknown[]) => unknown)(...args)
@@ -188,6 +214,7 @@ export function makeFakeCtx(options?: {
 
   return {
     ctx,
+    inject,
     tools,
     cleanups,
     warnings,

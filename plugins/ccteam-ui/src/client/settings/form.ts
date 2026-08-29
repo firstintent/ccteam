@@ -1,5 +1,5 @@
 /**
- * The staged form behind each ccteam settings card, the way DSH's own
+ * The staged form behind the ccteam settings card, the way DSH's own
  * configurable-plugin cards stage theirs (ui-settings-plugins `card-form.ts`):
  * a card stages what the user types and writes it only on save, each field
  * shows its effective value and whether the user layer carries it, and the
@@ -80,37 +80,25 @@ export interface SettingsCardFace extends CardActions {
   spec: CardSpec
 }
 
-/** Settings namespace of the `@ccteam/ccteam-ui` host half (src/settings.ts). */
-export const CCTEAM_UI_NS = 'ccteam-ui'
+/** The one settings namespace this plugin serves (src/settings.ts). */
+export const CCTEAM_NS = 'ccteam-ui'
 
-/** Settings namespace of the `@ccteam/ccteam-client` host plugin — spelled here: a client package must not import a Host package. */
-export const CCTEAM_CLIENT_NS = 'ccteam-client'
-
-/** The `ccteam-ui` card: daemon URL, personal REST token, optional default project. */
-export const UI_CARD: CardSpec = {
-  namespace: CCTEAM_UI_NS,
-  titleKey: 'settings.ui.title',
-  descriptionKey: 'settings.ui.description',
+/**
+ * The single ccteam card: base URL once, then one credential per face — the
+ * personal REST token the workbench reads the team with, and the enrollment
+ * credential a DSH agent calls the ccteam tools with. They are different
+ * credentials for different callers, so both live here rather than one
+ * standing in for the other.
+ */
+export const CCTEAM_CARD: CardSpec = {
+  namespace: CCTEAM_NS,
+  titleKey: 'settings.card.title',
+  descriptionKey: 'settings.card.description',
   fields: [
     { field: 'daemonUrl', kind: 'text', labelKey: 'settings.field.daemonUrl', hintKey: 'settings.field.daemonUrl.hint', placeholder: 'http://127.0.0.1:7331' },
     { field: 'restToken', kind: 'secret', labelKey: 'settings.field.restToken', hintKey: 'settings.field.restToken.hint' },
-    { field: 'defaultProject', kind: 'text', labelKey: 'settings.field.defaultProject', hintKey: 'settings.field.defaultProject.hint' },
-  ],
-}
-
-/**
- * The `ccteam-client` card. That plugin ships no browser half of its own (it is
- * a tool + transport surface), and the configurable-plugins tab pairs cards
- * with namespaces without knowing what they mean — so the ccteam UI plugin
- * contributes the card, and it renders only where that namespace is served.
- */
-export const CLIENT_CARD: CardSpec = {
-  namespace: CCTEAM_CLIENT_NS,
-  titleKey: 'settings.client.title',
-  descriptionKey: 'settings.client.description',
-  fields: [
-    { field: 'daemonUrl', kind: 'text', labelKey: 'settings.field.daemonUrl', hintKey: 'settings.field.daemonUrl.hint', placeholder: 'http://127.0.0.1:7331' },
     { field: 'enrollment', kind: 'secret', labelKey: 'settings.field.enrollment', hintKey: 'settings.field.enrollment.hint' },
+    { field: 'defaultProject', kind: 'text', labelKey: 'settings.field.defaultProject', hintKey: 'settings.field.defaultProject.hint' },
   ],
 }
 

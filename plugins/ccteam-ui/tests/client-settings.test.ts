@@ -5,7 +5,7 @@
  * and reset. Zero React, zero wire.
  */
 import { describe, expect, it } from 'vitest'
-import { CLIENT_CARD, SettingsCardController, UI_CARD } from '../src/client/settings/form.js'
+import { CCTEAM_CARD, SettingsCardController } from '../src/client/settings/form.js'
 import type { Section } from '../src/client/settings/form.js'
 
 interface ScopeState {
@@ -72,7 +72,7 @@ function fakeScope(initial: Partial<ScopeState> = {}) {
 describe('projection', () => {
   it('is unavailable (renders nothing) until the Host serves the namespace', () => {
     const { scope, host } = fakeScope({ status: 'loading' })
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     expect(card.getSnapshot().available).toBe(false)
     host({ status: 'ready' })
     expect(card.getSnapshot().available).toBe(true)
@@ -83,7 +83,7 @@ describe('projection', () => {
       value: { daemonUrl: 'http://127.0.0.1:7331', restToken: 'ccteam:abc', defaultProject: 'demo' },
       user: { defaultProject: 'demo' },
     })
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const { fields } = card.getSnapshot()
     expect(fields.daemonUrl).toEqual({ text: 'http://127.0.0.1:7331', overridden: false, configured: true })
     expect(fields.defaultProject).toEqual({ text: 'demo', overridden: true, configured: true })
@@ -93,13 +93,13 @@ describe('projection', () => {
 
   it('reports an unset secret as not configured', () => {
     const { scope } = fakeScope({ value: { daemonUrl: 'http://127.0.0.1:7331' } })
-    const card = new SettingsCardController(scope, CLIENT_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     expect(card.getSnapshot().fields.enrollment?.configured).toBe(false)
   })
 
   it('publishes a new snapshot (new reference) whenever the scope changes, and keeps the reference otherwise', () => {
     const { scope, host } = fakeScope()
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const first = card.getSnapshot()
     expect(card.getSnapshot()).toBe(first)
     let notified = 0
@@ -116,7 +116,7 @@ describe('projection', () => {
 describe('staging', () => {
   it('edit stages a draft: dirty, overridden preview, no write yet', () => {
     const { scope, writes } = fakeScope()
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const face = card.inject()
     face.edit('daemonUrl', 'http://10.0.0.1:7331')
     expect(card.getSnapshot().dirty).toBe(true)
@@ -126,7 +126,7 @@ describe('staging', () => {
 
   it('discard drops every draft; reset stages a clear', () => {
     const { scope } = fakeScope({ value: { daemonUrl: 'x' }, user: { daemonUrl: 'x' } })
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const face = card.inject()
     face.edit('daemonUrl', 'y')
     face.discard()
@@ -141,7 +141,7 @@ describe('staging', () => {
 describe('save', () => {
   it('writes set for text, unset for blank, skips a blank secret, then reads the outcome back', async () => {
     const { scope, writes } = fakeScope({ value: { daemonUrl: 'old', defaultProject: 'p' }, user: { defaultProject: 'p' } })
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const face = card.inject()
     face.edit('daemonUrl', ' http://new:7331 ')
     face.edit('defaultProject', '')
@@ -161,7 +161,7 @@ describe('save', () => {
 
   it('writes a secret and reports it configured afterwards', async () => {
     const { scope, writes } = fakeScope()
-    const card = new SettingsCardController(scope, CLIENT_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const face = card.inject()
     face.edit('enrollment', 'ccteam-enroll:id:secret')
     await card.save()
@@ -172,7 +172,7 @@ describe('save', () => {
   it('keeps the drafts and flags failure when the Host did not take the value', async () => {
     const { scope, behave } = fakeScope({ value: { daemonUrl: 'old' } })
     behave('reject')
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     const face = card.inject()
     face.edit('daemonUrl', 'new')
     await card.save()
@@ -186,7 +186,7 @@ describe('save', () => {
   it('treats a rejected write as a failed save rather than throwing', async () => {
     const { scope, behave } = fakeScope()
     behave('throw')
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     card.inject().edit('daemonUrl', 'new')
     await expect(card.save()).resolves.toBeUndefined()
     expect(card.getSnapshot().failed).toBe(true)
@@ -194,7 +194,7 @@ describe('save', () => {
 
   it('is a no-op with nothing staged and while a save is in flight', async () => {
     const { scope, writes } = fakeScope()
-    const card = new SettingsCardController(scope, UI_CARD)
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
     await card.save()
     expect(writes).toEqual([])
     card.inject().edit('daemonUrl', 'a')

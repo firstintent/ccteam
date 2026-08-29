@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { PACKAGE_VERSION } from '../src/index.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -18,6 +19,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 describe('package exports keep the DSH scanner working', () => {
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
     exports: Record<string, unknown>
+    version: string
   }
 
   it('exports ./package.json alongside ./client', () => {
@@ -35,3 +37,19 @@ describe('package exports keep the DSH scanner working', () => {
     expect(resolved.endsWith('package.json')).toBe(true)
   })
 })
+
+/**
+ * The version the transport reports in ACP `agentInfo.version` is what ccteam's
+ * Rust floor check gates on (`MIN_DSH_CLIENT_VERSION`, dsh_acp/handshake.rs).
+ * A constant that drifts from package.json fails the handshake with a version
+ * message naming a version nobody shipped.
+ */
+describe('reported plugin version', () => {
+  it('matches package.json', () => {
+    expect(PACKAGE_VERSION).toBe(pkgVersion())
+  })
+})
+
+function pkgVersion(): string {
+  return (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string }).version
+}

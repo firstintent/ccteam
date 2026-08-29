@@ -153,7 +153,7 @@ describe('apply', () => {
     expect(registrations).toEqual([])
   })
 
-  it('registers the entry, the panel, and one card per ccteam namespace once the slots are declared', () => {
+  it('registers the entry, the panel, and the one ccteam card once the slots are declared', () => {
     const { ctx, waits, registrations, bound } = recordingCtx()
     apply(ctx as never)
     declareAll(waits)
@@ -168,13 +168,13 @@ describe('apply', () => {
     expect(panel?.options).toMatchObject({ id: 'ccteam', order: 0, locale: 'ccteam' })
 
     const cards = byName('settings.plugin.item')
-    expect(cards.map(card => card.options.key)).toEqual(['ccteam-ui', 'ccteam-client'])
+    expect(cards.map(card => card.options.key)).toEqual(['ccteam-ui'])
     for (const card of cards) {
       expect(card.component).toBe(SettingsCard)
       expect(card.options.locale).toBe('ccteam')
     }
-    expect(bound).toEqual(['ccteam-ui', 'ccteam-client'])
-    expect(registrations).toHaveLength(4)
+    expect(bound).toEqual(['ccteam-ui'])
+    expect(registrations).toHaveLength(3)
   })
 
   it('injects the console face: one observable store under hooks, dispatch, and the BFF client', () => {

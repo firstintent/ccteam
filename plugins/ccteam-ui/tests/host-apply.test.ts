@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { apply } from '../src/index.js'
-import { AcpClient, makeFakeCtx, shortSocketPath } from './fakes.js'
+import { AcpClient, makeFakeCtx, shortSocketPath } from './host-cordis-fakes.js'
 
 interface WireCall {
   authorization: string

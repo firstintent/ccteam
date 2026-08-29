@@ -6,15 +6,38 @@ export const SETTINGS_NAMESPACE = 'ccteam-ui'
 export const UNCHECKED_STATUS = 'Not checked. If the daemon is unreachable, run: ccteam start'
 const NO_SERVICE_STATUS = 'Settings service unavailable. If the daemon is unreachable, run: ccteam start'
 
-export interface CcteamUiSettings {
+/**
+ * ONE flat namespace for all three faces of this plugin. The base URL is
+ * entered once and every face reads it; the two credentials sit on the same
+ * card because they are the same person's, one per face:
+ *
+ *   - `enrollment` identifies THIS DSH PROCESS to ccteam's MCP endpoint, so the
+ *     agent's ccteam tools work (`ccteam-enroll:<id>:<secret>`);
+ *   - `restToken` identifies the HUMAN's ccteam account, so the workbench can
+ *     read their team (`ccteam:<hex>`).
+ *
+ * They are not interchangeable, which is why both exist and why each hint says
+ * where to copy it from.
+ *
+ * Keys are FLAT on purpose: this schema is also the shape of the row `config`
+ * that ccteam's materializer writes into a profile's `cordis.patch.yml`, and
+ * that config reaches `apply(ctx, config)` verbatim. Nesting a key under a
+ * namespace makes the value silently undefined (shipped once, v0.10.0).
+ */
+export interface CcteamSettings {
   daemonUrl: string
+  enrollment: string
   restToken: string
   defaultProject: string
   connectionStatus: string
 }
 
-export const CcteamUiSettingsSchema: Schema<CcteamUiSettings> = Schema.object({
+export const CcteamSettingsSchema: Schema<CcteamSettings> = Schema.object({
   daemonUrl: Schema.string().default(DEFAULT_DAEMON_URL).description('ccteam daemon URL.'),
+  enrollment: Schema.string()
+    .default('')
+    .role('secret')
+    .description('Enrollment credential from ccteam config (tool surface).'),
   restToken: Schema.string()
     .default('')
     .role('secret')
@@ -41,25 +64,29 @@ export interface SettingsContext {
 }
 
 /**
- * Register the settings card. The token lives here and in closure scope only:
- * it is never written to `process.env`, never logged, and never leaves the host
- * half (see bff.ts).
+ * Register the settings card. Credentials live here and in closure scope only:
+ * they are never written to `process.env`, never logged, and never leave the
+ * host half (see bff.ts and tools.ts).
  */
-export function registerCcteamUiSettings(
+export function registerCcteamSettings(
   ctx: SettingsContext,
-  base?: Partial<CcteamUiSettings>,
-): SettingsScope<CcteamUiSettings> {
+  base?: Partial<CcteamSettings>,
+): SettingsScope<CcteamSettings> {
   if (ctx.settings === undefined) {
     return {
       get: () => ({
         daemonUrl: base?.daemonUrl ?? DEFAULT_DAEMON_URL,
+        enrollment: base?.enrollment ?? '',
         restToken: base?.restToken ?? '',
         defaultProject: base?.defaultProject ?? '',
         connectionStatus: base?.connectionStatus ?? NO_SERVICE_STATUS,
       }),
     }
   }
-  return ctx.settings.register(SETTINGS_NAMESPACE, CcteamUiSettingsSchema, {
+  return ctx.settings.register(SETTINGS_NAMESPACE, CcteamSettingsSchema, {
+    // `live` for the panel's own reads (the BFF resolves through closures on
+    // every request); the tool and transport faces read their credential per
+    // call, so an edit reaches them without a restart too.
     applies: 'live',
     base,
   })

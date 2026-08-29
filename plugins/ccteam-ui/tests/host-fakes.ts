@@ -18,6 +18,38 @@ export interface FakeRoute {
  * references/deepseek-harness/packages/host/webserver/src/index.ts: one map per
  * kind, duplicate key throws, registration returns the disposer.
  */
+/**
+ * Cordis-faithful `ctx.inject`: the body runs only once EVERY named service
+ * exists (vendor/cordis `Fiber._refresh`). A host ctx built here serves
+ * `webServer` and `settings` but no agent runtime, so the plugin's tool and
+ * transport faces correctly never activate against it.
+ *
+ * @param ctx - the fake plugin context the body should receive.
+ * @returns the `inject` implementation to place on that context.
+ */
+export function fakeInject(ctx: Record<string, unknown>) {
+  return (deps: readonly string[], body: (injected: unknown) => void): void => {
+    for (const dep of deps) {
+      const value = ctx[dep]
+      if (value === undefined || value === null) return
+    }
+    body(ctx)
+  }
+}
+
+/**
+ * A plugin context carrying exactly the web-half services, with `inject` wired
+ * the way Cordis wires it.
+ *
+ * @param services - the services this runtime offers.
+ * @returns the context to hand to `apply`.
+ */
+export function hostCtx(services: Record<string, unknown>): Record<string, unknown> {
+  const ctx: Record<string, unknown> = { ...services }
+  ctx.inject = fakeInject(ctx)
+  return ctx
+}
+
 export class FakeWebServer {
   readonly routes: FakeRoute[] = []
   private readonly taken = new Set<string>()

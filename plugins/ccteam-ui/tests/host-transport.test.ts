@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { afterEach, describe, expect, it } from 'vitest'
 import { SessionCredentialStore } from '../src/credentials.js'
 import { startDshSocketTransport } from '../src/transport.js'
-import { AcpClient, makeFakeCtx, settle, shortSocketPath, waitFor } from './fakes.js'
+import { AcpClient, makeFakeCtx, settle, shortSocketPath, waitFor } from './host-cordis-fakes.js'
 
 const teardowns: (() => Promise<void> | void)[] = []
 

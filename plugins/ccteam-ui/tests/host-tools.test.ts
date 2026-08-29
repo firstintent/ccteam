@@ -78,9 +78,11 @@ describe('ccteam tools', () => {
     // is not the exempt MCP route: with web auth enabled the daemon answered a
     // plain-text 401 `auth required` (owner-reported real-machine regression).
     const urls: string[] = []
-    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
-      urls.push(url)
-      const body = JSON.parse(String(init.body)) as { method: string; id: string }
+    // Typed as the real `fetch` (the tsconfig here checks tests too): the
+    // client always passes a string, so narrowing at the top is honest.
+    const fetchImpl: typeof fetch = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
+      urls.push(String(input))
+      const body = JSON.parse(String(init?.body)) as { method: string; id: string }
       return new Response(JSON.stringify({
         jsonrpc: '2.0',
         id: body.id,
@@ -115,9 +117,9 @@ describe('ccteam tools', () => {
   it('initializes over streamable HTTP, captures Mcp-Session-Id, and echoes it on tool calls', async () => {
     const requests: RequestInit[] = []
     const methods: string[] = []
-    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
-      requests.push(init)
-      const body = JSON.parse(String(init.body)) as { method: string; id: string }
+    const fetchImpl: typeof fetch = vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+      requests.push(init ?? {})
+      const body = JSON.parse(String(init?.body)) as { method: string; id: string }
       methods.push(body.method)
       if (body.method === 'initialize') {
         return new Response(JSON.stringify({
@@ -157,8 +159,8 @@ describe('ccteam tools', () => {
       credential: () => 'ccteam-enroll:e1:secret',
       clientName: 'test-client',
       clientVersion: '0',
-      fetchImpl: vi.fn(async (_url: string, init: RequestInit) => {
-        const body = JSON.parse(String(init.body)) as { method: string; id: string }
+      fetchImpl: vi.fn(async (_input: URL | RequestInfo, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as { method: string; id: string }
         if (body.method === 'initialize') {
           return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: {} }))
         }
