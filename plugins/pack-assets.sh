@@ -9,7 +9,16 @@
 # Rust change.
 #
 # `npm pack` is byte-reproducible for a given (source, dependency tree, npm
-# version), which is what makes the sha256 cache key in materialize.rs stable.
+# version) — INCLUDING across checkouts at different paths, which is what makes
+# the sha256 cache key in materialize.rs stable and a committed tarball
+# reviewable. That property is not free: rolldown prints module ids into
+# `//#region` comments, so a build whose virtual ids were absolute embedded the
+# checkout path (found by the DSH2-MERGE checker: the committed tarball hashed
+# 7bddf3… while a fresh pack from another worktree hashed abac17…). The ids are
+# package-relative now (plugins/ccteam-ui/build/css-plugins.ts), and the
+# two-path check below is what keeps them that way: it rebuilds and re-packs
+# each plugin from a second, differently-named directory and refuses to publish
+# a tarball whose bytes depend on where the repo happens to live.
 #
 # The guard below is the point of this script: `npm pack` folds
 # `bundledDependencies` in from `node_modules`, so packing WITHOUT installing
@@ -62,6 +71,27 @@ for plugin in "${plugins[@]}"; do
       exit 1
     }
   done <<< "$bundled"
+
+  # Two-path reproducibility gate: same source, different directory, same bytes.
+  mirror="$staging/mirror-$plugin"
+  rm -rf "$mirror"
+  cp -al "$src" "$mirror" 2>/dev/null || cp -a "$src" "$mirror"
+  (cd "$mirror" && npm run build >/dev/null)
+  mirror_out="$staging/$plugin-mirror"
+  mkdir -p "$mirror_out"
+  (cd "$mirror" && npm pack --pack-destination "$mirror_out" >/dev/null)
+  mirror_tgz="$(find "$mirror_out" -maxdepth 1 -name '*.tgz' -print -quit)"
+  a="$(sha256sum "$tgz" | cut -d' ' -f1)"
+  b="$(sha256sum "$mirror_tgz" | cut -d' ' -f1)"
+  if [ "$a" != "$b" ]; then
+    echo "pack-assets: $plugin is not path-reproducible" >&2
+    echo "             $src -> $a" >&2
+    echo "             $mirror -> $b" >&2
+    echo "             (something in the build output carries the checkout path;" >&2
+    echo "              diff the two extracted trees to find it)" >&2
+    exit 1
+  fi
+  echo "    two-path reproducible: $a"
 
   install -m 0644 "$tgz" "$assets/$plugin.tgz"
   sha256sum "$assets/$plugin.tgz"

@@ -238,6 +238,35 @@ describe('CSS modules (lightningcss, the DSH preset pipeline)', () => {
     expect(code).toBe(styleInjectionModule('@ccteam/ccteam-ui', '/x/panel.module.css', compileCss('@ccteam/ccteam-ui', '/x/panel.module.css', sheet, 'module').css, compileCss('@ccteam/ccteam-ui', '/x/panel.module.css', sheet, 'module').classMap))
   })
 
+  /**
+   * Rolldown prints every module id into a `//#region` comment in the bundle,
+   * so an absolute virtual id puts the build machine's checkout path into
+   * `lib/client.js` — and therefore into the tarball `materialize.rs` embeds
+   * and caches by sha256. Two worktrees of the same commit then produce
+   * different bytes, which is exactly what `plugins/pack-assets.sh` promises
+   * they do not (found by the DSH2-MERGE checker: 7bddf3… vs abac17…).
+   */
+  it('anchors virtual ids to the package root, so no checkout path reaches the bundle', async () => {
+    const read = async (): Promise<string> => '.panel { color: inherit; }'
+    const alice = createCssPlugins('@ccteam/ccteam-ui', read, '/home/alice/ccteam-ui')
+    const build = createCssPlugins('@ccteam/ccteam-ui', read, '/srv/build/ccteam-ui')
+
+    const aliceId = alice[0]!.resolveId('./panel.module.css', '/home/alice/ccteam-ui/src/client/index.tsx')
+    const buildId = build[0]!.resolveId('./panel.module.css', '/srv/build/ccteam-ui/src/client/index.tsx')
+
+    expect(aliceId).toBe('\0ccteam-css-module:src/client/panel.module.css.mjs')
+    expect(buildId).toBe(aliceId)
+
+    // …and the id still names a real file when the loader resolves it back.
+    const readsBack: string[] = []
+    const rooted = createCssPlugins('@ccteam/ccteam-ui', async (file) => {
+      readsBack.push(file)
+      return '.panel { color: inherit; }'
+    }, '/srv/build/ccteam-ui')
+    await rooted[0]!.load.call({ addWatchFile: () => {} }, buildId!)
+    expect(readsBack).toEqual(['/srv/build/ccteam-ui/src/client/panel.module.css'])
+  })
+
   it('routes each stylesheet flavour through its own virtual id', async () => {
     const reads: string[] = []
     const watched: string[] = []

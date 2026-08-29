@@ -15,7 +15,11 @@
  * sheet and the panel rendered as bare DOM.
  *
  * Virtual ids carry the `.mjs` suffix: tsdown's own CSS guard matches ids
- * ending in `.css` and demands @tsdown/css, so a virtual id must not.
+ * ending in `.css` and demands @tsdown/css, so a virtual id must not. They are
+ * also PACKAGE-RELATIVE whenever a root is given: rolldown prints every module
+ * id into a `//#region` comment in the bundle, so an absolute id makes
+ * `lib/client.js` — and therefore the tarball `materialize.rs` embeds and
+ * caches by sha256 — differ between two checkouts of the same commit.
  */
 import { readFile } from 'node:fs/promises'
 import { basename, dirname, relative, resolve, sep } from 'node:path'
@@ -81,9 +85,9 @@ export function styleInjectionModule(
  * @param fileId - absolute stylesheet path.
  * @param source - stylesheet text.
  * @param mode - how the import is consumed.
- * @param hashRoot - directory the `[hash]` input is taken relative to. The
- *   preset hashes the absolute path, which is fine for a build that only ever
- *   runs in one tree; this package is packed into a tarball that must be
+ * @param packageRoot - directory paths are taken relative to. The preset
+ *   hashes the absolute path, which is fine for a build that only ever runs in
+ *   one tree; this package is packed into a tarball that must be
  *   byte-reproducible across checkouts, so the hash input is the
  *   package-relative path when a root is given.
  * @returns the replacement module source, the class map, and the compiled text.
@@ -93,9 +97,9 @@ export function compileCss(
   fileId: string,
   source: string,
   mode: CssMode,
-  hashRoot?: string,
+  packageRoot?: string,
 ): CompiledCss {
-  const filename = hashRoot === undefined ? fileId : relative(hashRoot, fileId).split(sep).join('/')
+  const filename = packageRoot === undefined ? fileId : packageRelative(packageRoot, fileId)
   const { code, exports } = transform({
     filename,
     code: Buffer.from(source),
@@ -132,17 +136,23 @@ function absoluteFrom(source: string, importer: string | undefined): string {
   return importer === undefined ? source : resolve(dirname(importer), source)
 }
 
+/** A path below `root`, POSIX-separated so the id is platform-stable. */
+function packageRelative(root: string, file: string): string {
+  return relative(root, file).split(sep).join('/')
+}
+
 /**
  * Build the CSS route plugins for one package.
  * @param pluginId - npm package name.
  * @param read - injected for tests; defaults to reading the real file.
- * @param hashRoot - see {@link compileCss}.
+ * @param packageRoot - see {@link compileCss}. Also anchors the virtual ids,
+ *   which is what keeps the emitted bundle free of build-machine paths.
  * @returns the three routes, in matching order (module, inline, global).
  */
 export function createCssPlugins(
   pluginId: string,
   read: (file: string) => Promise<string> = file => readFile(file, 'utf8'),
-  hashRoot?: string,
+  packageRoot?: string,
 ): CssPlugin[] {
   const route = (
     name: string,
@@ -154,14 +164,17 @@ export function createCssPlugins(
     name,
     resolveId(source, importer) {
       if (!matches(source)) return null
-      return prefix + absoluteFrom(strip(source), importer) + VIRTUAL_SUFFIX
+      const file = absoluteFrom(strip(source), importer)
+      const id = packageRoot === undefined ? file : packageRelative(packageRoot, file)
+      return prefix + id + VIRTUAL_SUFFIX
     },
     async load(id) {
       if (!id.startsWith(prefix)) return null
-      const fileId = id.slice(prefix.length, -VIRTUAL_SUFFIX.length)
+      const named = id.slice(prefix.length, -VIRTUAL_SUFFIX.length)
+      const fileId = packageRoot === undefined ? named : resolve(packageRoot, named)
       // The virtual id otherwise hides the real stylesheet from the watch graph.
       this.addWatchFile(fileId)
-      return compileCss(pluginId, fileId, await read(fileId), mode, hashRoot).code
+      return compileCss(pluginId, fileId, await read(fileId), mode, packageRoot).code
     },
   })
 
