@@ -2,10 +2,10 @@
 
 > English: [dsh-plugin.md](dsh-plugin.md)
 
-一个插件 `@ccteam/ccteam-ui` 把 DeepSeek Harness（DSH）和 ccteam 接起来。本文讲的是
-手动启动的 `dsh web`，以及 DSH 页面里的 ccteam 工作台。ccteam 自带的
-**DSH** 页面、从 ccteam 反向雇用 DSH 会话等内容，请看
-[usage.md](usage.md) 的“DSH Web”一节。
+一个插件 `@ccteam/ccteam-ui` 把 DeepSeek Harness（DSH）和 ccteam 接起来。本文讲
+怎么装它——既可以把它当成完整的 ccteam（连引擎一起装），也可以装在你已经在跑的
+ccteam 旁边——以及怎么在 DSH 里用 ccteam 工作台。ccteam 自带的 **DSH** 页面、
+从 ccteam 反向雇用 DSH 会话等内容，请看 [usage.md](usage.md) 的“DSH Web”一节。
 
 这个插件的定位：把 ccteam 最核心的体验——在一个地方驱动多种
 harness——带进 DSH 自己的 UI 里。它从头到尾按 DSH 客户端插件的机制构建
@@ -14,64 +14,146 @@ web 控制台的移植。
 
 ## 1. 你会得到什么
 
-装一次，得到三个面：
+装一次，得到三个面和一个引擎托管：
 
 | 面 | 面向谁 | 提供什么 |
 |---|---|---|
 | **工作台** | 使用 DSH Web 的人 | DSH 里的 ccteam 工作台：整页界面，含跨 harness 团队树、原生级会话（流式 Markdown、工具步骤、选择提示、附件、打断）和详情栏，入口是 DSH 自己侧栏底部的 ccteam 按钮。 |
 | **工具** | DSH 会话里的 agent（LLM） | 在 DSH 会话中注册 ccteam 的 8 个 MCP 工具，让 DSH agent 也能雇用与驱动团队其他成员。 |
 | **传输** | ccteam | ccteam 雇用 DSH 会话所走的 ACP 通道。只有 profile 行里带 socket 路径时才启用，而那只有 ccteam 托管的运行时才会写。 |
+| **引擎** | 你 | ccteam daemon 本身：插件把 `ccteam` 二进制作为平台包一起带来，负责安装、启动，并在设置卡里给出「引擎」段（状态、版本、启动 / 停止 / 重启 / 更新）。 |
 
 三个面各自独立生效：没有 DSH web app 的 profile 照样拿到工具面，没有 agent
 运行时的 profile 照样拿到工作台。
 
-## 2. 方式一：由 ccteam 管理（推荐，零步骤）
+## 2. 两种安装方式，一个 daemon
 
-如果 DSH 是通过 ccteam 使用的——例如 `/new dsh`、ccteam 的 DSH 页面，
-或 `session_spawn` 传入 `vendor:"dsh"`——ccteam 会自动把这个插件和对应
-凭据物化到你这个身份的 DSH 运行环境里。不需要安装，也不需要手工粘贴。
+ccteam 是一个二进制引擎、两个安装面——`ccteam` CLI 和这个插件。二者把二进制装
+到同一个位置，用同一个 `$CCTEAM_HOME`（默认 `~/.ccteam`），跑的是**同一个
+daemon**。从哪边开始都行，另一边之后会自动接上（见 §3）。
 
-可以这样确认已经生效：
+### 2.1 方式 A——插件自带引擎
 
-- DSH 自己的侧栏底部出现 **ccteam** 按钮。
-- ccteam 雇用的 DSH 会话能够回答 `status` 工具调用。
-
-## 3. 方式二：使用你自己启动的 `dsh web`
-
-### 3.1 安装插件
-
-在这个 web 实例实际使用的 profile 中执行：
+不需要先装任何东西。在你的 `dsh web` 实际使用的 profile 中执行：
 
 ```bash
 dsh plugin --profile web add @ccteam/ccteam-ui
 ```
 
-重启对应的 `dsh web` 进程，再在浏览器中强制刷新（Ctrl+Shift+R 或
-Cmd+Shift+R）。DSH 的 设置 → 插件 → **插件列表** 会把它显示为 `ccteam-ui`。
+然后重启对应的 `dsh web` 进程，再在浏览器中强制刷新（Ctrl+Shift+R 或
+Cmd+Shift+R）。插件启动时会：
 
-还有一个快捷办法：管理员在 ccteam web 打开 **Settings → Hosts**，对检测到
-的本机 DSH 点击 **Register DSH plugin**；DSH 进程仍需你自己重启。
+1. **安装引擎。** 二进制以 `optionalDependencies` 平台包
+   `@ccteam/engine-<os>-<cpu>` 的形式随插件而来（`linux`/`darwin` ×
+   `x64`/`arm64`；npm 和 pnpm 只会下载匹配本机的那一个，而且这些包没有任何
+   lifecycle 脚本）。插件把其中的 `bin/ccteam` 复制到 `install.sh` 使用的同一
+   位置——`$CCTEAM_INSTALL_DIR`（若设置），否则 `PATH` 上已有 `ccteam` 所在的
+   目录（先解软链），否则 `~/.local/bin`——复制件先要能回答 `--version` 才会
+   被换上。目标若是软链或位于包管理器目录（`node_modules`、Homebrew、nix、
+   snap），只报告、绝不覆盖；想装到别处就设 `CCTEAM_INSTALL_DIR`。
+2. **启动 daemon。** 「自动启动」开着（默认）时执行 `ccteam start --json`——
+   与 CLI 同一个脱离终端、幂等的 launcher——并等待 `GET /health` 就绪。若这个
+   home 已有 daemon 在应答，则直接接上（§3）。
+3. **自动配好凭据。** 同一台机器、同一个 OS 用户下，工作台不需要粘贴任何
+   东西：插件只读一个文件 `$CCTEAM_HOME/secrets/web-token`（daemon 为自己的
+   operator 写下的控制台 token），并通过 REST 向 daemon 领取工具面的
+   enrollment 凭据、存进设置卡。你在卡里手填的 token 永远优先于文件。
+4. **显示「引擎」段**（§4）；还没有项目时，工作台首屏会让你添加一个工作区。
 
-### 3.2 配置
+「自动启动」可在卡上关掉；关掉它不会停止任何 daemon，只是插件从此等你来点。
 
-打开 DSH 的 **设置 → 插件 → 插件配置**，填好 **ccteam-ui** 这张卡再点
-**保存**。DSH 只对它认为是「操作者本机」的浏览器显示这一页：手起的 `dsh web` 请从 `127.0.0.1` 打开，或经 ccteam 的 DSH 页访问（ccteam 会声明该页拥有其 Host，见 usage.md → DSH Web；对 0.1.1-rc.2 及更早版本，ccteam 把这处读取回填进下发的客户端 bundle）；从局域网地址直接打开原生 `dsh web`，这一页会是空白。
+### 2.2 方式 B——先装 CLI
 
-| 字段 | 是什么 | 从哪里获取 |
+先装 `ccteam` CLI 并启动（`curl -sSL
+https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh`，
+然后 `ccteam start`——见 [usage.md](usage.md)）。插件随后有三种来法：
+
+- **由 ccteam 物化（零步骤）。** 如果 DSH 是通过 ccteam 使用的——`/new dsh`、
+  ccteam 的 **DSH** 页面，或 `session_spawn` 传入 `vendor:"dsh"`——ccteam 会
+  把这个插件和对应凭据物化到你这个身份的 DSH 运行环境里。确认：DSH 侧栏底部
+  出现 **ccteam** 按钮；ccteam 雇用的 DSH 会话能回答 `status` 工具调用。
+- **从 ccteam web 注册。** 管理员打开 **Settings → Hosts**，对检测到的本机
+  DSH 点击 **Register DSH plugin**；DSH 进程仍需你自己重启（ccteam 从不重启
+  不是它起的进程）。
+- **手动安装。** `dsh plugin --profile web add @ccteam/ccteam-ui`，然后重启
+  `dsh web`。插件会找到正在跑的 daemon 并接上。
+
+方式 B 的三种来法下，「引擎」段都显示 **attached**：daemon 是 CLI 起的，插件
+不管任何不是它起的东西（§3）。
+
+## 3. 共存：一个 `$CCTEAM_HOME`，一个 daemon
+
+同一个 OS 用户下，装了插件的原生 DSH、ccteam web、CLI、systemd unit 共用一个
+home、一个 daemon。规则如下：
+
+- **谁先起谁赢，其余 attach。** 插件动手前先探 `GET /health`。应答里的
+  `home` 与插件解析出的 `$CCTEAM_HOME` 相同，那就是*这个* daemon：卡上显示
+  **attached**（别处起的）或 **running**（本插件起的）。插件的 daemon 在跑时
+  敲 `ccteam start`，得到的是 `alreadyRunning{pid,home}`、同一个 pid——不会有
+  第二个实例，也没有前台模式可以起出第二个。
+- **插件被释放不停 daemon。** DSH 重启、`dsh plugin update`、禁用插件，都只
+  释放插件自己的探针，别的一概不动；你的 Telegram 网关和进行中的委派照常，
+  插件下次启动重新 attach。
+- **停止是显式的、整体的。** 卡上的「停止」执行 `ccteam daemon stop`：停的
+  是那唯一的 daemon，所以 ccteam web 和 IM 网关随之一起停（agent 进程永不被
+  杀）。systemd 托管时 unit 可能把它再拉起来。
+- **home 不同只报告、不修。** `/health` 报的 `home` 与插件的不一致时，卡上
+  显示 **home 不匹配**，插件不会去起第二个 daemon；把 `CCTEAM_HOME`（或卡上
+  的 daemon 地址）指向同一个 home，两边就共用一个引擎。
+- **你自己装的插件绝不被重复安装。** ccteam 往你的 `~/.dsh` web profile 注册
+  或物化插件时，若发现 `@ccteam/ccteam-ui` 已由你自己 `dsh plugin add` 装过，
+  就只写自己的配置行——不装第二份、不加第二条 bundle 行，DSH 也就不会报
+  `duplicate loader entry id`。版本与 ccteam 内嵌的那份不一致时，`ccteam
+  doctor` 和 **Hosts** 页报 `plugin_version_mismatch{installed,embedded}`，
+  留给你自己的 `dsh plugin --profile web update @ccteam/ccteam-ui` 处理。
+- **插件不写 `~/.dsh`。** 把它装进去的是你的 `dsh plugin add`；ccteam 只追加
+  自己的 override 行。
+- **远端或受管 daemon 只 attach。** daemon 地址不是 loopback、运行时本身由
+  ccteam 起（daemon 是它的父进程）、或 profile 行是 ccteam 带着凭据物化的——
+  这些都意味着引擎属于别人：卡上只报状态，不提供启动 / 停止。
+
+## 4. 「引擎」段
+
+DSH **设置 → 插件 → 插件配置 → ccteam-ui** 卡里有「引擎」段：
+
+- **状态** —— `unsupported`（本 OS/CPU 没有发布引擎，不装任何东西）·
+  `missing`（还没有 `ccteam` 二进制）· `installing` · `stopped`（已装、daemon
+  未跑）· `starting` · `running`（本插件起的）· `attached`（别处起的）·
+  `mismatch`（home 或版本不一致，§3 / §7）。
+- **版本** —— 本插件钉死的引擎版本、已装二进制的版本、正在跑的 daemon 的版本。
+- **pid · home · 绑定地址** —— 来自 `/health`：进程 id、`$CCTEAM_HOME`、实际
+  服务的 web 地址（以及开着时的 DSH 伴生监听地址）。
+- **启动 / 停止 / 重启 / 更新引擎** —— 分别是 `ccteam start`、
+  `ccteam daemon stop`、先停后起、以及
+  `ccteam update --channel npm --binary <平台包里的 bin>`。更新刻意走引擎自己
+  的更新器：它会等在飞的 turn 跑完、优雅重启、核对新版本——直接把文件盖到正
+  在跑的 daemon 上做不到这些。
+- **自动启动** —— 插件加载时安装并启动（默认开）。
+- **引擎路径**（高级）—— 显式指定 `ccteam` 二进制；留空 = 先 shell 的 `PATH`，
+  再规范安装路径。
+- **引擎日志** —— `$CCTEAM_HOME/daemon.log` 的尾部，与 `ccteam daemon logs`
+  读的是同一个文件。
+
+## 5. 配置三个面
+
+连接设置在同一张卡上。DSH 只对它认为是「操作者本机」的浏览器显示这一页：手起
+的 `dsh web` 请从 `127.0.0.1` 打开，或经 ccteam 的 DSH 页访问（ccteam 会声明
+该页拥有其 Host，见 usage.md → DSH Web；对 0.1.1-rc.2 及更早版本，ccteam 把这
+处读取回填进下发的客户端 bundle）；从局域网地址直接打开原生 `dsh web`，这一页
+会是空白。
+
+| 字段 | 是什么 | 什么时候填 |
 |---|---|---|
-| **ccteam daemon 地址** | 三个面共用的 daemon 地址，通常是 `http://127.0.0.1:7331` | 你自己的 ccteam daemon |
-| **REST API token** | 标识**你这个人**，工作台凭它读你的团队 | ccteam web → **Settings → Account** 的开发者 REST 卡片（可直接粘贴不带前缀的 token） |
-| **Enrollment 凭据** | 标识**这个 DSH 进程**，它的 agent 凭此调用 ccteam 工具 | ccteam web → **Settings → Access**，复制 `ccteam-enroll:<id>:<secret>` |
+| **ccteam daemon 地址** | 三个面共用的 daemon 地址；默认 `http://127.0.0.1:7331` | 只在 daemon 在别处时填（别的端口、局域网另一台机器）；非 loopback 地址会让「引擎」段变成只 attach |
+| **REST API token** | 标识**你这个人**，工作台凭它读你的团队 | 同机时自动从 `$CCTEAM_HOME/secrets/web-token` 读取；只有 daemon 的 home 你读不到时才需要粘贴（ccteam web → **Settings → Account**，可不带前缀） |
+| **Enrollment 凭据** | 标识**这个 DSH 进程**，它的 agent 凭此调用 ccteam 工具 | 本机 daemon 会自动领取并存在这里；daemon 在别处时从 ccteam web → **Settings → Access** 复制一枚 `ccteam-enroll:<id>:<secret>` 粘贴 |
 | **默认项目**（可选） | 工作台没点名项目时新会话落到哪个项目 | 一个项目 slug；留空则每次询问 |
 
-两个凭据**不能互换**——一个是人，一个是进程。用得上哪个面就填哪个，留空
-只意味着那个面会继续问你要。
+两个凭据**不能互换**——一个是人，一个是进程。凭据字段是只写的：卡片只显示
+**已配置** / **未配置**，从不回显值；留空即保持现值。由 ccteam 启动或注册
+（Hosts → 注册 DSH 插件）的实例已经带上你自己的 REST token。
 
-凭据字段是只写的：卡片只显示 **已配置** / **未配置**，从不回显值；留空即
-保持现值。由 ccteam 启动或注册（Hosts → 注册 DSH 插件）的实例已经带上你自己
-的 REST token，只有手起的 `dsh web` 才需要手工粘贴。
-
-## 4. 使用工作台
+## 6. 使用工作台
 
 点击 DSH 侧栏底部的 ccteam 按钮，工作台以**停靠在 DSH 旁边**的窗格打开：
 左边 DSH 自己的侧栏、会话、详情照常可用，右边同时跑 ccteam（对 DSH 而言，
@@ -126,26 +208,44 @@ harness 的目录里选**模型**和 **effort**（留空即 harness 默认），
 
 工作台需要 DSH 0.1.0-rc.7 起提供的原生侧栏底部座位与 overlay 座位。
 
-## 5. 排查问题
+## 7. 排查问题
 
 | 现象 | 处理方式 |
 |---|---|
-| **未连接** | 执行 `ccteam start`；面板也会显示可复制的命令。 |
+| **未连接** | 打开「引擎」段点「启动」（或执行 `ccteam start`；面板也会显示可复制的命令）。`stopped` = 二进制在、daemon 没跑；`missing` = 没有二进制——「启动」会先从平台包把它装上。 |
+| **「引擎」段报 home 不匹配** | 配置的地址上有个 daemon 在应答，但它的 `$CCTEAM_HOME` 不是插件的。插件不会起第二个。用与那个 daemon 相同的 `CCTEAM_HOME` 启动 DSH，或把卡上的 daemon 地址指向你要的那个 daemon。 |
+| **「引擎」段报版本不匹配** | 正在跑的引擎不是本插件钉死的版本。引擎旧 → 点「更新引擎」（等 turn 跑完 + 优雅重启 + 核对版本）。插件旧 → `dsh plugin --profile web update @ccteam/ccteam-ui` 后重启 DSH。正在跑的二进制绝不会被悄悄换掉。 |
+| **「引擎」段报 unsupported** | ccteam 只为 Linux 和 macOS 的 x64 / arm64 发布引擎；其它平台什么都不装（Windows 不支持；WSL 算 Linux）。请另行安装 ccteam 并把卡指向它，或直接用 ccteam web。 |
+| **安装被拒：目标是软链 / 归包管理器** | 安装梯度落到了一个属于别人的 `ccteam`（软链、Homebrew、nix、snap、`node_modules` 目录）。用那个工具更新它，或给 DSH 进程设 `CCTEAM_INSTALL_DIR=<dir>` 让插件装到别处。 |
 | **401** | HTTP 请求中的 REST 形式是 `Bearer ccteam:<hex>`。卡片里的 **REST API token** 就是这枚个人 token（粘贴时不要加 `Bearer`）；**Enrollment 凭据** 是 `ccteam-enroll:<id>:<secret>`。二者是不同凭据——先确认没有把其中一个填进了另一个的框。 |
-| **启动时报 `duplicate loader entry id`** | 同一个插件被插入了两次（常见于 registry 和 bundle patch 都有，或手改了 `cordis.patch.yml`）。只保留一条，删除重复项。 |
+| **启动时报 `duplicate loader entry id`** | 同一个插件被插入了两次（常见于 registry 和 bundle patch 都有，或手改了 `cordis.patch.yml`）。只保留一条，删除重复项。ccteam 自己的注册绝不会在你装的那份旁边再加一条。 |
+| **`ccteam doctor` 报 `plugin_version_mismatch`** | 你自己 `dsh plugin add` 的那份与这个 ccteam 内嵌的版本不一致。ccteam 不动它；执行 `dsh plugin --profile web update @ccteam/ccteam-ui`。 |
 | **侧栏里没有 ccteam 按钮** | 插件需要 DSH 0.1.0-rc.7 或更新（原生侧栏底部座位与 overlay 座位）。升级 DSH 后，到 设置 → 插件 → 插件列表 确认 `ccteam-ui` 为 Enabled。 |
 | **局域网明文 HTTP 异常** | 参阅 [usage.md](usage.md) 的“Access and security”安全上下文说明。 |
 | **DSH 里人手打的 turn 不在 ccteam 账本里** | 这是设计如此：DSH 自己页面里的输入属于 harness 原生对话；ccteam 只记录自己路由的 turn，完整对话仍保存在 DSH 中。 |
 
-## 6. 版本与更新
+## 8. 版本与更新
 
-需要 **DSH 0.1.0-rc.7 或更高版本**。更新或移除插件时，继续使用同一组
-profile 命令（必须写出包名）：
+需要 **DSH 0.1.0-rc.7 或更高版本**。
+
+**版本锁步。** 每个插件发布都钉死它一起发布的引擎版本（`package.json` 里的
+`ccteam.engine`，与它依赖的 `@ccteam/engine-*` 版本相同）。没有 daemon 在跑
+时，插件会先把已装二进制换到这个版本再启动；有 daemon 在跑时插件绝不碰二进
+制：版本不同显示为「不匹配」，修复是单向的——引擎旧就点卡上的「更新引擎」，
+插件旧就 `dsh plugin --profile web update @ccteam/ccteam-ui`。CLI 的
+`ccteam update` 更新的是同一个引擎，`ccteam status` 显示「运行中 vs 二进制」
+的版本。
+
+**平台。** `@ccteam/engine-linux-x64`、`-linux-arm64`、`-darwin-x64`、
+`-darwin-arm64`。Windows 没有引擎包；卡上显示 `unsupported`，不装任何东西。
+
+更新或移除插件时，继续使用同一组 profile 命令（必须写出包名）：
 
 ```bash
 dsh plugin --profile web update @ccteam/ccteam-ui
 dsh plugin --profile web remove @ccteam/ccteam-ui
 ```
 
-移除插件是安全的：只会删除该插件自己的条目，不会删除 DSH 会话，也不会改写
-DSH 的其他配置。
+移除插件是安全的：只会删除该插件自己的条目，不会删除 DSH 会话，不会改写
+DSH 的其他配置，不会停止 daemon，也不会卸载 `ccteam` 二进制（不再需要时用
+`install.sh --uninstall` 卸掉）。
