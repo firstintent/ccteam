@@ -33,7 +33,7 @@ use crate::latency::now_unix_ms;
 use crate::three_layer_sec::{SecOutcome, ThreeLayerSec};
 use crate::transport::providers::telegram::TelegramChannel;
 use crate::transport::{Channel, ChannelMessage, SendMessage};
-use crate::{list_bots, BotRegistration};
+use crate::BotRegistration;
 
 /// V0.6.1 F132 — keyed map of live IM Channels, keyed by
 /// `ChannelMessage::channel` (`"telegram"`, `"slack"`, `"discord"`,
@@ -287,6 +287,18 @@ pub struct DaemonArgs {
     /// no DSH runtime and DSH hires report it (see
     /// `dsh_runtime_without_a_web_host`).
     pub dsh_runtime: Option<Arc<DshRuntimeManager>>,
+    /// The ccteam root (`~/.ccteam`) this daemon owns. `None` → the
+    /// env-derived production root ([`crate::default_ccteam_root_public`]).
+    ///
+    /// The sibling of [`Self::registry`] (which injects `projects_root`):
+    /// together they pin BOTH halves of [`ccteam_core::CcteamPaths`], so an
+    /// embedding process — `ccteam start`, or a test that runs the daemon
+    /// in-process — states its root instead of the daemon reading `CCTEAM_HOME`
+    /// out of the shared process environment. That read was the whole reason
+    /// in-process daemon tests had to `set_var("CCTEAM_HOME", …)` and race every
+    /// other test in the same binary (CLI-ENVTEST-1); with this field they
+    /// never touch env at all.
+    pub ccteam_root: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for DaemonArgs {
@@ -314,6 +326,7 @@ impl std::fmt::Debug for DaemonArgs {
             )
             .field("pi_rpc_adapter", &self.pi_rpc_adapter.is_some())
             .field("dsh_runtime", &self.dsh_runtime.is_some())
+            .field("ccteam_root", &self.ccteam_root)
             .finish()
     }
 }
@@ -331,8 +344,11 @@ pub async fn run_daemon_with_shutdown<F>(mut args: DaemonArgs, shutdown: F) -> R
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let creds = credentials::load(args.credentials.as_deref())?;
-    let initial = list_bots()?;
+    // The one place the daemon's root is decided (injected or env-derived);
+    // every root-relative path below reads THIS, never the process env.
+    let ccteam_root = daemon_ccteam_root(&args);
+    let creds = credentials::load(credentials_path_for(&args).as_deref())?;
+    let initial = crate::list_bots_in(&ccteam_root, None)?;
     tracing::info!(
         bots = initial.len(),
         has_telegram = creds.telegram.is_some(),
@@ -368,7 +384,6 @@ where
     // / parse error yields an empty map; the third tier of
     // `resolve_project_dir` (projects_root/slug) still applies.
     let config_projects: std::collections::HashMap<String, PathBuf> = {
-        let ccteam_root = crate::default_ccteam_root_public();
         match crate::load_config_projects_map(&ccteam_root) {
             Ok(map) => {
                 tracing::info!(
@@ -416,7 +431,7 @@ where
             }
         }
     }
-    replay_durable_outbox(&channels).await;
+    replay_durable_outbox(&ccteam_root, &channels).await;
     // In-place IM hot-reload: share the channel map so the inbound + event
     // consumers read the live set while a reload swaps credential-driven
     // entries underneath them. `last_creds` lets a reload no-op when
@@ -436,6 +451,7 @@ where
     let gateway = args.gateway.clone().unwrap_or_else(|| {
         Arc::new(Mutex::new(build_gateway(
             factory.clone(),
+            &ccteam_root,
             &projects_root,
             &config_projects,
             &initial,
@@ -597,14 +613,18 @@ where
     let sec = Arc::new(Mutex::new(ThreeLayerSec::new(AclPolicy::default())));
 
     let inbound_consumer = spawn_inbound_consumer(
+        ccteam_root.clone(),
         inbound_rx,
         shared_channels.clone(),
         sec.clone(),
         gateway.clone(),
         restore_complete_rx,
     );
-    let gateway_event_consumer =
-        spawn_gateway_event_consumer(gateway_event_rx, shared_channels.clone());
+    let gateway_event_consumer = spawn_gateway_event_consumer(
+        ccteam_root.clone(),
+        gateway_event_rx,
+        shared_channels.clone(),
+    );
 
     tracing::info!(
         channels = shared_channels.read().unwrap().len(),
@@ -761,7 +781,7 @@ async fn reload_im_channels(
     menu_specs: &[crate::transport::CommandSpec],
 ) {
     // Re-read credentials (global/admin bot) + tenants.json (per-tenant bots).
-    let new_creds = match credentials::load(args.credentials.as_deref()) {
+    let new_creds = match credentials::load(credentials_path_for(args).as_deref()) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "imd: reload could not read credentials");
@@ -780,7 +800,7 @@ async fn reload_im_channels(
     // owner's live global bot (and a creds-only change never blips the tenant
     // bots). Globals use the SAME table the startup path walks + current bot
     // registrations; per-tenant bots come from tenants.json.
-    let bots = list_bots().unwrap_or_default();
+    let bots = crate::list_bots_in(&daemon_ccteam_root(args), None).unwrap_or_default();
     let mut rebuilt: ChannelMap = HashMap::new();
     let probe_path = rejected_sender_probe_path_for(args);
     if creds_changed {
@@ -1021,12 +1041,34 @@ fn build_lark_channel(
     Some(Arc::new(ch))
 }
 
+/// The ccteam root this daemon run owns: the caller's injected
+/// [`DaemonArgs::ccteam_root`] when present, else the env-derived production
+/// root. EVERY root-relative path in the daemon resolves through this one
+/// function, so an embedder pins the whole daemon with a single field and no
+/// path can quietly fall back to `$CCTEAM_HOME` / `$HOME` behind its back.
+fn daemon_ccteam_root(args: &DaemonArgs) -> PathBuf {
+    args.ccteam_root
+        .clone()
+        .unwrap_or_else(crate::default_ccteam_root_public)
+}
+
+/// The credentials file this daemon run reads: an explicit override wins, then
+/// the injected root's `secrets/im-credentials.json`, then the env-derived
+/// default inside [`credentials::load`].
+fn credentials_path_for(args: &DaemonArgs) -> Option<PathBuf> {
+    args.credentials.clone().or_else(|| {
+        args.ccteam_root
+            .as_ref()
+            .map(|root| root.join("secrets").join("im-credentials.json"))
+    })
+}
+
 /// JSONL file where per-tenant channels record the senders they rejected, so
 /// the web self-serve setup flow can offer them (Lark `open_id`s, Telegram
 /// `chat_id`s). When tests override the credentials path, derive the matching
 /// fake `~/.ccteam` root from that path instead of touching the real home.
 fn rejected_sender_probe_path_for(args: &DaemonArgs) -> PathBuf {
-    if let Some(creds) = &args.credentials {
+    if let Some(creds) = credentials_path_for(args) {
         if let Some(secrets) = creds.parent() {
             if let Some(root) = secrets.parent() {
                 return root.join("state").join("im").join("rejected-senders.jsonl");
@@ -1050,7 +1092,7 @@ fn rejected_sender_probe_path_for(args: &DaemonArgs) -> PathBuf {
 /// default home), derive the sibling `users/` from its `secrets/` parent so a
 /// test home is honored; otherwise the canonical env-aware path.
 fn users_dir_for(args: &DaemonArgs) -> PathBuf {
-    if let Some(creds) = &args.credentials {
+    if let Some(creds) = credentials_path_for(args) {
         // creds = .../secrets/im-credentials.json → .../secrets/users
         if let Some(secrets) = creds.parent() {
             return secrets.join("users");
@@ -1132,6 +1174,7 @@ fn build_tenant_channels(
 
 fn build_gateway(
     factory: AdapterFactory,
+    ccteam_root: &Path,
     projects_root: &Path,
     config_projects: &HashMap<String, PathBuf>,
     bots: &[BotRegistration],
@@ -1165,10 +1208,10 @@ fn build_gateway(
     // Enable `/newproject <slug> <path>`: config.yaml lives under the
     // ccteam root; new projects are scaffolded at the caller's path.
     gateway.enable_project_creation(ccteam_core::CcteamPaths {
-        root: crate::default_ccteam_root_public(),
+        root: ccteam_root.to_path_buf(),
         projects_root: projects_root.to_path_buf(),
     });
-    if let Err(err) = gateway.enable_persistence(crate::default_ccteam_root_public()) {
+    if let Err(err) = gateway.enable_persistence(ccteam_root.to_path_buf()) {
         tracing::warn!(
             error = %err,
             "ccteam-im: failed to load gateway state; starting with empty route table"
@@ -1216,8 +1259,14 @@ pub fn build_gateway_for_daemon(
     });
     let ccteam_root = crate::default_ccteam_root_public();
     let config_projects = crate::load_config_projects_map(&ccteam_root).unwrap_or_default();
-    let bots = list_bots()?;
-    let gateway = build_gateway(factory, &projects_root, &config_projects, &bots);
+    let bots = crate::list_bots_in(&ccteam_root, None)?;
+    let gateway = build_gateway(
+        factory,
+        &ccteam_root,
+        &projects_root,
+        &config_projects,
+        &bots,
+    );
     Ok((gateway, claude_stream_json, pi_rpc))
 }
 
@@ -1327,6 +1376,7 @@ pub fn sec_gate_payload(outcome: SecOutcome, has_nontext_payload: bool) -> Optio
 /// Drain the mpsc receiving from every listener and route each accepted
 /// `ChannelMessage` directly through the v8.1 gateway.
 fn spawn_inbound_consumer(
+    ccteam_root: PathBuf,
     mut rx: tokio::sync::mpsc::Receiver<ChannelMessage>,
     channels: Arc<RwLock<ChannelMap>>,
     sec: Arc<Mutex<ThreeLayerSec>>,
@@ -1403,6 +1453,7 @@ fn spawn_inbound_consumer(
                 let msg = msg.clone();
                 let cid = cid.clone();
                 let mut restore_complete = restore_complete.clone();
+                let ccteam_root = ccteam_root.clone();
                 tokio::spawn(async move {
                     if restore_complete.changed().await.is_err() {
                         tracing::warn!(
@@ -1422,7 +1473,15 @@ fn spawn_inbound_consumer(
                             msg.selection.as_ref(),
                         )
                         .await;
-                    deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+                    deliver_gateway_replies(
+                        &ccteam_root,
+                        &cid,
+                        route_t0,
+                        &msg,
+                        channel.as_ref(),
+                        replies,
+                    )
+                    .await;
                 });
                 continue;
             }
@@ -1474,6 +1533,7 @@ fn spawn_inbound_consumer(
                 let channel = Arc::clone(&channel);
                 let msg = msg.clone();
                 let cid = cid.clone();
+                let ccteam_root = ccteam_root.clone();
                 tokio::spawn(async move {
                     let replies = Gateway::handle_message_shared(
                         gateway,
@@ -1486,7 +1546,15 @@ fn spawn_inbound_consumer(
                         msg.selection.as_ref(),
                     )
                     .await;
-                    deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+                    deliver_gateway_replies(
+                        &ccteam_root,
+                        &cid,
+                        route_t0,
+                        &msg,
+                        channel.as_ref(),
+                        replies,
+                    )
+                    .await;
                 });
                 continue;
             }
@@ -1504,7 +1572,15 @@ fn spawn_inbound_consumer(
                     msg.selection.as_ref(),
                 )
                 .await;
-            deliver_gateway_replies(&cid, route_t0, &msg, channel.as_ref(), replies).await;
+            deliver_gateway_replies(
+                &ccteam_root,
+                &cid,
+                route_t0,
+                &msg,
+                channel.as_ref(),
+                replies,
+            )
+            .await;
         }
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
@@ -1515,6 +1591,7 @@ fn spawn_inbound_consumer(
 /// backgrounded-spawn branches so the reply-delivery + latency logging can
 /// never drift between them.
 async fn deliver_gateway_replies(
+    ccteam_root: &Path,
     cid: &str,
     route_t0: std::time::Instant,
     msg: &ChannelMessage,
@@ -1526,7 +1603,7 @@ async fn deliver_gateway_replies(
             for (seq, reply) in replies.into_iter().enumerate() {
                 let out = SendMessage::new(reply, msg.reply_target.clone())
                     .in_thread(msg.thread_ts.clone());
-                send_gateway_outbound(cid, seq, &msg.channel, channel, out).await;
+                send_gateway_outbound(ccteam_root, cid, seq, &msg.channel, channel, out).await;
             }
             tracing::info!(
                 event = "latency",
@@ -1539,7 +1616,7 @@ async fn deliver_gateway_replies(
         Err(err) => {
             let out = SendMessage::new(format_gateway_user_error(&err), msg.reply_target.clone())
                 .in_thread(msg.thread_ts.clone());
-            send_gateway_outbound(cid, 0, &msg.channel, channel, out).await;
+            send_gateway_outbound(ccteam_root, cid, 0, &msg.channel, channel, out).await;
             tracing::warn!(
                 event = "latency",
                 stage = "imd.gateway.err",
@@ -1562,6 +1639,7 @@ struct StatusHandle {
 }
 
 fn spawn_gateway_event_consumer(
+    event_outbox_root: PathBuf,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<GatewayEvent>,
     channels: Arc<RwLock<ChannelMap>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1613,7 +1691,15 @@ fn spawn_gateway_event_consumer(
                         .in_thread(evt.thread_ts)
                         .with_attachments(evt.attachments)
                         .with_options(evt.options);
-                    send_gateway_outbound(&evt.id, 0, &evt.channel, channel.as_ref(), out).await;
+                    send_gateway_outbound(
+                        &event_outbox_root,
+                        &evt.id,
+                        0,
+                        &evt.channel,
+                        channel.as_ref(),
+                        out,
+                    )
+                    .await;
                 }
                 GatewayEventKind::Progress { status_key, done } => {
                     deliver_progress(
@@ -1757,14 +1843,16 @@ enum DurableOutboundState {
     Failed,
 }
 
-fn durable_outbox_path() -> PathBuf {
-    crate::default_ccteam_root_public()
-        .join("state")
-        .join("im")
-        .join("outbound.jsonl")
+/// The at-least-once outbound ledger, under the daemon's own ccteam root
+/// (`daemon_ccteam_root`) — threaded from `run_daemon_with_shutdown` rather
+/// than re-read from env, so an in-process daemon writes into the root its
+/// embedder injected instead of the operator's live `~/.ccteam`.
+fn durable_outbox_path_in(ccteam_root: &Path) -> PathBuf {
+    ccteam_root.join("state").join("im").join("outbound.jsonl")
 }
 
 async fn send_gateway_outbound(
+    ccteam_root: &Path,
     inbound_id: &str,
     seq: usize,
     channel_name: &str,
@@ -1788,7 +1876,8 @@ async fn send_gateway_outbound(
     if parts.len() <= 1 {
         // Unchanged single-message path: id = `{inbound_id}-{seq}`.
         let id = format!("{inbound_id}-{seq}");
-        queue_and_send_durable_part(id, inbound_id, channel_name, channel, message).await;
+        queue_and_send_durable_part(ccteam_root, id, inbound_id, channel_name, channel, message)
+            .await;
         return;
     }
 
@@ -1801,8 +1890,15 @@ async fn send_gateway_outbound(
         let id = format!("{inbound_id}-{seq}-{part_idx}");
         let mut part_msg = message.clone();
         part_msg.content = part;
-        let sent =
-            queue_and_send_durable_part(id, inbound_id, channel_name, channel, part_msg).await;
+        let sent = queue_and_send_durable_part(
+            ccteam_root,
+            id,
+            inbound_id,
+            channel_name,
+            channel,
+            part_msg,
+        )
+        .await;
         if !sent {
             failed_parts.push(part_idx + 1); // 1-based for the user notice
         }
@@ -1835,28 +1931,33 @@ async fn send_gateway_outbound(
 /// `true` when the send succeeded. Shared by the single- and multi-part
 /// branches of [`send_gateway_outbound`].
 async fn queue_and_send_durable_part(
+    ccteam_root: &Path,
     id: String,
     inbound_id: &str,
     channel_name: &str,
     channel: &(dyn Channel + Send + Sync),
     message: SendMessage,
 ) -> bool {
-    append_durable_outbound(DurableOutboundRow {
-        ts_ms: now_unix_ms_u64(),
-        id: id.clone(),
-        inbound_id: inbound_id.to_string(),
-        channel: channel_name.to_string(),
-        state: DurableOutboundState::Queued,
-        message: message.clone(),
-        platform_message_id: None,
-        error: None,
-    });
-    finish_durable_outbound_send(id, inbound_id, channel_name, channel, message).await
+    append_durable_outbound(
+        ccteam_root,
+        DurableOutboundRow {
+            ts_ms: now_unix_ms_u64(),
+            id: id.clone(),
+            inbound_id: inbound_id.to_string(),
+            channel: channel_name.to_string(),
+            state: DurableOutboundState::Queued,
+            message: message.clone(),
+            platform_message_id: None,
+            error: None,
+        },
+    );
+    finish_durable_outbound_send(ccteam_root, id, inbound_id, channel_name, channel, message).await
 }
 
 /// Send a single already-queued durable row and append its terminal
 /// (`Sent`/`Failed`) ledger entry. Returns `true` on success.
 async fn finish_durable_outbound_send(
+    ccteam_root: &Path,
     id: String,
     inbound_id: &str,
     channel_name: &str,
@@ -1865,29 +1966,35 @@ async fn finish_durable_outbound_send(
 ) -> bool {
     match channel.send(&message).await {
         Ok(platform_message_id) => {
-            append_durable_outbound(DurableOutboundRow {
-                ts_ms: now_unix_ms_u64(),
-                id,
-                inbound_id: inbound_id.to_string(),
-                channel: channel_name.to_string(),
-                state: DurableOutboundState::Sent,
-                message,
-                platform_message_id,
-                error: None,
-            });
+            append_durable_outbound(
+                ccteam_root,
+                DurableOutboundRow {
+                    ts_ms: now_unix_ms_u64(),
+                    id,
+                    inbound_id: inbound_id.to_string(),
+                    channel: channel_name.to_string(),
+                    state: DurableOutboundState::Sent,
+                    message,
+                    platform_message_id,
+                    error: None,
+                },
+            );
             true
         }
         Err(err) => {
-            append_durable_outbound(DurableOutboundRow {
-                ts_ms: now_unix_ms_u64(),
-                id,
-                inbound_id: inbound_id.to_string(),
-                channel: channel_name.to_string(),
-                state: DurableOutboundState::Failed,
-                message,
-                platform_message_id: None,
-                error: Some(err.to_string()),
-            });
+            append_durable_outbound(
+                ccteam_root,
+                DurableOutboundRow {
+                    ts_ms: now_unix_ms_u64(),
+                    id,
+                    inbound_id: inbound_id.to_string(),
+                    channel: channel_name.to_string(),
+                    state: DurableOutboundState::Failed,
+                    message,
+                    platform_message_id: None,
+                    error: Some(err.to_string()),
+                },
+            );
             tracing::warn!(
                 inbound_id,
                 channel = %channel_name,
@@ -1899,8 +2006,8 @@ async fn finish_durable_outbound_send(
     }
 }
 
-async fn replay_durable_outbox(channels: &ChannelMap) {
-    let path = durable_outbox_path();
+async fn replay_durable_outbox(ccteam_root: &Path, channels: &ChannelMap) {
+    let path = durable_outbox_path_in(ccteam_root);
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -1928,19 +2035,23 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
         .filter(|row| row.state != DurableOutboundState::Sent)
     {
         let Some(channel) = channels.get(&row.channel) else {
-            append_durable_outbound(DurableOutboundRow {
-                ts_ms: now_unix_ms_u64(),
-                id: row.id,
-                inbound_id: row.inbound_id,
-                channel: row.channel,
-                state: DurableOutboundState::Failed,
-                message: row.message,
-                platform_message_id: None,
-                error: Some("replay failed: channel is not configured".to_string()),
-            });
+            append_durable_outbound(
+                ccteam_root,
+                DurableOutboundRow {
+                    ts_ms: now_unix_ms_u64(),
+                    id: row.id,
+                    inbound_id: row.inbound_id,
+                    channel: row.channel,
+                    state: DurableOutboundState::Failed,
+                    message: row.message,
+                    platform_message_id: None,
+                    error: Some("replay failed: channel is not configured".to_string()),
+                },
+            );
             continue;
         };
         finish_durable_outbound_send(
+            ccteam_root,
             row.id,
             &row.inbound_id,
             &row.channel,
@@ -1951,8 +2062,8 @@ async fn replay_durable_outbox(channels: &ChannelMap) {
     }
 }
 
-fn append_durable_outbound(row: DurableOutboundRow) {
-    if let Err(err) = append_durable_outbound_inner(&row) {
+fn append_durable_outbound(ccteam_root: &Path, row: DurableOutboundRow) {
+    if let Err(err) = append_durable_outbound_inner(ccteam_root, &row) {
         tracing::warn!(
             id = %row.id,
             state = ?row.state,
@@ -1962,13 +2073,13 @@ fn append_durable_outbound(row: DurableOutboundRow) {
     }
 }
 
-fn append_durable_outbound_inner(row: &DurableOutboundRow) -> Result<()> {
+fn append_durable_outbound_inner(ccteam_root: &Path, row: &DurableOutboundRow) -> Result<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     let _guard = LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    let path = durable_outbox_path();
+    let path = durable_outbox_path_in(ccteam_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2096,7 +2207,10 @@ mod tests {
         let channels = Arc::new(RwLock::new(channels));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
-        let consumer = spawn_gateway_event_consumer(rx, channels);
+        // Reaction events never touch the durable outbox, but pin the root at a
+        // tempdir anyway so no test can ever append to the operator's real one.
+        let outbox_root = TempDir::new().unwrap();
+        let consumer = spawn_gateway_event_consumer(outbox_root.path().to_path_buf(), rx, channels);
 
         let reaction_event = |on: bool| GatewayEvent {
             id: format!("gateway-reaction-{on}"),
@@ -2160,7 +2274,10 @@ mod tests {
         let channels = Arc::new(RwLock::new(channels));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
-        let consumer = spawn_gateway_event_consumer(rx, channels);
+        // Reaction events never touch the durable outbox, but pin the root at a
+        // tempdir anyway so no test can ever append to the operator's real one.
+        let outbox_root = TempDir::new().unwrap();
+        let consumer = spawn_gateway_event_consumer(outbox_root.path().to_path_buf(), rx, channels);
 
         let ev = |on: bool| GatewayEvent {
             id: format!("r-{on}"),

@@ -16,6 +16,8 @@ mod update;
 // forwards to the daemon over mcp.sock; the daemon-side handler
 // (`ccteam_im::mcp::McpDispatch`) holds the gateway + enforces the cto gate.
 mod mcp_tool_groups;
+#[cfg(test)]
+mod test_hygiene;
 mod web_chat_bridge;
 // Bare `ccteam doctor` readiness checkup: one consolidated row per vendor,
 // grouped ccteam/project advisories, a summary, and a final daemon-start hint
