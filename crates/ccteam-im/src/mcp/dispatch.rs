@@ -3226,19 +3226,18 @@ async fn run_session_collect(
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
-    let (resolved, live, projection) = {
+    // Residency comes from the SAME lock hold as the resolve: two acquisitions
+    // could disagree about a session that was released in between.
+    let (resolved, live, projection, residency) = {
         let gw = gateway.lock().await;
         (
             gw.session_resolve_any(&sid),
             gw.live_turn_for(&sid),
             gw.progress_projection(),
+            gw.session_residency(&sid),
         )
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
-    let is_live = {
-        let gw = gateway.lock().await;
-        gw.session_resolve(&sid).is_some()
-    };
 
     // Tail the ccteam-owned transcript mirror.
     // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
@@ -3291,8 +3290,12 @@ async fn run_session_collect(
     if truncated {
         body.insert("truncated".into(), serde_json::json!(true));
     }
-    if !is_live {
-        body.insert("status".into(), serde_json::json!("stopped"));
+    // `status: "stopped"` used to mean nothing more than "not live", which
+    // read as "this session is over" for a session that was merely between
+    // processes — the caller's next move (spawn a replacement vs dispatch to
+    // this one) turns on that difference. Say which it is.
+    if let Some(residency) = residency.filter(|r| *r != crate::gateway::RESIDENCY_RESIDENT) {
+        body.insert("residency".into(), serde_json::json!(residency));
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
     if caller == McpCaller::Ambient && !rows.is_empty() {
@@ -3399,11 +3402,16 @@ async fn run_session_list_at(
     // gateway mutex).
     let (views, live_turns, projection, status_roots) = {
         let gw = gateway.lock().await;
-        let views = gw.session_views();
+        // RESIDENT (+ external + detached) rows, then the RELEASED ones: a
+        // session ccteam is not holding a process for is not gone — it resumes
+        // by sid on the next dispatch — so a caller that could not see it here
+        // would keep spawning duplicates of work it already has.
+        let mut views = gw.session_views();
+        views.extend(gw.released_session_views(caller_visible_projects.as_ref()));
         let status_roots = views
             .iter()
             .filter_map(|view| {
-                gw.session_resolve(&view.sid)
+                gw.session_resolve_any(&view.sid)
                     .map(|resolved| (view.sid.clone(), resolved.project_dir))
             })
             .collect::<std::collections::HashMap<_, _>>();
@@ -3414,16 +3422,6 @@ async fn run_session_list_at(
             status_roots,
         )
     };
-    let context_pcts = status_roots
-        .iter()
-        .filter_map(|(sid, dir)| {
-            ccteam_harness::execution::turns_mirror::read_all_turns(dir, sid)
-                .ok()
-                .and_then(|turns| turns.into_iter().rev().find_map(|turn| turn.status))
-                .and_then(|status| status.context.and_then(|context| context.pct()))
-                .map(|pct| (sid.clone(), pct.round() as u64))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
     // v0.9.1 — honest activity per row (same resolver as the web session
     // list): one incremental snapshot per DISTINCT project, not per session.
     // Tests and daemonless callers may not have enabled the gateway projection;
@@ -3495,6 +3493,20 @@ async fn run_session_list_at(
         .collect();
     let total = classified.len();
     let truncated = total > limit;
+    // Context % costs a `turns.jsonl` tail read per session, so it is paid ONLY
+    // for the rows actually emitted — not for the whole fleet before the cut.
+    let context_pcts = classified
+        .iter()
+        .take(limit)
+        .filter_map(|(v, _)| {
+            let dir = status_roots.get(&v.sid)?;
+            ccteam_harness::execution::turns_mirror::read_all_turns(dir, &v.sid)
+                .ok()
+                .and_then(|turns| turns.into_iter().rev().find_map(|turn| turn.status))
+                .and_then(|status| status.context.and_then(|context| context.pct()))
+                .map(|pct| (v.sid.clone(), pct.round() as u64))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let rows: Vec<serde_json::Value> = classified
         .iter()
         .take(limit)
@@ -3512,6 +3524,11 @@ async fn run_session_list_at(
                 row.insert("role".into(), serde_json::json!(v.role));
             }
             row.insert("vendor".into(), serde_json::json!(v.vendor));
+            // Residency only when it is NOT the default: a resident row would
+            // spend the caller's context saying nothing.
+            if v.residency != crate::gateway::RESIDENCY_RESIDENT {
+                row.insert("residency".into(), serde_json::json!(v.residency));
+            }
             // The caller's OWN row (see `caller_sid`). Named nothing like
             // `current` on purpose: the two answer different questions, and
             // reading one as the other is the failure this ends.
@@ -6316,6 +6333,95 @@ mod session_tool_tests {
             .find(|row| row["sid"] == principal)
             .unwrap();
         assert!(parent.get("model").is_none());
+    }
+
+    /// A session ccteam is not holding a process for is still REAL: it must be
+    /// listed (so a caller reuses it instead of spawning a duplicate) and
+    /// marked `residency:"released"`, while `activity` keeps saying only what
+    /// the session is DOING. A resident row carries no `residency` at all —
+    /// the agent's context is not spent on a field that says nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_shows_released_sessions_and_marks_their_residency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let child = run_session_spawn(
+            &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let child = parse(&child)["sid"].as_str().unwrap().to_string();
+
+        // Resident rows say nothing about residency.
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let row = |list: &serde_json::Value, sid: &str| -> serde_json::Value {
+            list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["sid"] == sid)
+                .cloned()
+                .unwrap_or_else(|| panic!("{sid} must be listed: {list}"))
+        };
+        assert!(row(&list, &child).get("residency").is_none());
+
+        // Release the child's process; the row survives, now marked.
+        {
+            let mut guard = gw.lock().await;
+            guard.set_sessions_config(ccteam_core::SessionsConfig {
+                idle_release_secs: 1,
+                ..Default::default()
+            });
+            guard.settle_turn_for_tests(&child);
+            guard.backdate_residency_for_tests(&child, std::time::Duration::from_secs(600));
+        }
+        assert_eq!(Gateway::idle_release_tick(&gw).await, vec![child.clone()]);
+
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert_eq!(row(&list, &child)["residency"], "released");
+        assert!(
+            row(&list, &child).get("activity").is_some(),
+            "activity is still answered from the file verdict"
+        );
+        // The caller's own (still resident) row is unchanged.
+        assert!(row(&list, &principal).get("residency").is_none());
+
+        // `session_collect` says the same thing, in place of the old
+        // `status:"stopped"` (which could not tell "asleep" from "over").
+        let collected = parse(
+            &run_session_collect(
+                &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(collected["residency"], "released");
+        assert!(collected.get("status").is_none());
+
+        // An explicit stop flips the word — the difference the caller acts on.
+        gw.lock().await.stop_session(&child).await.unwrap();
+        let collected = parse(
+            &run_session_collect(
+                &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(collected["residency"], "stopped");
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert!(
+            !list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["sid"] == child.as_str()),
+            "a stopped session leaves the listing: {list}"
+        );
     }
 
     /// v0.9.5 feedback fix — a title-less `session_spawn{task}` derives a

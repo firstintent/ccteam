@@ -241,7 +241,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_collect",
-            "description": "Collect a session transcript in YOUR OWN project. Returns `{activity,context_pct?,cursor?,truncated?,turns:[{turn_id,content,outcome?,error_kind?,error?}],cost_usd?,tokens_total?}` and `status:\"stopped\"` only when not live. Pass `since` for turns after a cursor; default paging is oldest-first, `tail:true` selects the newest `n`. Empty `turns` means no answer yet.",
+            "description": "Collect a session transcript in YOUR OWN project. Returns `{activity,context_pct?,cursor?,truncated?,turns:[{turn_id,content,outcome?,error_kind?,error?}],cost_usd?,tokens_total?}`, plus `residency` when ccteam holds no process for it: `released` (dispatch resumes it) or `stopped` (ended by its user). Pass `since` for turns after a cursor; default paging is oldest-first, `tail:true` selects the newest `n`. Empty `turns` means no answer yet.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {
@@ -256,7 +256,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "session_list",
-            "description": "List live sessions, most recently active first. Rows are `{sid,vendor,role?,title?,activity,context_pct?,parent_sid?,is_self?,waiting_approval?,host?,cost_usd?,tokens_total?}`; host is non-local only. Filter with `project`/`activity`; cap with `limit` (default 30). `truncated:true`, `total`, and a hint appear only when capped. Pass `tree:true` to add delegation topology over the filtered rows. Use `is_self` to find your own sid.",
+            "description": "List sessions you can reach, most recently active first. Rows are `{sid,vendor,role?,title?,activity,residency?,context_pct?,parent_sid?,is_self?,waiting_approval?,host?,cost_usd?,tokens_total?}`; host is non-local only. `residency` appears only when ccteam holds no process: `released` sessions are idle-but-real and resume on your next dispatch, so reuse one instead of spawning a duplicate. Filter with `project`/`activity`; cap with `limit` (default 30). `truncated:true`, `total`, and a hint appear only when capped. Pass `tree:true` to add delegation topology over the filtered rows. Use `is_self` to find your own sid.",
             "inputSchema": json!({
                 "type": "object",
                 "properties": {

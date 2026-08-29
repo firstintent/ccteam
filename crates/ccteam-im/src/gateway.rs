@@ -11656,7 +11656,7 @@ impl Gateway {
     /// Test seam: pretend `sid` has been resident and silent for `by`, so an
     /// idle-release pass can be exercised without sleeping through a real TTL.
     #[cfg(test)]
-    fn backdate_residency_for_tests(&mut self, sid: &str, by: std::time::Duration) {
+    pub(crate) fn backdate_residency_for_tests(&mut self, sid: &str, by: std::time::Duration) {
         if let Some(session) = self.sessions.get_mut(sid) {
             session.resident_since -= by;
             if let Ok(mut last) = session.last_event_at.lock() {
@@ -11664,6 +11664,19 @@ impl Gateway {
             }
         }
     }
+
+    /// Test seam: close `sid`'s in-flight turn, exactly as the pump does on a
+    /// canonical `TurnCompleted`. Test doubles that emit no turn boundary would
+    /// otherwise leave every session looking permanently mid-turn.
+    #[cfg(test)]
+    pub(crate) fn settle_turn_for_tests(&self, sid: &str) {
+        if let Some(session) = self.sessions.get(sid) {
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = None;
+            }
+        }
+    }
+
     // ── delegation (v0.9.0 W2 — F2/F5/F7) ──────────────────────────────────
 
     /// The active delegation guardrail posture (hot-reloaded config, else the
