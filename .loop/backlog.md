@@ -17,6 +17,13 @@
 
 > **v0.10.4 周期(2026-08-25 起,owner 直驱)**:第二个 DSH 插件 `@ccteam/ccteam-ui`(2026-08-28 起,原名 `@ccteam/dsh-team`;插件 1 同日改名 `@ccteam/ccteam-client`,原 `@ccteam/dsh-client`)—— DSH 原生 web 里的 ccteam 面板(跨 vendor 会话树 + 内嵌聊天 + 一键 spawn)+ 双插件设置卡。**定位(owner 2026-08-28)**:ccteam-ui = 在 DSH 的 UI 里用多种 harness,把 ccteam 最核心的体验带进 DSH(DSH 的 UI 风格优于 ccteam web),**未来可能整体取代现有 ccteam web**;故一切按 DSH 客户端插件机制构建,零 ccteam-web 移植。需求 SoT = `docs-local/versions/v0-10-4/README.md`(gitignored;含 4 路调研证据与 R4 本机校准)。规划钦定:包名(原 PRD 草名 dsh-console 弃用);REST 凭据复用现有个人 token(不新增品类);rollout 全员。scaffold + 契约缝(`src/shared/contract.ts`)已由规划亲自落 dev。**UI 材料红线(owner 令 2026-08-21)**:组件只用 `@deepseek-ai/dsh-client-ui-primitives`,token 只引语义层 `--dsw-alias-*`/`--dsw-specific-*`,ccteam-web 前端零移植。本地对照 = `references/deepseek-harness`(HEAD 2026-08-21,更新很快,以它为准不以网页文档为准)。
 
+### DSH2-UI-4 会话行菜单 + 中途切模型/effort + 文案 harness(owner 直驱 2026-08-29,规划亲自)
+- **状态**:完成(829cc901) · **冲突域**:`plugins/ccteam-ui` + `crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz` + `crates/ccteam-web/web/src/lib/i18n.ts` + `docs/dsh-plugin*.md` · **建议入口**:规划亲自。
+- **owner 原话**:① 会话细节对齐 DSH(会话列表三个点菜单);② 每个会话中途切模型和 effort(harness 本来支持,不支持切 harness;多端对称、架构优雅);③ 界面文案 vendor → harness。
+- **做法**:① 行尾「⋯」`Menu`:打开/行内重命名/复制 sid/打断(工作中)/详情/停止(`Modal` 确认);② 不加 REST 字段:输入框底栏 `harness · model · effort ▾` 菜单(`/models` 目录 + effort 阶梯)→ 发送与人手输一样的 `/model <id> [effort]` 指令,走 gateway → harness 指令路(claude `set_model`、kimi/grok `session/set_model`),回执成助手行,statusline 刷新后标签更新——IM/web/MCP/DSH 同一条路;③ 插件 locales + SPA `i18n.ts` 文案(键与 API 字段不变)。顺手修:历史重载后 canonical 行的步骤保留。
+- **验证**:vitest 124/124;沙箱(rc.2 + fake claude):行菜单五项、行内重命名生效、选 high → `/model fake-model high` → 回执「已切换 model → fake-model(live);effort → high(live)」→ 标签 `claude · fake-model · high`,零报错。
+- **交接**:本会话上下文已大,后续由新会话接手:起手读 `docs-local/versions/v0-10-4/ccteam-ui-handoff.md`(小而全:坐标、构建/沙箱命令、硬边界、剩余需求队列)。
+
 ### DSH2-UI-3 ccteam-ui 整页工作台 + 原生级 chat(owner 直驱 2026-08-28,规划亲自)
 - **状态**:完成(a9b930cb) · **冲突域**:`plugins/ccteam-ui` + `crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz` + `docs/dsh-plugin*.md` + `docs/usage*.md` · **建议入口**:规划亲自(UI 归 Fable)。
 - **owner 原话**:「这个 ccteam-ui 插件弹窗不太好,新建会话很简陋。弹窗的 chat 和 dsh 原生 chat 差距还很大,重新设计开发:整体布局、chat。」
