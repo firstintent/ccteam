@@ -111,7 +111,7 @@
 
 ### CLI-ENVTEST-1 `ccteam-cli` bins 单测进程内改 `HOME`/`CCTEAM_HOME` 的竞态(CI `82faddb4` 一次红,规划 2026-08-29 立卡,待排)
 - **状态**:待排 · **冲突域**:`crates/ccteam-cli/src/web_chat_bridge.rs`(`#[cfg(test)]` 段)+ `crates/ccteam-cli/tests/` · **建议入门**:opus maker(小卡)。
-- **现象**:CI「deterministic baseline」job 在 `82faddb4`(只改 backlog 文案)上红:`web_chat_bridge::tests::web_chat_newproject_scaffolds_registers_and_cd_works` 读 `ccteam_home/config.yaml` NotFound(`web_chat_bridge.rs:882`);前后提交全绿。`web_chat_bridge.rs:200-216` 的测试在**进程内** `set_var("HOME"/"CCTEAM_HOME")` 并恢复,与同一 bins 测试进程里任何按 env 解析根目录的测试(PLUG-1 新增的 `daemon_cli`/`update` 单测按 `CcteamPaths::from_env` 读 env,虽不写)并发 —— 正是 AGENTS.md §六「env-mutating 测试放 `crates/*/tests/*.rs`,不放 lib/bins `#[cfg(test)]`」的坑;`ccteam-cli` 无 lib,bins 单测同样共享一个进程。
+- **现象**:CI「deterministic baseline」job 在 `82faddb4`(只改 backlog 文案)与 `2323f04c`(同样只改 backlog;当日第二次)上红:`web_chat_bridge::tests::web_chat_newproject_scaffolds_registers_and_cd_works` 读 `ccteam_home/config.yaml` NotFound(`web_chat_bridge.rs:882`);前后提交全绿。`web_chat_bridge.rs:200-216` 的测试在**进程内** `set_var("HOME"/"CCTEAM_HOME")` 并恢复,与同一 bins 测试进程里任何按 env 解析根目录的测试(PLUG-1 新增的 `daemon_cli`/`update` 单测按 `CcteamPaths::from_env` 读 env,虽不写)并发 —— 正是 AGENTS.md §六「env-mutating 测试放 `crates/*/tests/*.rs`,不放 lib/bins `#[cfg(test)]`」的坑;`ccteam-cli` 无 lib,bins 单测同样共享一个进程。
 - **做法**(治病根):①`web_chat_bridge` 的项目注册/`/cd` 路径改为注入式根(`_in(root)` API)后测试不再碰 env;②仍需 env 的用例整体搬到 `crates/ccteam-cli/tests/web_chat_bridge_env_test.rs`(独立进程);③新增守卫测试:扫描 `crates/ccteam-cli/src/**` 的 `#[cfg(test)]` 段不得出现 `set_var/remove_var`。
 - **DoD**:`cargo test -p ccteam-cli --bins` 连跑 20 次零红(`for i in $(seq 20)`);守卫测试有牙(临时塞一个 `set_var` 即红);基线不降。
 
