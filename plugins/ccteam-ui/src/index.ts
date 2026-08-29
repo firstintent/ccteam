@@ -93,13 +93,34 @@ export interface ApplyContext extends BffContext {
 }
 
 /**
+ * Resolve one field: the value pinned in the profile's patch row wins,
+ * otherwise the user's settings card decides.
+ *
+ * An EMPTY config value is "not pinned", not "pinned to empty". That
+ * distinction is the whole function: this plugin declares a `Config` schema
+ * with defaults, and Cordis validates the row against it before `apply`, so
+ * every key the row omits arrives as `''` (or the schema default) rather than
+ * `undefined`. A plain `??` therefore never falls through, and the settings
+ * card — the documented way a hand-started `dsh web` supplies its credentials
+ * — would be silently dead for every field.
+ *
+ * @param pinned - the value from the row config, if any.
+ * @param stored - the value from the settings card, if any.
+ * @returns the effective value, or `undefined` when neither layer has one.
+ */
+function resolve(pinned: string | undefined, stored: string | undefined): string | undefined {
+  for (const candidate of [pinned, stored]) {
+    if (typeof candidate === 'string' && candidate.trim() !== '') return candidate
+  }
+  return undefined
+}
+
+/**
  * Plugin body: register the one settings namespace, then hand each face the
  * closures that resolve its configuration.
  *
- * Precedence is config-over-settings: a value pinned in the profile's patch row
- * wins, otherwise the user's settings card decides. Both are read through
- * closures on every call, so editing the card takes effect without a restart.
- * Credentials never leave these closures.
+ * Both layers are read through closures on every call, so editing the card
+ * takes effect without a restart. Credentials never leave these closures.
  */
 export function apply(ctx: ApplyContext, config: Config = {}): void {
   const settings = registerCcteamSettings(ctx, {
@@ -109,11 +130,10 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
     defaultProject: config.defaultProject,
     connectionStatus: config.connectionStatus,
   })
-  const daemonUrl = (): string => config.daemonUrl ?? settings.get().daemonUrl ?? DEFAULT_DAEMON_URL
-  const enrollment = (): string | undefined => {
-    const enrolled = config.enrollment ?? settings.get().enrollment
-    return enrolled === undefined || enrolled.trim() === '' ? undefined : enrolled
-  }
+  const daemonUrl = (): string =>
+    resolve(config.daemonUrl, settings.get().daemonUrl) ?? DEFAULT_DAEMON_URL
+  const enrollment = (): string | undefined =>
+    resolve(config.enrollment, settings.get().enrollment)
 
   // One identity per ccteam session, never one per process: this runtime serves
   // many hires plus the human at the DSH UI.
@@ -126,8 +146,8 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
   ctx.inject(WEB_SERVICES, (webCtx: never) => {
     registerBff(webCtx as unknown as BffContext, {
       daemonUrl,
-      restToken: () => config.restToken ?? settings.get().restToken ?? '',
-      defaultProject: () => config.defaultProject ?? settings.get().defaultProject ?? '',
+      restToken: () => resolve(config.restToken, settings.get().restToken) ?? '',
+      defaultProject: () => resolve(config.defaultProject, settings.get().defaultProject) ?? '',
       logger: (webCtx as unknown as BffContext).logger,
     })
   })

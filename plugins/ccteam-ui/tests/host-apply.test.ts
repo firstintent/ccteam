@@ -97,6 +97,26 @@ describe('apply', () => {
     expect(calls.some(call => call.authorization.includes('from-env'))).toBe(false)
   })
 
+  /**
+   * The tool face's half of the same regression: the row config Cordis hands
+   * `apply` carries `enrollment: ''` for every profile that does not pin one
+   * (schema default), so the enrollment a human pasted into the DSH settings
+   * card must still win.
+   */
+  it('takes the enrollment from the settings card when the row config carries the schema default', async () => {
+    const calls = stubDaemon()
+    const h = makeFakeCtx({ settings: { enrollment: 'ccteam-enroll:from-card:secret' } })
+    apply(h.ctx as never, { enrollment: '', daemonUrl: '' })
+
+    const status = h.tools.find(tool => tool.name === 'status')!
+    await status.execute({}, { agent: { id: 'dsh-1', session: { id: 'dsh-1' }, followup: vi.fn() } })
+
+    expect(calls.map(call => call.authorization)).toEqual([
+      'Bearer ccteam-enroll:from-card:secret',
+      'Bearer ccteam-enroll:from-card:secret',
+    ])
+  })
+
   it('routes each session to its own daemon identity and falls back to enrollment', async () => {
     const calls = stubDaemon()
     const socketPath = shortSocketPath()

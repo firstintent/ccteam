@@ -202,6 +202,31 @@ describe('config-over-settings precedence', () => {
     expect(fake.calls[0]!.url).toContain('/api/v1/projects/settings-project/sessions')
   })
 
+  /**
+   * The regression this exists for: Cordis validates the row config against
+   * this plugin's `Config` schema BEFORE apply, so a key the row omits arrives
+   * as its schema default (`''`), not as undefined. Under a plain `??` that
+   * empty string wins and the settings card is dead — which is exactly how a
+   * hand-started `dsh web` is documented to supply its credentials (real
+   * machine, DSH 0.1.1-rc.2: "ccteam MCP credential is not configured" with a
+   * perfectly good enrollment string in DSH Settings).
+   */
+  it('treats an empty config value as unpinned, so the settings card still decides', async () => {
+    const fake = await probe(
+      { daemonUrl: '', restToken: '   ' },
+      { daemonUrl: 'http://from-settings:7331', restToken: 'ccteam:from-settings' },
+    )
+
+    expect(fake.calls[0]!.url).toBe('http://from-settings:7331/api/v1/capabilities')
+    expect(fake.calls[0]!.authorization).toBe('Bearer ccteam:from-settings')
+  })
+
+  it('falls back to the built-in daemon URL when neither layer has one', async () => {
+    const fake = await probe({ daemonUrl: '' }, { daemonUrl: '' })
+
+    expect(fake.calls[0]!.url).toBe(`${DEFAULT_DAEMON_URL}/api/v1/capabilities`)
+  })
+
   it('apply() wires the settings card and the BFF route together, once', () => {
     const server = new FakeWebServer()
     const { service, registrations } = fakeSettings({ restToken: 'ccteam:stored' })
