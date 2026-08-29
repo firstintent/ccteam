@@ -212,9 +212,9 @@ impl AgentProbeSpec {
         if self.vendor == "dsh" {
             return Some(
                 "DSH has no ccteam-writable config file: its ccteam surface is the \
-                 `@ccteam/ccteam-client` plugin inside your DSH web runtime. ccteam preloads \
+                 `@ccteam/ccteam-ui` plugin inside your DSH web runtime. ccteam preloads \
                  it for the runtimes it manages; for a `dsh web` you start yourself, use \
-                 Register here (or `dsh plugin --profile web add @ccteam/ccteam-client`) and \
+                 Register here (or `dsh plugin --profile web add @ccteam/ccteam-ui`) and \
                  restart that instance."
                     .to_string(),
             );
@@ -1197,9 +1197,9 @@ mod tests {
             by("dsh").tool_surface_notice().as_deref(),
             Some(
                 "DSH has no ccteam-writable config file: its ccteam surface is the \
-                 `@ccteam/ccteam-client` plugin inside your DSH web runtime. ccteam preloads \
+                 `@ccteam/ccteam-ui` plugin inside your DSH web runtime. ccteam preloads \
                  it for the runtimes it manages; for a `dsh web` you start yourself, use \
-                 Register here (or `dsh plugin --profile web add @ccteam/ccteam-client`) and \
+                 Register here (or `dsh plugin --profile web add @ccteam/ccteam-ui`) and \
                  restart that instance."
             )
         );

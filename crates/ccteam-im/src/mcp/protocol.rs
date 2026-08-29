@@ -158,7 +158,7 @@ pub fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         json!({
             "name": "status",
-            "description": "Discovery + health: which of claude / codex / grok / opencode / kimi / pi / dsh are installed on your project's host, plus per-vendor session_spawn recipes, daemon health, cost/budget, advisory models, and routing notes. Managed Pi sessions get the bridge; plain shell pi does not. Managed DSH sessions get the ccteam plugin; plain shell dsh needs @ccteam/ccteam-client.",
+            "description": "Discovery + health: which of claude / codex / grok / opencode / kimi / pi / dsh are installed on your project's host, plus per-vendor session_spawn recipes, daemon health, cost/budget, advisory models, and routing notes. Managed Pi sessions get the bridge; plain shell pi does not. Managed DSH sessions get the ccteam plugin; plain shell dsh needs @ccteam/ccteam-ui.",
             "inputSchema": object_schema(&[]),
         }),
         json!({

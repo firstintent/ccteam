@@ -93,10 +93,10 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
             .unwrap();
     let bundles = manifest["dsh"]["profile"]["bundles"].as_array().unwrap();
     let names: Vec<&str> = bundles.iter().filter_map(|v| v.as_str()).collect();
-    assert!(names.contains(&"@ccteam/ccteam-client"), "own bundle added");
     assert!(
         names.contains(&"@ccteam/ccteam-ui"),
-        "the team panel is registered by the same click: {names:?}"
+        "ccteam's own bundle — tools, transport and panel in one — is added by \
+         the click: {names:?}"
     );
     assert!(names.contains(&"@user/my-plugin"), "user bundle preserved");
 
@@ -119,15 +119,14 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
             .clone()
     };
 
-    let client_row = row_of("ccteam-client");
+    let ours = row_of("ccteam-ui");
     assert!(
-        client_row
-            .get("transportSocket")
+        ours.get("transportSocket")
             .and_then(serde_yaml::Value::as_str)
             .is_some_and(|socket| !socket.is_empty()),
         "row carries the socket path: {patch}"
     );
-    let team = row_of("ccteam-ui");
+    let team = ours;
     assert_eq!(
         team["daemonUrl"],
         serde_yaml::Value::String("http://127.0.0.1:7331".into()),
@@ -151,17 +150,15 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
         assert_eq!(mode & 0o777, 0o600, "the patch file is 0600");
     }
 
-    for package in ["ccteam-client", "ccteam-ui"] {
-        assert!(
-            profile
-                .join("node_modules")
-                .join("@ccteam")
-                .join(package)
-                .join("package.json")
-                .exists(),
-            "{package} materialized into the profile"
-        );
-    }
+    assert!(
+        profile
+            .join("node_modules")
+            .join("@ccteam")
+            .join("ccteam-ui")
+            .join("package.json")
+            .exists(),
+        "ccteam-ui materialized into the profile"
+    );
 
     // Idempotent: a second click neither errors nor duplicates the row.
     let resp = client
@@ -173,16 +170,14 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
     assert_eq!(resp.status(), 200);
     let patch_again = std::fs::read_to_string(profile.join("cordis.patch.yml")).unwrap();
     let rows_again: Vec<serde_yaml::Value> = serde_yaml::from_str(&patch_again).unwrap();
-    for id in ["ccteam-client", "ccteam-ui"] {
-        assert_eq!(
-            rows_again
-                .iter()
-                .filter(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(id))
-                .count(),
-            1,
-            "re-registration must not duplicate {id}: {patch_again}"
-        );
-    }
+    assert_eq!(
+        rows_again
+            .iter()
+            .filter(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some("ccteam-ui"))
+            .count(),
+        1,
+        "re-registration must not duplicate ccteam-ui: {patch_again}"
+    );
     let manifest_again: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(profile.join("package.json")).unwrap())
             .unwrap();

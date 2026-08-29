@@ -324,14 +324,14 @@ impl DshRuntimeManager {
         self.inner.shutdown_all().await;
     }
 
-    /// Hosts-page "register the ccteam DSH plugins" action (gate ①): merge
-    /// ccteam's OWN bundle entries and patch rows — `ccteam-client` carrying
-    /// this daemon's `transportSocket` and URL, `ccteam-ui` carrying the URL
-    /// — into the operator's real `~/.dsh` web profile, WITHOUT starting or
+    /// Hosts-page "register the ccteam DSH plugin" action (gate ①): merge
+    /// ccteam's OWN bundle entry and patch row — `ccteam-ui` carrying this
+    /// daemon's URL, `transportSocket` and the operator's REST token — into
+    /// the operator's real `~/.dsh` web profile, WITHOUT starting or
     /// attaching a runtime. This is how an operator whose hand-started `dsh
-    /// web` lacks the plugins gets them: register here, then restart that
+    /// web` lacks the plugin gets it: register here, then restart that
     /// instance themselves. Idempotent and merge-only; touches only ccteam's
-    /// own rows. The panel row carries the operator's own REST token (owner
+    /// own row. That row carries the operator's own REST token (owner
     /// decision 2026-08-28); enrollment stays the human's to paste.
     pub async fn register_operator_profile(&self) -> Result<PathBuf> {
         let daemon_url = self
@@ -352,13 +352,10 @@ impl DshRuntimeManager {
                     &ccteam_home,
                     &home,
                     DSH_NATIVE_WEB_PROFILE,
-                    crate::execution::dsh_acp::materialize::DshClientConfig {
+                    crate::execution::dsh_acp::materialize::DshPluginConfig {
+                        daemon_url: Some(&daemon_url),
                         enrollment: None,
-                        daemon_url: Some(&daemon_url),
                         transport_socket: Some(&socket.to_string_lossy()),
-                    },
-                    crate::execution::dsh_acp::materialize::DshUiConfig {
-                        daemon_url: Some(&daemon_url),
                         rest_token: rest_token.as_deref(),
                     },
                 )

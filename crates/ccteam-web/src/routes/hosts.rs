@@ -548,12 +548,13 @@ pub(crate) async fn handle_register_mcp(
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
         // DSH's "register ccteam" is not a vendor-config write: ccteam reaches
-        // DSH through Cordis plugins — `@ccteam/ccteam-client` (tool + transport)
-        // and `@ccteam/ccteam-ui` (the team panel). This action merges ccteam's
-        // OWN bundle entries + patch rows (carrying this daemon's
-        // transportSocket/URL, never a credential) into the operator's real
-        // `~/.dsh` web profile — gate ①, idempotent, merge-only — so a
-        // hand-started `dsh web` can serve hires after its owner restarts it.
+        // DSH through one Cordis plugin — `@ccteam/ccteam-ui`, which carries
+        // the tool face, the ACP transport and the team panel. This action
+        // merges ccteam's OWN bundle entry + patch row (carrying this daemon's
+        // transportSocket/URL and the operator's own REST token) into the
+        // operator's real `~/.dsh` web profile — gate ①, idempotent,
+        // merge-only — so a hand-started `dsh web` can serve hires after its
+        // owner restarts it.
         // Deliberately NOT part of register-all: it only takes effect after
         // the human restarts their own instance, so it stays an explicit ask.
         Some("dsh") => {
