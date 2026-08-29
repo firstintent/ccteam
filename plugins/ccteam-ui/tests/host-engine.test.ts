@@ -8,8 +8,9 @@
  * anything on dispose — so the tests assert what the fake CLI was NOT asked to
  * do as often as what it was.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { EngineSupervisor, isLoopbackUrl, lastJsonObject } from '../src/host/engine/supervisor.js'
 import {
@@ -27,7 +28,7 @@ import {
   tailFile,
   webTokenPath,
 } from '../src/host/engine/locate.js'
-import { classifyDestPath, installEngine, resolveInstallDir } from '../src/host/engine/install.js'
+import { classifyDestPath, installEngine, resolveInstallDirWith } from '../src/host/engine/install.js'
 import { createEnrollmentBootstrap, createTokenBootstrap } from '../src/host/engine/bootstrap.js'
 import {
   calls,
@@ -41,6 +42,7 @@ import {
 } from './host-engine-fakes.js'
 
 const ENGINE_VERSION = '0.10.3'
+const root = dirname(fileURLToPath(import.meta.url))
 
 const sandboxes: Sandbox[] = []
 const servers: FakeHealth[] = []
@@ -218,18 +220,107 @@ describe('installing from the platform package', () => {
     expect(readFileSync(dest, 'utf8')).toContain('0.10.3')
   })
 
-  it('follows install.sh’s ladder: override, then where ccteam already lives, then ~/.local/bin', () => {
-    const sbx = sandbox()
-    const environment = sandboxEnvironment(sbx)
-    expect(resolveInstallDir(environment)).toBe(sbx.installDir)
+  /**
+   * Rung-by-rung parity with the shell ladder, in install.sh's order — the
+   * same table `update.rs::install_dir_ladder_walks_install_sh_rungs_in_order`
+   * walks, with the same fixture paths, so a change to one ladder that is not
+   * made to the other shows up as a diff between two tests rather than as a
+   * user with two ccteam binaries.
+   */
+  it('walks install.sh’s rungs in order, exactly as the Rust copy does', () => {
+    const home = '/home/u'
+    const exec = (p: string): boolean =>
+      ['/opt/first/ccteam', '/home/u/.local/bin/ccteam', '/ro/ccteam', '/src/target/debug/ccteam'].includes(p)
+    const writable = (d: string): boolean => d !== '/ro'
+    const ladder = (env: string | undefined, path: string | undefined): string =>
+      resolveInstallDirWith(env, path, home, exec, writable)
 
-    const noOverride = { ...environment, env: { PATH: sbx.binDir } }
-    expect(resolveInstallDir(noOverride, join(sbx.binDir, 'ccteam'))).toBe(sbx.binDir)
-    expect(resolveInstallDir(noOverride)).toBe(join(sbx.root, 'home', '.local', 'bin'))
-    // A cargo build tree is an output, not an install location.
-    const target = join(sbx.root, 'target', 'debug')
-    mkdirSync(target, { recursive: true })
-    expect(resolveInstallDir(noOverride, join(target, 'ccteam'))).toBe(join(sbx.root, 'home', '.local', 'bin'))
+    // Rung 1 — the explicit override wins over everything…
+    expect(ladder('/custom', '/opt/first:/home/u/.local/bin')).toBe('/custom')
+    // …but an EMPTY override is not an override.
+    expect(ladder('', '/opt/first')).toBe('/opt/first')
+
+    // Rung 2 — `command -v ccteam`: the FIRST PATH hit, which is the binary a
+    // shell would run. Not whatever discovery picked: installing beside a
+    // shadowing copy instead of over it is the whole failure.
+    expect(ladder(undefined, '/nope:/opt/first:/home/u/.local/bin')).toBe('/opt/first')
+    // Rung 2 skips a cargo build tree (`cargo clean` would delete it)…
+    expect(ladder(undefined, '/src/target/debug:/home/u/.local/bin')).toBe('/home/u/.local/bin')
+    // …and a directory it cannot write.
+    expect(ladder(undefined, '/ro')).toBe('/home/u/.local/bin')
+    // POSIX says an empty PATH entry means the current directory; an installer
+    // must not honour that.
+    expect(ladder(undefined, ':/opt/first')).toBe('/opt/first')
+
+    // Rung 3 — nothing on PATH, no PATH at all.
+    expect(ladder(undefined, '/nope')).toBe('/home/u/.local/bin')
+    expect(ladder(undefined, undefined)).toBe('/home/u/.local/bin')
+  })
+
+  /**
+   * Drift guard, the same one the Rust copy carries: this ladder exists in
+   * THREE places (install.sh, update.rs, here), and a copy with no test rots.
+   * Read the shell source and require every rung to still be there — if
+   * install.sh's ladder changes, both copies fail rather than silently
+   * disagreeing.
+   */
+  it('still mirrors every rung install.sh actually has', () => {
+    const script = readFileSync(join(root, '..', '..', '..', 'install.sh'), 'utf8')
+    const ladder = script.split('resolve_install_dir() {')[1]?.split('\n}')[0]
+    expect(ladder, 'install.sh still defines resolve_install_dir()').toBeDefined()
+
+    for (const [rung, marker] of [
+      ['1: explicit override', 'CCTEAM_INSTALL_DIR'],
+      ['2: PATH lookup', 'command -v ccteam'],
+      ['2: symlink resolution', 'canonical_bin'],
+      ['2: build-tree exclusion', '*/target/release|*/target/debug'],
+      ['2: writability', '-w "$_dir"'],
+      ['3: default', '$HOME/.local/bin'],
+    ] as const) {
+      expect(ladder, `install.sh's ladder lost rung ${rung} (marker ${marker})`).toContain(marker)
+    }
+    // Order matters: the override is checked before the PATH lookup.
+    expect(ladder!.indexOf('CCTEAM_INSTALL_DIR')).toBeLessThan(ladder!.indexOf('command -v ccteam'))
+  })
+
+  /**
+   * The repro the ladder's symlink rung exists for. A link earlier on PATH
+   * pointing at the real install is an ordinary setup (`~/bin/ccteam ->
+   * /usr/local/bin/ccteam`, a package manager's `bin` shim). Taking the
+   * parent of the UNRESOLVED entry targets the link itself, which
+   * `classifyDestination` then refuses — so the plugin would report
+   * `destIsSymlink` and install nothing, on a machine where install.sh
+   * upgrades cleanly.
+   */
+  it('installs beside the real binary when PATH finds it through a symlink', async () => {
+    const sbx = sandbox()
+    const realDir = join(sbx.root, 'real-bin')
+    const pathDir = join(sbx.root, 'path-bin')
+    mkdirSync(realDir, { recursive: true })
+    mkdirSync(pathDir, { recursive: true })
+    const real = writeFakeCcteam(sbx, join(realDir, 'ccteam'))
+    const link = join(pathDir, 'ccteam')
+    symlinkSync(real, link)
+
+    // The link is first on PATH and its directory IS writable — the rung-2
+    // filters alone would happily choose it.
+    const resolved = resolveInstallDirWith(undefined, `${pathDir}:${realDir}`, join(sbx.root, 'home'))
+    expect(resolved).toBe(realDir)
+
+    const source = writeEnginePackageBin(sbx, join(sbx.root, 'pkg', 'bin'), ENGINE_VERSION)
+    // What an unresolved-parent ladder would have targeted, and why that is
+    // not merely cosmetic: the link is refused, so nothing installs at all.
+    expect(await installEngine({ source, dest: link })).toMatchObject({
+      ok: false,
+      errorKind: 'destIsSymlink',
+    })
+
+    const outcome = await installEngine({ source, dest: join(resolved, 'ccteam') })
+
+    expect(outcome).toMatchObject({ ok: true, binary: join(realDir, 'ccteam'), version: ENGINE_VERSION })
+    // The link is untouched and still points at the binary that was upgraded.
+    expect(lstatSync(link).isSymbolicLink()).toBe(true)
+    expect(realpathSync(link)).toBe(realpathSync(join(realDir, 'ccteam')))
   })
 })
 

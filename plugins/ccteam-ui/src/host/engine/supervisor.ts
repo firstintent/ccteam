@@ -587,7 +587,10 @@ export class EngineSupervisor {
         error: 'the daemon is running; use “update engine” so it drains and restarts cleanly',
       }
     }
-    const dest = join(resolveInstallDir(this.environment, status.binary), 'ccteam')
+    // The ladder does its OWN PATH lookup (see resolveInstallDir): "where does
+    // ccteam live" is not the same question as "which binary did discovery
+    // pick", and answering the wrong one installs beside a shadowing copy.
+    const dest = join(resolveInstallDir(this.environment), 'ccteam')
     this.phase = 'installing'
     try {
       const outcome = await installEngine({ source, dest, run: this.run })

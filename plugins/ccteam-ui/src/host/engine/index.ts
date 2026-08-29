@@ -21,6 +21,7 @@ export {
   locateEngine,
   parseVersionOutput,
   processExists,
+  whichOnPath,
   readDaemonEndpoint,
   runCommand,
   tailFile,
@@ -38,6 +39,7 @@ export {
   classifyDestination,
   installEngine,
   resolveInstallDir,
+  resolveInstallDirWith,
   resolvePackageBin,
   type DestVerdict,
   type InstallOutcome,
@@ -51,6 +53,7 @@ export {
   type SupervisorOptions,
 } from './supervisor.js'
 export {
+  ENROLL_PATH,
   createEnrollmentBootstrap,
   createTokenBootstrap,
   requestEnrollment,

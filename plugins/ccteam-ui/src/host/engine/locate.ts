@@ -251,16 +251,31 @@ export function isExecutableFile(path: string): boolean {
   }
 }
 
-/** First executable named `ccteam` on `PATH`, in PATH order. */
-export function findOnPath(environment: EngineEnvironment, name = 'ccteam'): string | undefined {
-  const raw = environment.env.PATH ?? ''
-  for (const entry of raw.split(delimiter)) {
-    const dir = entry.trim()
-    if (dir === '') continue
-    const candidate = join(dir, name)
-    if (isExecutableFile(candidate)) return candidate
+/**
+ * `command -v <name>`: the first executable of that name on `PATH`.
+ *
+ * Empty PATH entries mean "the current directory" in POSIX, which is exactly
+ * the kind of surprise an installer must not honour, so they are skipped —
+ * same rule as `update.rs::which_on_path`. `isExec` is injectable so the
+ * install ladder's table test can walk PATH without a real filesystem.
+ */
+export function whichOnPath(
+  name: string,
+  pathEnv: string | undefined,
+  isExec: (path: string) => boolean = isExecutableFile,
+): string | undefined {
+  if (pathEnv === undefined) return undefined
+  for (const entry of pathEnv.split(delimiter)) {
+    if (entry === '') continue
+    const candidate = join(entry, name)
+    if (isExec(candidate)) return candidate
   }
   return undefined
+}
+
+/** First executable named `ccteam` on this environment's `PATH`. */
+export function findOnPath(environment: EngineEnvironment, name = 'ccteam'): string | undefined {
+  return whichOnPath(name, environment.env.PATH)
 }
 
 /**

@@ -110,13 +110,27 @@ export interface EnrollmentOutcome {
 }
 
 /**
- * Ask the daemon for this DSH process's tool-face credential.
+ * The daemon route this asks. `POST /api/v1/enroll` MINTS a fresh credential
+ * every call (`crates/ccteam-web/src/routes/enroll.rs` → `enroll::mint_in`);
+ * the idempotent `enroll::ensure_user_credential` is, today, only reachable
+ * from the Rust side's own Hosts button.
  *
- * `POST /api/v1/enroll` MINTS (crates/ccteam-web/src/routes/enroll.rs), so
- * "idempotent ensure" is achieved by calling it at most once and storing the
- * result in the plugin's own settings — the same place a human would have
- * pasted it, visible and revocable from both ends. A caller that already has a
- * credential must not reach this function at all.
+ * So "ensure" is approximated ABOVE the wire — at most one mint per process,
+ * persisted into the settings card so the next boot finds it there instead of
+ * minting again. That is a real limitation, not a rounding error: a plugin
+ * that mints and then fails to persist leaves a credential behind.
+ *
+ * This constant plus {@link requestEnrollment} are the ONLY two places that
+ * know the shape of that call, so adopting a daemon-side idempotent ensure
+ * (backlog ENROLL-ENSURE-1) is a one-place change: point this at the new route
+ * and drop the at-most-once bookkeeping in
+ * {@link createEnrollmentBootstrap}.
+ */
+export const ENROLL_PATH = '/api/v1/enroll'
+
+/**
+ * Ask the daemon for this DSH process's tool-face credential. A caller that
+ * already has one must not reach this function at all.
  */
 export async function requestEnrollment(options: EnrollmentOptions): Promise<EnrollmentOutcome> {
   const doFetch = options.fetchImpl ?? ((input: string, init?: RequestInit) => fetch(input, init))
@@ -124,7 +138,7 @@ export async function requestEnrollment(options: EnrollmentOptions): Promise<Enr
   const authorization = options.authorization()
   let response: Response
   try {
-    response = await doFetch(`${base}/api/v1/enroll`, {
+    response = await doFetch(`${base}${ENROLL_PATH}`, {
       method: 'POST',
       headers: {
         accept: 'application/json',

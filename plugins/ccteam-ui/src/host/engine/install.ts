@@ -24,12 +24,13 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync
 import { createRequire } from 'node:module'
 import { join, sep } from 'node:path'
 import {
-  canonicalInstallDir,
   binaryVersion,
+  canonicalPath,
   enginePackageName,
   isExecutableFile,
   parentDir,
   runCommand,
+  whichOnPath,
   type EngineEnvironment,
   type EnginePlatform,
   type RunFn,
@@ -103,21 +104,66 @@ function isWritableDir(dir: string): boolean {
 }
 
 /**
- * install.sh's ladder: explicit override → wherever ccteam already lives
- * (writable, not a cargo build tree, not package-owned) → `$HOME/.local/bin`.
- * The middle rung is why a CLI user who installed to `/usr/local/bin` does not
- * get a second copy in `~/.local/bin` the first time they add the plugin.
+ * install.sh's ONE ladder, in TypeScript — a faithful copy of
+ * `update.rs::resolve_install_dir_with`, which is itself a copy of
+ * `resolve_install_dir()` in `install.sh:68-86`. THREE copies of one rule is
+ * two too many to leave untested, so both directions are pinned: the Rust test
+ * `install_sh_ladder_rungs_match_the_rust_copy` reads the shell source, and
+ * `tests/host-engine.test.ts` reads it again from here. Drift fails on either
+ * side rather than in a user's upgrade.
+ *
+ * Rungs:
+ *   1. `$CCTEAM_INSTALL_DIR`, when non-empty;
+ *   2. `command -v ccteam` — the binary a shell would RUN, **symlink-resolved
+ *      to its real directory**, excluding a cargo build tree, and only if that
+ *      directory is writable;
+ *   3. `$HOME/.local/bin`.
+ *
+ * Rung 2 does its own PATH lookup rather than reusing whatever
+ * `locateEngine()` found, and resolves the result through the link. Both
+ * halves are load-bearing and both were wrong here before: `locateEngine()`
+ * may have been handed an explicit `enginePath`, or have fallen back to the
+ * canonical path, neither of which is "where a shell finds ccteam"; and taking
+ * the parent of an unresolved PATH entry targets the LINK, so a
+ * `~/bin/ccteam -> /usr/local/bin/ccteam` setup installs onto the link (which
+ * is then refused) instead of beside the real binary.
  */
-export function resolveInstallDir(environment: EngineEnvironment, currentBinary?: string): string {
-  const pinned = (environment.env.CCTEAM_INSTALL_DIR ?? '').trim()
-  if (pinned !== '') return pinned
-  if (currentBinary !== undefined && currentBinary !== '') {
-    const dir = parentDir(currentBinary)
-    if (dir !== '' && !isCargoBuildTree(dir) && classifyDestPath(dir) === undefined && isWritableDir(dir)) {
-      return dir
-    }
+export function resolveInstallDir(environment: EngineEnvironment): string {
+  return resolveInstallDirWith(
+    environment.env.CCTEAM_INSTALL_DIR,
+    environment.env.PATH,
+    environment.homedir(),
+  )
+}
+
+/**
+ * Testable core of the ladder: every environment input is injected, so a table
+ * test can walk the rungs without a real PATH or a real filesystem. Mirrors
+ * `update.rs::resolve_install_dir_with` argument for argument.
+ *
+ * @param installDirEnv - `$CCTEAM_INSTALL_DIR`.
+ * @param pathEnv - `$PATH`.
+ * @param home - the user's home directory.
+ * @param isExec - is this path an executable file?
+ * @param isWritable - may we write into this directory?
+ */
+export function resolveInstallDirWith(
+  installDirEnv: string | undefined,
+  pathEnv: string | undefined,
+  home: string,
+  isExec: (path: string) => boolean = isExecutableFile,
+  isWritable: (dir: string) => boolean = isWritableDir,
+): string {
+  // Rung 1 — explicit override.
+  if (installDirEnv !== undefined && installDirEnv !== '') return installDirEnv
+  // Rung 2 — wherever a shell would find ccteam today.
+  const existing = whichOnPath('ccteam', pathEnv, isExec)
+  if (existing !== undefined) {
+    const dir = parentDir(canonicalPath(existing))
+    if (dir !== '' && !isCargoBuildTree(dir) && isWritable(dir)) return dir
   }
-  return canonicalInstallDir(environment)
+  // Rung 3 — the default.
+  return join(home, '.local', 'bin')
 }
 
 export type ResolvePackageBin = (platform: EnginePlatform) => string | undefined
