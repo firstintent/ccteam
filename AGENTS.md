@@ -17,7 +17,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 - **接口面**:8 个 MCP 工具 `mcp__ccteam__{status(+裸名发现别名),chat_send_file,session_*}` + `POST /mcp` streamable HTTP + REST `/api/v1`(OpenAPI = `/api/docs`)+ IM 斜杠命令面 + 统一 chat-shell web(per-session Chat|终端)。清单/参数/语义以代码与工具自描述为准(指针表 = tech-design 末尾)。
 - **内容面**:引擎零内置 persona/skill/提示词;role = 项目 `.claude/agents/<role>.md`(vendor 原生 `--agent` 自读,init 不种);skill = 用户级全局库 `~/.ccteam/skills`(会话显式 attach)+ 项目 `.agents/skills`(`.claude/skills` 软链);一切内容从 ccteam-hub 装(sha256 校验、never-execute)或用户自建。
 - **执行面**:daemon 不 tick、无 orchestrator 循环,只响应消息/排程;会话 = resume-by-sid + 容量挤停;编排智能 100% 用户空间(`ccteam-flow`/workflow.yaml 占位 deferred,倾向 prompt 层 skill over Rust 特性)。
-- **安装面**:`curl install.sh | sh`(prebuilt binary)→ `ccteam config` 注册五 vendor 全局 MCP(pi 例外:工具面走受管会话 bridge,ccteam 不写它任何配置);**ccteam 是纯 CLI、不是 vendor 插件**。
+- **安装面**:`curl install.sh | sh`(prebuilt binary)→ `ccteam config` 注册五 vendor 全局 MCP(pi 例外:工具面走受管会话 bridge,ccteam 不写它任何配置);**ccteam 是一个二进制引擎、两个安装/托管面**(owner 2026-08-29):CLI(`install.sh`)与 DSH 插件 `@ccteam/ccteam-ui`(npm,插件自带引擎平台包,`apply()` 自动装/自启/attach)—— 二者共用同一 `$CCTEAM_HOME` 与**同一个 daemon**(谁先起谁赢、其余 attach;插件被释放不停 daemon;PRD = `docs-local/versions/v0-10-5/prd.md`)。
 
 > 旧概念已全部退役、勿从旧文档/git 史复活:orchestrator tick、模式 1/2/3、flex、session=role(`(project,role)` dedup)、fresh-1M-context、cto 内置工作流、agent-team init。现行以本文 + 代码为准;验证优先用确定性 fake(`CCTEAM_{CLAUDE,CODEX}_BIN`),不退 baseline。
 
