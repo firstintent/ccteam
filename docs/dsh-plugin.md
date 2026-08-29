@@ -95,9 +95,18 @@ the team fills the pane until a session is chosen, a back control returns
 to it, and the details sheet slides over the conversation.
 
 - **Team** (left): **New session**, a search box, and every session grouped
-  by project — vendor monogram, title, `vendor · model · when`, the activity
+  by project — vendor monogram, title, `vendor · model · when`, the state
   dot and the accumulated cost; delegated children are indented under their
-  parent. Project headers fold and show the project’s total cost.
+  parent. The dot is the daemon’s activity verdict first (animated = working,
+  green = idle, amber = stale, red = stuck); a settled session then shows its
+  residency — a hollow ring means the daemon released its process after the
+  harness’s prompt-cache TTL and it resumes by sid on the next message, a
+  dimmed disc (with a “stopped” caption) means you stopped it. Hovering a
+  row explains the state. Project headers fold and show the project’s total
+  cost; hovering one reveals **⋯** (new session, copy slug, expand only this
+  project, collapse all) and **+**, which opens the new-session page with
+  that project preselected — the same affordances DSH’s own workspace rows
+  have.
 - **Main** (center): the selected session’s conversation, or the new-session
   hero when nothing is selected.
 - **Details** (right, toggle in the header): identity (sid, project, vendor,
