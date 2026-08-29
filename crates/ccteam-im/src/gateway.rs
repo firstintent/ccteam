@@ -9559,7 +9559,7 @@ impl Gateway {
             tokens_total: meta.as_ref().and_then(|meta| meta.tokens_total),
         };
         // Line 1 = where am I (slug/sid + title), nothing else; line 2 = run
-        // state · vendor model · role · metrics — every fact exactly once.
+        // state · metrics; line 3 = the harness identity — every fact once.
         let mut head = format!("🧭 → {}/{}", s.project, s.id);
         if let Some(title) = title.as_deref().filter(|title| !title.is_empty()) {
             head.push_str(&format!(
@@ -9567,20 +9567,37 @@ impl Gateway {
                 ccteam_harness::truncate_status_title(title)
             ));
         }
-        let mut second: Vec<String> = vec![format!("{state} {detail}").trim_end().to_string()];
-        match turn_status
+        // 📍 line = run state · metrics (ctx / turn / cost) — what the session
+        // is doing right now.
+        let second = format!(
+            "{} · {}",
+            format!("{state} {detail}").trim_end(),
+            ccteam_harness::render_status_metrics(&turn_status)
+        );
+        // Identity line = harness + model + effort + role kept TOGETHER
+        // (`claude claude-fable-5[1m] · max · cto`, owner layout 2026-08-29):
+        // the reader sees "who is answering" as one phrase instead of the
+        // model on one line and the effort two lines below. An unknown effort
+        // or a roleless session simply omits its segment (never a `—`).
+        let mut identity = match turn_status
             .model
             .as_deref()
             .filter(|model| !model.is_empty())
         {
-            Some(model) => second.push(format!("{} {model}", vendor_str(s.vendor))),
-            None => second.push(vendor_str(s.vendor).to_string()),
+            Some(model) => format!("{} {model}", vendor_str(s.vendor)),
+            None => vendor_str(s.vendor).to_string(),
+        };
+        if let Some(effort) = status
+            .as_ref()
+            .and_then(|st| st.effort.as_deref())
+            .filter(|e| !e.is_empty())
+        {
+            identity.push_str(&format!(" · {effort}"));
         }
         if !s.role.is_empty() {
-            second.push(s.role.clone());
+            identity.push_str(&format!(" · {}", s.role));
         }
-        second.push(ccteam_harness::render_status_metrics(&turn_status));
-        let mut out = format!("{head}\n📍 {}", second.join(" · "));
+        let mut out = format!("{head}\n📍 {second}\n   {identity}");
 
         // Project working-tree PATH — disambiguates an auto-appended slug
         // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
@@ -9589,20 +9606,13 @@ impl Gateway {
             out.push_str(&format!("\n   📁 {}", dir.display()));
         }
 
-        // Deep-view line: effort · resume — model and ctx already sit on the
-        // status line above, so they are NOT repeated here. Unknown → `—`.
-        let effort = status
-            .as_ref()
-            .and_then(|st| st.effort.as_deref())
-            .filter(|e| !e.is_empty())
-            .unwrap_or("—");
         // The REAL `--resume` id (Anthropic session uuid), shown in full so it
         // can be matched against `tmux ls` / `claude --resume`; `—` for a
         // tmux/codex session that carries no stream-json uuid (never fabricated).
         let resume = thread_vendor_uuid(&s.thread)
             .map(|u| format!("resume {u}"))
             .unwrap_or_else(|| "resume —".to_string());
-        out.push_str(&format!("\n   effort {effort} · {resume}"));
+        out.push_str(&format!("\n   {resume}"));
 
         // Running subagents / background workflows — straight from claude's task
         // lifecycle (NOT a fold). Subagents only exist while a turn is working;
@@ -21442,8 +21452,12 @@ mod tests {
             "current-session header: {idle:?}"
         );
         assert!(
-            idle[0].contains("effort max · resume —"),
-            "model·effort·ctx·resume line: {idle:?}"
+            idle[0].contains("\n   claude claude-opus-4-8 · max · reviewer\n"),
+            "identity line = harness model · effort · role, together: {idle:?}"
+        );
+        assert!(
+            idle[0].contains("\n   resume —"),
+            "resume key on its own line: {idle:?}"
         );
         // Owner req — /status ends by pointing at the full project list with a
         // live count (this gateway has one project, `alpha`), replacing the old
@@ -21693,7 +21707,7 @@ mod tests {
         assert_eq!(
             out,
             vec![format!(
-                "🧭 → alpha/s1\n📍 🟢 idle · claude · reviewer · turn 0\n   📁 {}\n   effort — · resume —\n   ↓ 所有 1 个项目 → /projects",
+                "🧭 → alpha/s1\n📍 🟢 idle · turn 0\n   claude · reviewer\n   📁 {}\n   resume —\n   ↓ 所有 1 个项目 → /projects",
                 proj.path().display()
             )]
         );
@@ -21721,8 +21735,8 @@ mod tests {
             "roleless → role shows —, vendor still shown: {out:?}"
         );
         assert!(
-            out[0].contains("effort — · resume —"),
-            "statusless + no-uuid → placeholders, never fabricated: {out:?}"
+            out[0].contains("\n   claude\n") && out[0].contains("\n   resume —"),
+            "statusless roleless → bare harness line, no fabricated effort; resume placeholder: {out:?}"
         );
     }
 
@@ -21745,7 +21759,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1\n📍 🟢 idle · claude · reviewer · turn 0"),
+            out[0].starts_with("🧭 → alpha/s1\n📍 🟢 idle · turn 0\n   claude · reviewer"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
