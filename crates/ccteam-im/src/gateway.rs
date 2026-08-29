@@ -9194,7 +9194,19 @@ impl Gateway {
             .values()
             .filter(|s| s.owner == canon && s.project == project)
             .min_by_key(|s| session_index(&s.id))
-            .map(|s| s.id.clone());
+            .map(|s| s.id.clone())
+            .or_else(|| {
+                // A RELEASED session of this project is just as adoptable —
+                // it resumes by sid on the next message. Without this leg a
+                // `/cd` (or the first `/cd` after a restart) would clear the
+                // focus and silently mint a NEW session next to the one the
+                // user has been talking to.
+                self.owned_released_metas(chat)
+                    .into_iter()
+                    .filter(|(slug, _)| slug == project)
+                    .min_by_key(|(_, meta)| session_index(&meta.sid))
+                    .map(|(_, meta)| meta.sid)
+            });
         match &adopted {
             Some(id) => {
                 self.current_session
@@ -9218,6 +9230,29 @@ impl Gateway {
             .values()
             .find(|s| s.owner == canon && s.handle == handle)
             .map(|s| s.id.clone())
+            .or_else(|| {
+                // A RELEASED session answers to its handle too — `@api` must
+                // reach the same session it reached before the process was let
+                // go (the submit core cold-resumes it). Recency-first, matching
+                // the live scan's "one owner, one handle" assumption.
+                self.owned_released_metas(chat)
+                    .into_iter()
+                    .find(|(_, meta)| meta_handle(meta) == handle)
+                    .map(|(_, meta)| meta.sid)
+            })
+    }
+
+    /// The RELEASED sessions this chat OWNS, recency-first — the own-only
+    /// scope `@handle` addressing and `/cd` adoption work in (as opposed to the
+    /// wider "can see" pool the listings use). Compared on the canonical owner
+    /// IDENTITY string, the same lossless comparison
+    /// [`Self::owner_identity_visible`] documents.
+    fn owned_released_metas(&self, chat: &ChatKey) -> Vec<(String, SessionMeta)> {
+        let canon = canonical_owner(chat).identity();
+        self.released_session_metas(None)
+            .into_iter()
+            .filter(|(_slug, meta)| meta.owner == canon)
+            .collect()
     }
 
     /// `/use @<role>` shorthand (v0.8.23 review §3.2-5, item 2b): resolve
@@ -9230,10 +9265,27 @@ impl Gateway {
     /// available to this chat, so the user can immediately retry.
     fn resolve_use_role_shorthand(&self, chat: &ChatKey, role: &str) -> Result<String> {
         let mut memo = ProjectPrincipalMemo::new();
-        let mut candidates: Vec<&GatewaySession> = self
+        // Released sessions are candidates too: `/use @reviewer` must reach the
+        // reviewer session whether or not ccteam happens to be holding its
+        // process right now.
+        let released: Vec<(String, SessionMeta)> = self
+            .released_session_metas(None)
+            .into_iter()
+            .filter(|(slug, meta)| {
+                self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+            })
+            .collect();
+        let mut candidates: Vec<(String, String)> = self
             .sessions
             .values()
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && s.role == role)
+            .map(|s| (s.id.clone(), self.session_last_active(s)))
+            .chain(
+                released
+                    .iter()
+                    .filter(|(_, meta)| meta.role == role)
+                    .map(|(_, meta)| (meta.sid.clone(), meta.last_active.clone())),
+            )
             .collect();
         if candidates.is_empty() {
             let mut available: Vec<&str> = self
@@ -9241,6 +9293,12 @@ impl Gateway {
                 .values()
                 .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && !s.role.is_empty())
                 .map(|s| s.role.as_str())
+                .chain(
+                    released
+                        .iter()
+                        .filter(|(_, meta)| !meta.role.is_empty())
+                        .map(|(_, meta)| meta.role.as_str()),
+                )
                 .collect();
             available.sort_unstable();
             available.dedup();
@@ -9253,12 +9311,12 @@ impl Gateway {
                 )
             });
         }
-        candidates.sort_by(|a, b| {
-            self.session_last_active(b)
-                .cmp(&self.session_last_active(a))
-                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
+        candidates.sort_by(|(a_sid, a_active), (b_sid, b_active)| {
+            b_active
+                .cmp(a_active)
+                .then_with(|| session_index(b_sid).cmp(&session_index(a_sid)))
         });
-        Ok(candidates[0].id.clone())
+        Ok(candidates.remove(0).0)
     }
 
     fn template_by_handle(&self, chat: &ChatKey, handle: &str) -> Option<GatewayRouteTemplate> {
@@ -9274,6 +9332,41 @@ impl Gateway {
             .filter(|t| t.channel == chat.channel && t.chat_id == chat.chat_id)
             .cloned()
             .collect()
+    }
+
+    /// Model / effort / context for one `/sessions` row.
+    ///
+    /// P3 — from the owning adapter's `thread_status` for a RESIDENT session;
+    /// from the session's persisted `status.json` for a RELEASED one (the same
+    /// file the adapter itself falls back to), so a released row is as
+    /// informative as ccteam can honestly make it. Statusless adapters (bg /
+    /// default) report `ThreadStatus::default()` (no model / no context).
+    /// Per-session failures degrade to `None` — never break the listing.
+    async fn row_thread_status(
+        &self,
+        source: &SessionRowSource<'_>,
+    ) -> Option<ccteam_harness::ThreadStatus> {
+        match source {
+            SessionRowSource::Resident(s) => (s.adapter.thread_status(&s.thread).await).ok(),
+            SessionRowSource::Released(slug, meta) => self
+                .projects
+                .get(*slug)
+                .and_then(|dir| {
+                    ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
+                })
+                .or_else(|| {
+                    // No status.json (an old session, or one that never ran a
+                    // priced turn): the spawn pick still beats saying nothing.
+                    meta.model
+                        .clone()
+                        .or_else(|| meta.observed_model.clone())
+                        .map(|model| ccteam_harness::ThreadStatus {
+                            model: Some(model),
+                            effort: meta.effort.clone(),
+                            ..Default::default()
+                        })
+                }),
+        }
     }
 
     /// The IM/web `/sessions` listing.
@@ -9330,26 +9423,6 @@ impl Gateway {
             lb.cmp(&la)
                 .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
         });
-        // ── the web bare-row feed: RESIDENT rows only ──────────────────────
-        // `parse_sessions_reply` rejects the whole reply if any line is not
-        // `sid:project:vendor:role`, and the SPA reads released sessions from
-        // its own REST rail rather than this frame, so the released set stays
-        // out of the web variant by design.
-        if is_web {
-            if visible.is_empty() {
-                return "no sessions".to_string();
-            }
-            let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
-            for s in &visible {
-                let status = (s.adapter.thread_status(&s.thread).await).ok();
-                let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
-                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
-                    Some(sfx) => format!("{base} — {sfx}"),
-                    None => base,
-                });
-            }
-            return web_rows.join("\n");
-        }
         // v0.8.23 review §1.3-D item 9 — the IM `/sessions` view (NOT the web
         // bare-row feed `parse_sessions_reply` depends on) pins a session
         // waiting on a HITL approval to the top: a stable sort on top of the
@@ -9357,7 +9430,9 @@ impl Gateway {
         // keep their recency order. Cheap — reuses the existing pending
         // registry (already shared with the daemon's `permission/ask`
         // handler), no new progress.jsonl read.
-        let waiting_sids: HashSet<String> = {
+        let waiting_sids: HashSet<String> = if is_web {
+            HashSet::new()
+        } else {
             let pend = self.pending.lock().await;
             visible
                 .iter()
@@ -9379,7 +9454,7 @@ impl Gateway {
                 self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
             })
             .collect();
-        let released_here: Vec<&(String, SessionMeta)> = if all {
+        let released_here: Vec<&(String, SessionMeta)> = if all || is_web {
             released.iter().collect()
         } else {
             elsewhere += released.iter().filter(|(slug, _)| slug != &cur).count();
@@ -9390,6 +9465,9 @@ impl Gateway {
             .values()
             .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
             .count();
+        if is_web && visible.is_empty() && released_here.is_empty() {
+            return "no sessions".to_string();
+        }
         if visible.is_empty() && released_here.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
                 return format!(
@@ -9413,6 +9491,44 @@ impl Gateway {
             .collect();
         let total = candidates.len();
         candidates.truncate(IM_SESSIONS_MAX_ROWS);
+        // ── the web bare-row feed ─────────────────────────────────────────
+        // `parse_sessions_reply` rejects the WHOLE reply if any line is not
+        // `sid:project:vendor:role[ — suffix]`, so this variant keeps exactly
+        // that shape: no banner, no tree indent, no ⏳/💤 prefix, no footer.
+        // A released session is listed here too — it is a real, resumable
+        // session, and after a restart NOTHING is resident, so a resident-only
+        // feed would tell the web picker the fleet had vanished. Its
+        // released-ness rides in the trailing suffix field, where the
+        // statusline already lives.
+        if is_web {
+            let mut web_rows: Vec<String> = Vec::with_capacity(candidates.len());
+            for source in &candidates {
+                let base = format!(
+                    "{}:{}:{}:{}",
+                    source.sid(),
+                    source.slug_of(&self.default_project),
+                    source.vendor(),
+                    source.role()
+                );
+                let mut tail: Vec<String> = Vec::new();
+                if let Some(sfx) = self
+                    .row_thread_status(source)
+                    .await
+                    .and_then(|st| st.status_suffix())
+                {
+                    tail.push(sfx);
+                }
+                if source.is_released() {
+                    tail.push("💤 released".to_string());
+                }
+                web_rows.push(if tail.is_empty() {
+                    base
+                } else {
+                    format!("{base} — {}", tail.join(" · "))
+                });
+            }
+            return web_rows.join("\n");
+        }
         // Render each candidate's row once, keyed by sid for the tree below.
         let mut rendered: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(candidates.len());
@@ -9424,25 +9540,7 @@ impl Gateway {
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
             // (no model / no context). Per-session failures degrade to the bare
             // row (never break the listing).
-            let status = match source {
-                SessionRowSource::Resident(s) => (s.adapter.thread_status(&s.thread).await).ok(),
-                SessionRowSource::Released(slug, meta) => self
-                    .projects
-                    .get(*slug)
-                    .and_then(|dir| {
-                        ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
-                    })
-                    .or_else(|| {
-                        meta.model
-                            .clone()
-                            .or_else(|| meta.observed_model.clone())
-                            .map(|model| ccteam_harness::ThreadStatus {
-                                model: Some(model),
-                                effort: meta.effort.clone(),
-                                ..Default::default()
-                            })
-                    }),
-            };
+            let status = self.row_thread_status(source).await;
             // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
             // with `sid vendor` (the SAME opening as the switch button —
             // `session_switch_options`: `sid vendor (title)`), then — when the
@@ -13886,8 +13984,42 @@ impl SessionRowSource<'_> {
         }
     }
 
+    fn role(&self) -> &str {
+        match self {
+            SessionRowSource::Resident(s) => &s.role,
+            SessionRowSource::Released(_, meta) => &meta.role,
+        }
+    }
+
+    /// Project slug. `fallback` covers a resident session whose project the
+    /// caller could not name (never happens in practice — the live map carries
+    /// it — but the web row shape has four mandatory fields).
+    fn slug_of<'a>(&'a self, fallback: &'a str) -> &'a str {
+        match self {
+            SessionRowSource::Resident(s) => {
+                if s.project.is_empty() {
+                    fallback
+                } else {
+                    &s.project
+                }
+            }
+            SessionRowSource::Released(slug, _) => slug,
+        }
+    }
+
     fn is_released(&self) -> bool {
         matches!(self, SessionRowSource::Released(..))
+    }
+}
+
+/// A session's `@handle` from its durable record — the same rule
+/// `plan_session_rebuild` applies when it puts one back in the live map
+/// (roleless ⇒ the sid, so addressing stays unique and non-empty).
+fn meta_handle(meta: &SessionMeta) -> &str {
+    if meta.role.is_empty() {
+        &meta.sid
+    } else {
+        &meta.role
     }
 }
 

@@ -811,41 +811,39 @@ mod tests {
         drop(socket);
         stop_stack(second).await;
 
-        // The restore RE-SPAWNS each persisted session through the
-        // resume-aware `start_thread` (same sid → deterministic vendor uuid →
-        // `--resume`, conversation preserved); `HarnessAdapter::resume_thread`
-        // is NOT on that path. (A real stdio body that outlived the daemon is
-        // gated by its body record first — `session_body` — and waited for
-        // instead; this recording fake spawns no process, so every persisted
-        // session restores at once.) So the evidence that "restart resumed
-        // both sessions" is two MORE starts — exactly one per persisted
-        // session — not a `resume_thread` count.
+        // A restart spawns NOTHING: both sessions come back RELEASED (listed,
+        // addressable, resumable), and only the one actually driven — `@api`,
+        // the codex session — pays for a vendor process. That is the whole
+        // point of resume-by-sid: the fleet survives the restart, the RAM does
+        // not. When it does resume, it goes through the resume-aware
+        // `start_thread` (same sid → deterministic vendor uuid → `--resume`,
+        // conversation preserved), never `HarnessAdapter::resume_thread`.
         assert_eq!(
             adapter_state.starts.load(Ordering::SeqCst),
-            4,
-            "2 fresh spawns + exactly 1 re-spawn per persisted session on restart"
+            3,
+            "2 fresh spawns + exactly 1 on-demand resume (only `@api` was driven)"
         );
         assert_eq!(
             adapter_state.resumes.load(Ordering::SeqCst),
             0,
-            "restore goes through start_thread, never resume_thread"
+            "resume goes through start_thread, never resume_thread"
         );
-        // Each vendor started exactly twice (once fresh, once restored) — this
-        // is what proves the restart revived BOTH sessions rather than, say,
-        // re-spawning one of them twice.
+        // The codex session started twice (fresh + resumed on `@api`); the
+        // claude one exactly once — it was listed and addressable after the
+        // restart without ever costing a second process.
         let vendors = adapter_state.started_vendors.lock().await.clone();
         assert_eq!(
             vendors
                 .iter()
                 .filter(|v| **v == AgentVendor::Claude)
                 .count(),
-            2,
-            "claude session spawned fresh + restored once: {vendors:?}"
+            1,
+            "the undriven claude session was never re-spawned: {vendors:?}"
         );
         assert_eq!(
             vendors.iter().filter(|v| **v == AgentVendor::Codex).count(),
             2,
-            "codex session spawned fresh + restored once: {vendors:?}"
+            "codex session spawned fresh + resumed by `@api`: {vendors:?}"
         );
     }
 
