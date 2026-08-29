@@ -113,7 +113,7 @@
 - **DoD**:新测试:fake ACP 对端 turn 中途关连接 → 1s 内 turn 失败且 `error_kind` 非 timeout → 下一条消息同 sid 复活;`cargo test -p ccteam-harness --lib` + `--test dsh_acp_test` 绿;基线不降;真机:SIGKILL 常驻 DSH 进程后下一条消息秒级失败并自动复活。
 
 ### CLI-ENVTEST-1 `ccteam-cli` bins 单测进程内改 `HOME`/`CCTEAM_HOME` 的竞态(CI `82faddb4` 一次红,规划 2026-08-29 立卡,待排)
-- **状态**:完成(4c60a61) · **冲突域**:`crates/ccteam-cli/src/web_chat_bridge.rs`(`#[cfg(test)]` 段)+ `crates/ccteam-cli/tests/` · **建议入门**:opus maker(小卡)。
+- **状态**:完成(4c60a61) · **冲突域**:`crates/ccteam-cli/src/web_chat_bridge.rs`(`#[cfg(test)]` 段)+ `crates/ccteam-cli/tests/`(规划 2026-08-29 增补授权:扩到 `crates/*/src` 各 `#[cfg(test)]` 段 + `crates/*/tests/` + 注入根所在的 `crates/ccteam-im/src/daemon.rs`,同形扫一遍) · **建议入门**:opus maker(小卡)。
 - **现象**:CI「deterministic baseline」job 在 `82faddb4`(只改 backlog 文案)与 `2323f04c`(同样只改 backlog;当日第二次)上红:`web_chat_bridge::tests::web_chat_newproject_scaffolds_registers_and_cd_works` 读 `ccteam_home/config.yaml` NotFound(`web_chat_bridge.rs:882`);前后提交全绿。`web_chat_bridge.rs:200-216` 的测试在**进程内** `set_var("HOME"/"CCTEAM_HOME")` 并恢复,与同一 bins 测试进程里任何按 env 解析根目录的测试(PLUG-1 新增的 `daemon_cli`/`update` 单测按 `CcteamPaths::from_env` 读 env,虽不写)并发 —— 正是 AGENTS.md §六「env-mutating 测试放 `crates/*/tests/*.rs`,不放 lib/bins `#[cfg(test)]`」的坑;`ccteam-cli` 无 lib,bins 单测同样共享一个进程。
 - **做法**(治病根):①`web_chat_bridge` 的项目注册/`/cd` 路径改为注入式根(`_in(root)` API)后测试不再碰 env;②仍需 env 的用例整体搬到 `crates/ccteam-cli/tests/web_chat_bridge_env_test.rs`(独立进程);③新增守卫测试:扫描 `crates/ccteam-cli/src/**` 的 `#[cfg(test)]` 段不得出现 `set_var/remove_var`。
 - **DoD**:`cargo test -p ccteam-cli --bins` 连跑 20 次零红(`for i in $(seq 20)`);守卫测试有牙(临时塞一个 `set_var` 即红);基线不降。
@@ -132,6 +132,7 @@
   5. **`ccteam-im` 两个既有单测**(`gateway_egress_reaction_*`)因 `spawn_gateway_event_consumer` 多了个参数而各加一行 tempdir root —— 编译必需的最小跟随改动。
   6. **生产合成根未改用注入**:`ccteam start` 仍走 `ccteam_root: None`(等价于 `build_gateway_for_daemon` 现读 env)。可以让 CLI 显式传 `Some(paths.root)` 使生产也「只解析一次」,但那是行为等价的额外改动,超出本卡,留给规划。
   - **经验**(供规划蒸馏):**「基线只增不减」与「env 测试搬 `tests/*.rs`」会互相打架** —— `test-baseline` 的选择器是 `--lib --bins`,搬一个走就掉一个数。所以搬迁是**下策**,注入才是上策;真要搬,得同时说清数字怎么补。另:共享 `CARGO_TARGET_DIR` 的老毛病本次又中两次(别的 worktree 覆盖 rlib → 新加的 `pub` 字段在下游报 `E0560`/`E0425`),`touch` 改动过的源文件即修,与 ENROLL-ENSURE-1 的记载一致。
+- **规划增补(2026-08-29)**:maker 一轮发现元凶不止卡面那一行(`commands.rs` 另一测试在同进程写 `CCTEAM_HOME`),并报 `ccteam-im/src/daemon.rs` 单测同病。按 §五「同形扫一遍」授权增补:守卫扫描器扩到全 workspace `crates/*/src` 的 `#[cfg(test)]` 段,逐个修根(注入根优先;确需 env 的搬 `crates/<crate>/tests/*_env_test.rs` 并在回写里逐条记账,基线只增不减)。
 
 ### ENROLL-ENSURE-1 `POST /api/v1/enroll` 只 mint 不 ensure:插件/手起客户端无法幂等领取 enrollment 凭据(PLUG-3 checker 2026-08-29 指出,待排)
 - **状态**:完成(4913cd4) · **冲突域**:`crates/ccteam-web/src/routes/enroll.rs` + `crates/ccteam-core/src/enroll.rs` + `crates/ccteam-web/tests/enroll*` + `plugins/ccteam-ui/src/host/engine/bootstrap.ts`(调用点一处切换) · **建议入门**:opus maker(小卡;Rust 先,插件调用点随后)。
