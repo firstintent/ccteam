@@ -359,11 +359,9 @@ fn find_method<'a>(records: &'a [Value], method: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("expected a {method} record, got {records:?}"))
 }
 
+/// ccteam's one row in a profile's patch list — every face is configured from it.
 fn patch_config(profile_dir: &Path) -> serde_yaml::Mapping {
-    patch_config_for(profile_dir, "ccteam-client")
-}
-
-fn patch_config_for(profile_dir: &Path, row_id: &str) -> serde_yaml::Mapping {
+    let row_id = "ccteam-ui";
     let raw = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap();
     let patch: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
     let row = patch
@@ -618,15 +616,14 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
         serde_yaml::Value::String("ccteam-enroll:abc:secret".into())
     );
 
-    // Zero user steps: the team panel is installed AND credentialed in the
-    // tenant's own home by the same start.
-    let team = patch_config_for(&profile_dir, "ccteam-ui");
+    // Zero user steps: the same row credentials the workbench in the tenant's
+    // own home by the same start.
     assert_eq!(
-        team["daemonUrl"],
+        config["daemonUrl"],
         serde_yaml::Value::String("http://127.0.0.1:7331".into())
     );
     assert_eq!(
-        team["restToken"],
+        config["restToken"],
         serde_yaml::Value::String(TENANT_REST_TOKEN.into())
     );
     assert!(
@@ -693,12 +690,8 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     assert_eq!(package["name"], "dsh-web-profile");
     assert_eq!(
         package["dsh"]["profile"]["bundles"],
-        serde_json::json!([
-            "@deepseek-ai/dsh-web-app",
-            "@ccteam/ccteam-client",
-            "@ccteam/ccteam-ui"
-        ]),
-        "only ccteam's own bundles are appended"
+        serde_json::json!(["@deepseek-ai/dsh-web-app", "@ccteam/ccteam-ui"]),
+        "only ccteam's own bundle is appended"
     );
     let raw_patch = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap();
     assert!(
@@ -715,17 +708,16 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
         "ccteam never injects enrollment into the operator's own home: {config:?}"
     );
 
-    // The panel is registered and pointed at this daemon; the spec writes
+    // The same row points the workbench at this daemon; the spec writes
     // exactly the token the runtime resolved (none was given here), so the
     // row carries none.
-    let team = patch_config_for(&profile_dir, "ccteam-ui");
     assert_eq!(
-        team["daemonUrl"],
+        config["daemonUrl"],
         serde_yaml::Value::String("http://127.0.0.1:7331".into())
     );
     assert!(
-        team.get("restToken").is_none(),
-        "no token given, none written: {team:?}"
+        config.get("restToken").is_none(),
+        "no token given, none written: {config:?}"
     );
 }
 
@@ -1037,7 +1029,7 @@ async fn session_new_never_sends_acp_mcp_servers_even_with_secret() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-new"),
+            &spawn_ctx_with_model(&tmp, "s-new"),
         ),
     )
     .await
@@ -1260,7 +1252,7 @@ async fn meta_vendor_uuid_loads_before_new() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, sid),
+            &spawn_ctx_with_model(&tmp, sid),
         )
         .await
         .expect("load start");
@@ -1300,7 +1292,7 @@ async fn load_failure_falls_back_to_session_new_with_fresh_uuid() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, sid),
+            &spawn_ctx_with_model(&tmp, sid),
         )
         .await
         .expect("fallback start");
@@ -1341,7 +1333,7 @@ async fn prompt_roundtrip_uses_shared_acp_turn_runner() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-prompt"),
+            &spawn_ctx_with_model(&tmp, "s-prompt"),
         )
         .await
         .expect("start ok");
@@ -1410,7 +1402,7 @@ async fn version_gate_refuses_a_plugin_older_than_the_socket_transport() {
     assert!(message.contains("0.10.2"), "got {message}");
     assert!(message.contains(MIN_DSH_CLIENT_VERSION), "got {message}");
     assert!(
-        message.contains("dsh plugin add @ccteam/ccteam-client"),
+        message.contains("dsh plugin add @ccteam/ccteam-ui"),
         "the error must name the remedy: {message}"
     );
 }
