@@ -567,3 +567,278 @@ async fn a_crafted_host_falls_back_to_the_recorded_bind() {
         "a crafted Host must never reach the snippet: {minted:#?}"
     );
 }
+
+/// The idempotent face (`ensure`): a program that boots repeatedly asks for
+/// *its* credential, not another one. Same identity + same label ⇒ the same
+/// record, no second file on disk, and no bearer the second time — the secret
+/// was returned once and is not recoverable, which is exactly what
+/// `bearer_prefix` is for.
+#[tokio::test]
+async fn ensure_returns_the_same_credential_and_never_mints_a_second() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    let body = serde_json::json!({"label": "dsh-plugin:web", "ensure": true});
+    let (status, first) = post_mint(&c, addr, ADMIN_HEX, "/api/v1/enroll", body.clone()).await;
+    assert_eq!(status, 201, "first ensure creates: {first:#?}");
+    let bearer = first["bearer"].as_str().expect("bearer").to_string();
+    let id = first["credential"]["id"].as_str().unwrap().to_string();
+    assert_eq!(first["credential"]["label"], "dsh-plugin:web");
+
+    // Second boot: same key, same record, nothing minted.
+    let (status, again) = post_mint(&c, addr, ADMIN_HEX, "/api/v1/enroll", body.clone()).await;
+    assert_eq!(status, 200, "an existing credential is not a creation");
+    assert_eq!(again["created"], false);
+    assert_eq!(again["credential"]["id"], id);
+    assert!(
+        again.get("bearer").is_none(),
+        "a reused credential has no recoverable secret: {again:#?}"
+    );
+    assert!(again.get("snippets").is_none(), "{again:#?}");
+    assert_eq!(
+        again["credential"]["bearer_prefix"],
+        format!("ccteam-enroll:{id}:"),
+        "the prefix is how a holder checks it has THE credential"
+    );
+    assert!(
+        bearer.starts_with(again["credential"]["bearer_prefix"].as_str().unwrap()),
+        "the prefix must match the bearer handed out at creation"
+    );
+    assert_eq!(enroll::list_in(&paths.root).len(), 1, "exactly one record");
+    assert!(
+        enroll::verify_in(&paths.root, &bearer).is_some(),
+        "the credential the client already holds keeps working"
+    );
+
+    // A different label is a different slot — ensure is per (identity, label),
+    // not "one credential per caller".
+    let (status, other) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/enroll",
+        serde_json::json!({"label": "ci", "ensure": true}),
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert_ne!(other["credential"]["id"], serde_json::json!(id));
+    assert_eq!(enroll::list_in(&paths.root).len(), 2);
+
+    // A body that cannot mean anything is refused before any lookup.
+    let (status, err) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/enroll",
+        serde_json::json!({"ensure": true}),
+    )
+    .await;
+    assert_eq!(status, 400, "ensure without its key: {err:#?}");
+    let (status, err) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/enroll",
+        serde_json::json!({"label": "ci", "rotate": true}),
+    )
+    .await;
+    assert_eq!(status, 400, "rotate without ensure: {err:#?}");
+    assert_eq!(
+        enroll::list_in(&paths.root).len(),
+        2,
+        "a refused request mints nothing"
+    );
+    // A plain mint is still a MINT: the copy button hands out a new snippet.
+    let (status, _) = mint_user(&c, addr, ADMIN_HEX, Some("dsh-plugin:web")).await;
+    assert_eq!(status, 201);
+    assert_eq!(enroll::list_in(&paths.root).len(), 3);
+}
+
+/// `ensure` is keyed by the CALLER's identity and the route's scope, never by
+/// anything in the body — so two identities that pick the same label get two
+/// credentials, and a project-scoped ensure (behind the same ACL layer) is a
+/// third slot rather than a collision.
+#[tokio::test]
+async fn ensure_isolates_identities_that_share_a_label() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let tenant = reg.add("alice");
+    reg.save(&paths.users_dir()).unwrap();
+    let tenant_tok = tenant.web_token.clone();
+    let tenant_owner = format!("user:{}", tenant.id);
+    seed_project(&paths, "aliceproj", &tenant_owner);
+
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+    let body = serde_json::json!({"label": "dsh-plugin:web", "ensure": true});
+
+    let (status, admin) = post_mint(&c, addr, ADMIN_HEX, "/api/v1/enroll", body.clone()).await;
+    assert_eq!(status, 201);
+    let (status, alice) = post_mint(&c, addr, &tenant_tok, "/api/v1/enroll", body.clone()).await;
+    assert_eq!(status, 201, "a tenant's slot is its own: {alice:#?}");
+    assert_ne!(alice["credential"]["id"], admin["credential"]["id"]);
+    assert_eq!(alice["credential"]["owner"], tenant_owner);
+    for m in [&admin, &alice] {
+        assert!(enroll::verify_in(&paths.root, m["bearer"].as_str().unwrap()).is_some());
+    }
+    // Re-ensuring as each identity still resolves to its own record.
+    let (status, alice_again) =
+        post_mint(&c, addr, &tenant_tok, "/api/v1/enroll", body.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(alice_again["credential"]["id"], alice["credential"]["id"]);
+
+    // The project route shares the body, so it gains ensure through the same
+    // gate — and scope is part of the key, so this is a THIRD credential.
+    let (status, pinned) = post_mint(
+        &c,
+        addr,
+        &tenant_tok,
+        "/api/v1/projects/aliceproj/enroll",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, 201, "{pinned:#?}");
+    assert_eq!(pinned["credential"]["project"], "aliceproj");
+    assert_ne!(pinned["credential"]["id"], alice["credential"]["id"]);
+    let (status, pinned_again) = post_mint(
+        &c,
+        addr,
+        &tenant_tok,
+        "/api/v1/projects/aliceproj/enroll",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(pinned_again["credential"]["id"], pinned["credential"]["id"]);
+
+    // A caller who cannot see the project never reaches the handler, ensure or
+    // not: the layer answers first (same 404 as every sibling route).
+    let (status, _) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/projects/aliceproj/enroll",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, 404);
+    assert_eq!(enroll::list_in(&paths.root).len(), 3);
+}
+
+/// `rotate` is the way back for a caller that LOST its secret: a fresh record
+/// under the same key, and the old bearer dead so a stale holder fails closed.
+#[tokio::test]
+async fn ensure_rotate_mints_a_replacement_and_revokes_the_old() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    let (_, first) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/enroll",
+        serde_json::json!({"label": "dsh-plugin:web", "ensure": true}),
+    )
+    .await;
+    let old_bearer = first["bearer"].as_str().unwrap().to_string();
+
+    let (status, rotated) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/enroll",
+        serde_json::json!({"label": "dsh-plugin:web", "ensure": true, "rotate": true}),
+    )
+    .await;
+    assert_eq!(status, 201, "a rotation is a creation: {rotated:#?}");
+    let new_bearer = rotated["bearer"].as_str().unwrap().to_string();
+    assert_ne!(rotated["credential"]["id"], first["credential"]["id"]);
+    assert!(
+        enroll::verify_in(&paths.root, &old_bearer).is_none(),
+        "the replaced bearer must stop verifying"
+    );
+    assert!(enroll::verify_in(&paths.root, &new_bearer).is_some());
+    assert_eq!(
+        enroll::list_in(&paths.root).len(),
+        1,
+        "rotate replaces, it does not pile up"
+    );
+    // And the key still resolves to the replacement.
+    let (status, after) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/enroll",
+        serde_json::json!({"label": "dsh-plugin:web", "ensure": true}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(after["credential"]["id"], rotated["credential"]["id"]);
+    assert!(new_bearer.starts_with(after["credential"]["bearer_prefix"].as_str().unwrap()));
+}
+
+/// The spec at `/api/docs` is what an external client reads, so the ensure
+/// contract has to be IN it: the flag, its rotate companion, and the fact that
+/// a reused credential answers 200 without a bearer.
+#[tokio::test]
+async fn the_spec_documents_the_ensure_contract() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    let spec: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/openapi.json"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let form = &spec["components"]["schemas"]["MintEnrollForm"]["properties"];
+    for key in ["label", "ensure", "rotate"] {
+        assert!(
+            !form[key].is_null(),
+            "MintEnrollForm lost `{key}`: {form:#?}"
+        );
+    }
+    let ensured = &spec["components"]["schemas"]["EnsuredEnrollment"]["properties"];
+    assert!(
+        ensured["credential"]["$ref"]
+            .as_str()
+            .is_some_and(|r| r.ends_with("EnrollView")),
+        "the 200 body must carry the (secret-free) credential view: {ensured:#?}"
+    );
+    assert!(
+        ensured.get("bearer").is_none(),
+        "the reuse response must have no bearer field at all: {ensured:#?}"
+    );
+    // Both enroll mints document the same two outcomes, so a client reading
+    // either route knows a 200 means "already existed".
+    for path in ["/api/v1/enroll", "/api/v1/projects/{slug}/enroll"] {
+        let responses = &spec["paths"][path]["post"]["responses"];
+        assert!(
+            responses["200"]["content"]["application/json"]["schema"]["$ref"]
+                .as_str()
+                .is_some_and(|r| r.ends_with("EnsuredEnrollment")),
+            "{path} does not document the ensure hit: {responses:#?}"
+        );
+        assert!(!responses["201"].is_null(), "{path}: {responses:#?}");
+        assert!(!responses["400"].is_null(), "{path}: {responses:#?}");
+    }
+}

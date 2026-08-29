@@ -198,22 +198,71 @@ pub fn revoke_in(root: &Path, id: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Label the machine-user credential carries. It is part of that record's
+/// IDENTITY, not decoration: see [`ensure_in`].
+pub const MACHINE_LABEL: &str = "this machine";
+
+/// What [`ensure_in`] resolved to.
+pub struct Ensured {
+    pub credential: EnrollCredential,
+    /// `true` only when this call minted the record. The secret is knowable
+    /// exactly then, so this is what tells a caller whether it may hand a
+    /// bearer back; a reused record can only be identified by [`EnrollCredential::id`].
+    pub created: bool,
+}
+
+/// Get-or-mint, keyed by **(owner, scope, label)** — the idempotent face of
+/// [`mint_in`], shared by every caller that wants *the* credential for a
+/// purpose rather than *another* one.
+///
+/// The key includes the LABEL because a label is how a caller names its own
+/// slot ("this machine", "dsh-plugin:web"), and dropping it made the lookup
+/// return whichever user-scoped record happened to be newest: one console mint
+/// and the next daemon start would rewrite five vendor configs with a
+/// different bearer. Owner is in the key because a credential speaks for one
+/// identity, and scope because a project-pinned record must never satisfy a
+/// request for an unpinned one (it reaches less than the caller asked for).
+///
+/// `rotate` is the escape hatch for a caller that LOST its secret: the record
+/// is unreadable by then (only the id is public), so the only way back is a
+/// fresh mint. The replacement is minted BEFORE the old one is revoked, so a
+/// failure mid-way leaves the caller with a working credential rather than
+/// none.
+pub fn ensure_in(
+    root: &Path,
+    scope: EnrollScope,
+    owner: &str,
+    label: Option<&str>,
+    rotate: bool,
+) -> Result<Ensured> {
+    let existing = list_in(root)
+        .into_iter()
+        .find(|c| c.owner == owner && c.scope == scope && c.label.as_deref() == label);
+    match existing {
+        Some(cred) if !rotate => Ok(Ensured {
+            credential: cred,
+            created: false,
+        }),
+        existing => {
+            let cred = mint_in(root, scope, owner, label.map(str::to_string))?;
+            if let Some(old) = existing {
+                revoke_in(root, &old.id)?;
+            }
+            Ok(Ensured {
+                credential: cred,
+                created: true,
+            })
+        }
+    }
+}
+
 /// The machine-user credential, minted once and reused — this is what daemon
 /// start writes into the vendor global configs, so it must be stable across
 /// restarts or every restart would rewrite five config files with a new value.
+/// One slot, named by [`MACHINE_LABEL`]; see [`ensure_in`] for why the name is
+/// part of the key.
 pub fn ensure_user_credential_in(root: &Path, owner: &str) -> Result<EnrollCredential> {
-    if let Some(existing) = list_in(root)
-        .into_iter()
-        .find(|c| c.scope == EnrollScope::User && c.owner == owner)
-    {
-        return Ok(existing);
-    }
-    mint_in(
-        root,
-        EnrollScope::User,
-        owner,
-        Some("this machine".to_string()),
-    )
+    Ok(ensure_in(root, EnrollScope::User, owner, Some(MACHINE_LABEL), false)?.credential)
 }
 
 /// Convenience wrappers for callers that already hold [`CcteamPaths`].
@@ -313,6 +362,121 @@ mod tests {
         let other = ensure_user_credential_in(&root, "user:u42").unwrap();
         assert_ne!(other.id, first.id);
         assert_eq!(list_in(&root).len(), 2);
+    }
+
+    /// The get-or-mint face: same (owner, scope, label) → the same record, and
+    /// no second file on disk. This is what a client that boots repeatedly
+    /// (a plugin, a CI runner) needs, and it is the same function the machine
+    /// credential goes through.
+    #[test]
+    fn ensure_is_idempotent_per_owner_scope_and_label() {
+        let (_tmp, root) = root();
+        let first = ensure_in(
+            &root,
+            EnrollScope::User,
+            "user:web-api",
+            Some("dsh-plugin:web"),
+            false,
+        )
+        .unwrap();
+        assert!(first.created, "nothing existed yet");
+        let again = ensure_in(
+            &root,
+            EnrollScope::User,
+            "user:web-api",
+            Some("dsh-plugin:web"),
+            false,
+        )
+        .unwrap();
+        assert!(!again.created, "must not mint a second credential");
+        assert_eq!(first.credential.id, again.credential.id);
+        assert_eq!(list_in(&root).len(), 1);
+
+        // Every part of the key separates: another identity, another scope,
+        // another label are each a different slot.
+        for other in [
+            ensure_in(
+                &root,
+                EnrollScope::User,
+                "user:u42",
+                Some("dsh-plugin:web"),
+                false,
+            )
+            .unwrap(),
+            ensure_in(
+                &root,
+                EnrollScope::Project {
+                    slug: "alpha".to_string(),
+                },
+                "user:web-api",
+                Some("dsh-plugin:web"),
+                false,
+            )
+            .unwrap(),
+            ensure_in(&root, EnrollScope::User, "user:web-api", Some("ci"), false).unwrap(),
+        ] {
+            assert!(other.created);
+            assert_ne!(other.credential.id, first.credential.id);
+        }
+        assert_eq!(list_in(&root).len(), 4);
+        assert!(verify_in(&root, &first.credential.bearer()).is_some());
+    }
+
+    /// A caller that lost its secret cannot read it back (only the id is
+    /// public), so `rotate` is the only way home: a fresh record under the same
+    /// key, and the old bearer dead so a stale holder fails closed.
+    #[test]
+    fn ensure_rotate_replaces_the_record_and_revokes_the_old() {
+        let (_tmp, root) = root();
+        let first = ensure_in(&root, EnrollScope::User, "user:web-api", Some("ci"), false)
+            .unwrap()
+            .credential;
+        let rotated =
+            ensure_in(&root, EnrollScope::User, "user:web-api", Some("ci"), true).unwrap();
+        assert!(rotated.created, "rotate always mints");
+        assert_ne!(rotated.credential.id, first.id);
+        assert!(
+            verify_in(&root, &first.bearer()).is_none(),
+            "the rotated-away bearer must stop verifying"
+        );
+        assert!(verify_in(&root, &rotated.credential.bearer()).is_some());
+        assert_eq!(
+            list_in(&root).len(),
+            1,
+            "rotate replaces, it does not pile up"
+        );
+
+        // And the rotated record is what the next plain ensure resolves to.
+        let after = ensure_in(&root, EnrollScope::User, "user:web-api", Some("ci"), false).unwrap();
+        assert!(!after.created);
+        assert_eq!(after.credential.id, rotated.credential.id);
+    }
+
+    /// The machine credential is one SLOT, not "the newest user-scoped record":
+    /// a console mint (or a plugin ensure) must not become what daemon start
+    /// writes into five vendor configs.
+    #[test]
+    fn the_machine_credential_is_not_shadowed_by_a_newer_labelled_one() {
+        let (_tmp, root) = root();
+        let machine = ensure_user_credential_in(&root, "user:web-api").unwrap();
+        assert_eq!(machine.label.as_deref(), Some(MACHINE_LABEL));
+        let newer = mint_in(
+            &root,
+            EnrollScope::User,
+            "user:web-api",
+            Some("rob's laptop".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            list_in(&root).first().map(|c| c.id.clone()),
+            Some(newer.id.clone()),
+            "the console mint really is the newest record"
+        );
+        assert_eq!(
+            ensure_user_credential_in(&root, "user:web-api").unwrap().id,
+            machine.id,
+            "daemon start must keep writing the SAME bearer"
+        );
     }
 
     #[test]

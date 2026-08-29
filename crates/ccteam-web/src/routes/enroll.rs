@@ -31,6 +31,29 @@
 //! [`EnrollView::bearer_prefix`]); `POST` returns the full bearer exactly once,
 //! because that is the only moment it can be copied. Same posture as the
 //! satellite join token.
+//!
+//! **Ensure (idempotent) vs mint.** A human clicking a copy button wants a new
+//! snippet every time; a PROGRAM that boots repeatedly (the DSH plugin, a CI
+//! runner) wants *the* credential for its slot, or it leaves a new record on
+//! disk per restart. Both routes therefore take `ensure` + `label` in the body
+//! and go through `ccteam_core::enroll::ensure_in`, keyed by
+//! (identity, scope, label) — the same function the machine credential and the
+//! Hosts "register MCP" button use.
+//!
+//! That flag lives in the BODY rather than in a new `PUT /api/v1/enroll/{label}`
+//! for three reasons, in order of weight: (a) the scope lives in the ROUTE, so
+//! putting ensure in the shared body gives the project-scoped mint the same
+//! semantics through the same gate, and the next project-addressed enroll route
+//! inherits it — a `{label}` path would cover the flat route only and need a
+//! second one later; (b) a label is free text ("rob's laptop") and a path
+//! segment is a lossy, escaping-sensitive place to put it; (c) `{label}` cannot
+//! even sit next to the existing `DELETE /api/v1/enroll/{id}` — axum's router
+//! refuses two different capture names at the same position.
+//!
+//! An ensure that RESOLVES to an existing record answers `200` with no bearer:
+//! the secret is not recoverable, by construction. The caller compares
+//! [`EnrollView::bearer_prefix`] against the credential it holds; if it holds
+//! none, `rotate: true` mints a replacement and revokes the old one.
 
 use std::path::Path;
 
@@ -100,8 +123,19 @@ pub struct EnrollListResponse {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct MintEnrollForm {
     /// Free-text reminder of where the snippet went ("rob's laptop", "ci").
+    /// With `ensure` it is the KEY, so it must be non-empty there.
     #[serde(default)]
     pub label: Option<String>,
+    /// Get-or-mint instead of mint: idempotent per (caller identity, scope,
+    /// `label`). `201` + bearer when this call created the credential, `200`
+    /// and NO bearer when it resolved to one that already existed.
+    #[serde(default)]
+    pub ensure: bool,
+    /// With `ensure`: mint a replacement and revoke the old record. For a
+    /// caller that lost its secret — the only way back, since a stored secret
+    /// is never readable again.
+    #[serde(default)]
+    pub rotate: bool,
 }
 
 /// One vendor's ready-to-paste config, produced by the writer that owns that
@@ -118,6 +152,21 @@ pub struct EnrollSnippet {
     /// The config text. Merge it into an existing file — every writer behind
     /// this is merge-not-clobber, and so is the paste.
     pub body: String,
+}
+
+/// `ensure` response when the credential ALREADY EXISTED (`200`). No bearer and
+/// no snippets: the secret was returned once, at mint time, and is not
+/// recoverable — so this says *which* record answers to that key and lets the
+/// caller check whether the one it holds is the same one.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EnsuredEnrollment {
+    pub credential: EnrollView,
+    /// Always `false` here — a created one answers `201` with the full bearer.
+    pub created: bool,
+    /// The `POST /mcp` endpoint this credential is used against.
+    pub url: String,
+    /// See [`MintedEnrollment::insecure_transport`].
+    pub insecure_transport: bool,
 }
 
 /// `POST /api/v1/enroll` response — the ONE place a secret is returned.
@@ -141,11 +190,23 @@ pub struct MintedEnrollment {
 /// 404, never 403: the same shape `project_acl_layer` and `handle_project` use,
 /// so a caller cannot probe for the existence of something it may not see.
 ///
-/// (There is no `bad_request` helper any more, and that is the point: moving the
-/// scope onto the route removed every "which scope did you mean / where is the
-/// project field" validation branch this module used to own.)
+/// (Scope is still never validated here — moving it onto the route removed
+/// every "which scope did you mean / where is the project field" branch this
+/// module used to own. The one 400 below is about the request's own shape, not
+/// about what the caller may reach: see [`bad_request`].)
 fn not_found(msg: impl Into<String>) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+/// 400 for a body that cannot mean anything — `ensure` with no key. Unlike a
+/// 404 here, it reveals nothing: the caller is being told about ITS OWN
+/// request, before any lookup happens.
+fn bad_request(msg: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
+        .into_response()
 }
 
 /// Whether `identity` may see this credential at all. Owner is the axis (a
@@ -183,8 +244,9 @@ pub(crate) async fn handle_list_enrollments(
     Json(EnrollListResponse { credentials }).into_response()
 }
 
-/// `POST /api/v1/enroll` — mint a credential for THIS MACHINE'S USER (names no
-/// project, so the holder must name one per call and can only reach its own).
+/// `POST /api/v1/enroll` — mint (or, with `ensure`, get-or-mint) a credential
+/// for THIS MACHINE'S USER (names no project, so the holder must name one per
+/// call and can only reach its own).
 ///
 /// No project in the path or the body ⇒ nothing for the project ACL to gate,
 /// and nothing for this handler to check beyond the caller being authenticated:
@@ -196,7 +258,9 @@ pub(crate) async fn handle_list_enrollments(
     tag = "enroll",
     request_body = MintEnrollForm,
     responses(
-        (status = 201, description = "Minted; carries the bearer + per-vendor snippets", body = MintedEnrollment),
+        (status = 201, description = "Minted (or `ensure` created it); carries the bearer + per-vendor snippets", body = MintedEnrollment),
+        (status = 200, description = "`ensure` resolved to an existing credential; NO bearer (not recoverable) — compare `bearer_prefix`, or retry with `rotate`", body = EnsuredEnrollment),
+        (status = 400, description = "`ensure` with no label, or `rotate` without `ensure`"),
     ),
 )]
 pub(crate) async fn handle_mint_enrollment(
@@ -226,7 +290,9 @@ pub(crate) async fn handle_mint_enrollment(
     params(("slug" = String, Path, description = "Project the credential is pinned to")),
     request_body = MintEnrollForm,
     responses(
-        (status = 201, description = "Minted; carries the bearer + per-vendor snippets", body = MintedEnrollment),
+        (status = 201, description = "Minted (or `ensure` created it); carries the bearer + per-vendor snippets", body = MintedEnrollment),
+        (status = 200, description = "`ensure` resolved to an existing credential; NO bearer (not recoverable)", body = EnsuredEnrollment),
+        (status = 400, description = "`ensure` with no label, or `rotate` without `ensure`"),
         (status = 404, description = "Unknown project, or not visible to the caller (the project ACL layer answers first)"),
     ),
 )]
@@ -244,8 +310,17 @@ pub(crate) async fn handle_mint_project_enrollment(
     mint_and_render(&app, &identity, scope, &headers, form).await
 }
 
-/// Mint + render, shared by both mint routes. Takes the scope as a decided
-/// fact: whichever route resolved it has already been authorized for it.
+/// What the blocking half resolved to. `Created` is the only variant that can
+/// carry a bearer, and it carries it exactly once.
+enum Resolved {
+    Created(EnrollCredential, Vec<EnrollSnippet>),
+    Reused(EnrollCredential),
+}
+
+/// Mint-or-ensure + render, shared by both routes. Takes the scope as a decided
+/// fact: whichever route resolved it has already been authorized for it, and
+/// the owner is the CALLER's — never a value from the body — so neither mode
+/// can reach another identity's pool.
 async fn mint_and_render(
     app: &AppState,
     identity: &Identity,
@@ -259,31 +334,54 @@ async fn mint_and_render(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    if form.ensure && label.is_none() {
+        return bad_request(
+            "ensure needs a non-empty label: it is the key the credential is looked up by",
+        );
+    }
+    if form.rotate && !form.ensure {
+        return bad_request(
+            "rotate only applies to ensure: a plain mint is already a new credential",
+        );
+    }
     let url = mcp_url_for_request(headers, app);
     let owner = identity.owner_tag();
     let root = app.paths.root.clone();
     let render_url = url.clone();
+    let (ensure, rotate) = (form.ensure, form.rotate);
 
-    let minted = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<(EnrollCredential, Vec<EnrollSnippet>)> {
-            let cred = enroll::mint_in(&root, scope, &owner, label)?;
-            // The bearer only exists inside the record, so minting has to come
-            // first — which means a rendering failure would otherwise leave a
-            // live credential nobody was ever shown. Roll it back so a failed
-            // mint leaves nothing behind.
-            match render_snippets(&render_url, &cred.bearer()) {
-                Ok(snippets) => Ok((cred, snippets)),
-                Err(err) => {
-                    let _ = enroll::revoke_in(&root, &cred.id);
-                    Err(err)
-                }
+    let resolved = tokio::task::spawn_blocking(move || -> anyhow::Result<Resolved> {
+        let cred = if ensure {
+            let ensured = enroll::ensure_in(&root, scope, &owner, label.as_deref(), rotate)?;
+            if !ensured.created {
+                // Nothing to render: the secret was handed out at mint time and
+                // is not recoverable. The id (and its bearer prefix) is the
+                // whole answer.
+                return Ok(Resolved::Reused(ensured.credential));
             }
-        },
-    )
+            ensured.credential
+        } else {
+            enroll::mint_in(&root, scope, &owner, label)?
+        };
+        // The bearer only exists inside the record, so minting has to come
+        // first — which means a rendering failure would otherwise leave a
+        // live credential nobody was ever shown. Roll it back so a failed
+        // mint leaves nothing behind. (After a `rotate` that also means the
+        // key is left EMPTY rather than holding an unusable orphan: the old
+        // record is gone by the caller's own request, and the retry mints a
+        // credential the caller actually receives.)
+        match render_snippets(&render_url, &cred.bearer()) {
+            Ok(snippets) => Ok(Resolved::Created(cred, snippets)),
+            Err(err) => {
+                let _ = enroll::revoke_in(&root, &cred.id);
+                Err(err)
+            }
+        }
+    })
     .await;
 
-    match minted {
-        Ok(Ok((cred, snippets))) => (
+    match resolved {
+        Ok(Ok(Resolved::Created(cred, snippets))) => (
             StatusCode::CREATED,
             Json(MintedEnrollment {
                 credential: EnrollView::of(&cred),
@@ -291,6 +389,16 @@ async fn mint_and_render(
                 insecure_transport: is_insecure_transport(&url),
                 url,
                 snippets,
+            }),
+        )
+            .into_response(),
+        Ok(Ok(Resolved::Reused(cred))) => (
+            StatusCode::OK,
+            Json(EnsuredEnrollment {
+                credential: EnrollView::of(&cred),
+                created: false,
+                insecure_transport: is_insecure_transport(&url),
+                url,
             }),
         )
             .into_response(),
