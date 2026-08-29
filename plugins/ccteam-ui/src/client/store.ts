@@ -12,6 +12,8 @@ import type {
   Activity,
   AttachmentRef,
   ChoiceOption,
+  EngineActionResult,
+  EngineStatus,
   ModelsCatalog,
   ProjectInfo,
   SendReceipt,
@@ -60,6 +62,8 @@ export type Selection =
   | { kind: 'none' }
   | { kind: 'new' }
   | { kind: 'session'; sid: string }
+  /** The engine panel, opened from the header dot. */
+  | { kind: 'engine' }
 
 /** Inline chat notice derived from a receipt or a stream event (honest, never swallowed). */
 export interface ChatNotice {
@@ -136,6 +140,31 @@ export interface SpawnDraft {
   role: string | null
 }
 
+/** The four explicit engine actions the settings card offers (never automatic). */
+export type EngineAction = 'start' | 'stop' | 'restart' | 'update'
+
+/**
+ * The engine as the workbench last heard of it. `status` is the host's own
+ * verdict (src/host/engine/supervisor.ts) kept verbatim; everything the UI
+ * derives from it (dot color, first-run gating, enablement) lives in
+ * engine.ts as pure selectors. `watchers` counts the seats currently showing
+ * engine state — the poller runs only while it is positive.
+ */
+export interface EngineSlice {
+  status: EngineStatus | null
+  /** Transport failure of the last poll; the last known status is kept. */
+  pollError: string | null
+  /** Action in flight (optimistic pending state on its button). */
+  pending: EngineAction | null
+  /** Action awaiting the confirmation Modal (stop / restart). */
+  confirm: EngineAction | null
+  /** The host's error text for the last action; cleared by the next action. */
+  error: string | null
+  watchers: number
+  /** The version banner was dismissed for this session (not persisted). */
+  bannerDismissed: boolean
+}
+
 /** Whole-workbench state. */
 export interface ConsoleState {
   open: boolean
@@ -158,6 +187,9 @@ export interface ConsoleState {
   details: { open: boolean; step: { sid: string; itemId: string } | null }
   layout: { mode: LayoutMode; dockWidth: number }
   spawn: { busy: boolean; error: string | null; draft: SpawnDraft }
+  engine: EngineSlice
+  /** The first-run 「添加工作区」 flow. */
+  projectCreate: { busy: boolean; error: string | null }
   badge: number
   nextNoticeId: number
   nextLocalId: number
@@ -211,6 +243,20 @@ export type Action =
   | { type: 'choice_resolved'; sid: string; id: string; selection: string }
   | { type: 'choice_failed'; sid: string; id: string; message: string }
   | { type: 'delegation'; parentSid?: string; childSid?: string; relation: string; title?: string; reason?: string }
+  | { type: 'select_engine' }
+  | { type: 'engine_watch' }
+  | { type: 'engine_unwatch' }
+  | { type: 'engine_loaded'; status: EngineStatus }
+  | { type: 'engine_failed'; message: string }
+  | { type: 'engine_confirm'; action: EngineAction }
+  | { type: 'engine_confirm_cancel' }
+  | { type: 'engine_action_started'; action: EngineAction }
+  | { type: 'engine_action_settled'; action: EngineAction; result: EngineActionResult }
+  | { type: 'engine_action_failed'; action: EngineAction; message: string }
+  | { type: 'engine_dismiss_banner' }
+  | { type: 'project_create_started' }
+  | { type: 'project_create_failed'; message: string }
+  | { type: 'project_create_done'; project: ProjectInfo }
 
 /** Persisted slice loaded at store creation. */
 export interface Persisted {
@@ -273,10 +319,17 @@ export function initialState(persisted: Persisted = {}): ConsoleState {
         role: null,
       },
     },
+    engine: initialEngine(),
+    projectCreate: { busy: false, error: null },
     badge: 0,
     nextNoticeId: 1,
     nextLocalId: 1,
   }
+}
+
+/** The engine slice before the first poll lands. */
+export function initialEngine(): EngineSlice {
+  return { status: null, pollError: null, pending: null, confirm: null, error: null, watchers: 0, bannerDismissed: false }
 }
 
 const EMPTY_CHAT: ChatState = {
@@ -725,6 +778,58 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
         next = withNotice(next, action.parentSid, { kind: 'info', message })
       }
       return next
+    }
+    case 'select_engine':
+      if (state.selection.kind === 'engine') return state
+      return { ...state, selection: { kind: 'engine' } }
+    case 'engine_watch':
+      return { ...state, engine: { ...state.engine, watchers: state.engine.watchers + 1 } }
+    case 'engine_unwatch':
+      return { ...state, engine: { ...state.engine, watchers: Math.max(0, state.engine.watchers - 1) } }
+    case 'engine_loaded':
+      return { ...state, engine: { ...state.engine, status: action.status, pollError: null } }
+    case 'engine_failed':
+      return { ...state, engine: { ...state.engine, pollError: action.message } }
+    case 'engine_confirm':
+      return { ...state, engine: { ...state.engine, confirm: action.action } }
+    case 'engine_confirm_cancel':
+      if (state.engine.confirm === null) return state
+      return { ...state, engine: { ...state.engine, confirm: null } }
+    case 'engine_action_started':
+      return { ...state, engine: { ...state.engine, pending: action.action, confirm: null, error: null } }
+    case 'engine_action_settled':
+      return {
+        ...state,
+        engine: {
+          ...state.engine,
+          pending: null,
+          status: action.result.status,
+          pollError: null,
+          error: action.result.ok ? null : action.result.error ?? action.result.errorKind ?? 'unknown',
+        },
+      }
+    case 'engine_action_failed':
+      return { ...state, engine: { ...state.engine, pending: null, error: action.message } }
+    case 'engine_dismiss_banner':
+      if (state.engine.bannerDismissed) return state
+      return { ...state, engine: { ...state.engine, bannerDismissed: true } }
+    case 'project_create_started':
+      return { ...state, projectCreate: { busy: true, error: null } }
+    case 'project_create_failed':
+      return { ...state, projectCreate: { busy: false, error: action.message } }
+    case 'project_create_done': {
+      // The new project is known here before the catalog is re-read, and the
+      // hero opens on it so the next step (its first session) is one keypress.
+      const rest = (state.catalogs.projects ?? []).filter(project => project.slug !== action.project.slug)
+      const projects = [...rest, action.project].sort((a, b) => a.slug.localeCompare(b.slug))
+      return {
+        ...state,
+        projectCreate: { busy: false, error: null },
+        catalogs: { ...state.catalogs, projects },
+        spawn: { ...state.spawn, draft: { ...state.spawn.draft, project: action.project.slug, role: null } },
+        selection: { kind: 'new' },
+        graphStale: true,
+      }
     }
   }
 }

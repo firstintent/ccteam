@@ -28,6 +28,7 @@ export type ApiMethod =
   | 'engine.log' // tail of the daemon's own log file
   | 'team.graph' // delegation tree across vendors, grouped by project
   | 'catalog.projects' // projects the identity can spawn into
+  | 'projects.create' // register an existing directory as a ccteam project (first run: 添加工作区)
   | 'catalog.models' // per-vendor model ids + effort ladders (advisory)
   | 'catalog.roles' // roles defined in one project
   | 'session.history' // transcript page for one sid (newest-last, cursor for older)
@@ -168,6 +169,21 @@ export interface ProjectInfo {
   /** Team label the daemon shows for the project (slug when unset). */
   team?: string
   host?: string
+}
+
+/** Register an existing directory on the daemon's host as a ccteam project. */
+export interface ProjectCreateRequest {
+  /** Absolute directory; the daemon scaffolds `.ccteam/` in place and never creates the directory. */
+  path: string
+  /** Project slug (`[a-z0-9-]`); the client derives one from the directory name when the user leaves it blank. */
+  slug: string
+}
+
+export interface ProjectCreateResponse {
+  ok: boolean
+  project?: ProjectInfo & { path: string }
+  errorKind?: string
+  error?: string
 }
 
 export interface ModelEntry {

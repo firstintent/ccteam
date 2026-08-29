@@ -16,6 +16,8 @@ import type {
   HistoryResponse,
   ModelsCatalog,
   PanelEvent,
+  ProjectCreateRequest,
+  ProjectCreateResponse,
   ProjectInfo,
   RenameRequest,
   ResolveRequest,
@@ -44,6 +46,7 @@ export interface MethodMap {
   'engine.log': { req: EngineLogRequest; res: EngineLogResponse }
   'team.graph': { req: Record<string, never>; res: TeamGraph }
   'catalog.projects': { req: Record<string, never>; res: { projects: ProjectInfo[] } }
+  'projects.create': { req: ProjectCreateRequest; res: ProjectCreateResponse }
   'catalog.models': { req: Record<string, never>; res: ModelsCatalog }
   'catalog.roles': { req: RolesRequest; res: RolesResponse }
   'session.history': { req: HistoryRequest; res: HistoryResponse }

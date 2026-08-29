@@ -22,7 +22,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import type { CcteamLocaleKey } from './locales.js'
 import type { ApiClient } from './api.js'
 import type { Action, ConsoleStore } from './store.js'
-import type { SettingsCardFace } from './settings/form.js'
+import type { SettingsCardController, SettingsCardFace } from './settings/form.js'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -48,6 +48,18 @@ export interface ConsoleFace {
   api: ApiClient
 }
 
+/**
+ * The settings card's injected face: the staged form (its controller under
+ * `hooks.card`) plus the workbench store (under `hooks.console`, for the
+ * engine slice the 「引擎」 section renders), the store's write path, and the
+ * BFF client the engine actions call.
+ */
+export interface SettingsSeatFace extends SettingsCardFace {
+  hooks: { card: SettingsCardController; console: ConsoleStore }
+  dispatch(action: Action): void
+  api: ApiClient
+}
+
 /** Composed props of the `sidebar.footer.action` entry: owner column state + face + `t`. */
 export type EntryButtonProps = PropsRuntime<'sidebar.footer.action'> & InjectFace<ConsoleFace> & PropsLocale<'ccteam'>
 
@@ -55,7 +67,10 @@ export type EntryButtonProps = PropsRuntime<'sidebar.footer.action'> & InjectFac
 export type WorkbenchProps = PropsRuntime<'shell.overlay'> & InjectFace<ConsoleFace> & PropsLocale<'ccteam'>
 
 /** Composed props of one `settings.plugin.item` card: the card face + `t`. */
-export type SettingsCardProps = PropsRuntime<'settings.plugin.item'> & InjectFace<SettingsCardFace> & PropsLocale<'ccteam'>
+export type SettingsCardProps = PropsRuntime<'settings.plugin.item'> & InjectFace<SettingsSeatFace> & PropsLocale<'ccteam'>
+
+/** DSH's own workspace list, as the framework's global seat hands it to every slot component. */
+export type UseWorkspaces = WorkbenchProps['useWorkspaces']
 
 /** The client context as this plugin sees it (locale + settingsScope merges pulled above). */
 export type CcteamClientContext = ClientContext

@@ -30,6 +30,7 @@
  *   POST  /api/v1/sessions/{sid}/resolve          → answer a choice prompt
  *   PATCH /api/v1/sessions/{sid}                  → set the title
  *   POST  /api/v1/projects/{slug}/sessions        → create a session
+ *   POST  /api/v1/projects                        → register a project ({slug, path})
  *   POST  /api/v1/projects/{slug}/uploads?name=   → store an attachment
  *   GET   /api/v1/projects/{slug}/uploads/{name}  → attachment bytes
  */
@@ -53,6 +54,8 @@ import {
   type ModelsCatalog,
   type PanelEvent,
   type ProjectInfo,
+  type ProjectCreateRequest,
+  type ProjectCreateResponse,
   type RenameRequest,
   type ResolveRequest,
   type RolesRequest,
@@ -87,6 +90,7 @@ const API_METHODS: ReadonlySet<string> = new Set<ApiMethod>([
   'engine.log',
   'team.graph',
   'catalog.projects',
+  'projects.create',
   'catalog.models',
   'catalog.roles',
   'session.history',
@@ -276,6 +280,34 @@ export function createBff(options: BffOptions): Bff {
     if (result.kind !== 'ok') return { projects: [] }
     const rows = Array.isArray(result.body) ? result.body : arrayOf(asRecord(result.body)?.projects)
     return { projects: buildProjects(rows) }
+  }
+
+  /**
+   * `POST /api/v1/projects {slug, path}` — the same body ccteam web's own
+   * new-project form sends (crates/ccteam-web/web/src/lib/dashboardApi.ts):
+   * `host` absent means the daemon's own host, `team` absent lets the daemon
+   * default it. The daemon's error envelope (`project already exists: <slug>`,
+   * the slug/path complaint) is lifted verbatim so the panel can show it.
+   */
+  async function createProject(request: ProjectCreateRequest): Promise<ProjectCreateResponse> {
+    const path = (request.path ?? '').trim()
+    const slug = (request.slug ?? '').trim()
+    if (!path.startsWith('/')) return { ok: false, errorKind: 'bad_request', error: 'path must be an absolute directory' }
+    if (slug === '') return { ok: false, errorKind: 'bad_request', error: 'slug is required' }
+    const result = await call('/api/v1/projects', { method: 'POST', body: { slug, path } })
+    if (result.kind !== 'ok') {
+      const failed = failure(result)
+      return { ok: false, ...defined('errorKind', failed.errorKind), ...defined('error', failed.error) }
+    }
+    const body = asRecord(result.body)
+    return {
+      ok: true,
+      project: {
+        slug: stringOf(body?.slug) ?? slug,
+        path: stringOf(body?.path) ?? path,
+        ...defined('host', emptyToUndefined(stringOf(body?.host))),
+      },
+    }
   }
 
   async function models(): Promise<ModelsCatalog> {
@@ -503,6 +535,8 @@ export function createBff(options: BffOptions): Bff {
         return await teamGraph()
       case 'catalog.projects':
         return await projects()
+      case 'projects.create':
+        return await createProject(record as unknown as ProjectCreateRequest)
       case 'catalog.models':
         return await models()
       case 'catalog.roles':

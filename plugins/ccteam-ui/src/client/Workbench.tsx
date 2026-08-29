@@ -23,10 +23,8 @@ import { createPortal } from 'react-dom'
 import {
   Button,
   IconBranchOutline16,
-  IconCheckOutline14,
   IconChevronLeftOutline14,
   IconCloseOutline16,
-  IconCopyOutline16,
   IconFullscreenOutline16,
   IconInspectOutline12,
   IconPanelLeftOutline16,
@@ -40,6 +38,9 @@ import type { ApiClient } from './api.js'
 import { Chat } from './Chat.js'
 import type { ComposerAttachment } from './Composer.js'
 import { Details } from './Details.js'
+import { CopyChip, EngineDot, EnginePanel, ProjectPanel, VersionBanner } from './EnginePanel.js'
+import { engineDot, engineEnablement, engineStateKey, firstRunState, relationOf, runEngineAction } from './engine.js'
+import { createProject } from './projects.js'
 import { Hero } from './Hero.js'
 import { chatOf, dotState, findNode, planSpawnOutcome } from './store.js'
 import type { Action, ConsoleState } from './store.js'
@@ -117,27 +118,6 @@ export async function loadCatalogs(dispatch: Dispatch, api: ApiClient): Promise<
   ])
 }
 
-function CopyChip({ text, t }: { text: string; t: T }) {
-  const [copied, setCopied] = useState(false)
-  return (
-    <span className={css.codeChip}>
-      {text}
-      <button
-        type="button"
-        className={css.iconBtn}
-        aria-label={t('states.copy')}
-        title={copied ? t('states.copied') : t('states.copy')}
-        onClick={() => {
-          writeClipboard(text)
-          setCopied(true)
-        }}
-      >
-        {copied ? <IconCheckOutline14 size={14} /> : <IconCopyOutline16 size={14} />}
-      </button>
-    </span>
-  )
-}
-
 function StateScreen({ state, dispatch, api, t }: { state: ConsoleState; dispatch: Dispatch; api: ApiClient; t: T }) {
   const phase = state.connection.phase
   if (phase === 'checking') {
@@ -203,7 +183,7 @@ function isTextTarget(target: EventTarget | null): boolean {
  * @param props - the injected face (bound `useConsole`, dispatch, api) + the locale seat.
  * @returns a portal into document.body.
  */
-export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
+export function Workbench({ useConsole, useWorkspaces, dispatch, api, t }: WorkbenchProps) {
   const state = useConsole(snapshot => snapshot)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const [host] = useState(() => (typeof document === 'undefined' ? null : document.createElement('div')))
@@ -277,6 +257,14 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
     if (!state.open) return
     void refreshStatus(dispatch, api)
   }, [state.open, dispatch, api])
+  // The open pane watches the engine (the poller runs while somebody does).
+  useEffect(() => {
+    if (!state.open) return
+    dispatch({ type: 'engine_watch' })
+    return () => {
+      dispatch({ type: 'engine_unwatch' })
+    }
+  }, [state.open, dispatch])
   useEffect(() => {
     if (!state.open || state.connection.phase !== 'ok') return
     if (!state.graphStale || state.graphLoading) return
@@ -354,6 +342,32 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
   const teamColumnShown = !narrow && state.teamOpen
   const detailsAsColumn = tier === 'three'
 
+  // The engine gates the pane: not ready → the engine panel (one-click start);
+  // ready with no project → add a workspace; the header dot opens the engine
+  // panel by hand. Every verdict is derived from the host's facts (engine.ts).
+  const engine = state.engine
+  const firstRun = firstRunState(engine.status, state.catalogs.projects)
+  const gate: 'engine' | typeof firstRun = state.selection.kind === 'engine' ? 'engine' : firstRun
+  const relation = relationOf(engine.status)
+  const enablement = engineEnablement(engine.status, engine.pending)
+  const engineLabel = t(engineStateKey(engine.status))
+  const bannerShown = !engine.bannerDismissed && (relation.kind === 'engine-older' || relation.kind === 'plugin-older')
+  const startEngine = (): void => {
+    void runEngineAction(dispatch, api, 'start').then(() => {
+      void refreshStatus(dispatch, api)
+    })
+  }
+  const enginePanel = (panelMode: 'first-run' | 'manual') => (
+    <EnginePanel
+      t={t}
+      mode={panelMode}
+      status={engine.status}
+      pending={engine.pending}
+      error={engine.error}
+      onStart={startEngine}
+    />
+  )
+
   const attach = (files: File[]): void => {
     const project = state.spawn.draft.project
     if (project === null) return
@@ -379,6 +393,7 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
   const team = (fill: boolean) => (
     <TeamColumn
       graph={state.graph}
+      projects={state.catalogs.projects}
       graphError={state.graphError}
       filter={state.filter}
       collapsed={state.collapsed}
@@ -585,6 +600,10 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
           dispatch({ type: 'close_details' })
           return
         }
+        if (state.selection.kind === 'engine') {
+          dispatch({ type: 'clear_selection' })
+          return
+        }
         if (full) {
           dispatch({ type: 'set_mode', mode: 'docked' })
           return
@@ -656,6 +675,20 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
               <StateDot state={connected ? 'done' : state.connection.phase === 'checking' ? 'ongoing' : 'error'} size={8} />
             </span>
           </Tooltip>
+          <Tooltip label={t('header.engine', { state: engineLabel })} delayMs={300}>
+            <button
+              type="button"
+              className={css.engineDotBtn}
+              aria-label={t('header.engine', { state: engineLabel })}
+              aria-pressed={state.selection.kind === 'engine'}
+              data-engine-state={engine.status?.state ?? 'unknown'}
+              onClick={() => {
+                dispatch(state.selection.kind === 'engine' ? { type: 'clear_selection' } : { type: 'select_engine' })
+              }}
+            >
+              <EngineDot dot={engineDot(engine.status)} size={8} />
+            </button>
+          </Tooltip>
         </span>
         <div className={css.crumbs}>
           {node !== undefined && (
@@ -675,6 +708,12 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
             <>
               <span className={css.crumbSep}>/</span>
               <span className={`${css.crumb} ${css.crumbTitle}`}>{t('hero.title')}</span>
+            </>
+          )}
+          {state.selection.kind === 'engine' && (
+            <>
+              <span className={css.crumbSep}>/</span>
+              <span className={`${css.crumb} ${css.crumbTitle}`}>{t('engine.title')}</span>
             </>
           )}
         </div>
@@ -732,20 +771,56 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
           </Tooltip>
         </div>
       </div>
-      <div className={css.columns}>
-        {teamColumnShown && team(false)}
-        {teamFillsPane
-          ? team(true)
-          : (
+      {bannerShown && (
+        <VersionBanner
+          t={t}
+          relation={relation}
+          canUpdate={enablement.update}
+          pending={engine.pending}
+          onUpdate={() => {
+            void runEngineAction(dispatch, api, 'update')
+          }}
+          onDismiss={() => {
+            dispatch({ type: 'engine_dismiss_banner' })
+          }}
+        />
+      )}
+      {gate === 'ready'
+        ? (
+            <div className={css.columns}>
+              {teamColumnShown && team(false)}
+              {teamFillsPane
+                ? team(true)
+                : (
+                    <main className={css.main}>
+                      {mainContent}
+                      {!detailsAsColumn && state.details.open && (
+                        <div className={css.sheet}>{details}</div>
+                      )}
+                    </main>
+                  )}
+              {detailsAsColumn && state.details.open && !teamFillsPane && details}
+            </div>
+          )
+        : (
+            <div className={css.columns}>
               <main className={css.main}>
-                {mainContent}
-                {!detailsAsColumn && state.details.open && (
-                  <div className={css.sheet}>{details}</div>
-                )}
+                {gate === 'no-project'
+                  ? (
+                      <ProjectPanel
+                        t={t}
+                        busy={state.projectCreate.busy}
+                        error={state.projectCreate.error}
+                        useWorkspaces={useWorkspaces}
+                        onCreate={(path, slug) => {
+                          void createProject(dispatch, api, path, slug)
+                        }}
+                      />
+                    )
+                  : enginePanel(gate === 'engine' ? 'manual' : 'first-run')}
               </main>
-            )}
-        {detailsAsColumn && state.details.open && !teamFillsPane && details}
-      </div>
+            </div>
+          )}
     </div>
   )
 

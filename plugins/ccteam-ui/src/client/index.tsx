@@ -31,6 +31,7 @@ import type { CcteamClientContext, ConsoleFace } from './slots.js'
 import { en, zh } from './locales.js'
 import { EntryButton } from './EntryButton.js'
 import { Workbench, refreshStatus } from './Workbench.js'
+import { startEnginePoller } from './engine.js'
 import { SettingsCard } from './settings/SettingsCard.js'
 import { CCTEAM_CARD, SettingsCardController } from './settings/form.js'
 
@@ -109,6 +110,17 @@ export function apply(ctx: CcteamClientContext): void {
   }, 'ccteam-ui: team event stream')
   void refreshStatus(store.dispatch, api)
 
+  // The one engine poller: runs while a seat (the open workbench, the
+  // expanded settings card) watches the engine — 1s through a transition,
+  // 5s otherwise — and re-probes ccteam itself the moment the daemon comes
+  // up or goes away, so the workbench's connection state follows the engine.
+  ctx.effect(() => startEnginePoller(store, api, {
+    onReachableChange() {
+      void refreshStatus(store.dispatch, api)
+      store.dispatch({ type: 'graph_stale' })
+    },
+  }), 'ccteam-ui: engine poller')
+
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
     name: 'sidebar.footer.action',
     id: 'ccteam',
@@ -137,6 +149,9 @@ export function apply(ctx: CcteamClientContext): void {
     name: 'settings.plugin.item',
     key: card.spec.namespace,
     locale: NS,
-    inject: () => card.inject(),
+    // The card face plus the workbench store (its engine slice), the write
+    // path, and the BFF client — the 「引擎」 section is one seat of the same
+    // state the workbench header and first-run panel read.
+    inject: () => ({ ...card.inject(), hooks: { card, console: store }, dispatch: store.dispatch, api }),
   }, SettingsCard))
 }

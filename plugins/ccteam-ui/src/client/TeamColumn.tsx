@@ -27,7 +27,7 @@ import {
   Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { TeamGraph, TeamNode } from '../shared/contract.js'
+import type { ProjectInfo, TeamGraph, TeamNode } from '../shared/contract.js'
 import { formatCost, relativeTime, vendorGlyph } from './format.js'
 import { dotState, filterRows, flattenNodes } from './store.js'
 import type { T } from './slots.js'
@@ -35,6 +35,8 @@ import css from './workbench.module.css'
 
 export interface TeamColumnProps {
   graph: TeamGraph | null
+  /** The project catalog: a project with no session yet still gets a head (and its `+`). */
+  projects?: ProjectInfo[] | null
   graphError: string | null
   filter: string
   collapsed: Record<string, boolean>
@@ -373,7 +375,17 @@ export function TeamColumn(props: TeamColumnProps) {
   const { graph, filter, collapsed, selectedSid, liveActivity, now, t } = props
   const [renamingSid, setRenamingSid] = useState<string | null>(null)
   const [pendingStop, setPendingStop] = useState<TeamNode | null>(null)
-  const projects = graph?.projects ?? []
+  const graphProjects = graph?.projects ?? []
+  const known = new Set(graphProjects.map(project => project.slug))
+  // A project the catalog knows but the graph does not (no session yet) still
+  // gets a head, so a workspace added a moment ago is visible — and spawnable
+  // from its own `+` — before its first session exists.
+  const projects = graph === null
+    ? graphProjects
+    : [
+        ...graphProjects,
+        ...(props.projects ?? []).filter(project => !known.has(project.slug)).map(project => ({ slug: project.slug, nodes: [] as TeamNode[] })),
+      ].sort((a, b) => a.slug.localeCompare(b.slug))
   // The global fold button reflects and flips the AGGREGATE of the underlying
   // `collapsed` record, not the filtered `isCollapsed` a search narrows to —
   // a search only forces rows open for the view, it never clears the record.

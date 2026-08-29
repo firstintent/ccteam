@@ -1470,3 +1470,234 @@
     animation: none;
   }
 }
+
+/* --------------------------------------------------------- engine seats */
+
+/* Grey disc for "installed, not running" / "not yet known" — the one state
+ * StateDot's four colors do not cover. */
+.dotNeutral {
+  display: inline-block;
+  flex: none;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-dimmed);
+}
+
+/* The tiny engine dot in the header; a button, so it opens the engine panel. */
+.engineDotBtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 50%;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.engineDotBtn:hover,
+.engineDotBtn[aria-pressed='true'] {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.engineDotBtn:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: -2px;
+}
+
+/* Version banner: one line under the header, dismissible for the session. */
+.banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px 8px 14px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-state-warn-tertiary);
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xs-13);
+}
+
+.bannerIcon {
+  flex: none;
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.bannerText {
+  flex: 1;
+  min-width: 0;
+}
+
+.bannerActions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* First-run panels (engine not ready / add a workspace) and the manual engine panel. */
+.firstRun {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.firstRunCard {
+  width: 100%;
+  max-width: 420px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 22px 24px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 14px;
+  background: var(--dsw-alias-bg-layer-2);
+  box-shadow: var(--dsw-shadow-lv2);
+}
+
+.firstRunTitle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-s-strong-14);
+}
+
+.firstRunTitle > svg {
+  flex: none;
+  color: var(--dsw-alias-brand-primary);
+}
+
+.firstRunBody {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xs-13);
+}
+
+.firstRunDetail {
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12);
+  font-family: var(--ds-font-family-code);
+  overflow-wrap: anywhere;
+}
+
+.firstRunFacts {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xxs-12);
+  font-family: var(--ds-font-family-code);
+}
+
+.firstRunFacts dt {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.firstRunFacts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.firstRunError {
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary);
+  font: var(--dsw-font-xs-13);
+}
+
+.firstRunActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.firstRunHint {
+  margin: 0;
+  color: var(--dsw-alias-label-dimmed);
+  font: var(--dsw-font-xxs-12);
+}
+
+.projectField {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.projectLabel {
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xxs-12);
+}
+
+.projectInput {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xs-13);
+  font-family: var(--ds-font-family-code);
+}
+
+.projectInput:focus-visible {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+.projectInput::placeholder {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.importList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+}
+
+.importTitle {
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xxs-strong-12);
+}
+
+.importRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.importText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.importName {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xs-13);
+}
+
+.importPath {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12);
+  font-family: var(--ds-font-family-code);
+}

@@ -21,12 +21,17 @@ export interface CardFieldSpec {
   /**
    * `text` renders the effective value; `secret` is write-only — it renders
    * blank, reports only whether a value is configured, and a blank draft
-   * writes nothing (keeps the stored value).
+   * writes nothing (keeps the stored value); `toggle` is a live boolean —
+   * flipping it writes at once, there is no save step.
    */
-  kind: 'text' | 'secret'
+  kind: 'text' | 'secret' | 'toggle'
   labelKey: CcteamLocaleKey
   hintKey: CcteamLocaleKey
   placeholder?: string
+  /** Where the card draws it: the credential list (default) or the engine section. */
+  section?: 'engine'
+  /** What a toggle shows while no layer supplies a value. */
+  defaultValue?: boolean
 }
 
 /** One card: the namespace it edits and the controls it shows. */
@@ -60,6 +65,8 @@ export interface CardState {
   /** Whether the last save did not land as staged; cleared by the next edit, discard, or successful save. */
   failed: boolean
   fields: Record<string, FieldState>
+  /** Live toggles by field (effective value, or the spec default). */
+  toggles: Record<string, boolean>
 }
 
 /** The write actions a card's slot entry injects. */
@@ -72,6 +79,8 @@ export interface CardActions {
   save(): void
   /** Drop every staged edit. */
   discard(): void
+  /** Write one live toggle at once (no staging). */
+  setToggle(field: string, value: boolean): void
 }
 
 /** The registration-side face one card's slot entry injects (`hooks.card` → `useCard`). */
@@ -99,6 +108,9 @@ export const CCTEAM_CARD: CardSpec = {
     { field: 'restToken', kind: 'secret', labelKey: 'settings.field.restToken', hintKey: 'settings.field.restToken.hint' },
     { field: 'enrollment', kind: 'secret', labelKey: 'settings.field.enrollment', hintKey: 'settings.field.enrollment.hint' },
     { field: 'defaultProject', kind: 'text', labelKey: 'settings.field.defaultProject', hintKey: 'settings.field.defaultProject.hint' },
+    // The engine section's two controls (drawn there, not in the list above).
+    { field: 'autoStart', kind: 'toggle', labelKey: 'engine.autoStart', hintKey: 'engine.autoStart.hint', section: 'engine', defaultValue: true },
+    { field: 'enginePath', kind: 'text', labelKey: 'engine.enginePath', hintKey: 'engine.enginePath.hint', section: 'engine', placeholder: '/usr/local/bin/ccteam' },
   ],
 }
 
@@ -109,6 +121,12 @@ function stringAt(section: unknown, field: string): string {
   if (section === null || typeof section !== 'object') return ''
   const value = (section as Section)[field]
   return typeof value === 'string' ? value : ''
+}
+
+function booleanAt(section: unknown, field: string): boolean | undefined {
+  if (section === null || typeof section !== 'object') return undefined
+  const value = (section as Section)[field]
+  return typeof value === 'boolean' ? value : undefined
 }
 
 function hasOwn(section: unknown, field: string): boolean {
@@ -181,7 +199,34 @@ export class SettingsCardController {
         this.failed = false
         this.publish()
       },
+      setToggle: (field, value) => {
+        void this.setToggle(field, value)
+      },
     }
+  }
+
+  /**
+   * Write one live toggle at once: the Host either takes the value — read
+   * back, never assumed — or the switch stays where it was and the card
+   * reports the failure.
+   * @param field - the toggle's field.
+   * @param value - the new value.
+   * @returns settlement after the write and the read-back.
+   */
+  async setToggle(field: string, value: boolean): Promise<void> {
+    if (this.saving) return
+    this.saving = true
+    this.failed = false
+    this.publish()
+    let threw = false
+    try {
+      await this.scope.set(field, value)
+    } catch {
+      threw = true
+    }
+    this.failed = threw || booleanAt(this.scope.getSnapshot().value, field) !== value
+    this.saving = false
+    this.publish()
   }
 
   /**
@@ -230,7 +275,12 @@ export class SettingsCardController {
   private project(): CardState {
     const snapshot = this.scope.getSnapshot()
     const fields: Record<string, FieldState> = {}
+    const toggles: Record<string, boolean> = {}
     for (const spec of this.spec.fields) {
+      if (spec.kind === 'toggle') {
+        toggles[spec.field] = booleanAt(snapshot.value, spec.field) ?? spec.defaultValue ?? false
+        continue
+      }
       const staged = this.staged.get(spec.field)
       const current = stringAt(snapshot.value, spec.field)
       if (spec.kind === 'secret') {
@@ -250,6 +300,7 @@ export class SettingsCardController {
       saving: this.saving,
       failed: this.failed,
       fields,
+      toggles,
     }
   }
 }

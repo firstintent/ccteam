@@ -381,3 +381,32 @@ describe('unknown routes', () => {
     expect(foreign.json()).toEqual({ error: 'not found' })
   })
 })
+
+describe('projects.create', () => {
+  it('posts {slug, path} to /api/v1/projects and returns the created project', async () => {
+    const fake = new FakeFetch()
+      .on('/api/v1/projects', { status: 201, json: { slug: 'demo', host: 'local', path: '/home/u/demo' } })
+    expect((await post(bff(fake), 'projects.create', { path: '/home/u/demo', slug: 'demo' })).json())
+      .toEqual({ ok: true, project: { slug: 'demo', path: '/home/u/demo', host: 'local' } })
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0]).toMatchObject({ method: 'POST', body: { slug: 'demo', path: '/home/u/demo' } })
+    expect(new URL(fake.calls[0]!.url).pathname).toBe('/api/v1/projects')
+    // No `host`: the daemon's own host; no `team`: the daemon's default.
+    expect(Object.keys(fake.calls[0]!.body as object).sort()).toEqual(['path', 'slug'])
+  })
+
+  it('lifts the daemon error envelope verbatim', async () => {
+    const fake = new FakeFetch()
+      .on('/api/v1/projects', { status: 409, json: { ok: false, error: 'project already exists: demo' } })
+    const created = (await post(bff(fake), 'projects.create', { path: '/home/u/demo', slug: 'demo' })).json() as { ok: boolean; error?: string }
+    expect(created.ok).toBe(false)
+    expect(created.error).toBe('project already exists: demo')
+  })
+
+  it('refuses a relative path or a blank slug without touching the daemon', async () => {
+    const fake = new FakeFetch()
+    expect((await post(bff(fake), 'projects.create', { path: 'demo', slug: 'demo' })).json()).toMatchObject({ ok: false, errorKind: 'bad_request' })
+    expect((await post(bff(fake), 'projects.create', { path: '/home/u/demo', slug: ' ' })).json()).toMatchObject({ ok: false, errorKind: 'bad_request' })
+    expect(fake.calls).toEqual([])
+  })
+})

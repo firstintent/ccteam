@@ -205,3 +205,32 @@ describe('save', () => {
     expect(writes).toHaveLength(1)
   })
 })
+
+describe('toggles', () => {
+  it('projects a live toggle from the effective value, defaulting per spec, apart from the staged fields', () => {
+    const { scope, host } = fakeScope()
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
+    expect(card.getSnapshot().toggles).toEqual({ autoStart: true })
+    expect(card.getSnapshot().fields.autoStart).toBeUndefined()
+    host({ value: { autoStart: false } })
+    expect(card.getSnapshot().toggles.autoStart).toBe(false)
+  })
+
+  it('setToggle writes at once (no staging) and reads the outcome back', async () => {
+    const { scope, writes } = fakeScope()
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
+    await card.setToggle('autoStart', false)
+    expect(writes).toEqual([{ op: 'set', field: 'autoStart', value: false }])
+    expect(card.getSnapshot()).toMatchObject({ failed: false, saving: false, dirty: false })
+    expect(card.getSnapshot().toggles.autoStart).toBe(false)
+  })
+
+  it('setToggle reports failure when the Host keeps the old value', async () => {
+    const { scope, behave } = fakeScope()
+    behave('reject')
+    const card = new SettingsCardController(scope, CCTEAM_CARD)
+    await card.setToggle('autoStart', false)
+    expect(card.getSnapshot().failed).toBe(true)
+    expect(card.getSnapshot().toggles.autoStart).toBe(true)
+  })
+})

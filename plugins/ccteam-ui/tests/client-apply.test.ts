@@ -142,6 +142,7 @@ describe('apply', () => {
       'ccteam-ui: dictionaries',
       'ccteam-ui: persistence',
       'ccteam-ui: team event stream',
+      'ccteam-ui: engine poller',
     ])
   })
 
@@ -205,7 +206,7 @@ describe('apply', () => {
     for (const card of registrations.filter(r => r.options.name === 'settings.plugin.item')) {
       const face = (card.options.inject as () => {
         hooks: { card: { getSnapshot(): { available: boolean; fields: Record<string, unknown> }; subscribe: unknown } }
-        spec: { namespace: string; fields: Array<{ field: string }> }
+        spec: { namespace: string; fields: Array<{ field: string; kind: string }> }
         edit: unknown
         save: unknown
         discard: unknown
@@ -215,7 +216,8 @@ describe('apply', () => {
       expect(typeof face.hooks.card.subscribe).toBe('function')
       const state = face.hooks.card.getSnapshot()
       expect(state.available).toBe(true)
-      expect(Object.keys(state.fields).sort()).toEqual(face.spec.fields.map(f => f.field).sort())
+      // Toggles are live controls, projected apart from the staged fields.
+      expect(Object.keys(state.fields).sort()).toEqual(face.spec.fields.filter(f => f.kind !== 'toggle').map(f => f.field).sort())
       for (const action of [face.edit, face.save, face.discard, face.reset]) expect(typeof action).toBe('function')
     }
   })
