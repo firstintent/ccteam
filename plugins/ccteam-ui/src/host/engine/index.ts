@@ -56,6 +56,7 @@ export {
   ENROLL_PATH,
   createEnrollmentBootstrap,
   createTokenBootstrap,
+  defaultEnrollmentLabel,
   requestEnrollment,
   type EnrollmentBootstrap,
   type EnrollmentOptions,

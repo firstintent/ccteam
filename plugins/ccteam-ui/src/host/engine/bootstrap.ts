@@ -22,7 +22,10 @@
  *     The value is returned to the BFF's closure and used to build one
  *     `Authorization` header.
  */
+import { createHash } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
+import { dirname, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { webTokenPath } from './locate.js'
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
@@ -96,46 +99,91 @@ export interface EnrollmentOptions {
   daemonUrl: () => string
   /** Authorization value the REST call carries; `undefined` = unauthenticated. */
   authorization: () => string | undefined
-  /** Persist the minted bearer so the next boot finds it instead of minting again. */
+  /**
+   * The credential this installation ALREADY holds (profile row or settings
+   * card), if any. It is what separates "the daemon's record is mine" from
+   * "the daemon has a record whose secret I do not have" — see
+   * {@link createEnrollmentBootstrap}.
+   */
+  held?: () => string | undefined
+  /** Persist the bearer, so the next boot finds it without asking at all. */
   persist?: (bearer: string) => Promise<void>
   fetchImpl?: FetchLike
+  /** Slot name. Defaults to {@link defaultEnrollmentLabel}. */
   label?: string
   logger?: { warn(message: string): void }
 }
 
 export interface EnrollmentOutcome {
   ok: boolean
+  /**
+   * Set ONLY when the daemon created the credential — the one moment its
+   * secret exists on the wire. An ensure that resolved to an existing record
+   * answers without one, by construction.
+   */
   bearer?: string
+  /**
+   * `ccteam-enroll:<id>:` — present on any success. Identifies the record
+   * without carrying a secret byte, so a holder can check whether what it has
+   * is what the daemon answers with.
+   */
+  bearerPrefix?: string
   error?: string
 }
 
 /**
- * The daemon route this asks. `POST /api/v1/enroll` MINTS a fresh credential
- * every call (`crates/ccteam-web/src/routes/enroll.rs` → `enroll::mint_in`);
- * the idempotent `enroll::ensure_user_credential` is, today, only reachable
- * from the Rust side's own Hosts button.
+ * The daemon route this asks: `POST /api/v1/enroll` with `ensure: true` and a
+ * label, which is idempotent per (identity, label) — one credential per
+ * installation, however many times DSH restarts
+ * (`crates/ccteam-web/src/routes/enroll.rs` → `ccteam_core::enroll::ensure_in`,
+ * the same function the machine credential goes through).
  *
- * So "ensure" is approximated ABOVE the wire — at most one mint per process,
- * persisted into the settings card so the next boot finds it there instead of
- * minting again. That is a real limitation, not a rounding error: a plugin
- * that mints and then fails to persist leaves a credential behind.
- *
- * This constant plus {@link requestEnrollment} are the ONLY two places that
- * know the shape of that call, so adopting a daemon-side idempotent ensure
- * (backlog ENROLL-ENSURE-1) is a one-place change: point this at the new route
- * and drop the at-most-once bookkeeping in
- * {@link createEnrollmentBootstrap}.
+ * This constant plus {@link requestEnrollment} are the only two places that
+ * know the shape of that call.
  */
 export const ENROLL_PATH = '/api/v1/enroll'
 
 /**
- * Ask the daemon for this DSH process's tool-face credential. A caller that
- * already has one must not reach this function at all.
+ * The slot THIS installation's credential lives in.
+ *
+ * It has to name the installation, not just the plugin: two DSH profiles
+ * running under one ccteam identity would otherwise share a slot, and the
+ * second one — holding no secret for a record that already exists — would
+ * rotate the first one's credential out from under it on every boot.
+ *
+ * A profile is a directory (`<dsh home>/profiles/<name>`) and this file is
+ * loaded from inside it, so the name is right there in the module path; that
+ * survives pnpm's `.pnpm/...` indirection, which sits below the profile dir.
+ * When there is no `profiles/<name>` on the path (a hoisted install, a test),
+ * the fallback is a digest of the directory this module was loaded from —
+ * still unique per installation, still stable across boots, just not
+ * human-readable.
  */
-export async function requestEnrollment(options: EnrollmentOptions): Promise<EnrollmentOutcome> {
+export function defaultEnrollmentLabel(modulePath = fileURLToPath(import.meta.url)): string {
+  const parts = modulePath.split(sep)
+  const at = parts.lastIndexOf('profiles')
+  const named = at >= 0 ? parts[at + 1] : undefined
+  if (named !== undefined && named !== '') return `dsh-plugin:${named}`
+  const digest = createHash('sha256').update(dirname(modulePath)).digest('hex').slice(0, 12)
+  return `dsh-plugin:path-${digest}`
+}
+
+/**
+ * Ask the daemon for this installation's tool-face credential.
+ *
+ * `rotate` is for the caller that cannot use the record the daemon already
+ * has (it never stored the secret, or the store was lost): the replacement is
+ * minted and the old record revoked, which is the only way back — a stored
+ * secret is never readable again.
+ */
+export async function requestEnrollment(
+  options: EnrollmentOptions,
+  rotate = false,
+): Promise<EnrollmentOutcome> {
   const doFetch = options.fetchImpl ?? ((input: string, init?: RequestInit) => fetch(input, init))
   const base = options.daemonUrl().trim().replace(/\/+$/, '')
   const authorization = options.authorization()
+  const label = options.label ?? defaultEnrollmentLabel()
   let response: Response
   try {
     response = await doFetch(`${base}${ENROLL_PATH}`, {
@@ -145,7 +193,7 @@ export async function requestEnrollment(options: EnrollmentOptions): Promise<Enr
         'content-type': 'application/json',
         ...(authorization === undefined ? {} : { authorization }),
       },
-      body: JSON.stringify({ label: options.label ?? 'dsh plugin' }),
+      body: JSON.stringify(rotate ? { label, ensure: true, rotate: true } : { label, ensure: true }),
     })
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
@@ -154,70 +202,110 @@ export async function requestEnrollment(options: EnrollmentOptions): Promise<Enr
     return { ok: false, error: `HTTP ${response.status}` }
   }
   let bearer: string | undefined
+  let bearerPrefix: string | undefined
   try {
-    const body = (await response.json()) as { bearer?: unknown }
+    const body = (await response.json()) as {
+      bearer?: unknown
+      credential?: { bearer_prefix?: unknown }
+    }
     bearer = typeof body.bearer === 'string' && body.bearer.trim() !== '' ? body.bearer.trim() : undefined
+    const prefix = body.credential?.bearer_prefix
+    bearerPrefix = typeof prefix === 'string' && prefix.trim() !== '' ? prefix.trim() : undefined
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   }
-  if (bearer === undefined) return { ok: false, error: 'the daemon returned no bearer' }
-  if (options.persist !== undefined) {
+  if (bearer === undefined && bearerPrefix === undefined) {
+    return { ok: false, error: 'the daemon named no credential' }
+  }
+  if (bearer !== undefined && options.persist !== undefined) {
     try {
       await options.persist(bearer)
     } catch (error) {
-      // The credential is usable this run even if it could not be stored; say so.
+      // The credential is usable this run even if it could not be stored; say
+      // so. The next boot re-ensures and lands on the same slot.
       options.logger?.warn(
-        `ccteam-ui: minted an enrollment credential but could not store it: ${error instanceof Error ? error.message : String(error)}`,
+        `ccteam-ui: received an enrollment credential but could not store it: ${error instanceof Error ? error.message : String(error)}`,
       )
     }
   }
-  return { ok: true, bearer }
+  return { ok: true, bearer, bearerPrefix }
 }
 
 export interface EnrollmentBootstrap {
-  /** The credential this process minted, if it has one yet. Never blocks. */
+  /** The credential this process resolved, if it has one yet. Never blocks. */
   value(): string | undefined
-  /** Mint once, at most. Concurrent callers share the one attempt. */
+  /** Resolve this installation's credential. Concurrent callers share one attempt. */
   ensure(): Promise<string | undefined>
-  /** How many mint calls actually reached the daemon — asserted by the tests. */
-  readonly mints: number
+  /** How many REST calls actually reached the daemon — asserted by the tests. */
+  readonly requests: number
 }
 
 /**
- * One credential per DSH process, minted at most once.
+ * One credential per installation — the daemon guarantees it, not this file.
  *
- * `POST /api/v1/enroll` is a MINT, so calling it on every boot would leave a
- * new record behind every time DSH restarts. Minting once and storing the
- * result through `persist` is what makes it an ensure in practice: the next
- * boot reads it back out of the settings card, sees a credential, and never
- * calls this at all.
+ * The endpoint is idempotent per (identity, label), so asking twice cannot
+ * leave two records behind; what is memoized here is only the answer, because
+ * a process has no reason to re-ask once it holds a usable credential.
+ *
+ * Two answers are possible and they mean different things:
+ *
+ *   - CREATED (`bearer`): the daemon minted it just now. Store it and use it.
+ *   - EXISTS (`bearerPrefix` only): the slot is taken and the secret is not
+ *     recoverable. If what this installation already holds has that prefix,
+ *     it IS the credential and there is nothing to do; otherwise the store was
+ *     lost, and `rotate` replaces the record rather than piling a second one
+ *     next to it.
  */
 export function createEnrollmentBootstrap(options: EnrollmentOptions): EnrollmentBootstrap {
-  let minted: string | undefined
+  let resolved: string | undefined
   let inFlight: Promise<string | undefined> | undefined
-  let mints = 0
+  let requests = 0
+
+  const ask = async (rotate: boolean): Promise<EnrollmentOutcome> => {
+    requests += 1
+    return await requestEnrollment(options, rotate)
+  }
+
+  const run = async (): Promise<string | undefined> => {
+    const first = await ask(false)
+    if (!first.ok) {
+      options.logger?.warn(`ccteam-ui: could not enroll with the ccteam daemon: ${first.error}`)
+      return undefined
+    }
+    if (first.bearer !== undefined) return first.bearer
+    const held = options.held?.()
+    if (held !== undefined && first.bearerPrefix !== undefined && held.startsWith(first.bearerPrefix)) {
+      // Already holding exactly this record — asking again would be the only
+      // way to turn an ensure into a second credential.
+      return held
+    }
+    const rotated = await ask(true)
+    if (!rotated.ok) {
+      options.logger?.warn(
+        `ccteam-ui: the ccteam daemon holds an enrollment credential for this profile that this plugin cannot use, and replacing it failed: ${rotated.error}`,
+      )
+      return undefined
+    }
+    return rotated.bearer
+  }
+
   return {
-    value: () => minted,
+    value: () => resolved,
     async ensure(): Promise<string | undefined> {
-      if (minted !== undefined) return minted
+      if (resolved !== undefined) return resolved
       if (inFlight !== undefined) return await inFlight
-      mints += 1
-      inFlight = requestEnrollment(options)
-        .then(outcome => {
-          if (outcome.ok) {
-            minted = outcome.bearer
-          } else {
-            options.logger?.warn(`ccteam-ui: could not enroll with the ccteam daemon: ${outcome.error}`)
-          }
-          return minted
+      inFlight = run()
+        .then(bearer => {
+          resolved = bearer
+          return resolved
         })
         .finally(() => {
           inFlight = undefined
         })
       return await inFlight
     },
-    get mints(): number {
-      return mints
+    get requests(): number {
+      return requests
     },
   }
 }

@@ -29,7 +29,11 @@ import {
   webTokenPath,
 } from '../src/host/engine/locate.js'
 import { classifyDestPath, installEngine, resolveInstallDirWith } from '../src/host/engine/install.js'
-import { createEnrollmentBootstrap, createTokenBootstrap } from '../src/host/engine/bootstrap.js'
+import {
+  createEnrollmentBootstrap,
+  createTokenBootstrap,
+  defaultEnrollmentLabel,
+} from '../src/host/engine/bootstrap.js'
 import {
   calls,
   makeSandbox,
@@ -700,32 +704,152 @@ describe('credential hygiene', () => {
   })
 
   it('asks the daemon for the enrollment credential over REST, once, and stores it', async () => {
-    const posted: Array<{ url: string; authorization: string | undefined }> = []
+    const posted: Array<{ url: string; authorization: string | undefined; body: unknown }> = []
     const stored: string[] = []
     const bootstrap = createEnrollmentBootstrap({
       daemonUrl: () => 'http://127.0.0.1:7331/',
       authorization: () => 'Bearer ccteam:deadbeef',
+      label: 'dsh-plugin:web',
       persist: async bearer => {
         stored.push(bearer)
       },
       fetchImpl: async (url, init) => {
-        posted.push({ url, authorization: (init?.headers as Record<string, string> | undefined)?.authorization })
-        return new Response(JSON.stringify({ bearer: 'ccteam-enroll:e1:secret' }), {
-          status: 201,
-          headers: { 'content-type': 'application/json' },
+        posted.push({
+          url,
+          authorization: (init?.headers as Record<string, string> | undefined)?.authorization,
+          body: JSON.parse(String(init?.body ?? '{}')),
         })
+        return new Response(
+          JSON.stringify({
+            bearer: 'ccteam-enroll:e1:secret',
+            credential: { id: 'e1', bearer_prefix: 'ccteam-enroll:e1:' },
+          }),
+          { status: 201, headers: { 'content-type': 'application/json' } },
+        )
       },
     })
 
     expect(await bootstrap.ensure()).toBe('ccteam-enroll:e1:secret')
     expect(await bootstrap.ensure()).toBe('ccteam-enroll:e1:secret')
 
+    // The call is an ENSURE, keyed by this installation's label — a plain mint
+    // would hand back a second credential on the next boot.
     expect(posted).toEqual([
-      { url: 'http://127.0.0.1:7331/api/v1/enroll', authorization: 'Bearer ccteam:deadbeef' },
+      {
+        url: 'http://127.0.0.1:7331/api/v1/enroll',
+        authorization: 'Bearer ccteam:deadbeef',
+        body: { label: 'dsh-plugin:web', ensure: true },
+      },
     ])
-    expect(bootstrap.mints).toBe(1)
+    expect(bootstrap.requests).toBe(1)
     expect(stored).toEqual(['ccteam-enroll:e1:secret'])
     expect(Object.values(process.env).some(value => (value ?? '').includes('ccteam-enroll:'))).toBe(false)
+  })
+
+  /**
+   * The point of the daemon-side ensure: whatever happens to this plugin's own
+   * storage between boots, the daemon ends up holding ONE credential for this
+   * installation. The fake below is the route's contract, not a mock of the
+   * plugin's expectations — create → 201 + bearer, taken → 200 + prefix only,
+   * rotate → replace — so a client that regressed to minting would show up
+   * here as a second record.
+   */
+  it('ensure is idempotent: the plugin holds exactly one credential across two boots', async () => {
+    const records = new Map<string, { id: string; secret: string }>()
+    let minted = 0
+    const daemon: typeof fetch = (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { label: string; ensure?: boolean; rotate?: boolean }
+      expect(body.ensure).toBe(true)
+      const existing = records.get(body.label)
+      if (existing !== undefined && body.rotate !== true) {
+        return new Response(
+          JSON.stringify({ created: false, credential: { id: existing.id, bearer_prefix: `ccteam-enroll:${existing.id}:` } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      minted += 1
+      const record = { id: `e${minted}`, secret: `s${minted}` }
+      records.set(body.label, record)
+      return new Response(
+        JSON.stringify({
+          bearer: `ccteam-enroll:${record.id}:${record.secret}`,
+          credential: { id: record.id, bearer_prefix: `ccteam-enroll:${record.id}:` },
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      )
+    }) as unknown as typeof fetch
+
+    // Boot 1: nothing stored anywhere. The daemon creates the one credential.
+    let settingsCard: string | undefined
+    const boot = (): ReturnType<typeof createEnrollmentBootstrap> =>
+      createEnrollmentBootstrap({
+        daemonUrl: () => 'http://127.0.0.1:7331',
+        authorization: () => 'Bearer ccteam:deadbeef',
+        label: 'dsh-plugin:web',
+        held: () => settingsCard,
+        persist: async bearer => {
+          settingsCard = bearer
+        },
+        fetchImpl: daemon as never,
+      })
+
+    const first = boot()
+    expect(await first.ensure()).toBe('ccteam-enroll:e1:s1')
+    expect(settingsCard).toBe('ccteam-enroll:e1:s1')
+
+    // Boot 2, holding it: the daemon says the slot is taken, and the prefix
+    // proves it is THIS credential — so nothing is minted and nothing rotates.
+    const second = boot()
+    expect(await second.ensure()).toBe('ccteam-enroll:e1:s1')
+    expect(second.requests).toBe(1)
+    expect(records.size).toBe(1)
+    expect(minted).toBe(1)
+
+    // Boot 3 after the store was LOST (a failed persist, a wiped card): the
+    // secret is gone for good, so the record is REPLACED rather than joined by
+    // a second one.
+    settingsCard = undefined
+    const third = boot()
+    expect(await third.ensure()).toBe('ccteam-enroll:e2:s2')
+    expect(third.requests).toBe(2)
+    expect(records.size).toBe(1)
+    expect(records.get('dsh-plugin:web')?.id).toBe('e2')
+
+    // A second installation gets its own slot, and never touches the first's.
+    const other = createEnrollmentBootstrap({
+      daemonUrl: () => 'http://127.0.0.1:7331',
+      authorization: () => 'Bearer ccteam:deadbeef',
+      label: 'dsh-plugin:other',
+      fetchImpl: daemon as never,
+    })
+    expect(await other.ensure()).toBe('ccteam-enroll:e3:s3')
+    expect(records.get('dsh-plugin:web')?.id).toBe('e2')
+    expect(Object.values(process.env).some(value => (value ?? '').includes('ccteam-enroll:'))).toBe(false)
+  })
+
+  /**
+   * The label names the INSTALLATION. Two profiles under one ccteam identity
+   * sharing a label would rotate each other's credential away on every boot,
+   * so the fallback still has to be unique per installation.
+   */
+  it('labels the credential by the DSH profile it was loaded from', () => {
+    expect(defaultEnrollmentLabel('/home/rob/.dsh/profiles/web/node_modules/@ccteam/ccteam-ui/lib/index.js')).toBe(
+      'dsh-plugin:web',
+    )
+    // pnpm's indirection sits BELOW the profile dir, so the name still reads.
+    expect(
+      defaultEnrollmentLabel(
+        '/srv/runtime/dsh/web/alice/profiles/tenant-3/node_modules/.pnpm/@ccteam+ccteam-ui@0.10.4/node_modules/@ccteam/ccteam-ui/lib/index.js',
+      ),
+    ).toBe('dsh-plugin:tenant-3')
+    // No profile on the path: a digest of where it was loaded from, which is
+    // unique per installation and stable across boots.
+    const hoisted = defaultEnrollmentLabel('/opt/dsh/node_modules/@ccteam/ccteam-ui/lib/index.js')
+    expect(hoisted).toMatch(/^dsh-plugin:path-[0-9a-f]{12}$/)
+    expect(defaultEnrollmentLabel('/opt/dsh/node_modules/@ccteam/ccteam-ui/lib/index.js')).toBe(hoisted)
+    expect(defaultEnrollmentLabel('/opt/other/node_modules/@ccteam/ccteam-ui/lib/index.js')).not.toBe(hoisted)
+    // The real one is computed from this module's own location.
+    expect(defaultEnrollmentLabel()).toMatch(/^dsh-plugin:/)
   })
 })
 

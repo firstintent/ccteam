@@ -246,12 +246,16 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
 
   /**
    * The tool face's credential is ASKED OF THE DAEMON, never scavenged from a
-   * file: `POST /api/v1/enroll` mints one and the plugin stores it in its own
-   * settings, so the next boot finds it there instead of minting again.
+   * file: `POST /api/v1/enroll` with `ensure` is idempotent per (identity,
+   * label), so this installation ends up with exactly one credential however
+   * many times DSH restarts. The bearer is still stored in this plugin's own
+   * settings — that is what lets the next boot skip the call entirely, and
+   * what makes the credential visible and revocable from both ends.
    */
   const enrollmentBootstrap = createEnrollmentBootstrap({
     daemonUrl,
     authorization: () => authorizationFor(restToken()),
+    held: () => resolve(config.enrollment, settings.get().enrollment),
     persist: async (bearer: string) => {
       await settings.update?.({ enrollment: bearer })
     },
