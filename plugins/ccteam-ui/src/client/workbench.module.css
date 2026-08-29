@@ -527,6 +527,89 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* DSH's own row affordance: the "⋯" appears on hover / focus / while its
+ * menu is open, taking the cost's place. */
+.rowMore {
+  flex: none;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: -4px;
+  border: none;
+  border-radius: 6px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.rowMore:hover {
+  background: var(--dsw-alias-interactive-bg-hover-solid);
+  color: var(--dsw-alias-label-primary);
+}
+
+.sessionRow:hover .rowMore,
+.sessionRow:focus-within .rowMore,
+.sessionRow[data-menu-open] .rowMore {
+  display: inline-flex;
+}
+
+.sessionRow:hover .rowCost,
+.sessionRow:focus-within .rowCost,
+.sessionRow[data-menu-open] .rowCost {
+  display: none;
+}
+
+.rowRename {
+  width: 100%;
+  min-width: 0;
+  height: 20px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xs-13);
+  font-family: inherit;
+  outline: none;
+}
+
+.composerModelBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 340px;
+  height: 28px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-xs-13);
+  font-family: inherit;
+}
+
+.composerModelBtn:hover,
+.composerModelBtn[aria-expanded='true'] {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.composerModelBtn > b {
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.composerModelBtn > span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .main {
   position: relative;
   flex: 1;

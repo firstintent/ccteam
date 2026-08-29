@@ -126,8 +126,20 @@ context). **Enter** sends, **Shift+Enter** inserts a newline, `/` at the start
 lists the pass-through commands (`/compact`, `/new`, `/clear`, `/role`,
 `/model`), the paper-clip adds attachments (images render inline).
 **Load earlier messages** pages the transcript back. ccteam records a step’s
-name and summary only; the full tool input/output stays in the vendor’s own
+name and summary only; the full tool input/output stays in the harness’s own
 session, and steps are shown live, not replayed from history.
+
+**Switching model / effort mid-session**: the `harness · model · effort ▾`
+control in the composer bar lists the harness’s models (from the `/models`
+catalog) and its effort ladder; picking one sends the same `/model <id>
+[effort]` directive a human would type — the harness performs the switch and
+answers with a receipt row, and the label follows the live statusline. This
+is the one path every front shares (IM, ccteam web, MCP, DSH); the harness
+itself cannot be switched.
+
+**Session rows** carry a **⋯** menu like DSH’s own: open, rename (inline),
+copy sid, interrupt the running turn, details, and stop (with a confirm; a
+stopped session can still be resumed by sid).
 
 **Esc** leaves a text field first, then closes the details, then docks a
 full-page pane, then closes the pane. When the workbench is closed, the ccteam button carries a

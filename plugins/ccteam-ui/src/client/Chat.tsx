@@ -12,6 +12,7 @@ import clsx from 'clsx'
 import {
   Button,
   IconApiOutline14,
+  IconChevronDownOutline14,
   IconCodeOutline16,
   IconEditOutline16,
   IconGlobeOutline14,
@@ -20,13 +21,16 @@ import {
   IconSparkle16,
   IconThinkOutline16,
   MarkdownText,
+  Menu,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { AttachmentRef, ChoiceOption, Step, TeamNode } from '../shared/contract.js'
+import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { AttachmentRef, ChoiceOption, ModelsCatalog, Step, TeamNode } from '../shared/contract.js'
 import type { ApiClient } from './api.js'
 import { Composer } from './Composer.js'
 import type { ComposerAttachment } from './Composer.js'
-import { formatElapsed } from './format.js'
+import { formatElapsed, modelDirective } from './format.js'
+import { effortsFor } from './store.js'
 import type { Action, ChatNotice, ChatRow, ChatState } from './store.js'
 import type { T } from './slots.js'
 import css from './workbench.module.css'
@@ -41,11 +45,89 @@ export interface ChatProps {
   project: string | undefined
   chat: ChatState
   node: TeamNode | undefined
+  /** Model / effort catalog (advisory) for the switch menu. */
+  models: ModelsCatalog | null
   selectedStep: string | null
   api: ApiClient
   dispatch: Dispatch
   t: T
   onSelectStep(itemId: string): void
+}
+
+function ModelSwitch({ node, chat, models, t, onSwitch }: {
+  node: TeamNode
+  chat: ChatState
+  models: ModelsCatalog | null
+  t: T
+  onSwitch(text: string): void
+}) {
+  const [open, setOpen] = useState(false)
+  const currentModel = chat.status?.model ?? node.model ?? null
+  const currentEffort = chat.status?.effort ?? node.effort ?? null
+  const catalog = models?.vendors.find(v => v.vendor === node.vendor)
+  const modelEntries = catalog?.models ?? []
+  const efforts = effortsFor(models, node.vendor, currentModel)
+  const items: MenuEntry[] = [{ type: 'label', id: 'models', text: t('model.models') }]
+  const known = new Set(modelEntries.map(m => m.id))
+  if (currentModel !== null && !known.has(currentModel)) {
+    items.push({ id: `m:${currentModel}`, label: currentModel })
+  }
+  for (const entry of modelEntries) {
+    items.push({ id: `m:${entry.id}`, label: entry.displayName === undefined || entry.displayName === entry.id ? entry.id : `${entry.displayName} · ${entry.id}` })
+  }
+  if (modelEntries.length === 0 && currentModel === null) {
+    // Nothing observed yet: a bare /model asks the harness for its own picker.
+    items.push({ id: 'm:', label: t('spawn.model.default') })
+  }
+  if (efforts.length > 0) {
+    items.push({ type: 'separator', id: 'sep' }, { type: 'label', id: 'efforts', text: t('model.efforts') })
+    for (const effort of efforts) items.push({ id: `e:${effort}`, label: effort })
+  }
+  const selected = [
+    ...(currentModel === null ? [] : [`m:${currentModel}`]),
+    ...(currentEffort === null ? [] : [`e:${currentEffort}`]),
+  ]
+  return (
+    <Menu
+      open={open}
+      align="end"
+      side="top"
+      portal
+      dense
+      items={items}
+      selectedIds={selected}
+      onSelect={(id) => {
+        setOpen(false)
+        if (id.startsWith('m:')) {
+          const model = id.slice(2)
+          const keepEffort = currentEffort !== null && effortsFor(models, node.vendor, model).includes(currentEffort) ? currentEffort : null
+          onSwitch(modelDirective(model, keepEffort))
+        } else if (id.startsWith('e:')) {
+          onSwitch(modelDirective(currentModel ?? '', id.slice(2)))
+        }
+      }}
+      onClose={() => {
+        setOpen(false)
+      }}
+      anchor={(
+        <button
+          type="button"
+          className={css.composerModelBtn}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          title={t('model.switch')}
+          onClick={() => {
+            setOpen(previous => !previous)
+          }}
+        >
+          <b>{node.vendor}</b>
+          {currentModel !== null && <span>· {currentModel}</span>}
+          {currentEffort !== null && <span>· {currentEffort}</span>}
+          <IconChevronDownOutline14 size={12} />
+        </button>
+      )}
+    />
+  )
 }
 
 function StepIcon({ kind }: { kind: string }) {
@@ -223,7 +305,7 @@ function Row({ row, selectedStep, t, onSelectStep, onResolve }: {
  * @param props - sid + transcript state + transports.
  * @returns the transcript + composer.
  */
-export function Chat({ sid, project, chat, node, selectedStep, api, dispatch, t, onSelectStep }: ChatProps) {
+export function Chat({ sid, project, chat, node, models, selectedStep, api, dispatch, t, onSelectStep }: ChatProps) {
   const [draft, setDraft] = useState('')
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
   const [tick, setTick] = useState(0)
@@ -400,15 +482,24 @@ export function Chat({ sid, project, chat, node, selectedStep, api, dispatch, t,
       })
   }
 
+  // The harness owns model/effort switching: the picker sends the same
+  // `/model <id> [effort]` directive a human would type, the harness answers
+  // with a receipt row, and the statusline refresh updates the label.
+  const switchModel = (text: string): void => {
+    pinnedRef.current = true
+    dispatch({ type: 'send_started', sid, text })
+    api
+      .call('session.send', { sid, text })
+      .then((receipt) => {
+        dispatch({ type: 'send_settled', sid, receipt })
+      })
+      .catch((error: unknown) => {
+        dispatch({ type: 'send_failed', sid, message: error instanceof Error ? error.message : String(error) })
+      })
+  }
   const trailing = node === undefined
     ? undefined
-    : (
-        <span className={css.composerModel} title={`${node.vendor}${node.model === undefined ? '' : ` · ${node.model}`}`}>
-          <b>{node.vendor}</b>
-          {node.model !== undefined && <span>· {chat.status?.model ?? node.model}</span>}
-          {(chat.status?.effort ?? node.effort) !== undefined && <span>· {chat.status?.effort ?? node.effort}</span>}
-        </span>
-      )
+    : <ModelSwitch node={node} chat={chat} models={models} t={t} onSwitch={switchModel} />
 
   return (
     <>

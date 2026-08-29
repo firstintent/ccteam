@@ -342,7 +342,17 @@ export function rowFromTranscript(row: TranscriptRow): ChatRow {
  * the canonical rows.
  */
 function reconcile(existing: ChatRow[], canonical: ChatRow[]): ChatRow[] {
-  const rows = canonical.slice()
+  // Steps are live-only knowledge: a canonical row re-read from disk carries
+  // none, so keep the ones an earlier reconcile already attached.
+  const rememberedSteps = new Map<string, Step[]>()
+  for (const row of existing) {
+    if (row.kind === 'assistant' && row.ephemeral !== true && row.steps.length > 0) rememberedSteps.set(row.id, row.steps)
+  }
+  const rows = canonical.map((row) => {
+    if (row.kind !== 'assistant' || row.steps.length > 0) return row
+    const steps = rememberedSteps.get(row.id)
+    return steps === undefined ? row : { ...row, steps }
+  })
   const canonicalUserTexts = new Set(rows.filter(r => r.kind === 'user').map(r => r.content))
   const lastAssistantIndex = (() => {
     for (let i = rows.length - 1; i >= 0; i -= 1) if (rows[i]!.kind === 'assistant') return i

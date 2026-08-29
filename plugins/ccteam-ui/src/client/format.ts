@@ -91,3 +91,17 @@ export function basename(path: string): string {
   const cut = path.lastIndexOf('/')
   return cut === -1 ? path : path.slice(cut + 1)
 }
+
+/**
+ * The `/model` directive text for a switch. The harness owns the switch —
+ * ccteam forwards this exactly as a human would type it (`/model <id>
+ * [effort]`), which is the one path every front (IM, web, MCP, DSH) shares.
+ * @param model - target model id (empty = ask the harness for its picker).
+ * @param effort - target effort, when the harness has an effort axis.
+ * @returns the directive text.
+ */
+export function modelDirective(model: string, effort: string | null): string {
+  const id = model.trim()
+  if (id === '') return '/model'
+  return effort === null || effort.trim() === '' ? `/model ${id}` : `/model ${id} ${effort.trim()}`
+}

@@ -464,7 +464,7 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
     const codex = findByTestId(el, "charter-roster-card-local-codex")!;
     expect(codex.role).toBe("button");
     expect(codex.tabIndex).toBe(0);
-    expect(codex.title).toBe("查看该 vendor 的会话拓扑");
+    expect(codex.title).toBe("查看该 harness 的会话拓扑");
     codex.onClick!();
     expect(onVendorPick).toHaveBeenCalledWith("codex");
 
@@ -485,7 +485,7 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
     expect(plain).toContain('data-testid="charter-roster-card-local-claude"');
     expect(plain).not.toContain('role="button"');
     expect(plain).not.toContain("charter-roster-card pickable");
-    expect(plain).not.toContain("查看该 vendor 的会话拓扑");
+    expect(plain).not.toContain("查看该 harness 的会话拓扑");
     expect(findByTestId(VendorRosterCards({ hosts, nodes }), "charter-roster-card-local-claude")!.onClick)
       .toBeUndefined();
 

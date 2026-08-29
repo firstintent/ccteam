@@ -17,7 +17,7 @@ import {
   reduce,
 } from '../src/client/store.js'
 import type { Action, ConsoleState, StorageLike } from '../src/client/store.js'
-import { formatCost, formatElapsed, formatTokens, relativeTime, titleFromTask, vendorGlyph } from '../src/client/format.js'
+import { formatCost, formatElapsed, formatTokens, modelDirective, relativeTime, titleFromTask, vendorGlyph } from '../src/client/format.js'
 import type { TeamGraph, TeamNode } from '../src/shared/contract.js'
 
 function run(actions: Action[], start = initialState()): ConsoleState {
@@ -137,6 +137,18 @@ describe('chat: live turn', () => {
       expect(canon.ephemeral).toBeUndefined()
       expect(canon.steps).toHaveLength(1)
     }
+  })
+
+  it('steps attached to a canonical row survive later history reloads', () => {
+    let state = run([
+      { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.' }, now: NOW },
+      { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:assistant', role: 'assistant', content: 'done.' }], hasMore: false },
+      { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:assistant', role: 'assistant', content: 'done.' }, { turnId: 'u2:user', role: 'user', content: 'more' }], hasMore: false },
+    ])
+    const first = chatOf(state, 's1').rows[0]
+    expect(first?.kind).toBe('assistant')
+    if (first?.kind === 'assistant') expect(first.steps.map(s => s.itemId)).toEqual(['t1'])
   })
 
   it('an answer with options becomes a choice row that waits, and resolving it resumes work', () => {
@@ -273,6 +285,15 @@ describe('layout', () => {
     expect(state.layout.mode).toBe('docked')
     expect(reduce(state, { type: 'set_mode', mode: 'docked' })).toBe(state)
     expect(initialState({ mode: 'full', dockWidth: 640 }).layout).toEqual({ mode: 'full', dockWidth: 640 })
+  })
+})
+
+describe('model switch', () => {
+  it('spells the /model directive exactly as a human would type it', () => {
+    expect(modelDirective('opus', null)).toBe('/model opus')
+    expect(modelDirective(' opus ', 'high')).toBe('/model opus high')
+    expect(modelDirective('opus', '  ')).toBe('/model opus')
+    expect(modelDirective('', 'high')).toBe('/model')
   })
 })
 

@@ -403,6 +403,45 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
       onRetry={() => {
         void refreshGraph(dispatch, api)
       }}
+      onRename={(sid, title) => {
+        api
+          .call('session.rename', { sid, title })
+          .then((receipt) => {
+            if (!receipt.ok) dispatch({ type: 'notice', sid, kind: 'error', message: receipt.error ?? receipt.errorKind ?? 'rename failed' })
+            void refreshGraph(dispatch, api)
+          })
+          .catch((error: unknown) => {
+            dispatch({ type: 'notice', sid, kind: 'error', message: error instanceof Error ? error.message : String(error) })
+          })
+      }}
+      onCopySid={(sid) => {
+        writeClipboard(sid)
+      }}
+      onInterrupt={(sid) => {
+        api
+          .call('session.interrupt', { sid })
+          .then((receipt) => {
+            if (!receipt.ok) dispatch({ type: 'notice', sid, kind: 'error', message: receipt.error ?? receipt.errorKind ?? 'interrupt failed' })
+          })
+          .catch((error: unknown) => {
+            dispatch({ type: 'notice', sid, kind: 'error', message: error instanceof Error ? error.message : String(error) })
+          })
+      }}
+      onStop={(sid) => {
+        api
+          .call('session.stop', { sid })
+          .then((receipt) => {
+            if (!receipt.ok) dispatch({ type: 'notice', sid, kind: 'error', message: receipt.error ?? receipt.errorKind ?? 'stop failed' })
+            void refreshGraph(dispatch, api)
+          })
+          .catch((error: unknown) => {
+            dispatch({ type: 'notice', sid, kind: 'error', message: error instanceof Error ? error.message : String(error) })
+          })
+      }}
+      onDetails={(sid) => {
+        dispatch({ type: 'select_session', sid })
+        dispatch({ type: 'open_details' })
+      }}
     />
   )
 
@@ -438,6 +477,7 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
             project={node?.project}
             chat={chat}
             node={node}
+            models={state.catalogs.models}
             selectedStep={selectedStep}
             api={api}
             dispatch={dispatch}

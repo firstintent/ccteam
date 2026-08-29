@@ -43,7 +43,7 @@ export function CostPillButton({
       type="button"
       data-testid="cost-pill"
       onClick={onOpenStatus}
-      title="今日花费 / 24h 预算（点开看 per-vendor）"
+      title="今日花费 / 24h 预算（点开看 per-harness）"
       className="cost-pill"
       style={{ ...tone, cursor: "pointer" }}
     >
