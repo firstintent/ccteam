@@ -286,9 +286,11 @@ export function Details(props: DetailsProps) {
                           {working && (
                             <Button variant="outline" size="sm" onClick={interrupt}>{t('details.interrupt')}</Button>
                           )}
-                          <Button variant="outline" size="sm" onClick={stop}>
-                            {confirmStop ? t('details.stop.confirm') : t('details.stop')}
-                          </Button>
+                          {node.residency !== 'stopped' && (
+                            <Button variant="outline" size="sm" onClick={stop}>
+                              {confirmStop ? t('details.stop.confirm') : t('details.stop')}
+                            </Button>
+                          )}
                           <Button
                             variant="ghost"
                             size="sm"
