@@ -135,6 +135,6 @@ pub fn stateful_router() -> Router<AppState> {
 /// Stateless routers (currently just `/health`). M5.3 keeps `/health`
 /// outside the auth gate so ops monitoring works without baking in
 /// the secret token.
-pub fn stateless_router() -> Router {
-    Router::new().merge(health::router())
+pub fn stateless_router(identity: std::sync::Arc<health::HealthIdentity>) -> Router {
+    Router::new().merge(health::router(identity))
 }

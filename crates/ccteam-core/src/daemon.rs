@@ -142,6 +142,30 @@ pub struct PidRecord {
     pub version: String,
     /// RFC3339 spawn timestamp (informational).
     pub started_at: String,
+    /// The exact argv (program excluded) the launcher exec'd for this
+    /// daemon. Recorded so a restart REPLAYS the original invocation
+    /// instead of guessing defaults — the failure it prevents is an
+    /// update-restart silently moving a daemon off its custom
+    /// `--web-bind` (or dropping `--no-imd`) onto the compiled-in
+    /// default. `None` = written by a launcher that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+}
+
+/// Value of a `--flag <value>` pair in a recorded argv. Pure (no fs/env)
+/// so the callers that surface a running daemon's binds (`/health`'s
+/// sibling `ccteam daemon status --json`) unit-test without a daemon.
+pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return it.next().map(String::as_str);
+        }
+        if let Some(rest) = a.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 /// Read + parse the pid record. `None` covers "missing", "unreadable"
@@ -454,8 +478,17 @@ pub struct DaemonStartSpec {
 /// Outcome of a start request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartVerdict {
-    Started { pid: u32, version: Option<String> },
-    AlreadyRunning { version: Option<String> },
+    Started {
+        pid: u32,
+        version: Option<String>,
+    },
+    AlreadyRunning {
+        version: Option<String>,
+        /// Pid of the instance already serving, when the launcher's pid
+        /// record identifies a live process. `None` for an instance this
+        /// launcher never spawned (no record / stale record).
+        pid: Option<u32>,
+    },
 }
 
 /// Outcome of a stop request. Refusals and timeouts are verdicts (not
@@ -611,14 +644,15 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
     use std::process::Stdio;
 
     let socket = daemon_socket_path(paths);
+    let pidfile = pidfile_path(paths);
     let probe = probe_daemon_at(&socket, DAEMON_PROBE_TIMEOUT);
     if probe.ready {
         return Ok(StartVerdict::AlreadyRunning {
             version: probe.version,
+            pid: live_record_pid(&pidfile),
         });
     }
 
-    let pidfile = pidfile_path(paths);
     if let Some(parent) = pidfile.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -633,6 +667,7 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
                 if probe.ready {
                     return Ok(StartVerdict::AlreadyRunning {
                         version: probe.version,
+                        pid: Some(record.pid),
                     });
                 }
                 if !process_matches_record(&record) {
@@ -722,6 +757,7 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
         process_start_time,
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
+        args: Some(spec.args.clone()),
     };
     if let Err(err) = write_pid_record(&pidfile, &record) {
         kill_and_reap(&mut child);
@@ -771,6 +807,14 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
 #[cfg(not(unix))]
 pub fn start_managed(_paths: &CcteamPaths, _spec: &DaemonStartSpec) -> Result<StartVerdict> {
     anyhow::bail!("daemon lifecycle is only supported on Unix")
+}
+
+/// Pid from the launcher's record, but only when it still names a live
+/// process — a stale record must never hand a caller someone else's pid.
+fn live_record_pid(pidfile: &Path) -> Option<u32> {
+    read_pid_record(pidfile)
+        .filter(process_matches_record)
+        .map(|r| r.pid)
 }
 
 /// Stop a managed daemon with default tuning. **Caller must hold the
@@ -1039,6 +1083,7 @@ mod tests {
             process_start_time: read_process_start_time(pid).unwrap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            args: None,
         }
     }
 
@@ -1065,6 +1110,46 @@ mod tests {
         );
         std::fs::write(&path, "not json at all").unwrap();
         assert_eq!(read_pid_record(&path), None);
+    }
+
+    #[test]
+    fn arg_value_reads_space_and_equals_forms_and_misses_cleanly() {
+        let args: Vec<String> = [
+            "internal",
+            "daemon-run",
+            "--web-bind",
+            "127.0.0.1:9",
+            "--no-imd",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(arg_value(&args, "--web-bind"), Some("127.0.0.1:9"));
+        // A boolean flag has no value, and an absent flag is not an error.
+        assert_eq!(arg_value(&args, "--no-imd"), None);
+        assert_eq!(arg_value(&args, "--dsh-web-bind"), None);
+        let eq: Vec<String> = vec!["--web-bind=0.0.0.0:1".to_string()];
+        assert_eq!(arg_value(&eq, "--web-bind"), Some("0.0.0.0:1"));
+        // A prefix match must not be mistaken for the flag itself.
+        let other: Vec<String> = vec!["--web-bind-extra".to_string(), "x".to_string()];
+        assert_eq!(arg_value(&other, "--web-bind"), None);
+    }
+
+    #[test]
+    fn pid_record_without_args_still_parses() {
+        // The field is additive: a record written before it existed must
+        // read back as a VALID record (not "stale"), or an upgrade would
+        // orphan the running daemon.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("orchestrator.pid");
+        std::fs::write(
+            &path,
+            br#"{"pid":7,"process_start_time":"1","version":"0.0.0","started_at":"t"}"#,
+        )
+        .unwrap();
+        let record = read_pid_record(&path).expect("legacy record parses");
+        assert_eq!(record.pid, 7);
+        assert_eq!(record.args, None);
     }
 
     #[test]
@@ -1278,6 +1363,7 @@ mod tests {
             process_start_time: "0".into(),
             version: "0.0.0".into(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            args: None,
         };
         write_pid_record(&pidfile_path(&p), &record).unwrap();
         let report = daemon_status(&p);

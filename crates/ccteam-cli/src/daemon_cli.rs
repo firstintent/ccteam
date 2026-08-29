@@ -27,10 +27,11 @@ use crate::legacy_takeover;
 /// `CCTEAM_{CLAUDE,CODEX}_BIN`.
 pub const DAEMON_BIN_ENV: &str = "CCTEAM_DAEMON_BIN";
 /// Default embedded-web bind, shared by the daemon verbs' clap defaults
-/// and `ccteam update`'s upgrade-restart (which has no `--web-bind` of its
-/// own — same posture as `daemon restart`).
+/// and [`LauncherFlags::default`]. The DSH companion bind has no constant
+/// of its own: it is always derived as `web port + 1`
+/// ([`effective_dsh_web_bind`]), so a non-default web bind can never be
+/// paired with a stale hardcoded companion port.
 pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:7331";
-pub const DEFAULT_DSH_WEB_BIND: &str = "0.0.0.0:7332";
 /// Hidden test hooks: shrink the ready-wait / stop-wait budgets so
 /// failure-path integration tests don't burn the production timeouts.
 const READY_TIMEOUT_ENV: &str = "CCTEAM_DAEMON_READY_TIMEOUT_MS";
@@ -88,21 +89,72 @@ fn spawn_program() -> Result<PathBuf> {
     ccteam_core::current_ccteam_bin().context("resolve daemon binary to detach")
 }
 
-fn start_spec(
-    paths: &CcteamPaths,
-    web_bind: &str,
-    dsh_web_bind: Option<&str>,
-) -> Result<dcore::DaemonStartSpec> {
-    let dsh_web_bind = effective_dsh_web_bind(web_bind, dsh_web_bind)?;
+/// v0.10.5 D7 — the daemon's runtime flags as the launcher holds them.
+/// Plain data (no clap) so `ccteam update`'s restart path can build one
+/// without a parsed command line, and so [`daemon_run_argv`] is a pure
+/// function the unit tests can pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LauncherFlags {
+    pub no_web: bool,
+    pub no_imd: bool,
+    pub web_bind: String,
+    pub dsh_web_bind: Option<String>,
+    pub web_no_auth: bool,
+    pub web_token_file: Option<PathBuf>,
+    pub no_clipboard: bool,
+}
+
+impl Default for LauncherFlags {
+    fn default() -> Self {
+        Self {
+            no_web: false,
+            no_imd: false,
+            web_bind: DEFAULT_WEB_BIND.to_string(),
+            dsh_web_bind: None,
+            web_no_auth: false,
+            web_token_file: None,
+            no_clipboard: false,
+        }
+    }
+}
+
+/// argv (program excluded) for the detached daemon. v0.10.5 D7: the exec
+/// target is the hidden `internal daemon-run`, NOT `start` — `start` is
+/// now the launcher itself, so pointing the launcher at it would fork
+/// bomb. Pure so the forwarding contract is unit-tested without spawning.
+pub(crate) fn daemon_run_argv(flags: &LauncherFlags) -> Result<Vec<String>> {
+    let dsh_web_bind = effective_dsh_web_bind(&flags.web_bind, flags.dsh_web_bind.as_deref())?;
+    let mut args = vec![
+        "internal".to_string(),
+        "daemon-run".to_string(),
+        "--web-bind".to_string(),
+        flags.web_bind.clone(),
+        "--dsh-web-bind".to_string(),
+        dsh_web_bind,
+    ];
+    if flags.no_web {
+        args.push("--no-web".to_string());
+    }
+    if flags.no_imd {
+        args.push("--no-imd".to_string());
+    }
+    if flags.web_no_auth {
+        args.push("--web-no-auth".to_string());
+    }
+    if let Some(path) = &flags.web_token_file {
+        args.push("--web-token-file".to_string());
+        args.push(path.display().to_string());
+    }
+    if flags.no_clipboard {
+        args.push("--no-clipboard".to_string());
+    }
+    Ok(args)
+}
+
+fn start_spec(paths: &CcteamPaths, args: Vec<String>) -> Result<dcore::DaemonStartSpec> {
     Ok(dcore::DaemonStartSpec {
         program: spawn_program()?,
-        args: vec![
-            "start".to_string(),
-            "--web-bind".to_string(),
-            web_bind.to_string(),
-            "--dsh-web-bind".to_string(),
-            dsh_web_bind,
-        ],
+        args,
         log_path: dcore::daemon_log_path(paths),
         ready_timeout: env_duration_ms(READY_TIMEOUT_ENV, dcore::START_READY_TIMEOUT),
     })
@@ -181,37 +233,66 @@ fn web_hint(web_bind: &str) -> String {
     )
 }
 
-pub fn run_daemon_start(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) -> Result<()> {
+pub fn run_daemon_start(flags: &LauncherFlags, json: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
+    // v0.10.5 — `home` rides on BOTH verdicts, not just `started`: a
+    // plugin treats "I started it" and "it was already up" as the same
+    // success and then has to answer one question — is this daemon MY
+    // home's? Answering it on only one branch would leave the other
+    // needing a second lookup to be safe.
+    let home = canonical_home(&paths);
     takeover_pre_step();
     let _lock = match dcore::acquire_operation_lock(&paths) {
         Ok(lock) => lock,
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     };
-    let spec = start_spec(&paths, web_bind, dsh_web_bind)?;
+    let spec = start_spec(&paths, daemon_run_argv(flags)?)?;
     match dcore::start_managed(&paths, &spec) {
         Ok(dcore::StartVerdict::Started { pid, version }) => {
             let v = version.clone().unwrap_or_else(|| "unknown".into());
             emit(
                 json,
-                serde_json::json!({ "status": "started", "pid": pid, "version": version }),
+                serde_json::json!({
+                    "status": "started",
+                    "pid": pid,
+                    "version": version,
+                    "home": home,
+                }),
                 &format!(
                     "ccteam daemon started (pid {pid}, version {v}).\n{}",
-                    web_hint(web_bind)
+                    web_hint(&flags.web_bind)
                 ),
             );
         }
-        Ok(dcore::StartVerdict::AlreadyRunning { version }) => {
+        Ok(dcore::StartVerdict::AlreadyRunning { version, pid }) => {
             let v = version.clone().unwrap_or_else(|| "unknown".into());
+            let who = pid
+                .map(|p| format!("pid {p}"))
+                .unwrap_or_else(|| "pid unknown — not started by the launcher".to_string());
             emit(
                 json,
-                serde_json::json!({ "status": "alreadyRunning", "version": version }),
-                &format!("ccteam daemon already running (version {v})."),
+                serde_json::json!({
+                    "status": "alreadyRunning",
+                    "pid": pid,
+                    "version": version,
+                    "home": home,
+                }),
+                &format!("ccteam daemon already running ({who}, version {v}) in {home}."),
             );
         }
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     }
     Ok(())
+}
+
+/// Canonical `$CCTEAM_HOME` as a string — the same resolution
+/// `GET /health` reports, so a client comparing the two never sees a
+/// symlinked path differ from a resolved one.
+fn canonical_home(paths: &CcteamPaths) -> String {
+    std::fs::canonicalize(&paths.root)
+        .unwrap_or_else(|_| paths.root.clone())
+        .display()
+        .to_string()
 }
 
 pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
@@ -286,11 +367,20 @@ pub(crate) enum RestartOutcome {
 /// (`daemon start/restart` and `ccteam update` all do). Shared by
 /// [`run_daemon_restart`] and the `ccteam update` upgrade-restart contract
 /// so the lock/stop/start logic lives in exactly one place.
+///
+/// `flags = None` means **replay the recorded invocation**: `ccteam
+/// update` restarts a daemon it did not launch and must not move it onto
+/// the compiled-in default bind (or silently drop its `--no-imd`). The
+/// pid record carries the launcher's argv precisely so the replay is
+/// exact; with no record it falls back to the defaults.
 pub(crate) fn restart_managed(
     paths: &CcteamPaths,
-    web_bind: &str,
-    dsh_web_bind: Option<&str>,
+    flags: Option<&LauncherFlags>,
 ) -> Result<RestartOutcome> {
+    let replay = match flags {
+        Some(_) => None,
+        None => dcore::read_pid_record(&dcore::pidfile_path(paths)).and_then(|r| r.args),
+    };
     // ONE lock across stop + start.
     let _lock = dcore::acquire_operation_lock(paths)?;
     let was_running = match dcore::stop_managed_with(paths, false, stop_tuning())? {
@@ -301,14 +391,18 @@ pub(crate) fn restart_managed(
         }
         dcore::StopVerdict::TimedOut { pid } => return Ok(RestartOutcome::StopTimedOut { pid }),
     };
-    let spec = start_spec(paths, web_bind, dsh_web_bind)?;
+    let args = match replay {
+        Some(args) => args,
+        None => daemon_run_argv(flags.unwrap_or(&LauncherFlags::default()))?,
+    };
+    let spec = start_spec(paths, args)?;
     match dcore::start_managed(paths, &spec)? {
         dcore::StartVerdict::Started { pid, version } => Ok(if was_running {
             RestartOutcome::Restarted { pid, version }
         } else {
             RestartOutcome::Started { pid, version }
         }),
-        dcore::StartVerdict::AlreadyRunning { version } => {
+        dcore::StartVerdict::AlreadyRunning { version, .. } => {
             Ok(RestartOutcome::AlreadyServing { version })
         }
     }
@@ -389,21 +483,16 @@ fn restart_command_action(
     }
 }
 
-pub fn run_daemon_restart(
-    web_bind: &str,
-    dsh_web_bind: Option<&str>,
-    json: bool,
-    if_managed: bool,
-) -> Result<()> {
+pub fn run_daemon_restart(flags: &LauncherFlags, json: bool, if_managed: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     // Restart is the verb `make install` runs on upgraded dev boxes, so
     // it carries the same takeover pre-step as start.
     takeover_pre_step();
-    let outcome = match restart_managed(&paths, web_bind, dsh_web_bind) {
+    let outcome = match restart_managed(&paths, Some(flags)) {
         Ok(outcome) => outcome,
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     };
-    match restart_command_action(outcome, if_managed, web_bind) {
+    match restart_command_action(outcome, if_managed, &flags.web_bind) {
         RestartCommandAction::Emit { machine, human } => emit(json, machine, &human),
         RestartCommandAction::Fail { code, message } => fail(json, code, &message),
     }
@@ -415,10 +504,29 @@ pub fn run_daemon_status(json: bool) -> Result<()> {
     let report = dcore::daemon_status(&paths);
     let binary_version = env!("CARGO_PKG_VERSION");
     let pid = report.record.as_ref().map(|r| r.pid);
+    let live = report.managed.then_some(report.record.as_ref()).flatten();
+    // v0.10.5 — the `GET /health` field set, answered locally. A client
+    // that can run the CLI but cannot reach the web port (auth not set up
+    // yet, bind not known yet) gets the SAME identity facts from here,
+    // plus the absolute path of the binary that would serve them. The
+    // binds and uptime come from the launcher's recorded argv/timestamp,
+    // so they describe the RUNNING daemon, not this process's defaults.
+    let recorded = live.and_then(|r| r.args.as_deref()).unwrap_or(&[]);
     let machine = serde_json::json!({
+        "status": if report.ready { "ok" } else { "down" },
+        "version": report.running_version,
+        "build": crate::build_commit(),
+        "home": canonical_home(&paths),
+        "pid": report.managed.then_some(pid).flatten(),
+        "web_bind": ccteam_core::daemon::arg_value(recorded, "--web-bind"),
+        "dsh_web_bind": ccteam_core::daemon::arg_value(recorded, "--dsh-web-bind")
+            .filter(|v| !v.eq_ignore_ascii_case("off")),
+        "uptime_secs": live.and_then(|r| uptime_secs(&r.started_at)),
+        "binary": ccteam_core::current_ccteam_bin()
+            .ok()
+            .map(|p| p.display().to_string()),
         "ready": report.ready,
         "managed": report.managed,
-        "pid": report.managed.then_some(pid).flatten(),
         "runningVersion": report.running_version,
         "binaryVersion": binary_version,
         "socket": report.socket.display().to_string(),
@@ -441,7 +549,8 @@ pub fn run_daemon_status(json: bool) -> Result<()> {
         ),
         (Some(_), false) => human.push_str("  managed: no   (stale pid record)\n"),
         (None, _) if report.ready => human.push_str(
-            "  managed: no   (foreground `ccteam start` or a self-supervised instance)\n",
+            "  managed: no   (a hand-run `internal daemon-run` or a self-supervised \
+             instance; `ccteam start` always produces a managed one)\n",
         ),
         (None, _) => human.push_str("  managed: no\n"),
     }
@@ -468,6 +577,17 @@ pub fn run_daemon_status(json: bool) -> Result<()> {
     }
     emit(json, machine, human.trim_end());
     Ok(())
+}
+
+/// Seconds since an RFC3339 timestamp, or `None` when it is unparseable /
+/// in the future (a clock that ran backwards must not report a wrapped
+/// uptime).
+fn uptime_secs(started_at: &str) -> Option<u64> {
+    let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+    (chrono::Utc::now() - started.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .try_into()
+        .ok()
 }
 
 pub fn run_daemon_logs(lines: usize, follow: bool, json: bool) -> Result<()> {
@@ -667,6 +787,83 @@ mod tests {
 
         assert_eq!(code, "notManaged");
         assert_eq!(message, hint);
+    }
+
+    #[test]
+    fn daemon_run_argv_targets_the_internal_entry_and_forwards_every_flag() {
+        // The exec target must NOT be `start`: since v0.10.5 D7 `start` IS
+        // the launcher, so pointing the launcher at it would fork bomb.
+        let flags = LauncherFlags {
+            no_web: true,
+            no_imd: true,
+            web_bind: "127.0.0.1:9000".to_string(),
+            dsh_web_bind: Some("off".to_string()),
+            web_no_auth: true,
+            web_token_file: Some(PathBuf::from("/tmp/tok")),
+            no_clipboard: true,
+        };
+        let argv = daemon_run_argv(&flags).unwrap();
+        assert_eq!(
+            &argv[..2],
+            &["internal".to_string(), "daemon-run".to_string()]
+        );
+        for expected in [
+            "--web-bind",
+            "127.0.0.1:9000",
+            "--dsh-web-bind",
+            "off",
+            "--no-web",
+            "--no-imd",
+            "--web-no-auth",
+            "--web-token-file",
+            "/tmp/tok",
+            "--no-clipboard",
+        ] {
+            assert!(
+                argv.iter().any(|a| a == expected),
+                "missing {expected} in {argv:?}"
+            );
+        }
+        assert!(!argv.contains(&"start".to_string()), "{argv:?}");
+    }
+
+    #[test]
+    fn daemon_run_argv_omits_flags_that_are_off_and_derives_the_companion_bind() {
+        let argv = daemon_run_argv(&LauncherFlags {
+            web_bind: "127.0.0.1:7331".to_string(),
+            ..LauncherFlags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "internal",
+                "daemon-run",
+                "--web-bind",
+                "127.0.0.1:7331",
+                "--dsh-web-bind",
+                "127.0.0.1:7332",
+            ]
+        );
+        // The recorded argv is what a restart replays, so it must round
+        // trip through the accessor `daemon status --json` reads.
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&argv, "--web-bind"),
+            Some("127.0.0.1:7331")
+        );
+    }
+
+    #[test]
+    fn uptime_secs_ignores_garbage_and_future_timestamps() {
+        assert_eq!(uptime_secs("not a timestamp"), None);
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(
+            uptime_secs(&future),
+            None,
+            "a backwards clock must not wrap"
+        );
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(90)).to_rfc3339();
+        assert!(uptime_secs(&past).is_some_and(|s| (85..=95).contains(&s)));
     }
 
     #[test]

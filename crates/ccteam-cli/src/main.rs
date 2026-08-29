@@ -45,6 +45,15 @@ const VERSION: &str = concat!(
     ")"
 );
 
+/// The git commit this binary was built from, or `None` when git was
+/// unavailable at build time. `build.rs` owns the capture; this is the
+/// single accessor so `--version`, `GET /health` and `ccteam daemon
+/// status --json` can never disagree about what "unknown" means.
+pub(crate) fn build_commit() -> Option<String> {
+    let commit = env!("CCTEAM_GIT_COMMIT");
+    (!commit.is_empty() && commit != "unknown").then(|| commit.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "ccteam",
@@ -57,6 +66,61 @@ struct Cli {
     home: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// v0.10.5 D7 — the daemon's OWN runtime flags. There is exactly one way
+/// to start the daemon (the launcher), so these are launcher flags that
+/// get forwarded verbatim to the hidden `internal daemon-run` child; the
+/// child is the only process that ever interprets them. Shared by
+/// `start` / `daemon start` / `daemon restart` / `internal daemon-run` so
+/// the flag list has ONE definition and cannot drift between them.
+#[derive(clap::Args, Debug, Clone)]
+struct DaemonRunArgs {
+    /// Run without the embedded web UI (IM gateway only).
+    #[arg(long, default_value_t = false)]
+    no_web: bool,
+    /// Run without the IM gateway (Telegram / Slack / Discord bridge); web only.
+    #[arg(long, default_value_t = false)]
+    no_imd: bool,
+    /// Web UI bind address; non-loopback binds auto-enable token auth.
+    #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
+    web_bind: String,
+    /// DSH web companion proxy bind (default: web-bind port + 1; `off` disables).
+    #[arg(long, value_name = "ADDR|off")]
+    dsh_web_bind: Option<String>,
+    /// Disable web token auth. DANGEROUS on non-loopback binds.
+    #[arg(long, default_value_t = false)]
+    web_no_auth: bool,
+    /// Read the auth token from this file (default `~/.ccteam/web-token`).
+    #[arg(long, value_name = "PATH")]
+    web_token_file: Option<PathBuf>,
+    /// Do not copy the web auth token to the clipboard (for CI / headless runs).
+    #[arg(long, default_value_t = false)]
+    no_clipboard: bool,
+}
+
+/// [`DaemonRunArgs`] plus the launcher's own `--json` verdict switch.
+#[derive(clap::Args, Debug, Clone)]
+struct LaunchArgs {
+    #[command(flatten)]
+    run: DaemonRunArgs,
+    /// Emit one machine-readable JSON line on stdout.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+impl DaemonRunArgs {
+    fn to_launcher_flags(&self) -> daemon_cli::LauncherFlags {
+        daemon_cli::LauncherFlags {
+            no_web: self.no_web,
+            no_imd: self.no_imd,
+            web_bind: self.web_bind.clone(),
+            dsh_web_bind: self.dsh_web_bind.clone(),
+            web_no_auth: self.web_no_auth,
+            web_token_file: self.web_token_file.clone(),
+            no_clipboard: self.no_clipboard,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -76,30 +140,8 @@ enum Command {
         #[arg(long, value_name = "OWNER")]
         owner: Option<String>,
     },
-    /// Run the gateway daemon in the foreground: IM gateway plus embedded web UI.
-    Start {
-        /// Run without the embedded web UI (IM gateway only).
-        #[arg(long, default_value_t = false)]
-        no_web: bool,
-        /// Run without the IM gateway (Telegram / Slack / Discord bridge); web only.
-        #[arg(long, default_value_t = false)]
-        no_imd: bool,
-        /// Web UI bind address; non-loopback binds auto-enable token auth.
-        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
-        web_bind: String,
-        /// DSH web companion proxy bind (default: web-bind port + 1; `off` disables).
-        #[arg(long, value_name = "ADDR|off")]
-        dsh_web_bind: Option<String>,
-        /// Disable web token auth. DANGEROUS on non-loopback binds.
-        #[arg(long, default_value_t = false)]
-        web_no_auth: bool,
-        /// Read the auth token from this file (default `~/.ccteam/web-token`).
-        #[arg(long, value_name = "PATH")]
-        web_token_file: Option<PathBuf>,
-        /// Do not copy the web auth token to the clipboard (for CI / headless runs).
-        #[arg(long, default_value_t = false)]
-        no_clipboard: bool,
-    },
+    /// Start the gateway daemon in the background (alias for `daemon start`); idempotent.
+    Start(LaunchArgs),
     /// One-screen health view: daemon, projects, sessions, web URL and token.
     Status,
     /// Internal hook handlers and low-level utilities (not for daily use).
@@ -117,6 +159,12 @@ enum Command {
     },
     /// Update ccteam to the latest release and restart the daemon onto the new binary.
     Update {
+        /// Override install-channel detection (npm/bun/pnpm require `--binary`).
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+        /// Install this already-downloaded ccteam binary (npm/bun/pnpm channels).
+        #[arg(long, value_name = "PATH", requires = "channel")]
+        binary: Option<PathBuf>,
         /// Skip the in-flight drain and restart the daemon immediately.
         #[arg(long, default_value_t = false)]
         now: bool,
@@ -180,18 +228,7 @@ enum Command {
 #[derive(Subcommand)]
 enum DaemonCommand {
     /// Start the daemon in the background and wait for readiness (idempotent).
-    Start {
-        /// Embedded web UI bind address, forwarded to the detached
-        /// `ccteam start`.
-        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
-        web_bind: String,
-        /// DSH web companion bind (default: web-bind port + 1; `off` disables).
-        #[arg(long, value_name = "ADDR|off")]
-        dsh_web_bind: Option<String>,
-        /// Emit one machine-readable JSON line on stdout.
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Start(LaunchArgs),
     /// Stop the managed daemon (SIGTERM + wait); a non-managed instance is refused.
     Stop {
         /// Escalate to SIGKILL after the wait (daemon only; agent sessions untouched).
@@ -203,13 +240,8 @@ enum DaemonCommand {
     },
     /// Restart the managed daemon (stop + start under one operation lock).
     Restart {
-        /// Embedded web UI bind address, forwarded to the detached
-        /// `ccteam start`.
-        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:7331")]
-        web_bind: String,
-        /// DSH web companion bind (default: web-bind port + 1; `off` disables).
-        #[arg(long, value_name = "ADDR|off")]
-        dsh_web_bind: Option<String>,
+        #[command(flatten)]
+        run: DaemonRunArgs,
         /// Emit exactly one machine-readable JSON line on stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -477,6 +509,15 @@ enum HostCommand {
 /// session utilities (peek / progress / attach), mux hook-emit, web server.
 #[derive(Subcommand)]
 enum InternalCommand {
+    /// Run the gateway daemon body in THIS process. The launcher
+    /// (`ccteam start` / `ccteam daemon start`) is the only caller; it
+    /// forwards its flags here verbatim and records the argv so a restart
+    /// replays it. Never run this by hand — an instance started outside
+    /// the launcher has no pid record, so `daemon stop` refuses it and a
+    /// plugin cannot manage it (exactly the `nohup ccteam start &` failure
+    /// D7 removed).
+    #[command(hide = true)]
+    DaemonRun(DaemonRunArgs),
     /// Claude Code hook handlers (read the hook payload JSON on stdin).
     Hook {
         #[command(subcommand)]
@@ -660,55 +701,50 @@ fn main() -> Result<()> {
             print!("{report}");
             Ok(())
         }
-        Command::Start {
-            no_web,
-            no_imd,
-            web_bind,
-            dsh_web_bind,
-            web_no_auth,
-            web_token_file,
-            no_clipboard,
-        } => run_start(
-            StartWebOpts {
-                disabled: no_web,
-                bind: web_bind,
-                dsh_bind: dsh_web_bind,
-                no_auth: web_no_auth,
-                token_file: web_token_file,
-                no_clipboard,
-            },
-            StartImdOpts { disabled: no_imd },
-        ),
+        // v0.10.5 D7 — `ccteam start` is a delegating alias for `daemon
+        // start` (symmetric with `ccteam stop` ≡ `daemon stop`). The
+        // foreground start is GONE: a `nohup ccteam start &` instance was
+        // unmanaged, so `daemon stop` refused it, a plugin could not manage
+        // it, and `daemon start` could only report `alreadyRunning`. One
+        // way in = the launcher; the daemon body lives in the hidden
+        // `internal daemon-run`, which is the launcher's only exec target.
+        Command::Start(args) => {
+            daemon_cli::run_daemon_start(&args.run.to_launcher_flags(), args.json)
+        }
         Command::Status => run_status(),
         Command::Internal { cmd } => run_internal(cmd),
         // v0.9.7 — `ccteam stop` is a delegating alias for `daemon stop`
         // (the trigger-file channel is retired).
         Command::Stop => daemon_cli::run_daemon_stop(false, false),
         Command::Daemon { cmd } => match cmd {
-            DaemonCommand::Start {
-                web_bind,
-                dsh_web_bind,
-                json,
-            } => daemon_cli::run_daemon_start(&web_bind, dsh_web_bind.as_deref(), json),
+            DaemonCommand::Start(args) => {
+                daemon_cli::run_daemon_start(&args.run.to_launcher_flags(), args.json)
+            }
             DaemonCommand::Stop { force, json } => daemon_cli::run_daemon_stop(force, json),
             DaemonCommand::Restart {
-                web_bind,
-                dsh_web_bind,
+                run,
                 json,
                 if_managed,
-            } => {
-                daemon_cli::run_daemon_restart(&web_bind, dsh_web_bind.as_deref(), json, if_managed)
-            }
+            } => daemon_cli::run_daemon_restart(&run.to_launcher_flags(), json, if_managed),
             DaemonCommand::Status { json } => daemon_cli::run_daemon_status(json),
             DaemonCommand::Logs { n, follow, json } => daemon_cli::run_daemon_logs(n, follow, json),
         },
         // v0.9.7 — `ccteam update`: channel-aware self-update + upgrade-restart.
         Command::Update {
+            channel,
+            binary,
             now,
             no_restart,
             json,
             force,
-        } => update::run_update(now, no_restart, json, force),
+        } => update::run_update(update::UpdateRequest {
+            channel,
+            binary,
+            now,
+            no_restart,
+            json,
+            force,
+        }),
         // v0.8.6 W3/W4a — `ccteam project <ls|show|new|stop|rm>` group.
         Command::Project { cmd } => match cmd {
             ProjectCommand::Ls { format } => run_ls(format),
@@ -1070,6 +1106,19 @@ fn run_skill(cmd: SkillCommand) -> Result<()> {
 /// standalone web server).
 fn run_internal(cmd: InternalCommand) -> Result<()> {
     match cmd {
+        InternalCommand::DaemonRun(args) => run_start(
+            StartWebOpts {
+                disabled: args.no_web,
+                bind: args.web_bind,
+                dsh_bind: args.dsh_web_bind,
+                no_auth: args.web_no_auth,
+                token_file: args.web_token_file,
+                no_clipboard: args.no_clipboard,
+            },
+            StartImdOpts {
+                disabled: args.no_imd,
+            },
+        ),
         InternalCommand::Hook { cmd } => run_hook(cmd),
         InternalCommand::RegisterMcp { json } => run_internal_register_mcp(json),
         InternalCommand::Attach { slug, sid } => run_internal_attach(&slug, sid.as_deref()),
@@ -2153,6 +2202,7 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         token_file: web.token_file.clone(),
         dsh_web_bind,
         no_auth_grace_secs: Some(5),
+        build: build_commit(),
     })
 }
 
