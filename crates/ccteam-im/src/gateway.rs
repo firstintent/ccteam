@@ -3918,16 +3918,18 @@ impl Gateway {
                         anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
                     })?
                     .to_string();
-                // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
-                // A detached body (alive from before a restart) is stoppable
-                // through the same gate, resolved from its meta.json owner.
+                // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own
+                // session. Not-resident is not not-there: a detached body
+                // (alive from before a restart) and a RELEASED session (ccteam
+                // holds no process, but the next message would resume it) are
+                // both stoppable through the same gate, resolved from their
+                // meta.json owner — otherwise "stop the thing I'm talking to"
+                // would fail on exactly the sessions whose process was let go.
                 let accessible = self
                     .sessions
                     .get(&sid)
                     .map(|s| self.chat_can_access(chat, s))
-                    .unwrap_or_else(|| {
-                        self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
-                    });
+                    .unwrap_or_else(|| self.chat_can_access_sid(chat, &sid));
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
@@ -16259,6 +16261,17 @@ mod tests {
         // Idempotent; unknown sid still errors so the API can 404.
         guard.stop_session("s1").await.unwrap();
         assert!(guard.stop_session("s404").await.is_err());
+        // …and the IM verb reaches it too: `/stop` on a released sid used to
+        // read as "unknown session for this chat" (its gate only knew resident
+        // + detached), which failed on exactly the sessions whose process the
+        // idle sweeper had just let go.
+        assert_eq!(
+            guard
+                .handle_text("mock", "chat-1", "alice", "/stop s1")
+                .await
+                .unwrap(),
+            vec!["stopped session s1\n↓ 本项目会话 → /sessions"]
+        );
 
         // A stopped session does not come back on its own: the next message
         // opens a NEW sid rather than resuming the one the user ended.
