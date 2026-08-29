@@ -397,6 +397,22 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
       onToggleProject={(slug) => {
         dispatch({ type: 'toggle_project', slug })
       }}
+      onProjectAction={(action, slug) => {
+        switch (action) {
+          case 'new':
+            dispatch({ type: 'set_draft', draft: { project: slug } })
+            dispatch({ type: 'select_new' })
+            return
+          case 'copy':
+            writeClipboard(slug)
+            return
+          case 'solo':
+            dispatch({ type: 'expand_only', slug })
+            return
+          case 'collapseAll':
+            dispatch({ type: 'collapse_all' })
+        }
+      }}
       onFilter={(filter) => {
         dispatch({ type: 'set_filter', filter })
       }}

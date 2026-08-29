@@ -132,17 +132,17 @@ describe('method dispatch', () => {
         nodes: [
           {
             sid: 's1', slug: 'ccteam', role: 'cto', vendor: 'claude', host: 'local',
-            status: 'live', depth: 0, cost_usd: 1.5, tokens_total: 42,
+            status: 'working', residency: 'resident', depth: 0, cost_usd: 1.5, tokens_total: 42,
             title: 'root', last_active: '2026-08-25T10:00:00Z', turn_count: 3,
           },
           {
             sid: 's2', slug: 'ccteam', role: '', vendor: 'codex', host: 'local',
-            status: 'idle', depth: 1, parent_sid: 's1',
+            status: 'idle', residency: 'released', depth: 1, parent_sid: 's1',
             last_active: '2026-08-25T10:05:00Z', turn_count: 1,
           },
           {
             sid: 's3', slug: 'other', role: '', vendor: 'dsh', host: 'local',
-            status: 'idle', depth: 0, last_active: '', turn_count: 0,
+            status: 'idle', residency: 'bogus', depth: 0, last_active: '', turn_count: 0,
           },
         ],
         edges: [],
@@ -160,6 +160,7 @@ describe('method dispatch', () => {
       project: 'ccteam',
       vendor: 'claude',
       activity: 'working',
+      residency: 'resident',
       title: 'root',
       role: 'cto',
       host: 'local',
@@ -172,6 +173,7 @@ describe('method dispatch', () => {
         project: 'ccteam',
         vendor: 'codex',
         activity: 'idle',
+        residency: 'released',
         host: 'local',
         parentSid: 's1',
         lastActive: '2026-08-25T10:05:00Z',

@@ -4,7 +4,10 @@
  * children indented under their parents. Each row: harness monogram, title,
  * a meta line (harness · model · when), the activity dot, the accumulated
  * cost, and — like DSH's own session rows — a trailing "⋯" menu (open,
- * rename inline, copy sid, interrupt, details, stop with a confirm).
+ * rename inline, copy sid, interrupt, details, stop with a confirm). Each
+ * workspace header carries DSH's ProjectRowItem affordances: hover reveals
+ * a "⋯" menu (new session / copy slug / expand only / collapse all) and a
+ * "+" that opens the new-session page with that project preselected.
  * Presentation only — every fact arrives via props, every action leaves
  * through a callback.
  */
@@ -45,6 +48,7 @@ export interface TeamColumnProps {
   onSelect(sid: string): void
   onNew(): void
   onToggleProject(slug: string): void
+  onProjectAction(action: ProjectAction, slug: string): void
   onFilter(filter: string): void
   onRetry(): void
   onRename(sid: string, title: string): void
@@ -83,6 +87,127 @@ function sumCost(nodes: readonly TeamNode[]): number {
 /** Row menu entry ids (the `Menu` primitive reports the picked id). */
 type RowAction = 'open' | 'rename' | 'copy' | 'interrupt' | 'details' | 'stop'
 
+/** Workspace header actions ("⋯" menu entries; "+" is `new`). */
+export type ProjectAction = 'new' | 'copy' | 'solo' | 'collapseAll'
+
+/**
+ * Residency hint for a row's tooltip — only the states a reader must know
+ * about (a resident session needs no caption).
+ * @param t - translate.
+ * @param node - the row's node.
+ * @returns the caption, or null.
+ */
+function residencyHint(t: T, node: TeamNode): string | null {
+  switch (node.residency) {
+    case 'released':
+      return t('row.released')
+    case 'stopped':
+      return t('row.stopped')
+    case 'detached':
+      return t('row.detached')
+    default:
+      return null
+  }
+}
+
+/**
+ * The row's dot: activity always wins; a settled (idle) session then shows
+ * its residency — hollow ring = released (resumes on the next message),
+ * dimmed disc = stopped, running matrix = a detached body still finishing.
+ * @param activity - the resolved activity.
+ * @param node - the row's node.
+ * @returns the dot element.
+ */
+function RowDot({ activity, node }: { activity: TeamNode['activity']; node: TeamNode }) {
+  if (activity === 'idle') {
+    if (node.residency === 'released') return <span className={css.rowDotReleased} aria-hidden="true" />
+    if (node.residency === 'stopped') return <span className={css.rowDotStopped} aria-hidden="true" />
+    if (node.residency === 'detached') return <StateDot className={css.rowDot} state="ongoing" size={8} />
+  }
+  return <StateDot className={css.rowDot} state={dotState(activity)} size={8} />
+}
+
+function ProjectHead({ slug, collapsed, total, count, canSpawn, t, onToggle, onAction }: {
+  slug: string
+  collapsed: boolean
+  total: string | null
+  count: number
+  canSpawn: boolean
+  t: T
+  onToggle(): void
+  onAction(action: ProjectAction): void
+}) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const items: MenuEntry[] = [
+    { id: 'new', label: t('project.new'), icon: <IconPlusOutline16 size={16} />, disabled: !canSpawn },
+    { id: 'copy', label: t('project.copySlug') },
+    { type: 'separator', id: 'sep-1' },
+    { id: 'solo', label: t('project.solo') },
+    { id: 'collapseAll', label: t('project.collapseAll') },
+  ]
+  return (
+    <div className={css.projectHead} data-menu-open={menuOpen ? '' : undefined}>
+      <button
+        type="button"
+        className={css.projectToggle}
+        data-collapsed={collapsed ? '' : undefined}
+        aria-expanded={!collapsed}
+        onClick={onToggle}
+      >
+        <span className={css.projectChevron} aria-hidden="true">
+          <IconChevronDownOutline14 size={12} />
+        </span>
+        <span className={css.projectName}>{slug}</span>
+        {total !== null && <span className={css.projectCount}>{total}</span>}
+        <span className={css.projectCount}>{count}</span>
+      </button>
+      <span className={css.projectActions}>
+        <Menu
+          open={menuOpen}
+          align="end"
+          portal
+          dense
+          items={items}
+          onSelect={(id) => {
+            setMenuOpen(false)
+            onAction(id as ProjectAction)
+          }}
+          onClose={() => {
+            setMenuOpen(false)
+          }}
+          anchor={(
+            <button
+              type="button"
+              className={css.projectIconBtn}
+              aria-label={t('tree.projectActions', { slug })}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              onClick={(event) => {
+                event.stopPropagation()
+                setMenuOpen(previous => !previous)
+              }}
+            >
+              <IconEllipsisOutline16 size={16} />
+            </button>
+          )}
+        />
+        <button
+          type="button"
+          className={css.projectIconBtn}
+          aria-label={t('tree.newIn', { slug })}
+          disabled={!canSpawn}
+          onClick={(event) => {
+            event.stopPropagation()
+            onAction('new')
+          }}
+        >
+          <IconPlusOutline16 size={16} />
+        </button>
+      </span>
+    </div>
+  )
+}
+
 function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect, onAction, onRenameCommit, onRenameCancel }: {
   node: TeamNode
   depth: number
@@ -101,8 +226,12 @@ function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect,
   const inputRef = useRef<HTMLInputElement | null>(null)
   const cost = formatCost(node.costUsd)
   const when = whenText(t, node.lastActive, now)
-  const working = (activity ?? node.activity) === 'working'
-  const meta = [node.vendor, node.model, when].filter((s): s is string => s !== undefined && s !== null && s !== '').join(' · ')
+  const rowActivity = activity ?? node.activity
+  const working = rowActivity === 'working'
+  const meta = [node.vendor, node.model, when, node.residency === 'stopped' ? t('residency.stopped') : undefined]
+    .filter((s): s is string => s !== undefined && s !== null && s !== '')
+    .join(' · ')
+  const hint = residencyHint(t, node)
 
   useEffect(() => {
     if (!renaming) return
@@ -132,8 +261,9 @@ function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect,
     { type: 'separator', id: 'sep-1' },
     ...(working ? [{ id: 'interrupt', label: t('row.interrupt') } as MenuEntry] : []),
     { id: 'details', label: t('row.details') },
-    { type: 'separator', id: 'sep-2' },
-    { id: 'stop', label: t('row.stop'), danger: true },
+    ...(node.residency === 'stopped'
+      ? []
+      : [{ type: 'separator', id: 'sep-2' } as MenuEntry, { id: 'stop', label: t('row.stop'), danger: true } as MenuEntry]),
   ]
 
   const onRowKey = (event: KeyboardEvent<HTMLDivElement>): void => {
@@ -152,7 +282,8 @@ function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect,
       tabIndex={0}
       aria-current={active ? 'true' : undefined}
       data-menu-open={menuOpen ? '' : undefined}
-      title={renaming ? undefined : `${node.sid} · ${meta}`}
+      data-residency={node.residency}
+      title={renaming ? undefined : (hint === null ? `${node.sid} · ${meta}` : `${node.sid} · ${meta}\n${hint}`)}
       onClick={() => {
         if (!renaming) onSelect(node.sid)
       }}
@@ -191,7 +322,7 @@ function SessionRow({ node, depth, active, activity, now, t, renaming, onSelect,
           : <span className={css.rowTitle}>{node.title ?? node.sid}</span>}
         <span className={css.rowMeta}>{meta}</span>
       </span>
-      <StateDot className={css.rowDot} state={dotState(activity ?? node.activity)} size={8} />
+      <RowDot activity={rowActivity} node={node} />
       {cost !== null && <span className={css.rowCost}>{cost}</span>}
       <Menu
         open={menuOpen}
@@ -318,22 +449,20 @@ export function TeamColumn(props: TeamColumnProps) {
           const total = formatCost(group.total > 0 ? group.total : undefined)
           return (
             <section key={group.slug}>
-              <button
-                type="button"
-                className={css.projectHead}
-                data-collapsed={isCollapsed ? '' : undefined}
-                aria-expanded={!isCollapsed}
-                onClick={() => {
+              <ProjectHead
+                slug={group.slug}
+                collapsed={isCollapsed}
+                total={total}
+                count={group.rows.length}
+                canSpawn={props.canSpawn}
+                t={t}
+                onToggle={() => {
                   props.onToggleProject(group.slug)
                 }}
-              >
-                <span className={css.projectChevron} aria-hidden="true">
-                  <IconChevronDownOutline14 size={12} />
-                </span>
-                <span className={css.projectName}>{group.slug}</span>
-                {total !== null && <span className={css.projectCount}>{total}</span>}
-                <span className={css.projectCount}>{group.rows.length}</span>
-              </button>
+                onAction={(action) => {
+                  props.onProjectAction(action, group.slug)
+                }}
+              />
               {!isCollapsed
                 && group.rows.map(({ node, depth }) => (
                   <SessionRow

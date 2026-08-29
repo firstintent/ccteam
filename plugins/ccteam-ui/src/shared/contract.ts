@@ -35,11 +35,21 @@ export type ApiMethod =
 
 export type Activity = 'working' | 'idle' | 'stale' | 'stuck'
 
+/**
+ * Whether ccteam currently holds a harness process/connection for the
+ * session — orthogonal to `Activity`. `released` = idle past the harness's
+ * prompt-cache TTL (or evicted for capacity); it resumes by sid on the next
+ * message. `stopped` = the user stopped it. `detached` = its process outlived
+ * a daemon restart and is finishing on its own.
+ */
+export type Residency = 'resident' | 'released' | 'stopped' | 'detached'
+
 export interface TeamNode {
   sid: string
   project: string
   vendor: string
   activity: Activity
+  residency?: Residency
   title?: string
   role?: string
   model?: string

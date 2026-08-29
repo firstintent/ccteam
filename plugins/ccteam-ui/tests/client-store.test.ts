@@ -12,6 +12,7 @@ import {
   findNode,
   flattenNodes,
   initialState,
+  lifecycleCopyKey,
   loadPersisted,
   planSpawnOutcome,
   reduce,
@@ -186,15 +187,26 @@ describe('chat: live turn', () => {
     expect(chatOf(state, 's1').rows.map(r => r.kind)).toEqual(['user'])
   })
 
-  it('lifecycle end states drop the live turn', () => {
+  it('lifecycle end states drop the live turn and keep the transition on the row', () => {
     const state = run([
       { type: 'session_event', sid: 's1', event: { kind: 'progress', content: 'x', done: false }, now: NOW },
-      { type: 'session_event', sid: 's1', event: { kind: 'lifecycle', state: 'evicted' }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'lifecycle', state: 'evicted', reason: 'idle' }, now: NOW },
     ])
     const chat = chatOf(state, 's1')
     expect(chat.live).toBeNull()
     expect(chat.activity).toBe('idle')
-    expect(chat.rows.at(-1)?.kind).toBe('system')
+    const last = chat.rows.at(-1)
+    expect(last?.kind).toBe('system')
+    expect(last?.kind === 'system' ? last.lifecycle : undefined).toEqual({ state: 'evicted', reason: 'idle' })
+  })
+
+  it('lifecycle copy distinguishes idle release from a capacity eviction and a user stop', () => {
+    expect(lifecycleCopyKey('evicted', 'idle')).toBe('chat.lifecycle.released')
+    expect(lifecycleCopyKey('evicted', 'capacity')).toBe('chat.lifecycle.evicted')
+    expect(lifecycleCopyKey('evicted', undefined)).toBe('chat.lifecycle.evicted')
+    expect(lifecycleCopyKey('stopped', undefined)).toBe('chat.lifecycle.stopped')
+    expect(lifecycleCopyKey('resumed', undefined)).toBe('chat.lifecycle.resumed')
+    expect(lifecycleCopyKey('crashed', undefined)).toBeNull()
   })
 })
 
@@ -364,6 +376,14 @@ describe('tree utils', () => {
     expect(filterRows(rows, 'GPT').map(r => r.node.sid)).toEqual(['s4'])
     expect(filterRows(rows, '')).toBe(rows)
     expect(filterRows(rows, 'zzz')).toEqual([])
+  })
+
+  it('expand-only and collapse-all fold the whole project list', () => {
+    const two: TeamGraph = { projects: [{ slug: 'a', nodes: [node('s1')] }, { slug: 'b', nodes: [node('s2')] }, { slug: 'c', nodes: [] }] }
+    const loaded = run([{ type: 'graph_loaded', graph: two }])
+    expect(reduce(loaded, { type: 'expand_only', slug: 'b' }).collapsed).toEqual({ a: true, b: false, c: true })
+    expect(reduce(loaded, { type: 'collapse_all' }).collapsed).toEqual({ a: true, b: true, c: true })
+    expect(reduce(initialState(), { type: 'collapse_all' }).collapsed).toEqual({})
   })
 
   it('finds nodes anywhere and maps activity to dot states', () => {

@@ -184,7 +184,8 @@ export function Details(props: DetailsProps) {
                     <span className={css.v}>
                       <StateDot state={dotState(activity)} size={8} />
                       {' '}
-                      {working ? t('chat.working') : (activity ?? 'idle')}
+                      {t(`state.${activity ?? 'idle'}`)}
+                      {node.residency !== undefined && ` · ${t(`residency.${node.residency}`)}`}
                     </span>
                     <Kv k={t('details.lastActive')} v={whenText(t, node.lastActive, now)} />
                     <Kv k={t('details.turns')} v={node.turnCount === undefined ? undefined : String(node.turnCount)} />

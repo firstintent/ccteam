@@ -396,6 +396,10 @@
   padding: 0 8px 16px;
 }
 
+/* Workspace (project) header — DSH's own ProjectRowItem shape: the row is a
+ * flex container whose leading toggle button carries chevron + name + counts,
+ * and whose trailing action slot ("⋯" menu + "+") only surfaces on hover /
+ * focus / while its menu is open, taking the counts' place. */
 .projectHead {
   display: flex;
   align-items: center;
@@ -405,16 +409,83 @@
   margin-top: 6px;
   padding: 0 6px;
   box-sizing: border-box;
-  border: none;
   border-radius: 8px;
   background: transparent;
-  cursor: pointer;
   color: var(--dsw-alias-label-secondary);
   font: var(--dsw-font-xxs-strong-12);
 }
 
-.projectHead:hover {
+.projectHead:hover,
+.projectHead:focus-within,
+.projectHead[data-menu-open] {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.projectToggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.projectToggle:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: -2px;
+  border-radius: 6px;
+}
+
+.projectActions {
+  flex: none;
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding-right: 2px;
+}
+
+.projectHead:hover .projectActions,
+.projectHead:focus-within .projectActions,
+.projectHead[data-menu-open] .projectActions {
+  display: inline-flex;
+}
+
+.projectHead:hover .projectCount,
+.projectHead:focus-within .projectCount,
+.projectHead[data-menu-open] .projectCount {
+  display: none;
+}
+
+/* Bare 16px glyph buttons, tertiary grey → primary on hover (DSH iconButton). */
+.projectIconBtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 4px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.projectIconBtn:hover {
+  color: var(--dsw-alias-label-primary);
+}
+
+.projectIconBtn:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
 }
 
 .projectChevron {
@@ -423,7 +494,7 @@
   transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
 }
 
-.projectHead[data-collapsed] .projectChevron {
+.projectToggle[data-collapsed] .projectChevron {
   transform: rotate(-90deg);
 }
 
@@ -518,6 +589,32 @@
 
 .rowDot {
   flex: none;
+}
+
+/* Residency, the second signal next to activity: a released session (idle
+ * past its harness's prompt-cache TTL, resumes on the next message) is a
+ * hollow ring; a stopped one a filled dimmed dot. Both only show when the
+ * activity itself is settled — work in progress always wins the dot. */
+.rowDotReleased {
+  flex: none;
+  box-sizing: border-box;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--dsw-alias-label-dimmed);
+  background: transparent;
+}
+
+.rowDotStopped {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-dimmed);
+}
+
+.sessionRow[data-residency='stopped'] .rowTitle {
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .rowCost {

@@ -94,7 +94,14 @@ export type ChatRow =
     resolving?: boolean
     error?: string
   }
-  | { kind: 'system'; id: string; text: string; tone: 'info' | 'warn' | 'error' }
+  | {
+    kind: 'system'
+    id: string
+    text: string
+    tone: 'info' | 'warn' | 'error'
+    /** Set on lifecycle rows so the renderer can pick honest copy per transition. */
+    lifecycle?: { state: string; reason?: string }
+  }
 
 /** The in-flight assistant turn (narrative snapshot + structured steps). */
 export interface LiveTurn {
@@ -166,6 +173,8 @@ export type Action =
   | { type: 'clear_selection' }
   | { type: 'set_filter'; filter: string }
   | { type: 'toggle_project'; slug: string }
+  | { type: 'expand_only'; slug: string }
+  | { type: 'collapse_all' }
   | { type: 'toggle_team' }
   | { type: 'toggle_details' }
   | { type: 'open_details' }
@@ -465,6 +474,7 @@ function applySessionEvent(chat: ChatState, action: Extract<Action, { type: 'ses
         id: `lifecycle-${action.now}`,
         text: event.reason === undefined ? event.state : `${event.state} · ${event.reason}`,
         tone: event.state === 'failed' || event.state === 'crashed' ? 'error' : 'info',
+        lifecycle: { state: event.state, ...(event.reason === undefined ? {} : { reason: event.reason }) },
       }
       const ended = ENDED_LIFECYCLE.has(event.state)
       return {
@@ -513,6 +523,16 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
       return { ...state, filter: action.filter }
     case 'toggle_project':
       return { ...state, collapsed: { ...state.collapsed, [action.slug]: !state.collapsed[action.slug] } }
+    case 'expand_only': {
+      const collapsed: Record<string, boolean> = {}
+      for (const project of state.graph?.projects ?? []) collapsed[project.slug] = project.slug !== action.slug
+      return { ...state, collapsed }
+    }
+    case 'collapse_all': {
+      const collapsed: Record<string, boolean> = {}
+      for (const project of state.graph?.projects ?? []) collapsed[project.slug] = true
+      return { ...state, collapsed }
+    }
     case 'toggle_team':
       return { ...state, teamOpen: !state.teamOpen }
     case 'toggle_details':
@@ -888,6 +908,37 @@ export function dotState(activity: Activity | undefined): 'ongoing' | 'done' | '
     case 'idle':
     case undefined:
       return 'done'
+  }
+}
+
+/**
+ * Locale key for a lifecycle transition's transcript row. Idle release and
+ * capacity eviction both arrive as `evicted` (the daemon's one release path);
+ * the reason tells the reader whether it was the cache-TTL sweep or the
+ * fleet cap — and that the session comes back on its own.
+ * @param state - lifecycle state.
+ * @param reason - machine-readable cause, when the frame carried one.
+ * @returns a dictionary key, or null for a transition with no dedicated copy.
+ */
+export type LifecycleCopyKey =
+  | 'chat.lifecycle.released'
+  | 'chat.lifecycle.evicted'
+  | 'chat.lifecycle.stopped'
+  | 'chat.lifecycle.resumed'
+  | 'chat.lifecycle.interrupted'
+
+export function lifecycleCopyKey(state: string, reason: string | undefined): LifecycleCopyKey | null {
+  switch (state) {
+    case 'evicted':
+      return reason === 'idle' ? 'chat.lifecycle.released' : 'chat.lifecycle.evicted'
+    case 'stopped':
+      return 'chat.lifecycle.stopped'
+    case 'resumed':
+      return 'chat.lifecycle.resumed'
+    case 'interrupted':
+      return 'chat.lifecycle.interrupted'
+    default:
+      return null
   }
 }
 

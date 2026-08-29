@@ -40,6 +40,7 @@ import {
   EVENTS_PATH,
   UPLOAD_PATH,
   type Activity,
+  type Residency,
   type ApiMethod,
   type AttachmentRef,
   type ChoiceOption,
@@ -731,6 +732,7 @@ export function buildGraph(nodes: unknown[]): TeamGraph {
       project: slug,
       vendor: stringOf(row.vendor) ?? '',
       activity: activityOf(stringOf(row.status)),
+      ...defined('residency', residencyOf(stringOf(row.residency))),
       ...defined('title', emptyToUndefined(stringOf(row.title))),
       ...defined('role', emptyToUndefined(stringOf(row.role))),
       ...defined('model', emptyToUndefined(stringOf(row.model))),
@@ -808,15 +810,14 @@ export function buildModels(rows: unknown[]): ModelsCatalog {
 }
 
 /**
- * The graph endpoint reports tracked-ness (`live` / `idle`), a coarser axis
- * than the workbench's four-way activity. `live` is surfaced as `working` and
- * the live SSE refines it; `stale` / `stuck` are not derivable here (they
- * come from the per-project session view, which would cost one call per
- * project).
+ * The graph endpoint's `status` is the daemon's single activity verdict
+ * (`working` / `idle` / `stale` / `stuck`, the same resolver every other
+ * surface reads). Anything else — including the `detached` word a body
+ * outliving a restart carries — is not work in progress and reads as idle;
+ * residency says the rest.
  */
 function activityOf(status: string | undefined): Activity {
   switch (status) {
-    case 'live':
     case 'working':
       return 'working'
     case 'stale':
@@ -825,6 +826,19 @@ function activityOf(status: string | undefined): Activity {
       return 'stuck'
     default:
       return 'idle'
+  }
+}
+
+/** The graph endpoint's `residency` axis, passed through when it is one of ours. */
+function residencyOf(residency: string | undefined): Residency | undefined {
+  switch (residency) {
+    case 'resident':
+    case 'released':
+    case 'stopped':
+    case 'detached':
+      return residency
+    default:
+      return undefined
   }
 }
 

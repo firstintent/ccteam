@@ -30,7 +30,7 @@ import type { ApiClient } from './api.js'
 import { Composer } from './Composer.js'
 import type { ComposerAttachment } from './Composer.js'
 import { formatElapsed, modelDirective } from './format.js'
-import { effortsFor } from './store.js'
+import { effortsFor, lifecycleCopyKey } from './store.js'
 import type { Action, ChatNotice, ChatRow, ChatState } from './store.js'
 import type { T } from './slots.js'
 import css from './workbench.module.css'
@@ -295,8 +295,10 @@ function Row({ row, selectedStep, t, onSelectStep, onResolve }: {
           }}
         />
       )
-    case 'system':
-      return <div className={css.systemRow} data-tone={row.tone}>{t('chat.lifecycle', { state: row.text })}</div>
+    case 'system': {
+      const key = row.lifecycle === undefined ? null : lifecycleCopyKey(row.lifecycle.state, row.lifecycle.reason)
+      return <div className={css.systemRow} data-tone={row.tone}>{key === null ? t('chat.lifecycle', { state: row.text }) : t(key)}</div>
+    }
   }
 }
 
