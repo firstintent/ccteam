@@ -9,7 +9,7 @@
  *
  *   - whoever starts it first wins, and everyone else ATTACHES;
  *   - `dispose()` releases probes and nothing else — a DSH restart or a
- *     `dsh plugin update` must never drop the Telegram gateway or a running
+ *     `dsh plugin --profile <name> update` must never drop the Telegram gateway or a running
  *     A2A delegation;
  *   - a daemon reporting a DIFFERENT home is never "fixed" by starting a
  *     second one; it is reported (`Mismatch{home}`) and left alone;
@@ -282,7 +282,7 @@ export class EngineSupervisor {
           errorKind: 'packageMissing',
           error:
             'the engine package that ships with this plugin is not installed; reinstall the ' +
-            'plugin (`dsh plugin add @ccteam/ccteam-ui`) so its platform package comes with it',
+            'plugin (`dsh plugin --profile <name> add @ccteam/ccteam-ui`, profile = the one you started `dsh web` with) so its platform package comes with it',
         }
       }
       if (before.binary === undefined) {
@@ -574,7 +574,7 @@ export class EngineSupervisor {
         errorKind: 'packageMissing',
         error:
           'the engine package that ships with this plugin is not installed; reinstall the plugin ' +
-          '(`dsh plugin add @ccteam/ccteam-ui`) so its platform package comes with it',
+          '(`dsh plugin --profile <name> add @ccteam/ccteam-ui`, profile = the one you started `dsh web` with) so its platform package comes with it',
       }
     }
     // A RUNNING daemon is never swapped from under itself — that is what

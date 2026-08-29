@@ -32,7 +32,7 @@ export interface CcteamSettings {
   connectionStatus: string
   /**
    * Install the engine and start its daemon when this plugin loads. ON by
-   * default: `dsh plugin add @ccteam/ccteam-ui` is meant to be the whole
+   * default: `dsh plugin --profile <name> add @ccteam/ccteam-ui` is meant to be the whole
    * install. Turning it off never STOPS anything — the daemon outlives this
    * plugin either way (PRD D1); it only means the plugin waits to be asked.
    */

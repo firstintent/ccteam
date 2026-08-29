@@ -20,14 +20,14 @@ import {
   writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { EngineStatus } from '../shared/contract.js'
-import { engineDot, engineEnablement, engineInertKey, engineStateKey, truncateMiddle } from './engine.js'
+import { engineDot, engineEnablement, engineInertKey, engineStateKey, hostDetailShown, truncateMiddle } from './engine.js'
 import type { EngineDotState, VersionRelation } from './engine.js'
 import { isAbsolutePath } from './projects.js'
 import type { T, UseWorkspaces } from './slots.js'
 import type { EngineAction } from './store.js'
 import css from './workbench.module.css'
 
-/** A code chip with a copy button (`ccteam start`, `dsh plugin update …`). */
+/** A code chip with a copy button (`ccteam start`, `dsh plugin --profile <name> update …`). */
 export function CopyChip({ text, t }: { text: string; t: T }) {
   const [copied, setCopied] = useState(false)
   return (
@@ -131,7 +131,7 @@ export function EnginePanel({ t, status, pending, error, mode, onStart, onOpenSe
             <dd title={status.daemonHome ?? ''}>{status.daemonHome ?? '—'}</dd>
           </dl>
         )}
-        {status !== null && status.detail !== '' && <p className={css.firstRunDetail}>{status.detail}</p>}
+        {status !== null && hostDetailShown(status, false) && <p className={css.firstRunDetail}>{status.detail}</p>}
         {error !== null && <p className={css.firstRunError} role="alert">{t('engine.error', { message: error })}</p>}
         {(showStart || onOpenSettings !== undefined) && (
           <div className={css.firstRunActions}>
@@ -159,6 +159,14 @@ export function EnginePanel({ t, status, pending, error, mode, onStart, onOpenSe
   )
 }
 
+/**
+ * The repair when the plugin is the older side. DSH refuses `dsh plugin …`
+ * without `--profile`, and the client runtime's host description carries the
+ * account home but not the profile name, so the command names `<name>` and
+ * the hint line says which one.
+ */
+export const PLUGIN_UPDATE_COMMAND = 'dsh plugin --profile <name> update @ccteam/ccteam-ui'
+
 export interface VersionBannerProps {
   t: T
   relation: VersionRelation
@@ -172,7 +180,7 @@ export interface VersionBannerProps {
 /**
  * The version banner: engine older than the plugin's pinned version → update
  * the engine (one-way repair, PRD D5); plugin older than the daemon → the
- * `dsh plugin update` command to copy.
+ * `dsh plugin --profile <name> update` command to copy.
  * @param props - relation and actions.
  * @returns the banner, or null when the versions agree.
  */
@@ -185,6 +193,7 @@ export function VersionBanner({ t, relation, canUpdate, pending, onUpdate, onDis
         {relation.kind === 'engine-older'
           ? t('banner.engineOlder', { engine: relation.engine, pinned: relation.pinned })
           : t('banner.pluginOlder', { plugin: relation.plugin, engine: relation.engine })}
+        {relation.kind === 'plugin-older' && <span className={css.bannerHint}>{t('banner.profileHint')}</span>}
       </span>
       <span className={css.bannerActions}>
         {relation.kind === 'engine-older' && canUpdate && (
@@ -192,7 +201,7 @@ export function VersionBanner({ t, relation, canUpdate, pending, onUpdate, onDis
             {pending === 'update' ? t('engine.action.updating') : t('banner.update')}
           </Button>
         )}
-        {relation.kind === 'plugin-older' && <CopyChip text="dsh plugin update @ccteam/ccteam-ui" t={t} />}
+        {relation.kind === 'plugin-older' && <CopyChip text={PLUGIN_UPDATE_COMMAND} t={t} />}
         <button type="button" className={css.iconBtn} aria-label={t('banner.dismiss')} onClick={onDismiss}>
           <IconCloseOutline16 size={14} />
         </button>

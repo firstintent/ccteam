@@ -1530,6 +1530,12 @@
   min-width: 0;
 }
 
+.bannerHint {
+  display: block;
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-xxs-12);
+}
+
 .bannerActions {
   flex: none;
   display: inline-flex;

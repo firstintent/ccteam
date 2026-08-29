@@ -16,6 +16,7 @@ import {
   enginePollMs,
   engineStateKey,
   firstRunState,
+  hostDetailShown,
   needsConfirmation,
   refreshEngine,
   relationOf,
@@ -177,6 +178,20 @@ describe('engineEnablement', () => {
     expect(engineEnablement(status({ supervised: false, unsupervisedReason: 'pinned' }), null)).toEqual({ start: false, stop: false, restart: false, update: false })
     expect(engineEnablement(status({ state: 'stopped', reachable: false }), 'start')).toEqual({ start: false, stop: false, restart: false, update: false })
     expect(engineEnablement(null, null)).toEqual({ start: false, stop: false, restart: false, update: false })
+  })
+
+  it('shows the host detail only where it adds to the client copy', () => {
+    expect(hostDetailShown(null, false)).toBe(false)
+    expect(hostDetailShown(status({ state: 'mismatch', mismatch: 'home' }), true)).toBe(true)
+    expect(hostDetailShown(status({ state: 'mismatch', mismatch: 'version' }), false)).toBe(true)
+    expect(hostDetailShown(status({ state: 'unsupported' }), true)).toBe(true)
+    // A live daemon: the sentence carries pid + home, which a facts line already shows.
+    expect(hostDetailShown(status({ state: 'running' }), false)).toBe(true)
+    expect(hostDetailShown(status({ state: 'attached' }), true)).toBe(false)
+    for (const state of ['missing', 'stopped', 'starting', 'installing'] as const) {
+      expect(hostDetailShown(status({ state, reachable: false }), false), state).toBe(false)
+    }
+    expect(hostDetailShown(status({ state: 'mismatch', mismatch: 'home', detail: '' }), false)).toBe(false)
   })
 
   it('confirms the two actions that take a daemon down', () => {

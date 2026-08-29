@@ -24,6 +24,7 @@ import {
   engineEnablement,
   engineInertKey,
   engineStateKey,
+  hostDetailShown,
   requestEngineAction,
   stripAnsi,
   truncateMiddle,
@@ -121,6 +122,7 @@ export function EngineSection({ t, engine, api, dispatch, autoStart, onAutoStart
         </span>
       </div>
       {status?.state === 'attached' && <p className={css.engineHint}>{t('engine.attached.hint')}</p>}
+      {status !== null && hostDetailShown(status, facts.length > 0) && <p className={css.engineDetail}>{status.detail}</p>}
       {facts.length > 0 && (
         <p className={css.engineFacts}>
           {facts.map(fact => (

@@ -123,8 +123,9 @@ describe('settings engine section', () => {
     expect(html).toContain('127.0.0.1:17951')
     expect(html).toContain('href="http://127.0.0.1:17951"')
     expect(html).toContain('打开 ccteam web')
-    // The daemon version repeats the binary's: shown once.
+    // The daemon version repeats the binary's: shown once; the host sentence repeats the facts: hidden.
     expect(html).not.toContain('daemon v0.10.3')
+    expect(html).not.toContain('is running (pid 4242)')
   })
 
   it('stopped: only start is enabled and there is no web link', () => {
@@ -143,10 +144,11 @@ describe('settings engine section', () => {
     expect(button(html, '停止').disabled).toBe(false)
   })
 
-  it('version mismatch with an older engine: the update button appears, the daemon version is shown', () => {
-    const html = section(slice({ status: status({ state: 'mismatch', mismatch: 'version', runningVersion: '0.10.1' }) }))
+  it('version mismatch with an older engine: the update button appears, the daemon version and the host sentence are shown', () => {
+    const html = section(slice({ status: status({ state: 'mismatch', mismatch: 'version', runningVersion: '0.10.1', detail: 'the running engine is 0.10.1; this plugin ships against 0.10.3.' }) }))
     expect(html).toContain('版本不一致')
     expect(html).toContain('daemon v0.10.1')
+    expect(html).toContain('this plugin ships against 0.10.3.')
     expect(button(html, '更新引擎').disabled).toBe(false)
     expect(button(html, '停止').disabled).toBe(true)
   })
@@ -197,16 +199,19 @@ function panel(engine: EngineSlice, mode: 'first-run' | 'manual' = 'first-run'):
 
 describe('first-run engine panel', () => {
   it('stopped: title, reason, one-click start, and where the settings live', () => {
-    const html = panel(slice({ status: status({ state: 'stopped', reachable: false }) }))
+    const html = panel(slice({ status: status({ state: 'stopped', reachable: false, detail: 'ccteam 0.10.3 is installed at /tmp/sbx/bin/ccteam; the daemon is not running.' }) }))
     expect(html).toContain('ccteam 引擎未运行')
     expect(html).toContain('引擎已安装,但 daemon 没有运行。')
+    // The host sentence repeats the reason in other words: hidden.
+    expect(html).not.toContain('the daemon is not running.')
     expect(button(html, '启动引擎').disabled).toBe(false)
     expect(html).toContain('插件配置 → ccteam-ui')
   })
 
   it('installing / starting: a spinner title and no start button', () => {
-    const html = panel(slice({ status: status({ state: 'installing', reachable: false }) }))
+    const html = panel(slice({ status: status({ state: 'installing', reachable: false, detail: 'installing the ccteam engine from the plugin’s platform package…' }) }))
     expect(html).toContain('正在安装引擎…')
+    expect(html).not.toContain('platform package…')
     expect(buttons(html)).toEqual([])
     expect(panel(slice({ status: status({ state: 'starting', reachable: false }) }))).toContain('正在启动引擎…')
   })
@@ -217,9 +222,10 @@ describe('first-run engine panel', () => {
     expect(html).toContain('此 DSH 由 ccteam 启动')
   })
 
-  it('home mismatch: both homes and the one hint', () => {
-    const html = panel(slice({ status: status({ state: 'mismatch', mismatch: 'home', home: '/a/.ccteam', daemonHome: '/b/.ccteam' }) }))
+  it('home mismatch: both homes, the one hint, and the host sentence (it names both homes)', () => {
+    const html = panel(slice({ status: status({ state: 'mismatch', mismatch: 'home', home: '/a/.ccteam', daemonHome: '/b/.ccteam', detail: 'the daemon at http://127.0.0.1:17951 runs in /b/.ccteam, not /a/.ccteam.' }) }))
     expect(html).toContain('引擎家目录不一致')
+    expect(html).toContain('runs in /b/.ccteam, not /a/.ccteam.')
     expect(html).toContain('/a/.ccteam')
     expect(html).toContain('/b/.ccteam')
     expect(html).toContain('统一 CCTEAM_HOME 后重启 DSH')
@@ -252,7 +258,10 @@ describe('version banner', () => {
       <VersionBanner t={t} relation={{ kind: 'plugin-older', plugin: '0.10.3', engine: '0.10.9' }} canUpdate={false} pending={null} onUpdate={() => {}} onDismiss={() => {}} />,
     )
     expect(html).toContain('插件 v0.10.3 低于引擎 v0.10.9')
-    expect(html).toContain('dsh plugin update @ccteam/ccteam-ui')
+    // DSH refuses `dsh plugin …` without --profile; the runtime does not expose the profile name.
+    expect(html).toContain('dsh plugin --profile &lt;name&gt; update @ccteam/ccteam-ui')
+    expect(html).not.toContain('dsh plugin update')
+    expect(html).toContain('profile = 启动 dsh web 时用的那个')
     expect(renderToStaticMarkup(<VersionBanner t={t} relation={{ kind: 'match' }} canUpdate={false} pending={null} onUpdate={() => {}} onDismiss={() => {}} />)).toBe('')
   })
 })

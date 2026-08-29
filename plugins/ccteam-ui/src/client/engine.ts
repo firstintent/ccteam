@@ -428,6 +428,33 @@ export function startEnginePoller(store: ConsoleStore, api: ApiClient, options: 
   }
 }
 
+/**
+ * Whether the host's `detail` sentence adds to the client copy. It does for
+ * a mismatch (both homes / both versions) and an unsupported platform (the
+ * tuple), and for a live daemon when no facts line already shows pid + home;
+ * for missing / stopped / starting / installing it repeats the client's own
+ * sentence in other words, so those hide it.
+ * @param status - the host's status.
+ * @param factsShown - whether the surface already renders the facts line.
+ * @returns true when the detail line is worth a row.
+ */
+export function hostDetailShown(status: EngineStatus | null, factsShown: boolean): boolean {
+  if (status === null || status.detail === '') return false
+  switch (status.state) {
+    case 'mismatch':
+    case 'unsupported':
+      return true
+    case 'running':
+    case 'attached':
+      return !factsShown
+    case 'missing':
+    case 'stopped':
+    case 'starting':
+    case 'installing':
+      return false
+  }
+}
+
 // ------------------------------------------------------------------ text
 
 /**

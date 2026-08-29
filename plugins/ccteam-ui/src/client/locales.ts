@@ -272,6 +272,7 @@ export const zh = {
   'banner.pluginOlder': '插件 v{plugin} 低于引擎 v{engine}',
   'banner.update': '更新引擎',
   'banner.dismiss': '关闭提示',
+  'banner.profileHint': 'profile = 启动 dsh web 时用的那个',
 } satisfies Record<string, string>
 
 /** The ccteam namespace key union. */
@@ -549,4 +550,5 @@ export const en = {
   'banner.pluginOlder': 'Plugin v{plugin} is older than the engine (v{engine})',
   'banner.update': 'Update engine',
   'banner.dismiss': 'Dismiss',
+  'banner.profileHint': 'profile = the one you started dsh web with',
 } satisfies Record<CcteamLocaleKey, string>

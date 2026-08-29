@@ -425,6 +425,23 @@ describe('apply(): probe, attach, start', () => {
     expect(calls(sbx)).toEqual([])
   })
 
+  it('names the reinstall command WITH --profile when the platform package is missing', async () => {
+    const { supervisor } = await harness({ installed: false, packageVersion: false })
+
+    // DSH rc.2 refuses `dsh plugin add …` without `--profile <name>`: the only
+    // command this plugin ever prints must be the one that runs.
+    const started = await supervisor.start()
+    expect(started.ok).toBe(false)
+    expect(started.errorKind).toBe('packageMissing')
+    expect(started.error).toContain('`dsh plugin --profile <name> add @ccteam/ccteam-ui`')
+    expect(started.error).toContain('profile = the one you started `dsh web` with')
+    expect(started.error).not.toContain('`dsh plugin add')
+
+    const updated = await supervisor.update()
+    expect(updated.errorKind).toBe('packageMissing')
+    expect(updated.error).toContain('`dsh plugin --profile <name> add @ccteam/ccteam-ui`')
+  })
+
   it('installs the engine from the platform package, then starts it', async () => {
     const { sbx, supervisor } = await harness({ installed: false })
 

@@ -95,7 +95,7 @@ describe('settings registration', () => {
   })
 
   /**
-   * `autoStart` is ON by default because `dsh plugin add @ccteam/ccteam-ui` is
+   * `autoStart` is ON by default because `dsh plugin --profile <name> add @ccteam/ccteam-ui` is
    * meant to be the whole install (PRD G2). It is also the one key whose
    * default is load-bearing in the OTHER direction: it lives on the settings
    * card and NOT in the profile row schema, because Cordis fills every row

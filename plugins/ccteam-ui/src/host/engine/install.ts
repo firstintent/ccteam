@@ -4,7 +4,7 @@
  * The binary rides `optionalDependencies` on `@ccteam/engine-<os>-<cpu>`
  * (esbuild's shape: `os`/`cpu` fields, no lifecycle script), because a DSH
  * profile is a pnpm workspace and pnpm 10 blocks postinstall by default.
- * `dsh plugin add @ccteam/ccteam-ui` therefore downloads the right engine for
+ * `dsh plugin --profile <name> add @ccteam/ccteam-ui` therefore downloads the right engine for
  * this machine and nothing else — but it downloads it into `node_modules`,
  * where PATH cannot see it and where a `pnpm prune` can take it away.
  *

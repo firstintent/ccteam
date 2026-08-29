@@ -191,7 +191,7 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
   /**
    * The row describes an engine somebody else set up. A ccteam-materialized
    * profile is recognized by the CREDENTIALS in its row — ccteam writes them,
-   * a human's `dsh plugin add` never does — rather than by the daemon URL,
+   * a human's `dsh plugin --profile <name> add` never does — rather than by the daemon URL,
    * whose schema default is present in every row and would otherwise mark
    * every profile as somebody else's.
    */

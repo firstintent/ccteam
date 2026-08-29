@@ -275,6 +275,16 @@
 }
 
 /* Facts line: monospace, tertiary, `·`-separated; the full home in `title`. */
+/* The host's own sentence, only where it adds to the label (mismatch / unsupported). */
+.engineDetail {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: var(--ds-font-family-code);
+  color: var(--dsw-alias-label-tertiary);
+  overflow-wrap: anywhere;
+}
+
 .engineFacts {
   margin: 0;
   display: flex;
