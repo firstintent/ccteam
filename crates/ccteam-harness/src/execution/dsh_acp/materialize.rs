@@ -863,10 +863,14 @@ fn materialize_profile_files(
     })?;
 
     let package_json = merged_profile_package_json(profile_dir, plans, spec, ownership)?;
-    write_if_changed(&profile_dir.join("package.json"), package_json.as_bytes())?;
+    write_document_if_changed(
+        &profile_dir.join("package.json"),
+        &package_json,
+        DocumentKind::Json,
+    )?;
     let patch_path = profile_dir.join(PATCH_FILE);
     if let Some(patch_yaml) = merged_profile_patch_yaml(&patch_path, spec, ownership)? {
-        write_if_changed(&patch_path, patch_yaml.as_bytes())?;
+        write_document_if_changed(&patch_path, &patch_yaml, DocumentKind::Yaml)?;
     }
     // The patch may carry this identity's credentials (`restToken`, and a
     // tenant's `enrollment`): private to the OS user, whatever the umask made
@@ -1256,16 +1260,109 @@ fn flat_config<'a>(entries: impl IntoIterator<Item = (&'static str, Option<&'a s
     config
 }
 
-fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
-    if fs::read(path).is_ok_and(|existing| existing == bytes) {
-        return Ok(());
+/// Which parser answers "do these two files SAY the same thing?".
+#[derive(Clone, Copy)]
+enum DocumentKind {
+    Json,
+    Yaml,
+}
+
+impl DocumentKind {
+    /// Same document? A side this build cannot parse answers `false`: an
+    /// unreadable file is not evidence that ccteam's rows are already in it.
+    fn same_document(self, a: &str, b: &str) -> bool {
+        match self {
+            DocumentKind::Json => match (
+                serde_json::from_str::<serde_json::Value>(a),
+                serde_json::from_str::<serde_json::Value>(b),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            },
+            DocumentKind::Yaml => match (
+                serde_yaml::from_str::<serde_yaml::Value>(a),
+                serde_yaml::from_str::<serde_yaml::Value>(b),
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            },
+        }
+    }
+}
+
+/// Write `body` to `path` only when it SAYS something the file does not
+/// already say — compared as a parsed document, never as bytes.
+///
+/// Re-registration must cost ZERO writes: the daemon registers on every start
+/// and every `register-mcp` call registers again. ccteam rebuilds both profile
+/// files from a parsed model, and serializing normalizes formatting the
+/// operator never asked to change (`serde_json` sorts object keys;
+/// `serde_yaml` renders a flow mapping as a block one and prefers single
+/// quotes), so a byte comparison calls a file "changed" that says exactly what
+/// it said before — and rewrites the operator's own profile on every run.
+///
+/// Honest about what the FIRST ccteam write costs: it does normalize that
+/// file's formatting, and `serde_yaml` drops YAML comments (it parses to a
+/// value, not to a syntax tree that could carry them). That is a one-time cost
+/// on a file ccteam legitimately edits — a normalized file compares equal on
+/// every later run, so nothing here re-normalizes what it already normalized,
+/// and comments the operator adds after that survive as long as the document
+/// keeps saying the same thing. A comment-preserving round-trip needs a
+/// CST-level YAML parser, and no crate in this workspace's graph has one
+/// (`serde_yaml` 0.9 is the only YAML in it); pulling in a new dependency to
+/// keep comments through a re-formatting write is not a trade this makes.
+fn write_document_if_changed(
+    path: &Path,
+    body: &str,
+    kind: DocumentKind,
+) -> Result<(), HarnessError> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == body || kind.same_document(&existing, body) {
+            return Ok(());
+        }
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
             HarnessError::SpawnFailed(format!("create parent {}: {e}", parent.display()))
         })?;
     }
-    fs::write(path, bytes).map_err(|e| {
+    replace_file(path, body.as_bytes())
+}
+
+/// Put `bytes` at `path` in one step: sibling temp file, then rename over the
+/// target. A concurrent reader — DSH's own boot, or `dsh plugin`'s pnpm — sees
+/// either the old file or the new one, never the truncated middle of an
+/// in-place write.
+///
+/// The temp file takes the destination's current mode when there is one, so
+/// the patch file (it carries this identity's credentials) stays 0600 across
+/// the swap rather than being world-readable for the window between the rename
+/// and the chmod behind it. No fsync: these are re-derivable registration
+/// files, not the durability-critical state
+/// [`crate::execution::fs_atomic::atomic_write_durable`] exists for — losing
+/// one to a power cut costs a re-registration, which the next daemon start
+/// does anyway.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), HarnessError> {
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        now_nanos()
+    ));
+    let swap = (|| -> std::io::Result<()> {
+        fs::write(&tmp, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(path) {
+                let mode = meta.permissions().mode() & 0o7777;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+            }
+        }
+        fs::rename(&tmp, path)
+    })();
+    swap.map_err(|e| {
+        let _ = fs::remove_file(&tmp);
         HarnessError::SpawnFailed(format!("write DSH profile file {}: {e}", path.display()))
     })
 }
@@ -1323,6 +1420,11 @@ fn set_private_file(path: &Path) -> Result<(), HarnessError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Already private: chmod-ing it again is a change to a file a
+        // re-registration is supposed to leave entirely alone.
+        if fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o7777 == 0o600) {
+            return Ok(());
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
             HarnessError::SpawnFailed(format!("chmod 0600 {}: {e}", path.display()))
         })?;
@@ -2667,6 +2769,151 @@ mod tests {
             findings[0].kind,
             DshPluginFindingKind::VersionMismatch { .. }
         ));
+    }
+
+    /// Registering the same thing twice must cost NOTHING on disk. The daemon
+    /// registers on every start and every `register-mcp` call registers again;
+    /// a profile whose files are rewritten each time is a profile whose mtime
+    /// lies to every tool that watches it — and whose operator sees ccteam
+    /// touching their file for no reason.
+    #[test]
+    fn re_registration_is_a_no_op_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dsh-web-profile",
+                "private": true,
+                "dependencies": {"@ccteam/whatever": "^2.0.0"},
+                "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base", "@ccteam/whatever"]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Their row, in formatting ccteam's serializer does not reproduce: a
+        // flow mapping and double quotes.
+        fs::write(
+            profile_dir.join(PATCH_FILE),
+            "- config: { keep: true }\n  name: \"@ccteam/whatever\"\n  id: whatever\n",
+        )
+        .unwrap();
+        let theirs = user_package(
+            &profile_dir,
+            "whatever",
+            serde_json::json!({"name": "@ccteam/whatever", "version": "2.0.0"}),
+        );
+        let before_theirs = tree_bytes(&theirs);
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        // What survives their row's re-formatting is its MEANING.
+        assert_eq!(
+            row_with_id(&read_patch(&profile_dir), "whatever")["config"]["keep"],
+            serde_yaml::Value::Bool(true),
+            "their row still says what they wrote"
+        );
+        let package_path = profile_dir.join("package.json");
+        let patch_path = profile_dir.join(PATCH_FILE);
+        let package_bytes = fs::read(&package_path).unwrap();
+        let patch_bytes = fs::read(&patch_path).unwrap();
+        let package_stamp = fs::metadata(&package_path).unwrap().modified().unwrap();
+        let patch_stamp = fs::metadata(&patch_path).unwrap().modified().unwrap();
+
+        // Far enough apart that a rewrite would move the mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            fs::read(&package_path).unwrap(),
+            package_bytes,
+            "the second registration rewrote package.json"
+        );
+        assert_eq!(
+            fs::metadata(&package_path).unwrap().modified().unwrap(),
+            package_stamp,
+            "package.json was written again — same bytes, new mtime"
+        );
+        assert_eq!(
+            fs::read(&patch_path).unwrap(),
+            patch_bytes,
+            "the second registration rewrote the patch file"
+        );
+        assert_eq!(
+            fs::metadata(&patch_path).unwrap().modified().unwrap(),
+            patch_stamp,
+            "the patch file was written again — same bytes, new mtime"
+        );
+        assert_eq!(
+            tree_bytes(&theirs),
+            before_theirs,
+            "their package is still theirs"
+        );
+        assert!(
+            !fs::read_dir(&profile_dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| { entry.file_name().to_string_lossy().ends_with(".tmp") }),
+            "a swap left its temp file behind"
+        );
+    }
+
+    /// The operator formatted their profile their own way — a comment above
+    /// their row, a manifest they compacted — and it says exactly what ccteam
+    /// would write. Re-registration asks that question by MEANING, so their
+    /// formatting and their comment stay; a byte comparison would flatten both
+    /// on every daemon start, and `serde_yaml` would take the comment with it.
+    #[test]
+    fn a_profile_the_operator_reformatted_is_not_rewritten() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = operator_installed_profile(dsh_home.path(), "0.10.4-alpha.0");
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        let package_path = profile_dir.join("package.json");
+        let patch_path = profile_dir.join(PATCH_FILE);
+        let compacted = format!(
+            "{}\n",
+            serde_json::to_string(&read_package(&profile_dir)).unwrap()
+        );
+        let annotated = format!(
+            "# these rows are ccteam's; this file is mine.\n{}\n",
+            fs::read_to_string(&patch_path).unwrap()
+        );
+        assert_ne!(
+            compacted.as_bytes(),
+            fs::read(&package_path).unwrap(),
+            "the fixture must not already be ccteam's own formatting"
+        );
+        fs::write(&package_path, &compacted).unwrap();
+        fs::write(&patch_path, &annotated).unwrap();
+        let package_stamp = fs::metadata(&package_path).unwrap().modified().unwrap();
+        let patch_stamp = fs::metadata(&patch_path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&package_path).unwrap(),
+            compacted,
+            "their manifest formatting is not ccteam's to normalize twice"
+        );
+        assert_eq!(
+            fs::read_to_string(&patch_path).unwrap(),
+            annotated,
+            "their comment survives a registration that had nothing to change"
+        );
+        assert_eq!(
+            fs::metadata(&package_path).unwrap().modified().unwrap(),
+            package_stamp
+        );
+        assert_eq!(
+            fs::metadata(&patch_path).unwrap().modified().unwrap(),
+            patch_stamp
+        );
     }
 
     /// A bundle id listed twice aborts the whole Cordis boot. Rows ccteam

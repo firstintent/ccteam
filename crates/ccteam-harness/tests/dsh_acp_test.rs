@@ -949,6 +949,114 @@ fn operator_web_spawn_keeps_their_scoped_packages_and_reports_a_broken_install()
     );
 }
 
+/// The daemon registers on every start, so the operator's DSH profile is
+/// re-registered over and over. The second pass must touch NOTHING: not the
+/// bytes, not the mtime — not even after they reformatted the files ccteam
+/// wrote (a comment above the rows, a manifest they compacted). ccteam rebuilds
+/// both files from a parsed model, so the only honest comparison is by meaning;
+/// comparing bytes would flatten their formatting on every daemon start and
+/// take their YAML comments with it.
+#[test]
+#[serial(dsh_env)]
+fn a_repeated_operator_web_spawn_leaves_their_profile_untouched() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dsh_home = operator_dsh_home(&tmp);
+    let profile_dir = dsh_home.join("profiles").join(DSH_NATIVE_WEB_PROFILE);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::write(
+        profile_dir.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-web-profile",
+            "dependencies": {"@ccteam/whatever": "^2.0.0"},
+            "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-web-app", "@ccteam/whatever"]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = profile_dir
+        .join("node_modules")
+        .join("@ccteam")
+        .join("whatever");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::write(
+        theirs.join("package.json"),
+        serde_json::json!({"name": "@ccteam/whatever", "version": "2.0.0"}).to_string(),
+    )
+    .unwrap();
+    let socket = identity_socket_path("user:web-api", &ccteam_home(&tmp));
+    let spawn = || {
+        build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: "user:web-api",
+            ccteam_home: ccteam_home(&tmp),
+            dsh_home: dsh_home.clone(),
+            profile: DSH_NATIVE_WEB_PROFILE,
+            materialize_profile: false,
+            enrollment: None,
+            daemon_url: Some("http://127.0.0.1:7331"),
+            transport_socket: Some(&socket),
+            rest_token: None,
+        })
+        .expect("operator web spawn spec");
+    };
+
+    spawn();
+
+    let package_path = profile_dir.join("package.json");
+    let patch_path = profile_dir.join("cordis.patch.yml");
+    let package_body = format!(
+        "{}\n",
+        serde_json::to_string(
+            &serde_json::from_slice::<Value>(&std::fs::read(&package_path).unwrap()).unwrap()
+        )
+        .unwrap()
+    );
+    let patch_body = format!(
+        "# ccteam writes these rows; the file is mine.\n{}\n",
+        std::fs::read_to_string(&patch_path).unwrap()
+    );
+    std::fs::write(&package_path, &package_body).unwrap();
+    std::fs::write(&patch_path, &patch_body).unwrap();
+    let package_stamp = std::fs::metadata(&package_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let patch_stamp = std::fs::metadata(&patch_path).unwrap().modified().unwrap();
+
+    // Far enough apart that a rewrite would move the mtime.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    spawn();
+
+    assert_eq!(
+        std::fs::read_to_string(&package_path).unwrap(),
+        package_body,
+        "a repeated spawn rewrote their manifest"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&patch_path).unwrap(),
+        patch_body,
+        "a repeated spawn rewrote their patch file — and took the comment"
+    );
+    assert_eq!(
+        std::fs::metadata(&package_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        package_stamp,
+        "their manifest was written again with the same bytes"
+    );
+    assert_eq!(
+        std::fs::metadata(&patch_path).unwrap().modified().unwrap(),
+        patch_stamp,
+        "their patch file was written again with the same bytes"
+    );
+    assert_eq!(
+        patch_config(&profile_dir)["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+        "the config row is still the one ccteam configured"
+    );
+}
+
 #[test]
 #[serial(dsh_env)]
 fn web_profile_factory_seeds_operator_credentials_and_marker_for_tenant_home() {
