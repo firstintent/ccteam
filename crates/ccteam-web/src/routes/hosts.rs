@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::{deny_non_admin, Identity};
-use crate::dsh_web::PluginVersionMismatchView;
+use crate::dsh_web::DshPluginFindingView;
 use crate::state::AppState;
 
 /// The id of this machine — the single host until the v0.9 host axis adds
@@ -76,11 +76,12 @@ pub struct AgentHealth {
     pub status: String,
     /// Copy-paste remediation when not `ready`; `null` when ready.
     pub hint: Option<String>,
-    /// `dsh` only: the operator installed the ccteam plugin themselves at a
-    /// version this build does not embed. ccteam reports it and leaves their
-    /// install alone — updating someone else's package is theirs to do.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plugin_version_mismatch: Option<PluginVersionMismatchView>,
+    /// `dsh` only: what the operator's OWN `~/.dsh` profile carries that
+    /// ccteam left alone — version drift from the embedded copy, a duplicated
+    /// bundle id, an install pnpm never finished. Reports, never repairs:
+    /// touching someone else's package is theirs to do.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dsh_plugin_findings: Vec<DshPluginFindingView>,
 }
 
 /// Collection row for `GET /api/v1/hosts`.
@@ -236,11 +237,13 @@ fn agent_health(
         _ => None,
     };
     AgentHealth {
-        // Only DSH has an operator-installed ccteam plugin to drift from; every
-        // other vendor answers `None` by construction.
-        plugin_version_mismatch: (spec.vendor == "dsh")
-            .then(|| crate::dsh_web::operator_plugin_version_mismatches(ccteam_root))
-            .and_then(|mut found| found.pop()),
+        // Only DSH has an operator-installed ccteam plugin to report on; every
+        // other vendor answers "nothing" by construction.
+        dsh_plugin_findings: if spec.vendor == "dsh" {
+            crate::dsh_web::operator_dsh_plugin_findings(ccteam_root)
+        } else {
+            Vec::new()
+        },
         vendor: spec.vendor.to_string(),
         harness_id: spec.harness_id.to_string(),
         installed,
@@ -437,7 +440,7 @@ pub(crate) async fn handle_host_detail(
                             hint: None,
                             // A satellite's own `~/.dsh` is not this machine's
                             // to read; its report belongs to its own doctor.
-                            plugin_version_mismatch: None,
+                            dsh_plugin_findings: Vec::new(),
                         }
                     })
                     .collect();

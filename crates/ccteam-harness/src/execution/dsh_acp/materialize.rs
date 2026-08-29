@@ -13,6 +13,7 @@
 //! the result with the Rust change. This mirrors the checked-in Pi bridge
 //! asset: Rust builds must not require npm or node.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -107,25 +108,76 @@ pub struct OperatorInstall {
     pub version: Option<String>,
 }
 
-/// An operator-installed plugin whose version differs from the copy ccteam
-/// embeds. Reported by `doctor` and the Hosts surface, never repaired:
-/// overwriting someone else's install is exactly what this module stopped
-/// doing.
+/// One thing ccteam found in a DSH profile it does NOT own and did not touch.
+///
+/// Every finding is a REPORT: `doctor` and the Hosts surface print it, the
+/// operator's own `dsh plugin` command fixes it. Repairing an install ccteam
+/// did not make is exactly what this module stopped doing — that is what
+/// leaves the same plugin id in a profile twice and aborts the whole Cordis
+/// boot (`duplicate loader entry id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginVersionMismatch {
-    pub bundle: &'static str,
-    pub installed: String,
-    pub embedded: String,
+pub struct DshPluginFinding {
+    /// npm name, as it appears in `dsh.profile.bundles`.
+    pub bundle: String,
+    pub kind: DshPluginFindingKind,
+    /// The operator's next step. Built here so `doctor` and the Hosts panel
+    /// can never word the same fix differently.
+    pub remedy: String,
 }
 
-impl PluginVersionMismatch {
+/// What ccteam found about one `@ccteam/*` entry someone else owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DshPluginFindingKind {
+    /// Their install is at a version this build does not embed.
+    VersionMismatch { installed: String, embedded: String },
+    /// Their package is there but carries no readable `version`, so the
+    /// mismatch check could not run — advisory. Not knowing is not drift, but
+    /// staying silent would read as "aligned".
+    VersionUnknown,
+    /// pnpm's dependency table declares it and no package directory exists:
+    /// the operator's own broken install, which ccteam does not take over.
+    MissingOnDisk,
+    /// The same bundle id is listed more than once and the rows are theirs.
+    /// Cordis aborts the boot on a duplicate loader entry id; ccteam collapses
+    /// only the rows it wrote itself.
+    DuplicateBundleId { count: usize },
+    /// More than one override row carries a ccteam loader id and they are not
+    /// all ccteam's own shape — so ccteam wrote none of them rather than
+    /// silently arm "the first".
+    DuplicatePatchRow { row_id: &'static str, count: usize },
+}
+
+impl DshPluginFinding {
+    /// Machine-readable code — the same token on every surface.
+    pub fn code(&self) -> &'static str {
+        match self.kind {
+            DshPluginFindingKind::VersionMismatch { .. } => "plugin_version_mismatch",
+            DshPluginFindingKind::VersionUnknown => "plugin_version_unknown",
+            DshPluginFindingKind::MissingOnDisk => "plugin_missing_on_disk",
+            DshPluginFindingKind::DuplicateBundleId { .. } => "duplicate_bundle_id",
+            DshPluginFindingKind::DuplicatePatchRow { .. } => "duplicate_patch_row",
+        }
+    }
+
     /// The one wording both surfaces print, so `doctor` and the Hosts panel
     /// can never word the same finding differently.
     pub fn report(&self) -> String {
-        format!(
-            "{} plugin_version_mismatch{{installed={}, embedded={}}}",
-            self.bundle, self.installed, self.embedded
-        )
+        let payload = match &self.kind {
+            DshPluginFindingKind::VersionMismatch {
+                installed,
+                embedded,
+            } => format!("installed={installed}, embedded={embedded}"),
+            DshPluginFindingKind::VersionUnknown | DshPluginFindingKind::MissingOnDisk => {
+                format!("id={}", self.bundle)
+            }
+            DshPluginFindingKind::DuplicateBundleId { count } => {
+                format!("id={}, count={count}", self.bundle)
+            }
+            DshPluginFindingKind::DuplicatePatchRow { row_id, count } => {
+                format!("id={row_id}, count={count}")
+            }
+        };
+        format!("{} {}{{{payload}}}", self.bundle, self.code())
     }
 }
 
@@ -179,36 +231,15 @@ pub fn register_ccteam_plugins_into_profile(
 /// NOT required: a resolver failure leaves the panel asking for one, which is
 /// still a working registration.
 pub fn ccteam_plugins_registered_in_profile(dsh_home: &Path, profile: &str) -> bool {
-    let profile_dir = dsh_home.join("profiles").join(profile);
-    let bundles: Vec<String> = fs::read_to_string(profile_dir.join("package.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|manifest| {
-            Some(
-                manifest
-                    .get("dsh")?
-                    .get("profile")?
-                    .get("bundles")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(|b| b.as_str().map(str::to_string))
-                    .collect(),
-            )
-        })
-        .unwrap_or_default();
+    let profile_dir = profile_dir_of(dsh_home, profile);
+    let bundles = profile_bundles(&profile_dir);
     if !CCTEAM_PLUGINS
         .iter()
         .all(|plugin| bundles.iter().any(|b| b == plugin.bundle))
     {
         return false;
     }
-    let Some(rows) = fs::read_to_string(profile_dir.join(PATCH_FILE))
-        .ok()
-        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
-        .and_then(|patch| patch.as_sequence().cloned())
-    else {
-        return false;
-    };
+    let rows = read_patch_rows(&profile_dir);
     CCTEAM_PLUGINS.iter().all(|plugin| {
         rows.iter().any(|row| {
             row.get("id").and_then(serde_yaml::Value::as_str) == Some(plugin.row_id)
@@ -229,14 +260,17 @@ pub fn materialize_profile_in(
 ) -> Result<MaterializedDshProfile, HarnessError> {
     // Decide BEFORE extracting anything: a plugin the operator installed
     // themselves needs no cache, no link and no bundle row — extracting one
-    // would only spend disk on a copy nothing may point at.
+    // would only spend disk on a copy nothing may point at. The same snapshot
+    // gates every branch below that would modify or delete something (see
+    // [`ScopeOwnership`]), taken once, before this call writes anything.
     let profile_dir = profile_dir_of(dsh_home, spec.name);
+    let ownership = ScopeOwnership::snapshot(&profile_dir, ccteam_root, spec.manifest);
     let mut plans = Vec::with_capacity(CCTEAM_PLUGINS.len());
     let mut cache_dirs = Vec::with_capacity(CCTEAM_PLUGINS.len());
     let mut operator_installed = Vec::new();
     let mut cache_rebuilt = false;
     for plugin in CCTEAM_PLUGINS.iter() {
-        match operator_install_of(&profile_dir, ccteam_root, plugin, spec.manifest) {
+        match ownership.operator_install_of(plugin) {
             Some(install) => {
                 operator_installed.push(install);
                 plans.push(PluginPlan::KeepOperatorInstall);
@@ -249,7 +283,7 @@ pub fn materialize_profile_in(
             }
         }
     }
-    materialize_profile_files(&profile_dir, &plans, &spec)?;
+    materialize_profile_files(&profile_dir, &plans, &spec, &ownership)?;
 
     Ok(MaterializedDshProfile {
         cache_dirs,
@@ -269,58 +303,175 @@ fn ccteam_plugin_cache_root(ccteam_root: &Path) -> PathBuf {
     ccteam_root.join("runtime").join("dsh")
 }
 
-/// The operator's own copy of one plugin in this profile, or `None` when the
-/// only copy is ccteam's (or there is none).
+/// Who owns each `@ccteam/*` entry in one profile — the ONE gate every branch
+/// that would modify or delete something asks first.
 ///
-/// [`ManifestPolicy::Owned`] answers `None` unconditionally: ccteam names,
-/// writes and owns that home end to end, so there is no third party to defer
-/// to and the tenant path keeps its semantics exactly.
-fn operator_install_of(
-    profile_dir: &Path,
-    ccteam_root: &Path,
-    plugin: &PluginAsset,
-    manifest: ManifestPolicy,
-) -> Option<OperatorInstall> {
-    if manifest == ManifestPolicy::Owned {
-        return None;
-    }
-    let package_dir = profile_dir
-        .join("node_modules")
-        .join(CCTEAM_SCOPE)
-        .join(plugin.package);
-    // pnpm's dependency table is the operator's declaration and outlives any
-    // one `node_modules` layout — including a profile an older ccteam already
-    // linked over, which is how such a profile stops being clobbered.
-    let declared = profile_declares_dependency(profile_dir, plugin.bundle);
-    let ours = fs::read_link(&package_dir)
-        .is_ok_and(|target| target.starts_with(ccteam_plugin_cache_root(ccteam_root)));
-    let installed = package_dir.join("package.json").is_file();
-    if !declared && (ours || !installed) {
-        return None;
-    }
-    Some(OperatorInstall {
-        bundle: plugin.bundle,
-        version: installed_package_version(&package_dir),
-    })
+/// # The ownership rule (binding)
+///
+/// A bundle row is the USER's when
+///
+/// * the profile's `package.json` declares it in a pnpm dependency table
+///   (`dependencies` / `devDependencies` / `optionalDependencies`), **or**
+/// * its package directory exists and is not a symlink into
+///   `<ccteam_home>/runtime/dsh/`.
+///
+/// User-owned rows, directories and patch rows are never modified or deleted —
+/// only reported (see [`DshPluginFinding`]). A row with neither a dependency
+/// line nor a package directory is ccteam's own: re-materializing it is
+/// self-healing, not a clobber, which is how a new embedded sha still reaches
+/// a profile an older ccteam linked.
+///
+/// Both halves matter, because ccteam materializes exactly one shape — the
+/// bare bundle name in `dsh.profile.bundles`, a `node_modules/@ccteam/<pkg>`
+/// symlink into `<ccteam_home>/runtime/dsh/`, and never a line in pnpm's
+/// dependency table. So a dependency entry, or a package directory that is not
+/// that symlink, can only be someone else's. Installing over one would swap
+/// their chosen copy for ccteam's embedded one and leave the profile carrying
+/// the same plugin TWICE — the shape Cordis aborts the whole boot for
+/// (`duplicate loader entry id`).
+///
+/// [`ManifestPolicy::Owned`] (a ccteam-managed tenant home) answers "ccteam"
+/// for everything: ccteam names, writes and owns that home end to end, so
+/// there is no third party to defer to and the tenant path keeps its semantics
+/// exactly.
+///
+/// A snapshot, not a live view: taken before the caller writes anything, so
+/// ccteam's own writes can never turn an entry into "someone else's" halfway
+/// through a call.
+struct ScopeOwnership {
+    /// `node_modules/@ccteam/` in this profile.
+    scope_dir: PathBuf,
+    /// Bundle names pnpm's dependency tables declare.
+    declared: BTreeSet<String>,
+    /// Package names present under [`Self::scope_dir`], mapped to whether the
+    /// entry is ccteam's own symlink into its cache root.
+    scope_dirs: BTreeMap<String, bool>,
+    /// A home ccteam owns end to end has no third party in it.
+    ccteam_owns_home: bool,
 }
 
-/// Is this bundle in the profile's own dependency table? Read-only,
+/// Who wrote one `@ccteam/*` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleOwner {
+    /// ccteam's own: safe to re-materialize, collapse or prune.
+    Ccteam,
+    /// Someone else's: report it, never touch it.
+    User,
+}
+
+impl ScopeOwnership {
+    fn snapshot(profile_dir: &Path, ccteam_root: &Path, manifest: ManifestPolicy) -> Self {
+        let scope_dir = profile_dir.join("node_modules").join(CCTEAM_SCOPE);
+        let cache_root = ccteam_plugin_cache_root(ccteam_root);
+        let mut scope_dirs = BTreeMap::new();
+        if let Ok(entries) = fs::read_dir(&scope_dir) {
+            for entry in entries.flatten() {
+                let ours =
+                    fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(&cache_root));
+                scope_dirs.insert(entry.file_name().to_string_lossy().into_owned(), ours);
+            }
+        }
+        Self {
+            scope_dir,
+            declared: declared_dependencies(profile_dir),
+            scope_dirs,
+            ccteam_owns_home: manifest == ManifestPolicy::Owned,
+        }
+    }
+
+    /// The rule, in one place. Anything outside the `@ccteam/` scope answers
+    /// [`BundleOwner::User`]: ccteam never writes there, so it never removes
+    /// anything there either.
+    fn owner_of(&self, bundle: &str) -> BundleOwner {
+        if self.ccteam_owns_home {
+            return BundleOwner::Ccteam;
+        }
+        let Some(package) = package_of_bundle(bundle) else {
+            return BundleOwner::User;
+        };
+        if self.declared.contains(bundle) {
+            return BundleOwner::User;
+        }
+        match self.scope_dirs.get(package) {
+            // A directory that is not ccteam's link into its own cache: a real
+            // pnpm install, or a link pointing somewhere else.
+            Some(false) => BundleOwner::User,
+            Some(true) | None => BundleOwner::Ccteam,
+        }
+    }
+
+    fn is_ours(&self, bundle: &str) -> bool {
+        self.owner_of(bundle) == BundleOwner::Ccteam
+    }
+
+    /// A stale `@ccteam/*` entry ccteam may prune: one this build's table no
+    /// longer knows AND one ccteam wrote itself.
+    fn is_prunable_stale(&self, name: Option<&str>) -> bool {
+        name.is_some_and(|name| is_stale_ccteam_bundle(Some(name)) && self.is_ours(name))
+    }
+
+    fn package_dir_of(&self, bundle: &str) -> PathBuf {
+        self.scope_dir
+            .join(package_of_bundle(bundle).unwrap_or(bundle))
+    }
+
+    /// Is a package directory (or link, however broken) there at all? A
+    /// declared bundle with none is the operator's own half-finished install.
+    fn package_dir_present(&self, bundle: &str) -> bool {
+        package_of_bundle(bundle).is_some_and(|package| self.scope_dirs.contains_key(package))
+    }
+
+    /// The operator's own copy of one plugin in this profile, or `None` when
+    /// the only copy is ccteam's (or there is none).
+    fn operator_install_of(&self, plugin: &PluginAsset) -> Option<OperatorInstall> {
+        (self.owner_of(plugin.bundle) == BundleOwner::User).then(|| OperatorInstall {
+            bundle: plugin.bundle,
+            version: installed_package_version(&self.package_dir_of(plugin.bundle)),
+        })
+    }
+}
+
+/// The package directory name one `@ccteam/*` bundle installs into, or `None`
+/// for a bundle outside ccteam's scope.
+fn package_of_bundle(bundle: &str) -> Option<&str> {
+    bundle.strip_prefix(CCTEAM_SCOPE)?.strip_prefix('/')
+}
+
+/// Bundles the profile's own dependency tables declare. Read-only,
 /// best-effort; ccteam never writes any of these three keys.
-fn profile_declares_dependency(profile_dir: &Path, bundle: &str) -> bool {
+fn declared_dependencies(profile_dir: &Path) -> BTreeSet<String> {
     let Some(manifest) = fs::read_to_string(profile_dir.join("package.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
     else {
-        return false;
+        return BTreeSet::new();
     };
     ["dependencies", "devDependencies", "optionalDependencies"]
         .iter()
-        .any(|table| {
-            manifest
-                .get(table)
-                .and_then(serde_json::Value::as_object)
-                .is_some_and(|deps| deps.contains_key(bundle))
+        .filter_map(|table| manifest.get(table).and_then(serde_json::Value::as_object))
+        .flat_map(|deps| deps.keys().cloned())
+        .collect()
+}
+
+/// The bundles this profile lists, in order. Read-only, best-effort: an
+/// unreadable or unparseable manifest lists none.
+fn profile_bundles(profile_dir: &Path) -> Vec<String> {
+    fs::read_to_string(profile_dir.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|manifest| {
+            Some(
+                manifest
+                    .get("dsh")?
+                    .get("profile")?
+                    .get("bundles")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|b| b.as_str().map(str::to_string))
+                    .collect(),
+            )
         })
+        .unwrap_or_default()
 }
 
 fn installed_package_version(package_dir: &Path) -> Option<String> {
@@ -354,33 +505,129 @@ fn embedded_plugin_version(plugin: &PluginAsset) -> Option<String> {
     None
 }
 
-/// Read-only, best-effort: ccteam plugins this profile carries from the
-/// operator's OWN install whose version differs from the embedded copy.
+/// Read-only, best-effort: what this profile carries that is the operator's
+/// own — and that ccteam therefore left exactly as it found it.
 ///
-/// ccteam does not overwrite an install it did not make, so drift is REPORTED
-/// (`doctor`, the Hosts surface) and left for the operator's own
-/// `dsh plugin ... update` to fix. Anything missing or unreadable answers "no
-/// mismatch": not knowing is not a finding. Never writes.
-pub fn ccteam_plugin_version_mismatches(
+/// ccteam does not repair an install it did not make, so drift, duplicates and
+/// half-finished installs are REPORTED (`doctor`, the Hosts surface) and left
+/// for the operator's own `dsh plugin ...` command to fix. Anything missing or
+/// unreadable answers "no finding": not knowing is not a finding. Never
+/// writes.
+pub fn ccteam_plugin_findings(
     ccteam_root: &Path,
     dsh_home: &Path,
     profile: &str,
-) -> Vec<PluginVersionMismatch> {
+) -> Vec<DshPluginFinding> {
     let profile_dir = profile_dir_of(dsh_home, profile);
-    CCTEAM_PLUGINS
-        .iter()
-        .filter_map(|plugin| {
-            let installed =
-                operator_install_of(&profile_dir, ccteam_root, plugin, ManifestPolicy::MergeOnly)?
-                    .version?;
-            let embedded = embedded_plugin_version(plugin)?;
-            (installed != embedded).then_some(PluginVersionMismatch {
-                bundle: plugin.bundle,
-                installed,
-                embedded,
-            })
-        })
-        .collect()
+    let ownership = ScopeOwnership::snapshot(&profile_dir, ccteam_root, ManifestPolicy::MergeOnly);
+    let mut findings = Vec::new();
+    let finding = |bundle: String, kind: DshPluginFindingKind| DshPluginFinding {
+        remedy: plugin_finding_remedy(&profile_dir, profile, &bundle, &kind),
+        bundle,
+        kind,
+    };
+
+    // Duplicates first: a profile that cannot boot outranks a version digit.
+    // ccteam collapses the duplicate rows it wrote itself, so one that
+    // survives a registration is one of theirs.
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for bundle in profile_bundles(&profile_dir) {
+        if package_of_bundle(&bundle).is_some() {
+            *counts.entry(bundle).or_default() += 1;
+        }
+    }
+    findings.extend(counts.into_iter().filter_map(|(bundle, count)| {
+        (count > 1 && !ownership.is_ours(&bundle))
+            .then(|| finding(bundle, DshPluginFindingKind::DuplicateBundleId { count }))
+    }));
+
+    let rows = read_patch_rows(&profile_dir);
+    for plugin in CCTEAM_PLUGINS.iter() {
+        // Override rows ccteam did not write, sharing a loader id with the row
+        // it does write: it armed none of them rather than pick one.
+        let carrying = override_row_indices(&rows, plugin);
+        if carrying.len() > 1
+            && !carrying
+                .iter()
+                .all(|index| is_ccteam_patch_row(&rows[*index], plugin))
+        {
+            findings.push(finding(
+                plugin.bundle.to_string(),
+                DshPluginFindingKind::DuplicatePatchRow {
+                    row_id: plugin.row_id,
+                    count: carrying.len(),
+                },
+            ));
+        }
+
+        if ownership.is_ours(plugin.bundle) {
+            continue;
+        }
+        let kind = if !ownership.package_dir_present(plugin.bundle) {
+            DshPluginFindingKind::MissingOnDisk
+        } else {
+            match installed_package_version(&ownership.package_dir_of(plugin.bundle)) {
+                None => DshPluginFindingKind::VersionUnknown,
+                Some(installed) => match embedded_plugin_version(plugin) {
+                    Some(embedded) if installed != embedded => {
+                        DshPluginFindingKind::VersionMismatch {
+                            installed,
+                            embedded,
+                        }
+                    }
+                    _ => continue,
+                },
+            }
+        };
+        findings.push(finding(plugin.bundle.to_string(), kind));
+    }
+    findings
+}
+
+/// The operator's next step for one finding — one wording, both surfaces.
+fn plugin_finding_remedy(
+    profile_dir: &Path,
+    profile: &str,
+    bundle: &str,
+    kind: &DshPluginFindingKind,
+) -> String {
+    let dir = profile_dir.display();
+    match kind {
+        DshPluginFindingKind::VersionMismatch { .. } => format!(
+            "your own install in {dir}, left untouched; update it with \
+             `dsh plugin --profile {profile} update {bundle}`"
+        ),
+        DshPluginFindingKind::VersionUnknown => format!(
+            "your own install in {dir} carries no readable `version`, so the version check did \
+             not run; reinstall it with `dsh plugin --profile {profile} add {bundle}` if that \
+             copy is broken"
+        ),
+        DshPluginFindingKind::MissingOnDisk => format!(
+            "declared in {dir}/package.json but nothing is installed; ccteam did not take your \
+             install over — finish it with `dsh plugin --profile {profile} add {bundle}`"
+        ),
+        DshPluginFindingKind::DuplicateBundleId { .. } => format!(
+            "listed more than once in {dir}/package.json (`dsh.profile.bundles`) — Cordis aborts \
+             the whole boot on a duplicate loader entry id; ccteam touched none of your rows, so \
+             remove the extra one (`dsh plugin --profile {profile} remove {bundle}`, then add it \
+             once)"
+        ),
+        DshPluginFindingKind::DuplicatePatchRow { .. } => format!(
+            "more than one override row carries this loader id in {dir}/{PATCH_FILE}; ccteam \
+             wrote none of them rather than arm one and leave the other — keep the row you want \
+             and delete the rest"
+        ),
+    }
+}
+
+/// This profile's patch rows. Read-only, best-effort: a missing or
+/// unparseable file has none.
+fn read_patch_rows(profile_dir: &Path) -> Vec<serde_yaml::Value> {
+    fs::read_to_string(profile_dir.join(PATCH_FILE))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+        .and_then(|patch| patch.as_sequence().cloned())
+        .unwrap_or_default()
 }
 
 /// The `ccteam-ui` row's own plugin config. Reaches `apply(ctx, config)`
@@ -609,15 +856,16 @@ fn materialize_profile_files(
     profile_dir: &Path,
     plans: &[PluginPlan],
     spec: &ProfileSpec<'_>,
+    ownership: &ScopeOwnership,
 ) -> Result<(), HarnessError> {
     fs::create_dir_all(profile_dir).map_err(|e| {
         HarnessError::SpawnFailed(format!("create DSH profile {}: {e}", profile_dir.display()))
     })?;
 
-    let package_json = merged_profile_package_json(profile_dir, plans, spec)?;
+    let package_json = merged_profile_package_json(profile_dir, plans, spec, ownership)?;
     write_if_changed(&profile_dir.join("package.json"), package_json.as_bytes())?;
     let patch_path = profile_dir.join(PATCH_FILE);
-    if let Some(patch_yaml) = merged_profile_patch_yaml(&patch_path, spec)? {
+    if let Some(patch_yaml) = merged_profile_patch_yaml(&patch_path, spec, ownership)? {
         write_if_changed(&patch_path, patch_yaml.as_bytes())?;
     }
     // The patch may carry this identity's credentials (`restToken`, and a
@@ -642,8 +890,10 @@ fn materialize_profile_files(
             ensure_symlink(&scope_dir.join(plugin.package), cache_dir)?;
         }
     }
-    // The scope dir is ccteam's too (see [`is_stale_ccteam_bundle`]): a link
-    // left behind by a former plugin name points at a cache nobody maintains.
+    // A link left behind by a former plugin name points at a cache nobody
+    // maintains — but only the entries ccteam wrote are ccteam's to remove
+    // (see [`ScopeOwnership`]): a `@ccteam/*` package the operator installed
+    // themselves survives here byte-for-byte and is reported instead.
     if let Ok(entries) = fs::read_dir(&scope_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -653,7 +903,10 @@ fn materialize_profile_files(
             {
                 continue;
             }
-            remove_existing(&entry.path())?;
+            let bundle = format!("{CCTEAM_SCOPE}/{}", name.to_string_lossy());
+            if ownership.is_ours(&bundle) {
+                remove_existing(&entry.path())?;
+            }
         }
     }
     Ok(())
@@ -661,17 +914,19 @@ fn materialize_profile_files(
 
 /// A bundle name under ccteam's npm scope that is NOT one of [`CCTEAM_PLUGINS`].
 ///
-/// ccteam owns the `@ccteam/` scope in every profile it writes, stale entries
-/// included: a bundle, patch row, or scope link under it that this table no
+/// A bundle, patch row, or scope link under `@ccteam/` that this table no
 /// longer knows is a former ccteam plugin (renamed or retired). Left in place
 /// it resolves to a package nobody maintains — or to nothing — and its own
 /// patch layer keeps inserting a row id the successor package also inserts,
-/// which aborts the whole Cordis boot (`duplicate loader entry id`). Nothing
-/// outside the scope is ever touched: merge-only means ccteam's own entries
-/// only, and "own" includes the ones it used to write.
+/// which aborts the whole Cordis boot (`duplicate loader entry id`).
+///
+/// Stale is only half the question: ccteam prunes an entry only when it also
+/// WROTE it (see [`ScopeOwnership::is_prunable_stale`]). A `@ccteam/*` package
+/// the operator installed themselves is theirs whatever this table knows —
+/// nothing outside ccteam's own writes is ever removed.
 fn is_stale_ccteam_bundle(name: Option<&str>) -> bool {
     name.is_some_and(|name| {
-        name.starts_with(&format!("{CCTEAM_SCOPE}/"))
+        package_of_bundle(name).is_some()
             && !CCTEAM_PLUGINS.iter().any(|plugin| plugin.bundle == name)
     })
 }
@@ -680,6 +935,7 @@ fn merged_profile_package_json(
     profile_dir: &Path,
     plans: &[PluginPlan],
     spec: &ProfileSpec<'_>,
+    ownership: &ScopeOwnership,
 ) -> Result<String, HarnessError> {
     let path = profile_dir.join("package.json");
     let manifest_exists = path.exists();
@@ -756,7 +1012,28 @@ fn merged_profile_package_json(
         *bundles = serde_json::json!([]);
     }
     let bundles = bundles.as_array_mut().expect("bundles coerced to array");
-    bundles.retain(|v| !is_stale_ccteam_bundle(v.as_str()));
+    // One pass over ccteam's own scope: drop the rows for retired ccteam
+    // plugins, and collapse a bundle id ccteam listed twice to one row. Both
+    // are gated on ownership (see [`ScopeOwnership`]) — a `@ccteam/*` row the
+    // operator wrote survives even when it is stale or duplicated, and the
+    // scan reports it (`duplicate_bundle_id`) instead. Rows outside the scope
+    // are never inspected.
+    let mut kept: BTreeSet<String> = BTreeSet::new();
+    bundles.retain(|value| {
+        let Some(name) = value.as_str() else {
+            return true;
+        };
+        if package_of_bundle(name).is_none() {
+            return true;
+        }
+        let ours = ownership.is_ours(name);
+        if ours && is_stale_ccteam_bundle(Some(name)) {
+            return false;
+        }
+        // A repeat of an id already kept: ccteam's own collapses, theirs stays
+        // exactly as they left it.
+        kept.insert(name.to_string()) || !ours
+    });
     // Only the plugins ccteam installs get a bundle row. An operator-installed
     // one is already a layer by `dsh plugin`'s own reconciliation — and if
     // that reconciliation dropped it, adding it back is ccteam overruling DSH
@@ -803,6 +1080,14 @@ fn merged_profile_package_json(
 /// mismatch, so passing it keeps this honest rather than silently patching
 /// some other plugin's row.
 ///
+/// One override row per loader id, always: ccteam collapses the duplicates it
+/// wrote itself (see [`is_ccteam_patch_row`]) onto the first and updates that
+/// one. When a row ccteam did NOT write shares the id, it updates none of them
+/// — arming one and leaving the other is the silent half of the bug — and the
+/// scan reports `duplicate_patch_row` for the operator to resolve. Pruning is
+/// gated the same way as everywhere else in this module: a stale row naming a
+/// `@ccteam/*` package the operator installed is theirs and stays.
+///
 /// `config` is the row's own plugin config — it reaches `apply(ctx, config)`
 /// verbatim and is the `base` layer of the plugin's settings namespace, so its
 /// keys are FLAT (`daemonUrl` / `enrollment` / `transportSocket` / `restToken`).
@@ -811,6 +1096,7 @@ fn merged_profile_package_json(
 fn merged_profile_patch_yaml(
     path: &Path,
     spec: &ProfileSpec<'_>,
+    ownership: &ScopeOwnership,
 ) -> Result<Option<String>, HarnessError> {
     let existing = if path.exists() {
         let raw = fs::read_to_string(path).map_err(|e| {
@@ -846,12 +1132,14 @@ fn merged_profile_patch_yaml(
     if !spec.config.is_empty() {
         ours.push((&UI_PLUGIN, flat_config(spec.config.entries())));
     }
-    // Rows naming a former ccteam package are pruned whatever their id (see
-    // [`is_stale_ccteam_bundle`]); every other row survives byte-for-byte.
+    // Rows naming a former ccteam package ccteam itself wrote are pruned
+    // whatever their id; every other row survives byte-for-byte.
     let before = existing.len();
     let mut rows: Vec<serde_yaml::Value> = existing
         .into_iter()
-        .filter(|row| !is_stale_ccteam_bundle(row.get("name").and_then(serde_yaml::Value::as_str)))
+        .filter(|row| {
+            !ownership.is_prunable_stale(row.get("name").and_then(serde_yaml::Value::as_str))
+        })
         .collect();
     let pruned = rows.len() != before;
 
@@ -863,13 +1151,26 @@ fn merged_profile_patch_yaml(
     }
 
     for (plugin, config) in ours {
-        let existing_row = rows.iter_mut().find(|row| {
-            row.get("id").and_then(serde_yaml::Value::as_str) == Some(plugin.row_id)
-                && row.get("insert").is_none()
-        });
-        match existing_row {
-            Some(row) => {
-                let row = row.as_mapping_mut().ok_or_else(|| {
+        let carrying = override_row_indices(&rows, plugin);
+        if carrying.len() > 1
+            && !carrying
+                .iter()
+                .all(|index| is_ccteam_patch_row(&rows[*index], plugin))
+        {
+            // A row ccteam did not write shares this loader id. Updating "the
+            // first" would arm one copy and leave the other; the scan reports
+            // it instead (`duplicate_patch_row`).
+            continue;
+        }
+        // Duplicates ccteam wrote collapse onto the first — the invariant is
+        // one override row per loader id. Removing from the back keeps the
+        // earlier indices (and `carrying[0]`) valid.
+        for index in carrying.iter().skip(1).rev() {
+            rows.remove(*index);
+        }
+        match carrying.first() {
+            Some(&index) => {
+                let row = rows[index].as_mapping_mut().ok_or_else(|| {
                     HarnessError::SpawnFailed(format!(
                         "DSH profile patch {} row `{}` must be a mapping",
                         path.display(),
@@ -907,6 +1208,38 @@ fn merged_profile_patch_yaml(
     serde_yaml::to_string(&serde_yaml::Value::Sequence(rows))
         .map(Some)
         .map_err(|e| HarnessError::SpawnFailed(format!("serialize DSH profile patch: {e}")))
+}
+
+/// Every row that overrides this plugin's loader entry: its `id`, and no
+/// `insert` (an insert row is a different statement — it ADDS the entry — and
+/// ccteam never writes one).
+fn override_row_indices(rows: &[serde_yaml::Value], plugin: &PluginAsset) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.get("id").and_then(serde_yaml::Value::as_str) == Some(plugin.row_id)
+                && row.get("insert").is_none()
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Is this override row one ccteam wrote? ccteam writes exactly three keys
+/// (`id`, `name`, `config`) naming its own bundle, so a row carrying any other
+/// key — or naming another package — is the operator's, whatever id it holds.
+/// Shape is the only evidence available: the row for a plugin the operator
+/// installed is still written by ccteam (that config row is what arms their
+/// copy), so "whose bundle is it" cannot answer this one.
+fn is_ccteam_patch_row(row: &serde_yaml::Value, plugin: &PluginAsset) -> bool {
+    let Some(mapping) = row.as_mapping() else {
+        return false;
+    };
+    mapping
+        .keys()
+        .all(|key| matches!(key.as_str(), Some("id" | "name" | "config")))
+        && row
+            .get("name")
+            .is_none_or(|name| name.as_str() == Some(plugin.bundle))
 }
 
 /// A row's `config` mapping: present keys only, FLAT, in declaration order.
@@ -1838,12 +2171,12 @@ mod tests {
     }
 
     /// Renaming or retiring a ccteam plugin must not strand its old name in a
-    /// profile:
-    /// `@ccteam/*` is ccteam's scope, so a bundle, patch row, or scope link
-    /// under it that the table no longer knows is pruned — a stale bundle's
-    /// own patch layer would otherwise re-insert a row id the new package also
-    /// inserts, and Cordis aborts the boot on the duplicate. Everything outside
-    /// the scope survives byte-for-byte.
+    /// profile: a bundle, patch row, or scope link ccteam ITSELF wrote that
+    /// this table no longer knows is pruned — a stale bundle's own patch layer
+    /// would otherwise re-insert a row id the new package also inserts, and
+    /// Cordis aborts the boot on the duplicate. What ccteam wrote is what the
+    /// ownership gate says it wrote (a link into its own cache, with no pnpm
+    /// dependency line); everything else survives byte-for-byte.
     #[test]
     fn stale_ccteam_scoped_entries_are_pruned_from_a_merge_only_profile() {
         let root = tempfile::tempdir().unwrap();
@@ -1855,7 +2188,7 @@ mod tests {
             profile_dir.join("package.json"),
             serde_json::json!({
                 "name": "dsh-web-profile",
-                "dependencies": {"@ccteam/dsh-retired": "link:/somewhere"},
+                "dependencies": {"@user/my-plugin": "1.0.0"},
                 "dsh": {"profile": {"bundles": [
                     "@deepseek-ai/dsh-base",
                     "@ccteam/dsh-retired",
@@ -1873,7 +2206,9 @@ mod tests {
              - id: my-plugin\n  name: '@user/my-plugin'\n  config:\n    keepMe: true\n",
         )
         .unwrap();
-        let stale_target = root.path().join("stale-cache");
+        // Links ccteam itself wrote: into its own extraction cache, under
+        // namespaces this build no longer ships.
+        let stale_target = ccteam_plugin_cache_root(root.path()).join("retired");
         fs::create_dir_all(&stale_target).unwrap();
         #[cfg(unix)]
         {
@@ -1890,8 +2225,8 @@ mod tests {
             "stale ccteam bundles go, the user's bundle stays, ours are appended"
         );
         assert_eq!(
-            package["dependencies"]["@ccteam/dsh-retired"],
-            serde_json::json!("link:/somewhere"),
+            package["dependencies"]["@user/my-plugin"],
+            serde_json::json!("1.0.0"),
             "pnpm's dependency table is not ours to edit"
         );
 
@@ -2028,21 +2363,29 @@ mod tests {
         operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
 
         let embedded = embedded_plugin_version(&UI_PLUGIN).expect("the tarball carries a version");
-        let mismatches = ccteam_plugin_version_mismatches(root.path(), dsh_home.path(), "web");
+        let findings = ccteam_plugin_findings(root.path(), dsh_home.path(), "web");
+        assert_eq!(findings.len(), 1, "one finding, no more: {findings:?}");
+        assert_eq!(findings[0].bundle, CCTEAM_UI_BUNDLE);
         assert_eq!(
-            mismatches,
-            vec![PluginVersionMismatch {
-                bundle: CCTEAM_UI_BUNDLE,
+            findings[0].kind,
+            DshPluginFindingKind::VersionMismatch {
                 installed: "0.0.1-theirs".to_string(),
                 embedded: embedded.clone(),
-            }]
+            }
         );
         assert_eq!(
-            mismatches[0].report(),
+            findings[0].report(),
             format!(
                 "{CCTEAM_UI_BUNDLE} plugin_version_mismatch{{installed=0.0.1-theirs, embedded={embedded}}}"
             ),
             "one wording for both surfaces"
+        );
+        assert!(
+            findings[0]
+                .remedy
+                .contains("`dsh plugin --profile web update @ccteam/ccteam-ui`"),
+            "the remedy is theirs to run: {}",
+            findings[0].remedy
         );
         assert_eq!(
             installed_package_version(&plugin_link(&profile_dir, &UI_PLUGIN)),
@@ -2062,7 +2405,7 @@ mod tests {
         operator_installed_profile(dsh_home.path(), &embedded);
         operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
         assert!(
-            ccteam_plugin_version_mismatches(root.path(), dsh_home.path(), "web").is_empty(),
+            ccteam_plugin_findings(root.path(), dsh_home.path(), "web").is_empty(),
             "same version, nothing to report"
         );
 
@@ -2070,13 +2413,11 @@ mod tests {
         let fresh_home = tempfile::tempdir().unwrap();
         operator_register(fresh_root.path(), fresh_home.path(), SOCKET).unwrap();
         assert!(
-            ccteam_plugin_version_mismatches(fresh_root.path(), fresh_home.path(), "web")
-                .is_empty(),
+            ccteam_plugin_findings(fresh_root.path(), fresh_home.path(), "web").is_empty(),
             "ccteam's own materialization is the embedded copy"
         );
         assert!(
-            ccteam_plugin_version_mismatches(fresh_root.path(), fresh_home.path(), "no-such")
-                .is_empty(),
+            ccteam_plugin_findings(fresh_root.path(), fresh_home.path(), "no-such").is_empty(),
             "an absent profile is not a finding"
         );
     }
@@ -2152,7 +2493,7 @@ mod tests {
             "and still lists the bundle exactly once"
         );
         assert!(
-            ccteam_plugin_version_mismatches(root.path(), dsh_home.path(), WEB_PROFILE).is_empty(),
+            ccteam_plugin_findings(root.path(), dsh_home.path(), WEB_PROFILE).is_empty(),
             "a managed home has no operator install to drift from"
         );
     }
@@ -2169,9 +2510,12 @@ mod tests {
             config: DshPluginConfig::default(),
             manifest: ManifestPolicy::MergeOnly,
         };
+        // No profile files at all: nothing declared, no scope dir, so a
+        // `@ccteam/*` row can only be one ccteam wrote.
+        let ownership = ScopeOwnership::snapshot(dir.path(), dir.path(), ManifestPolicy::MergeOnly);
         fs::write(&path, "- id: keep\n  name: '@user/keep'\n").unwrap();
         assert_eq!(
-            merged_profile_patch_yaml(&path, &spec).unwrap(),
+            merged_profile_patch_yaml(&path, &spec, &ownership).unwrap(),
             None,
             "nothing ours, nothing stale: untouched"
         );
@@ -2180,7 +2524,7 @@ mod tests {
             "- id: keep\n  name: '@user/keep'\n- id: old\n  name: '@ccteam/ccteam-retired'\n",
         )
         .unwrap();
-        let rewritten = merged_profile_patch_yaml(&path, &spec)
+        let rewritten = merged_profile_patch_yaml(&path, &spec, &ownership)
             .unwrap()
             .expect("a stale row forces a rewrite");
         let rows: serde_yaml::Value = serde_yaml::from_str(&rewritten).unwrap();
@@ -2191,5 +2535,407 @@ mod tests {
             .filter_map(|row| row.get("name").and_then(serde_yaml::Value::as_str))
             .collect();
         assert_eq!(names, vec!["@user/keep"]);
+    }
+    /// A real package directory pnpm put in a profile — never one of ccteam's
+    /// symlinks, so the ownership gate reads it as the operator's.
+    fn user_package(profile_dir: &Path, package: &str, manifest: serde_json::Value) -> PathBuf {
+        let dir = profile_dir
+            .join("node_modules")
+            .join(CCTEAM_SCOPE)
+            .join(package);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("package.json"), manifest.to_string()).unwrap();
+        fs::write(dir.join("marker.txt"), b"pnpm put me here").unwrap();
+        dir
+    }
+
+    /// Every file of a directory, by name and bytes: "byte-for-byte" is the
+    /// whole claim about someone else's install.
+    fn tree_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn rows_with_id(patch: &serde_yaml::Value, id: &str) -> usize {
+        patch
+            .as_sequence()
+            .expect("patch is a sequence")
+            .iter()
+            .filter(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(id))
+            .count()
+    }
+
+    /// The ownership gate from the PRUNER's side: a `@ccteam/*` package the
+    /// operator installed is theirs, whatever this build's plugin table knows
+    /// about the name — including an older copy of ccteam's own plugin. Their
+    /// bundle rows, package directories, dependency lines and patch rows all
+    /// survive a registration byte-for-byte; the drift is reported, not
+    /// repaired.
+    #[test]
+    fn user_owned_ccteam_scoped_packages_survive_a_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dsh-web-profile",
+                "private": true,
+                "dependencies": {"@ccteam/whatever": "^2.0.0", CCTEAM_UI_BUNDLE: "^0.9.0"},
+                "dsh": {"profile": {"bundles": [
+                    "@deepseek-ai/dsh-base",
+                    "@ccteam/whatever",
+                    CCTEAM_UI_BUNDLE
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let theirs = user_package(
+            &profile_dir,
+            "whatever",
+            serde_json::json!({"name": "@ccteam/whatever", "version": "2.0.0"}),
+        );
+        let older_ui = user_package(
+            &profile_dir,
+            UI_PLUGIN.package,
+            serde_json::json!({"name": CCTEAM_UI_BUNDLE, "version": "0.9.0-theirs"}),
+        );
+        fs::write(
+            profile_dir.join(PATCH_FILE),
+            "- id: whatever\n  name: '@ccteam/whatever'\n  config:\n    keepMe: true\n",
+        )
+        .unwrap();
+        let before_theirs = tree_bytes(&theirs);
+        let before_ui = tree_bytes(&older_ui);
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            bundle_entries(&profile_dir),
+            vec![
+                "@deepseek-ai/dsh-base".to_string(),
+                "@ccteam/whatever".to_string(),
+                CCTEAM_UI_BUNDLE.to_string(),
+            ],
+            "a bundle row of theirs is neither pruned nor duplicated"
+        );
+        assert_eq!(
+            read_package(&profile_dir)["dependencies"],
+            serde_json::json!({"@ccteam/whatever": "^2.0.0", CCTEAM_UI_BUNDLE: "^0.9.0"}),
+            "pnpm's dependency table is not ours to edit"
+        );
+        assert_eq!(
+            tree_bytes(&theirs),
+            before_theirs,
+            "their package is theirs"
+        );
+        assert_eq!(
+            tree_bytes(&older_ui),
+            before_ui,
+            "an older copy of ccteam's own plugin, installed by them, is still theirs"
+        );
+        let patch = read_patch(&profile_dir);
+        assert_eq!(
+            row_with_id(&patch, "whatever")["config"]["keepMe"],
+            serde_yaml::Value::Bool(true),
+            "their patch row survives whatever this build's table knows: {patch:?}"
+        );
+        assert!(
+            !root.path().join("runtime").join("dsh").join("ui").exists(),
+            "nothing of ours is extracted next to their install"
+        );
+
+        let findings = ccteam_plugin_findings(root.path(), dsh_home.path(), "web");
+        assert_eq!(
+            findings.len(),
+            1,
+            "the drift is reported once: {findings:?}"
+        );
+        assert!(matches!(
+            findings[0].kind,
+            DshPluginFindingKind::VersionMismatch { .. }
+        ));
+    }
+
+    /// A bundle id listed twice aborts the whole Cordis boot. Rows ccteam
+    /// wrote itself collapse to one — self-healing, since re-materializing
+    /// what ccteam owns is always ccteam's call.
+    #[test]
+    fn a_duplicate_bundle_row_ccteam_owns_collapses_to_one() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dsh-web-profile",
+                "dsh": {"profile": {"bundles": [
+                    "@deepseek-ai/dsh-base",
+                    CCTEAM_UI_BUNDLE,
+                    CCTEAM_UI_BUNDLE
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            bundle_entries(&profile_dir),
+            vec![
+                "@deepseek-ai/dsh-base".to_string(),
+                CCTEAM_UI_BUNDLE.to_string()
+            ],
+            "ccteam's own duplicate collapses to a single row"
+        );
+        assert!(
+            ccteam_plugin_findings(root.path(), dsh_home.path(), "web").is_empty(),
+            "nothing left to report once ccteam has cleaned up after itself"
+        );
+    }
+
+    /// The same id twice in a profile the operator installed into: removing a
+    /// row they wrote is not ccteam's call, so both stay and the scan reports
+    /// the duplicate with the command that fixes it.
+    #[test]
+    fn a_duplicate_bundle_row_of_theirs_is_reported_never_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = operator_installed_profile(dsh_home.path(), "0.10.4-alpha.0");
+        let mut manifest = read_package(&profile_dir);
+        manifest["dsh"]["profile"]["bundles"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(CCTEAM_UI_BUNDLE));
+        fs::write(profile_dir.join("package.json"), manifest.to_string()).unwrap();
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            bundle_entries(&profile_dir)
+                .iter()
+                .filter(|bundle| bundle.as_str() == CCTEAM_UI_BUNDLE)
+                .count(),
+            2,
+            "both rows are theirs and both stay"
+        );
+        let findings = ccteam_plugin_findings(root.path(), dsh_home.path(), "web");
+        let duplicate = findings
+            .iter()
+            .find(|finding| finding.code() == "duplicate_bundle_id")
+            .unwrap_or_else(|| panic!("the duplicate is reported: {findings:?}"));
+        assert_eq!(
+            duplicate.kind,
+            DshPluginFindingKind::DuplicateBundleId { count: 2 }
+        );
+        assert_eq!(
+            duplicate.report(),
+            format!("{CCTEAM_UI_BUNDLE} duplicate_bundle_id{{id={CCTEAM_UI_BUNDLE}, count=2}}")
+        );
+        assert!(
+            duplicate
+                .remedy
+                .contains("`dsh plugin --profile web remove @ccteam/ccteam-ui`"),
+            "the remedy is theirs to run: {}",
+            duplicate.remedy
+        );
+    }
+
+    /// One override row per loader id: duplicates ccteam wrote itself collapse
+    /// onto the first, and that one carries this call's config.
+    #[test]
+    fn duplicate_patch_rows_ccteam_wrote_collapse_to_one() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(PATCH_FILE),
+            "- id: ccteam-ui\n  name: '@ccteam/ccteam-ui'\n  config:\n    daemonUrl: http://old\n\
+             - id: ccteam-ui\n  name: '@ccteam/ccteam-ui'\n  config:\n    daemonUrl: http://old\n",
+        )
+        .unwrap();
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        let patch = read_patch(&profile_dir);
+        assert_eq!(
+            rows_with_id(&patch, CCTEAM_UI_ROW_ID),
+            1,
+            "one row per loader id: {patch:?}"
+        );
+        assert_eq!(
+            ccteam_row(&patch)["config"]["transportSocket"],
+            serde_yaml::Value::String(SOCKET.into()),
+            "the surviving row is the one this call armed"
+        );
+        assert!(ccteam_plugin_findings(root.path(), dsh_home.path(), "web").is_empty());
+    }
+
+    /// A second override row for the same loader id that ccteam did NOT write:
+    /// arming one and leaving the other is the silent half of the bug, so
+    /// ccteam updates neither and reports instead.
+    #[test]
+    fn a_patch_row_ccteam_did_not_write_is_reported_never_silently_updated() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join(PATCH_FILE),
+            "- id: ccteam-ui\n  name: '@ccteam/ccteam-ui'\n  config:\n    daemonUrl: http://old\n\
+             - id: ccteam-ui\n  name: '@ccteam/ccteam-ui'\n  disabled: true\n  config:\n    daemonUrl: http://theirs\n",
+        )
+        .unwrap();
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        let patch = read_patch(&profile_dir);
+        assert_eq!(
+            rows_with_id(&patch, CCTEAM_UI_ROW_ID),
+            2,
+            "a row of theirs is never removed: {patch:?}"
+        );
+        assert!(
+            patch.as_sequence().unwrap().iter().all(|row| row
+                .get("config")
+                .and_then(|c| c.get("transportSocket"))
+                .is_none()),
+            "ccteam armed neither row rather than pick one: {patch:?}"
+        );
+        let findings = ccteam_plugin_findings(root.path(), dsh_home.path(), "web");
+        let duplicate = findings
+            .iter()
+            .find(|finding| finding.code() == "duplicate_patch_row")
+            .unwrap_or_else(|| panic!("the ambiguity is reported: {findings:?}"));
+        assert_eq!(
+            duplicate.kind,
+            DshPluginFindingKind::DuplicatePatchRow {
+                row_id: CCTEAM_UI_ROW_ID,
+                count: 2,
+            }
+        );
+        assert_eq!(
+            duplicate.report(),
+            format!("{CCTEAM_UI_BUNDLE} duplicate_patch_row{{id={CCTEAM_UI_ROW_ID}, count=2}}")
+        );
+    }
+
+    /// A dependency line with nothing installed is the operator's own
+    /// half-finished install. ccteam neither takes it over nor drops a second
+    /// copy next to it: it ensures the config row and reports the gap.
+    #[test]
+    fn a_declared_plugin_with_no_package_directory_is_reported_never_taken_over() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dsh-web-profile",
+                "dependencies": {CCTEAM_UI_BUNDLE: "^0.10.4"},
+                "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base", CCTEAM_UI_BUNDLE]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let out = operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            out.operator_installed,
+            vec![OperatorInstall {
+                bundle: CCTEAM_UI_BUNDLE,
+                version: None,
+            }],
+            "a declaration with nothing behind it is still their install"
+        );
+        assert!(
+            out.cache_dirs.is_empty() && !out.cache_rebuilt,
+            "nothing is extracted for an install ccteam does not make"
+        );
+        assert!(
+            fs::symlink_metadata(plugin_link(&profile_dir, &UI_PLUGIN)).is_err(),
+            "no link of ours lands where pnpm will put theirs"
+        );
+        assert_eq!(
+            bundle_entries(&profile_dir),
+            vec![
+                "@deepseek-ai/dsh-base".to_string(),
+                CCTEAM_UI_BUNDLE.to_string()
+            ],
+            "their row stays, and ccteam adds none"
+        );
+        assert_eq!(
+            ccteam_row(&read_patch(&profile_dir))["config"]["daemonUrl"],
+            serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+            "the config row is the one thing ccteam does write"
+        );
+
+        let findings = ccteam_plugin_findings(root.path(), dsh_home.path(), "web");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].kind, DshPluginFindingKind::MissingOnDisk);
+        assert_eq!(
+            findings[0].report(),
+            format!("{CCTEAM_UI_BUNDLE} plugin_missing_on_disk{{id={CCTEAM_UI_BUNDLE}}}")
+        );
+        assert!(
+            findings[0]
+                .remedy
+                .contains("`dsh plugin --profile web add @ccteam/ccteam-ui`"),
+            "the remedy finishes THEIR install: {}",
+            findings[0].remedy
+        );
+    }
+
+    /// Their package with no readable `version`: the mismatch check cannot
+    /// run, and staying silent would read as "aligned".
+    #[test]
+    fn a_user_install_without_a_version_is_reported_as_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dsh-web-profile",
+                "dependencies": {CCTEAM_UI_BUNDLE: "^0.10.4"},
+                "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base", CCTEAM_UI_BUNDLE]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        user_package(
+            &profile_dir,
+            UI_PLUGIN.package,
+            serde_json::json!({"name": CCTEAM_UI_BUNDLE}),
+        );
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        let findings = ccteam_plugin_findings(root.path(), dsh_home.path(), "web");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].kind, DshPluginFindingKind::VersionUnknown);
+        assert_eq!(
+            findings[0].report(),
+            format!("{CCTEAM_UI_BUNDLE} plugin_version_unknown{{id={CCTEAM_UI_BUNDLE}}}"),
+            "the operator can see WHY the version check did not run"
+        );
     }
 }

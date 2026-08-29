@@ -808,20 +808,144 @@ fn operator_web_spawn_leaves_a_self_installed_ccteam_plugin_alone() {
         serde_yaml::Value::String(socket.to_string_lossy().into_owned())
     );
 
-    let mismatches =
-        ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_version_mismatches(
-            &ccteam_home(&tmp),
-            &dsh_home,
-            DSH_NATIVE_WEB_PROFILE,
-        );
-    assert_eq!(mismatches.len(), 1, "the drift is reported: {mismatches:?}");
-    assert_eq!(mismatches[0].installed, "9.9.9-theirs");
+    let findings = ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
+        &ccteam_home(&tmp),
+        &dsh_home,
+        DSH_NATIVE_WEB_PROFILE,
+    );
+    assert_eq!(findings.len(), 1, "the drift is reported: {findings:?}");
     assert!(
-        mismatches[0]
+        matches!(
+            &findings[0].kind,
+            ccteam_harness::execution::dsh_acp::materialize::DshPluginFindingKind::VersionMismatch {
+                installed,
+                ..
+            } if installed == "9.9.9-theirs"
+        ),
+        "the finding names the version they pinned: {findings:?}"
+    );
+    assert!(
+        findings[0]
             .report()
             .starts_with("@ccteam/ccteam-ui plugin_version_mismatch{installed=9.9.9-theirs,"),
         "one wording for doctor and the Hosts panel: {}",
-        mismatches[0].report()
+        findings[0].report()
+    );
+    assert!(
+        findings[0]
+            .remedy
+            .contains("`dsh plugin --profile web update @ccteam/ccteam-ui`"),
+        "and one remedy: {}",
+        findings[0].remedy
+    );
+}
+
+/// The same attach, against a profile carrying an unrelated `@ccteam/*`
+/// package of the operator's AND a `dsh plugin add` that pnpm never finished
+/// (a dependency line with no package directory).
+///
+/// ccteam owns the `@ccteam/` scope only for the entries it wrote itself: a
+/// package the operator installed under that scope is theirs whatever this
+/// build's plugin table knows, and a declaration with nothing behind it is
+/// their broken install — ccteam neither takes it over nor drops a second copy
+/// beside it, it reports.
+#[test]
+#[serial(dsh_env)]
+fn operator_web_spawn_keeps_their_scoped_packages_and_reports_a_broken_install() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dsh_home = operator_dsh_home(&tmp);
+    let profile_dir = dsh_home.join("profiles").join(DSH_NATIVE_WEB_PROFILE);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::write(
+        profile_dir.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-web-profile",
+            "dependencies": {"@ccteam/other": "^1.0.0", "@ccteam/ccteam-ui": "^0.10.4"},
+            "dsh": {"profile": {"bundles": [
+                "@deepseek-ai/dsh-web-app",
+                "@ccteam/other",
+                "@ccteam/ccteam-ui"
+            ]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = profile_dir
+        .join("node_modules")
+        .join("@ccteam")
+        .join("other");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::write(
+        theirs.join("package.json"),
+        serde_json::json!({"name": "@ccteam/other", "version": "1.0.0"}).to_string(),
+    )
+    .unwrap();
+    let socket = identity_socket_path("user:web-api", &ccteam_home(&tmp));
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:web-api",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_NATIVE_WEB_PROFILE,
+        materialize_profile: false,
+        enrollment: None,
+        daemon_url: Some("http://127.0.0.1:7331"),
+        transport_socket: Some(&socket),
+        rest_token: None,
+    })
+    .expect("operator web spawn spec");
+
+    let package: Value =
+        serde_json::from_slice(&std::fs::read(profile_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        package["dsh"]["profile"]["bundles"],
+        serde_json::json!([
+            "@deepseek-ai/dsh-web-app",
+            "@ccteam/other",
+            "@ccteam/ccteam-ui"
+        ]),
+        "every row of theirs survives, and ccteam adds none"
+    );
+    assert_eq!(
+        std::fs::read(theirs.join("package.json")).unwrap(),
+        serde_json::json!({"name": "@ccteam/other", "version": "1.0.0"})
+            .to_string()
+            .into_bytes(),
+        "a `@ccteam/*` package they installed is not ccteam's to prune"
+    );
+    assert!(
+        std::fs::symlink_metadata(
+            profile_dir
+                .join("node_modules")
+                .join("@ccteam")
+                .join("ccteam-ui")
+        )
+        .is_err(),
+        "ccteam installs nothing where their unfinished install belongs"
+    );
+    assert_eq!(
+        patch_config(&profile_dir)["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+        "the config row is still written"
+    );
+
+    let findings = ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
+        &ccteam_home(&tmp),
+        &dsh_home,
+        DSH_NATIVE_WEB_PROFILE,
+    );
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(
+        findings[0].report(),
+        "@ccteam/ccteam-ui plugin_missing_on_disk{id=@ccteam/ccteam-ui}"
+    );
+    assert!(
+        findings[0]
+            .remedy
+            .contains("`dsh plugin --profile web add @ccteam/ccteam-ui`"),
+        "the remedy finishes THEIR install: {}",
+        findings[0].remedy
     );
 }
 

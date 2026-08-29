@@ -89,33 +89,47 @@ pub struct DshStatusResponse {
     pub native_url: Option<String>,
 }
 
-/// One ccteam plugin the operator installed into their own `~/.dsh`
-/// themselves, at a version other than the one this ccteam embeds.
+/// One thing ccteam found in the operator's OWN `~/.dsh` profile and left
+/// exactly as it was.
 ///
-/// ccteam does not overwrite an install it did not make, so this is a REPORT:
-/// the operator updates their own copy with their own `dsh plugin` command.
-/// Same finding, same wording as `ccteam doctor` — see
-/// [`ccteam_harness::execution::dsh_acp::materialize::PluginVersionMismatch`].
+/// ccteam does not repair an install it did not make, so every one of these is
+/// a REPORT: the operator's own `dsh plugin` command fixes it. Same finding,
+/// same wording as `ccteam doctor` — see
+/// [`ccteam_harness::execution::dsh_acp::materialize::DshPluginFinding`].
 #[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
-pub struct PluginVersionMismatchView {
+pub struct DshPluginFindingView {
     /// npm name (`@ccteam/ccteam-ui`).
     pub bundle: String,
-    /// Version installed in the operator's own DSH profile.
-    pub installed: String,
-    /// Version this ccteam build embeds.
-    pub embedded: String,
+    /// Machine-readable code — `plugin_version_mismatch`, `duplicate_bundle_id`,
+    /// `plugin_missing_on_disk`, `plugin_version_unknown` or
+    /// `duplicate_patch_row`.
+    pub code: String,
+    /// Version installed in the operator's own DSH profile (version findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    /// Version this ccteam build embeds (version findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<String>,
+    /// How many rows carry the duplicated id (duplicate findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
     /// The one-line report both surfaces print.
     pub report: String,
+    /// The operator's next step, worded once for both surfaces.
+    pub remedy: String,
 }
 
-/// Read-only, best-effort: version drift between the operator's OWN
-/// `dsh plugin add`-ed ccteam plugins and the copies this build embeds.
+/// Read-only, best-effort: what the operator's OWN `~/.dsh` profile carries
+/// that ccteam refuses to touch — version drift from the embedded copy, a
+/// duplicated id, or an install pnpm never finished.
 ///
 /// The ONE place the web layer asks this question — the Hosts panel's `dsh`
-/// row reads it, and a home we cannot resolve or read answers "no drift".
-/// Only the operator's real `~/.dsh` can drift: a tenant's DSH home is
+/// row reads it, and a home we cannot resolve or read answers "nothing found".
+/// Only the operator's real `~/.dsh` can carry these: a tenant's DSH home is
 /// ccteam-owned and materialized from the embedded copy by construction.
-pub fn operator_plugin_version_mismatches(ccteam_root: &Path) -> Vec<PluginVersionMismatchView> {
+pub fn operator_dsh_plugin_findings(ccteam_root: &Path) -> Vec<DshPluginFindingView> {
+    use ccteam_harness::execution::dsh_acp::materialize::DshPluginFindingKind as Kind;
+
     let Ok(home) = ccteam_harness::execution::dsh_acp::spawn_spec::dsh_home_for_identity(
         true,
         "",
@@ -123,17 +137,31 @@ pub fn operator_plugin_version_mismatches(ccteam_root: &Path) -> Vec<PluginVersi
     ) else {
         return Vec::new();
     };
-    ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_version_mismatches(
+    ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
         ccteam_root,
         &home,
         ccteam_harness::DSH_NATIVE_WEB_PROFILE,
     )
     .into_iter()
-    .map(|mismatch| PluginVersionMismatchView {
-        bundle: mismatch.bundle.to_string(),
-        installed: mismatch.installed.clone(),
-        embedded: mismatch.embedded.clone(),
-        report: mismatch.report(),
+    .map(|finding| DshPluginFindingView {
+        code: finding.code().to_string(),
+        report: finding.report(),
+        installed: match &finding.kind {
+            Kind::VersionMismatch { installed, .. } => Some(installed.clone()),
+            _ => None,
+        },
+        embedded: match &finding.kind {
+            Kind::VersionMismatch { embedded, .. } => Some(embedded.clone()),
+            _ => None,
+        },
+        count: match finding.kind {
+            Kind::DuplicateBundleId { count } | Kind::DuplicatePatchRow { count, .. } => {
+                Some(count)
+            }
+            _ => None,
+        },
+        bundle: finding.bundle,
+        remedy: finding.remedy,
     })
     .collect()
 }

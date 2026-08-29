@@ -242,7 +242,7 @@ fn gather_readiness(paths: &CcteamPaths) -> ReadinessReport {
     }
     ccteam.push(ReportRow::visible(check_pricing()));
     ccteam.push(ReportRow::visible(check_home_layout(paths)));
-    ccteam.push(ReportRow::advisory(check_dsh_plugin_version(paths)));
+    ccteam.push(ReportRow::advisory(check_dsh_plugin_health(paths)));
 
     ReadinessReport {
         agents,
@@ -724,14 +724,16 @@ fn check_home_layout(paths: &CcteamPaths) -> CheckLine {
 
 /// Advisory-only scan for registered projects that still use a real legacy
 /// `.claude/skills` directory. A clean result is counted but hidden.
-/// Did the operator install a ccteam DSH plugin themselves at a version this
-/// build does not embed?
+/// Does the operator's OWN `~/.dsh` profile carry something ccteam refused to
+/// touch — version drift from the embedded copy, a duplicated bundle id, an
+/// install pnpm never finished?
 ///
 /// A WARN, never a repair: ccteam stopped materializing over an install it did
 /// not make (that is what leaves the same plugin id in a profile twice and
-/// aborts the whole Cordis boot), so the drift is reported and the operator's
-/// own `dsh plugin` command fixes it. Same wording the Hosts panel prints.
-fn check_dsh_plugin_version(paths: &CcteamPaths) -> CheckLine {
+/// aborts the whole Cordis boot), so each finding is reported and the
+/// operator's own `dsh plugin` command fixes it. Same wording the Hosts panel
+/// prints — report and remedy both come from the finding itself.
+fn check_dsh_plugin_health(paths: &CcteamPaths) -> CheckLine {
     let Ok(home) = ccteam_harness::execution::dsh_acp::spawn_spec::dsh_home_for_identity(
         true,
         "",
@@ -739,27 +741,23 @@ fn check_dsh_plugin_version(paths: &CcteamPaths) -> CheckLine {
     ) else {
         return CheckLine::new(CheckStatus::Pass, "dsh-plug", "no DSH home to check");
     };
-    let profile = ccteam_harness::DSH_NATIVE_WEB_PROFILE;
-    let mismatches =
-        ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_version_mismatches(
-            &paths.root,
-            &home,
-            profile,
-        );
-    match mismatches.first() {
-        None => CheckLine::new(CheckStatus::Pass, "dsh-plug", "DSH plugin version aligned"),
-        Some(mismatch) => CheckLine::new(
-            CheckStatus::Warn,
-            "dsh-plug",
-            format!(
-                "{} — your own install in {}, left untouched; update it with \
-                 `dsh plugin --profile {profile} update {}`",
-                mismatch.report(),
-                home.join("profiles").join(profile).display(),
-                mismatch.bundle,
-            ),
-        ),
+    let findings = ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
+        &paths.root,
+        &home,
+        ccteam_harness::DSH_NATIVE_WEB_PROFILE,
+    );
+    if findings.is_empty() {
+        return CheckLine::new(CheckStatus::Pass, "dsh-plug", "DSH plugin version aligned");
     }
+    CheckLine::new(
+        CheckStatus::Warn,
+        "dsh-plug",
+        findings
+            .iter()
+            .map(|finding| format!("{} — {}", finding.report(), finding.remedy))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 fn check_project_skill_faces(paths: &CcteamPaths) -> CheckLine {
