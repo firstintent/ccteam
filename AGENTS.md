@@ -94,7 +94,7 @@ ccteam = 多 harness agent 团队的桥接与治理层:常驻 daemon(IM gateway 
 | **Subagents / Hooks** | subagent = agent 内 `Task(subagent_type=…)` ad-hoc 节流;ccteam hook 只写 `.claude/settings.local.json` 自己的段 |
 | **MCP 注册(五 vendor;pi 走 bridge)** | `ccteam config` / daemon-start 幂等写各 vendor 全局配置(Claude `~/.claude.json`、Codex `~/.codex/config.toml`、Grok/OpenCode/Kimi 对称;**pi 不在此列** —— `tool_surface = ManagedSessionBridge`,受管会话挂 ccteam-owned 扩展拿工具面,手起的 `pi` 无 ccteam 工具),任何主会话可编排;per-project `.mcp.json` 仅由 web 按需写第三方 server;repo **不**带任何 vendor 插件清单(`.claude-plugin`/`marketplace.json`/根 `.mcp.json`)|
 
-**CLI 分组**:顶层扁平 `init / start / stop / status / config / doctor` + `project` + `session` + `role` + `host` + 隐藏 `internal`;pre-v0.6 遗留命令面已整体退役、无 alias(现行命令面以 clap 定义为准,`--help` 自描述)。
+**CLI 分组**:顶层扁平 `init / start / stop / status / config / doctor` + `project` + `session` + `role` + `host` + 隐藏 `internal`;pre-v0.6 遗留命令面已整体退役、无 alias(现行命令面以 clap 定义为准,`--help` 自描述);**daemon 只有一种起法 = launcher**(`start` ≡ `daemon start`:setsid 脱离 + 就绪轮询 + pid 记录;前台主体 = 隐藏 `internal daemon-run`,仅供 launcher exec —— owner 2026-08-29 删前台 `start`,杜绝 nohup 起的非托管实例与托管实例打架)。
 
 ## 五、PR / 实现纪律
 
