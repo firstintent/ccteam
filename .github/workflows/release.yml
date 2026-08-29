@@ -268,7 +268,7 @@ jobs:
   # npm channel (PRD v0.10.5 D2 / PLUG-5): the same four binaries ride into
   # `@ccteam/engine-<os>-<cpu>` platform packages, and `@ccteam/ccteam-ui`
   # (the DSH plugin) pins them as optionalDependencies at the SAME version,
-  # so `dsh plugin add @ccteam/ccteam-ui` brings an engine with it and
+  # so `dsh plugin --profile <name> add @ccteam/ccteam-ui` brings an engine with it and
   # `ccteam update --channel npm` has something to install from. Runs only
   # after the GitHub release succeeded, and only when the repository secret
   # `NPM_TOKEN` (publish rights on the `@ccteam` org) is set — without it the
@@ -294,7 +294,7 @@ jobs:
             {
               echo "## npm publish skipped"
               echo "Repository secret \`NPM_TOKEN\` is not set (it needs publish rights on the \`@ccteam\` npm org)."
-              echo "The GitHub release above is complete; \`dsh plugin add @ccteam/ccteam-ui\` will not see this version until the packages are published."
+              echo "The GitHub release above is complete; \`dsh plugin --profile <name> add @ccteam/ccteam-ui\` will not see this version until the packages are published."
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
@@ -383,5 +383,5 @@ jobs:
           {
             echo "## npm"
             echo "Published \`@ccteam/ccteam-ui@${VERSION}\` (dist-tag \`${DIST_TAG}\`) with \`@ccteam/engine-{linux-x64,linux-arm64,darwin-x64,darwin-arm64}@${VERSION}\`."
-            echo "Install: \`dsh plugin add @ccteam/ccteam-ui\`"
+            echo "Install: \`dsh plugin --profile <name> add @ccteam/ccteam-ui\` (DSH requires the profile flag)"
           } >> "$GITHUB_STEP_SUMMARY"
