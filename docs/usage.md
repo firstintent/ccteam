@@ -62,6 +62,8 @@ make install
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ```
 
+**4 · From DeepSeek Harness** — no toolchain and no separate ccteam install: `dsh plugin --profile web add @ccteam/ccteam-ui`, restart `dsh web`, and the plugin installs the engine from its platform package into the same place the script uses and starts the daemon. It is the same binary and the same daemon as every other path — a `ccteam` CLI installed later attaches to it. Details: [dsh-plugin.md](dsh-plugin.md).
+
 Then verify:
 
 ```bash
@@ -77,24 +79,45 @@ pi --version       # optional; only needed for Pi sessions (0.83.0 or newer)
 
 > If `ccteam` is not found, add `~/.local/bin` to PATH: `export PATH="$HOME/.local/bin:$PATH"`, then reopen your shell.
 
-**Where it lands.** One ladder decides the destination for every install mode — the script, `make install`, and `ccteam update` all use it, so you never end up with two `ccteam` binaries disagreeing: an explicit `CCTEAM_INSTALL_DIR` wins, otherwise the directory where `ccteam` already lives (an upgrade replaces the copy you are running, symlinks resolved), otherwise `~/.local/bin`. After installing, the script names any *other* `ccteam` still on your PATH — it only reports, never deletes — because a copy earlier on PATH is what makes an upgrade look like it did nothing.
+**Where it lands.** One ladder decides the destination for every install mode — the script, `make install`, `ccteam update`, and the DSH plugin all use it, so you never end up with two `ccteam` binaries disagreeing: an explicit `CCTEAM_INSTALL_DIR` wins, otherwise the directory where `ccteam` already lives (an upgrade replaces the copy you are running, symlinks resolved), otherwise `~/.local/bin`. After installing, the script names any *other* `ccteam` still on your PATH — it only reports, never deletes — because a copy earlier on PATH is what makes an upgrade look like it did nothing.
 
 ### 2. The Daemon
 
-`make install` (and the one-click script, when it detects an upgrade) already started the daemon with **`ccteam daemon start`**: one resident process (web console + IM gateway + standard resource API + MCP socket), detached with `setsid` so it survives your shell closing and SSH disconnects. This is the single supervision mechanism on Linux, macOS, and WSL — **there is no systemd or launchd unit anymore** (retired in v0.9.7). Manage it the same way on every platform:
+`make install` (and the one-click script, when it detects an upgrade) already started the daemon with **`ccteam start`**: one resident process (web console + IM gateway + standard resource API + MCP socket). There is exactly one way to start it — the launcher. `ccteam start` is `ccteam daemon start`: it detaches the daemon with `setsid` so it survives your shell closing and SSH disconnects, waits until the daemon is ready, records the pid in `~/.ccteam/state/orchestrator.pid`, prints the web console link, and exits. It is idempotent — a second `ccteam start` finds the running daemon and reports it instead of starting another — and there is no foreground mode (`nohup ccteam start &` is just the launcher, which exits once the daemon is up). The DSH plugin's auto-start runs the same launcher, so a daemon started from DSH and one started from the CLI are the same daemon (see [dsh-plugin.md](dsh-plugin.md) → coexistence). This is the single supervision mechanism on Linux, macOS, and WSL — ccteam installs **no systemd or launchd unit**. Manage it the same way on every platform:
 
 ```bash
+ccteam start             # ≡ ccteam daemon start: detach, wait for readiness, print the web link (idempotent)
 ccteam daemon status     # pid · ready · running-vs-binary version   (add --json for scripts)
 ccteam daemon logs -f    # follow ~/.ccteam/daemon.log
 ccteam daemon restart    # graceful SIGTERM stop + re-detach (also `make daemon-restart`)
-ccteam daemon stop       # graceful stop; agent processes are never killed — see "What a daemon restart does to live sessions" below
+ccteam stop              # ≡ ccteam daemon stop: graceful stop; agent processes are never killed — see "What a daemon restart does to live sessions" below
 ```
 
-Honest tradeoff: with no OS supervisor there is **no crash-restart and no auto-start at boot** — after a reboot, run `ccteam daemon start` again (`ccteam status` / `ccteam doctor` show a down daemon at a glance; a `@reboot ccteam daemon start` cron line covers boot-start if you want it). Uninstall with `make uninstall` (source) or `install.sh --uninstall` (prebuilt) — both stop the daemon and remove the binary but keep `~/.ccteam`.
+Runtime flags (`--web-bind`, `--dsh-web-bind`, `--no-web`, `--no-imd`, `--web-no-auth`, `--web-token-file`, `--no-clipboard`) are launcher flags forwarded verbatim to the daemon; `ccteam daemon restart` replays the flags the daemon was started with unless you name new ones. With `--json`, `ccteam start` prints exactly one line: `{"status":"started","pid":…,"version":"…","home":"…"}` or `{"status":"alreadyRunning","pid":…,"version":"…","home":"…"}` — both are success (`home` is the canonical `$CCTEAM_HOME`, so a caller can tell whose daemon it found) — and `{"status":"error","code":"…","message":"…"}` otherwise.
 
-**Upgrading from a pre-v0.9.7 install (systemd/launchd):** just re-run the installer or `ccteam daemon start` once — its one-time takeover disables and removes the old ccteam service unit and brings the daemon back up self-managed. A unit you wrote by hand is left untouched (ccteam reports that instance as "not managed" and won't stop it — use your own supervisor). See [Updating](#updating) for the ongoing path.
+**Who is running.** `GET /health` on the web port needs no token and answers the daemon's identity: `status`, `version`, `build` (commit, when the build recorded one), `home` (canonical `$CCTEAM_HOME`), `pid`, `web_bind` (the address actually served — a `:0` request reports the assigned port), `dsh_web_bind` (`null` when the companion listener is off), `uptime_secs`. `ccteam daemon status --json` prints the same fields, taken from the running daemon (`null` when it cannot be reached over HTTP — `--no-web`, or a bind this host cannot dial), plus `binary` (absolute path of the `ccteam` you invoked), `ready`, `managed`, `runningVersion`, `binaryVersion` and `socket`. The DSH plugin, the CLI and any script of yours compare `home` before trusting a daemon as theirs.
 
-Without detaching at all (dev / containers / your own supervisor's `ExecStart`), `ccteam start` still runs in the foreground.
+Honest tradeoff: with no OS supervisor there is **no crash-restart and no auto-start at boot** — after a reboot, run `ccteam start` again (`ccteam status` / `ccteam doctor` show a down daemon at a glance; a `@reboot ccteam start` cron line covers boot-start if you want it). If you would rather have systemd supervise it, the launcher's shape is `Type=forking`:
+
+```ini
+# ~/.config/systemd/user/ccteam.service
+[Unit]
+Description=ccteam daemon
+
+[Service]
+Type=forking
+ExecStart=%h/.local/bin/ccteam start
+ExecStop=%h/.local/bin/ccteam stop
+# Only the daemon belongs to the unit: agent processes it spawned must survive a stop.
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+Do not set `PIDFile=`: `~/.ccteam/state/orchestrator.pid` is a JSON record (pid + process start time + version), not a bare pid, and systemd finds the daemon in the unit's cgroup on its own. `systemctl --user enable --now ccteam` then keeps it up; `ccteam daemon status` still reports it as managed (it was started by the launcher), `ccteam start` from a shell reports `alreadyRunning`, and the DSH plugin attaches to it like any other daemon — its **Stop** button is still a real `ccteam stop`, after which systemd may bring the daemon back. Uninstall with `make uninstall` (source) or `install.sh --uninstall` (prebuilt) — both stop the daemon and remove the binary but keep `~/.ccteam`.
+
+**Upgrading from an install that used a ccteam-written systemd/launchd unit:** just re-run the installer or `ccteam start` once — its one-time takeover disables and removes the old ccteam service unit and brings the daemon back up self-managed. A unit you wrote by hand is left untouched (ccteam reports that instance as "not managed" and won't stop it — use your own supervisor). See [Updating](#updating) for the ongoing path.
 
 `make install`, and `ccteam status` at any time, print the web console URL, for example:
 
@@ -114,7 +137,7 @@ Open the link printed by `ccteam start`. The console is a chat-style UI with a *
 
 ### Register MCP (Automatic)
 
-Every `ccteam daemon start` (and foreground `ccteam start`) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor whose config ccteam may write** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of those vendors can orchestrate the team (`grok mcp doctor` verifies the Grok side). The entry carries a **user-scoped enrollment credential** — it says whose the config is and nothing more; the per-process identity is issued by the daemon when that vendor's session connects, so two agents started an hour apart from the same config are two callers with their own ledger rows. The write is idempotent and merge-only (your other MCP servers are untouched), vendors that are not installed are skipped, and an entry left over from an older ccteam (a `Bearer ccteam:<hex>` admin token, or a `command`-style stdio entry) reads as *not registered* and is replaced on the next start.
+Every daemon start (`ccteam start` / `ccteam daemon start`, including the DSH plugin's auto-start) automatically registers ccteam's own tools (session spawning/dispatch, file sending, and related controls) into the configuration of **every installed vendor whose config ccteam may write** — Claude (`~/.claude.json`), Codex (`~/.codex/config.toml`), Grok (`~/.grok/config.toml`), OpenCode (`~/.config/opencode/opencode.json`), Kimi (`~/.kimi-code/mcp.json`) — so a plain session of those vendors can orchestrate the team (`grok mcp doctor` verifies the Grok side). The entry carries a **user-scoped enrollment credential** — it says whose the config is and nothing more; the per-process identity is issued by the daemon when that vendor's session connects, so two agents started an hour apart from the same config are two callers with their own ledger rows. The write is idempotent and merge-only (your other MCP servers are untouched), vendors that are not installed are skipped, and an entry left over from an older ccteam (a `Bearer ccteam:<hex>` admin token, or a `command`-style stdio entry) reads as *not registered* and is replaced on the next start.
 
 **DSH is deliberately not on that config-writer list** because it has no equivalent global MCP file. Hiring DSH from ccteam needs no plugin installation: `/new dsh`, the DSH page, or `session_spawn {vendor:"dsh", ...}` connects into that identity's one DSH web runtime — the same space the **DSH** menu shows (regular users: `$CCTEAM_HOME/runtime/dsh/web/<user>/`; owner: real `~/.dsh`) — so hired sessions appear live in the DSH sidebar, grouped under the project's workspace, cold-resume by sid, and track raw token usage. ccteam preloads its `@ccteam/ccteam-ui` plugin in the runtimes it manages; for a `dsh web` you started yourself, register the plugin from the **Hosts** page (or `dsh plugin --profile web add @ccteam/ccteam-ui`) and restart that instance. A DSH session of your own can also orchestrate the team: paste the daemon URL (default `http://127.0.0.1:7331`) and an enrollment credential from **Settings → Access** into DSH Settings — it gets the same eight tools, and if it has not been bound to a ccteam project yet, its first tool call asks for a project slug and remembers it.
 
@@ -372,17 +395,18 @@ ccteam init --slug demo        # Override inferred slug.
 ccteam init --owner user:u123  # Multi-user: assign project ownership.
 ccteam config                  # One-time setup: MCP, IM bot, preferences.
 ccteam config mcp              # Register/refresh ccteam MCP for config-writable vendors; useful without TTY.
-ccteam daemon start            # Start the daemon in the background (setsid; idempotent).
-ccteam daemon stop [--force]   # Graceful stop; --force escalates to SIGKILL (daemon only).
-ccteam daemon restart          # Graceful stop + re-detach under one lock.
-ccteam daemon status [--json]  # pid · ready · running-vs-binary version.
-ccteam daemon logs [-f] [-n N] # Tail/follow ~/.ccteam/daemon.log.
-ccteam start                   # Run in the FOREGROUND (dev / containers / your own supervisor).
-ccteam start --web-bind 127.0.0.1:7331   # Local-only bind, no token.
+ccteam start [--json]          # Start the daemon in the background (≡ `ccteam daemon start`: setsid, wait for readiness; idempotent).
+ccteam start --web-bind 127.0.0.1:7331   # Local-only bind, no token (launcher flags are forwarded to the daemon).
 ccteam start --dsh-web-bind off          # Disable the DSH Web companion listener.
 ccteam start --no-web | --no-imd         # Gateway only / web only.
 ccteam stop                    # Alias for `ccteam daemon stop`.
+ccteam daemon start            # The same launcher as `ccteam start`.
+ccteam daemon stop [--force]   # Graceful stop; --force escalates to SIGKILL (daemon only).
+ccteam daemon restart          # Graceful stop + re-detach under one lock (replays the running flags unless you name new ones).
+ccteam daemon status [--json]  # pid · ready · running-vs-binary version; --json = the /health identity + binary path.
+ccteam daemon logs [-f] [-n N] # Tail/follow ~/.ccteam/daemon.log.
 ccteam update [--now] [--no-restart] [--json]   # Update in place, then restart onto the new binary.
+ccteam update --channel npm --binary <path>     # Install an already-downloaded ccteam (e.g. the DSH plugin's platform package) through the same ladder + restart contract.
 ccteam status                  # Daemon heartbeat, projects, sessions, web link, version/update hint.
 ccteam doctor                  # Install/dependency checks; --verify-mcp checks MCP surface.
 ```
@@ -463,12 +487,16 @@ ccteam update --now                # Skip the drain wait and restart immediately
 
 `ccteam update` detects how ccteam was installed and re-runs that install path — for the one-click / prebuilt install it replays `install.sh` (same download + SHA-256 verify + atomic swap; no second downloader). A from-source checkout is never recompiled for you: it prints `git pull && make install`. After the binary is swapped, if a managed daemon is running, `update` waits for in-flight turns to go idle (up to 5 minutes; `--now` skips the wait), gracefully restarts the daemon onto the new binary, and verifies the running version matches.
 
+**`ccteam update --channel npm --binary <path>`** is the same update for a binary that is already on disk — the DSH plugin's **Update engine** button runs it with the `bin/ccteam` of its `@ccteam/engine-<os>-<cpu>` platform package, and you can run it yourself with any ccteam binary. It checks that `<path>` is an executable that answers `--version`, installs it through the same ladder as `install.sh` (`CCTEAM_INSTALL_DIR` → where `ccteam` already lives → `~/.local/bin`; a symlink or package-manager-owned destination is refused with a message, never overwritten; pointing `--binary` at the installed file itself reports `alreadyInstalled`), records the install channel, and then runs the same drain + graceful-restart + version-verify contract (`--no-restart` and `--now` apply). `--binary` is only accepted with `--channel npm|bun|pnpm`; the standalone channel downloads its own.
+
+A restart never moves the daemon: `ccteam update` (like `ccteam daemon restart` with no flags) replays the launcher's recorded flags or, when the daemon predates that record, the binds it reports on `/health`. When neither is available — no launcher record and no `/health` answer (a daemon started with `--no-web`, or a build older than the identity surface) — the binary is swapped but the restart is **refused** rather than guessed, and the message names the exact restart to run: `ccteam stop && ccteam start --web-bind <addr> [...]` with the flags the daemon is running, or `ccteam daemon restart --web-bind <addr>`.
+
 What a daemon restart does to live sessions is the resume-by-id contract plus one rule — **one session, one process**: `terminal`/tmux sessions keep running (separate process tree); a default `stream-json` session's process is let go, not killed — an idle one exits on its own, a session mid-turn keeps working to the end of its turn. The new daemon finds such a survivor by its body record (`<project>/.ccteam/chat/<sid>/body.json`) and never starts a second process for the same session: the session shows as `detached` (web rail, `session_list activity:detached`, IM `/sessions`), messages sent to it queue and are delivered the moment that process exits, `/stop` / `session_stop` ends it now, and when it exits ccteam recovers the answer it gave in the meantime from Claude's own transcript and delivers it (IM/web reply, delegation notification) before rebuilding the session by id. ACP (grok/kimi/opencode) and codex processes end with the daemon; their in-flight turn is interrupted and the session resumes its context by id on the next message. `ccteam status` and `ccteam doctor` show the install channel, the running-vs-binary version, and whether a newer release is available (a lazy check, at most once every ~20h; toggle with `check_for_update` in `preferences.toml`). **Satellites update themselves** — run `ccteam update` on each; the console's Hosts view and `ccteam status` flag any host whose version lags the daemon.
 
 State file quick reference. `~/.ccteam` is grouped by responsibility: `secrets/` for credentials, `state/` for daemon-written state, `cache/` for disposable cache, and `run/` for sockets.
 
 ```bash
-journalctl --user -u ccteam -n 120               # Daemon log (systemd journal; or make daemon-logs).
+ccteam daemon logs -n 120                        # Daemon log (~/.ccteam/daemon.log; or make daemon-logs).
 cat ~/.ccteam/config.yaml                        # Project registry: slug -> path.
 cat ~/.ccteam/state/gateway/routing.json         # Chat routing: current project/session + live set.
 cat ~/.ccteam/state/sessions/next-sid            # Monotonic sid counter; never reused.
@@ -496,7 +524,7 @@ ccteam host mint-token --daemon http://daemon-host:7331 --web-token <admin-hex>
 
 # On the satellite (any machine running ccteam start):
 ccteam host join --daemon http://daemon-host:7331 --token <join-token>
-# The running `ccteam start` picks the join up within 30s and connects out.
+# The running daemon picks the join up within 30s and connects out.
 
 ccteam host ls                     # This machine's satellite credentials (if joined).
 
@@ -521,7 +549,7 @@ Start with these three commands; they usually locate the issue:
 ```bash
 ccteam doctor
 ccteam status
-journalctl --user -u ccteam -n 120
+ccteam daemon logs -n 120
 ```
 
 1. **`ccteam: command not found`** - `~/.local/bin` is not in PATH. Run `export PATH="$HOME/.local/bin:$PATH"`.
