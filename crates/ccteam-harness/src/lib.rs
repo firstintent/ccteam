@@ -78,7 +78,8 @@ pub use execution::dsh_acp::{
 };
 pub use execution::dsh_runtime::{
     is_ccteam_managed_dsh_orphan, sweep_legacy_dsh_orphans, DshEnrollmentResolver,
-    DshRuntimeConfig, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState, DshRuntimeStatus,
+    DshRestTokenResolver, DshRuntimeConfig, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState,
+    DshRuntimeStatus,
 };
 pub use execution::fs_atomic::atomic_write_durable;
 pub use execution::grok_acp::{GrokAcpAdapter, GROK_ACP_ADAPTER_NAME};
@@ -103,6 +104,9 @@ pub use execution::session_meta::{
     apply_title, discover_external_claude_sessions, list_session_metas, read_session_meta,
     touch_last_active, truncate_title, write_session_meta, ExternalClaudeSession, SessionMeta,
     SessionOrigin, TitleSource,
+};
+pub use execution::turn_status::{
+    render_status_line, render_status_metrics, truncate_status_title, StatusIdentity, TurnStatus,
 };
 pub use execution::ClaudeBgAdapter;
 pub use hook_sink::{default_ccteam_hook_socket_path, HookEvent, HookSink, HookSinkClient};

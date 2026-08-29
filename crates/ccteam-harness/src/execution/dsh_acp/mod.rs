@@ -214,7 +214,7 @@ impl DshAcpAdapter {
             // `dsh web` predates the registration.
             message.push_str(
                 ". That instance was started outside ccteam — register the plugin \
-                 (`dsh plugin add @ccteam/dsh-client`) and restart your DSH web",
+                 (`dsh plugin add @ccteam/ccteam-ui`) and restart your DSH web",
             );
         }
         message.push_str(&format!(": {error}"));
@@ -697,6 +697,7 @@ mod tests {
         DshAcpAdapter::new(Arc::new(DshRuntimeManager::new(
             PathBuf::from("/nonexistent/ccteam-home"),
             Arc::new(|_root, _owner| Err(anyhow::anyhow!("no enrollment in tests"))),
+            Arc::new(|_root, _owner| Err(anyhow::anyhow!("no REST token in tests"))),
         )))
     }
 
@@ -718,6 +719,7 @@ mod tests {
         let manager = Arc::new(DshRuntimeManager::new(
             PathBuf::from("/nonexistent/ccteam-home"),
             Arc::new(|_root, _owner| anyhow::bail!("no enrollment in tests")),
+            Arc::new(|_root, _owner| anyhow::bail!("no REST token in tests")),
         ));
         let adapter = DshAcpAdapter::new(Arc::clone(&manager));
         assert!(Arc::ptr_eq(adapter.runtime(), &manager));

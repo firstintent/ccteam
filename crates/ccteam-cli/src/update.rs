@@ -20,6 +20,7 @@
 //! ([`run_restart_contract`]) are pure/injectable so they unit-test
 //! without running curl or a real daemon.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -46,13 +47,52 @@ pub(crate) enum UpdateAction {
     RunInstaller { restart: RestartPlan },
     /// Source: print `git pull && make install`, exit 0.
     SourceGuidance,
-    /// Npm/Bun/Pnpm: print "not published yet", exit 0.
+    /// Npm/Bun/Pnpm WITH `--binary`: install that already-downloaded
+    /// binary through install.sh's ladder, then the same restart
+    /// contract. The package manager owns the download (it already put
+    /// the platform package on disk); ccteam owns the ladder + restart.
+    InstallLocalBinary {
+        channel: InstallChannel,
+        source: PathBuf,
+        restart: RestartPlan,
+    },
+    /// Npm/Bun/Pnpm without `--binary`: print "not published yet", exit 0.
     NpmNotPublished {
         channel: InstallChannel,
         suggested: Option<String>,
     },
+    /// `--binary` on a channel that owns its own download → refuse rather
+    /// than silently ignoring the flag.
+    BinaryNotSupported { channel: InstallChannel },
     /// Other: error + current_exe + repo URL, exit 1.
     UnknownChannel,
+}
+
+/// The `ccteam update` command line, as one value (the arg list grew past
+/// the point where four positional bools read safely at the call site).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateRequest {
+    /// `--channel`: override [`install_channel::detect`].
+    pub channel: Option<String>,
+    /// `--binary`: an already-downloaded ccteam to install (npm family).
+    pub binary: Option<PathBuf>,
+    pub now: bool,
+    pub no_restart: bool,
+    pub json: bool,
+    pub force: bool,
+}
+
+/// Parse `--channel`. Unknown tokens are an error at the CLI edge rather
+/// than a silent fall-through to detection.
+pub(crate) fn parse_channel(raw: &str) -> Option<InstallChannel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "npm" => Some(InstallChannel::Npm),
+        "bun" => Some(InstallChannel::Bun),
+        "pnpm" => Some(InstallChannel::Pnpm),
+        "standalone" => Some(InstallChannel::Standalone),
+        "source" => Some(InstallChannel::Source),
+        _ => None,
+    }
 }
 
 /// Post-swap restart posture for a standalone update.
@@ -65,23 +105,42 @@ pub(crate) enum RestartPlan {
 }
 
 /// Pure channel→action mapping (unit-tested; no side effects).
-pub(crate) fn plan(channel: &InstallChannel, no_restart: bool, now: bool) -> UpdateAction {
-    match channel {
-        InstallChannel::Standalone => UpdateAction::RunInstaller {
-            restart: if no_restart {
-                RestartPlan::None
-            } else {
-                RestartPlan::Managed { now }
-            },
-        },
-        InstallChannel::Source => UpdateAction::SourceGuidance,
-        InstallChannel::Npm | InstallChannel::Bun | InstallChannel::Pnpm => {
-            UpdateAction::NpmNotPublished {
+pub(crate) fn plan(
+    channel: &InstallChannel,
+    binary: Option<&Path>,
+    no_restart: bool,
+    now: bool,
+) -> UpdateAction {
+    let restart = if no_restart {
+        RestartPlan::None
+    } else {
+        RestartPlan::Managed { now }
+    };
+    let npm_family = matches!(
+        channel,
+        InstallChannel::Npm | InstallChannel::Bun | InstallChannel::Pnpm
+    );
+    if let Some(source) = binary {
+        return if npm_family {
+            UpdateAction::InstallLocalBinary {
                 channel: channel.clone(),
-                suggested: install_channel::suggested_update_command(channel),
+                source: source.to_path_buf(),
+                restart,
             }
-        }
-        InstallChannel::Other => UpdateAction::UnknownChannel,
+        } else {
+            UpdateAction::BinaryNotSupported {
+                channel: channel.clone(),
+            }
+        };
+    }
+    match channel {
+        InstallChannel::Standalone => UpdateAction::RunInstaller { restart },
+        InstallChannel::Source => UpdateAction::SourceGuidance,
+        _ if npm_family => UpdateAction::NpmNotPublished {
+            channel: channel.clone(),
+            suggested: install_channel::suggested_update_command(channel),
+        },
+        _ => UpdateAction::UnknownChannel,
     }
 }
 
@@ -175,7 +234,11 @@ pub(crate) fn run_restart_contract(
         }
     };
     match outcome {
-        daemon_cli::RestartOutcome::NotManaged { hint } => {
+        // Both refusals leave the daemon RUNNING and untouched — the
+        // binary is swapped, the process is not. `RestartRefused` already
+        // says exactly that, so the reconstruction refusal reuses it.
+        daemon_cli::RestartOutcome::NotManaged { hint }
+        | daemon_cli::RestartOutcome::ReplayUnavailable { hint } => {
             RestartContractStatus::RestartRefused { hint }
         }
         daemon_cli::RestartOutcome::StopTimedOut { pid } => RestartContractStatus::RestartError {
@@ -201,10 +264,31 @@ pub(crate) fn run_restart_contract(
 }
 
 /// `ccteam update` entry point.
-pub fn run_update(now: bool, no_restart: bool, json: bool, force: bool) -> Result<()> {
+pub fn run_update(req: UpdateRequest) -> Result<()> {
+    let UpdateRequest {
+        channel: channel_override,
+        binary,
+        now,
+        no_restart,
+        json,
+        force,
+    } = req;
     let paths = CcteamPaths::from_env()?;
-    let channel = install_channel::detect(&paths);
-    match plan(&channel, no_restart, now) {
+    let channel = match channel_override.as_deref() {
+        Some(raw) => match parse_channel(raw) {
+            Some(c) => c,
+            None => fail(
+                json,
+                "unknownChannelName",
+                &format!(
+                    "--channel {raw} is not a known install channel (npm, bun, pnpm, \
+                     standalone, source)"
+                ),
+            ),
+        },
+        None => install_channel::detect(&paths),
+    };
+    match plan(&channel, binary.as_deref(), no_restart, now) {
         UpdateAction::SourceGuidance => {
             emit(
                 json,
@@ -236,6 +320,21 @@ pub fn run_update(now: bool, no_restart: bool, json: bool, force: bool) -> Resul
             );
             Ok(())
         }
+        UpdateAction::BinaryNotSupported { channel } => fail(
+            json,
+            "binaryNotSupported",
+            &format!(
+                "--binary is only meaningful for the npm/bun/pnpm channels (the package \
+                 manager already downloaded the binary); the {} channel downloads its own — \
+                 drop --binary",
+                channel.as_str()
+            ),
+        ),
+        UpdateAction::InstallLocalBinary {
+            channel,
+            source,
+            restart,
+        } => run_local_binary_update(&paths, &channel, &source, restart, json),
         UpdateAction::UnknownChannel => {
             let exe = std::env::current_exe()
                 .ok()
@@ -367,28 +466,32 @@ fn run_standalone_update(paths: &CcteamPaths, restart: RestartPlan, json: bool) 
                 now,
                 || dcore::probe_daemon(paths),
                 || wait_for_active_sessions_idle(paths),
-                || {
-                    daemon_cli::restart_managed(
-                        paths,
-                        daemon_cli::DEFAULT_WEB_BIND,
-                        Some(daemon_cli::DEFAULT_DSH_WEB_BIND),
-                    )
-                },
+                // `None` = replay the launcher's recorded invocation.
+                // An update must put the daemon back exactly where it
+                // was; passing this crate's compiled-in defaults would
+                // move a daemon off its custom `--web-bind` (onto a port
+                // that may already be taken) and drop its `--no-imd`.
+                || daemon_cli::restart_managed(paths, None),
             );
-            emit_restart_contract(json, &expected, status)
+            emit_restart_contract(json, "standalone", &expected, status)
         }
     }
 }
 
 /// Map the restart-contract state to the `--json` line / prose / exit code.
-fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStatus) -> Result<()> {
+fn emit_restart_contract(
+    json: bool,
+    channel: &str,
+    expected: &str,
+    status: RestartContractStatus,
+) -> Result<()> {
     match status {
         RestartContractStatus::DaemonDown => {
             emit(
                 json,
                 serde_json::json!({
                     "status": "binarySwapped",
-                    "channel": "standalone",
+                    "channel": channel,
                     "reason": "daemonDown",
                     "version": expected,
                 }),
@@ -405,7 +508,7 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
                 json,
                 serde_json::json!({
                     "status": "restarted",
-                    "channel": "standalone",
+                    "channel": channel,
                     "version": version,
                 }),
                 &format!(
@@ -427,7 +530,7 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
                 json,
                 serde_json::json!({
                     "status": "restarted",
-                    "channel": "standalone",
+                    "channel": channel,
                     "version": running,
                     "versionSkew": true,
                     "expectedVersion": exp,
@@ -454,6 +557,363 @@ fn emit_restart_contract(json: bool, expected: &str, status: RestartContractStat
             ),
         ),
     }
+}
+
+/// What the install destination already holds. Anything but
+/// [`DestVerdict::Writable`] is REPORTED, never overwritten: a symlink or
+/// a package-manager-owned file belongs to something that will put it
+/// back, and clobbering it produces two rival ccteams with no record of
+/// which one PATH resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DestVerdict {
+    /// Free to install (absent, or a plain file we may replace).
+    Writable,
+    /// A symlink — its target is somebody else's install.
+    Symlink { target: String },
+    /// Inside a package manager's tree (npm/pnpm/bun/nix/homebrew/snap).
+    PackageManaged { owner: &'static str },
+}
+
+/// Pure path classification, split from the fs probe so every rule is
+/// unit-testable without building the matching directory tree.
+pub(crate) fn classify_dest_path(dest: &Path) -> Option<&'static str> {
+    let text = dest.to_string_lossy();
+    let owner = if dest
+        .components()
+        .any(|c| c.as_os_str() == "node_modules" || c.as_os_str() == ".pnpm")
+    {
+        "a node package tree (node_modules)"
+    } else if text.starts_with("/nix/store") {
+        "nix"
+    } else if dest.components().any(|c| c.as_os_str() == "Cellar") {
+        "homebrew"
+    } else if text.starts_with("/snap/") {
+        "snap"
+    } else {
+        return None;
+    };
+    Some(owner)
+}
+
+/// Classify the destination: path rules first (they apply whether or not
+/// the file exists yet), then the on-disk symlink check.
+pub(crate) fn classify_destination(dest: &Path) -> DestVerdict {
+    if let Some(owner) = classify_dest_path(dest) {
+        return DestVerdict::PackageManaged { owner };
+    }
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => DestVerdict::Symlink {
+            target: std::fs::read_link(dest)
+                .map(|t| t.display().to_string())
+                .unwrap_or_else(|_| "<unreadable>".to_string()),
+        },
+        _ => DestVerdict::Writable,
+    }
+}
+
+/// install.sh's ONE ladder, in Rust. install.sh cannot be reused here:
+/// the npm channel's whole point is that the binary is already on disk,
+/// so there is no installer script to replay (and no network). The rungs
+/// therefore have to be a faithful copy of `resolve_install_dir()` in
+/// `install.sh` — two ladders that disagree is exactly the "two ccteam
+/// binaries, whichever sorts first on PATH wins" failure that file
+/// documents. `install_sh_ladder_rungs_match_the_rust_copy` reads the
+/// shell source so drift fails a test rather than a user's upgrade.
+///
+/// Rungs (mirroring install.sh:68-86):
+/// 1. `$CCTEAM_INSTALL_DIR`, when non-empty;
+/// 2. `command -v ccteam` — the binary a shell would RUN, symlink-resolved
+///    to its real directory, excluding a cargo build tree, and only if
+///    that directory is writable. Note this is a PATH lookup, not
+///    `current_exe()`: "where does ccteam live" and "which binary is
+///    running right now" are different questions, and answering the wrong
+///    one installs beside the shadowing copy instead of over it;
+/// 3. `$HOME/.local/bin`.
+pub(crate) fn resolve_install_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("resolve home directory for the install ladder")?;
+    Ok(resolve_install_dir_with(
+        std::env::var("CCTEAM_INSTALL_DIR").ok(),
+        std::env::var("PATH").ok(),
+        &home,
+        &|p| is_executable_file(p),
+        &|d| is_writable_dir(d),
+    ))
+}
+
+/// Testable core of the ladder: every environment input is injected, so a
+/// table test can walk the rungs without a real PATH or a real filesystem.
+pub(crate) fn resolve_install_dir_with(
+    install_dir_env: Option<String>,
+    path_env: Option<String>,
+    home: &Path,
+    is_exec: &dyn Fn(&Path) -> bool,
+    is_writable: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
+    // Rung 1 — explicit override.
+    if let Some(dir) = install_dir_env.filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    // Rung 2 — wherever a shell would find ccteam today.
+    if let Some(existing) = which_on_path("ccteam", path_env.as_deref(), is_exec) {
+        if let Some(dir) = canonical_bin(&existing)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .filter(|dir| !is_cargo_build_tree(dir))
+            .filter(|dir| is_writable(dir))
+            .map(Path::to_path_buf)
+        {
+            return dir;
+        }
+    }
+    // Rung 3 — the default.
+    home.join(".local").join("bin")
+}
+
+/// `command -v <name>`: the first executable of that name on `PATH`.
+/// Empty PATH entries mean "the current directory" in POSIX, which is
+/// exactly the kind of surprise an installer must not honour, so they are
+/// skipped.
+pub(crate) fn which_on_path(
+    name: &str,
+    path_env: Option<&str>,
+    is_exec: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    path_env?
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| Path::new(entry).join(name))
+        .find(|candidate| is_exec(candidate))
+}
+
+/// install.sh's `canonical_bin`: resolve a link to its target so a link
+/// and its target are recognised as the SAME binary rather than two rival
+/// installs. Falls back to the path as-given when it cannot be resolved
+/// (the shell helper does the same).
+fn canonical_bin(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(&m))
+}
+
+/// `<…>/target/{debug,release}` is a build output, not an install
+/// location: `cargo clean` there would take the daemon's binary with it.
+fn is_cargo_build_tree(dir: &Path) -> bool {
+    matches!(
+        dir.file_name().and_then(|n| n.to_str()),
+        Some("debug") | Some("release")
+    ) && dir.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("target"))
+}
+
+fn is_writable_dir(dir: &Path) -> bool {
+    std::fs::metadata(dir).is_ok_and(|m| m.is_dir()) && {
+        let probe = dir.join(".ccteam-write-probe");
+        let ok = std::fs::write(&probe, b"").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    }
+}
+
+/// npm/bun/pnpm channel: the package manager already downloaded the
+/// platform package, so ccteam validates it, installs it through the
+/// ladder above, and then runs the SAME drain + graceful-restart +
+/// version-verify contract the standalone channel uses.
+fn run_local_binary_update(
+    paths: &CcteamPaths,
+    channel: &InstallChannel,
+    source: &Path,
+    restart: RestartPlan,
+    json: bool,
+) -> Result<()> {
+    // 1. The source must be a real, runnable ccteam — verified BEFORE
+    //    anything on disk moves, so a bad `--binary` can never leave a
+    //    half-installed tree.
+    let meta = match std::fs::metadata(source) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => fail(
+            json,
+            "binaryNotAFile",
+            &format!("--binary {} is not a file", source.display()),
+        ),
+        Err(err) => fail(
+            json,
+            "binaryNotFound",
+            &format!("--binary {}: {err}", source.display()),
+        ),
+    };
+    if !is_executable(&meta) {
+        fail(
+            json,
+            "binaryNotExecutable",
+            &format!(
+                "--binary {} is not executable (chmod +x it; the npm platform package \
+                 ships bin/ccteam with mode 755)",
+                source.display()
+            ),
+        );
+    }
+    let Some(version) = binary_version(source) else {
+        fail(
+            json,
+            "binaryVersionUnreadable",
+            &format!(
+                "--binary {} did not answer `--version` with a parseable version; it is \
+                 not a usable ccteam binary",
+                source.display()
+            ),
+        );
+    };
+
+    // 2. Where install.sh would put it.
+    let dir = match resolve_install_dir() {
+        Ok(d) => d,
+        Err(err) => fail(json, "installDirUnresolved", &format!("{err:#}")),
+    };
+    let dest = dir.join("ccteam");
+    match classify_destination(&dest) {
+        DestVerdict::Writable => {}
+        DestVerdict::Symlink { target } => fail(
+            json,
+            "destIsSymlink",
+            &format!(
+                "{} is a symlink to {target} — refusing to replace it. Whatever owns that \
+                 link would put it back, leaving two ccteam binaries. Replace the link \
+                 yourself, or install elsewhere with CCTEAM_INSTALL_DIR=<dir>",
+                dest.display()
+            ),
+        ),
+        DestVerdict::PackageManaged { owner } => fail(
+            json,
+            "destPackageManaged",
+            &format!(
+                "{} is owned by {owner} — refusing to write into it. Update it with that \
+                 tool, or install elsewhere with CCTEAM_INSTALL_DIR=<dir>",
+                dest.display()
+            ),
+        ),
+    }
+
+    // 3. Installing a file onto itself is a no-op, not an update.
+    if same_file(source, &dest) {
+        emit(
+            json,
+            serde_json::json!({
+                "status": "alreadyInstalled",
+                "channel": channel.as_str(),
+                "version": version,
+                "binary": dest.display().to_string(),
+            }),
+            &format!(
+                "{} already IS the installed binary ({version}); nothing to copy",
+                dest.display()
+            ),
+        );
+        return Ok(());
+    }
+
+    // 4. Same atomic swap install.sh does: write beside the target, then
+    //    rename over it, so a reader never sees a half-written binary.
+    if let Err(err) = install_binary(source, &dest) {
+        fail(
+            json,
+            "installFailed",
+            &format!(
+                "could not install {} to {}: {err:#}",
+                source.display(),
+                dest.display()
+            ),
+        );
+    }
+    // The marker is how `install_channel::detect` answers next time; a
+    // successful install that does not write it leaves the channel to be
+    // re-guessed from the path.
+    if let Err(err) = install_channel::write_marker(
+        paths,
+        &install_channel::InstallMarker {
+            channel: channel.clone(),
+            tag: Some(version.clone()),
+            installed_at: Some(chrono::Utc::now().to_rfc3339()),
+            bin: Some(dest.display().to_string()),
+        },
+    ) {
+        eprintln!("ccteam update: could not record the install marker: {err:#}");
+    }
+
+    // 5. The standalone channel's restart contract, unchanged.
+    match restart {
+        RestartPlan::None => {
+            emit(
+                json,
+                serde_json::json!({
+                    "status": "binarySwapped",
+                    "channel": channel.as_str(),
+                    "reason": "noRestart",
+                    "version": version,
+                    "binary": dest.display().to_string(),
+                }),
+                &format!(
+                    "installed {version} to {}; run `ccteam daemon restart` to load it \
+                     into the running daemon",
+                    dest.display()
+                ),
+            );
+            Ok(())
+        }
+        RestartPlan::Managed { now } => {
+            daemon_cli::takeover_pre_step();
+            let status = run_restart_contract(
+                &version,
+                now,
+                || dcore::probe_daemon(paths),
+                || wait_for_active_sessions_idle(paths),
+                || daemon_cli::restart_managed(paths, None),
+            );
+            emit_restart_contract(json, channel.as_str(), &version, status)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_meta: &std::fs::Metadata) -> bool {
+    true
+}
+
+/// True when both paths resolve to the same file (so `--binary` pointing
+/// at the already-installed ccteam is recognised instead of copied).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Copy + chmod 755 + atomic rename, all inside the destination dir so
+/// the rename cannot cross a filesystem boundary.
+fn install_binary(source: &Path, dest: &Path) -> Result<()> {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let tmp = dir.join(".ccteam.new");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::copy(source, &tmp)
+        .with_context(|| format!("copy {} to {}", source.display(), tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod 755 {}", tmp.display()))?;
+    }
+    if let Err(err) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("publish {}", dest.display()));
+    }
+    Ok(())
 }
 
 /// Replay `install.sh` (it does the download + sha256 + atomic mv). In
@@ -517,8 +977,15 @@ fn installed_binary_version() -> Option<String> {
     // atomic swap just replaced the running updater's inode, so
     // `current_exe()` reports `<path> (deleted)` and probing it would fail —
     // masking the real (new) version behind the updater's stale compiled one.
-    let exe = ccteam_core::current_ccteam_bin().ok()?;
-    let out = Command::new(&exe)
+    binary_version(&ccteam_core::current_ccteam_bin().ok()?)
+}
+
+/// Run `<exe> --version` and parse it. Shared by the standalone path (which
+/// asks the freshly-swapped binary) and the npm path (which asks the
+/// candidate BEFORE installing it) — one parser, so "is this a usable
+/// ccteam binary?" is answered the same way in both.
+fn binary_version(exe: &Path) -> Option<String> {
+    let out = Command::new(exe)
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -527,9 +994,13 @@ fn installed_binary_version() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // `ccteam --version` prints e.g. "ccteam 0.9.8 (<commit>)"; take the
-    // first dotted-numeric token.
+    parse_version_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `ccteam --version` prints e.g. `ccteam 0.9.8 (<commit>)`; take the
+/// first dotted-numeric token. Pure, so the parse is unit-tested without
+/// running a binary.
+pub(crate) fn parse_version_output(text: &str) -> Option<String> {
     text.lines().next().and_then(|line| {
         line.split_whitespace()
             .map(|t| t.trim_start_matches('v'))
@@ -700,6 +1171,229 @@ mod tests {
     /// installer when nothing newer has been published — the whole point of the
     /// pre-check. Pure, so it runs without touching the network.
     #[test]
+    fn plan_routes_a_supplied_binary_to_the_npm_install_and_keeps_no_restart() {
+        let bin = Path::new("/pkg/bin/ccteam");
+        assert_eq!(
+            plan(&InstallChannel::Npm, Some(bin), false, false),
+            UpdateAction::InstallLocalBinary {
+                channel: InstallChannel::Npm,
+                source: bin.to_path_buf(),
+                restart: RestartPlan::Managed { now: false },
+            },
+            "npm + --binary reuses the standalone restart contract"
+        );
+        assert_eq!(
+            plan(&InstallChannel::Pnpm, Some(bin), true, false),
+            UpdateAction::InstallLocalBinary {
+                channel: InstallChannel::Pnpm,
+                source: bin.to_path_buf(),
+                restart: RestartPlan::None,
+            },
+            "--no-restart must survive the new arm"
+        );
+        // Without --binary the npm family is still unpublished guidance.
+        assert!(matches!(
+            plan(&InstallChannel::Npm, None, false, false),
+            UpdateAction::NpmNotPublished { .. }
+        ));
+        // A channel that downloads its own binary refuses the flag rather
+        // than ignoring it.
+        assert_eq!(
+            plan(&InstallChannel::Standalone, Some(bin), false, false),
+            UpdateAction::BinaryNotSupported {
+                channel: InstallChannel::Standalone
+            }
+        );
+    }
+
+    #[test]
+    fn parse_channel_accepts_the_known_names_only() {
+        assert_eq!(parse_channel("npm"), Some(InstallChannel::Npm));
+        assert_eq!(parse_channel(" NPM "), Some(InstallChannel::Npm));
+        assert_eq!(
+            parse_channel("standalone"),
+            Some(InstallChannel::Standalone)
+        );
+        assert_eq!(
+            parse_channel("other"),
+            None,
+            "`other` is a verdict, not a request"
+        );
+        assert_eq!(parse_channel("brew"), None);
+    }
+
+    #[test]
+    fn classify_destination_protects_symlinks_and_package_manager_trees() {
+        // Path rules apply whether or not the file exists yet.
+        for (path, owner) in [
+            (
+                "/home/u/.nvm/versions/node/v20/lib/node_modules/x/bin/ccteam",
+                "node",
+            ),
+            ("/nix/store/abc-ccteam/bin/ccteam", "nix"),
+            ("/opt/homebrew/Cellar/ccteam/1.0/bin/ccteam", "homebrew"),
+            ("/snap/ccteam/current/bin/ccteam", "snap"),
+        ] {
+            match classify_destination(Path::new(path)) {
+                DestVerdict::PackageManaged { owner: got } => {
+                    assert!(got.contains(owner), "{path} -> {got}")
+                }
+                other => panic!("{path} should be package-managed, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            classify_destination(Path::new("/home/u/.local/bin/ccteam")),
+            DestVerdict::Writable
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("real");
+        std::fs::write(&target, b"x").unwrap();
+        let link = tmp.path().join("ccteam");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            classify_destination(&link),
+            DestVerdict::Symlink { .. }
+        ));
+        // A plain file IS replaceable — that is the ordinary upgrade.
+        let plain = tmp.path().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        assert_eq!(classify_destination(&plain), DestVerdict::Writable);
+    }
+
+    /// Rung-by-rung parity with the shell ladder. Each case names the
+    /// rung it exercises, in install.sh's order.
+    #[test]
+    fn install_dir_ladder_walks_install_sh_rungs_in_order() {
+        let home = Path::new("/home/u");
+        let exec = |p: &Path| {
+            matches!(
+                p.to_str(),
+                Some("/opt/first/ccteam")
+                    | Some("/home/u/.local/bin/ccteam")
+                    | Some("/ro/ccteam")
+                    | Some("/src/target/debug/ccteam")
+            )
+        };
+        let writable = |d: &Path| d != Path::new("/ro");
+        let ladder = |env: Option<&str>, path: Option<&str>| {
+            resolve_install_dir_with(
+                env.map(str::to_string),
+                path.map(str::to_string),
+                home,
+                &exec,
+                &writable,
+            )
+        };
+
+        // Rung 1 — the explicit override wins over everything.
+        assert_eq!(
+            ladder(Some("/custom"), Some("/opt/first:/home/u/.local/bin")),
+            Path::new("/custom")
+        );
+        // ...but an EMPTY override is not an override.
+        assert_eq!(
+            ladder(Some(""), Some("/opt/first")),
+            Path::new("/opt/first")
+        );
+
+        // Rung 2 — `command -v ccteam`: the FIRST PATH hit, which is the
+        // binary a shell would run. Not `current_exe()`: installing beside
+        // a shadowing copy instead of over it is the whole failure.
+        assert_eq!(
+            ladder(None, Some("/nope:/opt/first:/home/u/.local/bin")),
+            Path::new("/opt/first")
+        );
+        // Rung 2 skips a cargo build tree (`cargo clean` would delete it)…
+        assert_eq!(
+            ladder(None, Some("/src/target/debug:/home/u/.local/bin")),
+            Path::new("/home/u/.local/bin"),
+            "a build tree is not an install location"
+        );
+        // …and a directory it cannot write.
+        assert_eq!(
+            ladder(None, Some("/ro")),
+            Path::new("/home/u/.local/bin"),
+            "an unwritable dir falls through to the default"
+        );
+
+        // Rung 3 — nothing on PATH, no PATH at all.
+        assert_eq!(ladder(None, Some("/nope")), Path::new("/home/u/.local/bin"));
+        assert_eq!(ladder(None, None), Path::new("/home/u/.local/bin"));
+    }
+
+    /// Drift guard: the Rust ladder is a COPY of install.sh's, and a copy
+    /// with no test rots. Read the shell source and require every rung to
+    /// still be there — if install.sh's ladder changes, this fails and
+    /// whoever changed it has to update the Rust copy too.
+    #[test]
+    fn install_sh_ladder_rungs_match_the_rust_copy() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../install.sh")
+            .canonicalize()
+            .expect("install.sh is two levels above the crate");
+        let body = std::fs::read_to_string(&script).expect("read install.sh");
+        let ladder = body
+            .split_once("resolve_install_dir() {")
+            .expect("install.sh still defines resolve_install_dir()")
+            .1
+            .split_once("\n}")
+            .expect("resolve_install_dir() is brace-terminated")
+            .0;
+        for (rung, marker) in [
+            ("1: explicit override", "CCTEAM_INSTALL_DIR"),
+            ("2: PATH lookup", "command -v ccteam"),
+            ("2: symlink resolution", "canonical_bin"),
+            ("2: build-tree exclusion", "*/target/release|*/target/debug"),
+            ("2: writability", "-w \"$_dir\""),
+            ("3: default", "$HOME/.local/bin"),
+        ] {
+            assert!(
+                ladder.contains(marker),
+                "install.sh's ladder lost rung {rung} (marker {marker:?}); \
+                 `update::resolve_install_dir_with` mirrors it and must be \
+                 updated in the same change.\n--- ladder ---\n{ladder}"
+            );
+        }
+        // Order matters: the override is checked before the PATH lookup.
+        assert!(
+            ladder.find("CCTEAM_INSTALL_DIR").unwrap() < ladder.find("command -v ccteam").unwrap(),
+            "install.sh checks the override first; the Rust copy assumes it"
+        );
+    }
+
+    #[test]
+    fn which_on_path_takes_the_first_hit_and_ignores_empty_entries() {
+        let exec = |p: &Path| p.starts_with("/b") || p.starts_with("/c");
+        assert_eq!(
+            which_on_path("ccteam", Some("/a:/b:/c"), &exec),
+            Some(PathBuf::from("/b/ccteam"))
+        );
+        // An empty PATH entry means "cwd" in POSIX — an installer must not
+        // resolve its destination from wherever it happens to be run.
+        assert_eq!(
+            which_on_path("ccteam", Some(":/b"), &exec),
+            Some(PathBuf::from("/b/ccteam"))
+        );
+        assert_eq!(which_on_path("ccteam", Some("/a"), &exec), None);
+        assert_eq!(which_on_path("ccteam", None, &exec), None);
+    }
+
+    #[test]
+    fn parse_version_output_takes_the_first_dotted_numeric_token() {
+        assert_eq!(
+            parse_version_output("ccteam 0.10.5 (abc1234)\n").as_deref(),
+            Some("0.10.5")
+        );
+        assert_eq!(
+            parse_version_output("ccteam v1.2.3\n").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(parse_version_output("usage: something\n"), None);
+        assert_eq!(parse_version_output(""), None);
+    }
+
+    #[test]
     fn gate_skips_the_download_when_already_on_the_latest() {
         // Newer upstream → install it.
         assert_eq!(
@@ -737,41 +1431,41 @@ mod tests {
     #[test]
     fn plan_maps_channel_to_action() {
         assert_eq!(
-            plan(&InstallChannel::Standalone, false, false),
+            plan(&InstallChannel::Standalone, None, false, false),
             UpdateAction::RunInstaller {
                 restart: RestartPlan::Managed { now: false }
             }
         );
         assert_eq!(
-            plan(&InstallChannel::Standalone, false, true),
+            plan(&InstallChannel::Standalone, None, false, true),
             UpdateAction::RunInstaller {
                 restart: RestartPlan::Managed { now: true }
             }
         );
         // --no-restart wins over --now.
         assert_eq!(
-            plan(&InstallChannel::Standalone, true, true),
+            plan(&InstallChannel::Standalone, None, true, true),
             UpdateAction::RunInstaller {
                 restart: RestartPlan::None
             }
         );
         assert_eq!(
-            plan(&InstallChannel::Source, false, false),
+            plan(&InstallChannel::Source, None, false, false),
             UpdateAction::SourceGuidance
         );
         assert!(matches!(
-            plan(&InstallChannel::Npm, false, false),
+            plan(&InstallChannel::Npm, None, false, false),
             UpdateAction::NpmNotPublished {
                 channel: InstallChannel::Npm,
                 ..
             }
         ));
         assert!(matches!(
-            plan(&InstallChannel::Bun, false, false),
+            plan(&InstallChannel::Bun, None, false, false),
             UpdateAction::NpmNotPublished { .. }
         ));
         assert_eq!(
-            plan(&InstallChannel::Other, false, false),
+            plan(&InstallChannel::Other, None, false, false),
             UpdateAction::UnknownChannel
         );
     }

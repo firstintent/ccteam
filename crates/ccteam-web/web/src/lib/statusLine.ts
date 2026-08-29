@@ -9,7 +9,7 @@
 // structured `model` / `context` fields are a fallback when an older daemon
 // (or a partial payload) gives us numbers but no pre-rendered line.
 
-import type { SessionContext, SessionStatus } from "./sessionsApi";
+import type { SessionContext, SessionStatus, TurnStatus } from "./sessionsApi";
 
 /** Humanize a token count the way the backend does: `1_000_000 → "1M"`,
  *  `200_000 → "200k"`, `188_000 → "188k"`. Whole millions render as `<n>M`;
@@ -58,4 +58,22 @@ export function formatStatusLine(status: SessionStatus): string | null {
     parts.push(formatContext(status.context));
   }
   return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+export function formatTurnStatus(status?: TurnStatus): { text: string; warn: boolean } | null {
+  if (!status) return null;
+  // Bubble footer = `turn N · ctx N%` only: the model sits in the bubble header
+  // and the ledger lives on the session pages — every fact once.
+  const parts: string[] = [`turn ${status.turn}`];
+  const pct = contextPct(status.context);
+  const roundedPct = typeof pct === "number" && Number.isFinite(pct) ? Math.round(pct) : null;
+  if (roundedPct !== null) parts.push(`ctx ${roundedPct}%${roundedPct >= 85 ? "⚠" : ""}`);
+  return { text: parts.join(" · "), warn: roundedPct !== null && roundedPct >= 85 };
+}
+
+/** TurnStatus serializes ContextUsage's numerator/denominator; derive pct
+ * locally because the Rust `pct()` helper is intentionally not a stored field. */
+export function contextPct(context?: TurnStatus["context"]): number | null {
+  if (!context || context.used_tokens == null || context.window_tokens <= 0) return null;
+  return (context.used_tokens / context.window_tokens) * 100;
 }

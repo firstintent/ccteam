@@ -652,11 +652,16 @@ function VendorManageRow({
             // the write (satellite): state without a dead-end CTA.
             <span>{t("mcpNotRegistered")}</span>
           )
+        ) : agent.vendor === "dsh" && agent.installed && agent.mcp_registered ? (
+          // Already in the operator's ~/.dsh web profile — state, no CTA.
+          <span className="ok" data-testid="host-vendor-dsh-plugin-ok">
+            ✓ {t("dshPluginOk")}
+          </span>
         ) : agent.vendor === "dsh" && agent.installed && isLocal && isAdmin ? (
           // DSH's "register ccteam" writes ccteam's plugin bundle + patch row
           // into the operator's ~/.dsh web profile (server-side gate ①); the
           // human then restarts their own `dsh web` to load it. Idempotent, so
-          // the CTA stays available; the row hint explains the restart.
+          // the CTA stays until the profile actually carries our row.
           <button
             type="button"
             className="btn primary mini"

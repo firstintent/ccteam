@@ -14,14 +14,14 @@
 //!
 //! - `daemon_healthy`: [`ccteam_core::check_daemon_health`]`.is_healthy()`
 //!   (the same MCP-socket probe `ccteam status` prints).
-//! - `sessions_live` / `sessions_idle`: the gateway session map. We prefer the
-//!   **live** map ([`Gateway::session_views`]) when [`AppState::gateway`] is
-//!   attached (the daemon process), else fall back to the on-disk
-//!   [`tracked_chat_sessions`] snapshot (mirrors how `run_status` reads
-//!   sessions out-of-process). Split (matching `run_status`): a tracked session
-//!   counts **live** when the daemon is healthy, **idle** otherwise — the
-//!   gateway carries no finer per-session live/idle bit (`SessionView::status`
-//!   is `"live"` for any tracked session), so daemon health is the split.
+//! - `sessions_live` / `sessions_idle`: the RESIDENCY split. `sessions_live` =
+//!   sessions ccteam holds a vendor process for ([`Gateway::session_views`]);
+//!   `sessions_idle` = sessions that exist and resume on their next message but
+//!   hold no process (the on-disk metas that are `is_resumable()` and not
+//!   resident, counted outside the gateway lock). With no gateway attached
+//!   (standalone web) or the daemon down, nothing can be resident: the on-disk
+//!   [`tracked_chat_sessions`] count lands in `sessions_idle` instead (mirrors
+//!   how `run_status` reads sessions out-of-process).
 //! - `cost_24h_usd` + `cost_24h_by_vendor`: sum the shared incremental
 //!   progress projection across every registered project.
 //! - `budget_cap_24h`: the aggregate 24h cap. Budgets are declared per project
@@ -150,9 +150,12 @@ pub struct StatusResponse {
     /// Whether the daemon MCP socket is reachable (`ccteam status`'s daemon
     /// line). `false` from a standalone web process or when the daemon is down.
     pub daemon_healthy: bool,
-    /// Tracked sessions counted **live** (daemon healthy).
+    /// Sessions ccteam is holding a vendor process for right now (RESIDENT).
+    /// `0` when the daemon is down — nothing is held.
     pub sessions_live: u32,
-    /// Tracked sessions counted **idle** (daemon down → none are live).
+    /// Sessions that exist and resume on their next message but hold no
+    /// process (RELEASED). With the daemon down this carries the last known
+    /// tracked count instead, since nothing can be resident.
     pub sessions_idle: u32,
     /// Sum of every project's rolling-24h cost (USD).
     pub cost_24h_usd: f64,
@@ -305,34 +308,39 @@ pub(crate) async fn handle_status(
     }
 }
 
+/// RESIDENT rows of a `session_views()` snapshot — the sessions this daemon
+/// holds a vendor process (or DSH connection) for. Not every row is one: an
+/// `external` row is the ledger entry of a hand-started client ccteam never
+/// spawned, and a `detached` row is a body the daemon is WAITING on, not
+/// holding. Counting them as live overstated the fleet's memory cost.
+fn count_resident(views: &[ccteam_im::gateway::SessionView]) -> u32 {
+    views
+        .iter()
+        .filter(|view| view.residency == ccteam_im::gateway::RESIDENCY_RESIDENT)
+        .count() as u32
+}
+
 /// Compute the global snapshot synchronously inside `spawn_blocking`. The
 /// gateway section is now a pure catalog snapshot; progress reads are byte-
 /// cursor catch-ups outside that lock and normally reduce to metadata stats.
 fn aggregate_status(app: &AppState) -> StatusResponse {
     let daemon_healthy = ccteam_core::check_daemon_health(&app.paths).is_healthy();
 
-    // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
-    // Either way we only need the COUNT of tracked sessions; the live/idle
-    // split is daemon health (the gateway has no finer per-session bit).
+    // ── sessions: RESIDENT (a process ccteam is holding) vs RELEASED (real,
+    // resumable, no process). The split used to be daemon health, because the
+    // gateway carried no finer per-session bit; it does now, and the honest
+    // numbers are what tell an operator whether the fleet is costing memory.
     let mut active_watches = 0;
     let mut views = Vec::new();
-    let tracked_count: u32 = if let Some(gw) = app.gateway.as_ref() {
+    // `Some(n)` = RESIDENT rows of the live snapshot; `None` = standalone web
+    // (no gateway in this process), where nothing can be resident at all.
+    let resident_count: Option<u32> = if let Some(gw) = app.gateway.as_ref() {
         let guard = ccteam_im::latency::gateway_blocking_lock(gw, "web.status.snapshot");
         views = guard.session_views();
         active_watches = guard.armed_delegation_watch_count();
-        views.len() as u32
+        Some(count_resident(&views))
     } else {
-        // Standalone web (no daemon gateway): fall back to the persisted route
-        // table the CLI's `run_status` reads. A missing / unreadable file is an
-        // empty list, never an error. No live map ⇒ no per-session fleet rows.
-        ccteam_im::gateway::tracked_chat_sessions(&app.paths.root)
-            .map(|rows| rows.len() as u32)
-            .unwrap_or(0)
-    };
-    let (sessions_live, sessions_idle) = if daemon_healthy {
-        (tracked_count, 0)
-    } else {
-        (0, tracked_count)
+        None
     };
 
     // ── cost: sum each project's 24h cost + merge the per-vendor breakdown. ──
@@ -351,6 +359,40 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
             .or_insert_with(|| app.progress_projection.project_snapshot(&view.project));
     }
     let session_rows = build_session_cost_rows(&projections, &views);
+    // Released = every on-disk session that is resumable and not resident. The
+    // scan runs OUTSIDE the gateway lock (metadata reads per project), through
+    // the same `is_resumable` predicate the gateway's own listings use.
+    let tracked: std::collections::HashSet<&str> =
+        views.iter().map(|view| view.sid.as_str()).collect();
+    let released_count = if daemon_healthy && resident_count.is_some() {
+        projects
+            .iter()
+            .map(|project| {
+                ccteam_harness::list_session_metas(&app.paths.project_dir(&project.state.slug))
+                    .into_iter()
+                    .filter(|meta| meta.is_resumable() && !tracked.contains(meta.sid.as_str()))
+                    .count() as u32
+            })
+            .sum()
+    } else {
+        0
+    };
+    let (sessions_live, sessions_idle) = match resident_count {
+        Some(resident) if daemon_healthy => (resident, released_count),
+        // The gateway is here but the daemon record says unhealthy: report
+        // what it holds as idle rather than claim a healthy resident fleet.
+        Some(resident) => (0, resident),
+        // Standalone web (no daemon gateway): fall back to the persisted route
+        // table the CLI's `run_status` reads — sessions that exist, none of
+        // them held here, so they are idle by definition. A missing /
+        // unreadable file is an empty list, never an error.
+        None => (
+            0,
+            ccteam_im::gateway::tracked_chat_sessions(&app.paths.root)
+                .map(|rows| rows.len() as u32)
+                .unwrap_or(0),
+        ),
+    };
 
     let mut cost_24h_usd = 0.0_f64;
     let mut cost_24h_by_vendor: BTreeMap<String, f64> = BTreeMap::new();
@@ -618,6 +660,7 @@ mod tests {
     fn view(sid: &str, project: &str, vendor: &str) -> ccteam_im::gateway::SessionView {
         ccteam_im::gateway::SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: sid.into(),
             project: project.into(),
@@ -640,6 +683,22 @@ mod tests {
             parent_sid: None,
             delegation_depth: 0,
         }
+    }
+
+    /// `sessions_live` is the RESIDENT count: `session_views()` also carries
+    /// external (hand-started) and detached (body outliving a restart) rows,
+    /// and neither is a process this daemon holds.
+    #[test]
+    fn count_resident_ignores_external_and_detached_rows() {
+        let resident = view("s1", "demo", "claude");
+        let mut external = view("s2", "demo", "claude");
+        external.residency = "external".to_string();
+        external.driveable = false;
+        let mut detached = view("s3", "demo", "claude");
+        detached.residency = "detached".to_string();
+        detached.driveable = false;
+        assert_eq!(count_resident(&[resident, external, detached]), 1);
+        assert_eq!(count_resident(&[]), 0);
     }
 
     #[test]

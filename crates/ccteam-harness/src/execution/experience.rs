@@ -558,6 +558,7 @@ mod tests {
         let meta = super::super::session_meta::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: crate::AgentVendor::Opencode,
@@ -603,6 +604,7 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap(),
+                status: None,
                 tool_calls: Vec::new(),
                 attachments: Vec::new(),
                 outcome: Some("failed".into()),
@@ -629,6 +631,7 @@ mod tests {
         let meta = super::super::session_meta::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: crate::AgentVendor::Claude,
@@ -668,6 +671,7 @@ mod tests {
                 user: "hi".into(),
                 assistant: "hello".into(),
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: vec![],
                 attachments: vec![],
                 outcome: None,

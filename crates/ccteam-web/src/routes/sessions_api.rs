@@ -64,10 +64,7 @@ use axum::{
     Extension, Json,
 };
 use ccteam_harness::execution::turns_mirror::{turns_jsonl_path, TurnRecord};
-use ccteam_harness::{
-    AgentVendor, ChoicePrompt, HarnessAdapter, PermissionMode, SessionProtocol, ThreadHandle,
-    ThreadStatus,
-};
+use ccteam_harness::{AgentVendor, ChoicePrompt, PermissionMode, SessionProtocol};
 use ccteam_im::gateway::{GatewayEvent, SessionView};
 use ccteam_im::transport::MessageOption;
 use futures::stream::StreamExt;
@@ -223,20 +220,63 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
     }
 }
 
-/// Replace the gateway's cheap `"live"` hint with the real activity
-/// (`working|idle|stale|stuck`) through the SHARED resolver — the same
-/// `ccteam_core::stall::classify_session_activity` IM `/status` and MCP
-/// `session_list` answer through, so the SPA rail and a phone's `/status` card
-/// can never tell the user different things about one session.
+/// One project's activity resolver, snapshotted once and asked per session —
+/// the SHARED path every web surface answers "what is this session doing"
+/// through (`working|idle|stale|stuck`), so the session rail, the team graph,
+/// MCP `session_list` and a phone's `/status` card can never tell the user
+/// different things about one session.
 ///
-/// `live_turns` is the daemon's in-flight-turn snapshot, taken under the same
-/// lock that produced `views`. Persisted activity comes from the incremental
-/// projection after the lock is released.
+/// The project snapshot + its staleness baseline are computed ONCE per project
+/// (they are per-project facts), which is why this is a value rather than a
+/// free function: the team graph asks it for every session of a project, and
+/// recomputing the baseline per row was the duplication that let the two
+/// surfaces drift.
 ///
-/// A project the catalog can't price for staleness no longer bails out (that
+/// A project the catalog can't price for staleness does NOT bail out (that
 /// left every row saying `"live"`, i.e. green, on a surface whose whole job is
 /// to say what a session is doing): fall back to `0` silent seconds, the same
 /// fallback the IM side uses.
+pub(crate) struct ProjectActivity {
+    snapshot: ccteam_im::progress_projection::ProjectProjectionSnapshot,
+    silent_seconds: u64,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+impl ProjectActivity {
+    pub(crate) fn new(
+        projection: &ccteam_im::progress_projection::ProgressProjection,
+        slug: &str,
+    ) -> Self {
+        let now = chrono::Utc::now();
+        let snapshot = projection.project_snapshot(slug);
+        let silent_seconds = snapshot
+            .last_valid
+            .as_ref()
+            .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+            .unwrap_or(0);
+        Self {
+            snapshot,
+            silent_seconds,
+            now,
+        }
+    }
+
+    /// The file verdict for one sid, folded with the daemon's in-flight turn
+    /// when the caller holds one.
+    pub(crate) fn resolve(
+        &self,
+        sid: &str,
+        live: Option<ccteam_core::stall::LiveTurn>,
+    ) -> ccteam_core::stall::ProgressActivityStatus {
+        self.snapshot
+            .session_activity_borrowed(sid, self.silent_seconds, live, self.now)
+    }
+}
+
+/// Replace the gateway's cheap `"live"` hint on each row with its real
+/// activity. `live_turns` is the daemon's in-flight-turn snapshot, taken under
+/// the same lock that produced `views`; persisted activity comes from the
+/// incremental projection after the lock is released.
 fn apply_progress_activity_status(
     projection: &ccteam_im::progress_projection::ProgressProjection,
     slug: &str,
@@ -246,13 +286,7 @@ fn apply_progress_activity_status(
     if views.is_empty() {
         return;
     }
-    let snapshot = projection.project_snapshot(slug);
-    let silent_seconds = snapshot
-        .last_valid
-        .as_ref()
-        .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, chrono::Utc::now()))
-        .unwrap_or(0);
-    let now = chrono::Utc::now();
+    let activity = ProjectActivity::new(projection, slug);
     for view in views {
         // A detached body (alive from before a daemon restart, not driven from
         // here) is neither working nor idle in the activity sense — its own
@@ -260,14 +294,9 @@ fn apply_progress_activity_status(
         if view.detached.is_some() {
             continue;
         }
-        let activity = snapshot.session_activity_borrowed(
-            &view.sid,
-            silent_seconds,
-            live_turns.get(&view.sid).copied(),
-            now,
-        );
-        view.last_activity_seconds = activity.last_activity_seconds;
-        view.status = activity.status.activity.to_string();
+        let resolved = activity.resolve(&view.sid, live_turns.get(&view.sid).copied());
+        view.last_activity_seconds = resolved.last_activity_seconds;
+        view.status = resolved.status.activity.to_string();
     }
 }
 
@@ -698,6 +727,9 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
         event["attachments"] =
             serde_json::to_value(&turn.attachments).unwrap_or_else(|_| json!([]));
     }
+    if let Some(status) = &turn.status {
+        event["status"] = serde_json::to_value(status).unwrap_or(json!(null));
+    }
     event
 }
 
@@ -710,21 +742,6 @@ fn turn_to_event(turn: &TurnRecord) -> serde_json::Value {
 /// truth for a session's live statusline: shared by `GET
 /// /sessions/{sid}/status` and the team graph's per-live-node model join
 /// ([`super::agents::handle_agents_graph`]), so both report the same model.
-pub(crate) async fn resolved_thread_status(
-    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
-    thread: ThreadHandle,
-    sid: &str,
-) -> ThreadStatus {
-    match adapter.thread_status(&thread).await {
-        Ok(s) => s,
-        Err(err) => {
-            // A statusless answer is valid — degrade to empty, never a 5xx.
-            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
-            ThreadStatus::default()
-        }
-    }
-}
-
 /// `GET /api/v1/sessions/{sid}/status`
 ///
 /// The session's live statusline — model + context-window usage — for the
@@ -769,7 +786,7 @@ pub(crate) async fn handle_session_status(
     let Some((adapter, thread)) = resolved else {
         return unknown_session(&sid);
     };
-    let status = resolved_thread_status(adapter, thread, &sid).await;
+    let status = ccteam_im::gateway::resolved_thread_status(adapter, thread, &sid).await;
     let context = status.context.map(|c| {
         json!({
             // `used_tokens` / `pct` are null when no channel reports occupancy
@@ -1478,6 +1495,7 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
                 id: opt.id.clone(),
             })
             .collect(),
+        status: None,
         sid: Some(sid.to_string()),
         // Not resolvable from a bare `(sid, prompt)` pair; the reseed just
         // won't ACL-filter into the team view's global SSE for a tenant
@@ -2070,6 +2088,9 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     if done {
         payload["done"] = serde_json::Value::Bool(true);
     }
+    if let Some(status) = &ev.status {
+        payload["status"] = serde_json::to_value(status).unwrap_or(json!(null));
+    }
     let attachments = ev
         .attachments
         .iter()
@@ -2288,6 +2309,7 @@ mod tests {
             user: user.into(),
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![],
             outcome: None,
@@ -2332,6 +2354,7 @@ mod tests {
             user: String::new(),
             assistant: assistant.into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![],
             outcome: None,
@@ -2370,6 +2393,7 @@ mod tests {
             user: "spawn a reviewer".into(),
             assistant: "done — s2".into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![ccteam_harness::execution::turns_mirror::AttachmentRef {
                 id: "1780000000000-chart.png".into(),
@@ -2403,6 +2427,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -2642,6 +2667,7 @@ mod tests {
     fn view(sid: &str) -> SessionView {
         SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: sid.into(),
             project: "demo".into(),
@@ -2721,6 +2747,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: "s1".into(),
             project: "demo".into(),
@@ -2773,6 +2800,7 @@ mod tests {
         let mut views = vec![
             SessionView {
                 driveable: true,
+                residency: "resident".to_string(),
                 detached: None,
                 sid: "s1".into(),
                 project: "demo".into(),
@@ -2797,6 +2825,7 @@ mod tests {
             },
             SessionView {
                 driveable: true,
+                residency: "resident".to_string(),
                 detached: None,
                 sid: "s2".into(),
                 project: "demo".into(),
@@ -2856,6 +2885,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: "s1".into(),
             project: "demo".into(),
@@ -2902,6 +2932,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: "s1".into(),
             project: "demo".into(),
@@ -3294,6 +3325,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: None,
         };

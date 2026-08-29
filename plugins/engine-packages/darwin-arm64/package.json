@@ -1,0 +1,19 @@
+{
+  "name": "@ccteam/engine-darwin-arm64",
+  "version": "0.0.0-template",
+  "description": "The ccteam engine binary for darwin arm64. Installed as an optional dependency of @ccteam/ccteam-ui; npm and pnpm skip it on every other platform.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/firstintent/ccteam.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "bin": {
+    "ccteam": "bin/ccteam"
+  },
+  "files": [
+    "bin/ccteam"
+  ],
+  "preferUnplugged": true
+}

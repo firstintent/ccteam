@@ -90,6 +90,17 @@ pub struct ServeOpts {
     /// integration tests pass `Some(0)` so the captured stderr can be
     /// asserted without taking 5 s per case.
     pub no_auth_grace_secs: Option<u64>,
+    /// v0.10.5 — git commit of the running binary, surfaced by
+    /// `GET /health` as `build`. Only the binary crate's `build.rs`
+    /// captures it, so the CLI passes it down; `None` (library / test
+    /// callers) reports `build: null` rather than a guess.
+    pub build: Option<String>,
+    /// Publish `run/daemon-endpoint.json` (the address `ccteam daemon
+    /// status` dials to reach `/health`) while serving. ONLY the daemon
+    /// body sets this: a standalone `ccteam internal web` shares the same
+    /// `$CCTEAM_HOME` but is not the daemon, and letting it publish would
+    /// point every `daemon status` at the wrong server.
+    pub publish_endpoint: bool,
 }
 
 impl Default for ServeOpts {
@@ -110,6 +121,8 @@ impl Default for ServeOpts {
                     .expect("hardcoded DSH web companion bind parses"),
             ),
             no_auth_grace_secs: Some(5),
+            build: None,
+            publish_endpoint: false,
         }
     }
 }
@@ -136,6 +149,7 @@ pub fn router_with_state(state: AppState) -> Router {
     // projection with the gateway-owned Arc. This avoids hydrating the same
     // large journals twice during daemon startup.
     state.progress_projection.start_hydration();
+    let health = std::sync::Arc::clone(&state.health);
     let stateful = routes::stateful_router()
         // v0.8.18 档1 — project-ownership ACL for every `/projects/{slug}/...`
         // route. Layered INSIDE `auth_layer` (which is added after it, so it
@@ -155,7 +169,7 @@ pub fn router_with_state(state: AppState) -> Router {
     // session and authenticates `/api/v1/**`, never the MCP data plane.
     let mcp = routes::mcp::router().with_state(state);
     Router::new()
-        .merge(routes::stateless_router())
+        .merge(routes::stateless_router(health))
         .merge(mcp)
         .merge(stateful)
         .layer(CompressionLayer::new().gzip(true).br(true))
@@ -318,7 +332,35 @@ where
         tracing::info!(addr = %addr, "ccteam DSH web companion bound");
     }
 
-    let state = build_state(paths, auth_state).with_dsh_web(std::sync::Arc::clone(&supervisor));
+    // The `/health` identity is only truthful AFTER both listeners exist
+    // (a `:0` bind has no port before that), so it is published here — the
+    // one place where every address is a fact rather than a request.
+    let health = routes::health::HealthIdentity::bound(
+        &paths,
+        opts.build.clone(),
+        local.to_string(),
+        companion_local.map(|a| a.to_string()),
+    );
+    // Address discovery for anything that has to ASK the running daemon
+    // who it is (`ccteam daemon status`, `ccteam update`'s restart). The
+    // launcher's recorded argv cannot answer it — `:0` requests "any free
+    // port" — so the process that owns the port publishes it, and the
+    // answer itself still comes from `/health`.
+    let endpoint = ccteam_core::daemon::endpoint_path(&paths);
+    if opts.publish_endpoint {
+        if let Err(err) = ccteam_core::daemon::write_endpoint(
+            &endpoint,
+            &ccteam_core::daemon::DaemonEndpoint {
+                pid: std::process::id(),
+                web_bind: local.to_string(),
+            },
+        ) {
+            tracing::warn!(error = %err, "could not publish the daemon endpoint");
+        }
+    }
+    let state = build_state(paths, auth_state)
+        .with_dsh_web(std::sync::Arc::clone(&supervisor))
+        .with_health_identity(health);
     let app = router_with_state(state.clone());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_task = tokio::spawn(async move {
@@ -352,6 +394,9 @@ where
     })
     .await
     .context("axum serve loop terminated with error")?;
+    if opts.publish_endpoint {
+        ccteam_core::daemon::remove_endpoint(&endpoint);
+    }
     let _ = shutdown_task.await;
     if let Some(handle) = companion_handle {
         handle
@@ -463,7 +508,10 @@ mod tests {
             token_file: None,
             dsh_web_bind: Some("127.0.0.1:7332".parse().unwrap()),
             no_auth_grace_secs: Some(5),
+            build: Some("abc1234".to_string()),
+            publish_endpoint: false,
         };
+        assert_eq!(opts.build.as_deref(), Some("abc1234"));
         assert!(!opts.no_auth);
         assert!(opts.token_file.is_none());
         assert_eq!(opts.bind.port(), 7331);

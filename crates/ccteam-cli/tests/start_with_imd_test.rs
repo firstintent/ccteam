@@ -12,10 +12,12 @@
 //!    `ccteam-im/Cargo.toml` and deleted `src/main.rs`. Cargo's
 //!    `CARGO_BIN_EXE_<name>` env var is only emitted for binaries
 //!    declared in the workspace; absence is the cleanest proof.
-//! 3. An end-to-end smoke that boots `ccteam start --no-web` in the
-//!    background against an empty CCTEAM_HOME, observes the daemon MCP
-//!    socket accept connections, then `ccteam stop`s gracefully. With
-//!    `--no-imd` set the MCP socket must still accept connections.
+//! 3. An end-to-end smoke that boots the daemon body (`ccteam internal
+//!    daemon-run --no-web`, the launcher's only exec target since
+//!    v0.10.5 D7 deleted the foreground `ccteam start`) against an empty
+//!    CCTEAM_HOME, observes the daemon MCP socket accept connections,
+//!    then SIGTERMs it gracefully. With `--no-imd` set the MCP socket
+//!    must still accept connections.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,6 +42,15 @@ fn start_help_advertises_no_imd_flag() {
     assert!(
         stdout.contains("--no-web"),
         "help text should still mention --no-web; got: {stdout}",
+    );
+    // v0.10.5 D7 — the flags survive, the SEMANTICS do not: `ccteam
+    // start` launches a managed background daemon. Help that still says
+    // "foreground" would send an operator back to `nohup ccteam start &`,
+    // the unmanaged instance this change exists to make impossible.
+    assert!(
+        !stdout.to_lowercase().contains("foreground"),
+        "`ccteam start` is the launcher alias; its help must not describe a \
+         foreground run. got: {stdout}",
     );
 }
 
@@ -98,7 +109,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     // surfacing as a silent timeout.
     let stderr_log = ccteam_home.join("daemon-case1.stderr.log");
     let mut child = Command::new(ccteam_bin())
-        .args(["start", "--no-web"])
+        .args(["internal", "daemon-run", "--no-web"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -108,7 +119,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
             std::fs::File::create(&stderr_log).expect("create daemon stderr log"),
         ))
         .spawn()
-        .expect("spawn ccteam start");
+        .expect("spawn ccteam internal daemon-run");
     let child_pid = child.id();
 
     let observed_mcp = await_mcp_socket_reachable(&mut child, &mcp_socket, READY_TIMEOUT);
@@ -123,7 +134,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let daemon_stderr = std::fs::read_to_string(&stderr_log).unwrap_or_default();
     assert!(
         observed_mcp,
-        "MCP socket at {} should accept connections from `ccteam start` \
+        "MCP socket at {} should accept connections from the daemon body \
          (daemon early_exit={early_exit:?}).\n--- daemon stderr ---\n{}",
         mcp_socket.display(),
         daemon_stderr.trim(),
@@ -137,7 +148,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
     let _ = std::fs::remove_file(&heartbeat);
     let _ = std::fs::remove_file(&mcp_socket);
     let mut child2 = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd"])
+        .args(["internal", "daemon-run", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -145,7 +156,7 @@ fn start_spawns_imd_supervisor_unless_no_imd_set() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn ccteam start --no-imd");
+        .expect("spawn ccteam internal daemon-run --no-imd");
     let child2_pid = child2.id();
 
     let observed_no_imd_mcp = await_mcp_socket_reachable(&mut child2, &mcp_socket, READY_TIMEOUT);

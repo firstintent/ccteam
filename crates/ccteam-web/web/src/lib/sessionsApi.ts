@@ -29,7 +29,13 @@ export interface SessionView {
   vendor: string;
   permission_mode: string;
   current: boolean;
+  /** What the session is DOING: `working` | `idle` | `stale` | `stuck`, or
+   *  `detached`. NOT a liveness flag — see `residency`. */
   status: string;
+  /** Whether ccteam is HOLDING an execution attachment: `resident` |
+   *  `released` | `stopped` | `detached` | `external`. Optional for
+   *  backward-compat; absent reads as resident. */
+  residency?: string;
   last_activity_seconds?: number | null;
   /** Wire protocol: `"stream-json"` (the薄/default, no pane) | `"terminal"`
    *  (advanced, owns a tmux/rmux pane). Optional for backward-compat — a
@@ -80,6 +86,7 @@ export interface SessionHistoryEvent {
   assistant: string;
   /** Reference metadata only — never bytes, base64, daemon paths, or URLs. */
   attachments?: OutboundAttachmentRef[];
+  status?: TurnStatus;
 }
 
 export interface SessionHistory {
@@ -115,6 +122,14 @@ export interface SessionContext {
    *  `derived` (computed from per-turn tokens) / `probed` (pulled from the
    *  vendor's own status command) / `unknown`. */
   source?: "reported" | "derived" | "probed" | "unknown";
+}
+
+export interface TurnStatus {
+  model?: string | null;
+  context?: SessionContext | null;
+  turn: number;
+  cost_usd?: number | null;
+  tokens_total?: number | null;
 }
 
 /** Per-session statusline payload from `GET /api/v1/sessions/{sid}/status`

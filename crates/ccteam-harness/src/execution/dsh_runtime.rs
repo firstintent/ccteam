@@ -70,6 +70,14 @@ impl DshRuntimeConfig {
 /// layer supplies the resolver.
 pub type DshEnrollmentResolver = Arc<dyn Fn(&Path, &str) -> Result<String> + Send + Sync>;
 
+/// Resolves the identity's own ccteam REST bearer (`ccteam:<hex>`) — the one
+/// the team panel calls `/api/v1` with — from `(ccteam_home, owner_tag)`.
+///
+/// Injected for the same reason as [`DshEnrollmentResolver`]: the token stores
+/// (`ccteam-core::tenants`, `ccteam-web::token`) sit ABOVE this crate. Reuse
+/// before mint is the resolver's job, not this manager's.
+pub type DshRestTokenResolver = Arc<dyn Fn(&Path, &str) -> Result<String> + Send + Sync>;
+
 /// Lifecycle of one identity's DSH web runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DshRuntimeState {
@@ -219,6 +227,7 @@ pub struct DshRuntimeManager {
 struct Inner {
     ccteam_home: PathBuf,
     enrollment: DshEnrollmentResolver,
+    rest_token: DshRestTokenResolver,
     /// Set once by `configure`, after the daemon knows its own ports.
     config: OnceLock<DshRuntimeConfig>,
     instances: Mutex<HashMap<String, DshInstance>>,
@@ -242,11 +251,16 @@ impl DshRuntimeManager {
     /// Unconfigured manager: answers `disabled` and spawns nothing until
     /// [`configure`](Self::configure) runs. Two-phase on purpose — the daemon
     /// builds ONE manager in its composition root, before any port is bound.
-    pub fn new(ccteam_home: PathBuf, enrollment: DshEnrollmentResolver) -> Self {
+    pub fn new(
+        ccteam_home: PathBuf,
+        enrollment: DshEnrollmentResolver,
+        rest_token: DshRestTokenResolver,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 ccteam_home,
                 enrollment,
+                rest_token,
                 config: OnceLock::new(),
                 instances: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
@@ -260,9 +274,10 @@ impl DshRuntimeManager {
     pub fn configured(
         ccteam_home: PathBuf,
         enrollment: DshEnrollmentResolver,
+        rest_token: DshRestTokenResolver,
         config: DshRuntimeConfig,
     ) -> Self {
-        let manager = Self::new(ccteam_home, enrollment);
+        let manager = Self::new(ccteam_home, enrollment, rest_token);
         manager.configure(config);
         manager
     }
@@ -310,12 +325,14 @@ impl DshRuntimeManager {
     }
 
     /// Hosts-page "register the ccteam DSH plugin" action (gate ①): merge
-    /// ccteam's OWN bundle entry and its `ccteam-client` patch row — carrying
-    /// this daemon's `transportSocket` and URL — into the operator's real
-    /// `~/.dsh` web profile, WITHOUT starting or attaching a runtime. This is
-    /// how an operator whose hand-started `dsh web` lacks the plugin gets it:
-    /// register here, then restart that instance themselves. Idempotent and
-    /// merge-only; never touches enrollment or any other row.
+    /// ccteam's OWN bundle entry and patch row — `ccteam-ui` carrying this
+    /// daemon's URL, `transportSocket` and the operator's REST token — into
+    /// the operator's real `~/.dsh` web profile, WITHOUT starting or
+    /// attaching a runtime. This is how an operator whose hand-started `dsh
+    /// web` lacks the plugin gets it: register here, then restart that
+    /// instance themselves. Idempotent and merge-only; touches only ccteam's
+    /// own row. That row carries the operator's own REST token (owner
+    /// decision 2026-08-28); enrollment stays the human's to paste.
     pub async fn register_operator_profile(&self) -> Result<PathBuf> {
         let daemon_url = self
             .inner
@@ -326,18 +343,20 @@ impl DshRuntimeManager {
         let home = self.inner.home_for(&identity)?;
         let socket = self.inner.socket_for(&identity);
         let ccteam_home = self.inner.ccteam_home.clone();
+        let rest_token = self.inner.rest_token_for(OPERATOR_OWNER_TAG);
         tokio::task::spawn_blocking(move || -> Result<PathBuf> {
             crate::execution::dsh_acp::spawn_spec::ensure_socket_dir(&socket)
                 .map_err(|e| anyhow!("{e}"))?;
             let materialized =
-                crate::execution::dsh_acp::materialize::register_dsh_client_into_profile(
+                crate::execution::dsh_acp::materialize::register_ccteam_plugins_into_profile(
                     &ccteam_home,
                     &home,
                     DSH_NATIVE_WEB_PROFILE,
-                    crate::execution::dsh_acp::materialize::DshClientConfig {
-                        enrollment: None,
+                    crate::execution::dsh_acp::materialize::DshPluginConfig {
                         daemon_url: Some(&daemon_url),
+                        enrollment: None,
                         transport_socket: Some(&socket.to_string_lossy()),
+                        rest_token: rest_token.as_deref(),
                     },
                 )
                 .map_err(|e| anyhow!("{e}"))?;
@@ -694,15 +713,24 @@ impl Inner {
         // only on this branch: an ATTACHED instance is the human's process, and
         // ccteam does not edit the home of a `dsh web` it did not start.
         let socket = self.socket_for(identity);
+        // The panel's REST bearer travels with ccteam's own rows into the
+        // operator's profile too (owner decision 2026-08-28: pasting a token
+        // is for a hand-started `dsh web` only). It is the operator's own
+        // admin web token, written into the operator's own home, 0600. A
+        // resolver failure is not fatal: the panel just starts unconfigured.
+        let rest_token = self.rest_token_for(&identity.owner_tag);
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
             owner_tag: &identity.owner_tag,
             ccteam_home: self.ccteam_home.clone(),
             dsh_home: home.clone(),
             profile: DSH_NATIVE_WEB_PROFILE,
             materialize_profile: false,
+            // Enrollment stays the human's to paste: it is a session-level
+            // MCP principal for hand-driven DSH agents, not the panel's token.
             enrollment: None,
             daemon_url: self.config().map(|config| config.daemon_url.as_str()),
             transport_socket: Some(&socket),
+            rest_token: rest_token.as_deref(),
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -720,6 +748,23 @@ impl Inner {
         })
     }
 
+    /// This identity's own ccteam REST bearer for the panel row, or `None`
+    /// when it cannot be resolved. A convenience, not a precondition: a
+    /// runtime that cannot resolve one still serves DSH, with the panel
+    /// asking for a token. Never logs the value.
+    fn rest_token_for(&self, owner: &str) -> Option<String> {
+        match (self.rest_token)(&self.ccteam_home, owner) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                tracing::warn!(
+                    owner = %owner,
+                    "no ccteam REST token for this identity; DSH team panel starts unconfigured: {error:#}"
+                );
+                None
+            }
+        }
+    }
+
     async fn start_tenant(
         &self,
         identity: &DshRuntimeIdentity,
@@ -732,6 +777,7 @@ impl Inner {
             .ok_or_else(|| anyhow!("DSH web runtime is not configured"))?;
         let bearer = (self.enrollment)(&self.ccteam_home, owner)
             .with_context(|| format!("ensure enrollment credential for {owner}"))?;
+        let rest_token = self.rest_token_for(owner);
         let socket = self.socket_for(identity);
         let spawn = build_web_spawn_spec(DshWebSpawnOptions {
             owner_tag: owner,
@@ -742,6 +788,7 @@ impl Inner {
             enrollment: Some(&bearer),
             daemon_url: Some(&config.daemon_url),
             transport_socket: Some(&socket),
+            rest_token: rest_token.as_deref(),
         })
         .map_err(|e| anyhow!("{e}"))?;
         let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
@@ -1100,6 +1147,7 @@ mod tests {
         DshRuntimeManager::configured(
             PathBuf::from("/nonexistent/ccteam-home"),
             Arc::new(|_root, owner| Ok(format!("ccteam-enroll:test:{owner}"))),
+            Arc::new(|_root, owner| Ok(format!("ccteam:token-for-{owner}"))),
             config,
         )
     }
@@ -1213,6 +1261,7 @@ mod tests {
     async fn unconfigured_manager_reports_disabled_and_starts_nothing() {
         let manager = DshRuntimeManager::new(
             PathBuf::from("/nonexistent/ccteam-home"),
+            Arc::new(|_root, _owner| Ok(String::new())),
             Arc::new(|_root, _owner| Ok(String::new())),
         );
         let identity = DshRuntimeIdentity {

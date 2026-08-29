@@ -37,7 +37,8 @@ function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
     role: "brain",
     vendor: "claude",
     host: "local",
-    status: "live",
+    status: "idle",
+    residency: "resident",
     depth: 0,
     last_active: "2026-01-01T00:00:00Z",
     turn_count: 3,
@@ -233,7 +234,7 @@ describe("AgentsTree (SSR-safe, fixture-driven)", () => {
       // A live model with no effort axis ⇒ model alone, no separator.
       fixtureNode({ sid: "s2", model: "kimi-code/k3" }),
       // Idle: the graph reports neither — never a spawn-time guess.
-      fixtureNode({ sid: "s3", status: "idle" }),
+      fixtureNode({ sid: "s3", residency: "released" }),
     ];
     const html = renderToString(
       <MemoryRouter>
@@ -368,9 +369,9 @@ describe("AgentsTicker (recent dispatches)", () => {
 
 describe("VendorKpiChips (per-vendor rollup + topology filter)", () => {
   const nodes = [
-    fixtureNode({ sid: "s0", vendor: "claude", status: "live", cost_usd: 0.3 }),
-    fixtureNode({ sid: "s1", vendor: "claude", status: "idle", cost_usd: 0.2 }),
-    fixtureNode({ sid: "s2", vendor: "grok", status: "live", cost_usd: 0.05, parent_sid: "s0" }),
+    fixtureNode({ sid: "s0", vendor: "claude", cost_usd: 0.3 }),
+    fixtureNode({ sid: "s1", vendor: "claude", residency: "released", cost_usd: 0.2 }),
+    fixtureNode({ sid: "s2", vendor: "grok", cost_usd: 0.05, parent_sid: "s0" }),
   ];
 
   it("renders one chip per vendor with live count + Σcost; the active vendor is highlighted", () => {
@@ -420,9 +421,9 @@ describe("VendorKpiChips (per-vendor rollup + topology filter)", () => {
 // chip-filter test above does.
 describe("roster vendor pick → filtered topology (TEAM-7)", () => {
   const nodes = [
-    fixtureNode({ sid: "s0", vendor: "claude", status: "live" }),
-    fixtureNode({ sid: "s1", vendor: "codex", status: "live", cost_usd: 0.11, parent_sid: "s0" }),
-    fixtureNode({ sid: "s2", vendor: "grok", status: "idle" }),
+    fixtureNode({ sid: "s0", vendor: "claude" }),
+    fixtureNode({ sid: "s1", vendor: "codex", cost_usd: 0.11, parent_sid: "s0" }),
+    fixtureNode({ sid: "s2", vendor: "grok", residency: "released" }),
   ];
 
   it("hands the charter tab a pick handler", async () => {

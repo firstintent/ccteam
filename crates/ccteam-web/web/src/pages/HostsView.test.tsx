@@ -369,6 +369,31 @@ describe("VendorManageRow DSH plugin registration (v0.10.3 gate ①)", () => {
     expect(html).toContain("注册 DSH 插件");
   });
 
+  it("an already-registered dsh row shows state, not the CTA", () => {
+    // The plugin is either in the operator's ~/.dsh web profile or it is not;
+    // an idempotent CTA that never goes away reads as "not done yet".
+    const html = renderToString(
+      <HostManageCard
+        detail={dshDetail({
+          agents: [
+            agent({
+              vendor: "dsh",
+              tool_surface: "managed_session_bridge",
+              version: "0.1.0-rc.6",
+              mcp_registered: true,
+            }),
+          ],
+        })}
+        busy={null}
+        isAdmin
+        onRegister={() => {}}
+        onImport={() => {}}
+      />,
+    );
+    expect(html).not.toContain("register-dsh-plugin");
+    expect(html).toContain('data-testid="host-vendor-dsh-plugin-ok"');
+  });
+
   it("tenants, satellites, and a not-installed dsh get no CTA", () => {
     const tenant = renderToString(
       <HostManageCard

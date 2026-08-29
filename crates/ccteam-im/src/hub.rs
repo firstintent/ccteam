@@ -53,7 +53,14 @@ pub const HUB_BASE_ENV: &str = "CCTEAM_HUB_BASE";
 /// Resolve the active hub raw-content base: [`HUB_BASE_ENV`] when set,
 /// otherwise [`ccteam_core::HUB_RAW_BASE`] (`main`).
 pub fn hub_base() -> String {
-    std::env::var(HUB_BASE_ENV).unwrap_or_else(|_| ccteam_core::HUB_RAW_BASE.to_string())
+    hub_base_from(std::env::var(HUB_BASE_ENV).ok())
+}
+
+/// Pure rule behind [`hub_base`]. Split out so its test does not have to
+/// `remove_var`/`set_var` the override under every sibling test in this
+/// binary (CLI-ENVTEST-1).
+fn hub_base_from(raw: Option<String>) -> String {
+    raw.unwrap_or_else(|| ccteam_core::HUB_RAW_BASE.to_string())
 }
 
 /// The whole `index.json` catalog. Top-level metadata + the plugin list.
@@ -1076,9 +1083,13 @@ mod tests {
 
     #[test]
     fn hub_base_honours_env_override() {
-        // Sanity: with the env unset we get the core default.
-        std::env::remove_var(HUB_BASE_ENV);
-        assert_eq!(hub_base(), ccteam_core::HUB_RAW_BASE);
+        // Unset → the core default; set → verbatim (the override is a base URL,
+        // never merged or validated here).
+        assert_eq!(hub_base_from(None), ccteam_core::HUB_RAW_BASE);
+        assert_eq!(
+            hub_base_from(Some("https://example.test/raw".to_string())),
+            "https://example.test/raw"
+        );
     }
 
     #[test]

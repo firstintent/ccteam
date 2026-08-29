@@ -81,6 +81,7 @@ fn write_one_tracked_session(root: &std::path::Path) {
         &ccteam_harness::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".to_string(),
             slug: "outside".to_string(),
             vendor: ccteam_harness::AgentVendor::Claude,

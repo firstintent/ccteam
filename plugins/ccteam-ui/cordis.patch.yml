@@ -1,0 +1,3 @@
+- insert:
+    - id: ccteam-ui
+      name: '@ccteam/ccteam-ui'

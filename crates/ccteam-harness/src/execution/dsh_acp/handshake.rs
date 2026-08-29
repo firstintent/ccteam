@@ -15,7 +15,7 @@ use crate::{HarnessError, PermissionMode};
 pub const DEFAULT_DSH_PROVIDER: &str = "deepseek-official";
 pub const DEFAULT_DSH_MODEL: &str = "deepseek-v4-flash";
 
-/// Floor for the embedded `@ccteam/dsh-client` plugin: the first version that
+/// Floor for the embedded `@ccteam/ccteam-ui` plugin: the first version that
 /// serves ACP on `transportSocket` and reads `_meta.ccteam`. An older plugin
 /// answers `initialize` perfectly well and then ignores every credential, so
 /// the gate has to be here rather than in a session method.
@@ -194,7 +194,7 @@ pub async fn session_load(
 /// What the user has to do when the peer on the socket is not a plugin ccteam
 /// can drive. Named once so every arm below says the same thing.
 const REGISTER_REMEDY: &str = "register or update it from the ccteam Hosts page \
-     (or `dsh plugin add @ccteam/dsh-client`) and restart your DSH web instance";
+     (or `dsh plugin add @ccteam/ccteam-ui`) and restart your DSH web instance";
 
 fn assert_ccteam_plugin(init: &Value) -> Result<(), HarnessError> {
     let name = init
@@ -209,7 +209,7 @@ fn assert_ccteam_plugin(init: &Value) -> Result<(), HarnessError> {
     }
     if !name.starts_with("ccteam-dsh") {
         return Err(HarnessError::SpawnFailed(format!(
-            "the DSH ACP peer identified as `{name}`, not ccteam's `@ccteam/dsh-client` plugin: \
+            "the DSH ACP peer identified as `{name}`, not ccteam's `@ccteam/ccteam-ui` plugin: \
              {REGISTER_REMEDY}"
         )));
     }

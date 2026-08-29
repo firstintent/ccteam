@@ -248,7 +248,35 @@ fn render_settings_template(
 /// `enabledPlugins` key ccteam does not render. See
 /// [`merge_ccteam_settings`].
 pub fn write_project_settings(project_dir: &Path, enabled: &EnabledPluginsSetting) -> Result<()> {
-    write_settings_template(project_dir, enabled, ProjectSettingsKind::ArtifactDriven)
+    write_settings_template(
+        project_dir,
+        enabled,
+        ProjectSettingsKind::ArtifactDriven,
+        effective_hook_sh_path()?,
+    )
+}
+
+/// [`write_project_settings`] for a caller that already holds the ccteam root.
+///
+/// The hook dispatcher the rendered settings point at lives under
+/// `paths.root`; resolving it from `CCTEAM_HOME` instead (what
+/// [`effective_hook_sh_path`] does) means a caller that passed an explicit
+/// `paths` — `bootstrap_project`, `ccteam init`, the web/IM create path —
+/// could stamp a hook path belonging to a DIFFERENT home than the one it just
+/// materialized. Taking the root as an argument is also what lets its test
+/// stop `set_var`-ing `CCTEAM_HOME` under every sibling test in the binary
+/// (CLI-ENVTEST-1).
+pub fn write_project_settings_in(
+    paths: &crate::CcteamPaths,
+    project_dir: &Path,
+    enabled: &EnabledPluginsSetting,
+) -> Result<()> {
+    write_settings_template(
+        project_dir,
+        enabled,
+        ProjectSettingsKind::ArtifactDriven,
+        paths.hooks_script(),
+    )
 }
 
 /// Discriminator for settings template writes.
@@ -261,6 +289,7 @@ fn write_settings_template(
     project_dir: &Path,
     enabled: &EnabledPluginsSetting,
     kind: ProjectSettingsKind,
+    hook_sh: std::path::PathBuf,
 ) -> Result<()> {
     let dir = project_dir.join(".claude");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -268,7 +297,6 @@ fn write_settings_template(
     // **local** settings layer so the user's committed
     // `.claude/settings.json` is never touched.
     let path = dir.join("settings.local.json");
-    let hook_sh = effective_hook_sh_path()?;
     let extra = SettingsEnv {
         ccteam_home: std::env::var("CCTEAM_HOME").ok(),
         ccteam_projects_root: std::env::var("CCTEAM_PROJECTS_ROOT").ok(),

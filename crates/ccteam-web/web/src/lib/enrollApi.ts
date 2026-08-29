@@ -87,8 +87,12 @@ export async function listEnrollments(): Promise<EnrollCredentialView[]> {
   return body.credentials ?? [];
 }
 
-/** `POST /api/v1/enroll` — a credential for this machine's user (no project). */
-export function mintUserEnrollment(req: MintEnrollRequest = {}): Promise<MintedEnrollment> {
+/** `POST /api/v1/enroll` — a credential for this machine's user (no project).
+ *  The label is REQUIRED here: the unlabelled machine-user slot is the daemon's
+ *  own credential, so the route refuses a request that does not name a slot. */
+export function mintUserEnrollment(
+  req: MintEnrollRequest & { label: string },
+): Promise<MintedEnrollment> {
   return postMint("/api/v1/enroll", req);
 }
 

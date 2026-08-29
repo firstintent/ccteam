@@ -47,9 +47,15 @@ const PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT: u64 = 120;
 /// misconfig can't make the prompt expire instantly (which would deny every
 /// tool before the user can possibly click).
 pub fn permission_prompt_timeout_secs() -> u64 {
-    std::env::var("CCTEAM_PERMISSION_PROMPT_TTL_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    permission_prompt_timeout_secs_from(std::env::var("CCTEAM_PERMISSION_PROMPT_TTL_SECS").ok())
+}
+
+/// Pure rule behind [`permission_prompt_timeout_secs`]: parse, clamp away a
+/// zero/garbage value, else the default. Split out so its test does not have
+/// to mutate the process environment under every sibling test in this binary
+/// (CLI-ENVTEST-1).
+fn permission_prompt_timeout_secs_from(raw: Option<String>) -> u64 {
+    raw.and_then(|raw| raw.parse::<u64>().ok())
         .filter(|n| *n >= 1)
         .unwrap_or(PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT)
 }
@@ -398,6 +404,7 @@ async fn ask_external_choice(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            status: None,
             sid: Some(sid.to_string()),
             slug: None,
         })
@@ -448,6 +455,32 @@ pub async fn ask_permission(
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> PermissionAnswer {
+    ask_permission_with_ttl(
+        sink,
+        pending,
+        ctx,
+        sid_label,
+        tool_name,
+        tool_input,
+        permission_prompt_timeout_secs(),
+    )
+    .await
+}
+
+/// [`ask_permission`] with the prompt TTL handed in. The env read stays in the
+/// wrapper above so a test can drive the timeout branch by passing a short TTL
+/// instead of `set_var`-ing `CCTEAM_PERMISSION_PROMPT_TTL_SECS` process-wide
+/// (CLI-ENVTEST-1).
+#[allow(clippy::too_many_arguments)]
+pub async fn ask_permission_with_ttl(
+    sink: &mpsc::UnboundedSender<GatewayEvent>,
+    pending: &Arc<Mutex<PendingInteractions>>,
+    ctx: &HitlPromptContext,
+    sid_label: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    ttl_secs: u64,
+) -> PermissionAnswer {
     let session_desc = if ctx.role.is_empty() {
         format!("session {sid_label}")
     } else {
@@ -478,7 +511,6 @@ pub async fn ask_permission(
         ],
         multi: false,
     };
-    let ttl_secs = permission_prompt_timeout_secs();
     let ttl = Duration::from_secs(ttl_secs);
 
     let progress = ctx.progress_path.as_deref().map(|path| PermissionProgress {
@@ -912,20 +944,21 @@ mod tests {
 
     #[test]
     fn permission_prompt_timeout_defaults_and_clamps() {
-        std::env::remove_var("CCTEAM_PERMISSION_PROMPT_TTL_SECS");
         assert_eq!(
-            permission_prompt_timeout_secs(),
+            permission_prompt_timeout_secs_from(None),
             PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT
         );
-        std::env::set_var("CCTEAM_PERMISSION_PROMPT_TTL_SECS", "0");
         assert_eq!(
-            permission_prompt_timeout_secs(),
+            permission_prompt_timeout_secs_from(Some("0".into())),
             PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT,
             "0 is clamped away (would expire instantly)"
         );
-        std::env::set_var("CCTEAM_PERMISSION_PROMPT_TTL_SECS", "5");
-        assert_eq!(permission_prompt_timeout_secs(), 5);
-        std::env::remove_var("CCTEAM_PERMISSION_PROMPT_TTL_SECS");
+        assert_eq!(
+            permission_prompt_timeout_secs_from(Some("nonsense".into())),
+            PERMISSION_PROMPT_TIMEOUT_SECS_DEFAULT,
+            "garbage falls back rather than expiring instantly"
+        );
+        assert_eq!(permission_prompt_timeout_secs_from(Some("5".into())), 5);
     }
 
     fn ctx() -> HitlPromptContext {
@@ -1029,17 +1062,17 @@ mod tests {
     /// never silently allows).
     #[tokio::test(flavor = "current_thread")]
     async fn ask_permission_times_out_when_nobody_answers() {
-        std::env::set_var("CCTEAM_PERMISSION_PROMPT_TTL_SECS", "1");
         let pending = Arc::new(Mutex::new(PendingInteractions::new()));
         let (tx, rx) = mpsc::unbounded_channel::<GatewayEvent>();
-        let answer = ask_permission(&tx, &pending, &ctx(), "s1", "Bash", &json!({})).await;
+        // TTL handed in, not set in the environment (CLI-ENVTEST-1).
+        let answer =
+            ask_permission_with_ttl(&tx, &pending, &ctx(), "s1", "Bash", &json!({}), 1).await;
         assert_eq!(answer, PermissionAnswer::Timeout);
         assert!(
             pending.lock().await.is_empty(),
             "lapsed pending is cleaned up"
         );
         drop(rx);
-        std::env::remove_var("CCTEAM_PERMISSION_PROMPT_TTL_SECS");
     }
 
     /// A closed sink (event consumer gone) fails safe to `Unavailable`

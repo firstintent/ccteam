@@ -102,9 +102,10 @@
 1. **扇出** —— 同一个自足的问题 `session_spawn` 给 2+ 个 vendor(异步、一次一事、`title` 标注这场对局)。
 2. **各自独立作答** —— 各自独立会话,互不串味。
 3. **在 turn 边界收集** —— 每个子会话转 idle 时完成通知各来一条;还缺的用 `session_collect` 补(缺席/失败的成员标记出来,绝不 kill)。
+   每条完成通知只有一行头 —— `s12 done · turn 7 · ctx 19%`(`⚠` 从 85% 起;失败写 `s12 FAILED (<kind>) …`)—— 后面直接是答案节选,再无别的; `session_collect` / `session_list` / 内联 dispatch 结果给数字 `context_pct`,据此决定**复用还是新开**不用再多调一次:上下文还宽裕就继续派给它;接近告警带就为下个任务新开一个、旧的闲置。interim 通知不带状态,不多花 token。
 4. **综合裁决你自己来** —— 共识、分歧、你的拍板。可选:把收来的答案回投给某个子会话互驳,或再起一个会话当裁判。
 
-**账单始终可见。** `session_list` / `session_collect` 每行带 model 和累计 `cost_usd` / `tokens_total`,一场扇出花多少钱是可加总的数字,不是惊喜。
+**账单始终可见。** `session_list` / `session_collect` 每行带累计 `cost_usd` / `tokens_total`,一场扇出花多少钱是可加总的数字,不是惊喜。
 
 ## 7. 编队(多 vendor 团队的起手式)
 
@@ -125,17 +126,17 @@
 
 ## 8. 装一次
 
-对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `session_spawn {vendor:"dsh", ...}`)——雇出来的会话就跑在该身份自己的 DSH web 运行时里,实时出现在 DSH 页侧栏,插件已预载;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/dsh-client`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
+对可写配置的 vendor,编排本身**无需再安装任何东西**:`ccteam config mcp`(装一次)把 ccteam server 注册进 Claude / Codex / Grok / OpenCode / Kimi,server 自带的使用说明会教任何连上的会话整套委派流程。DSH 是双向形态:你可以从 ccteam 直接雇它(`/new dsh` 或 `session_spawn {vendor:"dsh", ...}`)——雇出来的会话就跑在该身份自己的 DSH web 运行时里,实时出现在 DSH 页侧栏,插件已预载;也可以从 DSH 自己的 Web UI 出发,先跑 `dsh plugin --profile web add @ccteam/ccteam-ui`,再把 Settings → Access 里的 daemon URL 与 enrollment 凭据粘到 DSH Settings,让这个 DSH 会话成为委派父。若它还没绑定 ccteam 项目,第一次工具调用会要求点名项目 slug。Pi 不同:它也不让 ccteam 写配置,但只在 ccteam spawn 的 Pi 会话里挂 bridge——受管 Pi 会话能委派,你手起的 `pi` 一动不动。想在此之上加一个常驻指挥官 persona(路由习惯、审稿门内建)?从**插件市场**装 `team-brain`——那是口味选择,不是前提。真正的前提只有:
 
 - 本机 `ccteam start` 起着 daemon。
 - 你有一个**已注册的 ccteam 项目**并知道它的 slug;可写配置的 CLI 会话也可以从工作目录识别项目。
-- 对可写配置的 vendor,用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证);对 DSH,用已连接 `@ccteam/dsh-client` 的 DSH Web UI。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §9。)
+- 对可写配置的 vendor,用**普通 vendor 终端会话**——它读全局配置拿到 ccteam 工具(Grok 侧可 `grok mcp doctor` 验证);对 DSH,用已连接 `@ccteam/ccteam-ui` 的 DSH Web UI。(某些 SDK 驱动的会话不读用户级 MCP 配置,那种情况见 §9。)
 
 ## 9. 出问题时(人话)
 
 | 现象 | 怎么回事 → 怎么办 |
 |---|---|
-| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;DSH 则安装 `@ccteam/dsh-client` 并在 DSH Settings 粘贴 Access 凭据。SDK 会话可直接调 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam-enroll:<id>:<secret>`(设置 → 接入 里签发,并带上 `initialize` 返回的 `Mcp-Session-Id`)——同一套工具,而且 caller 在账本里有自己的行,它 spawn 出来的是它的子会话而不是一堆根节点。 |
+| 「工具用不了 / 没有这个工具」 | 这个会话没连上 ccteam。用普通 vendor 终端会话;DSH 则安装 `@ccteam/ccteam-ui` 并在 DSH Settings 粘贴 Access 凭据。SDK 会话可直接调 `POST http://localhost:7331/mcp` + `Authorization: Bearer ccteam-enroll:<id>:<secret>`(设置 → 接入 里签发,并带上 `initialize` 返回的 `Mcp-Session-Id`)——同一套工具,而且 caller 在账本里有自己的行,它 spawn 出来的是它的子会话而不是一堆根节点。 |
 | 「它半天没动静」 | 它在**干活(working)**,不是卡住。去干别的,一会儿回来看结论。 |
 | 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或把项目名说出来让会话带上 `project:"<slug>"`。 |
 | 「grok 用不了」 | 这台机器没装 grok CLI。`ccteam status` / capabilities 看这台机器实际有哪些 vendor。 |
@@ -148,9 +149,9 @@
 平时你不用报工具名——会话听懂人话自己调。但如果你在**写 persona / skill** 或想手动编排,ccteam 在 `ccteam` 这个 MCP server 下暴露 8 个工具,在 Claude 里叫 `mcp__ccteam__<名字>`:
 
 - **`session_spawn`** — 雇一个同事(可顺手交第一个任务)。`{vendor, title, task?, wait_seconds?, notify?, idempotency_key?, role?, model?, effort?, permission_mode?, project?}`。`vendor`=`claude`(默认)/`codex`/`grok`/`opencode`/`kimi`/`dsh`/`pi`。**没有 `protocol` 参数**——wire 通道由 vendor 派生(claude/codex = stream-json;grok/opencode/kimi/dsh = acp;pi = 它自己的 RPC),传入就是硬错误,与 `host` 相同;`dsh` 和 `pi` 只在 daemon 本机跑:把它们 spawn 进绑定卫星的项目会直接报错,绝不悄悄换台机器;受管 DSH 会话跑在该身份的 DSH web 运行时里(在 DSH 页可见、可点开插话),同 sid 可冷恢复、token 会入账,且不需要你手动装插件。DSH 另收 `mode` = 它的 agent preset(决定工具集):`standard` | `ptc` | `minimal` | `creator`,不传默认 `standard`(vendor 自家默认;雇佣会话权限 preset 默认 `danger-full-access`,工具执行免审批);其它 vendor 传非空 `mode` 一律拒绝。`role` 指 `.claude/agents/<role>.md` persona,不传=roleless(裸 vendor 读项目自己的 `CLAUDE.md`/`AGENTS.md`,多数时候是对的默认);grok/opencode/kimi/dsh 当前只支持 roleless,会忽略 role 参数。`model`/`effort` 原文透传给 vendor——不传吃 vendor 默认,模型目录是 advisory、永不拦你传什么;`title` ≤80 字符,只做账本/团队视图标签,永不进 prompt;`permission_mode:"hitl"` 把工具批准弹到绑定的 IM。**没有 `host` 参数**——执行机器继承自项目绑定,传了就是硬错误。`wait_seconds>0` 内联等答案;默认异步。返回永远是**新** `sid`;响应里的 `caller` 标明认证身份——`ambient:<sid>`(ccteam 会话,或在 `initialize` 时完成注册的手起 agent;无论哪种,该 sid 就是子会话的 `parent_sid`)或 `admin:<sid>` / `admin`(本机 `mcp.sock` 逃生门,不点名自己的 sid 就是根 spawn)。期望有父边却看到光秃秃的 `admin`,说明这次调用没有带上 per-process 身份——走 HTTP 时即「跳过了 enrollment 握手」。
-- **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?, notify?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。默认异步:**子会话一整个 vendor turn 干完、转 idle 时,只发一条完成通知**(话痨子会话的中途叙述不通知、只进账本);通知里明确写「已 idle、在等下一个 dispatch」——任务没真完,这就是你补派下一步的信号(「静默停摆」不再存在:idle 必有信号)。`notify` 选模式:`"final"`(默认)/`"all"`(每条消息都通知,调试用)/`"off"`(只记账本)。`wait_seconds`(≤600)阻塞到 turn 真正干完、返回**最终** `result_text`(中途叙述不会提前结束等待),超时返回 `pending`(子会话继续跑,绝不取消)。每种模式都**只管这一件事**:turn 边界一到,监视即结束——之后那个会话继续过自己的日子,不会再向你汇报。派给**不是你派生出来的**会话 = 交接:任务照跑、照记账本,但除非你显式传 `notify`,否则不给你装任何完成监视(`notify_deliverable` 会告诉你拿到的是哪一种)。
+- **`session_dispatch`** — 给现有会话再派一件事(`{sid, task, wait_seconds?, notify?}`)。原文转发,零注入;派给自己或祖先会被拒(防环)。默认异步:**子会话一整个 vendor turn 干完、转 idle 时,只发一条完成通知**(话痨子会话的中途叙述不通知、只进账本);通知只有一行头 `s12 done · turn 7 · ctx 19%`(`⚠` 从 85% 起;失败写 `s12 FAILED (<kind>)`)加答案节选,没有别的——任务没真完,`done` 就是你补派下一步的信号(「静默停摆」不再存在:idle 必有信号)。`notify` 选模式:`"final"`(默认)/`"all"`(每条消息都通知,调试用)/`"off"`(只记账本)。`wait_seconds`(≤600)阻塞到 turn 真正干完、返回**最终** `result_text`(中途叙述不会提前结束等待),超时返回 `pending`(子会话继续跑,绝不取消)。每种模式都**只管这一件事**:turn 边界一到,监视即结束——之后那个会话继续过自己的日子,不会再向你汇报。派给**不是你派生出来的**会话 = 交接:任务照跑、照记账本,但除非你显式传 `notify`,否则不给你装任何完成监视(`notify_deliverable` 会告诉你拿到的是哪一种)。
 - **`session_collect`** — 不进会话读它的输出(`{sid, tail?, n?, since?, max_chars?}`)。看 `activity`:`working`=在干(去轮询)/`idle`=干完了(去读)。返回限幅(默认 10k 字),长文本头 70% + 尾 30% 摘录,全文永在账本;并带累计账:`cost_usd`(有价表的 vendor)+ `tokens_total`(原始 token 数——只要 vendor 报 usage 就有,codex/grok/opencode/kimi/dsh 不再一片空白)。
-- **`session_list`** — 委派树(谁是谁的下属、忙闲、成本/token、`parent_sid`),按最近活跃排序。支持 `{project?, activity?, limit?}` 过滤(默认最多 30 行,截断时带 `truncated`/`total`;空字段省略),大船队不再灌爆你的上下文。web 团队视图渲染的是同一张图。
+- **`session_list`** — 名册(忙闲、`context_pct`、成本/token、`parent_sid`),按最近活跃排序;`tree:true` 才返回过滤后各行的委派树。只有 ccteam 没握着进程的行才带 `residency`:`released` = 会话还在,下次 dispatch 自动恢复(**复用它,别再开一个**),`stopped` = 用户已结束。支持 `{project?, activity?, limit?, tree?}`(默认最多 30 行,只在截断时带 `truncated`/`total`;空字段省略),大船队不再灌爆你的上下文。web 团队视图渲染的是同一张图。
 - **`session_stop`** — 显式关掉一个 `sid`(状态留盘,可冷恢复)。ccteam 只有两个自动刹车:每日预算触顶拒新活、live 容量超限优雅挤停最闲的会话——**创建永不因容量失败**。
 - 另加 **`status`**(daemon 健康 + 会话 + 今日成本,外加 caller 项目绑定主机的厂商面板——各 vendor 安装/auth/预算、已装 vendor 的 spawn 配方、advisory 模型目录、原文透传的分工笔记;见 §6)、其裸名发现别名 **`grok_claude_codex_kimi`**(响应完全一致;专治只显示工具名的宿主搜不到 vendor 关键词),与 **`chat_send_file`**(把 daemon 文件系统上的文件发回你绑定的 chat)。
 

@@ -34,6 +34,22 @@ use crate::pending::InteractionOrigin;
 use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
 use crate::BotRegistration;
 
+/// Resolve a live thread status after the caller has dropped the gateway
+/// lock. Adapter failures are observational gaps, never request failures.
+pub async fn resolved_thread_status(
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ThreadHandle,
+    sid: &str,
+) -> ccteam_harness::ThreadStatus {
+    match adapter.thread_status(&thread).await {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::warn!(%sid, %err, "thread_status failed; reporting empty status");
+            ccteam_harness::ThreadStatus::default()
+        }
+    }
+}
+
 /// v0.8.7 review-fix (R-M6) — a typed "the named role has no
 /// `.claude/agents/<role>.md`" error so create paths can distinguish a
 /// caller mistake (bad/unseeded role ⇒ a 4xx in the web API) from a genuine
@@ -263,6 +279,11 @@ struct GatewaySession {
     /// Mirrors `meta.delegation_depth`; the source for a child's depth on its
     /// next spawn and the `delegation.max_depth` guardrail.
     delegation_depth: u32,
+    /// When this live-map entry was installed (every insertion sets it fresh).
+    /// The FLOOR of the idle-release clock: `last_event_at` alone would read a
+    /// just-resumed session — which has produced no pump event yet — as
+    /// infinitely idle and release it the moment it becomes resident.
+    resident_since: Instant,
 }
 
 #[derive(Clone)]
@@ -280,6 +301,9 @@ struct UnlockedTurnPlan {
     provisional_inject: bool,
     prior_steered: bool,
     prime_tool_surface: bool,
+    /// Snapshot of [`Gateway::reply_wait`] taken while the lock was held, so
+    /// the unlocked commit does not have to re-read it (or re-read the env).
+    reply_wait: std::time::Duration,
 }
 
 /// How often a paneless session's pump mirrors a mid-turn "still working"
@@ -334,6 +358,88 @@ fn select_live_capacity_eviction(
                 .then_with(|| a.sid.cmp(&b.sid))
         })
         .map(|candidate| candidate.sid.clone())
+}
+
+/// Why a session left the live map. Both residency policies release through
+/// the same core; this is the only thing that differs, and it rides all the
+/// way out to the durable `session_evicted` event and the live lifecycle
+/// frame so an operator can tell a burst-cap eviction from a routine
+/// idle release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReason {
+    /// `sessions.max_live` was reached and this was the LRU eligible session.
+    Capacity,
+    /// Nobody spoke to it for its harness's `sessions.idle_release_secs`.
+    Idle,
+}
+
+impl ReleaseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReleaseReason::Capacity => "capacity",
+            ReleaseReason::Idle => "idle",
+        }
+    }
+}
+
+/// One resident session as BOTH residency policies see it — the single
+/// snapshot idle release and capacity eviction rank over, taken under one
+/// brief lock and consumed after it drops.
+#[derive(Clone)]
+struct ResidencySnapshot {
+    sid: String,
+    /// Live-entry epoch, presented back when releasing so a session replaced
+    /// between snapshot and release is never stopped stale.
+    generation: u64,
+    /// Vendor wire name — the key `sessions.idle_release_by_vendor` uses.
+    vendor: String,
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ThreadHandle,
+    turn_in_flight: bool,
+    waiting_approval: bool,
+    /// Persisted `meta.json::last_active` (see [`LiveCapacityCandidate`]).
+    last_active: String,
+    /// Time since the later of "installed in the live map" and "last event".
+    idle_for: std::time::Duration,
+}
+
+/// The sids whose vendor reports a turn-OUTLIVING task still running
+/// (background shell / workflow / async agent). Adapter round-trips, so this
+/// runs OFF the gateway lock; `running_tasks` is an in-memory snapshot clone
+/// for every adapter that implements it and `vec![]` for the rest.
+async fn outliving_task_sids(snapshot: &[ResidencySnapshot]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for row in snapshot {
+        if row
+            .adapter
+            .running_tasks(&row.thread)
+            .await
+            .iter()
+            .any(|task| task.outlives_turn())
+        {
+            out.insert(row.sid.clone());
+        }
+    }
+    out
+}
+
+/// Project the shared residency snapshot onto the capacity selector's ranking
+/// inputs. A session carrying a turn-outliving background task ranks as BUSY
+/// even between turns: its process is still doing real work, so it must not be
+/// picked ahead of a genuinely quiet session.
+fn live_capacity_candidates(
+    snapshot: &[ResidencySnapshot],
+    outliving: &HashSet<String>,
+) -> Vec<LiveCapacityCandidate> {
+    snapshot
+        .iter()
+        .map(|row| LiveCapacityCandidate {
+            sid: row.sid.clone(),
+            idle: !row.turn_in_flight && !outliving.contains(&row.sid),
+            last_active: row.last_active.clone(),
+            waiting_approval: row.waiting_approval,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +606,12 @@ pub struct Gateway {
     /// `None` in unit tests that don't exercise project creation; the
     /// daemon sets it via [`Gateway::enable_project_creation`].
     project_paths: Option<CcteamPaths>,
+    /// How long a paneless turn waits for the vendor's first event before
+    /// answering without one. Resolved ONCE here (see
+    /// [`gateway_reply_wait_duration`]) instead of re-read from the
+    /// environment on every turn; tests set it with
+    /// [`Gateway::set_reply_wait`].
+    reply_wait: std::time::Duration,
     /// Hot-reloaded view of `~/.ccteam/config.yaml` (re-parsed only on mtime
     /// change; pull-based, no watcher). `Some` once the daemon calls
     /// [`Gateway::enable_project_creation`]; lets `/cd` resolve a project
@@ -682,6 +794,7 @@ impl DelegationProgressEmitter {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: Some(record.slug),
         };
@@ -849,6 +962,8 @@ pub struct GatewayEvent {
     pub thread_ts: Option<String>,
     /// User-visible message content.
     pub content: String,
+    /// Per-turn status snapshot carried by answer events.
+    pub status: Option<ccteam_harness::TurnStatus>,
     /// Answer (new message) vs. live progress (edited status message).
     pub kind: GatewayEventKind,
     /// Outbound file attachments (V0.8.4 P2b — `chat_send_file`). Empty
@@ -1021,6 +1136,26 @@ pub struct SessionView {
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
     pub status: String,
+    /// Whether ccteam is holding an execution attachment for this session
+    /// right now — the RESIDENCY axis, orthogonal to what the session is
+    /// DOING ([`Self::status`] once a surface has folded in the activity
+    /// resolver). One of:
+    ///
+    /// | value | meaning |
+    /// |---|---|
+    /// | `resident` | ccteam holds a vendor process/connection for it |
+    /// | `released` | no process; the next message resumes THIS sid |
+    /// | `stopped` | the user ended it (`meta.stopped_at`) |
+    /// | `detached` | its body outlived the daemon; the watcher owns it |
+    /// | `external` | a hand-started client's ledger node — ccteam never held a thread and never will (see [`ccteam_harness::execution::session_meta::ManagedBy::External`]) |
+    ///
+    /// Exists because `status: "live"` was doing both jobs and could only
+    /// answer one: a persisted-but-not-resident session read as "working" on
+    /// every surface that trusted it. `#[serde(default = "…")]` reads back
+    /// `resident` for a payload written before the field existed, where every
+    /// row WAS in the live map.
+    #[serde(default = "session_view_residency_default")]
+    pub residency: String,
     /// Seconds since this session's latest progress event when known.
     #[serde(default)]
     pub last_activity_seconds: Option<u64>,
@@ -1096,6 +1231,22 @@ pub struct SessionView {
 fn session_view_driveable_default() -> bool {
     true
 }
+
+/// Pre-`residency` payloads only ever described live-map rows.
+fn session_view_residency_default() -> String {
+    RESIDENCY_RESIDENT.to_string()
+}
+
+/// ccteam holds a vendor process / connection for this session right now.
+pub const RESIDENCY_RESIDENT: &str = "resident";
+/// No process is held; the next message resumes THIS sid from `meta.json`.
+pub const RESIDENCY_RELEASED: &str = "released";
+/// The user explicitly ended it (`SessionMeta::stopped_at`).
+pub const RESIDENCY_STOPPED: &str = "stopped";
+/// Its OS body outlived the daemon that spawned it; the body watcher owns it.
+pub const RESIDENCY_DETACHED: &str = "detached";
+/// A hand-started client's ledger node — never ccteam's to hold.
+pub const RESIDENCY_EXTERNAL: &str = "external";
 
 /// The detached-body facts a session row carries (see [`SessionView::detached`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1968,6 +2119,7 @@ impl Gateway {
                 crate::pending::PendingInteractions::new(),
             )),
             project_paths: None,
+            reply_wait: gateway_reply_wait_duration(),
             config: None,
             progress_projection: None,
             im_reload_tx: None,
@@ -2085,6 +2237,14 @@ impl Gateway {
         Arc::clone(&self.pending)
     }
 
+    /// Override the paneless first-event wait (default:
+    /// [`gateway_reply_wait_duration`], i.e. `CCTEAM_IM_GATEWAY_REPLY_WAIT_MS`
+    /// or 5ms). Lets a test widen the window for a deliberately slow adapter
+    /// without touching the process environment.
+    pub fn set_reply_wait(&mut self, wait: std::time::Duration) {
+        self.reply_wait = wait;
+    }
+
     /// Enable `/newproject <slug> <path>` by giving the gateway the path
     /// context it needs to scaffold + register a project. The daemon
     /// wires this; unit tests that don't create projects leave it unset
@@ -2118,7 +2278,7 @@ impl Gateway {
     /// — it lives in each session's `meta.json` (the v0.8.21 Wave-2 SoT); this
     /// only restores the per-chat focus + the live-set, then cold-start rebuilds
     /// those sessions from their meta.json (async, via
-    /// [`resume_restored_sessions_shared`](Self::resume_restored_sessions_shared)).
+    /// [`reconcile_restored_sessions_shared`](Self::reconcile_restored_sessions_shared)).
     ///
     /// The daemon uses this for spawn-on-demand continuity across restarts.
     /// Unit tests keep the default in-memory mode (or pass a tempdir root).
@@ -2367,6 +2527,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
                 tool_face_primed: Arc::new(AtomicBool::new(false)),
+                resident_since: Instant::now(),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -2376,6 +2537,9 @@ impl Gateway {
             },
         );
         self.spawn_event_pump(&sid);
+        // Every resume/rebuild path funnels through here, so the "a session
+        // being driven again is no longer stopped" rule is written ONCE.
+        self.clear_session_stopped(&sid);
         if let Some((slug, cwd, body)) = post_mortem {
             // The previous body exited unobserved: let the watcher recover
             // what it said (vendor record) and report it — AFTER the session
@@ -2414,64 +2578,65 @@ impl Gateway {
             .await
     }
 
-    /// Drop `current_session` routes pointing at a missing or foreign session.
-    /// The ownership check also scrubs routes persisted by an older buggy
-    /// session_spawn that bound a tenant project's sid to the admin web chat.
+    /// Drop `current_session` routes pointing at a GONE or foreign session.
+    ///
+    /// "Gone" means the sid can no longer be driven at all — an unknown sid, a
+    /// hand-started external node, or a session the user explicitly stopped.
+    /// Being merely non-resident is NOT gone: a released session (and a
+    /// detached body) keeps its chat's focus, because the next message resumes
+    /// exactly that sid. The ownership check also scrubs routes persisted by an
+    /// older buggy session_spawn that bound a tenant project's sid to the admin
+    /// web chat.
     fn drop_dead_session_routes(&self) {
         let mut memo = ProjectPrincipalMemo::new();
         self.current_session.write().unwrap().retain(|chat, sid| {
             // A detached body is still this chat's session — it comes back
             // (rebuilt by sid) the moment the body exits; keep the focus.
-            self.detached.contains_key(sid)
-                || self
-                    .sessions
-                    .get(sid)
-                    .is_some_and(|session| self.chat_can_access_with(chat, session, &mut memo))
+            if self.detached.contains_key(sid) {
+                return true;
+            }
+            if let Some(session) = self.sessions.get(sid) {
+                return self.chat_can_access_with(chat, session, &mut memo);
+            }
+            // RELEASED (not resident, not stopped): the session is real, its
+            // transcript is on disk, and the next message resumes THAT sid.
+            // Dropping the focus here is what made an idle release — or a
+            // restart — silently mint a brand-new session on the chat's next
+            // plain message.
+            self.find_meta_for_sid(sid)
+                .map(|(slug, _dir, meta)| {
+                    meta.is_resumable()
+                        && self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo)
+                })
+                .unwrap_or(false)
         });
     }
 
-    /// v0.8.21 Wave-2 — cold-start rebuild the sessions that were live at last
-    /// persist (stashed in `restore_pending` by `load_state`) from their
-    /// `meta.json`. A daemon restart kills every child (stream-json children are
-    /// the daemon's own subprocesses; a terminal session also loses its tmux
-    /// pane — authorized breaking), so there is nothing to reattach to: each
-    /// session is re-spawned and resumes its conversation from the transcript
-    /// (`--resume`). Routes to a session that fails to rebuild are dropped, then
-    /// routing is re-persisted to reflect the rebuilt live-set. (The `&mut self`
-    /// form holds the lock across spawns; the daemon uses the `_shared` form.)
-    pub async fn resume_restored_sessions(&mut self) {
+    /// Cold-start RECONCILE of the sessions that were resident at last persist
+    /// (stashed in `restore_pending` by `load_state`) — it deliberately spawns
+    /// NOTHING.
+    ///
+    /// The old shape re-spawned a vendor process for every sid that had been
+    /// live, on the theory that a restart should restore the fleet. It didn't
+    /// buy what it looked like it bought: spawning never touches the model, so
+    /// there is no prompt cache to keep warm, no context to preserve (that
+    /// lives in the vendor's transcript, replayed by `--resume`) and nothing a
+    /// user can observe — only N vendor processes (≈300 MB each for claude)
+    /// standing by in case someone types. Resume-by-sid already covers the
+    /// real need: the first message to a session pays ~1–2 s of startup and
+    /// gets the SAME conversation back.
+    ///
+    /// What the pass still does, per pending sid: run the body gate, which
+    /// registers a body that outlived the previous daemon as DETACHED (the
+    /// watcher owns it from there — never a twin, never a kill) and queues a
+    /// post-mortem for a stale body record so an unobserved turn is still
+    /// recovered and reported. Then routes to a genuinely gone session are
+    /// scrubbed and routing is re-persisted. (The `&mut self` form is used by
+    /// tests; the daemon uses the `_shared` form.)
+    pub async fn reconcile_restored_sessions(&mut self) {
         let pending = std::mem::take(&mut self.restore_pending);
         for sid in pending {
-            if self.sessions.contains_key(&sid) {
-                continue;
-            }
-            let Ok((slug, cwd, meta)) = self.find_meta_for_sid(&sid) else {
-                tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
-                continue;
-            };
-            let reply_to = self
-                .tenant_project_owner_reply_target(&slug)
-                .or_else(|| {
-                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
-                })
-                .unwrap_or_else(web_api_chat);
-            if let Err(err) = self
-                .rebuild_session_from_meta(&slug, cwd, &meta, reply_to)
-                .await
-            {
-                if is_body_detached_error(&err) {
-                    tracing::info!(
-                        session = %sid,
-                        "ccteam-im: restore deferred; the session's body from before the restart is still running (watched, not duplicated)"
-                    );
-                    continue;
-                }
-                tracing::warn!(
-                    session = %sid,
-                    error = %err,
-                    "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
-                );
-            }
+            self.reconcile_one(&sid);
         }
         self.drop_dead_session_routes();
         if let Err(err) = self.persist_routing() {
@@ -2479,23 +2644,56 @@ impl Gateway {
         }
     }
 
-    /// Startup-restore variant that does NOT hold the gateway lock across the
-    /// slow `start_thread` await. Per session it: locks → builds the rebuild
-    /// plan (sync, cheap) → UNLOCKS → spawns the thread (slow; stream-json may
-    /// block on `system:init`) → re-locks → inserts. So a concurrent web `POST
-    /// /sessions` never waits behind a stale session's startup.
-    pub async fn resume_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
+    /// [`Self::reconcile_restored_sessions`] for the daemon: one brief lock per
+    /// sid instead of one long one, so a concurrent web `POST /sessions` never
+    /// waits behind the whole boot pass.
+    pub async fn reconcile_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
         let pending = {
             let mut g = gateway.lock().await;
             std::mem::take(&mut g.restore_pending)
         };
         for sid in pending {
-            Self::restore_one_shared(&gateway, &sid).await;
+            gateway.lock().await.reconcile_one(&sid);
         }
         let g = gateway.lock().await;
         g.drop_dead_session_routes();
         if let Err(err) = g.persist_routing() {
             tracing::warn!(error = %err, "ccteam-im: failed to persist restored routing");
+        }
+    }
+
+    /// Reconcile ONE previously-resident sid against reality: does it have a
+    /// body still running from before the restart? Sync — no spawn, no `.await`.
+    fn reconcile_one(&mut self, sid: &str) {
+        if self.sessions.contains_key(sid) {
+            return;
+        }
+        let Ok((slug, cwd, meta)) = self.find_meta_for_sid(sid) else {
+            tracing::warn!(session = %sid, "ccteam-im: reconcile skipped; no meta.json found");
+            return;
+        };
+        // An external node's process is not ccteam's, and an explicitly
+        // stopped session is finished: neither has a body ccteam should adopt.
+        if !meta.is_resumable() {
+            return;
+        }
+        match self.gate_session_body(sid, &slug, &cwd, &meta.role, meta.delegation_depth) {
+            Ok(BodyGate::Clear) => {}
+            Ok(BodyGate::PostMortem(body)) => {
+                // The previous body exited unobserved: let the watcher recover
+                // what it said (from the vendor's own record) and report it.
+                self.post_mortem_pending
+                    .push((sid.to_string(), slug, cwd, body));
+                self.body_watch_notify.notify_one();
+            }
+            Err(_) => {
+                // The typed detached refusal — `gate_session_body` already
+                // registered the body and woke the watcher.
+                tracing::info!(
+                    session = %sid,
+                    "ccteam-im: session body from before the restart is still running (watched, not duplicated)"
+                );
+            }
         }
     }
 
@@ -2634,6 +2832,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -2848,7 +3047,7 @@ impl Gateway {
         tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
         Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, "exited")
             .await;
-        Self::restore_one_shared(gateway, &d.sid).await;
+        Self::rebuild_one_shared(gateway, &d.sid).await;
         let mut g = gateway.lock().await;
         if g.sessions.contains_key(&d.sid) {
             g.emit_session_lifecycle(&d.sid, &d.slug, "resumed", "body_exited");
@@ -2948,6 +3147,7 @@ impl Gateway {
                     user: String::new(),
                     assistant: turn.assistant.clone(),
                     usage: turn.usage.clone(),
+                    status: None,
                     tool_calls: Vec::new(),
                     attachments: Vec::new(),
                     outcome: None,
@@ -2977,6 +3177,7 @@ impl Gateway {
                         user: String::new(),
                         assistant: String::new(),
                         usage: serde_json::Value::Null,
+                        status: None,
                         tool_calls: Vec::new(),
                         attachments: Vec::new(),
                         outcome: Some("unobserved".to_string()),
@@ -3039,6 +3240,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: Vec::new(),
+                status: None,
                 sid: Some(sid.to_string()),
                 slug: Some(slug.to_string()),
             });
@@ -3057,6 +3259,9 @@ impl Gateway {
                 vendor_error,
                 interim_notes: 0,
                 covered_turns: vec![turn_id],
+                context_pct: None,
+                turn: meta.turn_count,
+                error_kind: record.error_kind.clone(),
             });
         }
         tracing::info!(session = %sid, recovered = recovered.is_some(), "ccteam-im: unobserved turn reported");
@@ -3064,10 +3269,12 @@ impl Gateway {
     }
 
     /// Rebuild ONE sid from its meta.json with the lock held only around the
-    /// plan and the apply (the spawn runs unlocked) — the batch restore's loop
-    /// body, also used by the body watcher after a body exits. A typed
-    /// detached refusal is an info (the watcher keeps it); anything else warns.
-    async fn restore_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
+    /// plan and the apply (the spawn runs unlocked) — used by the body watcher
+    /// after a detached body exits, so its queued turns land on a live session.
+    /// A typed detached refusal is an info (the watcher keeps it); anything
+    /// else warns. Boot no longer calls this: see
+    /// [`Self::reconcile_restored_sessions`] for why a restart spawns nothing.
+    async fn rebuild_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
         let plan_and_reply = {
             let mut g = gateway.lock().await;
             if g.sessions.contains_key(sid) {
@@ -3516,7 +3723,7 @@ impl Gateway {
     /// guard held only across synchronous work; the slow
     /// `adapter.start_thread` await (tmux/subprocess spawn, stream-json
     /// `system:init`) runs with NO gateway lock held at all — the same shape
-    /// [`Self::resume_restored_sessions_shared`] already established. Two
+    /// [`Self::reconcile_restored_sessions_shared`] already established. Two
     /// concurrent inbound messages for the SAME chat that both observe "no
     /// session yet" are serialized through [`SpawnClaims`] (a lock separate
     /// from the gateway's own — the `PendingInteractions` house pattern) so
@@ -3729,16 +3936,18 @@ impl Gateway {
                         anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
                     })?
                     .to_string();
-                // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own session.
-                // A detached body (alive from before a restart) is stoppable
-                // through the same gate, resolved from its meta.json owner.
+                // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own
+                // session. Not-resident is not not-there: a detached body
+                // (alive from before a restart) and a RELEASED session (ccteam
+                // holds no process, but the next message would resume it) are
+                // both stoppable through the same gate, resolved from their
+                // meta.json owner — otherwise "stop the thing I'm talking to"
+                // would fail on exactly the sessions whose process was let go.
                 let accessible = self
                     .sessions
                     .get(&sid)
                     .map(|s| self.chat_can_access(chat, s))
-                    .unwrap_or_else(|| {
-                        self.is_session_detached(&sid) && self.chat_can_access_sid(chat, &sid)
-                    });
+                    .unwrap_or_else(|| self.chat_can_access_sid(chat, &sid));
                 if !accessible {
                     return Ok(Some(format!("unknown session for this chat: {sid}")));
                 }
@@ -4052,11 +4261,26 @@ impl Gateway {
                 .await
             {
                 Ok(resumed_sid) => {
-                    // Move current project to this session's project.
+                    // Move current project to this session's project, and bind
+                    // BOTH the focus and the reply target to THIS chat key.
+                    // `resume_stopped_session` can only route by the caller's
+                    // canonical IDENTITY (`ChatKey::from_identity` forces
+                    // `user_id = chat_id`), which is not the real key this chat
+                    // is addressed by — leaving the focus keyed to a chat that
+                    // never speaks, so the next plain message still went to the
+                    // OLD session.
                     if let Some(s) = self.sessions.get(&resumed_sid) {
                         let proj = s.project.clone();
+                        if let Ok(mut target) = s.reply_to.lock() {
+                            *target = chat.clone();
+                        }
                         self.current_project.insert(chat.clone(), proj);
                     }
+                    self.current_session
+                        .write()
+                        .unwrap()
+                        .insert(chat.clone(), resumed_sid.clone());
+                    self.persist_routing()?;
                     return Ok(format!("resumed session {resumed_sid}"));
                 }
                 Err(_) => return Ok(format!("unknown session for this chat: {id}")),
@@ -4211,11 +4435,13 @@ impl Gateway {
         options
     }
 
-    /// One "switch session" button per live, chat-visible session
-    /// (`nav:use:<sid>`), the current one marked `✓`. Scoped + ordered like
+    /// One "switch session" button per chat-visible session — RESIDENT and
+    /// RELEASED alike (`nav:use:<sid>`), the current one marked `✓` and a
+    /// released one `💤`. Scoped, ordered and bounded like
     /// [`Self::render_sessions`] (current project unless `all`; recency then
-    /// numeric-sid descending) so the buttons track the text list. Ended
-    /// (history) sessions switch only via their text `→ /use <sid>` hint.
+    /// numeric-sid descending) so the buttons track the text list row for row.
+    /// `/use` cold-resumes a released sid, so the button is as real as any
+    /// other; only an explicitly STOPPED session has no button.
     fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat).unwrap_or_default();
         let mut memo = ProjectPrincipalMemo::new();
@@ -4231,10 +4457,28 @@ impl Gateway {
             lb.cmp(&la)
                 .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
         });
-        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
-        let mut options: Vec<MessageOption> = visible
+        let released: Vec<(String, SessionMeta)> = self
+            .released_session_metas(None)
             .into_iter()
-            .map(|s| {
+            .filter(|(slug, meta)| {
+                (all || slug == &cur)
+                    && self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+            })
+            .collect();
+        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
+        let rows: Vec<SessionRowSource<'_>> = visible
+            .iter()
+            .map(|s| SessionRowSource::Resident(s))
+            .chain(
+                released
+                    .iter()
+                    .map(|(slug, meta)| SessionRowSource::Released(slug, meta)),
+            )
+            .take(IM_SESSIONS_MAX_ROWS)
+            .collect();
+        let mut options: Vec<MessageOption> = rows
+            .iter()
+            .map(|source| {
                 // Label = `sid vendor (title)` (✓ prefixes the current
                 // session), arranged sid → vendor → title — same `sid vendor`
                 // opening as the text rows. The button carries the human name;
@@ -4242,22 +4486,29 @@ impl Gateway {
                 // display cols so one verbose title can't widen every button
                 // (the left-align padding below pads all labels to the widest).
                 // Callback `data` is unchanged.
-                let marker = if Some(&s.id) == current_sid.as_ref() {
+                let sid = source.sid();
+                let marker = if current_sid.as_deref() == Some(sid) {
                     "✓ "
+                } else if source.is_released() {
+                    "💤 "
                 } else {
                     ""
                 };
-                let mut label = format!("{marker}{} {}", s.id, vendor_str(s.vendor));
-                if let Some(title) = self.session_title(s) {
+                let mut label = format!("{marker}{sid} {}", source.vendor());
+                let title = match source {
+                    SessionRowSource::Resident(s) => self.session_title(s),
+                    SessionRowSource::Released(_, meta) => meta.title.clone(),
+                };
+                if let Some(title) = title {
                     label.push_str(&format!(
                         " ({})",
                         truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
                     ));
                 }
                 MessageOption {
-                    data: format!("nav:use:{}", s.id),
+                    data: format!("nav:use:{sid}"),
                     label,
-                    id: s.id.clone(),
+                    id: sid.to_string(),
                 }
             })
             .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
@@ -4285,6 +4536,7 @@ impl Gateway {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options,
+            status: None,
             sid: None,
             slug: None,
         });
@@ -4863,6 +5115,7 @@ impl Gateway {
         });
         let mut meta = SessionMeta {
             managed_by: Default::default(),
+            stopped_at: None,
             sid: plan.id.clone(),
             slug: plan.project.clone(),
             vendor: plan.vendor,
@@ -4995,6 +5248,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
                 tool_face_primed: Arc::new(AtomicBool::new(false)),
+                resident_since: Instant::now(),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -5175,6 +5429,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
                 tool_face_primed: Arc::new(AtomicBool::new(false)),
+                resident_since: Instant::now(),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -5352,7 +5607,31 @@ impl Gateway {
             // state machine below rebuilds it whenever a stream ends.
             let attachment = session.adapter.event_attachment();
             let mut events = session.adapter.events(&session.thread);
-            let mut seq: u64 = 0; // answer sequence → message ids
+            let mut seq: u64 = project_dir
+                .as_ref()
+                .and_then(|dir| {
+                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
+                })
+                .map(|turns| {
+                    turns
+                        .iter()
+                        .filter(|turn| !turn.assistant.is_empty())
+                        .count() as u64
+                })
+                .unwrap_or(0); // assistant-row count → monotonic turn number
+            let mut vendor_turn: u64 = project_dir
+                .as_ref()
+                .and_then(|dir| {
+                    ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
+                })
+                .map(|turns| {
+                    turns
+                        .iter()
+                        .filter(|turn| !turn.user.is_empty())
+                        .count()
+                        .saturating_sub(1) as u64
+                })
+                .unwrap_or(0); // boundary re-read accounts for a row already appended
             let mut epoch: u64 = 0; // status epoch → one per turn
             let mut fold = crate::progress::ProgressFold::new();
             let mut dirty = false;
@@ -5371,6 +5650,14 @@ impl Gateway {
             let mut turn_last_answer: Option<(String, String)> = None;
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
+            let mut pending_answers: Vec<String> = Vec::new();
+            let mut turn_last_context_pct: Option<u64> = None;
+            // Immediate-flush protocols can deliver one or more assistant
+            // messages before their terminal boundary arrives. Remember that
+            // the current vendor turn already produced visible text so an
+            // otherwise-empty TurnCompleted does not create a duplicate web
+            // status-only Answer.
+            let mut turn_had_answer = false;
             // The final text + the reply target used by its ordinary web
             // Answer. Held independently from delegation bookkeeping so an
             // IM mirror never depends on the turns.jsonl append succeeding.
@@ -5418,6 +5705,7 @@ impl Gateway {
             // was written. `None` turn = no window open, so nothing to refresh.
             let mut heartbeat_turn: Option<(String, Instant)> = None;
             let mut heartbeat_last: Option<Instant> = None;
+            let mut structured_turn_open = false;
 
             loop {
                 // Flush timer, armed only while a throttled update waits.
@@ -5618,6 +5906,7 @@ impl Gateway {
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
                         if let ThreadEvent::TurnStarted { turn_id } = &evt {
+                            structured_turn_open = true;
                             if let Ok(mut started) = session.turn_started_at.lock() {
                                 if started.is_none() {
                                     *started = Some(Instant::now());
@@ -5679,6 +5968,7 @@ impl Gateway {
                                 },
                                 attachments: Vec::new(),
                                 options: Vec::new(),
+                                status: None,
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             }) {
@@ -5808,8 +6098,6 @@ impl Gateway {
                         // and append one kind:turn experience record (derived
                         // index; failure never breaks the pump).
                         if let Some((turn_id, usage, model)) = turn_terminal_accounting(&evt) {
-                            let is_completed =
-                                matches!(&evt, ThreadEvent::TurnCompleted { .. });
                             let duration_ms = session
                                 .turn_started_at
                                 .lock()
@@ -5888,51 +6176,6 @@ impl Gateway {
                                         session = %session_id,
                                         error = %err,
                                         "ccteam-im: failed to append experience.jsonl"
-                                    );
-                                }
-                            }
-
-                            if is_completed {
-                                let completed_origin =
-                                    take_turn_origin(&session, Some(turn_id));
-                                let mirror_answer = mirror_last_answer.take();
-                                // v0.9.5 feedback fix — the vendor turn is DONE and
-                                // the child is idle: flush ONE boundary signal
-                                // carrying the turn's final answer (the last
-                                // mirrored message) + the whole turn's mirrored ids
-                                // for batch dedup. Interim messages already flowed
-                                // as non-boundary signals (an `all` watch consumes
-                                // those); the default `final` watch notifies here
-                                // and ONLY here.
-                                let finished = turn_last_answer.take();
-                                let covered = std::mem::take(&mut turn_covered);
-                                let notes = turn_notes;
-                                turn_notes = 0;
-                                if let (Some(dtx), Some((final_turn, final_text))) =
-                                    (delegation_tx.as_ref(), finished.as_ref())
-                                {
-                                    let _ = dtx.send(crate::delegation::DelegationSignal {
-                                        child_sid: session_id.clone(),
-                                        turn_id: final_turn.clone(),
-                                        tail: final_text.clone(),
-                                        vendor: pump_vendor,
-                                        host: pump_host.clone(),
-                                        boundary: true,
-                                        vendor_error: false,
-                                        interim_notes: notes.saturating_sub(1),
-                                        covered_turns: covered,
-                                    });
-                                }
-                                if let Some((final_text, reply_to)) = mirror_answer {
-                                    mirror_internal_web_answer(
-                                        &tx,
-                                        mirror_paths.as_ref(),
-                                        &session,
-                                        &reply_to,
-                                        completed_origin,
-                                        &session_id,
-                                        seq,
-                                        &final_text,
                                     );
                                 }
                             }
@@ -6040,7 +6283,125 @@ impl Gateway {
                                 }
                             }
                         }
-                        if let Some(text) = async_event_text(&evt) {
+                        let answer_texts = match &evt {
+                            ThreadEvent::ItemCompleted { item } => match &item.details {
+                                ThreadItemDetails::AgentMessage(text) if !text.is_empty() => {
+                                    if session.protocol.is_terminal() || !structured_turn_open {
+                                        vec![text.clone()]
+                                    } else {
+                                        pending_answers.push(text.clone());
+                                        Vec::new()
+                                    }
+                                }
+                                _ => Vec::new(),
+                            },
+                            ThreadEvent::TurnCompleted { .. } => {
+                                std::mem::take(&mut pending_answers)
+                            }
+                            ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => {
+                                pending_answers.clear();
+                                vec![err.message.clone()]
+                            }
+                            _ => Vec::new(),
+                        };
+                        let is_turn_boundary = matches!(
+                            &evt,
+                            ThreadEvent::TurnCompleted { .. }
+                                | ThreadEvent::TurnFailed { .. }
+                                | ThreadEvent::Error(_)
+                        );
+                        if is_turn_boundary {
+                            let fallback = vendor_turn.saturating_add(1);
+                            vendor_turn = project_dir
+                                .as_ref()
+                                .and_then(|dir| {
+                                    ccteam_harness::execution::turns_mirror::read_all_turns(
+                                        dir,
+                                        &session_id,
+                                    )
+                                    .ok()
+                                })
+                                .map(|turns| {
+                                    turns
+                                        .iter()
+                                        .filter(|turn| !turn.user.is_empty())
+                                        .count() as u64
+                                })
+                                // The durable user-row count is authoritative:
+                                // a resumed pump may have sampled it either
+                                // before or after this turn's row was appended.
+                                .map(|count| count.max(fallback))
+                                .unwrap_or(fallback);
+                        }
+                        if !answer_texts.is_empty() {
+                            turn_had_answer = true;
+                        }
+                        if is_turn_boundary && answer_texts.is_empty() {
+                            let live_status = resolved_thread_status(
+                                Arc::clone(&session.adapter),
+                                session.thread.clone(),
+                                &session_id,
+                            )
+                            .await;
+                            let meta_status = session_catalog.get(&session_id).map(|entry| entry.meta);
+                            let projected = progress_projection.as_ref().and_then(|projection| {
+                                projection.session_snapshot(&session.project, &session_id)
+                            });
+                            let current_usage = turn_terminal_accounting(&evt).map(|(_, usage, _)| *usage);
+                            let status = ccteam_harness::TurnStatus {
+                                model: live_status.model.clone().or_else(|| {
+                                    projected.as_ref().and_then(|snapshot| snapshot.observed_model.clone())
+                                }).or_else(|| meta_status.as_ref().and_then(|meta| {
+                                    meta.observed_model.clone().or_else(|| meta.model.clone())
+                                })),
+                                context: live_status.context,
+                                turn: vendor_turn,
+                                cost_usd: projected.as_ref().and_then(|snapshot| snapshot.pricing(session.vendor).cost_usd).or_else(|| {
+                                    let base = meta_status.as_ref().and_then(|meta| meta.cost_usd);
+                                    current_usage.and_then(|usage| ccteam_cost::resolve_turn_cost(
+                                        &usage,
+                                        session.vendor.cost_vendor(),
+                                        live_status.model.as_deref().unwrap_or(""),
+                                    ).map(|cost| base.unwrap_or(0.0) + cost)).or(base)
+                                }),
+                                tokens_total: projected.as_ref().and_then(|snapshot| snapshot.tokens_total).or_else(|| {
+                                    let base = meta_status.as_ref().and_then(|meta| meta.tokens_total);
+                                    current_usage.map(|usage| base.unwrap_or(0).saturating_add(usage.total())).or(base)
+                                }),
+                            };
+                            turn_last_context_pct =
+                                crate::delegation::context_pct(Some(&status));
+                            let chat_key = session
+                                .reply_to
+                                .lock()
+                                .map(|key| key.clone())
+                                .unwrap_or_else(|_| session.owner.clone());
+                            if chat_key.channel == "web" && !turn_had_answer {
+                                let status_only = GatewayEvent {
+                                    id: format!("gateway-event-{session_id}-status-{vendor_turn}"),
+                                    channel: chat_key.channel,
+                                    chat_id: chat_key.chat_id,
+                                    thread_ts: None,
+                                    content: String::new(),
+                                    kind: GatewayEventKind::Answer,
+                                    attachments: Vec::new(),
+                                    options: Vec::new(),
+                                    status: Some(status),
+                                    sid: Some(session_id.clone()),
+                                    slug: Some(session.project.clone()),
+                                };
+                                if !tx.send(status_only) {
+                                    break;
+                                }
+                            }
+                        }
+                        if !answer_texts.is_empty()
+                            || matches!(&evt, ThreadEvent::TurnCompleted { .. })
+                        {
+                          let answer_count = answer_texts.len();
+                          for (answer_index, text) in answer_texts.into_iter().enumerate() {
+                            let is_final_answer = is_turn_boundary
+                                && answer_index.saturating_add(1) == answer_count;
                             let boundary_origin = match &evt {
                                 ThreadEvent::TurnFailed { turn_id, .. } => {
                                     Some(take_turn_origin(&session, Some(turn_id)))
@@ -6067,6 +6428,92 @@ impl Gateway {
 
                             seq = seq.saturating_add(1);
                             session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            let (status, meta_status) = if is_final_answer {
+                                let live_status = resolved_thread_status(
+                                    Arc::clone(&session.adapter),
+                                    session.thread.clone(),
+                                    &session_id,
+                                )
+                                .await;
+                                let meta_status =
+                                    session_catalog.get(&session_id).map(|entry| entry.meta);
+                                let projected = progress_projection.as_ref().and_then(|projection| {
+                                    projection.session_snapshot(&session.project, &session_id)
+                                });
+                                let projected_pricing = projected
+                                    .as_ref()
+                                    .map(|snapshot| snapshot.pricing(session.vendor));
+                                let current_usage =
+                                    turn_terminal_accounting(&evt).map(|(_, usage, _)| *usage);
+                                let projected_tokens =
+                                    projected.as_ref().and_then(|snapshot| snapshot.tokens_total);
+                                let projected_cost =
+                                    projected_pricing.and_then(|pricing| pricing.cost_usd);
+                                let status = ccteam_harness::TurnStatus {
+                                    model: live_status
+                                        .model
+                                        .clone()
+                                        .or_else(|| {
+                                            projected.as_ref().and_then(|snapshot| {
+                                                snapshot.observed_model.clone()
+                                            })
+                                        })
+                                        .or_else(|| {
+                                            meta_status.as_ref().and_then(|meta| {
+                                                meta.observed_model
+                                                    .clone()
+                                                    .or_else(|| meta.model.clone())
+                                            })
+                                        }),
+                                    context: live_status.context,
+                                    turn: vendor_turn,
+                                    cost_usd: projected_cost.or_else(|| {
+                                        let base =
+                                            meta_status.as_ref().and_then(|meta| meta.cost_usd);
+                                        current_usage
+                                            .and_then(|usage| {
+                                                ccteam_cost::resolve_turn_cost(
+                                                    &usage,
+                                                    session.vendor.cost_vendor(),
+                                                    live_status.model.as_deref().unwrap_or(""),
+                                                )
+                                                .map(|cost| base.unwrap_or(0.0) + cost)
+                                            })
+                                            .or(base)
+                                    }),
+                                    tokens_total: projected_tokens.or_else(|| {
+                                        let base = meta_status
+                                            .as_ref()
+                                            .and_then(|meta| meta.tokens_total);
+                                        current_usage
+                                            .map(|usage| {
+                                                base.unwrap_or(0).saturating_add(usage.total())
+                                            })
+                                            .or(base)
+                                    }),
+                                };
+                                (Some(status), meta_status)
+                            } else {
+                                (None, None)
+                            };
+                            let status_line = status.as_ref().map(|status| {
+                                ccteam_harness::render_status_line(
+                                    &ccteam_harness::StatusIdentity {
+                                        slug: &session.project,
+                                        sid: &session_id,
+                                        vendor: vendor_str(session.vendor),
+                                        role: &session.role,
+                                        title: meta_status
+                                            .as_ref()
+                                            .and_then(|meta| meta.title.as_deref()),
+                                    },
+                                    status,
+                                )
+                            });
+                            if let Some(status) = status.as_ref() {
+                                turn_last_context_pct =
+                                    crate::delegation::context_pct(Some(status));
+                            }
                             // v0.8.8 F1 — 落盘这条 assistant 回复到
                             // `.ccteam/chat/<sid>/turns.jsonl`(生产唯一 live
                             // writer)。这是 SPA / cto session_collect 历史读侧的
@@ -6087,7 +6534,14 @@ impl Gateway {
                                     role: session.role.clone(),
                                     user: String::new(),
                                     assistant: text.clone(),
-                                    usage: serde_json::Value::Null,
+                                    usage: if is_final_answer {
+                                        turn_terminal_accounting(&evt)
+                                            .map(|(_, usage, _)| ccteam_harness::execution::turn_status::usage_value(usage))
+                                            .unwrap_or(serde_json::Value::Null)
+                                    } else {
+                                        serde_json::Value::Null
+                                    },
+                                    status: status.clone(),
                                     tool_calls: Vec::new(),
                                     attachments: Vec::new(),
                                     outcome: failure.map(|_| "failed".to_string()),
@@ -6138,6 +6592,14 @@ impl Gateway {
                                                     vendor_error: true,
                                                     interim_notes: notes,
                                                     covered_turns: covered,
+                                                    context_pct: crate::delegation::context_pct(
+                                                        status.as_ref(),
+                                                    ),
+                                                    turn: status
+                                                        .as_ref()
+                                                        .map(|status| status.turn)
+                                                        .unwrap_or(vendor_turn),
+                                                    error_kind: record.error_kind.clone(),
                                                 });
                                             }
                                         } else {
@@ -6157,6 +6619,9 @@ impl Gateway {
                                                     vendor_error: false,
                                                     interim_notes: 0,
                                                     covered_turns: vec![record.turn_id.clone()],
+                                                    context_pct: None,
+                                                    turn: vendor_turn,
+                                                    error_kind: None,
                                                 });
                                             }
                                         }
@@ -6221,26 +6686,25 @@ impl Gateway {
                                 if channel == "web" {
                                     text.clone()
                                 } else {
-                                    let title = session_catalog
-                                        .get(&session_id)
-                                        .and_then(|entry| entry.meta.title);
-                                    format!(
-                                        "{text}\n\n{}",
-                                        context_echo_line(
-                                            &session.project,
-                                            &session_id,
-                                            &session.role,
-                                            title.as_deref(),
-                                        )
-                                    )
+                                    status_line
+                                        .as_ref()
+                                        .map(|line| format!("{text}\n\n{line}"))
+                                        .unwrap_or_else(|| text.clone())
                                 }
                             } else {
-                                contextual_answer(
+                                format!(
+                                    "{}{}",
+                                    contextual_answer(
                                     &session_id,
                                     &session.project,
                                     session.vendor,
                                     &session.role,
                                     &text,
+                                    ),
+                                    status_line
+                                        .as_ref()
+                                        .map(|line| format!("\n\n{line}"))
+                                        .unwrap_or_default(),
                                 )
                             };
                             // v0.10.1 — a shared IM thread needs an ADDRESSEE,
@@ -6269,6 +6733,7 @@ impl Gateway {
                                 kind: GatewayEventKind::Answer,
                                 attachments: Vec::new(),
                                 options: Vec::new(),
+                                status,
                                 sid: Some(session_id.clone()),
                                 slug: Some(session.project.clone()),
                             };
@@ -6294,6 +6759,52 @@ impl Gateway {
                                     &text,
                                 );
                             }
+                          }
+                          if let ThreadEvent::TurnCompleted { turn_id, .. } = &evt {
+                            let completed_origin = take_turn_origin(&session, Some(turn_id));
+                            let mirror_answer = mirror_last_answer.take();
+                            let finished = turn_last_answer.take();
+                            let covered = std::mem::take(&mut turn_covered);
+                            let notes = turn_notes;
+                            turn_notes = 0;
+                            if let (Some(dtx), Some((final_turn, final_text))) =
+                                (delegation_tx.as_ref(), finished.as_ref())
+                            {
+                                let _ = dtx.send(crate::delegation::DelegationSignal {
+                                    child_sid: session_id.clone(),
+                                    turn_id: final_turn.clone(),
+                                    tail: final_text.clone(),
+                                    vendor: pump_vendor,
+                                    host: pump_host.clone(),
+                                    boundary: true,
+                                    vendor_error: false,
+                                    interim_notes: notes.saturating_sub(1),
+                                    covered_turns: covered,
+                                    context_pct: turn_last_context_pct.take(),
+                                    turn: vendor_turn,
+                                    error_kind: None,
+                                });
+                            }
+                            if let Some((final_text, reply_to)) = mirror_answer {
+                                mirror_internal_web_answer(
+                                    &tx,
+                                    mirror_paths.as_ref(),
+                                    &session,
+                                    &reply_to,
+                                    completed_origin,
+                                    &session_id,
+                                    seq,
+                                    &final_text,
+                                );
+                            }
+                            structured_turn_open = false;
+                          }
+                          if matches!(&evt, ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)) {
+                            structured_turn_open = false;
+                          }
+                          if is_turn_boundary {
+                            turn_had_answer = false;
+                          }
                         } else if progress_on {
                             // ----- PROGRESS (IM, unchanged) -----
                             // The fold drives the IM status string; its dirty
@@ -6433,7 +6944,7 @@ impl Gateway {
     /// v0.8.21 Wave-2 — restore ROUTING + the sid counter (sync). The live map
     /// is left EMPTY; the sids that were live at last persist are stashed in
     /// `restore_pending` for the async
-    /// [`resume_restored_sessions_shared`](Self::resume_restored_sessions_shared)
+    /// [`reconcile_restored_sessions_shared`](Self::reconcile_restored_sessions_shared)
     /// step to cold-start rebuild from each session's `meta.json` (the SoT).
     /// No session content is read here (spawning is async; load_state is not).
     fn load_state(&mut self) -> Result<()> {
@@ -6489,19 +7000,18 @@ impl Gateway {
     /// `/use <sid>` (surfaced by `/sessions`, which reads the live map this
     /// populates) to reattach.
     ///
-    /// Best-effort and one-time: `meta.json` carries no "explicitly stopped"
-    /// marker (`/stop` never touches it), so a session the owner stopped long
-    /// ago could get resurrected here too. That's an acceptable one-off cost
-    /// (a stray `/stop` afterwards) against the alternative of silently
-    /// dropping genuinely-live conversations.
+    /// `meta.json` now carries `stopped_at`, so a session the owner explicitly
+    /// stopped is skipped here instead of being resurrected — the one-off
+    /// "stray `/stop` afterwards" cost this used to accept is gone.
     fn recover_routing_from_meta(&mut self) {
         let mut pending = Vec::new();
         for dir in self.projects.values() {
             for meta in list_session_metas(dir) {
                 self.session_catalog.insert(dir, &meta);
                 // An external node's metadata describes a process ccteam never
-                // started and whose client died with the daemon.
-                if meta.managed_by != ccteam_harness::execution::session_meta::ManagedBy::External {
+                // started and whose client died with the daemon; a stopped
+                // session is finished. Neither is ccteam's to reconcile.
+                if meta.is_resumable() {
                     pending.push(meta.sid);
                 }
             }
@@ -6897,6 +7407,7 @@ impl Gateway {
             kind: GatewayEventKind::ScheduledChanged,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(item.sid.clone()),
             slug: Some(item.project.clone()),
         });
@@ -7029,6 +7540,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: Vec::new(),
+                status: None,
                 sid: Some(entry.item.sid.clone()),
                 slug: Some(entry.item.project.clone()),
             });
@@ -7122,6 +7634,7 @@ impl Gateway {
             user: user_text.to_string(),
             assistant: String::new(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
             outcome: None,
@@ -7737,6 +8250,7 @@ impl Gateway {
                 },
                 attachments: Vec::new(),
                 options: Vec::new(),
+                status: None,
                 sid: Some(session_id.to_string()),
                 slug: Some(session.project.clone()),
             });
@@ -8008,7 +8522,7 @@ impl Gateway {
         } else {
             let mut replies = Vec::new();
             let mut events = session.adapter.events(&session.thread);
-            let wait = gateway_reply_wait_duration();
+            let wait = self.reply_wait;
             while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
                 if let Some(text) = event_text(&evt) {
                     replies.push(text);
@@ -8057,6 +8571,7 @@ impl Gateway {
                 kind: GatewayEventKind::Answer,
                 attachments: Vec::new(),
                 options: to_message_options(&prompt),
+                status: None,
                 sid: Some(session_id.to_string()),
                 slug: self.sessions.get(session_id).map(|s| s.project.clone()),
             });
@@ -8230,6 +8745,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: (!slug.is_empty()).then_some(slug),
         });
@@ -8698,7 +9214,19 @@ impl Gateway {
             .values()
             .filter(|s| s.owner == canon && s.project == project)
             .min_by_key(|s| session_index(&s.id))
-            .map(|s| s.id.clone());
+            .map(|s| s.id.clone())
+            .or_else(|| {
+                // A RELEASED session of this project is just as adoptable —
+                // it resumes by sid on the next message. Without this leg a
+                // `/cd` (or the first `/cd` after a restart) would clear the
+                // focus and silently mint a NEW session next to the one the
+                // user has been talking to.
+                self.owned_released_metas(chat)
+                    .into_iter()
+                    .filter(|(slug, _)| slug == project)
+                    .min_by_key(|(_, meta)| session_index(&meta.sid))
+                    .map(|(_, meta)| meta.sid)
+            });
         match &adopted {
             Some(id) => {
                 self.current_session
@@ -8722,6 +9250,29 @@ impl Gateway {
             .values()
             .find(|s| s.owner == canon && s.handle == handle)
             .map(|s| s.id.clone())
+            .or_else(|| {
+                // A RELEASED session answers to its handle too — `@api` must
+                // reach the same session it reached before the process was let
+                // go (the submit core cold-resumes it). Recency-first, matching
+                // the live scan's "one owner, one handle" assumption.
+                self.owned_released_metas(chat)
+                    .into_iter()
+                    .find(|(_, meta)| meta_handle(meta) == handle)
+                    .map(|(_, meta)| meta.sid)
+            })
+    }
+
+    /// The RELEASED sessions this chat OWNS, recency-first — the own-only
+    /// scope `@handle` addressing and `/cd` adoption work in (as opposed to the
+    /// wider "can see" pool the listings use). Compared on the canonical owner
+    /// IDENTITY string, the same lossless comparison
+    /// [`Self::owner_identity_visible`] documents.
+    fn owned_released_metas(&self, chat: &ChatKey) -> Vec<(String, SessionMeta)> {
+        let canon = canonical_owner(chat).identity();
+        self.released_session_metas(None)
+            .into_iter()
+            .filter(|(_slug, meta)| meta.owner == canon)
+            .collect()
     }
 
     /// `/use @<role>` shorthand (v0.8.23 review §3.2-5, item 2b): resolve
@@ -8734,10 +9285,27 @@ impl Gateway {
     /// available to this chat, so the user can immediately retry.
     fn resolve_use_role_shorthand(&self, chat: &ChatKey, role: &str) -> Result<String> {
         let mut memo = ProjectPrincipalMemo::new();
-        let mut candidates: Vec<&GatewaySession> = self
+        // Released sessions are candidates too: `/use @reviewer` must reach the
+        // reviewer session whether or not ccteam happens to be holding its
+        // process right now.
+        let released: Vec<(String, SessionMeta)> = self
+            .released_session_metas(None)
+            .into_iter()
+            .filter(|(slug, meta)| {
+                self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+            })
+            .collect();
+        let mut candidates: Vec<(String, String)> = self
             .sessions
             .values()
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && s.role == role)
+            .map(|s| (s.id.clone(), self.session_last_active(s)))
+            .chain(
+                released
+                    .iter()
+                    .filter(|(_, meta)| meta.role == role)
+                    .map(|(_, meta)| (meta.sid.clone(), meta.last_active.clone())),
+            )
             .collect();
         if candidates.is_empty() {
             let mut available: Vec<&str> = self
@@ -8745,6 +9313,12 @@ impl Gateway {
                 .values()
                 .filter(|s| self.chat_can_access_with(chat, s, &mut memo) && !s.role.is_empty())
                 .map(|s| s.role.as_str())
+                .chain(
+                    released
+                        .iter()
+                        .filter(|(_, meta)| !meta.role.is_empty())
+                        .map(|(_, meta)| meta.role.as_str()),
+                )
                 .collect();
             available.sort_unstable();
             available.dedup();
@@ -8757,12 +9331,12 @@ impl Gateway {
                 )
             });
         }
-        candidates.sort_by(|a, b| {
-            self.session_last_active(b)
-                .cmp(&self.session_last_active(a))
-                .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
+        candidates.sort_by(|(a_sid, a_active), (b_sid, b_active)| {
+            b_active
+                .cmp(a_active)
+                .then_with(|| session_index(b_sid).cmp(&session_index(a_sid)))
         });
-        Ok(candidates[0].id.clone())
+        Ok(candidates.remove(0).0)
     }
 
     fn template_by_handle(&self, chat: &ChatKey, handle: &str) -> Option<GatewayRouteTemplate> {
@@ -8780,6 +9354,50 @@ impl Gateway {
             .collect()
     }
 
+    /// Model / effort / context for one `/sessions` row.
+    ///
+    /// P3 — from the owning adapter's `thread_status` for a RESIDENT session;
+    /// from the session's persisted `status.json` for a RELEASED one (the same
+    /// file the adapter itself falls back to), so a released row is as
+    /// informative as ccteam can honestly make it. Statusless adapters (bg /
+    /// default) report `ThreadStatus::default()` (no model / no context).
+    /// Per-session failures degrade to `None` — never break the listing.
+    async fn row_thread_status(
+        &self,
+        source: &SessionRowSource<'_>,
+    ) -> Option<ccteam_harness::ThreadStatus> {
+        match source {
+            SessionRowSource::Resident(s) => (s.adapter.thread_status(&s.thread).await).ok(),
+            SessionRowSource::Released(slug, meta) => self
+                .projects
+                .get(*slug)
+                .and_then(|dir| {
+                    ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
+                })
+                .or_else(|| {
+                    // No status.json (an old session, or one that never ran a
+                    // priced turn): the spawn pick still beats saying nothing.
+                    meta.model
+                        .clone()
+                        .or_else(|| meta.observed_model.clone())
+                        .map(|model| ccteam_harness::ThreadStatus {
+                            model: Some(model),
+                            effort: meta.effort.clone(),
+                            ..Default::default()
+                        })
+                }),
+        }
+    }
+
+    /// The IM/web `/sessions` listing.
+    ///
+    /// Lists RESIDENT ∪ RELEASED sessions: a session that is not holding a
+    /// vendor process right now is not gone — its transcript is on disk and
+    /// the next message resumes exactly that sid — so hiding it (which is what
+    /// listing only the live map did once idle release started letting go of
+    /// processes) would make the fleet look like it evaporated. Released rows
+    /// render from persisted facts (`meta.json` + the session's `status.json`)
+    /// and carry a trailing 💤.
     async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
         // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
@@ -8803,7 +9421,7 @@ impl Gateway {
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
         // the IM footer can point at `/sessions all`.
         let cur = self.current_project_label(chat);
-        let (mut visible, elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
+        let (mut visible, mut elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
             (accessible, 0)
         } else {
             let elsewhere = accessible.iter().filter(|s| s.project != cur).count();
@@ -8845,15 +9463,32 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
+        // Released sessions of the same scope, ACL-filtered on the persisted
+        // owner (the stopped-session gate `chat_can_access_sid` walks), sharing
+        // this render's project-principal memo so one `state.json` read covers
+        // every row of a slug.
+        let released: Vec<(String, SessionMeta)> = self
+            .released_session_metas(None)
+            .into_iter()
+            .filter(|(slug, meta)| {
+                self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+            })
+            .collect();
+        let released_here: Vec<&(String, SessionMeta)> = if all || is_web {
+            released.iter().collect()
+        } else {
+            elsewhere += released.iter().filter(|(slug, _)| slug != &cur).count();
+            released.iter().filter(|(slug, _)| slug == &cur).collect()
+        };
         let detached_here = self
             .detached
             .values()
             .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
             .count();
-        if visible.is_empty() && is_web {
+        if is_web && visible.is_empty() && released_here.is_empty() {
             return "no sessions".to_string();
         }
-        if visible.is_empty() && detached_here == 0 {
+        if visible.is_empty() && released_here.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
                 return format!(
                     "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
@@ -8861,28 +9496,71 @@ impl Gateway {
             }
             return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
         }
-        // Render each visible session's row (async `thread_status`) once,
-        // keyed by sid for the IM tree; web keeps the flat bare-row feed.
-        let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
+        // One merged, bounded, recency-ordered candidate set. Residents keep
+        // their HITL pin (they are the only rows that can be waiting), then
+        // released rows follow — a session ccteam is holding open is the one
+        // the reader is most likely to act on.
+        let mut candidates: Vec<SessionRowSource<'_>> = visible
+            .iter()
+            .map(|s| SessionRowSource::Resident(s))
+            .chain(
+                released_here
+                    .iter()
+                    .map(|(slug, meta)| SessionRowSource::Released(slug, meta)),
+            )
+            .collect();
+        let total = candidates.len();
+        candidates.truncate(IM_SESSIONS_MAX_ROWS);
+        // ── the web bare-row feed ─────────────────────────────────────────
+        // `parse_sessions_reply` rejects the WHOLE reply if any line is not
+        // `sid:project:vendor:role[ — suffix]`, so this variant keeps exactly
+        // that shape: no banner, no tree indent, no ⏳/💤 prefix, no footer.
+        // A released session is listed here too — it is a real, resumable
+        // session, and after a restart NOTHING is resident, so a resident-only
+        // feed would tell the web picker the fleet had vanished. Its
+        // released-ness rides in the trailing suffix field, where the
+        // statusline already lives.
+        if is_web {
+            let mut web_rows: Vec<String> = Vec::with_capacity(candidates.len());
+            for source in &candidates {
+                let base = format!(
+                    "{}:{}:{}:{}",
+                    source.sid(),
+                    source.slug_of(&self.default_project),
+                    source.vendor(),
+                    source.role()
+                );
+                let mut tail: Vec<String> = Vec::new();
+                if let Some(sfx) = self
+                    .row_thread_status(source)
+                    .await
+                    .and_then(|st| st.status_suffix())
+                {
+                    tail.push(sfx);
+                }
+                if source.is_released() {
+                    tail.push("💤 released".to_string());
+                }
+                web_rows.push(if tail.is_empty() {
+                    base
+                } else {
+                    format!("{base} — {}", tail.join(" · "))
+                });
+            }
+            return web_rows.join("\n");
+        }
+        // Render each candidate's row once, keyed by sid for the tree below.
         let mut rendered: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(visible.len());
-        for s in &visible {
-            // P3 — model + ctx from the owning adapter's `thread_status`.
+            std::collections::HashMap::with_capacity(candidates.len());
+        for source in &candidates {
+            // P3 — model + ctx from the owning adapter's `thread_status` for a
+            // resident session; from the session's persisted `status.json` for
+            // a released one (the same file the adapter falls back to), so a
+            // released row is as informative as ccteam can honestly make it.
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
             // (no model / no context). Per-session failures degrade to the bare
             // row (never break the listing).
-            let status = (s.adapter.thread_status(&s.thread).await).ok();
-            // Web rows stay the machine-parsed `sid:project:vendor:role` feed +
-            // the full, shared `status_suffix()` (matches Codex /status;
-            // `parse_sessions_reply` splits on exactly 4 colon fields).
-            if is_web {
-                let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
-                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
-                    Some(sfx) => format!("{base} — {sfx}"),
-                    None => base,
-                });
-                continue;
-            }
+            let status = self.row_thread_status(source).await;
             // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
             // with `sid vendor` (the SAME opening as the switch button —
             // `session_switch_options`: `sid vendor (title)`), then — when the
@@ -8894,13 +9572,12 @@ impl Gateway {
             // spans projects without a per-row slug), NO role, NO `ctx` label
             // (all on /status); the title lives on the button; the vendor tag
             // + activity dot are gone.
-            let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
+            let vendor = source.vendor();
+            let sid = source.sid().to_string();
+            let mut row = format!("{sid} {vendor}");
             if let Some(st) = &status {
                 if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
-                    row.push_str(&format!(
-                        ".{}",
-                        strip_vendor_prefix(vendor_str(s.vendor), m)
-                    ));
+                    row.push_str(&format!(".{}", strip_vendor_prefix(vendor, m)));
                 }
                 if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
                     row.push_str(&format!(".{e}"));
@@ -8917,49 +9594,51 @@ impl Gateway {
                 }
             }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
-            if !s.host.is_empty() && s.host != "local" {
-                row.push_str(&format!(" @{}", s.host));
+            let host = source.host();
+            if !host.is_empty() && host != "local" {
+                row.push_str(&format!(" @{host}"));
+            }
+            // 💤 = released: real, resumable, just not holding a process.
+            if source.is_released() {
+                row.push_str(" 💤");
             }
             // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
             // an outstanding HITL approval. Prefixed last so it stays the
             // leftmost glance cue.
-            if waiting_sids.contains(&s.id) {
+            if waiting_sids.contains(&sid) {
                 row = format!("⏳ {row}");
             }
-            rendered.insert(s.id.clone(), row);
-        }
-        if is_web {
-            return web_rows.join("\n");
+            rendered.insert(sid, row);
         }
         // v0.9.0 W2 (F2) — IM tree: roots (a session with no VISIBLE parent —
         // a true root, or a parent in another project) sorted by sid, each
         // followed by its children indented `└─ ` (recursively). A parent-chain
         // cycle can never orphan a session: any unvisited row is appended flat.
         let visible_sids: std::collections::HashSet<&str> =
-            visible.iter().map(|s| s.id.as_str()).collect();
+            candidates.iter().map(|s| s.sid()).collect();
         let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
-        for s in &visible {
-            if let Some(p) = s.parent_sid.as_deref() {
+        for source in &candidates {
+            if let Some(p) = source.parent_sid() {
                 if visible_sids.contains(p) {
-                    children_of.entry(p).or_default().push(s.id.as_str());
+                    children_of.entry(p).or_default().push(source.sid());
                 }
             }
         }
-        // Roots + children keep the ALREADY-computed `visible` order (recency +
+        // Roots + children keep the ALREADY-computed candidate order (recency +
         // waiting-approval pin); the tree only adds indentation, never reorders
         // (so the ⏳ pin + recency sort above are preserved).
-        let roots: Vec<&str> = visible
+        let roots: Vec<&str> = candidates
             .iter()
-            .filter(|s| {
-                s.parent_sid
-                    .as_deref()
+            .filter(|source| {
+                source
+                    .parent_sid()
                     .map(|p| !visible_sids.contains(p))
                     .unwrap_or(true)
             })
-            .map(|s| s.id.as_str())
+            .map(|source| source.sid())
             .collect();
-        let mut tree_rows: Vec<String> = Vec::with_capacity(visible.len());
+        let mut tree_rows: Vec<String> = Vec::with_capacity(candidates.len());
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|r| (*r, 0usize)).collect();
         while let Some((sid, depth)) = stack.pop() {
@@ -8981,9 +9660,9 @@ impl Gateway {
             }
         }
         // Cycle-orphaned leftovers → flat, sorted by sid (never drop a row).
-        let mut leftovers: Vec<&str> = visible
+        let mut leftovers: Vec<&str> = candidates
             .iter()
-            .map(|s| s.id.as_str())
+            .map(|source| source.sid())
             .filter(|sid| !visited.contains(sid))
             .collect();
         leftovers.sort_by_key(|sid| session_index(sid));
@@ -9011,6 +9690,12 @@ impl Gateway {
         if !detached_rows.is_empty() {
             out.push('\n');
             out.push_str(&detached_rows.join("\n"));
+        }
+        if total > candidates.len() {
+            out.push_str(&format!(
+                "\n… 另有 {} 个会话(共 {total})—— /use <id> 直接进",
+                total - candidates.len()
+            ));
         }
         if elsewhere > 0 {
             out.push_str(&format!(
@@ -9155,6 +9840,82 @@ impl Gateway {
     /// authoritative "still working" straight from the vendor, so it upgrades
     /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
     /// which a fleet listing does not pay).
+    /// `/status` for a focused sid ccteam holds no process for — the RELEASED
+    /// twin of the live header, in the SAME five-line shape so the two read
+    /// identically apart from the state word. Every fact comes from what was
+    /// persisted (`meta.json` + the session's own `status.json`); nothing that
+    /// requires a running thread (running tasks, account usage, goal) is
+    /// invented. `None` when the sid is unknown, not visible to `chat`, or is
+    /// not actually released (stopped / external / detached), so the caller can
+    /// fall through to its normal paths.
+    fn render_released_status(
+        &self,
+        chat: &ChatKey,
+        sid: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> Option<String> {
+        if self.sessions.contains_key(sid) || self.detached.contains_key(sid) {
+            return None;
+        }
+        let (slug, dir, meta) = self.find_meta_for_sid(sid).ok()?;
+        if !meta.is_resumable() || !self.project_owner_visible_with(chat, &slug, &meta.owner, memo)
+        {
+            return None;
+        }
+        let status = ccteam_harness::execution::session_status::read_status_file(&dir, sid);
+        let turn_status = ccteam_harness::TurnStatus {
+            model: status
+                .as_ref()
+                .and_then(|status| status.model.clone())
+                .or_else(|| meta.observed_model.clone().or_else(|| meta.model.clone())),
+            context: status.as_ref().and_then(|status| status.context),
+            turn: meta.turn_count,
+            cost_usd: meta.cost_usd,
+            tokens_total: meta.tokens_total,
+        };
+        let mut head = format!("🧭 → {slug}/{sid}");
+        if let Some(title) = meta.title.as_deref().filter(|title| !title.is_empty()) {
+            head.push_str(&format!(
+                " 「{}」",
+                ccteam_harness::truncate_status_title(title)
+            ));
+        }
+        let second = format!(
+            "💤 released · {}",
+            ccteam_harness::render_status_metrics(&turn_status)
+        );
+        let mut identity = match turn_status
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            Some(model) => format!("{} {model}", vendor_str(meta.vendor)),
+            None => vendor_str(meta.vendor).to_string(),
+        };
+        if let Some(effort) = status
+            .as_ref()
+            .and_then(|st| st.effort.as_deref())
+            .or(meta.effort.as_deref())
+            .filter(|e| !e.is_empty())
+        {
+            identity.push_str(&format!(" · {effort}"));
+        }
+        if !meta.role.is_empty() {
+            identity.push_str(&format!(" · {}", meta.role));
+        }
+        let mut out = format!(
+            "{head}\n📍 {second}\n   {identity}\n   📁 {}",
+            dir.display()
+        );
+        let resume = if meta.vendor_uuid.is_empty() {
+            "resume —".to_string()
+        } else {
+            format!("resume {}", meta.vendor_uuid)
+        };
+        out.push_str(&format!("\n   {resume}"));
+        Some(out)
+    }
+
     async fn render_status(&self, chat: &ChatKey) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
@@ -9162,9 +9923,6 @@ impl Gateway {
             .values()
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
-        if visible.is_empty() {
-            return "no sessions — start one with /new".to_string();
-        }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
         // gone), point at /use rather than guess which session is "current".
@@ -9173,15 +9931,40 @@ impl Gateway {
             .read()
             .ok()
             .and_then(|m| m.get(chat).cloned());
-        let Some(s) = cur_sid
+        let focused_resident = cur_sid
             .as_ref()
-            .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid))
-        else {
+            .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid));
+        // A focus pointing at a RELEASED session is not a missing focus: the
+        // session is real, the next message resumes it, and the reader wants to
+        // know which one they are pointed at. Render it from persisted facts.
+        if focused_resident.is_none() {
+            if let Some(sid) = cur_sid.as_deref() {
+                if let Some(rendered) = self.render_released_status(chat, sid, &mut memo) {
+                    return rendered;
+                }
+            }
+        }
+        let Some(s) = focused_resident else {
             // No focused session — keep the user oriented by leading with the
             // current project, then point at the right next step: a fresh project
             // wants a first message; a project with sessions wants `/use`.
+            // Released sessions count: they are exactly what `/use` can reach.
+            let released_visible: Vec<(String, SessionMeta)> = self
+                .released_session_metas(None)
+                .into_iter()
+                .filter(|(slug, meta)| {
+                    self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+                })
+                .collect();
+            if visible.is_empty() && released_visible.is_empty() {
+                return "no sessions — start one with /new".to_string();
+            }
             let cur = self.current_project_label(chat);
-            let in_proj = visible.iter().filter(|s| s.project == cur).count();
+            let in_proj = visible.iter().filter(|s| s.project == cur).count()
+                + released_visible
+                    .iter()
+                    .filter(|(slug, _)| slug == &cur)
+                    .count();
             return if in_proj > 0 {
                 format!(
                     "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
@@ -9248,21 +10031,67 @@ impl Gateway {
             ),
         };
 
-        let role = if s.role.is_empty() { "—" } else { &s.role };
         // v0.8.23 review §3.2-5 (item 2c) — "你在哪": a standalone header line
         // giving the project slug + current session (sid/role/title) ahead of
         // the existing deep-view body, so the two-pointer (project × session)
         // mental model has one line that answers both at a glance. Same
-        // format as the turn-answer context echo (`context_echo_line`), so
+        // format as the turn-answer status line, so
         // the two surfaces read identically.
         let title = self.session_title(s);
-        let mut out = format!(
-            "🧭 {}\n📍 当前会话 {} · {} · {} · {role} · {state} {detail}",
-            context_echo_line(&s.project, &s.id, &s.role, title.as_deref()),
-            s.id,
-            s.project,
-            vendor_str(s.vendor)
+        let meta = self.session_catalog.get(&s.id).map(|entry| entry.meta);
+        let turn_status = ccteam_harness::TurnStatus {
+            model: status
+                .as_ref()
+                .and_then(|status| status.model.clone())
+                .or_else(|| {
+                    meta.as_ref()
+                        .and_then(|meta| meta.observed_model.clone().or_else(|| meta.model.clone()))
+                }),
+            context: status.as_ref().and_then(|status| status.context),
+            turn: meta.as_ref().map(|meta| meta.turn_count).unwrap_or(0),
+            cost_usd: meta.as_ref().and_then(|meta| meta.cost_usd),
+            tokens_total: meta.as_ref().and_then(|meta| meta.tokens_total),
+        };
+        // Line 1 = where am I (slug/sid + title), nothing else; line 2 = run
+        // state · metrics; line 3 = the harness identity — every fact once.
+        let mut head = format!("🧭 → {}/{}", s.project, s.id);
+        if let Some(title) = title.as_deref().filter(|title| !title.is_empty()) {
+            head.push_str(&format!(
+                " 「{}」",
+                ccteam_harness::truncate_status_title(title)
+            ));
+        }
+        // 📍 line = run state · metrics (ctx / turn / cost) — what the session
+        // is doing right now.
+        let second = format!(
+            "{} · {}",
+            format!("{state} {detail}").trim_end(),
+            ccteam_harness::render_status_metrics(&turn_status)
         );
+        // Identity line = harness + model + effort + role kept TOGETHER
+        // (`claude claude-fable-5[1m] · max · cto`, owner layout 2026-08-29):
+        // the reader sees "who is answering" as one phrase instead of the
+        // model on one line and the effort two lines below. An unknown effort
+        // or a roleless session simply omits its segment (never a `—`).
+        let mut identity = match turn_status
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            Some(model) => format!("{} {model}", vendor_str(s.vendor)),
+            None => vendor_str(s.vendor).to_string(),
+        };
+        if let Some(effort) = status
+            .as_ref()
+            .and_then(|st| st.effort.as_deref())
+            .filter(|e| !e.is_empty())
+        {
+            identity.push_str(&format!(" · {effort}"));
+        }
+        if !s.role.is_empty() {
+            identity.push_str(&format!(" · {}", s.role));
+        }
+        let mut out = format!("{head}\n📍 {second}\n   {identity}");
 
         // Project working-tree PATH — disambiguates an auto-appended slug
         // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
@@ -9271,33 +10100,13 @@ impl Gateway {
             out.push_str(&format!("\n   📁 {}", dir.display()));
         }
 
-        // Line 2: model · effort · ctx · resume (same fields /sessions shows, on
-        // their own line for the deep view). Statusless/failed → `—` placeholder.
-        let model = status
-            .as_ref()
-            .and_then(|st| st.model.as_deref())
-            .filter(|m| !m.is_empty())
-            .unwrap_or("—");
-        let effort = status
-            .as_ref()
-            .and_then(|st| st.effort.as_deref())
-            .filter(|e| !e.is_empty())
-            .unwrap_or("—");
-        let ctx = match status
-            .as_ref()
-            .and_then(|st| st.context.as_ref())
-            .and_then(|c| c.pct())
-        {
-            Some(pct) => format!("ctx {pct:.0}%"),
-            None => "ctx —".to_string(),
-        };
         // The REAL `--resume` id (Anthropic session uuid), shown in full so it
         // can be matched against `tmux ls` / `claude --resume`; `—` for a
         // tmux/codex session that carries no stream-json uuid (never fabricated).
         let resume = thread_vendor_uuid(&s.thread)
             .map(|u| format!("resume {u}"))
             .unwrap_or_else(|| "resume —".to_string());
-        out.push_str(&format!("\n   {model} · {effort} · {ctx} · {resume}"));
+        out.push_str(&format!("\n   {resume}"));
 
         // Running subagents / background workflows — straight from claude's task
         // lifecycle (NOT a fold). Subagents only exist while a turn is working;
@@ -9540,6 +10349,7 @@ impl Gateway {
                     },
                     current: current.contains(&s.id),
                     status: "live".to_string(),
+                    residency: RESIDENCY_RESIDENT.to_string(),
                     last_activity_seconds: None,
                     created_at,
                     last_active,
@@ -9577,6 +10387,86 @@ impl Gateway {
                 .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
         });
         views
+    }
+
+    /// **The one residency resolver.** Where a sid sits on the residency axis
+    /// right now: `resident` | `detached` | `external` | `stopped` |
+    /// `released`, or `None` for a sid ccteam has never heard of.
+    ///
+    /// Every surface that wants to say "is ccteam holding this session"
+    /// answers here, the same way every surface that wants to say "what is it
+    /// doing" answers through `ccteam_core::stall::classify_session_activity`.
+    /// Two axes, two resolvers, no third opinion.
+    pub fn session_residency(&self, sid: &str) -> Option<&'static str> {
+        if self.sessions.contains_key(sid) {
+            return Some(RESIDENCY_RESIDENT);
+        }
+        if self.detached.contains_key(sid) {
+            return Some(RESIDENCY_DETACHED);
+        }
+        let (_slug, _dir, meta) = self.find_meta_for_sid(sid).ok()?;
+        Some(residency_of_meta(&meta))
+    }
+
+    /// Every RELEASED session of the given projects — real, resumable, and
+    /// simply not holding a process right now. `slugs = None` means every
+    /// project the gateway has loaded.
+    ///
+    /// Rows are built from persisted facts only (`meta.json`), because that IS
+    /// all there is: `status`/`last_activity_seconds` are left for the caller's
+    /// activity resolver to fill from the progress projection, exactly as they
+    /// are for a resident row. `driveable` is `true` — sending one work
+    /// resumes it (`cold_resume_absent_sid`), which is the whole point of
+    /// releasing rather than stopping.
+    ///
+    /// Reads each project's `.ccteam/chat/*/meta.json` set from disk, so this
+    /// is for user-/agent-triggered listings, not for a poll loop.
+    pub fn released_session_views(
+        &self,
+        slugs: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<SessionView> {
+        let current: std::collections::HashSet<String> = self
+            .current_session
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        self.released_session_metas(slugs)
+            .iter()
+            .map(|(slug, meta)| released_session_view(meta, slug, &current))
+            .collect()
+    }
+
+    /// The `(slug, meta)` pairs behind [`Self::released_session_views`], for
+    /// callers that also need a fact the view does not carry (the IM listing
+    /// ACL-filters on `meta.owner`). Recency-ordered, catalog-warming.
+    pub(crate) fn released_session_metas(
+        &self,
+        slugs: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<(String, SessionMeta)> {
+        let mut out: Vec<(String, SessionMeta)> = Vec::new();
+        for (slug, dir) in &self.projects {
+            if slugs.is_some_and(|wanted| !wanted.contains(slug)) {
+                continue;
+            }
+            for meta in list_session_metas(dir) {
+                if !meta.is_resumable()
+                    || self.sessions.contains_key(&meta.sid)
+                    || self.detached.contains_key(&meta.sid)
+                {
+                    continue;
+                }
+                self.session_catalog.insert(dir, &meta);
+                out.push((slug.clone(), meta));
+            }
+        }
+        out.sort_by(|(_, a), (_, b)| {
+            b.last_active
+                .cmp(&a.last_active)
+                .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
+        });
+        out
     }
 
     /// Number of lazy catalog disk reads since gateway construction.
@@ -9905,6 +10795,7 @@ impl Gateway {
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
             managed_by: Default::default(),
+            stopped_at: None,
             sid: sid.clone(),
             slug: slug.to_string(),
             vendor: AgentVendor::Claude,
@@ -10009,6 +10900,7 @@ impl Gateway {
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
                 managed_by: Default::default(),
+                stopped_at: None,
                 sid: sid.clone(),
                 slug: slug.to_string(),
                 vendor: AgentVendor::Claude,
@@ -10487,7 +11379,27 @@ impl Gateway {
         Ok(CreateSessionOutcome { sid: outcome.id })
     }
 
-    // ── live-session capacity (v0.9.2) ──────────────────────────────────────
+    // ── session residency: idle release + capacity ceiling ──────────────────
+    //
+    // RESIDENCY is not the same axis as ACTIVITY. Activity says what a session
+    // is DOING (`working|idle|stale|stuck`, resolved once in
+    // `ccteam_core::stall::classify_session_activity`); residency says whether
+    // ccteam is holding a vendor process for it right now. A session can be
+    // idle and resident (a process sitting on a warm prompt cache), idle and
+    // released (nothing running; the next message resumes it by sid), or
+    // stopped (the user said so). Conflating the two is what made every
+    // history row read as "working" on the surfaces that only had `"live"`.
+    //
+    // The policy is a two-level ladder, in this order of importance:
+    //   1. IDLE RELEASE (primary) — a session nobody has spoken to for its
+    //      harness's `sessions.idle_release_secs` window is released. The
+    //      default window is the vendor's prompt-cache TTL, so a process is
+    //      held exactly as long as holding it can still save a cache re-read.
+    //   2. CAPACITY (secondary) — `sessions.max_live` still caps the burst
+    //      case, evicting the least-recently-active eligible session at
+    //      admission time.
+    // Both funnel through ONE release core, so "released" means the same thing
+    // and emits the same durable event whichever policy fired.
 
     fn sessions_config(&self) -> ccteam_core::SessionsConfig {
         if let Some(cfg) = &self.sessions_config_override {
@@ -10500,8 +11412,8 @@ impl Gateway {
             .unwrap_or_default()
     }
 
-    /// Override the daemon-wide live-session cap. Production reads the hot
-    /// config; deterministic tests use this to make eviction cheap to exercise.
+    /// Override the daemon-wide residency policy. Production reads the hot
+    /// config; deterministic tests use this to make release cheap to exercise.
     pub fn set_sessions_config(&mut self, cfg: ccteam_core::SessionsConfig) {
         self.sessions_config_override = Some(cfg);
     }
@@ -10538,10 +11450,11 @@ impl Gateway {
 
     /// Append the durable progress event and broadcast its live lifecycle twin
     /// from the same call site so state and web surfaces cannot drift.
-    fn emit_session_evicted(&self, sid: &str, slug: &str) {
+    fn emit_session_evicted(&self, sid: &str, slug: &str, reason: ReleaseReason) {
         if let Some(paths) = self.project_paths.as_ref() {
             let event = ccteam_harness::execution::progress_bridge::build_session_evicted_event(
-                sid, "capacity",
+                sid,
+                reason.as_str(),
             );
             let path = paths.progress_jsonl(slug);
             let sid = sid.to_string();
@@ -10561,18 +11474,129 @@ impl Gateway {
             content: format!("session evicted: {sid}"),
             kind: GatewayEventKind::SessionLifecycle {
                 state: "evicted".to_string(),
-                reason: "capacity".to_string(),
+                reason: reason.as_str().to_string(),
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
     }
 
-    /// Ensure one more live session can be admitted. Capacity never rejects a
-    /// creation/revival: eligible sessions are gracefully stopped LRU-first;
-    /// if every live session is protected, admission proceeds over cap.
+    /// One in-memory snapshot row per resident session — the SINGLE input both
+    /// residency policies rank over, so idle release and capacity eviction can
+    /// never disagree about what a session is doing. Everything here is a
+    /// cheap peek (no I/O, no adapter round-trip) except `last_active`, which
+    /// is the catalog's copy of `meta.json` (already in memory).
+    async fn residency_snapshot(&self) -> Vec<ResidencySnapshot> {
+        let now = Instant::now();
+        let pending = self.pending.lock().await;
+        self.sessions
+            .values()
+            .map(|session| {
+                let turn_in_flight = session
+                    .turn_started_at
+                    .lock()
+                    .map(|started| started.is_some())
+                    .unwrap_or(true);
+                // The idle clock runs from the LATER of "installed in the live
+                // map" and "last pump event": a session resumed a second ago
+                // has no events yet and must not read as ancient.
+                let last_event = session.last_event_at.lock().ok().and_then(|g| *g);
+                let floor = last_event.map_or(session.resident_since, |event| {
+                    event.max(session.resident_since)
+                });
+                ResidencySnapshot {
+                    sid: session.id.clone(),
+                    generation: session.generation,
+                    vendor: vendor_str(session.vendor).to_string(),
+                    adapter: Arc::clone(&session.adapter),
+                    thread: session.thread.clone(),
+                    turn_in_flight,
+                    waiting_approval: pending.pending_for_sid(&session.id).is_some(),
+                    last_active: self.session_last_active(session),
+                    idle_for: now.saturating_duration_since(floor),
+                }
+            })
+            .collect()
+    }
+
+    /// Fence one sid OUT of the live map without touching chat focus routes.
+    ///
+    /// Releasing a session is NOT the same as ending it: the chat that was
+    /// driving it keeps pointing at it, and the next message resumes THAT sid
+    /// (`cold_resume_absent_sid`). Dropping the route here is what used to
+    /// make a capacity eviction silently mint a brand-new session on the
+    /// chat's next plain message — the context the user was mid-way through
+    /// was still on disk, and nothing ever went back to it. Only an EXPLICIT
+    /// stop drops routes ([`Self::stop_session`]).
+    ///
+    /// Returns what the caller must close AFTER dropping the lock, or `None`
+    /// when the entry changed generation underneath us (a replacement is a
+    /// different session and gets ranked afresh).
+    fn fence_out_session(
+        &mut self,
+        sid: &str,
+        generation: u64,
+    ) -> Option<(String, Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle)> {
+        let session = self.sessions.get(sid)?.clone();
+        if session.generation != generation {
+            return None;
+        }
+        self.principals.forget(sid);
+        if let Some(pump) = self.event_pumps.remove(sid) {
+            pump.abort();
+        }
+        let removed = self.sessions.remove(sid);
+        if removed
+            .as_ref()
+            .is_none_or(|current| current.generation != generation)
+        {
+            return None;
+        }
+        Some((
+            session.project.clone(),
+            Arc::clone(&session.adapter),
+            session.thread.clone(),
+        ))
+    }
+
+    /// Release one resident session (lock-narrowed): fence it out under the
+    /// lock, close the vendor thread outside it, re-persist routing, then emit
+    /// the durable + live eviction pair. `true` when the session was actually
+    /// released. Shared by BOTH residency policies.
+    async fn release_session_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        generation: u64,
+        reason: ReleaseReason,
+    ) -> Result<bool> {
+        let fenced = {
+            let mut guard = gateway.lock().await;
+            guard.fence_out_session(sid, generation)
+        };
+        let Some((slug, adapter, thread)) = fenced else {
+            return Ok(false);
+        };
+        // Graceful vendor close is the slow half and never occupies the
+        // registry lock. The entry is already fenced out, so new work cannot
+        // race onto the retiring handle.
+        if let Err(error) = adapter.close_thread(&thread).await {
+            tracing::warn!(%sid, %error, reason = reason.as_str(), "session release close failed");
+        }
+        Self::persist_latest_routing_shared(gateway).await?;
+        gateway
+            .lock()
+            .await
+            .emit_session_evicted(sid, &slug, reason);
+        tracing::info!(sid, %slug, reason = reason.as_str(), "ccteam-im: released session");
+        Ok(true)
+    }
+
+    /// Ensure one more session can be admitted. Capacity never rejects a
+    /// creation/revival: eligible sessions are gracefully released LRU-first;
+    /// if every resident session is protected, admission proceeds over cap.
     async fn ensure_live_capacity(&mut self, exclude: &[String]) {
         let configured = self.sessions_config().max_live;
         let max_live = configured.max(1) as usize;
@@ -10584,22 +11608,9 @@ impl Gateway {
         let excluded: HashSet<String> = exclude.iter().cloned().collect();
 
         while self.sessions.len() >= max_live {
-            let candidates = {
-                let pending = self.pending.lock().await;
-                self.sessions
-                    .values()
-                    .map(|session| LiveCapacityCandidate {
-                        sid: session.id.clone(),
-                        idle: session
-                            .turn_started_at
-                            .lock()
-                            .map(|started| started.is_none())
-                            .unwrap_or(false),
-                        last_active: self.session_last_active(session),
-                        waiting_approval: pending.pending_for_sid(&session.id).is_some(),
-                    })
-                    .collect::<Vec<_>>()
-            };
+            let snapshot = self.residency_snapshot().await;
+            let candidates =
+                live_capacity_candidates(&snapshot, &outliving_task_sids(&snapshot).await);
             let Some(candidate_sid) = select_live_capacity_eviction(&candidates, &excluded) else {
                 tracing::warn!(
                     live = self.sessions.len(),
@@ -10609,31 +11620,35 @@ impl Gateway {
                 );
                 break;
             };
-            let slug = self
-                .sessions
-                .get(&candidate_sid)
-                .map(|session| session.project.clone())
-                .unwrap_or_default();
-            let stop_result = self.stop_session(&candidate_sid).await;
-            if !self.sessions.contains_key(&candidate_sid) {
-                self.emit_session_evicted(&candidate_sid, &slug);
-                tracing::info!(
-                    sid = %candidate_sid,
-                    %slug,
-                    reason = "capacity",
-                    max_live,
-                    "ccteam-im: gracefully evicted live session"
-                );
-            }
-            if let Err(err) = stop_result {
-                tracing::warn!(sid = %candidate_sid, error = %err,
-                    "ccteam-im: capacity eviction stop reported an error");
-            }
-            if self.sessions.contains_key(&candidate_sid) {
+            let Some(generation) = snapshot
+                .iter()
+                .find(|row| row.sid == candidate_sid)
+                .map(|row| row.generation)
+            else {
+                break;
+            };
+            let Some((slug, adapter, thread)) = self.fence_out_session(&candidate_sid, generation)
+            else {
                 tracing::warn!(sid = %candidate_sid,
                     "ccteam-im: capacity eviction left candidate live; admitting over cap");
                 break;
+            };
+            if let Err(error) = adapter.close_thread(&thread).await {
+                tracing::warn!(sid = %candidate_sid, %error,
+                    "ccteam-im: capacity eviction close reported an error");
             }
+            if let Err(error) = self.persist_routing() {
+                tracing::warn!(sid = %candidate_sid, %error,
+                    "ccteam-im: failed to persist routing after capacity eviction");
+            }
+            self.emit_session_evicted(&candidate_sid, &slug, ReleaseReason::Capacity);
+            tracing::info!(
+                sid = %candidate_sid,
+                %slug,
+                reason = "capacity",
+                max_live,
+                "ccteam-im: gracefully released live session"
+            );
         }
     }
 
@@ -10643,76 +11658,140 @@ impl Gateway {
     ) -> Result<()> {
         let excluded: HashSet<String> = exclude.iter().cloned().collect();
         loop {
-            let victim = {
-                let mut guard = gateway.lock().await;
+            let snapshot = {
+                let guard = gateway.lock().await;
                 let configured = guard.sessions_config().max_live;
                 let max_live = configured.max(1) as usize;
                 if guard.sessions.len() < max_live {
                     return Ok(());
                 }
-                let candidates = {
-                    let pending = guard.pending.lock().await;
-                    guard
-                        .sessions
-                        .values()
-                        .map(|session| LiveCapacityCandidate {
-                            sid: session.id.clone(),
-                            idle: session
-                                .turn_started_at
-                                .lock()
-                                .map(|started| started.is_none())
-                                .unwrap_or(false),
-                            last_active: guard.session_last_active(session),
-                            waiting_approval: pending.pending_for_sid(&session.id).is_some(),
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let Some(sid) = select_live_capacity_eviction(&candidates, &excluded) else {
-                    tracing::warn!(
-                        live = guard.sessions.len(),
-                        max_live,
-                        "ccteam-im: no eligible capacity victim; admitting over cap"
-                    );
-                    return Ok(());
-                };
-                // Re-check the selected entry under the same short lock that
-                // removes it. A replacement gets a new generation and will be
-                // selected afresh on the next loop rather than stopped stale.
-                let Some(session) = guard.sessions.get(&sid).cloned() else {
-                    continue;
-                };
-                guard.principals.forget(&sid);
-                if let Some(pump) = guard.event_pumps.remove(&sid) {
-                    pump.abort();
-                }
-                let removed = guard.sessions.remove(&sid);
-                if removed
-                    .as_ref()
-                    .is_none_or(|current| current.generation != session.generation)
-                {
-                    continue;
-                }
-                guard
-                    .current_session
-                    .write()
-                    .unwrap()
-                    .retain(|_, current| current != &sid);
-                (
-                    sid,
-                    session.project.clone(),
-                    Arc::clone(&session.adapter),
-                    session.thread.clone(),
-                )
+                guard.residency_snapshot().await
             };
-            let (sid, slug, adapter, thread) = victim;
-            // Graceful vendor close is the slow half and never occupies the
-            // registry lock. The entry is already fenced out, so new work
-            // cannot race onto the retiring handle.
-            if let Err(error) = adapter.close_thread(&thread).await {
-                tracing::warn!(%sid, %error, "capacity eviction close failed");
+            let candidates =
+                live_capacity_candidates(&snapshot, &outliving_task_sids(&snapshot).await);
+            let Some(sid) = select_live_capacity_eviction(&candidates, &excluded) else {
+                tracing::warn!(
+                    live = snapshot.len(),
+                    "ccteam-im: no eligible capacity victim; admitting over cap"
+                );
+                return Ok(());
+            };
+            let generation = snapshot
+                .iter()
+                .find(|row| row.sid == sid)
+                .map(|row| row.generation)
+                .unwrap_or_default();
+            // A replacement gets a new generation and is ranked afresh on the
+            // next loop rather than stopped stale.
+            Self::release_session_shared(gateway, &sid, generation, ReleaseReason::Capacity)
+                .await?;
+        }
+    }
+
+    // ── idle release (the primary residency policy) ─────────────────────────
+
+    /// How often the idle-release sweeper wakes. The TTL it enforces is on the
+    /// order of minutes-to-hours, so a minute of granularity costs nothing and
+    /// keeps the daemon's idle wakeups to one per minute.
+    const IDLE_RELEASE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The idle-release sweeper: releases the vendor process of every resident
+    /// session that has been idle past its harness's TTL. Runs for the
+    /// daemon's whole life, next to the body watcher. Never returns.
+    ///
+    /// This is NOT a content decision loop (`daemon 无自主内容决策循环`): it
+    /// produces no work, selects no task and sends nothing to any model — it
+    /// only lets go of an OS process whose session is untouched and resumes by
+    /// sid on the next message.
+    pub async fn run_idle_release_sweeper(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let mut ticker = tokio::time::interval(Self::IDLE_RELEASE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            Self::idle_release_tick(&gateway).await;
+        }
+    }
+
+    /// One idle-release pass. Public so a test can drive it deterministically
+    /// instead of waiting out a real interval. Returns the released sids.
+    ///
+    /// Eligibility (ALL required): no turn in flight, no outstanding HITL
+    /// approval, no turn-OUTLIVING background task (a background shell /
+    /// workflow / async agent is real work the session's process is still
+    /// carrying — the same `RunningTask::outlives_turn` authority the status
+    /// surfaces use), and an idle clock past the harness's TTL.
+    pub async fn idle_release_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) -> Vec<String> {
+        let (snapshot, config) = {
+            let guard = gateway.lock().await;
+            (guard.residency_snapshot().await, guard.sessions_config())
+        };
+        // Candidates first (cheap, in-memory), so the adapter round-trip below
+        // is paid only for sessions that are otherwise ready to be released.
+        let ripe: Vec<&ResidencySnapshot> = snapshot
+            .iter()
+            .filter(|row| {
+                !row.turn_in_flight
+                    && !row.waiting_approval
+                    && config
+                        .idle_release_for(&row.vendor)
+                        .is_some_and(|ttl| row.idle_for >= ttl)
+            })
+            .collect();
+        if ripe.is_empty() {
+            return Vec::new();
+        }
+        let mut released = Vec::new();
+        for row in ripe {
+            // Off the lock: the vendor's own answer to "is background work
+            // still running here".
+            if row
+                .adapter
+                .running_tasks(&row.thread)
+                .await
+                .iter()
+                .any(|task| task.outlives_turn())
+            {
+                continue;
             }
-            Self::persist_latest_routing_shared(gateway).await?;
-            gateway.lock().await.emit_session_evicted(&sid, &slug);
+            match Self::release_session_shared(
+                gateway,
+                &row.sid,
+                row.generation,
+                ReleaseReason::Idle,
+            )
+            .await
+            {
+                Ok(true) => released.push(row.sid.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+                }
+            }
+        }
+        released
+    }
+
+    /// Test seam: pretend `sid` has been resident and silent for `by`, so an
+    /// idle-release pass can be exercised without sleeping through a real TTL.
+    #[cfg(test)]
+    pub(crate) fn backdate_residency_for_tests(&mut self, sid: &str, by: std::time::Duration) {
+        if let Some(session) = self.sessions.get_mut(sid) {
+            session.resident_since -= by;
+            if let Ok(mut last) = session.last_event_at.lock() {
+                *last = last.map(|event| event - by);
+            }
+        }
+    }
+
+    /// Test seam: close `sid`'s in-flight turn, exactly as the pump does on a
+    /// canonical `TurnCompleted`. Test doubles that emit no turn boundary would
+    /// otherwise leave every session looking permanently mid-turn.
+    #[cfg(test)]
+    pub(crate) fn settle_turn_for_tests(&self, sid: &str) {
+        if let Some(session) = self.sessions.get(sid) {
+            if let Ok(mut started) = session.turn_started_at.lock() {
+                *started = None;
+            }
         }
     }
 
@@ -11590,13 +12669,22 @@ impl Gateway {
         }
         let notification = (mirror.notify != NotifyMode::Off).then(|| {
             crate::delegation::build_notification_text_with_outcome(
-                &signal.child_sid,
-                signal.vendor,
-                mirror.title.as_deref(),
-                &signal.turn_id,
-                &signal.tail,
-                signal.interim_notes,
-                signal.vendor_error,
+                &crate::delegation::DelegationSummary {
+                    sid: &signal.child_sid,
+                    turn_id: &signal.turn_id,
+                    outcome: if signal.vendor_error {
+                        crate::delegation::DelegationOutcome::Failed {
+                            kind: signal.error_kind.clone(),
+                            error: None,
+                        }
+                    } else {
+                        crate::delegation::DelegationOutcome::Done
+                    },
+                    context_pct: signal.context_pct,
+                    turn: signal.turn,
+                    cost_usd: None,
+                    answer: &signal.tail,
+                },
             )
         });
         Some(DelegationDeliveryPlan {
@@ -11811,6 +12899,7 @@ impl Gateway {
                         })
                         .collect();
                 if let Some(last) = missed.last() {
+                    let context_pct = crate::delegation::context_pct(last.status.as_ref());
                     pending.push(crate::delegation::DelegationSignal {
                         child_sid: child_sid.clone(),
                         turn_id: last.turn_id.clone(),
@@ -11828,6 +12917,13 @@ impl Gateway {
                             || last.error.is_some(),
                         interim_notes: missed.len().saturating_sub(1),
                         covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
+                        context_pct,
+                        turn: last
+                            .status
+                            .as_ref()
+                            .map(|status| status.turn)
+                            .unwrap_or_default(),
+                        error_kind: last.error_kind.clone(),
                     });
                 }
             }
@@ -12057,7 +13153,16 @@ impl Gateway {
         origin: TurnOrigin,
         deadline: GatewayDeadline,
     ) -> Result<Vec<String>> {
-        let (chat, session, generation, start_visible_events, project_paths, event_sink, pending) = {
+        let (
+            chat,
+            session,
+            generation,
+            start_visible_events,
+            project_paths,
+            event_sink,
+            pending,
+            reply_wait,
+        ) = {
             let guard = deadline.lock(&gateway).await?;
             let session = guard
                 .sessions
@@ -12078,6 +13183,7 @@ impl Gateway {
                 guard.project_paths.clone(),
                 guard.event_sink.clone(),
                 Arc::clone(&guard.pending),
+                guard.reply_wait,
             )
         };
         deadline.ensure_vendor_phase_can_start()?;
@@ -12142,8 +13248,9 @@ impl Gateway {
                     Ok(Vec::new())
                 } else {
                     let mut events = session.adapter.events(&session.thread);
-                    let wait = gateway_reply_wait_duration();
-                    while let Ok(Some(event)) = tokio::time::timeout(wait, events.next()).await {
+                    while let Ok(Some(event)) =
+                        tokio::time::timeout(reply_wait, events.next()).await
+                    {
                         if let Some(text) = event_text(&event) {
                             return Ok(vec![text]);
                         }
@@ -12177,6 +13284,7 @@ impl Gateway {
                         kind: GatewayEventKind::Answer,
                         attachments: Vec::new(),
                         options: to_message_options(&prompt),
+                        status: None,
                         sid: Some(sid.to_string()),
                         slug: Some(session.project),
                     });
@@ -12240,6 +13348,7 @@ impl Gateway {
             requested_routing,
             provisional_inject,
             prior_steered,
+            reply_wait: self.reply_wait,
         })
     }
 
@@ -12290,8 +13399,7 @@ impl Gateway {
             }
         } else {
             let mut events = plan.session.adapter.events(&plan.session.thread);
-            let wait = gateway_reply_wait_duration();
-            let _ = tokio::time::timeout(wait, events.next()).await;
+            let _ = tokio::time::timeout(plan.reply_wait, events.next()).await;
         }
         Ok(submitted.turn_id.0)
     }
@@ -12317,6 +13425,7 @@ impl Gateway {
             user: plan.user_text.clone(),
             assistant: String::new(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
             outcome: None,
@@ -12468,6 +13577,7 @@ impl Gateway {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: self.sessions.get(sid).map(|s| s.project.clone()),
         });
@@ -12526,21 +13636,31 @@ impl Gateway {
     /// [`switch_current_role`](Self::switch_current_role) teardown: abort
     /// the event pump, `close_thread` on the owning adapter, drop the
     /// session record, clear any `current_session` route that pointed at
-    /// it, then persist. Idempotent-ish: an unknown `sid` is an error so
-    /// the API can surface a 404, but a missing tmux pane inside
-    /// `close_thread` is tolerated (adapter close is idempotent). Never
+    /// it, record the stop in `meta.json`, then persist. A missing tmux pane
+    /// inside `close_thread` is tolerated (adapter close is idempotent). Never
     /// file-purges — deregister-only, per the locked W5b decision.
+    ///
+    /// This is the ONLY thing that ends a session. It works on a RELEASED sid
+    /// too (a session ccteam holds no process for right now): there is no
+    /// thread to close, but the user's "stop" is still a real decision and has
+    /// to stick — otherwise the very next message would resume it again. So a
+    /// released sid records `stopped_at`, drops routes and broadcasts the same
+    /// lifecycle frame the live path does. Idempotent: stopping an
+    /// already-stopped sid is `Ok`. Only a genuinely unknown sid (no live
+    /// entry, no detached body, no `meta.json`) is an error, so the API can
+    /// still 404.
     pub async fn stop_session(&mut self, sid: &str) -> Result<()> {
         // A body that outlived the previous daemon is not in the live map but
         // IS this sid's body: an explicit stop ends it (the one case the daemon
         // signals such a process — on the user's word, never on its own).
         if self.stop_detached_body(sid).await? {
+            self.mark_session_stopped(sid);
             return Ok(());
         }
-        let session = self
-            .sessions
-            .get(sid)
-            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
+        let Some(session) = self.sessions.get(sid) else {
+            return self.stop_released_session(sid);
+        };
+        let slug = session.project.clone();
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
         // The secret dies with the session — before the close, so a racing
@@ -12554,13 +13674,78 @@ impl Gateway {
         let _ = adapter.close_thread(&thread).await;
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
-        // chat doesn't keep addressing a dead session.
+        // chat doesn't keep addressing a dead session. (Only an EXPLICIT stop
+        // does this — an idle release / capacity eviction keeps the focus so
+        // the next message resumes the SAME sid.)
         self.current_session
             .write()
             .unwrap()
             .retain(|_, v| v != sid);
+        self.mark_session_stopped(sid);
+        self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         self.persist_routing()?;
         Ok(())
+    }
+
+    /// [`Self::stop_session`] for a sid ccteam holds no process for. Nothing to
+    /// close — the whole job is to make the decision durable so no resume path
+    /// brings it back.
+    fn stop_released_session(&mut self, sid: &str) -> Result<()> {
+        let (slug, _cwd, meta) = self
+            .find_meta_for_sid(sid)
+            .map_err(|_| anyhow!("unknown session: {sid}"))?;
+        if !meta.managed_by.is_driveable() {
+            return Err(anyhow!(
+                "session {sid} is a hand-started agent that enrolled with ccteam (external); \
+                 ccteam holds no thread for it and cannot stop it"
+            ));
+        }
+        let already_stopped = meta.stopped_at.is_some();
+        self.principals.forget(sid);
+        self.current_session
+            .write()
+            .unwrap()
+            .retain(|_, v| v != sid);
+        self.mark_session_stopped(sid);
+        if !already_stopped {
+            self.emit_session_lifecycle(sid, &slug, "stopped", "user");
+        }
+        self.persist_routing()?;
+        Ok(())
+    }
+
+    /// Record an explicit stop in `meta.json` (through the catalog, so the
+    /// in-memory index stays in lockstep with disk). Best-effort and
+    /// idempotent — the first stop's timestamp stands.
+    fn mark_session_stopped(&self, sid: &str) {
+        let Some(entry) = self.session_catalog.find_or_load(sid, &self.projects) else {
+            return;
+        };
+        if entry.meta.stopped_at.is_some() {
+            return;
+        }
+        let mut meta = entry.meta;
+        meta.stopped_at = Some(chrono::Utc::now().to_rfc3339());
+        if let Err(error) = self.session_catalog.write(&entry.project_dir, &meta) {
+            tracing::warn!(%sid, %error, "ccteam-im: failed to record session stop in meta.json");
+        }
+    }
+
+    /// Clear the explicit-stop marker: the user is driving this session again,
+    /// so it is no longer stopped. Called from the ONE rebuild apply point
+    /// every resume path funnels through.
+    fn clear_session_stopped(&self, sid: &str) {
+        let Some(entry) = self.session_catalog.find_or_load(sid, &self.projects) else {
+            return;
+        };
+        if entry.meta.stopped_at.is_none() {
+            return;
+        }
+        let mut meta = entry.meta;
+        meta.stopped_at = None;
+        if let Err(error) = self.session_catalog.write(&entry.project_dir, &meta) {
+            tracing::warn!(%sid, %error, "ccteam-im: failed to clear session stop in meta.json");
+        }
     }
 
     /// Interrupt a session's CURRENTLY-RUNNING turn without destroying it (the
@@ -12697,6 +13882,7 @@ impl Gateway {
             },
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: Some(sid.to_string()),
             slug: Some(slug.to_string()),
         });
@@ -12760,6 +13946,7 @@ fn detached_body_view(
             .unwrap_or_else(|| "local".to_string()),
         current: current.contains(&d.sid),
         status: "detached".to_string(),
+        residency: RESIDENCY_DETACHED.to_string(),
         last_activity_seconds: None,
         created_at: m(&|m| m.created_at.clone()),
         last_active: m(&|m| m.last_active.clone()),
@@ -12782,6 +13969,143 @@ fn is_body_detached_error(err: &anyhow::Error) -> bool {
         err.downcast_ref::<GatewayRequestError>(),
         Some(GatewayRequestError::SessionBodyDetached { .. })
     )
+}
+
+/// Cap on the rows one IM `/sessions` message prints. Now that a listing
+/// spans resident ∪ released sessions, a long-lived project's full history
+/// would otherwise arrive as a wall of text on a phone; the truncated count is
+/// reported in the footer and `/use <id>` still reaches any of them.
+const IM_SESSIONS_MAX_ROWS: usize = 15;
+
+/// One row of the IM `/sessions` listing, from whichever side of the residency
+/// axis it came. Lets the renderer treat both alike for ordering, tree
+/// building and formatting while keeping their DATA sources distinct — a
+/// resident row asks its adapter, a released row reads what was persisted.
+enum SessionRowSource<'a> {
+    Resident(&'a GatewaySession),
+    Released(&'a str, &'a SessionMeta),
+}
+
+impl SessionRowSource<'_> {
+    fn sid(&self) -> &str {
+        match self {
+            SessionRowSource::Resident(s) => &s.id,
+            SessionRowSource::Released(_, meta) => &meta.sid,
+        }
+    }
+
+    fn vendor(&self) -> &'static str {
+        match self {
+            SessionRowSource::Resident(s) => vendor_str(s.vendor),
+            SessionRowSource::Released(_, meta) => vendor_str(meta.vendor),
+        }
+    }
+
+    fn host(&self) -> &str {
+        match self {
+            SessionRowSource::Resident(s) => &s.host,
+            SessionRowSource::Released(_, meta) => &meta.host,
+        }
+    }
+
+    fn parent_sid(&self) -> Option<&str> {
+        match self {
+            SessionRowSource::Resident(s) => s.parent_sid.as_deref(),
+            SessionRowSource::Released(_, meta) => meta.parent_sid.as_deref(),
+        }
+    }
+
+    fn role(&self) -> &str {
+        match self {
+            SessionRowSource::Resident(s) => &s.role,
+            SessionRowSource::Released(_, meta) => &meta.role,
+        }
+    }
+
+    /// Project slug. `fallback` covers a resident session whose project the
+    /// caller could not name (never happens in practice — the live map carries
+    /// it — but the web row shape has four mandatory fields).
+    fn slug_of<'a>(&'a self, fallback: &'a str) -> &'a str {
+        match self {
+            SessionRowSource::Resident(s) => {
+                if s.project.is_empty() {
+                    fallback
+                } else {
+                    &s.project
+                }
+            }
+            SessionRowSource::Released(slug, _) => slug,
+        }
+    }
+
+    fn is_released(&self) -> bool {
+        matches!(self, SessionRowSource::Released(..))
+    }
+}
+
+/// A session's `@handle` from its durable record — the same rule
+/// `plan_session_rebuild` applies when it puts one back in the live map
+/// (roleless ⇒ the sid, so addressing stays unique and non-empty).
+fn meta_handle(meta: &SessionMeta) -> &str {
+    if meta.role.is_empty() {
+        &meta.sid
+    } else {
+        &meta.role
+    }
+}
+
+/// Residency as the DURABLE record alone can tell it (no live map): a
+/// hand-started node, an explicitly stopped session, or a released one.
+fn residency_of_meta(meta: &SessionMeta) -> &'static str {
+    if !meta.managed_by.is_driveable() {
+        RESIDENCY_EXTERNAL
+    } else if meta.stopped_at.is_some() {
+        RESIDENCY_STOPPED
+    } else {
+        RESIDENCY_RELEASED
+    }
+}
+
+/// The row a RELEASED session contributes to a listing — everything from
+/// `meta.json`, nothing invented. `status` starts at `"idle"` and is replaced
+/// by the caller's activity resolver (the file verdict), the same treatment a
+/// resident row's `"live"` placeholder gets.
+fn released_session_view(
+    meta: &SessionMeta,
+    slug: &str,
+    current: &std::collections::HashSet<String>,
+) -> SessionView {
+    SessionView {
+        sid: meta.sid.clone(),
+        project: slug.to_string(),
+        role: meta.role.clone(),
+        vendor: vendor_str(meta.vendor).to_string(),
+        permission_mode: meta.permission_mode.as_str().to_string(),
+        protocol: meta.protocol.as_str().to_string(),
+        host: if meta.host.is_empty() {
+            "local".to_string()
+        } else {
+            meta.host.clone()
+        },
+        current: current.contains(&meta.sid),
+        status: "idle".to_string(),
+        residency: RESIDENCY_RELEASED.to_string(),
+        last_activity_seconds: None,
+        created_at: meta.created_at.clone(),
+        last_active: meta.last_active.clone(),
+        title: meta.title.clone(),
+        turn_count: meta.turn_count,
+        cost_usd: meta.cost_usd,
+        tokens_total: meta.tokens_total,
+        model: meta.model.clone().or_else(|| meta.observed_model.clone()),
+        // ccteam relays no permission request for a thread it does not hold.
+        waiting_approval: false,
+        parent_sid: meta.parent_sid.clone(),
+        delegation_depth: meta.delegation_depth,
+        // Sending it work resumes it by sid — that IS the contract.
+        driveable: true,
+        detached: None,
+    }
 }
 
 fn external_node_view(meta: &SessionMeta) -> SessionView {
@@ -12808,6 +14132,7 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
         // routes no chat to a client it cannot submit a turn to.
         current: false,
         status: "idle".to_string(),
+        residency: RESIDENCY_EXTERNAL.to_string(),
         last_activity_seconds: silent_seconds,
         created_at: meta.created_at.clone(),
         last_active: meta.last_active.clone(),
@@ -12911,27 +14236,10 @@ fn render_rename_receipt(r: &SessionRename) -> String {
     out
 }
 
-/// v0.8.23 review §3.2-5 (item 2a) — the compact "which session just spoke"
-/// context line (`→ <slug>/<sid> (<role>)`), shared by the turn-answer echo
-/// (the detached event pump, IM only) and the `/status` "you are here"
-/// header, so the two surfaces read identically. `role` is omitted for a
-/// roleless session; `title` (when cheaply available from `meta.json`) is
-/// appended as a trailing `「tag」`.
-fn context_echo_line(slug: &str, sid: &str, role: &str, title: Option<&str>) -> String {
-    let mut line = format!("→ {slug}/{sid}");
-    if !role.is_empty() {
-        line.push_str(&format!(" ({role})"));
-    }
-    if let Some(t) = title.filter(|t| !t.is_empty()) {
-        line.push_str(&format!(" 「{t}」"));
-    }
-    line
-}
-
 /// v0.8.22 P1 — one read-modify-write refreshing meta.json's activity trio
 /// when paneless work starts or an assistant/error row lands: `last_active`
-/// (as `touch_last_active` always did), `turn_count` (the turns.jsonl line
-/// count), and `cost_usd` (this sid's priced `chat_turn_completed` events in
+/// (as `touch_last_active` always did), `turn_count` (vendor turn ordinal from
+/// user rows), and `cost_usd` (this sid's priced `chat_turn_completed` events in
 /// progress.jsonl — the same
 /// deterministic per-turn accounting `GET /api/v1/status`'s
 /// `build_session_cost_rows` uses, scoped to one sid). Best-effort, like the
@@ -12952,7 +14260,7 @@ fn refresh_session_activity_meta(
     };
     meta.last_active = chrono::Utc::now().to_rfc3339();
     meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
-        .map(|turns| turns.len() as u64)
+        .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
         .unwrap_or(meta.turn_count);
     if let Some(session) = projection.and_then(|projection| projection.session_snapshot(slug, sid))
     {
@@ -13281,6 +14589,7 @@ fn emit_turn_stall_warning(
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
         options: Vec::new(),
+        status: None,
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
     });
@@ -13478,6 +14787,7 @@ fn mirror_internal_web_answer(
         kind: GatewayEventKind::Answer,
         attachments: Vec::new(),
         options: Vec::new(),
+        status: None,
         sid: Some(session_id.to_string()),
         slug: Some(session.project.clone()),
     });
@@ -13509,6 +14819,7 @@ fn emit_progress(
         kind: GatewayEventKind::Progress { status_key, done },
         attachments: Vec::new(),
         options: Vec::new(),
+        status: None,
     })
 }
 
@@ -13540,6 +14851,7 @@ fn emit_activity(
         },
         attachments: Vec::new(),
         options: Vec::new(),
+        status: None,
         slug: Some(session.project.clone()),
     })
 }
@@ -13596,6 +14908,7 @@ fn progress_throttle() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+#[allow(dead_code)]
 fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     match evt {
         // Codex streams the agent message as `ItemUpdated` deltas *and* a
@@ -13754,6 +15067,11 @@ mod open_work_items_tests {
     }
 }
 
+/// How long a paneless turn waits for the vendor's first event before it
+/// answers without one. Read ONCE per gateway, at construction — the value
+/// then lives on [`Gateway::reply_wait`] so every turn path uses the same
+/// number and a test can set it directly rather than `set_var` it under every
+/// sibling test in this binary (CLI-ENVTEST-1).
 fn gateway_reply_wait_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS")
@@ -14328,14 +15646,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex as StdMutex, OnceLock};
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
     fn agent_msg(kind: fn(ThreadItem) -> ThreadEvent, text: &str) -> ThreadEvent {
         kind(ThreadItem {
             id: "i1".into(),
@@ -14565,7 +15875,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 2 });
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 2,
+            ..Default::default()
+        });
 
         let first = gateway
             .create_session_api(
@@ -14626,6 +15939,396 @@ mod tests {
             GatewayEventKind::SessionLifecycle { ref state, ref reason }
                 if state == "evicted" && reason == "capacity"
         ));
+    }
+
+    // ── idle release (the primary residency policy) ─────────────────────────
+
+    /// Idle release is what makes a fleet of 10–30 sessions affordable: a
+    /// session nobody has spoken to past its harness's TTL gives up its vendor
+    /// process, and — the load-bearing half — the chat that was driving it
+    /// KEEPS pointing at it, so the next plain message resumes the SAME sid
+    /// instead of silently opening a new session on a fresh context.
+    #[tokio::test]
+    async fn idle_release_frees_the_process_and_the_next_message_resumes_the_same_sid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 60,
+            ..Default::default()
+        });
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        // The fake emits no turn boundary, so close the turn by hand — exactly
+        // what the pump's `TurnCompleted` does after a real answer.
+        *gateway
+            .sessions
+            .get("s1")
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+
+        // Not yet idle: a fresh session is never released out from under its user.
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert!(gateway.lock().await.is_session_live("s1"));
+
+        // Past the TTL.
+        gateway
+            .lock()
+            .await
+            .backdate_residency_for_tests("s1", std::time::Duration::from_secs(120));
+        let mut events = gateway.lock().await.subscribe_events();
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+        {
+            let g = gateway.lock().await;
+            assert!(!g.is_session_live("s1"));
+            assert_eq!(g.session_residency("s1"), Some("released"));
+            // The FOCUS survives — only an explicit stop drops routes.
+            assert_eq!(
+                g.current_session.read().unwrap().values().next().cloned(),
+                Some("s1".to_string())
+            );
+        }
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.sid.as_deref(), Some("s1"));
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, ref reason }
+                if state == "evicted" && reason == "idle"
+        ));
+
+        // The next plain message resumes THAT sid — no new session is minted.
+        let reply = gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha--s1 echo: still here?"]);
+        let g = gateway.lock().await;
+        assert!(g.is_session_live("s1"));
+        assert_eq!(g.session_residency("s1"), Some("resident"));
+        assert_eq!(g.next_session, 1, "no new sid was minted");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2, "one cold resume");
+    }
+
+    /// Everything that means "this process is still carrying work" holds the
+    /// release off: a turn in flight, an outstanding HITL approval, and a
+    /// turn-OUTLIVING background task (the vendor's own answer, via
+    /// `RunningTask::outlives_turn` — the same authority `/status` uses).
+    /// `idle_release_secs: 0` disables the policy entirely.
+    #[tokio::test]
+    async fn idle_release_never_lets_go_of_a_session_that_is_still_working() {
+        // (a) a background task the vendor reports as outliving its turn.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let busy = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_background_task());
+        let mut gateway = Gateway::new(busy, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert!(
+            Gateway::idle_release_tick(&gateway).await.is_empty(),
+            "a running background task keeps the process"
+        );
+
+        // (b) a turn in flight.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw2 = Gateway::new(fake, "alpha", tmp2.path());
+        gw2.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        let sid2 = spawn_managed(&mut gw2).await;
+        *gw2.sessions
+            .get(&sid2)
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = Some(Instant::now());
+        gw2.backdate_residency_for_tests(&sid2, std::time::Duration::from_secs(600));
+        let gw2 = Arc::new(tokio::sync::Mutex::new(gw2));
+        assert!(
+            Gateway::idle_release_tick(&gw2).await.is_empty(),
+            "a turn in flight keeps the process"
+        );
+        // …and with the turn closed it goes.
+        *gw2.lock()
+            .await
+            .sessions
+            .get(&sid2)
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+        assert_eq!(Gateway::idle_release_tick(&gw2).await, vec![sid2.clone()]);
+
+        // (c) `0` disables the policy: an ancient session stays resident.
+        let tmp3 = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw3 = Gateway::new(fake, "alpha", tmp3.path());
+        gw3.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 0,
+            ..Default::default()
+        });
+        let sid3 = spawn_managed(&mut gw3).await;
+        gw3.backdate_residency_for_tests(&sid3, std::time::Duration::from_secs(86_400));
+        let gw3 = Arc::new(tokio::sync::Mutex::new(gw3));
+        assert!(Gateway::idle_release_tick(&gw3).await.is_empty());
+    }
+
+    /// Prompt-cache TTL is a VENDOR fact, so the per-harness override wins over
+    /// the global window.
+    #[tokio::test]
+    async fn idle_release_honours_the_per_harness_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 3600,
+            idle_release_by_vendor: std::collections::BTreeMap::from([("claude".into(), 30)]),
+            ..Default::default()
+        });
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(60));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid],
+            "60s idle beats claude's 30s override even though the global TTL is an hour"
+        );
+    }
+
+    /// Capacity eviction and idle release are the same release: neither may
+    /// drop the chat's focus. This was the bug — an eviction scrubbed
+    /// `current_session`, so the chat's next plain message opened a BRAND NEW
+    /// session while the one the user was mid-conversation with sat on disk.
+    #[tokio::test]
+    async fn capacity_eviction_keeps_the_chat_focus_so_the_next_message_resumes_the_same_sid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 1,
+            idle_release_secs: 0,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "first")
+            .await
+            .unwrap();
+        assert!(gateway.is_session_live("s1"));
+
+        // A second chat's session forces s1 out on capacity.
+        gateway
+            .handle_text("mock", "chat-2", "bob", "second")
+            .await
+            .unwrap();
+        assert!(
+            !gateway.is_session_live("s1"),
+            "s1 was evicted for capacity"
+        );
+        assert_eq!(gateway.session_residency("s1"), Some("released"));
+        assert_eq!(
+            gateway
+                .current_session
+                .read()
+                .unwrap()
+                .get(&ChatKey::new("mock", "chat-1", "alice"))
+                .cloned(),
+            Some("s1".to_string()),
+            "capacity eviction must not drop the chat's focus"
+        );
+
+        // chat-1 speaks again → the SAME sid comes back.
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "again")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha--s1 echo: again"]);
+        assert!(gateway.is_session_live("s1"));
+    }
+
+    /// `session_dispatch` funnels into the same submit core, so dispatching to
+    /// a released sid resumes it rather than failing or minting a twin.
+    #[tokio::test]
+    async fn dispatch_to_a_released_session_resumes_it_in_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+
+        let mut guard = gateway.lock().await;
+        guard
+            .submit_to_sid(&sid, "pick this back up".into())
+            .await
+            .unwrap();
+        assert_eq!(guard.session_residency(&sid), Some("resident"));
+        assert_eq!(guard.next_session, 1, "no new sid was minted");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// `/status` on a focus that points at a released session must render the
+    /// session — same five-line shape as the live header, with `💤 released` in
+    /// place of the run state — not "无当前会话".
+    #[tokio::test]
+    async fn status_renders_a_released_focus_from_persisted_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let status = gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            vec![format!(
+                "🧭 → alpha/s1\n📍 💤 released · turn 0\n   claude · reviewer\n   📁 {}\n   resume —",
+                alpha.display()
+            )]
+        );
+    }
+
+    /// An explicit stop works on a RELEASED sid — the user's decision has to
+    /// stick, or the very next message would resume the session they just
+    /// ended. Idempotent; only a sid that does not exist at all is an error.
+    #[tokio::test]
+    async fn stop_on_a_released_session_is_durable_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        *gateway
+            .sessions
+            .get("s1")
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let mut guard = gateway.lock().await;
+        let mut events = guard.subscribe_events();
+        guard.stop_session("s1").await.unwrap();
+        assert_eq!(guard.session_residency("s1"), Some("stopped"));
+        assert!(
+            read_session_meta(&alpha, "s1")
+                .unwrap()
+                .stopped_at
+                .is_some(),
+            "the stop is recorded in meta.json, not just in memory"
+        );
+        assert!(
+            guard.current_session.read().unwrap().is_empty(),
+            "an EXPLICIT stop drops the chat focus (unlike a release)"
+        );
+        assert!(guard.released_session_views(None).is_empty());
+        let event = events.recv().await.unwrap();
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, .. } if state == "stopped"
+        ));
+
+        // Idempotent; unknown sid still errors so the API can 404.
+        guard.stop_session("s1").await.unwrap();
+        assert!(guard.stop_session("s404").await.is_err());
+        // …and the IM verb reaches it too: `/stop` on a released sid used to
+        // read as "unknown session for this chat" (its gate only knew resident
+        // + detached), which failed on exactly the sessions whose process the
+        // idle sweeper had just let go.
+        assert_eq!(
+            guard
+                .handle_text("mock", "chat-1", "alice", "/stop s1")
+                .await
+                .unwrap(),
+            vec!["stopped session s1\n↓ 本项目会话 → /sessions"]
+        );
+
+        // A stopped session does not come back on its own: the next message
+        // opens a NEW sid rather than resuming the one the user ended.
+        let reply = guard
+            .handle_text("mock", "chat-1", "alice", "new topic")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha--s2 echo: new topic"]);
+        assert_eq!(guard.session_residency("s1"), Some("stopped"));
+    }
+
+    /// Resuming a stopped session clears the marker — a session being driven
+    /// again is not stopped. Written once, at the shared rebuild apply point.
+    #[tokio::test]
+    async fn resuming_a_stopped_session_clears_the_stop_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.stop_session(&sid).await.unwrap();
+        assert_eq!(gateway.session_residency(&sid), Some("stopped"));
+
+        gateway
+            .resume_stopped_session(&sid, "user:web-api", None)
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_residency(&sid), Some("resident"));
+        assert!(read_session_meta(tmp.path(), &sid)
+            .unwrap()
+            .stopped_at
+            .is_none());
     }
 
     // ── external ledger nodes (hand-started clients) ──────────────────────────
@@ -14747,7 +16450,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 8 });
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 8,
+            ..Default::default()
+        });
         for _ in 0..6 {
             spawn_managed(&mut gateway).await;
         }
@@ -14850,7 +16556,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 1 });
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 1,
+            ..Default::default()
+        });
 
         let node = gateway
             .register_external_node("alpha", "user:web-api", "codex/0.144.3")
@@ -14915,13 +16624,28 @@ mod tests {
             vec![managed.clone()],
             "only the managed session is rebuildable"
         );
-        restarted.resume_restored_sessions().await;
-        assert!(restarted.is_session_live(&managed));
+        restarted.reconcile_restored_sessions().await;
+        // Boot spawns nothing at all now, so "did it resurrect the external
+        // node" is asked of the LISTINGS: the managed session is there as a
+        // released row, the external one is not — it is neither resident nor
+        // resumable, and `released_session_views` filters on the same
+        // `is_resumable` predicate the reconcile pass does.
+        assert!(
+            restarted
+                .released_session_views(None)
+                .iter()
+                .any(|v| v.sid == managed),
+            "the managed session is released, not gone"
+        );
         assert!(
             !restarted.is_external_node(&node),
             "the external index starts empty; the client re-enrolls if it returns"
         );
         assert!(!restarted.session_views().iter().any(|v| v.sid == node));
+        assert!(!restarted
+            .released_session_views(None)
+            .iter()
+            .any(|v| v.sid == node));
         assert!(
             read_session_meta(&project_dir, &node).is_ok(),
             "the ledger row stays on disk as audit"
@@ -14992,7 +16716,7 @@ mod tests {
         let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
         restarted.enable_persistence(tmp.path()).unwrap();
         assert_eq!(restarted.restore_pending, vec![sid.clone()]);
-        restarted.resume_restored_sessions().await;
+        restarted.reconcile_restored_sessions().await;
 
         assert!(!restarted.is_session_live(&sid), "no twin is spawned");
         assert!(restarted.is_session_detached(&sid));
@@ -15095,7 +16819,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
         restarted.enable_persistence(tmp.path()).unwrap();
-        restarted.resume_restored_sessions().await;
+        restarted.reconcile_restored_sessions().await;
         assert!(restarted.is_session_detached(&sid));
         let pid = child.id();
 
@@ -15162,6 +16886,7 @@ mod tests {
                 user: "finish the task".into(),
                 assistant: String::new(),
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: Vec::new(),
                 attachments: Vec::new(),
                 outcome: None,
@@ -15180,12 +16905,15 @@ mod tests {
         let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
         restarted.set_delegation_notifier_tx(dtx);
         let mut events = restarted.subscribe_events();
-        restarted.resume_restored_sessions().await;
+        restarted.reconcile_restored_sessions().await;
         assert!(
-            restarted.is_session_live(&sid),
-            "rebuilt at once: nothing to wait for"
+            !restarted.is_session_detached(&sid),
+            "the body record was stale: nothing to wait for"
         );
-        assert!(!restarted.is_session_detached(&sid));
+        assert!(
+            !restarted.is_session_live(&sid),
+            "boot spawns nothing — recovering the unobserved turn does not need a live thread"
+        );
         assert_eq!(restarted.post_mortem_pending.len(), 1);
 
         let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
@@ -15420,6 +17148,7 @@ mod tests {
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: sid.map(str::to_string),
             slug: None,
         }
@@ -15754,10 +17483,19 @@ mod tests {
         routings: Arc<Mutex<Vec<TurnRouting>>>,
         degrade_inject_to_queue: bool,
         events: Arc<Mutex<VecDeque<(String, ThreadEvent)>>>,
-        /// Notified whenever an event is pushed so `events()` can wait rather
-        /// than terminate when the queue is momentarily empty (fixes the
+        /// Per-thread-identity wakeups. `events()` waits here rather than
+        /// terminating when the queue is momentarily empty (that fixes the
         /// multi-thread runtime race where the pump polls before `submit_turn`).
-        events_notify: Arc<tokio::sync::Notify>,
+        ///
+        /// Keyed by identity because ONE shared `Notify` hands its single
+        /// permit to an ARBITRARY waiter: a pump for a different session wakes,
+        /// finds nothing matching its own identity, consumes the permit and
+        /// goes back to sleep — stalling the pump the event was actually for.
+        /// That is the `turn_answer_*_context_echo_*` flake registered in
+        /// `.loop/verify/README.md` (a test-double race, never a gateway bug).
+        /// One wakeup per identity means a permit can only reach its target.
+        events_notify:
+            Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>>,
         event_delay: std::time::Duration,
         resume_delay: std::time::Duration,
         /// v0.8.21 Wave-2 — delay inside `start_thread` so a test can assert the
@@ -15774,6 +17512,7 @@ mod tests {
         directive_script: Arc<Mutex<VecDeque<DirectiveOutcome>>>,
         /// Status returned by `thread_status` (v0.8.5 P3).
         status: Arc<Mutex<ThreadStatus>>,
+        turn_boundary_status: Option<ThreadStatus>,
         /// v0.8.7 W2 — `SpawnCtx::permission_mode` captured per start_thread,
         /// in spawn order, so a test can assert the gateway threaded the right
         /// posture (skip vs hitl) down to the adapter.
@@ -15790,6 +17529,8 @@ mod tests {
         /// Off by default so the sync-drain tests (which only take the first
         /// text-bearing event) don't leave a stale `TurnCompleted` queued.
         emit_turn_boundary: bool,
+        /// Number of assistant messages emitted inside one vendor turn.
+        assistant_messages: usize,
         /// Emit the structured paneless turn-start boundary before reply data.
         /// Opt-in so timing-sensitive tests can pause between start/completion.
         emit_turn_started: bool,
@@ -15817,6 +17558,11 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        /// What `running_tasks` reports. A test seeds a turn-OUTLIVING task
+        /// (background shell / workflow / async agent) to prove the idle
+        /// sweeper never lets go of a session whose vendor is still carrying
+        /// work.
+        running_tasks: Arc<Mutex<Vec<RunningTask>>>,
     }
 
     impl Default for FakeAdapter {
@@ -15830,14 +17576,19 @@ mod tests {
     /// predicates are instance methods because privilege is CONFIGURATION (a
     /// named chat), not a property of the chat's shape: an unnamed chat is a
     /// guest, so a test that means "the owner's phone" must say so.
-    fn acl_gateway() -> Gateway {
+    ///
+    /// Hands back the project root alongside the gateway: it is a per-call
+    /// tempdir (a shared literal path let parallel tests stomp each other's
+    /// on-disk session state), so the caller must keep it alive.
+    fn acl_gateway() -> (Gateway, tempfile::TempDir) {
+        let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(
             Arc::new(FakeAdapter::new(AgentVendor::Claude)),
             "alpha",
-            "/tmp/alpha-acl",
+            proj.path(),
         );
         gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
-        gateway
+        (gateway, proj)
     }
 
     impl FakeAdapter {
@@ -15849,7 +17600,7 @@ mod tests {
                 routings: Arc::new(Mutex::new(Vec::new())),
                 degrade_inject_to_queue: false,
                 events: Arc::new(Mutex::new(VecDeque::new())),
-                events_notify: Arc::new(tokio::sync::Notify::new()),
+                events_notify: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 event_delay: std::time::Duration::ZERO,
                 resume_delay: std::time::Duration::ZERO,
                 start_delay: std::time::Duration::ZERO,
@@ -15858,10 +17609,12 @@ mod tests {
                 directives: Arc::new(Mutex::new(Vec::new())),
                 directive_script: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(ThreadStatus::default())),
+                turn_boundary_status: None,
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
+                assistant_messages: 1,
                 emit_turn_started: false,
                 turn_failure: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -15869,7 +17622,26 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                running_tasks: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// The wakeup channel for ONE thread identity, minted on first use.
+        /// Producer (`submit_turn` / a test's hand-pushed event) and consumer
+        /// (`events`) both route through here, so a permit can never land on a
+        /// foreign session's pump.
+        fn notify_for(&self, identity: &str) -> Arc<tokio::sync::Notify> {
+            let mut waiters = self
+                .events_notify
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(waiters.entry(identity.to_string()).or_default())
+        }
+
+        /// Wake `identity`'s pump after a test pushed onto `events` by hand
+        /// (the scripted-event path, which bypasses `submit_turn`).
+        fn wake(&self, identity: &str) {
+            self.notify_for(identity).notify_one();
         }
 
         /// Opt into emitting a `TurnCompleted` boundary after the answer
@@ -15881,6 +17653,16 @@ mod tests {
 
         fn with_turn_started(mut self) -> Self {
             self.emit_turn_started = true;
+            self
+        }
+
+        fn with_assistant_messages(mut self, count: usize) -> Self {
+            self.assistant_messages = count.max(1);
+            self
+        }
+
+        fn with_turn_boundary_status(mut self, status: ThreadStatus) -> Self {
+            self.turn_boundary_status = Some(status);
             self
         }
 
@@ -15915,6 +17697,22 @@ mod tests {
 
         fn with_start_delay(mut self, start_delay: std::time::Duration) -> Self {
             self.start_delay = start_delay;
+            self
+        }
+
+        /// Report one turn-OUTLIVING background task from `running_tasks`.
+        fn with_background_task(self) -> Self {
+            self.running_tasks
+                .try_lock()
+                .expect("uncontended at construction")
+                .push(RunningTask {
+                    task_id: "bg-1".into(),
+                    kind: "general-purpose".into(),
+                    description: "long shell".into(),
+                    task_type: "local_bash".into(),
+                    started: Instant::now(),
+                    backgrounded: true,
+                });
             self
         }
 
@@ -16023,18 +17821,22 @@ mod tests {
                     },
                 ));
             } else {
-                self.events.lock().await.push_back((
-                    h.identity.clone(),
-                    ThreadEvent::ItemCompleted {
-                        item: ThreadItem {
-                            id: "msg-1".to_string(),
-                            details: ThreadItemDetails::AgentMessage(format!(
-                                "{} echo: {text}",
-                                h.identity
-                            )),
+                for index in 0..self.assistant_messages {
+                    let content = if index.saturating_add(1) == self.assistant_messages {
+                        format!("{} echo: {text}", h.identity)
+                    } else {
+                        format!("{} checkpoint {}", h.identity, index.saturating_add(1))
+                    };
+                    self.events.lock().await.push_back((
+                        h.identity.clone(),
+                        ThreadEvent::ItemCompleted {
+                            item: ThreadItem {
+                                id: format!("msg-{}", index.saturating_add(1)),
+                                details: ThreadItemDetails::AgentMessage(content),
+                            },
                         },
-                    },
-                ));
+                    ));
+                }
                 // A real adapter also emits a turn boundary (carrying usage); the
                 // stream-json pump mirrors it to progress.jsonl for paneless
                 // sessions (v0.8.11 E4). Opt-in (`with_turn_boundary`) so the
@@ -16059,8 +17861,10 @@ mod tests {
                     ));
                 }
             }
-            // Wake any pump task that is waiting in `events()` for new work.
-            self.events_notify.notify_one();
+            // Wake THIS thread's pump if it is waiting in `events()` for new
+            // work. Per-identity so the permit cannot be stolen by another
+            // session's pump (see `events_notify`).
+            self.wake(&h.identity);
             Ok(TurnId::new(turn_id))
         }
 
@@ -16106,13 +17910,17 @@ mod tests {
 
         fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
             let events = Arc::clone(&self.events);
-            let notify = Arc::clone(&self.events_notify);
+            let notify = self.notify_for(&h.identity);
             let wanted = h.identity.clone();
             let delay = self.event_delay;
+            let status = Arc::clone(&self.status);
+            let boundary_status = self.turn_boundary_status.clone();
             Box::pin(futures::stream::unfold((), move |_| {
                 let events = Arc::clone(&events);
                 let notify = Arc::clone(&notify);
                 let wanted = wanted.clone();
+                let status = Arc::clone(&status);
+                let boundary_status = boundary_status.clone();
                 async move {
                     loop {
                         if !delay.is_zero() {
@@ -16122,6 +17930,11 @@ mod tests {
                         let idx = guard.iter().position(|(thread, _)| thread == &wanted);
                         if let Some(idx) = idx {
                             let (_, evt) = guard.remove(idx).unwrap();
+                            if matches!(&evt, ThreadEvent::TurnCompleted { .. }) {
+                                if let Some(boundary) = boundary_status {
+                                    *status.lock().await = boundary;
+                                }
+                            }
                             return Some((evt, ()));
                         }
                         drop(guard);
@@ -16149,6 +17962,10 @@ mod tests {
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
+            self.running_tasks.lock().await.clone()
         }
 
         async fn handle_directive(
@@ -16269,7 +18086,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_plain_message_submits_to_current_session_and_echoes() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let created = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -16418,12 +18236,12 @@ mod tests {
         let identity = gateway.sessions[&sid].thread.identity.clone();
         *gateway.sessions[&sid].turn_started_at.lock().unwrap() = None;
         fake.events.lock().await.push_back((
-            identity,
+            identity.clone(),
             ThreadEvent::TurnStarted {
                 turn_id: "queued-2".into(),
             },
         ));
-        fake.events_notify.notify_one();
+        fake.wake(&identity);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -16494,12 +18312,12 @@ mod tests {
 
         // …and when it really starts, the pump arms it by its own turn id.
         fake.events.lock().await.push_back((
-            identity,
+            identity.clone(),
             ThreadEvent::TurnStarted {
                 turn_id: "queued-2".into(),
             },
         ));
-        fake.events_notify.notify_one();
+        fake.wake(&identity);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let armed = gateway.sessions[&sid].watched_turn.lock().unwrap().clone();
@@ -16521,7 +18339,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_resource_api_create_view_submit_stop() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         // Create by API → s1, tracked, role/vendor/project as supplied.
         let sid = gateway
@@ -16560,11 +18379,19 @@ mod tests {
         // Submit to an unknown sid is an error (→ 404 at the API edge).
         assert!(gateway.submit_to_sid("s99", "x".into()).await.is_err());
 
-        // Stop by sid → session gone, view list empty; idempotent-not (a
-        // second stop is an error so the API can 404).
+        // Stop by sid → session gone from the live map, view list empty, and
+        // the decision is durable (`meta.stopped_at`) so no resume path brings
+        // it back. Idempotent: a second stop is `Ok` (the session IS stopped —
+        // 404 is reserved for a sid that does not exist at all).
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
-        assert!(gateway.stop_session("s1").await.is_err());
+        assert_eq!(gateway.session_residency("s1"), Some("stopped"));
+        assert!(
+            gateway.released_session_views(None).is_empty(),
+            "a stopped session is never listed as released"
+        );
+        gateway.stop_session("s1").await.unwrap();
+        assert!(gateway.stop_session("s99").await.is_err());
     }
 
     /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors
@@ -16576,7 +18403,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_session_views_reports_waiting_approval() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-waiting-approval");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -16623,7 +18451,8 @@ mod tests {
     #[tokio::test]
     async fn resume_dead_session_three_phase_round_trip() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let sid = gateway
             .create_session_api(
@@ -16733,11 +18562,23 @@ mod tests {
         assert_eq!(current.generation, newer_generation);
         assert_eq!(current.thread.identity, "newer-live-thread");
         drop(guard);
-        assert!(
-            fake.closes.load(Ordering::SeqCst) >= 1,
-            "the discarded vendor result must be closed, got {} closes",
-            fake.closes.load(Ordering::SeqCst)
-        );
+        // The close is fire-and-forget BY DESIGN: `apply_resume_dead_session`
+        // detaches it with `tokio::spawn` and returns the conflict error
+        // without awaiting it. Sampling the counter the instant that error
+        // arrives is therefore a pure scheduling race — poll it to the same
+        // expected value instead, bounded so a genuine regression still fails.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fake.closes.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the discarded vendor result must be closed, got {} closes",
+                fake.closes.load(Ordering::SeqCst)
+            )
+        });
     }
 
     /// A cold resume on one sid must not freeze a different live sid or the
@@ -17268,8 +19109,24 @@ mod tests {
     /// enqueue→resume→drain path (same end state: turn lands, sid stable).
     #[tokio::test]
     async fn gateway_resumes_dead_session_on_next_turn() {
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary()
+                .with_turn_boundary_status(ThreadStatus {
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        19,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    ..Default::default()
+                }),
+        );
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let (tx, _sink) = tokio::sync::mpsc::unbounded_channel();
+        gateway.set_event_sink(tx);
+        let mut events = gateway.subscribe_events();
 
         let sid = gateway
             .create_session_api(
@@ -17284,6 +19141,14 @@ mod tests {
 
         // First turn lands on the freshly-spawned child (one start_thread).
         gateway.submit_to_sid("s1", "first".into()).await.unwrap();
+        assert_eq!(
+            recv_answer(&mut events)
+                .await
+                .status
+                .as_ref()
+                .map(|status| status.turn),
+            Some(1)
+        );
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
 
         // The child dies out from under the handle.
@@ -17305,12 +19170,29 @@ mod tests {
             fake.live.load(Ordering::SeqCst),
             "the resume revived the child"
         );
+        assert_eq!(
+            recv_answer(&mut events)
+                .await
+                .status
+                .as_ref()
+                .map(|status| status.turn),
+            Some(2),
+            "resume turn ordinal follows durable user rows regardless of pump scheduling"
+        );
         assert_eq!(gateway.session_views().len(), 1, "still one session");
         assert_eq!(gateway.session_views()[0].sid, "s1");
 
         // Repeatable: kill it again, drive another turn — a 3rd start_thread.
         fake.live.store(false, Ordering::SeqCst);
         gateway.submit_to_sid("s1", "third".into()).await.unwrap();
+        assert_eq!(
+            recv_answer(&mut events)
+                .await
+                .status
+                .as_ref()
+                .map(|status| status.turn),
+            Some(3)
+        );
         assert_eq!(fake.starts.load(Ordering::SeqCst), 3, "resumed again");
 
         // Every turn reached the adapter against the stable identity (and a
@@ -17334,7 +19216,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_resumes_dead_session_before_directive() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let sid = gateway
             .create_session_api(
@@ -17379,7 +19262,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_interrupt_stops_turn_but_keeps_session_and_is_own_only() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         // chat-1 creates a session (its current).
         gateway
@@ -17463,7 +19347,8 @@ mod tests {
     #[tokio::test]
     async fn submit_to_sid_routes_slash_command_as_directive() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-directive");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17514,7 +19399,8 @@ mod tests {
     #[tokio::test]
     async fn submit_web_sid_handles_gateway_status_command() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-webstatus");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17555,7 +19441,8 @@ mod tests {
     #[tokio::test]
     async fn submit_web_sid_passes_turns_and_vendor_directives_through() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-webthru");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17608,7 +19495,8 @@ mod tests {
     #[tokio::test]
     async fn create_session_mints_unique_secret_and_injects_into_env() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-secret");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let s1 = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17682,7 +19570,8 @@ mod tests {
     #[tokio::test]
     async fn verify_session_principal_authenticates_by_sid_and_secret() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17718,7 +19607,8 @@ mod tests {
     #[tokio::test]
     async fn verify_session_principal_isolates_two_same_role_sessions() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-verify2");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid1 = gateway
             .create_session_api(
                 "alpha".into(),
@@ -17824,6 +19714,7 @@ mod tests {
             user: String::new(),
             assistant: who.into(),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: vec![],
             attachments: vec![],
             outcome: None,
@@ -18046,7 +19937,8 @@ mod tests {
     #[tokio::test]
     async fn web_turn_emits_no_reaction() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-web-noreact");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let mut rx = gateway.subscribe_events();
         // Wire a sink too (emit_user_signal prefers it) so we'd SEE a stray
         // reaction if one were emitted; subscribe_events tees the broadcast.
@@ -18153,8 +20045,23 @@ mod tests {
     /// chat always knows which session just spoke.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_answer_carries_context_echo_for_focused_im_session() {
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-focused");
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary()
+                .with_assistant_messages(3)
+                .with_turn_boundary_status(ThreadStatus {
+                    model: Some("claude-sonnet-4-6".into()),
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        19,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    ..Default::default()
+                }),
+        );
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
@@ -18168,29 +20075,114 @@ mod tests {
             .await
             .unwrap();
 
-        let ev = recv_answer(&mut events).await;
+        let first_turn = [
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+        ];
+        assert!(first_turn[..2].iter().all(|event| event.status.is_none()));
+        assert!(
+            first_turn[..2]
+                .iter()
+                .all(|event| !event.content.contains("\n\n→ ")),
+            "interim messages carry no status tail: {first_turn:?}"
+        );
+        let ev = &first_turn[2];
         assert!(
             ev.content.contains("echo: hello"),
             "answer still carries the real reply text: {}",
             ev.content
         );
+        // The echo is the LAST block of the answer. Split it off rather than
+        // matching the whole tail: the shared renderer also renders the session
+        // TITLE when one exists, and the first message's auto-title is written
+        // to meta.json asynchronously — so an `ends_with` on the bare
+        // "→ slug/sid (role)" form silently asserts "…and the title write has
+        // not landed yet", which is a race, not a contract.
+        let (body, echo) = ev
+            .content
+            .rsplit_once("\n\n")
+            .unwrap_or_else(|| panic!("context echo is the trailing block: {:?}", ev.content));
         assert!(
-            ev.content.ends_with("\n\n→ alpha/s1 (reviewer)"),
-            "context echo suffix present: {:?}",
-            ev.content
+            body.contains("echo: hello"),
+            "the reply text precedes the echo: {body:?}"
+        );
+        assert!(
+            echo.starts_with(
+                "→ alpha/s1 (reviewer) · claude claude-sonnet-4-6 · ctx 19% · turn 1 · $"
+            ),
+            "status line carries post-turn ctx, model, turn, and current cost: {echo:?}"
+        );
+        assert_eq!(
+            ev.status
+                .as_ref()
+                .and_then(|s| s.context.as_ref())
+                .and_then(|c| c.pct())
+                .map(|p| p.round() as u64),
+            Some(19)
+        );
+        assert_eq!(ev.status.as_ref().and_then(|s| s.tokens_total), Some(1_500));
+        assert_eq!(ev.status.as_ref().map(|status| status.turn), Some(1));
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
+        let assistant: Vec<_> = turns
+            .iter()
+            .filter(|turn| !turn.assistant.is_empty())
+            .collect();
+        assert_eq!(assistant.len(), 3);
+        assert!(assistant[..2].iter().all(|turn| turn.status.is_none()));
+        assert_eq!(
+            assistant[2].status.as_ref().map(|status| status.turn),
+            Some(1)
+        );
+        assert_ne!(assistant[2].usage, serde_json::Value::Null);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "second")
+            .await
+            .unwrap();
+        let second_turn = [
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+            recv_answer(&mut events).await,
+        ];
+        assert!(second_turn[..2].iter().all(|event| event.status.is_none()));
+        assert_eq!(
+            second_turn[2].status.as_ref().map(|status| status.turn),
+            Some(2),
+            "three assistant messages still count as one vendor turn"
+        );
+        assert_eq!(
+            second_turn
+                .iter()
+                .filter(|event| event.content.contains("\n\n→ "))
+                .count(),
+            1,
+            "one IM status tail per vendor turn"
         );
     }
 
     /// v0.8.23 review §3.2-5 (item 2a) — a roleless session's echo omits the
-    /// `(role)` parens (own `FakeAdapter`/gateway — the fake's `events()`
-    /// shares ONE `Notify` across every identity, so driving two live
-    /// sessions' pumps to completion in the SAME test can misdirect a wakeup
-    /// to the wrong session's still-parked pump; one live session per test
-    /// sidesteps that test-double-only race entirely).
+    /// `(role)` parens. One live session per test (the fake's `events()` now
+    /// wakes per identity, so this is isolation for its own sake, not a
+    /// workaround).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_answer_context_echo_omits_role_when_roleless() {
-        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-roleless");
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary()
+                .with_turn_boundary_status(ThreadStatus {
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        1,
+                        10,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    ..Default::default()
+                }),
+        );
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
@@ -18204,10 +20196,20 @@ mod tests {
             .await
             .unwrap();
         let im_ev = recv_answer(&mut im_events).await;
+        // Same title race as the focused case: the echo may carry a trailing
+        // 「title」 once the first message's async auto-title lands, so match
+        // the trailing block's head rather than the whole tail.
+        let (_, echo) = im_ev
+            .content
+            .rsplit_once("\n\n")
+            .unwrap_or_else(|| panic!("context echo is the trailing block: {:?}", im_ev.content));
         assert!(
-            im_ev.content.ends_with("\n\n→ alpha/s1"),
-            "roleless echo carries no (role) parens: {:?}",
-            im_ev.content
+            echo.starts_with("→ alpha/s1"),
+            "roleless echo names slug/sid: {echo:?}"
+        );
+        assert!(
+            !echo.contains('('),
+            "roleless echo carries no (role) parens: {echo:?}"
         );
     }
 
@@ -18221,8 +20223,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn out_of_focus_internal_answer_stays_out_of_the_im_thread() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // A FRESH fake per spawn: one shared `events_notify` could wake the
-        // wrong session's pump (test-double race, see `delegation_gateway`).
+        // A FRESH fake per spawn so each session also gets its own event queue
+        // (`FakeAdapter::events_notify` is per-identity, so wakeups no longer
+        // cross sessions — see `delegation_gateway`).
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
             Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
                 as Arc<dyn HarnessAdapter + Send + Sync>
@@ -18245,10 +20248,7 @@ mod tests {
 
         // A completion notification wakes the out-of-focus s1.
         gateway
-            .submit_to_sid(
-                "s1",
-                "[ccteam] delegated session s9 completed turn s9-1".into(),
-            )
+            .submit_to_sid("s1", "s9 done · turn 1\nanswer".into())
             .await
             .unwrap();
         let seen = recv_answer(&mut broadcast).await;
@@ -18302,7 +20302,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turn_answer_context_echo_skips_web_channel() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-echo-web");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
@@ -18368,7 +20369,7 @@ mod tests {
                 ),
             ));
             queued.push_back((
-                identity,
+                identity.clone(),
                 ThreadEvent::TurnCompleted {
                     turn_id: "background-turn".into(),
                     usage: Default::default(),
@@ -18376,7 +20377,7 @@ mod tests {
                 },
             ));
         }
-        fake.events_notify.notify_one();
+        fake.wake(&identity);
 
         let answers = recv_sink_answers(&mut events, 3).await;
         assert_eq!(answers.len(), 3, "two web answers + one final IM mirror");
@@ -18791,7 +20792,7 @@ mod tests {
             .submit_to_sid(&sid, "delegated task done".into())
             .await
             .unwrap();
-        fake.events_notify.notify_waiters();
+        fake.wake(&format!("alpha-reviewer-{sid}"));
 
         let answers = recv_sink_answers(&mut events, 1).await;
         wait_for_turn_idle(&gateway, &sid).await;
@@ -19188,14 +21189,18 @@ mod tests {
         );
     }
 
-    /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
-    /// The web API shares the same Gateway mutex, so restore work must not hold
-    /// that lock while awaiting the adapter; otherwise `POST /sessions` blocks
-    /// behind every stale restored session. v0.8.21 Wave-2 — restore now
-    /// COLD-STARTS (`start_thread`, not `resume_thread`); the `_shared` path
-    /// builds the plan under the lock, then spawns OUTSIDE it.
+    /// Resuming a released session can be slow (e.g. stream-json waits for
+    /// `system:init`). The web API shares the same Gateway mutex, so the resume
+    /// must not hold that lock while awaiting the adapter; otherwise every
+    /// other request blocks behind one cold start. The `_shared` path builds
+    /// the rebuild plan under the lock, then spawns OUTSIDE it.
+    ///
+    /// (This used to exercise the BOOT restore, which cold-started every
+    /// previously-live sid. Boot spawns nothing now — see
+    /// `reconcile_restored_sessions` — so the same lock discipline is asserted
+    /// where the cold start actually happens: the on-demand resume.)
     #[tokio::test]
-    async fn restored_session_resume_does_not_hold_gateway_lock_while_adapter_waits() {
+    async fn released_session_resume_does_not_hold_gateway_lock_while_adapter_waits() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("alpha");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -19227,9 +21232,29 @@ mod tests {
         restored.enable_persistence(tmp.path()).unwrap();
         let gateway = Arc::new(tokio::sync::Mutex::new(restored));
 
-        let resume_task = tokio::spawn(Gateway::resume_restored_sessions_shared(Arc::clone(
-            &gateway,
-        )));
+        // The boot pass itself is now pure bookkeeping: no spawn, no lock held
+        // across an adapter await.
+        Gateway::reconcile_restored_sessions_shared(Arc::clone(&gateway)).await;
+        assert_eq!(
+            slow.starts.load(Ordering::SeqCst),
+            0,
+            "boot must not cold-start anything"
+        );
+
+        let resume_task = tokio::spawn({
+            let gateway = Arc::clone(&gateway);
+            async move {
+                Gateway::resume_stopped_session_shared(
+                    gateway,
+                    "s1",
+                    "user:web-api",
+                    None,
+                    GatewayDeadline::start(),
+                )
+                .await
+                .unwrap()
+            }
+        });
         // Wait until the cold-start spawn is in flight.
         for _ in 0..50 {
             if slow.starts.load(Ordering::SeqCst) > 0 {
@@ -19245,15 +21270,15 @@ mod tests {
         {
             let guard = tokio::time::timeout(std::time::Duration::from_millis(50), gateway.lock())
                 .await
-                .expect("gateway lock must stay available while restored spawn awaits adapter");
+                .expect("gateway lock must stay available while a resume awaits the adapter");
             assert!(
                 guard.session_views().is_empty(),
                 "rebuilt session is applied only after the spawn completes"
             );
         }
 
-        resume_task.await.unwrap();
-        // After restore completes, the session is live.
+        assert_eq!(resume_task.await.unwrap(), "s1");
+        // After the resume completes, the session is resident again.
         assert_eq!(gateway.lock().await.session_views().len(), 1);
     }
 
@@ -19684,8 +21709,10 @@ mod tests {
     #[tokio::test]
     async fn session_resolve_reports_owning_project_for_scope_check() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-scope");
-        gateway.register_project("beta", "/tmp/beta-scope");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        gateway.register_project("beta", beta_dir.path());
         let sa = gateway
             .create_session_api(
                 "alpha".into(),
@@ -19774,7 +21801,8 @@ mod tests {
         // on this (and the session_spawn tool description was updated to
         // "always mints a new sid").
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let a = gateway
             .create_session_api(
                 "alpha".into(),
@@ -19815,7 +21843,8 @@ mod tests {
     #[tokio::test]
     async fn new_command_parses_hitl_token_and_threads_mode() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let created = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer hitl")
@@ -19849,7 +21878,8 @@ mod tests {
     #[tokio::test]
     async fn new_hitl_after_live_skip_spawns_second_honest_hitl_session() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         // First message auto-spawns the default cto in SKIP mode (s1).
         gateway
@@ -19892,7 +21922,8 @@ mod tests {
     #[tokio::test]
     async fn new_hitl_fresh_spawn_receipt_reports_hitl() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rm2b");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let receipt = gateway
             .handle_text("mock", "chat-1", "alice", "/new claude cto hitl")
             .await
@@ -19910,7 +21941,8 @@ mod tests {
     #[tokio::test]
     async fn new_command_defaults_to_skip() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -19926,7 +21958,8 @@ mod tests {
     #[tokio::test]
     async fn new_command_rejects_bad_permission_token() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // A bad trailing token is a command error (surfaces the typo); no
         // session is spawned.
         let res = gateway
@@ -19986,7 +22019,8 @@ mod tests {
     #[tokio::test]
     async fn session_sid_for_maps_project_role_to_sid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -20009,7 +22043,8 @@ mod tests {
     #[tokio::test]
     async fn reply_target_for_resolves_live_session_without_registry() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-fix1");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // Create + drive a session from a specific chat (sets reply_to → chat).
         gateway
             .handle_text("telegram", "chat-99", "alice", "/new claude reviewer")
@@ -20132,7 +22167,8 @@ mod tests {
     #[tokio::test]
     async fn create_session_skips_validation_without_agents_dir() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-no-agents");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -20155,7 +22191,8 @@ mod tests {
     #[tokio::test]
     async fn request_im_reload_signals_only_when_trigger_wired() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gw = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gw = Gateway::new(fake, "alpha", proj.path());
         // Standalone (no daemon): a reload request is a safe no-op, never panics.
         assert!(
             !gw.request_im_reload(),
@@ -20175,9 +22212,10 @@ mod tests {
     }
 
     /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
-    /// persist → reload → cold-start rebuild → the restored session reports
-    /// hitl. v0.8.21 Wave-2 — the posture round-trips through `meta.json`
-    /// (`permission_mode`), and the live map is rebuilt by the async restore.
+    /// persist → reload → the released row still reports hitl → the first
+    /// message RE-APPLIES it on resume. The posture round-trips through
+    /// `meta.json` (`permission_mode`), which is exactly why boot no longer
+    /// has to re-spawn anything to keep it.
     #[tokio::test]
     async fn hitl_mode_persists_across_reload() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -20199,18 +22237,28 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Fresh gateway loading the same persisted root. Wave-2: load_state
-        // restores routing (sync); the live map is cold-start rebuilt from
-        // meta.json by the async restore step (mirrors daemon startup).
+        // Fresh gateway loading the same persisted root (mirrors daemon
+        // startup): load_state restores routing, the reconcile pass spawns
+        // nothing, so the session comes back RELEASED.
         let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gw2 = Gateway::new(fake2.clone(), "alpha", project_dir);
         gw2.enable_persistence(tmp.path()).unwrap();
-        gw2.resume_restored_sessions().await;
+        gw2.reconcile_restored_sessions().await;
+        assert!(gw2.session_views().is_empty(), "boot holds no processes");
+        let released = gw2.released_session_views(None);
+        assert_eq!(released.len(), 1, "the session is listed from disk");
+        assert_eq!(
+            released[0].permission_mode, "hitl",
+            "the hitl posture must survive the persist/reload round-trip (via meta.json)"
+        );
+        // …and the resume re-applies it to the real vendor thread.
+        gw2.submit_to_sid("s1", "back".into()).await.unwrap();
         let views = gw2.session_views();
-        assert_eq!(views.len(), 1, "the session restored from disk");
+        assert_eq!(views.len(), 1, "the first message resumed the same sid");
+        assert_eq!(views[0].sid, "s1");
         assert_eq!(
             views[0].permission_mode, "hitl",
-            "the hitl posture must survive the persist/reload round-trip (via meta.json)"
+            "the resumed live session carries the persisted posture"
         );
     }
 
@@ -20275,6 +22323,7 @@ mod tests {
                 user: "review the diff".into(),
                 assistant: "LGTM, two nits inline.".into(),
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: vec![],
                 attachments: vec![],
                 outcome: None,
@@ -20842,7 +22891,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_renders_idle_working_stuck() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -20869,12 +22919,16 @@ mod tests {
         // /status = the CURRENT session deep view (📍 当前会话), NOT the fleet
         // list. The fake adapter's handle carries no `vendor_uuid` → `resume —`.
         assert!(
-            idle[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
+            idle[0].contains("📍 🟢 idle"),
             "current-session header: {idle:?}"
         );
         assert!(
-            idle[0].contains("claude-opus-4-8 · max · ctx 41% · resume —"),
-            "model·effort·ctx·resume line: {idle:?}"
+            idle[0].contains("\n   claude claude-opus-4-8 · max · reviewer\n"),
+            "identity line = harness model · effort · role, together: {idle:?}"
+        );
+        assert!(
+            idle[0].contains("\n   resume —"),
+            "resume key on its own line: {idle:?}"
         );
         // Owner req — /status ends by pointing at the full project list with a
         // live count (this gateway has one project, `alpha`), replacing the old
@@ -20897,7 +22951,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            working[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            working[0].contains("📍 🔵 working "),
             "working state: {working:?}"
         );
         assert!(
@@ -20923,10 +22977,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
             .unwrap();
-        assert!(
-            stuck[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔴 STUCK "),
-            "stuck state: {stuck:?}"
-        );
+        assert!(stuck[0].contains("📍 🔴 STUCK "), "stuck state: {stuck:?}");
         assert!(stuck[0].contains("silent"), "silent duration: {stuck:?}");
 
         // (4) A FRESHLY submitted turn whose `last_event_at` still holds the
@@ -20944,7 +22995,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            fresh[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🔵 working "),
+            fresh[0].contains("📍 🔵 working "),
             "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
         );
     }
@@ -21127,7 +23178,7 @@ mod tests {
         assert_eq!(
             out,
             vec![format!(
-                "🧭 → alpha/s1 (reviewer)\n📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle\n   📁 {}\n   — · — · ctx — · resume —\n   ↓ 所有 1 个项目 → /projects",
+                "🧭 → alpha/s1\n📍 🟢 idle · turn 0\n   claude · reviewer\n   📁 {}\n   resume —\n   ↓ 所有 1 个项目 → /projects",
                 proj.path().display()
             )]
         );
@@ -21139,7 +23190,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_roleless_and_no_context() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // Roleless: `/new claude` with no role token.
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude")
@@ -21150,23 +23202,25 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · — · 🟢 idle"),
+            out[0].contains("📍 🟢 idle"),
             "roleless → role shows —, vendor still shown: {out:?}"
         );
         assert!(
-            out[0].contains("— · — · ctx — · resume —"),
-            "statusless + no-uuid → placeholders, never fabricated: {out:?}"
+            out[0].contains("\n   claude\n") && out[0].contains("\n   resume —"),
+            "statusless roleless → bare harness line, no fabricated effort; resume placeholder: {out:?}"
         );
     }
 
     /// v0.8.23 review §3.2-5 (item 2c) — `/status` leads with a standalone
     /// "你在哪" header line (project slug + current session sid/role) ahead
-    /// of the existing `📍 当前会话` deep-view body, so the two-pointer
-    /// (project × session) mental model has one line answering both.
+    /// of the run-state line (`📍 🟢 idle`), so the two-pointer (project ×
+    /// session) mental model has one line answering both — and every fact
+    /// (identity / model / ctx) appears exactly once.
     #[tokio::test]
     async fn gateway_status_leads_with_where_am_i_header() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-status-header");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -21176,7 +23230,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out[0].starts_with("🧭 → alpha/s1 (reviewer)\n📍 当前会话"),
+            out[0].starts_with("🧭 → alpha/s1\n📍 🟢 idle · turn 0\n   claude · reviewer"),
             "leads with the you-are-here header before the existing body: {out:?}"
         );
     }
@@ -21185,7 +23239,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_empty_is_friendly() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let out = gateway
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
@@ -21302,7 +23357,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_acl_is_own_only() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // tg-1 owns s1.
         gateway
             .handle_text("telegram", "tg-1", "rob", "/new claude reviewer")
@@ -21326,10 +23382,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner.len(), 1);
-        assert!(
-            owner[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
-            "got: {owner:?}"
-        );
+        assert!(owner[0].contains("📍 🟢 idle"), "got: {owner:?}");
     }
 
     /// v0.8.19 `/status` — when the session's handle carries a stream-json
@@ -21340,7 +23393,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_status_shows_real_vendor_resume_uuid() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -21360,10 +23414,7 @@ mod tests {
             out[0].contains(&format!("resume {uuid}")),
             "the real --resume uuid must show in the deep view: {out:?}"
         );
-        assert!(
-            out[0].contains("📍 当前会话 s1 · alpha · claude · reviewer · 🟢 idle"),
-            "got: {out:?}"
-        );
+        assert!(out[0].contains("📍 🟢 idle"), "got: {out:?}");
     }
 
     /// v0.8.19 `/status` — registered in the command set + dispatches via
@@ -21375,7 +23426,8 @@ mod tests {
             "/status must be registered in GATEWAY_COMMANDS"
         );
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         let out = gateway
             .handle_text("mock", "chat-1", "alice", "/status")
             .await
@@ -21420,7 +23472,7 @@ mod tests {
     /// bot keeps the operator "own + all web" view.
     #[test]
     fn session_owner_visibility_converges_tenant_web_and_im() {
-        let gw = acl_gateway();
+        let (gw, _proj) = acl_gateway();
         // A web-created session's OWNER is the canonical user identity
         // (`user:<id>`), derived by `canonical_owner` from the web frontend chat.
         let web_a = canonical_owner(&ChatKey::new("web", "uaaa", "uaaa")).identity(); // user:uaaa
@@ -21485,7 +23537,7 @@ mod tests {
         let stranger = ChatKey::new("lark", "oc_other", "ou_stranger");
 
         // `"*"` — an explicit "anyone may talk" — names nobody.
-        let mut gw = acl_gateway();
+        let (mut gw, _proj) = acl_gateway();
         assert_eq!(
             gw.bind_operator_allowlist("lark", ["*".to_string()]),
             OperatorBindingKind::Wildcard
@@ -21505,7 +23557,7 @@ mod tests {
 
         // Naming the owner takes the bot back: Lark authorizes by SENDER
         // open_id, Telegram by chat id — either field may carry the name.
-        let mut named = acl_gateway();
+        let (mut named, _proj) = acl_gateway();
         assert_eq!(
             named.bind_operator_allowlist("lark", ["ou_owner".to_string()]),
             OperatorBindingKind::Named
@@ -21520,7 +23572,7 @@ mod tests {
         // An UNCONFIGURED platform keeps the legacy single-operator assumption
         // (a half-configured owner must not be locked out of their own bot);
         // the daemon warns about it at startup instead.
-        let plain = acl_gateway();
+        let (plain, _proj) = acl_gateway();
         assert_eq!(plain.principal(&owner), Principal::Operator);
     }
 
@@ -21593,7 +23645,7 @@ mod tests {
     /// the sender's `user_id`) was wrongly DENIED resume of its OWN session.
     #[test]
     fn owner_identity_visible_matches_live_acl_on_strings() {
-        let gw = acl_gateway();
+        let (gw, _proj) = acl_gateway();
         // meta.owner is the canonical identity STRING (user_id dropped).
         let admin_tg = ChatKey::new("telegram", "339", "rob"); // user_id ≠ chat_id
         let admin_owns = canonical_owner(&admin_tg).identity(); // "telegram:339"
@@ -21647,7 +23699,7 @@ mod tests {
     /// rule), keyed on PROJECT owners instead of session owners.
     #[test]
     fn project_acl_isolates_tenants_from_admin_and_each_other() {
-        let gw = acl_gateway();
+        let (gw, _proj) = acl_gateway();
         // Project owner tags, as `/newproject` + web `POST /projects` stamp
         // them: a tenant's project is `user:<id>`, the admin's is the shared web
         // pool `user:web-api` or its own IM `telegram:<chat_id>`, a legacy
@@ -21806,6 +23858,7 @@ mod tests {
         let meta = SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -21882,6 +23935,7 @@ mod tests {
         let meta = SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -22082,7 +24136,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_resolves_unambiguous_role() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-happy");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22109,7 +24164,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_ambiguous_picks_most_recent() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-ambiguous");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22134,7 +24190,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_unknown_role_lists_available_roles() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-unknown");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22155,7 +24212,8 @@ mod tests {
     #[tokio::test]
     async fn use_at_role_shorthand_respects_chat_acl() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-use-role-acl");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // tg-1 owns a `reviewer` session.
         gateway
             .handle_text("telegram", "tg-1", "rob", "/new claude reviewer")
@@ -22446,7 +24504,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_new_without_role_is_roleless() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         gateway
             .handle_text("tg", "c1", "u1", "/new claude")
@@ -22471,16 +24530,19 @@ mod tests {
         assert_eq!(s3.role, "reviewer", "/new claude reviewer → explicit role");
     }
 
-    #[allow(clippy::await_holding_lock)]
+    /// CLI-ENVTEST-1: the wait is set on the gateway, not in the process
+    /// environment — the old `set_var`/`remove_var` pair raced every sibling
+    /// test in this binary, and any turn that ran while it was in force
+    /// silently used a 20× wider window.
     #[tokio::test]
     async fn gateway_reply_wait_can_capture_realistic_delayed_event() {
-        let _guard = env_lock();
-        std::env::set_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS", "100");
         let fake = Arc::new(FakeAdapter::new_with_event_delay(
             AgentVendor::Claude,
             std::time::Duration::from_millis(25),
         ));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.set_reply_wait(std::time::Duration::from_millis(100));
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -22490,7 +24552,6 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "hi after delay")
             .await
             .unwrap();
-        std::env::remove_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS");
 
         assert_eq!(replies, vec!["alpha-reviewer-s1 echo: hi after delay"]);
     }
@@ -22667,7 +24728,8 @@ mod tests {
                 },
             )
         };
-        let mut gateway = Gateway::new_with_factory(factory, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new_with_factory(factory, "alpha", proj.path());
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -22754,7 +24816,8 @@ mod tests {
         ] {
             let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
             fake.directive_script.lock().await.push_back(outcome);
-            let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+            let proj = tempfile::TempDir::new().unwrap();
+            let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
             gateway
                 .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
                 .await
@@ -22776,7 +24839,8 @@ mod tests {
             .push_back(DirectiveOutcome::Done {
                 receipt: "已切换 model → opus（live）".into(),
             });
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-im");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22801,7 +24865,8 @@ mod tests {
             .push_back(DirectiveOutcome::Done {
                 receipt: "已切换 model → opus（live）".into(),
             });
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha-model-hint-web");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway
             .handle_text("web", "web-api", "web-api", "/new claude reviewer")
             .await
@@ -22839,7 +24904,8 @@ mod tests {
                 ],
                 multi: false,
             }));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22907,7 +24973,8 @@ mod tests {
                 ],
                 multi: false,
             }));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22937,7 +25004,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_multiline_slash_is_user_text() {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
@@ -22956,7 +25024,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_at_bot_switches_session_without_cross_chat_leakage() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -23029,70 +25098,51 @@ mod tests {
         let mut restored = Gateway::new(fake.clone(), "alpha", alpha);
         restored.register_project("beta", beta);
         restored.enable_persistence(tmp.path()).unwrap();
-        // Wave-2 — load_state restores routing (sync); the live map is cold-start
-        // rebuilt from each live sid's meta.json by the async restore step.
-        restored.resume_restored_sessions().await;
-
-        // v0.8.21 Wave-2 — the cto-gate secret is NOT persisted; a cold-start
-        // rebuild MINTS a fresh one (the prior child died with the prior process,
-        // so its secret is gone). The re-spawned child's env gets this new value,
-        // so pane-env + the gate map stay in lockstep at a fresh 32-char secret
-        // that differs from the pre-restart one.
-        let restored_s1 = restored.sessions.get("s1").unwrap().secret.clone();
-        let restored_s2 = restored.sessions.get("s2").unwrap().secret.clone();
-        assert_eq!(restored_s1.len(), 32);
-        assert_eq!(restored_s2.len(), 32);
-        assert_ne!(
-            restored_s1, original_secret_s1,
-            "secret is re-minted on cold-start rebuild, not persisted"
+        // `load_state` restores routing (sync); the boot pass only RECONCILES —
+        // it spawns nothing, because spawning never touches the model and so
+        // buys no warm cache, only N resident vendor processes.
+        restored.reconcile_restored_sessions().await;
+        assert!(
+            !restored.is_session_live("s1") && !restored.is_session_live("s2"),
+            "a restart must not re-spawn a vendor process for every sid"
         );
-        assert_ne!(
-            restored_s2, original_secret_s2,
-            "secret is re-minted on cold-start rebuild, not persisted"
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "boot spawns nothing: only the 2 original creates"
         );
 
-        // v0.9.0 W5 (real-machine smoke fix) — the curated Claude stream-json
-        // mcp.json MUST be re-written on cold-start rebuild with the FRESH
-        // secret, else the resumed session keeps a stale bearer and loses every
-        // ccteam MCP tool (can no longer delegate). Assert each session's
-        // mcp.json now carries the RESTORED secret and NOT the original one.
-        for (sid, restored_secret, original_secret) in [
-            ("s1", &restored_s1, &original_secret_s1),
-            ("s2", &restored_s2, &original_secret_s2),
-        ] {
-            let mcp = tmp
-                .path()
-                .join("beta")
-                .join(".ccteam")
-                .join("chat")
-                .join(sid)
-                .join("mcp.json");
-            let body = std::fs::read_to_string(&mcp)
-                .unwrap_or_else(|e| panic!("read {} after rebuild: {e}", mcp.display()));
-            assert!(
-                body.contains(restored_secret.as_str()),
-                "{sid} mcp.json must be rewritten with the fresh secret after resume"
-            );
-            assert!(
-                !body.contains(original_secret.as_str()),
-                "{sid} mcp.json must NOT keep the stale pre-restart secret"
-            );
-        }
+        // The chat's FOCUS survives, pointing at a RELEASED session — that is
+        // what makes the next plain message land on the SAME sid instead of
+        // minting a new one.
+        assert_eq!(
+            restored
+                .current_session
+                .read()
+                .unwrap()
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("s2")
+        );
 
         // v0.8.22 P0-3 — ordered by last_active desc: s2 (spawned after s1,
-        // pre-restart) sorts first.
+        // pre-restart) sorts first. Both are listed, marked 💤 released.
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 当前项目: beta\ns2 claude 💤\ns1 claude 💤"]
+        );
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["resumed session s1\n↓ 查看状态 → /status"]
         );
         let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
@@ -23105,24 +25155,69 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s2")
                 .await
                 .unwrap(),
-            vec!["using session s2\n↓ 查看状态 → /status"]
+            vec!["resumed session s2\n↓ 查看状态 → /status"]
         );
         let reply_s2 = restored
             .handle_text("mock", "chat-1", "alice", "after restart two")
             .await
             .unwrap();
         assert_eq!(reply_s2, vec!["beta-reviewer-s2 echo: after restart two"]);
-        // 2 original creates + 2 cold-start rebuilds on restart (Wave-2 re-spawns
-        // each live session; both were live, so both restart via start_thread).
-        // /use s1 + /use s2 then hit the already-rebuilt sessions (no new spawn).
+        // 2 original creates + 2 on-demand resumes (one per `/use`) — the
+        // vendor process is paid for when someone actually drives the session.
         assert_eq!(fake.starts.load(Ordering::SeqCst), 4);
+
+        // v0.8.21 Wave-2 — the cto-gate secret is NOT persisted; a cold resume
+        // MINTS a fresh one (the prior child died with the prior process, so
+        // its secret is gone). The re-spawned child's env gets this new value,
+        // so pane-env + the gate map stay in lockstep at a fresh 32-char secret
+        // that differs from the pre-restart one.
+        let restored_s1 = restored.sessions.get("s1").unwrap().secret.clone();
+        let restored_s2 = restored.sessions.get("s2").unwrap().secret.clone();
+        assert_eq!(restored_s1.len(), 32);
+        assert_eq!(restored_s2.len(), 32);
+        assert_ne!(
+            restored_s1, original_secret_s1,
+            "secret is re-minted on cold resume, not persisted"
+        );
+        assert_ne!(
+            restored_s2, original_secret_s2,
+            "secret is re-minted on cold resume, not persisted"
+        );
+
+        // v0.9.0 W5 (real-machine smoke fix) — the curated Claude stream-json
+        // mcp.json MUST be re-written on cold resume with the FRESH secret,
+        // else the resumed session keeps a stale bearer and loses every ccteam
+        // MCP tool (can no longer delegate). Assert each session's mcp.json now
+        // carries the RESUMED secret and NOT the original one.
+        for (sid, restored_secret, original_secret) in [
+            ("s1", &restored_s1, &original_secret_s1),
+            ("s2", &restored_s2, &original_secret_s2),
+        ] {
+            let mcp = tmp
+                .path()
+                .join("beta")
+                .join(".ccteam")
+                .join("chat")
+                .join(sid)
+                .join("mcp.json");
+            let body = std::fs::read_to_string(&mcp)
+                .unwrap_or_else(|e| panic!("read {} after resume: {e}", mcp.display()));
+            assert!(
+                body.contains(restored_secret.as_str()),
+                "{sid} mcp.json must be rewritten with the fresh secret after resume"
+            );
+            assert!(
+                !body.contains(original_secret.as_str()),
+                "{sid} mcp.json must NOT keep the stale pre-restart secret"
+            );
+        }
     }
 
     /// Guards the fix for the incident where a breaking routing-schema jump
     /// (or any other loss of `routing.json`) made a live chat session read as
     /// "vanished": with no routing.json to load, `load_state` must fall back
-    /// to each project's `meta.json` to rebuild the live-set, so the session
-    /// is findable again via `/sessions` + `/use` instead of gone for good.
+    /// to each project's `meta.json`, so the session is findable again via
+    /// `/sessions` + `/use` instead of gone for good.
     #[tokio::test]
     async fn gateway_recovers_live_sessions_from_meta_when_routing_json_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -23147,23 +25242,24 @@ mod tests {
 
         let mut restored = Gateway::new(fake.clone(), "beta", beta);
         restored.enable_persistence(tmp.path()).unwrap();
-        restored.resume_restored_sessions().await;
+        restored.reconcile_restored_sessions().await;
 
-        // s1 is live again and listed — not silently gone — even though
-        // routing.json never said so. The chat's FOCUS wasn't (and can't
-        // losslessly be) restored, so `/use` is still needed once.
+        // s1 is listed — not silently gone — even though routing.json never
+        // said so. It is RELEASED (a restart holds no process for it), and the
+        // chat's FOCUS wasn't (and can't losslessly be) restored, so `/use` is
+        // still needed once; that resumes the SAME sid.
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude"]);
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude 💤"]);
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["resumed session s1\n↓ 查看状态 → /status"]
         );
         let reply = restored
             .handle_text("mock", "chat-1", "alice", "after routing.json loss")
@@ -23178,11 +25274,12 @@ mod tests {
     /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
     /// daemon restart, even after a session is stopped. Concretely: spawn two
     /// SAME-role sessions (s1 + s2), stop s1, then rebuild the Gateway from the
-    /// persisted state. The reload must (1) restore s2 (proving the load_state
-    /// seen-panes collapse is gone — both same-role records survive) and (2)
-    /// resume the monotonic counter so the NEXT create is s3, never recycling
-    /// the freed s1. (next_session is persisted, so non-reuse holds by
-    /// construction.)
+    /// persisted state. The reload must (1) bring s2 back as RELEASED and
+    /// resumable while s1 stays STOPPED (proving the load_state seen-panes
+    /// collapse is gone — both same-role records survive independently) and
+    /// (2) resume the monotonic counter so the NEXT create is s3, never
+    /// recycling the freed s1. (next_session is persisted, so non-reuse holds
+    /// by construction.)
     #[tokio::test]
     async fn sid_stable_and_not_reused_across_restart() {
         let tmp = tempfile::tempdir().unwrap();
@@ -23224,16 +25321,24 @@ mod tests {
         // Rebuild from the same on-disk state (routing.json + next-sid + meta).
         let mut restored = Gateway::new(fake.clone(), "alpha", project_dir);
         restored.enable_persistence(tmp.path()).unwrap();
-        // Wave-2 — cold-start rebuild the live set (only s2; s1 was stopped, so
-        // it left live_sids and is not rebuilt — its meta.json lingers as history).
-        restored.resume_restored_sessions().await;
-        assert!(
-            restored.session_resolve("s2").is_some(),
-            "the surviving same-role session must restore after restart"
+        restored.reconcile_restored_sessions().await;
+        assert_eq!(
+            restored.session_residency("s2"),
+            Some("released"),
+            "the surviving same-role session comes back resumable after restart"
+        );
+        assert_eq!(
+            restored.session_residency("s1"),
+            Some("stopped"),
+            "the stopped session must not resurrect (history only)"
         );
         assert!(
-            restored.session_resolve("s1").is_none(),
-            "the stopped session must not resurrect (left live_sids; history only)"
+            restored
+                .released_session_views(None)
+                .iter()
+                .map(|v| v.sid.clone())
+                .eq(["s2".to_string()]),
+            "only s2 is listed as released"
         );
         // The NEXT create resumes the counter → s3, NEVER recycling s1.
         let s3 = restored
@@ -23287,7 +25392,7 @@ mod tests {
         let mut restored = Gateway::new(fake.clone(), "alpha", project_dir);
         restored.enable_persistence(tmp.path()).unwrap();
         // Nothing to rebuild (routing + meta gone) — but the counter survives.
-        restored.resume_restored_sessions().await;
+        restored.reconcile_restored_sessions().await;
         let next = restored
             .create_session_api(
                 "alpha".into(),
@@ -23437,7 +25542,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_registered_bot_template_spawns_on_demand() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "default", proj.path());
         gateway.register_bot_template(
             &BotRegistration {
                 workflow_slug: "alpha".to_string(),
@@ -23450,7 +25556,7 @@ mod tests {
                 project_dir: None,
                 created_at: chrono::Utc::now(),
             },
-            "/tmp/alpha",
+            proj.path().join("alpha"),
         );
 
         let reply = gateway
@@ -23465,7 +25571,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_registered_bot_templates_keep_ambiguous_dm_out_of_sessions() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "default", proj.path());
         for role in ["lead", "reviewer"] {
             gateway.register_bot_template(
                 &BotRegistration {
@@ -23479,7 +25586,7 @@ mod tests {
                     project_dir: None,
                     created_at: chrono::Utc::now(),
                 },
-                format!("/tmp/alpha-{role}"),
+                proj.path().join(format!("alpha-{role}")),
             );
         }
 
@@ -23531,7 +25638,8 @@ mod tests {
         .unwrap();
 
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
         gateway.enable_project_creation(paths);
@@ -23584,7 +25692,8 @@ mod tests {
         .unwrap();
 
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.enable_project_creation(paths);
 
         // Before the fix this returned Err "unknown project: dev-delta".
@@ -23661,10 +25770,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_cd_adopts_existing_session_in_target_project() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
-        gateway.register_project("beta", "/tmp/beta");
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        gateway.register_project("beta", beta_dir.path());
 
         // s1 in alpha; then /cd beta + /new makes s2 in beta.
         gateway
@@ -23700,10 +25811,12 @@ mod tests {
     #[tokio::test]
     async fn gateway_cd_overrides_single_template_project() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "default", "/tmp/default");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "default", proj.path());
         // The owner's own chat(s): named in the bot allowlist ⇒ operator.
         gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
-        gateway.register_project("beta", "/tmp/beta");
+        let beta_dir = tempfile::TempDir::new().unwrap();
+        gateway.register_project("beta", beta_dir.path());
         gateway.register_bot_template(
             &BotRegistration {
                 workflow_slug: "alpha".to_string(),
@@ -23716,7 +25829,7 @@ mod tests {
                 project_dir: None,
                 created_at: chrono::Utc::now(),
             },
-            "/tmp/alpha",
+            proj.path().join("alpha"),
         );
 
         // /cd to a different project than the bot's: the explicit target wins,
@@ -23741,7 +25854,8 @@ mod tests {
         use std::path::PathBuf;
 
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha");
+        let proj2 = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj2.path());
 
         // v0.8.8 F1 — the tracked pane is keyed by sid: s1 = alpha/lead →
         // ccteam-chat-alpha-s1 (NOT ...-lead). The first /new mints s1.
@@ -23796,7 +25910,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_newproject_validates_args_and_requires_path_context() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         // Missing path → usage error (parsed before any path-context check).
         let usage = gateway
             .handle_text("mock", "chat-1", "alice", "/newproject demo")
@@ -24118,7 +26233,8 @@ mod tests {
     #[tokio::test]
     async fn gateway_rename_with_no_active_session_errors() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", "/tmp/alpha-rename-noop");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
 
         let err = gateway
             .handle_text("mock", "chat-1", "alice", "/rename hello")
@@ -24433,7 +26549,8 @@ mod tests {
     #[tokio::test]
     async fn d6_external_origin_inbound_click_resolves_oneshot() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
 
         // The shared registry the daemon hands to BOTH the gateway and the
         // mcp.sock handler. Here the test plays the handler: register the
@@ -24496,7 +26613,8 @@ mod tests {
     #[tokio::test]
     async fn d6_external_stale_token_click_is_benign() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24551,7 +26669,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_approve_delivers_allow_over_oneshot() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24586,7 +26705,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_deny_delivers_deny_over_oneshot() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24612,7 +26732,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_delivers_pi_free_text_without_fabricating_an_option() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24646,7 +26767,8 @@ mod tests {
     #[tokio::test]
     async fn web_resolve_unknown_token_and_bad_option_are_errors() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24708,7 +26830,8 @@ mod tests {
     #[tokio::test]
     async fn expired_pending_is_drained_before_resolve() {
         let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake, "alpha", "/tmp/alpha");
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
         let shared = Arc::new(Mutex::new(crate::pending::PendingInteractions::new()));
         gateway.set_pending(shared.clone());
 
@@ -24779,9 +26902,9 @@ mod tests {
     }
 
     async fn delegation_gateway(project_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<Gateway>> {
-        // A FRESH fake per spawn so each session's pump has its OWN
-        // `events_notify` — a single shared fake's `notify_one` could wake the
-        // wrong pump when two sessions (parent + child) run concurrently.
+        // A FRESH fake per spawn so each session's pump has its OWN event
+        // queue when two sessions (parent + child) run concurrently. Wakeups
+        // are already per-identity (`FakeAdapter::events_notify`).
         let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
             // `with_turn_boundary` mirrors every current adapter (all emit
             // `TurnCompleted`) — required since v0.9.5: the delegation
@@ -24793,7 +26916,7 @@ mod tests {
     }
 
     /// e2e: an Ambient spawn records the parent lineage + trigger + title; a
-    /// notifying dispatch wakes the parent with a `[ccteam]` turn; the child's
+    /// notifying dispatch wakes the parent with a minimal completion turn; the child's
     /// turn is durably on disk by the time the notification lands (ordering).
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn delegation_e2e_spawn_dispatch_notifies_parent_and_ordering() {
@@ -24866,19 +26989,16 @@ mod tests {
         let mut notified = false;
         for _ in 0..200 {
             let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
-            if turns.iter().any(|t| {
-                t.user.contains("[ccteam] delegated session")
-                    || t.assistant.contains("[ccteam] delegated session")
-            }) {
+            if turns
+                .iter()
+                .any(|turn| turn.user.starts_with(&format!("{child_sid} done · turn ")))
+            {
                 notified = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(
-            notified,
-            "parent must receive the `[ccteam]` completion notification"
-        );
+        assert!(notified, "parent must receive the completion notification");
         let progress = ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha"))
             .unwrap_or_default();
         assert!(
@@ -24900,7 +27020,7 @@ mod tests {
         );
     }
 
-    /// Count the `[ccteam]` notification turns delivered to `sid`.
+    /// Count minimal completion notification turns delivered to `sid`.
     fn ccteam_notification_turns(
         project_dir: &std::path::Path,
         sid: &str,
@@ -24908,7 +27028,7 @@ mod tests {
         ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| t.user.contains("[ccteam] delegated session"))
+            .filter(|turn| turn.user.contains(" done · turn ") || turn.user.contains(" FAILED ("))
             .collect()
     }
 
@@ -24984,17 +27104,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let notification = notification.expect("parent receives vendor-fatal notification");
-        assert!(
-            notification
-                .user
-                .starts_with("[ccteam] [delegation completed with VENDOR ERROR]"),
-            "vendor-fatal notification must lead with an explicit marker: {}",
-            notification.user
-        );
+        assert!(notification.user.contains(" FAILED (turn_failed) · turn "));
         assert!(notification.user.contains(CAPACITY_ERROR));
-        assert!(notification
-            .user
-            .contains(&format!("session_collect{{sid:{child_sid}, tail:true}}")));
 
         let child_failure =
             ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &child_sid)
@@ -25070,6 +27181,9 @@ mod tests {
             vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
         };
         // Three interim narration messages inside the running turn → silence.
         for n in 1..=3 {
@@ -25091,22 +27205,16 @@ mod tests {
             vendor_error: false,
             interim_notes: 3,
             covered_turns: (1..=4).map(|n| format!("{child_sid}-{n}")).collect(),
+            context_pct: None,
+            turn: 4,
+            error_kind: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
-        assert!(
-            notes[0]
-                .user
-                .contains("is now IDLE, waiting for the next dispatch"),
-            "notification states the child went idle: {}",
-            notes[0].user
-        );
-        assert!(
-            notes[0].user.contains("3 interim note(s)"),
-            "notification folds the interim count: {}",
-            notes[0].user
-        );
+        assert!(notes[0]
+            .user
+            .starts_with(&format!("{child_sid} done · turn 4")));
         assert!(notes[0].user.contains("wave finished: 3 cards done"));
 
         // Replay (at-least-once upstream) → deduped, still one notification.
@@ -25173,6 +27281,9 @@ mod tests {
             vendor_error: false,
             interim_notes: 0,
             covered_turns: vec![format!("{child_sid}-{n}")],
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
         };
         Gateway::deliver_delegation_signal_shared(
             Arc::clone(&gateway),
@@ -25285,6 +27396,9 @@ mod tests {
             vendor_error: false,
             interim_notes: if boundary { n as usize - 1 } else { 0 },
             covered_turns: vec![format!("{child_sid}-{n}")],
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(1, false)).await;
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(2, false)).await;
@@ -25293,7 +27407,9 @@ mod tests {
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "all-mode narration remains ledger-only");
-        assert!(notes[0].user.contains("is now IDLE"));
+        assert!(notes[0]
+            .user
+            .starts_with(&format!("{child_sid} done · turn 2")));
 
         // `off` mode: nothing notifies, but the boundary still lands
         // delegation_completed in progress.jsonl.
@@ -25343,6 +27459,9 @@ mod tests {
                 vendor_error: false,
                 interim_notes: 0,
                 covered_turns: vec![format!("{child2}-1")],
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
             },
         )
         .await;
@@ -25571,6 +27690,7 @@ mod tests {
                 user: String::new(),
                 assistant: "the research is done".into(),
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: vec![],
                 attachments: vec![],
                 outcome: None,
@@ -25600,7 +27720,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|turn| turn.user.contains(" done · turn "))
                 .count()
         };
         let mut delivered = 0;
@@ -25662,6 +27782,7 @@ mod tests {
                     user: String::new(),
                     assistant: format!("checkpoint {n}"),
                     usage: serde_json::Value::Null,
+                    status: None,
                     tool_calls: vec![],
                     attachments: vec![],
                     outcome: None,
@@ -25688,7 +27809,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.user.contains("[ccteam] delegated session"))
+                .filter(|turn| turn.user.contains(" done · turn "))
                 .collect::<Vec<_>>()
         };
         let mut got: Vec<TurnRecord> = vec![];
@@ -25705,7 +27826,9 @@ mod tests {
             "the folded notification carries the LATEST text: {}",
             got[0].user
         );
-        assert!(got[0].user.contains("2 interim note(s)"));
+        assert!(got[0]
+            .user
+            .starts_with(&format!("{child_sid} done · turn ")));
 
         Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;

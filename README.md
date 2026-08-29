@@ -104,6 +104,19 @@ The daemon routes and records — at-least-once notifications across restarts, i
 - Plain-language walkthrough → [orchestration guide](docs/orchestration.md)
 - Every command → manual ([English](docs/usage.md) · [中文](docs/usage-cn.md))
 
+## Inside DeepSeek Harness
+
+ccteam also lives natively inside [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)'s own web UI, as one DSH client plugin — `@ccteam/ccteam-ui`, not a port of the console above, built with DSH's own slots, primitives and locale. Installing it once gives you three faces and an engine supervisor:
+
+| Face | For | What it gives you |
+|---|---|---|
+| **Workbench** | People using DSH Web | A full-page ccteam workbench opened from a button at the bottom of DSH's sidebar: the cross-harness team tree (search, per-project fold/unfold, hover ⋯ menu), a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, mid-turn model/effort switch, interrupt), and a details column — docks beside DSH's own panes or expands full-page. |
+| **Tools** | DSH agents (the LLM) | The same eight MCP tools described above, callable from inside a DSH session. |
+| **Transport** | ccteam | The channel that lets ccteam hire a DSH session the way it hires any other harness. |
+| **Engine** | You | The ccteam daemon itself, shipped with the plugin as a platform package (`@ccteam/engine-<os>-<cpu>`): installed, started and supervised from the **Engine** section of the plugin's settings card — state, version, **Start / Stop / Restart / Update engine**, a *Start the engine when the plugin loads* switch, the engine log. |
+
+Install it with `dsh plugin --profile web add @ccteam/ccteam-ui` and restart `dsh web`: the plugin brings the engine, starts the daemon, and picks up your console token from `~/.ccteam` on the same machine — nothing to paste. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `session_spawn` with `vendor:"dsh"`), the plugin and its credentials are materialized for you. Either way it is one daemon shared with the CLI and ccteam web: the plugin attaches to a running one, never starts a second one against another `~/.ccteam`, and never stops it when DSH restarts. The full setup (both install paths, coexistence rules, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
+
 ## Install
 
 Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
@@ -127,29 +140,37 @@ Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ```
 
-One static binary into `~/.local/bin`, no sudo. Every install mode — the script, `make install`, and `ccteam update` — resolves the destination through the same ladder (`CCTEAM_INSTALL_DIR` → wherever `ccteam` already lives → `~/.local/bin`), so an upgrade replaces the copy you are actually running instead of leaving a second one to shadow it.
+One static binary into `~/.local/bin`, no sudo. Every install mode — the script, `make install`, `ccteam update`, and the DSH plugin — resolves the destination through the same ladder (`CCTEAM_INSTALL_DIR` → wherever `ccteam` already lives → `~/.local/bin`), so an upgrade replaces the copy you are actually running instead of leaving a second one to shadow it.
 
-**2 · Let an agent do it** — paste into any agent you already have:
+**2 · From DeepSeek Harness** — one command, engine included:
+
+```bash
+dsh plugin --profile web add @ccteam/ccteam-ui
+```
+
+Restart `dsh web` and the plugin installs the ccteam engine from its platform package through the same ladder, starts the daemon, and shows an **Engine** section in its settings card. It is one shared daemon: the `ccteam` CLI, ccteam web and the plugin all use the same `~/.ccteam` — whoever starts first wins and the others attach ([details](docs/dsh-plugin.md)).
+
+**3 · Let an agent do it** — paste into any agent you already have:
 
 > Install https://github.com/firstintent/ccteam — follow `INSTALL.md` in the repo.
 
-**3 · From source** (Rust + Node):
+**4 · From source** (Rust + Node):
 
 ```bash
 git clone https://github.com/firstintent/ccteam && cd ccteam && make install
 ```
 
-**Start it** — `ccteam daemon start` runs ccteam in the background and keeps it running after you close the terminal (`make install` already did this for you). Manage it any time:
+**Start it** — `ccteam start` runs ccteam in the background and keeps it running after you close the terminal (`make install` and the DSH plugin already did this for you). It is the only way to start the daemon, and it is idempotent: a second `ccteam start` — from a shell, a script, or the DSH plugin — reports the one already running instead of starting another. Manage it any time:
 
 ```bash
-ccteam daemon start          # start in the background; prints your web console link
+ccteam start                 # start in the background; prints your web console link
 ccteam daemon status         # is it running, and on which version?
 ccteam daemon restart        # restart it
-ccteam daemon stop           # stop it (your sessions come back next time you start)
+ccteam stop                  # stop it (your sessions come back next time you start)
 ccteam daemon logs -f        # watch the logs live
 ```
 
-After you reboot your computer, run `ccteam daemon start` again to bring ccteam back.
+After you reboot your computer, run `ccteam start` again to bring ccteam back.
 
 **Configure in the browser** — open the printed link (also shown by `ccteam status`), create a project, and just type; the session is born on your first message. Then:
 
@@ -196,7 +217,7 @@ ccteam adds a team to your repo without taking it over:
 
 - **Roleless by default** — the brain reads *your* `CLAUDE.md` / `AGENTS.md` through the vendor's own mechanism; ccteam never rewrites project knowledge.
 - **Small footprint** — exactly `.ccteam/` (state), `.claude/agents/` (personas you install), and ccteam's own section of `.claude/settings.local.json` — never your `settings.json`.
-- **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
+- **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. A session you are not talking to releases its harness process after an idle window (default one hour, matching the prompt-cache TTL) and comes straight back on your next message, on the same id and the same conversation — so a fleet of thirty sessions costs thirty transcripts, not thirty resident processes. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
 
 ## Extras
 
@@ -221,7 +242,7 @@ It stays deliberately underneath:
 ccteam update                # update in place; restarts the daemon onto the new binary
 ```
 
-`ccteam status` shows your version and flags a newer release. (Details: [usage](docs/usage.md#updating).)
+`ccteam status` shows your version and flags a newer release. From DSH, the plugin's Engine section does the same with **Update engine** (the engine from its platform package, through the same drain + restart + verify); `dsh plugin --profile web update @ccteam/ccteam-ui` updates the plugin itself. (Details: [usage](docs/usage.md#updating).)
 
 ## Uninstall
 

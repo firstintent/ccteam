@@ -80,6 +80,49 @@ fn ccteam_web_serves_health_then_exits_when_killed() {
         .to_string();
     assert!(!addr.is_empty(), "bind addr empty");
 
+    // WEB-DSH-PORT-1: the DSH companion bind is derived from the web bind, so
+    // an ephemeral web port must derive an ephemeral companion port. `0 + 1`
+    // is port 1 — privileged, unbindable as a normal user, and the whole
+    // process died on it right after printing the line above (this test was
+    // red locally and green only in root CI).
+    let mut companion_line = String::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        companion_line.clear();
+        match reader.read_line(&mut companion_line) {
+            Ok(0) => break,
+            Ok(_) if companion_line.contains("companion listening on http://") => break,
+            Ok(_) => continue,
+            Err(err) => {
+                let _ = child.kill();
+                panic!("read stdout: {err}");
+            }
+        }
+    }
+    if !companion_line.contains("companion listening on http://") {
+        let _ = child.kill();
+        panic!("companion must announce its bind on stdout; got: {companion_line:?}");
+    }
+    let companion_addr = companion_line
+        .split("http://")
+        .nth(1)
+        .expect("companion line missing http://")
+        .trim()
+        .to_string();
+    let companion_port: u16 = companion_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("companion bind line has no port: {companion_line:?}")
+        });
+    assert!(
+        companion_port > 1,
+        "an ephemeral web port must yield a real read-back companion port, \
+         never 0 or the privileged port 1; got {companion_addr}"
+    );
+
     // GET /health — block until 200 or deadline.
     let url = format!("http://{addr}/health");
     let body = match stdlib_http_get(&url, Duration::from_secs(5)) {
@@ -96,6 +139,11 @@ fn ccteam_web_serves_health_then_exits_when_killed() {
     assert!(
         body.contains("\"ok\""),
         "/health body should contain status=ok; got: {body}",
+    );
+    // The port the companion actually got, not the one that was requested.
+    assert!(
+        body.contains(&format!("\"dsh_web_bind\":\"{companion_addr}\"")),
+        "/health must report the companion address it bound ({companion_addr}); got: {body}",
     );
 
     // Kill the child (SIGKILL on Unix). Clean SIGTERM-driven shutdown

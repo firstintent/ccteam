@@ -58,10 +58,12 @@ const TICKER_SIZE = 5;
 
 const chatPath = (sid: string) => `/chat/s/${encodeURIComponent(sid)}`;
 
-/** Tree status dot: pulsing = actively working (amber), live = idle-live
- *  (green), persisted-only = off (grey). */
+/** Tree status dot: pulsing = actively working (amber), resident = ccteam is
+ *  holding a process (green), released/stopped/external = off (grey).
+ *  Keyed on RESIDENCY, not on the activity word: a resident session is idle
+ *  most of the time, and "idle" is not "gone". */
 function treeDotClass(node: AgentNode, pulsing: Set<string>): string {
-  if (node.status !== "live") return "dot off";
+  if (node.residency !== "resident") return "dot off";
   return pulsing.has(node.sid) ? "dot busy" : "dot on";
 }
 
@@ -279,7 +281,7 @@ function vendorRollup(nodes: AgentNode[]): { vendor: string; live: number; cost:
   const byVendor = new Map<string, { vendor: string; live: number; cost: number }>();
   for (const n of nodes) {
     const agg = byVendor.get(n.vendor) ?? { vendor: n.vendor, live: 0, cost: 0 };
-    if (n.status === "live") agg.live += 1;
+    if (n.residency === "resident") agg.live += 1;
     agg.cost += n.cost_usd ?? 0;
     byVendor.set(n.vendor, agg);
   }
@@ -565,7 +567,7 @@ export default function AgentsView({
   }, [selected, historyBySid]);
 
   // ---- KPI strip (client-side, from the same graph + SSE data) ----
-  const liveCount = graph.nodes.filter((n) => n.status === "live").length;
+  const liveCount = graph.nodes.filter((n) => n.residency === "resident").length;
   const workingCount = graph.nodes.filter((n) => pulsing.has(n.sid)).length;
   const activeDispatches = edges.filter((e) => e.active).length;
   const totalCost = graph.nodes.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);

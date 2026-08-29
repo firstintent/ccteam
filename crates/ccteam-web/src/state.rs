@@ -30,6 +30,11 @@ pub struct AppState {
     /// `enabled = false` (loopback bind, or `--no-auth` opt-out) the
     /// `auth_layer` middleware short-circuits to pass-through.
     pub auth: Arc<AuthState>,
+    /// v0.10.5 — what `GET /health` reports about THIS daemon (home,
+    /// build, binds, uptime). Starts `unbound` (home + pid are already
+    /// real); `serve` replaces it via [`AppState::with_health_identity`]
+    /// once the listeners exist and the addresses are facts.
+    pub health: Arc<crate::routes::health::HealthIdentity>,
     /// V0.3.2 F56 — refcounted `tmux pipe-pane` registry shared by
     /// all WS PTY subscribers. The first subscriber to a given
     /// `<slug>` (or `<slug>/<sid>`) creates the FIFO + `pipe-pane`;
@@ -175,10 +180,12 @@ impl AppState {
         // `disabled` and spawns nothing until `serve` configures it (or hands
         // in the daemon-wide one via `with_dsh_web`).
         let dsh_runtime = crate::dsh_web::new_runtime_manager(paths.root.clone());
+        let health = Arc::new(crate::routes::health::HealthIdentity::unbound(&paths));
         Self {
             paths: Arc::new(paths),
             progress_projection,
             auth: Arc::new(auth),
+            health,
             pty: PtyRegistry::new(),
             chat_inbound: None,
             chat_outbound,
@@ -206,6 +213,15 @@ impl AppState {
 
     pub fn with_dsh_web(mut self, supervisor: Arc<crate::dsh_web::DshWebSupervisor>) -> Self {
         self.dsh_web = supervisor;
+        self
+    }
+
+    /// v0.10.5 — publish the bound `/health` identity. Only `serve` calls
+    /// it: the addresses are not knowable until after `TcpListener::bind`
+    /// (a `:0` bind has no port before then), so reporting them earlier
+    /// would mean reporting a request rather than a fact.
+    pub fn with_health_identity(mut self, identity: crate::routes::health::HealthIdentity) -> Self {
+        self.health = Arc::new(identity);
         self
     }
 

@@ -11,7 +11,7 @@
 //! local vendor web servers keyed by the authenticated web identity.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU16, Ordering},
     Arc,
@@ -28,8 +28,12 @@ use axum::{
 };
 use axum_extra::extract::CookieJar;
 use ccteam_core::enroll::ensure_user_credential_in;
+use ccteam_core::identity::{is_tenant_owned, WEB_OWNER_PREFIX};
+use ccteam_core::tenants::TenantRegistry;
+use ccteam_core::CcteamPaths;
 use ccteam_harness::{
-    DshEnrollmentResolver, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState, DshRuntimeStatus,
+    DshEnrollmentResolver, DshRestTokenResolver, DshRuntimeIdentity, DshRuntimeManager,
+    DshRuntimeState, DshRuntimeStatus,
 };
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde::Serialize;
@@ -85,6 +89,83 @@ pub struct DshStatusResponse {
     pub native_url: Option<String>,
 }
 
+/// One thing ccteam found in the operator's OWN `~/.dsh` profile and left
+/// exactly as it was.
+///
+/// ccteam does not repair an install it did not make, so every one of these is
+/// a REPORT: the operator's own `dsh plugin` command fixes it. Same finding,
+/// same wording as `ccteam doctor` — see
+/// [`ccteam_harness::execution::dsh_acp::materialize::DshPluginFinding`].
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+pub struct DshPluginFindingView {
+    /// npm name (`@ccteam/ccteam-ui`).
+    pub bundle: String,
+    /// Machine-readable code — `plugin_version_mismatch`, `duplicate_bundle_id`,
+    /// `plugin_missing_on_disk`, `plugin_version_unknown` or
+    /// `duplicate_patch_row`.
+    pub code: String,
+    /// Version installed in the operator's own DSH profile (version findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed: Option<String>,
+    /// Version this ccteam build embeds (version findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<String>,
+    /// How many rows carry the duplicated id (duplicate findings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    /// The one-line report both surfaces print.
+    pub report: String,
+    /// The operator's next step, worded once for both surfaces.
+    pub remedy: String,
+}
+
+/// Read-only, best-effort: what the operator's OWN `~/.dsh` profile carries
+/// that ccteam refuses to touch — version drift from the embedded copy, a
+/// duplicated id, or an install pnpm never finished.
+///
+/// The ONE place the web layer asks this question — the Hosts panel's `dsh`
+/// row reads it, and a home we cannot resolve or read answers "nothing found".
+/// Only the operator's real `~/.dsh` can carry these: a tenant's DSH home is
+/// ccteam-owned and materialized from the embedded copy by construction.
+pub fn operator_dsh_plugin_findings(ccteam_root: &Path) -> Vec<DshPluginFindingView> {
+    use ccteam_harness::execution::dsh_acp::materialize::DshPluginFindingKind as Kind;
+
+    let Ok(home) = ccteam_harness::execution::dsh_acp::spawn_spec::dsh_home_for_identity(
+        true,
+        "",
+        ccteam_root,
+    ) else {
+        return Vec::new();
+    };
+    ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
+        ccteam_root,
+        &home,
+        ccteam_harness::DSH_NATIVE_WEB_PROFILE,
+    )
+    .into_iter()
+    .map(|finding| DshPluginFindingView {
+        code: finding.code().to_string(),
+        report: finding.report(),
+        installed: match &finding.kind {
+            Kind::VersionMismatch { installed, .. } => Some(installed.clone()),
+            _ => None,
+        },
+        embedded: match &finding.kind {
+            Kind::VersionMismatch { embedded, .. } => Some(embedded.clone()),
+            _ => None,
+        },
+        count: match finding.kind {
+            Kind::DuplicateBundleId { count } | Kind::DuplicatePatchRow { count, .. } => {
+                Some(count)
+            }
+            _ => None,
+        },
+        bundle: finding.bundle,
+        remedy: finding.remedy,
+    })
+    .collect()
+}
+
 /// Build the DSH runtime manager with ccteam's enrollment resolver injected.
 ///
 /// The ONE construction site: `ccteam-harness` sits below `ccteam-core::enroll`
@@ -93,7 +174,11 @@ pub struct DshStatusResponse {
 /// daemon's own port, which is why `ccteam start` can build the manager in its
 /// composition root long before the web listener binds.
 pub fn new_runtime_manager(ccteam_home: PathBuf) -> Arc<DshRuntimeManager> {
-    Arc::new(DshRuntimeManager::new(ccteam_home, enrollment_resolver()))
+    Arc::new(DshRuntimeManager::new(
+        ccteam_home,
+        enrollment_resolver(),
+        rest_token_resolver(),
+    ))
 }
 
 fn enrollment_resolver() -> DshEnrollmentResolver {
@@ -102,6 +187,56 @@ fn enrollment_resolver() -> DshEnrollmentResolver {
             .map(|credential| credential.bearer())
             .with_context(|| format!("ensure enrollment credential for {owner}"))
     })
+}
+
+fn rest_token_resolver() -> DshRestTokenResolver {
+    Arc::new(|root, owner| {
+        rest_token_for_owner(root, owner)
+            .with_context(|| format!("resolve ccteam REST token for {owner}"))
+    })
+}
+
+/// The identity's OWN ccteam REST bearer, in the wire form the API accepts.
+///
+/// Reuse before mint, through the existing stores — no new token kind and no
+/// new ACL surface: a tenant's `web_token` is the very token they signed in
+/// with, and the operator's is the admin token file `ccteam start` already
+/// manages. Minting only happens where the store itself would mint: an unknown
+/// tenant is an error (this must never create a user), and the admin file is
+/// get-or-mint exactly as elsewhere.
+///
+/// The returned value is a credential: it is written only into that identity's
+/// own DSH profile and never logged or reported.
+fn rest_token_for_owner(root: &Path, owner: &str) -> Result<String> {
+    let paths = CcteamPaths {
+        root: root.to_path_buf(),
+        // Unused by the `secrets/` accessors below and never escapes here.
+        projects_root: root.join("projects"),
+    };
+    let hex = match owner
+        .strip_prefix(WEB_OWNER_PREFIX)
+        .filter(|_| is_tenant_owned(Some(owner)))
+    {
+        Some(id) => {
+            let dir = paths.users_dir();
+            let mut registry = TenantRegistry::load(&dir);
+            let existing = registry
+                .by_id(id)
+                .map(|tenant| tenant.web_token.clone())
+                .ok_or_else(|| anyhow!("no ccteam user {id}"))?;
+            if existing.trim().is_empty() {
+                let minted = registry
+                    .rotate_token(id)
+                    .ok_or_else(|| anyhow!("no ccteam user {id}"))?;
+                registry.save_one(&dir, id)?;
+                minted
+            } else {
+                existing
+            }
+        }
+        None => crate::token::generate_or_load_token(&paths.web_token_path())?,
+    };
+    Ok(format!("{}{hex}", crate::auth::TOKEN_PREFIX))
 }
 
 /// The web face of the DSH runtime: identity mapping, the companion port, and
@@ -259,6 +394,7 @@ async fn handle_companion_request(
 
 async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> Response {
     let (parts, body) = req.into_parts();
+    let plugin_bundle = is_plugin_bundle_path(parts.uri.path());
     let target = format!(
         "http://127.0.0.1:{port}{}",
         parts
@@ -272,7 +408,7 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
     builder = builder.headers(headers);
     builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     match builder.send().await {
-        Ok(resp) => response_from_reqwest(resp).await,
+        Ok(resp) => response_from_reqwest(resp, plugin_bundle).await,
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": err.to_string() })),
@@ -298,44 +434,156 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
 /// daemon host), which keeps it inert on the paths that never needed it.
 const CRYPTO_RANDOM_UUID_POLYFILL: &str = r#"<script>(function(){var c=window.crypto;if(!c||typeof c.getRandomValues!=="function")return;if(typeof c.randomUUID==="function")return;var h=[];for(var i=0;i<256;i++)h.push((i+256).toString(16).slice(1));Object.defineProperty(c,"randomUUID",{configurable:true,writable:true,value:function(){var b=new Uint8Array(16);c.getRandomValues(b);b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;return h[b[0]]+h[b[1]]+h[b[2]]+h[b[3]]+"-"+h[b[4]]+h[b[5]]+"-"+h[b[6]]+h[b[7]]+"-"+h[b[8]]+h[b[9]]+"-"+h[b[10]]+h[b[11]]+h[b[12]]+h[b[13]]+h[b[14]]+h[b[15]]}})})();</script>"#;
 
-/// Splice the polyfill in as the first thing inside `<head>` so it runs before
-/// the boot script and every client plugin module. Returns `None` when there
-/// is no head to open, leaving the body untouched rather than guessing.
+/// Declares that the page owns its Host, through DSH's own transport hook.
+///
+/// DSH keeps its **privileged surface** — the settings document (every
+/// Settings page: General, Models, Plugin configuration), and the deliverables
+/// file actions — reachable only from "the operator's own machine". The client
+/// decides that from the page authority (`dsh-client-connection`:
+/// `isLoopback = transport.ownsHost || page hostname is loopback`), and a
+/// non-loopback page gets every settings scope in `memory` mode: the describe
+/// mirror never asks the Host, so the Plugin configuration tab renders nothing
+/// at all — not the cards, not even the "no settings" line — while the same
+/// instance opened from `127.0.0.1` shows everything. Real-machine v0.10.4: a
+/// LAN browser on ccteam web → DSH saw an empty tab and had nowhere to paste a
+/// REST token.
+///
+/// Through the companion port that stand-in is ccteam's authenticated
+/// identity: the page reaches an instance that belongs to that identity alone
+/// (the operator's own `~/.dsh`, or the tenant's isolated home), after ccteam
+/// auth, and the server-side Host/Origin fence is already satisfied by the
+/// loopback rewrite in [`proxy_request_headers`]. `__DSH_TRANSPORT__.ownsHost`
+/// is the hook DSH documents for exactly this ("a shell that assembles its
+/// own transport"); the companion port is that shell.
+///
+/// Version-safe by construction, because the two published shapes of the hook
+/// differ and a served page carries the global for both:
+/// - DSH ≤ 0.1.1-rc.2 has no `ownsHost` and reads
+///   `transport?.createApiClient() ?? new WebApiClient()` — a global WITHOUT
+///   `createApiClient` aborts the whole boot ("transport?.createApiClient is
+///   not a function", real-machine), so the declaration ships a
+///   `createApiClient` that answers `undefined` and lets the default carrier
+///   through. On those versions the flag is simply not read: settings stay
+///   loopback-only there (a `127.0.0.1` tunnel is the way in), nothing else
+///   changes.
+/// - DSH after rc.2 reads `ownsHost`, ignores `createApiClient`, and takes
+///   `fetch` / `openStream` / `loadBundle` from the global only when present —
+///   none are, so HTTP + WebSocket + HTTP bundles stay the defaults.
+///
+/// An existing global (a shell that brought its own transport) is left alone
+/// except for the missing flag. Consequence to know once the flag is read:
+/// deliverables actions then act on the daemon host — the workspace machine.
+/// For DSH ≤ 0.1.1-rc.2, whose client never reads the flag, the companion
+/// port back-ports that read into the served client-connection bundle
+/// (`backport_owns_host`), so the declaration is effective on every version.
+const DSH_TRANSPORT_OWNS_HOST: &str = r#"<script>(function(){var g=window,t=g.__DSH_TRANSPORT__;if(t===undefined){g.__DSH_TRANSPORT__={ownsHost:true,createApiClient:function(){return undefined}};return}if(t!==null&&typeof t==="object"&&t.ownsHost===undefined){t.ownsHost=true}})();</script>"#;
+
+/// Splice the companion head scripts in as the first thing inside `<head>` so
+/// they run before the boot script and every client plugin module. Returns
+/// `None` when there is no head to open, leaving the body untouched rather
+/// than guessing.
 fn inject_polyfill(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let head = lower.find("<head")?;
     let open_end = lower[head..].find('>')? + head + 1;
-    let mut out = String::with_capacity(html.len() + CRYPTO_RANDOM_UUID_POLYFILL.len());
+    let mut out = String::with_capacity(
+        html.len() + CRYPTO_RANDOM_UUID_POLYFILL.len() + DSH_TRANSPORT_OWNS_HOST.len(),
+    );
     out.push_str(&html[..open_end]);
     out.push_str(CRYPTO_RANDOM_UUID_POLYFILL);
+    out.push_str(DSH_TRANSPORT_OWNS_HOST);
     out.push_str(&html[open_end..]);
     Some(out)
 }
 
-fn is_html_response(headers: &HeaderMap) -> bool {
+/// The one line DSH ≤ 0.1.1-rc.2 decides `isLoopback` on: page hostname
+/// alone. Upstream added the `__DSH_TRANSPORT__.ownsHost` read after rc.2
+/// shipped, and the client-connection bundle is served verbatim
+/// (`/plugins/<id>/client.js`), so the companion port back-ports exactly that
+/// read: the rc.2 line gains the same branch newer DSH evaluates natively.
+/// Anything else — another version, a minified build — passes through
+/// byte-for-byte, which is also how this retires: the first DSH release that
+/// reads the flag itself no longer carries the line.
+const RC2_IS_LOOPBACK_LINE: &str =
+    "isLoopback: pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),";
+const RC2_IS_LOOPBACK_OWNS_HOST: &str = "isLoopback: pageLocation === void 0 || \
+     globalThis.__DSH_TRANSPORT__?.ownsHost === true || \
+     isLoopbackHostname(pageLocation.hostname),";
+
+fn backport_owns_host(bundle: &str) -> Option<String> {
+    bundle
+        .contains(RC2_IS_LOOPBACK_LINE)
+        .then(|| bundle.replacen(RC2_IS_LOOPBACK_LINE, RC2_IS_LOOPBACK_OWNS_HOST, 1))
+}
+
+/// `/plugins/<id>/client.js` — DSH client-modules' bundle route (the rev rides
+/// the query string, which is not part of the path).
+fn is_plugin_bundle_path(path: &str) -> bool {
+    path.strip_prefix("/plugins/")
+        .is_some_and(|rest| !rest.starts_with('/') && rest.ends_with("/client.js"))
+}
+
+fn content_type_starts_with(headers: &HeaderMap, prefixes: &[&str]) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/html"))
+        .is_some_and(|v| {
+            let value = v.trim_start().to_ascii_lowercase();
+            prefixes.iter().any(|prefix| value.starts_with(prefix))
+        })
 }
 
-async fn response_from_reqwest(resp: reqwest::Response) -> Response {
+fn is_html_response(headers: &HeaderMap) -> bool {
+    content_type_starts_with(headers, &["text/html"])
+}
+
+fn is_javascript_response(headers: &HeaderMap) -> bool {
+    content_type_starts_with(headers, &["text/javascript", "application/javascript"])
+}
+
+/// What the companion port splices into a buffered upstream body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Splice {
+    /// The document: head scripts (secure-context polyfill + `ownsHost`).
+    Html,
+    /// A plugin client bundle: the rc.2 `ownsHost` back-port.
+    PluginBundle,
+}
+
+fn splice_for(headers: &HeaderMap, plugin_bundle: bool) -> Option<Splice> {
+    if is_html_response(headers) {
+        Some(Splice::Html)
+    } else if plugin_bundle && is_javascript_response(headers) {
+        Some(Splice::PluginBundle)
+    } else {
+        None
+    }
+}
+
+async fn response_from_reqwest(resp: reqwest::Response, plugin_bundle: bool) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
 
-    // HTML is buffered (documents are small) so the polyfill can be spliced
-    // in; everything else — assets, RPC payloads, downloads — keeps streaming
-    // untouched. `accept-encoding` is stripped on the way out (see
+    // HTML (small) and plugin client bundles (a few hundred KB, browser-cached
+    // per rev) are buffered so their splice can be applied; everything else —
+    // assets, RPC payloads, downloads — keeps streaming untouched.
+    // `accept-encoding` is stripped on the way out (see
     // `should_strip_request_header`), so the body here is always identity and
     // splicing can never corrupt a compressed stream.
-    if is_html_response(&headers) {
+    if let Some(splice) = splice_for(&headers, plugin_bundle) {
         match resp.bytes().await {
             Ok(bytes) => {
                 let body = match std::str::from_utf8(&bytes) {
-                    Ok(html) => match inject_polyfill(html) {
-                        Some(patched) => Body::from(patched),
-                        None => Body::from(bytes),
-                    },
+                    Ok(text) => {
+                        let patched = match splice {
+                            Splice::Html => inject_polyfill(text),
+                            Splice::PluginBundle => backport_owns_host(text),
+                        };
+                        match patched {
+                            Some(patched) => Body::from(patched),
+                            None => Body::from(bytes),
+                        }
+                    }
                     // Not UTF-8 → not something to splice; pass it through.
                     Err(_) => Body::from(bytes),
                 };
@@ -501,6 +749,61 @@ async fn proxy_websocket(socket: axum::extract::ws::WebSocket, port: u16, uri: a
 mod tests {
     use super::*;
 
+    /// The panel's token is REUSED, never a second credential: what lands in a
+    /// tenant's DSH profile must be the very token they sign in with, in the
+    /// wire form the REST API accepts.
+    ///
+    /// Root-injected, so no env pinning is needed — nothing here can reach the
+    /// real `~/.ccteam`.
+    #[test]
+    fn tenant_rest_token_is_the_one_the_tenant_already_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let users = root.join("secrets").join("users");
+        let mut registry = TenantRegistry::default();
+        let tenant = registry.add("alice");
+        registry.save(&users).unwrap();
+
+        let resolved = rest_token_for_owner(root, &format!("user:{}", tenant.id)).unwrap();
+        assert_eq!(resolved, format!("ccteam:{}", tenant.web_token));
+        assert_eq!(
+            rest_token_for_owner(root, &format!("user:{}", tenant.id)).unwrap(),
+            resolved,
+            "resolving twice must not rotate the tenant's login token"
+        );
+    }
+
+    /// An identity with no user row is an error, never a silently minted new
+    /// user: this resolver runs on a spawn path, not an admin one.
+    #[test]
+    fn unknown_tenant_is_refused_rather_than_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = rest_token_for_owner(tmp.path(), "user:u00000000").unwrap_err();
+        assert!(err.to_string().contains("u00000000"), "got {err}");
+        assert!(
+            !tmp.path().join("secrets").join("users").exists(),
+            "a failed lookup must not create a user store"
+        );
+    }
+
+    /// Operator-ish tags all collapse to the admin token file, get-or-mint —
+    /// the same value `ccteam start` manages, not a new one.
+    #[test]
+    fn operator_rest_token_is_the_admin_web_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let first = rest_token_for_owner(root, "user:web-api").unwrap();
+        let on_disk =
+            std::fs::read_to_string(root.join("secrets").join("web-token")).expect("token file");
+        assert_eq!(first, format!("ccteam:{}", on_disk.trim()));
+        assert_eq!(
+            rest_token_for_owner(root, "telegram:42").unwrap(),
+            first,
+            "every operator-ish tag resolves to the one admin token"
+        );
+    }
+
     #[test]
     fn strips_sensitive_and_hop_by_hop_headers() {
         assert!(should_strip_request_header(&header::COOKIE));
@@ -533,10 +836,111 @@ mod tests {
         assert!(patched.starts_with("<!doctype html>"));
     }
 
+    /// The privileged-surface declaration rides the same splice, ahead of the
+    /// boot script: `dsh-client-connection` reads `__DSH_TRANSPORT__` once, at
+    /// plugin boot, so a declaration placed after it is one that never counted.
+    #[test]
+    fn owns_host_declaration_lands_before_the_boot_script() {
+        let html =
+            "<html><head><script>window.__DSH_BOOT__ = {}</script></head><body></body></html>";
+        let patched = inject_polyfill(html).expect("head present");
+        let at = patched
+            .find("__DSH_TRANSPORT__")
+            .expect("declaration present");
+        assert!(at < patched.find("__DSH_BOOT__").unwrap());
+        assert!(patched.contains("ownsHost:true"));
+        // No transport override: `fetch` / `openStream` / `loadBundle` are
+        // absent so HTTP + WebSocket + HTTP bundles stay the defaults, and a
+        // shell that brought its own hooks keeps them.
+        assert!(!patched.contains("fetch:"));
+        assert!(!patched.contains("openStream"));
+        assert!(patched.contains("t.ownsHost===undefined"));
+        // DSH ≤ 0.1.1-rc.2 calls `transport?.createApiClient()` unconditionally
+        // and `??`-falls through to its default carrier on `undefined`; a
+        // global without it aborts the boot.
+        assert!(patched.contains("createApiClient:function(){return undefined}"));
+    }
+
     #[test]
     fn polyfill_injection_is_inert_without_a_head() {
         assert!(inject_polyfill("{\"json\":true}").is_none());
         assert!(inject_polyfill("plain text").is_none());
+    }
+
+    #[test]
+    fn rc2_connection_bundle_gains_the_owns_host_branch() {
+        let bundle = format!(
+            "\t\t\tconst handle = {{\n\t\t\t\tapi,\n\t\t\t\t{RC2_IS_LOOPBACK_LINE}\n\t\t\t\thostDescription: {{}}\n"
+        );
+        let patched = backport_owns_host(&bundle).expect("the rc.2 line is back-ported");
+        assert_eq!(
+            patched
+                .matches("__DSH_TRANSPORT__?.ownsHost === true")
+                .count(),
+            1,
+            "exactly one ownsHost read is added"
+        );
+        assert!(
+            !patched.contains(RC2_IS_LOOPBACK_LINE),
+            "the hostname-only line is replaced, not duplicated"
+        );
+        assert!(
+            patched.contains("isLoopbackHostname(pageLocation.hostname),"),
+            "the hostname read stays as the fallback"
+        );
+        let (before, after) = bundle.split_once(RC2_IS_LOOPBACK_LINE).unwrap();
+        assert!(patched.starts_with(before) && patched.ends_with(after));
+    }
+
+    #[test]
+    fn other_bundles_pass_through_untouched() {
+        for js in [
+            "",
+            "export const x = 1;",
+            // The post-rc.2 shape already reads the flag: nothing to back-port.
+            "isLoopback: transport?.ownsHost === true || isLoopbackHostname(pageLocation.hostname),",
+        ] {
+            assert!(backport_owns_host(js).is_none(), "{js:?}");
+        }
+    }
+
+    #[test]
+    fn only_plugin_bundle_paths_are_back_port_candidates() {
+        assert!(is_plugin_bundle_path(
+            "/plugins/@deepseek-ai/dsh-client-connection/client.js"
+        ));
+        assert!(is_plugin_bundle_path("/plugins/x/client.js"));
+        for path in [
+            "/",
+            "/plugins",
+            "/plugins/",
+            "/plugins/client.js",
+            "/plugins//client.js",
+            "/assets/index-abc.js",
+            "/ccteam/api/tree",
+        ] {
+            assert!(!is_plugin_bundle_path(path), "{path}");
+        }
+        let js = |ct: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+            h
+        };
+        assert_eq!(
+            splice_for(&js("text/javascript; charset=utf-8"), true),
+            Some(Splice::PluginBundle)
+        );
+        assert_eq!(
+            splice_for(&js("application/javascript"), true),
+            Some(Splice::PluginBundle)
+        );
+        assert_eq!(
+            splice_for(&js("text/javascript"), false),
+            None,
+            "a JS asset off the bundle route streams through"
+        );
+        assert_eq!(splice_for(&js("text/html"), true), Some(Splice::Html));
+        assert_eq!(splice_for(&js("application/json"), true), None);
     }
 
     #[test]

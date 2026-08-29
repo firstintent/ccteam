@@ -1,4 +1,6 @@
-//! F163 (+ v0.9.7) — `ccteam start` graceful SIGTERM/SIGINT shutdown tests.
+//! F163 (+ v0.9.7) — graceful SIGTERM/SIGINT shutdown tests for the
+//! daemon body (`ccteam internal daemon-run`; v0.10.5 D7 deleted the
+//! foreground `ccteam start`, which is now the launcher alias).
 //!
 //! Verifies:
 //! 1. SIGTERM causes the daemon to exit within the deadline (not hang).
@@ -25,7 +27,8 @@ fn ccteam_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ccteam")
 }
 
-/// Spawn a minimal `ccteam start` daemon in an isolated tempdir.
+/// Spawn a minimal daemon body (`ccteam internal daemon-run`, the
+/// launcher's only exec target since v0.10.5 D7) in an isolated tempdir.
 /// Returns (child, ccteam_home, mcp_socket_path).
 fn spawn_test_daemon(tmp_dir: &tempfile::TempDir) -> (std::process::Child, PathBuf, PathBuf) {
     spawn_test_daemon_with(
@@ -57,7 +60,7 @@ fn spawn_test_daemon_with(
     let mcp_socket = ccteam_home.join("run").join("mcp.sock");
 
     let child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd"])
+        .args(["internal", "daemon-run", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -65,7 +68,7 @@ fn spawn_test_daemon_with(
         .stdout(Stdio::null())
         .stderr(stderr_factory())
         .spawn()
-        .expect("spawn ccteam start");
+        .expect("spawn ccteam internal daemon-run");
 
     (child, ccteam_home, mcp_socket)
 }
@@ -152,7 +155,7 @@ fn sigterm_causes_graceful_exit_without_pidfile() {
     // record — that file is launcher-written only.
     assert!(
         !pidfile.exists(),
-        "foreground `ccteam start` must not write {}",
+        "a daemon body started outside the launcher must not write {}",
         pidfile.display()
     );
 
@@ -228,7 +231,7 @@ fn shutdown_does_not_kill_tmux_sessions() {
 
     // Capture stderr so we can inspect it for unwanted tmux-kill messages.
     let mut child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd"])
+        .args(["internal", "daemon-run", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -236,7 +239,7 @@ fn shutdown_does_not_kill_tmux_sessions() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn ccteam start");
+        .expect("spawn ccteam internal daemon-run");
 
     let ready = wait_for_ready(
         &mut child,
@@ -396,7 +399,7 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
     let socket = ccteam_home.join("run").join("mcp.sock");
 
     let mut child = Command::new(ccteam_bin())
-        .args(["start", "--no-web", "--no-imd"])
+        .args(["internal", "daemon-run", "--no-web", "--no-imd"])
         .env("HOME", fake_home)
         .env("CCTEAM_HOME", &ccteam_home)
         .env("CCTEAM_PROJECTS_ROOT", fake_home.join("projects"))
@@ -404,7 +407,7 @@ fn sigterm_emits_full_graceful_shutdown_telemetry() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn ccteam start");
+        .expect("spawn ccteam internal daemon-run");
 
     let ready = wait_for_ready(
         &mut child,

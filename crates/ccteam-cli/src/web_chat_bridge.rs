@@ -178,50 +178,36 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::{connect_async, WebSocketStream};
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
+    // CLI-ENVTEST-1 — these tests used to pin `HOME` + `CCTEAM_HOME` in the
+    // process while a whole daemon ran against them, and restore them after.
+    // `ccteam-cli` has no lib target, so every `#[cfg(test)]` module in `src/`
+    // shares ONE test binary: that set/restore raced any sibling test
+    // resolving a root from env (`commands.rs`'s peek tests set `CCTEAM_HOME`
+    // too), and the loser wrote its `config.yaml` into someone else's tempdir
+    // — twice red on CI for backlog-only commits. The fix is injection, not a
+    // wider lock: `DaemonArgs::ccteam_root` pins the daemon's root the same
+    // way `registry` already pinned `projects_root`, so nothing below touches
+    // the environment at all.
 
-    struct EnvRestore {
-        home: Option<std::ffi::OsString>,
-        ccteam_home: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn install(home: &Path, ccteam_home: &Path) -> Self {
-            let restore = Self {
-                home: std::env::var_os("HOME"),
-                ccteam_home: std::env::var_os("CCTEAM_HOME"),
-            };
-            std::env::set_var("HOME", home);
-            std::env::set_var("CCTEAM_HOME", ccteam_home);
-            restore
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            restore_env("HOME", self.home.take());
-            restore_env("CCTEAM_HOME", self.ccteam_home.take());
-        }
-    }
-
-    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
-        match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-    }
-
+    /// Both halves of the ccteam paths, rooted in the caller's tempdir.
     fn fake_paths(root: &Path) -> CcteamPaths {
         CcteamPaths {
             root: root.join(".ccteam"),
             projects_root: root.join("projects"),
         }
+    }
+
+    /// `/newproject` scaffolds through `bootstrap_project_at_dir`, whose
+    /// `pre_trust_project` step writes a trust entry into `~/.claude.json` —
+    /// the ONE path in this stack that resolves off `$HOME` rather than off
+    /// the injected root. Switch it off process-wide, once, exactly as
+    /// AGENTS.md §六 prescribes. Monotone (never restored, never unset), so
+    /// unlike a set/restore pair it cannot race a concurrent reader: the value
+    /// only ever goes absent → set, and both states keep the operator's real
+    /// `~/.claude.json` untouched.
+    fn keep_tests_off_the_real_claude_config() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(ccteam_core::disable_tool_surface_bootstrap_for_tests);
     }
 
     #[test]
@@ -504,6 +490,9 @@ mod tests {
         daemon_handle: tokio::task::JoinHandle<()>,
     }
 
+    /// Boot a web+daemon stack whose ccteam root and projects root are BOTH
+    /// the caller's tempdir — `registry` pins the latter, `ccteam_root` the
+    /// former (config.yaml, routing state, next-sid, the durable outbox).
     async fn spawn_stack(paths: CcteamPaths, adapter_state: Arc<RecordingState>) -> Stack {
         let bridge = build();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -531,6 +520,7 @@ mod tests {
         let args = ccteam_im::DaemonArgs {
             credentials: None,
             registry: Some(paths.projects_root.clone()),
+            ccteam_root: Some(paths.root.clone()),
             max_runtime: None,
             adapter_factory: Some(adapter_factory(adapter_state)),
             channels_override: None,
@@ -757,13 +747,10 @@ mod tests {
         listener.abort();
     }
 
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_chat_ws_routes_through_gateway_and_survives_restart() {
-        let _guard = env_lock();
         let home = TempDir::new().unwrap();
         let ccteam_home = home.path().join(".ccteam");
-        let _restore = EnvRestore::install(home.path(), &ccteam_home);
         let paths = fake_paths(home.path());
         std::fs::create_dir_all(&paths.projects_root).unwrap();
 
@@ -811,51 +798,47 @@ mod tests {
         drop(socket);
         stop_stack(second).await;
 
-        // The restore RE-SPAWNS each persisted session through the
-        // resume-aware `start_thread` (same sid → deterministic vendor uuid →
-        // `--resume`, conversation preserved); `HarnessAdapter::resume_thread`
-        // is NOT on that path. (A real stdio body that outlived the daemon is
-        // gated by its body record first — `session_body` — and waited for
-        // instead; this recording fake spawns no process, so every persisted
-        // session restores at once.) So the evidence that "restart resumed
-        // both sessions" is two MORE starts — exactly one per persisted
-        // session — not a `resume_thread` count.
+        // A restart spawns NOTHING: both sessions come back RELEASED (listed,
+        // addressable, resumable), and only the one actually driven — `@api`,
+        // the codex session — pays for a vendor process. That is the whole
+        // point of resume-by-sid: the fleet survives the restart, the RAM does
+        // not. When it does resume, it goes through the resume-aware
+        // `start_thread` (same sid → deterministic vendor uuid → `--resume`,
+        // conversation preserved), never `HarnessAdapter::resume_thread`.
         assert_eq!(
             adapter_state.starts.load(Ordering::SeqCst),
-            4,
-            "2 fresh spawns + exactly 1 re-spawn per persisted session on restart"
+            3,
+            "2 fresh spawns + exactly 1 on-demand resume (only `@api` was driven)"
         );
         assert_eq!(
             adapter_state.resumes.load(Ordering::SeqCst),
             0,
-            "restore goes through start_thread, never resume_thread"
+            "resume goes through start_thread, never resume_thread"
         );
-        // Each vendor started exactly twice (once fresh, once restored) — this
-        // is what proves the restart revived BOTH sessions rather than, say,
-        // re-spawning one of them twice.
+        // The codex session started twice (fresh + resumed on `@api`); the
+        // claude one exactly once — it was listed and addressable after the
+        // restart without ever costing a second process.
         let vendors = adapter_state.started_vendors.lock().await.clone();
         assert_eq!(
             vendors
                 .iter()
                 .filter(|v| **v == AgentVendor::Claude)
                 .count(),
-            2,
-            "claude session spawned fresh + restored once: {vendors:?}"
+            1,
+            "the undriven claude session was never re-spawned: {vendors:?}"
         );
         assert_eq!(
             vendors.iter().filter(|v| **v == AgentVendor::Codex).count(),
             2,
-            "codex session spawned fresh + restored once: {vendors:?}"
+            "codex session spawned fresh + resumed by `@api`: {vendors:?}"
         );
     }
 
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_chat_newproject_scaffolds_registers_and_cd_works() {
-        let _guard = env_lock();
+        keep_tests_off_the_real_claude_config();
         let home = TempDir::new().unwrap();
         let ccteam_home = home.path().join(".ccteam");
-        let _restore = EnvRestore::install(home.path(), &ccteam_home);
         let paths = fake_paths(home.path());
         std::fs::create_dir_all(&paths.projects_root).unwrap();
 
@@ -893,7 +876,6 @@ mod tests {
         stop_stack(stack).await;
     }
 
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn web_chat_sessions_share_the_web_console_pool() {
         // v0.8.18 柱2 档0 / cross-user fix (2026-07-28) — the web console pool is per IDENTITY. A
@@ -905,10 +887,7 @@ mod tests {
         // users and must stay isolated (owner report: cross-user session
         // leakage). IM-created sessions stay PRIVATE to their chat — covered by
         // the gateway own-only tests.
-        let _guard = env_lock();
         let home = TempDir::new().unwrap();
-        let ccteam_home = home.path().join(".ccteam");
-        let _restore = EnvRestore::install(home.path(), &ccteam_home);
         let paths = fake_paths(home.path());
         std::fs::create_dir_all(&paths.projects_root).unwrap();
 

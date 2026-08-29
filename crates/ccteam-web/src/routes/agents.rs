@@ -27,12 +27,20 @@
 //! closed. `?slug=` narrows the graph to one project (still gated by
 //! [`super::api_v1::can_see_project`]).
 //!
-//! **Status honesty**: a node is `"live"` when the gateway currently tracks
-//! it (in the in-memory session map) and `"idle"` otherwise (its `meta.json`
-//! persists on disk but nothing is currently spawned for it). This wave does
-//! not distinguish an idle-but-resumable session from one a user explicitly
-//! `stop`ped — no such flag exists on `meta.json` today; documented as a
-//! known scope reduction in the W4 handoff.
+//! **Status honesty — two axes, never one word.** `status` says what a
+//! session is DOING (`working|idle|stale|stuck`, resolved through the shared
+//! [`super::sessions_api::ProjectActivity`] — the same
+//! `ccteam_core::stall::classify_session_activity` the session rail, IM
+//! `/status` and MCP `session_list` answer through; `detached` keeps its own
+//! word). `residency` says whether ccteam is HOLDING a process for it
+//! (`resident|released|stopped|detached|external`).
+//!
+//! They used to be one field: `"live"` for anything in the gateway's live map,
+//! `"idle"` for everything else. The SPA mapped `live` → working, so every
+//! session ccteam happened to be holding open read as "working" — and after
+//! idle release started letting go of processes, every real conversation in a
+//! project's history read as "idle" next to them. Neither word was ever an
+//! answer to the question the reader was asking.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -84,9 +92,13 @@ pub struct AgentNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     pub host: String,
-    /// `"live"` (gateway-tracked) or `"idle"` (persisted, not tracked). See
-    /// the module doc's status-honesty note.
+    /// What the session is DOING: `working` | `idle` | `stale` | `stuck`, or
+    /// `detached` for a body that outlived the daemon. See the module doc.
     pub status: String,
+    /// Whether ccteam is HOLDING an execution attachment: `resident` |
+    /// `released` | `stopped` | `detached` | `external`. Orthogonal to
+    /// [`Self::status`] — see the module doc.
+    pub residency: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_sid: Option<String>,
     pub depth: u32,
@@ -175,30 +187,52 @@ fn normalize_host(host: &str) -> String {
 }
 
 /// Build the graph snapshot for exactly the given (already ACL-filtered)
-/// `slugs`, from a live-session-view lookup + armed-watch set the caller
-/// resolved under the gateway lock, plus `live_status` — the per-live-sid
-/// statusline the caller read AFTER dropping that lock (only live sids ever
-/// appear in it, so an idle node's `model`/`effort` are honestly `None`).
-/// Pure over its inputs (`project_dir` + these maps) so it's unit-testable
-/// without a server.
+/// `slugs`, from a live-session-view lookup + in-flight-turn + armed-watch set
+/// the caller resolved under the gateway lock, plus `live_status` — the
+/// per-live-sid statusline the caller read AFTER dropping that lock (only live
+/// sids ever appear in it, so a released node's `model`/`effort` fall back to
+/// the durable `meta.json` facts). `projection` supplies the file-backed
+/// activity verdict for every node, resident or not. Pure over its inputs so
+/// it's unit-testable without a server.
 pub(crate) fn build_agents_graph(
     project_dir_for: impl Fn(&str) -> std::path::PathBuf,
     slugs: &[String],
     live_by_sid: &HashMap<String, SessionView>,
     live_status: &HashMap<String, ThreadStatus>,
     armed_watches: &HashSet<String>,
+    projection: &ccteam_im::progress_projection::ProgressProjection,
+    live_turns: &HashMap<String, ccteam_core::stall::LiveTurn>,
 ) -> AgentsGraphResponse {
     let mut nodes = Vec::new();
     let mut hosts: HashSet<String> = HashSet::new();
     for slug in slugs {
         let dir = project_dir_for(slug);
+        // One snapshot + staleness baseline per PROJECT (a per-project fact),
+        // then one cheap question per session — the same shape the session
+        // list uses, through the same helper.
+        let activity = super::sessions_api::ProjectActivity::new(projection, slug);
         for m in ccteam_harness::list_session_metas(&dir) {
             let host = normalize_host(&m.host);
             hosts.insert(host.clone());
-            let status = if live_by_sid.contains_key(&m.sid) {
-                "live"
+            let tracked = live_by_sid.get(&m.sid);
+            // Residency: what the gateway is holding, else what the durable
+            // record alone can say.
+            let residency = match tracked {
+                Some(view) => view.residency.clone(),
+                None if !m.managed_by.is_driveable() => "external".to_string(),
+                None if m.stopped_at.is_some() => "stopped".to_string(),
+                None => "released".to_string(),
+            };
+            // A detached body is neither working nor idle in the activity
+            // sense — its own word stands (same rule as the session list).
+            let status = if residency == "detached" {
+                "detached".to_string()
             } else {
-                "idle"
+                activity
+                    .resolve(&m.sid, live_turns.get(&m.sid).copied())
+                    .status
+                    .activity
+                    .to_string()
             };
             let live = live_status.get(&m.sid);
             nodes.push(AgentNode {
@@ -214,7 +248,8 @@ pub(crate) fn build_agents_graph(
                     .and_then(|s| s.effort.clone())
                     .or_else(|| m.effort.clone()),
                 host,
-                status: status.to_string(),
+                status,
+                residency,
                 parent_sid: m.parent_sid.clone(),
                 depth: m.delegation_depth,
                 cost_usd: m.cost_usd,
@@ -279,13 +314,16 @@ pub(crate) async fn handle_agents_graph(
         Some(slug) => vec![slug.clone()],
         None => visible_project_slugs(&app, &identity),
     };
-    let (live_by_sid, armed_watches, live_handles) = {
+    let (live_by_sid, live_turns, armed_watches, live_handles) = {
         let guard = gw.lock().await;
         let live: HashMap<String, SessionView> = guard
             .session_views()
             .into_iter()
             .map(|v| (v.sid.clone(), v))
             .collect();
+        // The daemon's in-flight turns, taken under the SAME lock that produced
+        // the views — the live half of the activity verdict.
+        let live_turns = guard.live_turns();
         let armed = guard.armed_delegation_watch_sids();
         // `(adapter, thread)` clones for every live sid, resolved under this
         // same single lock acquisition — the `thread_status` I/O below runs
@@ -299,7 +337,7 @@ pub(crate) async fn handle_agents_graph(
                     .map(|(adapter, thread)| (sid.clone(), adapter, thread))
             })
             .collect();
-        (live, armed, handles)
+        (live, live_turns, armed, handles)
     };
     // The live-statusline join (model + effort): one per-live-sid read per
     // snapshot, through the SAME helper `GET /sessions/{sid}/status` serves —
@@ -319,7 +357,7 @@ pub(crate) async fn handle_agents_graph(
             |(sid, adapter, thread)| async move {
                 match tokio::time::timeout(
                     LIVE_STATUS_DEADLINE,
-                    super::sessions_api::resolved_thread_status(adapter, thread, &sid),
+                    ccteam_im::gateway::resolved_thread_status(adapter, thread, &sid),
                 )
                 .await
                 {
@@ -345,6 +383,8 @@ pub(crate) async fn handle_agents_graph(
         &live_by_sid,
         &live_status,
         &armed_watches,
+        &app.progress_projection,
+        &live_turns,
     );
     Json(graph).into_response()
 }
@@ -479,6 +519,7 @@ mod tests {
         let mut m = ccteam_harness::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: sid.to_string(),
             slug: "demo".to_string(),
             vendor,
@@ -508,6 +549,18 @@ mod tests {
         };
         m.sid = sid.to_string();
         ccteam_harness::write_session_meta(dir, &m).unwrap();
+    }
+
+    /// A projection over an empty ccteam home: every session's activity falls
+    /// back to the file verdict for "no progress rows", i.e. `idle`. Enough for
+    /// the topology/model assertions below, which are not about activity.
+    fn empty_projection(
+        tmp: &std::path::Path,
+    ) -> std::sync::Arc<ccteam_im::progress_projection::ProgressProjection> {
+        ccteam_im::progress_projection::ProgressProjection::new(ccteam_core::CcteamPaths {
+            root: tmp.join("home"),
+            projects_root: tmp.join("projects"),
+        })
     }
 
     #[test]
@@ -543,6 +596,8 @@ mod tests {
             &live,
             &HashMap::new(),
             &armed,
+            &empty_projection(tmp.path()),
+            &HashMap::new(),
         );
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
@@ -550,12 +605,14 @@ mod tests {
         assert_eq!(graph.edges[0].child, "s2");
         assert!(graph.edges[0].active, "s2 has an armed watch");
         assert_eq!(graph.hosts, vec!["local".to_string()]);
-        // Neither sid is in the live map ⇒ both idle.
+        // Neither sid is in the live map ⇒ both RELEASED (residency), and with
+        // no progress rows the file verdict for both is `idle` (activity).
+        assert!(graph.nodes.iter().all(|n| n.residency == "released"));
         assert!(graph.nodes.iter().all(|n| n.status == "idle"));
     }
 
     #[test]
-    fn build_agents_graph_marks_live_sessions() {
+    fn build_agents_graph_marks_resident_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("demo");
         std::fs::create_dir_all(&dir).unwrap();
@@ -582,6 +639,7 @@ mod tests {
                 host: "local".to_string(),
                 current: false,
                 status: "live".to_string(),
+                residency: "resident".to_string(),
                 last_activity_seconds: None,
                 created_at: String::new(),
                 last_active: String::new(),
@@ -601,8 +659,36 @@ mod tests {
             &live,
             &HashMap::new(),
             &HashSet::new(),
+            &empty_projection(tmp.path()),
+            &HashMap::new(),
         );
-        assert_eq!(graph.nodes[0].status, "live");
+        // RESIDENCY says ccteam is holding a process; ACTIVITY still answers
+        // what it is doing — being held open is not "working".
+        assert_eq!(graph.nodes[0].residency, "resident");
+        assert_eq!(graph.nodes[0].status, "idle");
+
+        // …and an in-flight turn is what makes it `working`.
+        let live_turns: HashMap<String, ccteam_core::stall::LiveTurn> = [(
+            "s1".to_string(),
+            ccteam_core::stall::LiveTurn {
+                silent_seconds: 1,
+                elapsed_seconds: 1,
+                stuck_after_seconds: 300,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let graph = build_agents_graph(
+            |_| dir.clone(),
+            &["demo".to_string()],
+            &live,
+            &HashMap::new(),
+            &HashSet::new(),
+            &empty_projection(tmp.path()),
+            &live_turns,
+        );
+        assert_eq!(graph.nodes[0].status, "working");
+        assert_eq!(graph.nodes[0].residency, "resident");
     }
 
     /// TEAM-4 — `nodes[].model` + `nodes[].effort` come from the caller's
@@ -645,6 +731,7 @@ mod tests {
                 host: "local".to_string(),
                 current: false,
                 status: "live".to_string(),
+                residency: "resident".to_string(),
                 last_activity_seconds: None,
                 created_at: String::new(),
                 last_active: String::new(),
@@ -674,6 +761,8 @@ mod tests {
             &live,
             &live_status,
             &HashSet::new(),
+            &empty_projection(tmp.path()),
+            &HashMap::new(),
         );
         let by_sid = |sid: &str| graph.nodes.iter().find(|n| n.sid == sid).unwrap();
         assert_eq!(by_sid("s1").model.as_deref(), Some("fable-5"));
@@ -681,7 +770,7 @@ mod tests {
         assert_eq!(
             by_sid("s2").model,
             None,
-            "an idle node has nothing live to report"
+            "a released node has nothing live to report"
         );
         assert_eq!(by_sid("s2").effort, None);
     }
@@ -708,6 +797,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: None,
         };
@@ -743,6 +833,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: None,
         };
@@ -764,6 +855,7 @@ mod tests {
             kind: ccteam_im::gateway::GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: Vec::new(),
+            status: None,
             sid: None,
             slug: Some("demo".to_string()),
         };

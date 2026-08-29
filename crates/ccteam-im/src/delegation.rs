@@ -1,10 +1,8 @@
 //! v0.9.0 W2 (F2/F5/F7) — delegation support types + pure helpers that don't
 //! need the `Gateway`'s private state (those methods live in `gateway.rs`).
 //!
-//! Holds: the pump → notifier signal, the bounded/TTL'd idempotency cache
-//! (in-memory only — honest: does NOT survive a restart), the completion
-//! notification text builder, and the workflow budget-cap parser. Live spend
-//! and delegation counters come from the shared progress projection.
+//! Holds the pump → notifier signal, bounded/TTL'd idempotency cache, shared
+//! delegation summary renderers, and the workflow budget-cap parser.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -24,8 +22,7 @@ use ccteam_harness::AgentVendor;
 ///   vendor turn (codex narrates checkpoints this way). Only an `all` watch
 ///   ever notifies on these.
 /// - `boundary: true` — the vendor turn finished (`TurnCompleted` /
-///   `TurnFailed` / `Error`): the child is now IDLE, waiting for the next
-///   dispatch. This is the default (`final`) notification point.
+///   `TurnFailed` / `Error`). This is the default (`final`) notification point.
 #[derive(Debug, Clone)]
 pub struct DelegationSignal {
     /// The child session whose message/turn just completed.
@@ -52,6 +49,109 @@ pub struct DelegationSignal {
     /// boundary these are recorded into `notified_turns` in one batch so a
     /// daemon-restart reconcile never re-delivers folded interim messages.
     pub covered_turns: Vec<String>,
+    /// Child context usage carried into the parent only at the turn boundary.
+    pub context_pct: Option<u64>,
+    /// Vendor turn ordinal shown in status surfaces.
+    pub turn: u64,
+    /// Stable failure kind when the boundary is a vendor error.
+    pub error_kind: Option<String>,
+}
+
+/// One source of truth for completion notifications and inline wait results.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DelegationSummary<'a> {
+    pub sid: &'a str,
+    pub turn_id: &'a str,
+    pub turn: u64,
+    pub outcome: DelegationOutcome,
+    pub context_pct: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub answer: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DelegationOutcome {
+    Done,
+    Failed {
+        kind: Option<String>,
+        error: Option<String>,
+    },
+}
+
+pub(crate) const INLINE_RESULT_MAX_CHARS: usize = 10_000;
+
+pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option<u64> {
+    status
+        .and_then(|status| status.context.as_ref())
+        .and_then(|context| context.pct())
+        .map(|pct| pct.round() as u64)
+}
+
+impl DelegationSummary<'_> {
+    pub(crate) fn notification_text(&self) -> String {
+        let outcome = match &self.outcome {
+            DelegationOutcome::Done => format!("{} done", self.sid),
+            DelegationOutcome::Failed { kind, .. } => format!(
+                "{} FAILED ({})",
+                self.sid,
+                kind.as_deref()
+                    .filter(|kind| !kind.is_empty())
+                    .unwrap_or("vendor error")
+            ),
+        };
+        let first = match self.context_pct {
+            Some(pct) => format!(
+                "{outcome} · turn {} · ctx {pct}%{}",
+                self.turn,
+                if pct >= 85 { "⚠" } else { "" }
+            ),
+            None => format!("{outcome} · turn {}", self.turn),
+        };
+        let answer = truncate_head_tail_with_marker(
+            self.answer.trim(),
+            NOTIFICATION_ANSWER_MAX_CHARS,
+            |omitted| full_answer_marker(omitted, self.sid),
+        );
+        if answer.text.is_empty() {
+            first
+        } else {
+            format!("{first}\n{}", answer.text)
+        }
+    }
+
+    pub(crate) fn inline_result(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut result = serde_json::Map::new();
+        result.insert("turn_id".into(), serde_json::json!(self.turn_id));
+        result.insert("turn".into(), serde_json::json!(self.turn));
+        let (kind, error) = match &self.outcome {
+            DelegationOutcome::Done => {
+                result.insert("status".into(), serde_json::json!("completed"));
+                (None, None)
+            }
+            DelegationOutcome::Failed { kind, error } => {
+                result.insert("status".into(), serde_json::json!("failed"));
+                (kind.as_deref(), error.as_deref())
+            }
+        };
+        if let Some(pct) = self.context_pct {
+            result.insert("context_pct".into(), serde_json::json!(pct));
+        }
+        let answer =
+            truncate_head_tail_with_marker(self.answer, INLINE_RESULT_MAX_CHARS, |omitted| {
+                full_answer_marker(omitted, self.sid)
+            });
+        result.insert("result_text".into(), serde_json::json!(answer.text));
+        if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
+            result.insert("error_kind".into(), serde_json::json!(kind));
+        }
+        if let Some(error) = error.filter(|error| !error.is_empty()) {
+            result.insert("error".into(), serde_json::json!(error));
+        }
+        if let Some(cost) = self.cost_usd {
+            result.insert("cost_usd".into(), serde_json::json!(cost));
+        }
+        result
+    }
 }
 
 /// The `notified_turns` key recording that a turn's BOUNDARY notification was
@@ -135,79 +235,12 @@ pub(crate) fn truncate_head_tail_with_marker(
 pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 4_000;
 
 pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
-    format!(
-        "…[truncated {omitted} chars — full text stays in the session ledger; run session_collect{{sid:{child_sid}, tail:true}} for the full answer]…"
-    )
+    format!("…[+{omitted} chars: session_collect{{sid:{child_sid},tail:true}}]…")
 }
 
-/// Build the task-completion notification delivered to the parent when the
-/// child's vendor turn finishes. English, `[ccteam]`-prefixed, names the child
-/// sid + vendor + optional title + turn id, includes a truncated final answer,
-/// and — the v0.9.5 feedback fix — states EXPLICITLY that the child is now
-/// idle and waiting, so a parent can always tell "task done / child stopped"
-/// from mere progress narration. This is a routed user-role message (NOT a
-/// system-prompt injection); `title` is a label only.
-pub fn build_notification_text(
-    child_sid: &str,
-    vendor: AgentVendor,
-    title: Option<&str>,
-    turn_id: &str,
-    assistant_text: &str,
-    interim_notes: usize,
-) -> String {
-    build_notification_text_with_outcome(
-        child_sid,
-        vendor,
-        title,
-        turn_id,
-        assistant_text,
-        interim_notes,
-        false,
-    )
-}
-
-/// Outcome-aware completion notification used by the gateway. Keeping the
-/// ordinary public builder as a success wrapper makes its existing output a
-/// byte-for-byte compatibility contract while structured vendor failures get
-/// an unmistakable leading marker.
-pub(crate) fn build_notification_text_with_outcome(
-    child_sid: &str,
-    vendor: AgentVendor,
-    title: Option<&str>,
-    turn_id: &str,
-    assistant_text: &str,
-    interim_notes: usize,
-    vendor_error: bool,
-) -> String {
-    let label = title
-        .filter(|t| !t.is_empty())
-        .map(|t| format!(" \"{t}\""))
-        .unwrap_or_default();
-    let excerpt = truncate_head_tail_with_marker(
-        assistant_text.trim(),
-        NOTIFICATION_ANSWER_MAX_CHARS,
-        |omitted| full_answer_marker(omitted, child_sid),
-    );
-    let folded = if interim_notes > 0 {
-        format!(
-            " {interim_notes} interim note(s) from this turn stayed in the ledger \
-             (session_collect{{sid:{child_sid}}} pages the full trail)."
-        )
-    } else {
-        String::new()
-    };
-    let outcome = if vendor_error {
-        "[delegation completed with VENDOR ERROR] "
-    } else {
-        ""
-    };
-    format!(
-        "[ccteam] {outcome}delegated session {child_sid} ({}{label}) completed turn {turn_id} and is now IDLE, waiting for the next dispatch.{folded}\n\
-         --- final answer ---\n{}\n\
-         (child is idle: if the task is not actually finished, follow up with session_dispatch{{sid:{child_sid}, task:…}}; run session_collect{{sid:{child_sid}, tail:true}} for the full answer)",
-        vendor_key(vendor),
-        excerpt.text,
-    )
+/// Render the ordinary user-role completion turn sent to the parent.
+pub(crate) fn build_notification_text_with_outcome(summary: &DelegationSummary<'_>) -> String {
+    summary.notification_text()
 }
 
 /// Build the interim-note notification (an `all`-mode watch only): the child
@@ -220,21 +253,17 @@ pub fn build_interim_notification_text(
     turn_id: &str,
     assistant_text: &str,
 ) -> String {
-    let label = title
-        .filter(|t| !t.is_empty())
-        .map(|t| format!(" \"{t}\""))
-        .unwrap_or_default();
+    let _ = (vendor, title, turn_id);
     let excerpt = truncate_head_tail_with_marker(
         assistant_text.trim(),
         NOTIFICATION_ANSWER_MAX_CHARS,
         |omitted| full_answer_marker(omitted, child_sid),
     );
-    format!(
-        "[ccteam] delegated session {child_sid} ({}{label}) posted an interim note (turn {turn_id}) — still WORKING, no action needed.\n\
-         --- note ---\n{}",
-        vendor_key(vendor),
-        excerpt.text,
-    )
+    if excerpt.text.is_empty() {
+        format!("{child_sid} interim")
+    } else {
+        format!("{child_sid} interim\n{}", excerpt.text)
+    }
 }
 
 /// Lowercase wire name of a vendor — the key `cost_24h_by_vendor` uses and the
@@ -403,37 +432,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn notification_text_states_task_done_and_idle() {
-        let t = build_notification_text(
-            "s7",
-            AgentVendor::Grok,
-            Some("research"),
-            "s7-3",
-            "hello",
-            0,
-        );
-        assert!(t.starts_with(
-            "[ccteam] delegated session s7 (grok \"research\") completed turn s7-3 and is now IDLE"
-        ));
-        assert!(t.contains("hello"));
-        assert!(t.contains("session_collect{sid:s7, tail:true}"));
-        // Single-message turn → no interim-fold sentence.
+    fn notification_text_uses_minimal_done_header() {
+        let t = DelegationSummary {
+            sid: "s444",
+            turn_id: "codex-uuid",
+            turn: 3,
+            outcome: DelegationOutcome::Done,
+            context_pct: Some(31),
+            cost_usd: None,
+            answer: "hello",
+        }
+        .notification_text();
+        assert_eq!(t, "s444 done · turn 3 · ctx 31%\nhello");
+        assert!(!t.contains("[ccteam]"));
+        assert!(!t.contains("--- final answer ---"));
+        assert!(!t.contains("child is idle"));
         assert!(!t.contains("interim note(s)"));
-        assert_eq!(
-            t,
-            "[ccteam] delegated session s7 (grok \"research\") completed turn s7-3 and is now IDLE, waiting for the next dispatch.\n\
-             --- final answer ---\n\
-             hello\n\
-             (child is idle: if the task is not actually finished, follow up with session_dispatch{sid:s7, task:…}; run session_collect{sid:s7, tail:true} for the full answer)"
-        );
     }
 
     #[test]
     fn notification_text_folds_interim_notes() {
-        let t = build_notification_text("s69", AgentVendor::Codex, None, "s69-54", "wave done", 53);
-        assert!(t.contains("is now IDLE, waiting for the next dispatch"));
-        assert!(t.contains("53 interim note(s) from this turn stayed in the ledger"));
-        assert!(t.contains("session_dispatch{sid:s69"));
+        let summary = DelegationSummary {
+            sid: "s69",
+            turn_id: "s69-54",
+            turn: 3,
+            outcome: DelegationOutcome::Done,
+            context_pct: Some(3),
+            cost_usd: Some(0.42),
+            answer: "wave done",
+        };
+        assert_eq!(
+            build_notification_text_with_outcome(&summary),
+            "s69 done · turn 3 · ctx 3%\nwave done"
+        );
     }
 
     #[test]
@@ -445,9 +476,7 @@ mod tests {
             "s69-3",
             "reading queue",
         );
-        assert!(t.starts_with("[ccteam] delegated session s69 (codex \"wave\") posted an interim note (turn s69-3) — still WORKING"));
-        assert!(t.contains("no action needed"));
-        assert!(t.contains("reading queue"));
+        assert_eq!(t, "s69 interim\nreading queue");
     }
 
     #[test]
@@ -462,20 +491,57 @@ mod tests {
             "HEAD{}TAIL",
             "x".repeat(NOTIFICATION_ANSWER_MAX_CHARS + 500)
         );
-        let t = build_notification_text("s1", AgentVendor::Claude, None, "s1-1", &long, 0);
+        let t = DelegationSummary {
+            sid: "s1",
+            turn_id: "s1-1",
+            turn: 4,
+            outcome: DelegationOutcome::Done,
+            context_pct: None,
+            cost_usd: None,
+            answer: &long,
+        }
+        .notification_text();
         assert!(t.contains("HEAD"));
         assert!(t.contains("TAIL"));
-        assert!(t.contains("truncated"));
-        assert!(t.contains("session_collect{sid:s1, tail:true}"));
-        assert!(t.contains("(claude)"));
-        let embedded = t
-            .split_once("--- final answer ---\n")
-            .unwrap()
-            .1
-            .split_once("\n(child is idle:")
-            .unwrap()
-            .0;
+        assert!(t.contains("…[+"));
+        assert!(t.contains("session_collect{sid:s1,tail:true}"));
+        let embedded = t.split_once('\n').unwrap().1;
         assert_eq!(embedded.chars().count(), NOTIFICATION_ANSWER_MAX_CHARS);
+    }
+
+    #[test]
+    fn notification_text_failed_header_and_context_warning() {
+        let summary = DelegationSummary {
+            sid: "s444",
+            turn_id: "codex-uuid",
+            turn: 3,
+            outcome: DelegationOutcome::Failed {
+                kind: Some("turn_timeout".into()),
+                error: Some("oops".into()),
+            },
+            context_pct: Some(31),
+            cost_usd: None,
+            answer: "oops",
+        };
+        assert_eq!(
+            build_notification_text_with_outcome(&summary),
+            "s444 FAILED (turn_timeout) · turn 3 · ctx 31%\noops"
+        );
+    }
+
+    #[test]
+    fn notification_text_omits_unknown_context() {
+        let t = DelegationSummary {
+            sid: "s444",
+            turn_id: "s1-1",
+            turn: 3,
+            outcome: DelegationOutcome::Done,
+            context_pct: None,
+            cost_usd: None,
+            answer: "ok",
+        }
+        .notification_text();
+        assert_eq!(t.lines().next(), Some("s444 done · turn 3"));
     }
 
     #[test]

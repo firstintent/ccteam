@@ -15,7 +15,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::materialize::{materialize_profile_in, DshClientConfig, ProfileSpec, WEB_PROFILE};
+use super::materialize::{materialize_profile_in, DshPluginConfig, ProfileSpec, WEB_PROFILE};
 use crate::{ccteam_root_from_env, HarnessError, SpawnCtx};
 
 pub const DSH_BIN_ENV: &str = "CCTEAM_DSH_BIN";
@@ -336,12 +336,19 @@ pub struct DshWebSpawnOptions<'a> {
     pub profile: &'a str,
     /// `true` = ccteam owns this whole profile (managed tenant home).
     /// `false` = the operator's own `~/.dsh`: ccteam merges ONLY its own
-    /// `@ccteam/dsh-client` entries in (gate ①), never a whole profile.
+    /// `@ccteam/ccteam-ui` entries in (gate ①), never a whole profile.
     pub materialize_profile: bool,
     pub enrollment: Option<&'a str>,
     pub daemon_url: Option<&'a str>,
     /// ACP socket the embedded ccteam plugin serves on for this identity.
     pub transport_socket: Option<&'a Path>,
+    /// This identity's own ccteam REST bearer (`ccteam:<hex>`), for the ccteam
+    /// panel — on both branches (owner decision 2026-08-28: the operator's own
+    /// admin web token goes into the operator's own profile; pasting a token
+    /// is for a hand-started `dsh web` only). `None` = nothing written and the
+    /// panel asks. Enrollment keeps the older line: `None` on the operator
+    /// branch.
+    pub rest_token: Option<&'a str>,
 }
 
 /// Build a `dsh web` child command for one identity's DSH runtime.
@@ -365,10 +372,15 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
     if let Some(path) = options.transport_socket {
         ensure_socket_dir(path)?;
     }
-    let config = DshClientConfig {
-        enrollment: options.enrollment,
+    // ccteam's one row: this daemon's URL for every face, the enrollment
+    // credential and socket for the tool + transport faces, and — when the
+    // runtime resolved one — this identity's REST bearer for the workbench
+    // (see `DshWebSpawnOptions::rest_token`).
+    let config = DshPluginConfig {
         daemon_url: options.daemon_url,
+        enrollment: options.enrollment,
         transport_socket: socket.as_deref(),
+        rest_token: options.rest_token,
     };
     if options.materialize_profile {
         seed_or_refresh_tenant_web_config_home(
@@ -382,7 +394,7 @@ pub fn build_web_spawn_spec(options: DshWebSpawnOptions<'_>) -> Result<DshSpawnS
             ProfileSpec::web(config),
         )?;
     } else {
-        super::materialize::register_dsh_client_into_profile(
+        super::materialize::register_ccteam_plugins_into_profile(
             &options.ccteam_home,
             &options.dsh_home,
             options.profile,
@@ -638,88 +650,11 @@ fn reject_demo_bin(bin: &str) -> Result<(), HarnessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    use serial_test::serial;
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn capture(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .copied()
-                    .map(|key| (key, std::env::var_os(key)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.iter().rev() {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
-
-    fn write_config_pair(home: &Path, credentials: &[u8], settings: Option<&[u8]>) {
-        std::fs::create_dir_all(home).unwrap();
-        std::fs::write(home.join(CREDENTIALS_FILE), credentials).unwrap();
-        if let Some(settings) = settings {
-            std::fs::write(home.join(SETTINGS_FILE), settings).unwrap();
-        }
-    }
-
-    /// One person, one DSH home — and the same one no matter which key shape
-    /// the caller holds (`owner_tag` on the adapter path, `operator` + `id` on
-    /// the runtime-manager path). A drift here would put the adapter's socket
-    /// in one home and the runtime's process in another.
-    #[test]
-    #[serial(dsh_config_env)]
-    fn identity_home_maps_tenants_managed_and_everyone_else_to_the_operator_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::capture(&["HOME"]);
-        let home = tmp.path().join("home");
-        let ccteam_home = tmp.path().join("ccteam-home");
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-
-        let tenant = identity_dsh_home("user:alice", &ccteam_home).unwrap();
-        assert_eq!(tenant, ccteam_home.join("runtime/dsh/web/alice"));
-        assert_eq!(
-            identity_dsh_home("user:alice", &ccteam_home).unwrap(),
-            tenant,
-            "same owner must always resolve to the same home"
-        );
-        assert_eq!(
-            dsh_home_for_identity(false, "alice", &ccteam_home).unwrap(),
-            tenant,
-            "the runtime manager's key shape must agree with the owner tag"
-        );
-
-        let operator = home.join(USER_DSH_DIR);
-        for tag in ["user:web-api", "user:", "telegram:123", ""] {
-            assert_eq!(
-                identity_dsh_home(tag, &ccteam_home).unwrap(),
-                operator,
-                "`{tag}` is the operator and owns ~/.dsh"
-            );
-        }
-        assert_eq!(
-            dsh_home_for_identity(true, "admin", &ccteam_home).unwrap(),
-            operator
-        );
-    }
+    // Every env-mutating DSH spawn-spec test lives in
+    // `tests/dsh_acp_test.rs` (AGENTS.md §六): the lib target is one process
+    // at full parallelism, so a `HOME`/`DEEPSEEK_API_KEY` write here is
+    // visible to every other lib test. What stays below is pure or injected.
 
     #[test]
     fn identity_socket_path_is_one_short_path_per_identity() {
@@ -838,80 +773,5 @@ mod tests {
         make_executable(&newer);
         let found = find_cached_dsh_bin_under(&home).unwrap();
         assert_eq!(found, newer);
-    }
-
-    #[test]
-    #[serial(dsh_config_env)]
-    fn config_source_prefers_tenant_home_with_credentials() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::capture(&["HOME", DEEPSEEK_API_KEY_ENV]);
-        let home = tmp.path().join("home");
-        let ccteam_home = tmp.path().join("ccteam-home");
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::remove_var(DEEPSEEK_API_KEY_ENV);
-        }
-
-        let operator_home = home.join(USER_DSH_DIR);
-        write_config_pair(&operator_home, b"operator", Some(b"operator-settings"));
-        let tenant_home = ccteam_home
-            .join("runtime")
-            .join("dsh")
-            .join("web")
-            .join(tenant_home_segment("alice"));
-        write_config_pair(&tenant_home, b"tenant", None);
-
-        assert_eq!(
-            dsh_config_source("user:alice", &ccteam_home),
-            DshConfigSource::TenantHome(tenant_home)
-        );
-        assert_eq!(
-            dsh_config_source("user:bob", &ccteam_home),
-            DshConfigSource::OperatorHome(operator_home)
-        );
-    }
-
-    #[test]
-    #[serial(dsh_config_env)]
-    fn tenant_web_seed_refreshes_unmodified_files_from_operator_home() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::capture(&["HOME", DEEPSEEK_API_KEY_ENV]);
-        let home = tmp.path().join("home");
-        let ccteam_home = tmp.path().join("ccteam-home");
-        let operator_home = home.join(USER_DSH_DIR);
-        let tenant_home = ccteam_home
-            .join("runtime")
-            .join("dsh")
-            .join("web")
-            .join(tenant_home_segment("alice"));
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::remove_var(DEEPSEEK_API_KEY_ENV);
-        }
-        write_config_pair(&operator_home, b"creds-v1", Some(b"settings-v1"));
-
-        seed_or_refresh_tenant_web_config_home("user:alice", &ccteam_home, &tenant_home).unwrap();
-        assert_eq!(
-            std::fs::read(tenant_home.join(CREDENTIALS_FILE)).unwrap(),
-            b"creds-v1"
-        );
-        assert_eq!(
-            std::fs::read(tenant_home.join(SETTINGS_FILE)).unwrap(),
-            b"settings-v1"
-        );
-        let marker = read_seed_marker(&tenant_home.join(SEED_MARKER_FILE)).unwrap();
-        assert_eq!(marker.credentials_sha256, sha256_hex(b"creds-v1"));
-        assert_eq!(marker.settings_sha256, Some(sha256_hex(b"settings-v1")));
-
-        write_config_pair(&operator_home, b"creds-v2", Some(b"settings-v2"));
-        seed_or_refresh_tenant_web_config_home("user:alice", &ccteam_home, &tenant_home).unwrap();
-        assert_eq!(
-            std::fs::read(tenant_home.join(CREDENTIALS_FILE)).unwrap(),
-            b"creds-v2"
-        );
-        assert_eq!(
-            std::fs::read(tenant_home.join(SETTINGS_FILE)).unwrap(),
-            b"settings-v2"
-        );
     }
 }

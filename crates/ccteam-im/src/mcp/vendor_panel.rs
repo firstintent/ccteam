@@ -589,7 +589,7 @@ fn render_recipes(
             "opencode" => "session_spawn{vendor:\"opencode\", task:\"…\"}",
             "pi" => "session_spawn{vendor:\"pi\", task:\"…\"} — managed local Pi RPC session with the ccteam bridge",
             "dsh" => {
-                "session_spawn{vendor:\"dsh\", task:\"…\"} — DeepSeek Harness via managed spawn (automatic ccteam plugin; no user action needed). External DSH plugin: dsh plugin --profile web add @ccteam/dsh-client; has cold resume"
+                "session_spawn{vendor:\"dsh\", task:\"…\"} — DeepSeek Harness via managed spawn (automatic ccteam plugin; no user action needed). External DSH plugin: dsh plugin --profile web add @ccteam/ccteam-ui; has cold resume"
             }
             _ => continue,
         };
@@ -863,7 +863,7 @@ mod tests {
         assert!(out.contains("session_spawn{vendor:\"claude\""), "{out}");
         assert!(out.contains("session_spawn{vendor:\"dsh\""), "{out}");
         assert!(
-            out.contains("dsh plugin --profile web add @ccteam/dsh-client"),
+            out.contains("dsh plugin --profile web add @ccteam/ccteam-ui"),
             "{out}"
         );
         assert!(out.contains("has cold resume"), "{out}");

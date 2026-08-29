@@ -1,0 +1,19 @@
+{
+  "name": "@ccteam/engine-linux-arm64",
+  "version": "0.0.0-template",
+  "description": "The ccteam engine binary for linux arm64. Installed as an optional dependency of @ccteam/ccteam-ui; npm and pnpm skip it on every other platform.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/firstintent/ccteam.git"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "bin": {
+    "ccteam": "bin/ccteam"
+  },
+  "files": [
+    "bin/ccteam"
+  ],
+  "preferUnplugged": true
+}

@@ -124,6 +124,65 @@ pub fn daemon_socket_path(paths: &CcteamPaths) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// endpoint publication (address discovery for `GET /health`)
+// ---------------------------------------------------------------------------
+
+/// `~/.ccteam/run/daemon-endpoint.json` — where the RUNNING daemon
+/// publishes the address it actually bound, after it bound it.
+///
+/// This is a **pointer, not an identity**: its only consumer uses it to
+/// find `GET /health`, and `/health` — answered by the live process — is
+/// the identity source of truth. Keeping the split is the whole point:
+/// the launcher's recorded argv says what was *requested* (`:0` means
+/// "any free port"), which is not what the daemon ends up serving.
+pub const ENDPOINT_NAME: &str = "daemon-endpoint.json";
+
+/// Resolve `~/.ccteam/run/daemon-endpoint.json`.
+pub fn endpoint_path(paths: &CcteamPaths) -> PathBuf {
+    paths.root.join("run").join(ENDPOINT_NAME)
+}
+
+/// The running daemon's actual web address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonEndpoint {
+    /// Pid of the process that published it, so a reader can tell a live
+    /// publication from one a SIGKILL left behind.
+    pub pid: u32,
+    /// `local_addr()` of the bound web listener — the assigned port, not
+    /// the requested one.
+    pub web_bind: String,
+}
+
+/// Publish the endpoint atomically (tmp + rename in the same dir).
+pub fn write_endpoint(path: &Path, endpoint: &DaemonEndpoint) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    let body = serde_json::to_vec(endpoint).context("serialize daemon endpoint")?;
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("publish {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Read the endpoint, but only while the publishing process is alive. A
+/// SIGKILLed daemon leaves the file behind, and handing that address to a
+/// caller would point it at whatever now owns the port.
+pub fn read_endpoint(path: &Path) -> Option<DaemonEndpoint> {
+    let endpoint: DaemonEndpoint =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    process_exists(endpoint.pid).then_some(endpoint)
+}
+
+/// Drop the publication (daemon shutdown). Idempotent.
+pub fn remove_endpoint(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+// ---------------------------------------------------------------------------
 // pid record
 // ---------------------------------------------------------------------------
 
@@ -142,6 +201,30 @@ pub struct PidRecord {
     pub version: String,
     /// RFC3339 spawn timestamp (informational).
     pub started_at: String,
+    /// The exact argv (program excluded) the launcher exec'd for this
+    /// daemon. Recorded so a restart REPLAYS the original invocation
+    /// instead of guessing defaults — the failure it prevents is an
+    /// update-restart silently moving a daemon off its custom
+    /// `--web-bind` (or dropping `--no-imd`) onto the compiled-in
+    /// default. `None` = written by a launcher that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+}
+
+/// Value of a `--flag <value>` pair in a recorded argv. Pure (no fs/env)
+/// so the callers that surface a running daemon's binds (`/health`'s
+/// sibling `ccteam daemon status --json`) unit-test without a daemon.
+pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            return it.next().map(String::as_str);
+        }
+        if let Some(rest) = a.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 /// Read + parse the pid record. `None` covers "missing", "unreadable"
@@ -454,8 +537,17 @@ pub struct DaemonStartSpec {
 /// Outcome of a start request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartVerdict {
-    Started { pid: u32, version: Option<String> },
-    AlreadyRunning { version: Option<String> },
+    Started {
+        pid: u32,
+        version: Option<String>,
+    },
+    AlreadyRunning {
+        version: Option<String>,
+        /// Pid of the instance already serving, when the launcher's pid
+        /// record identifies a live process. `None` for an instance this
+        /// launcher never spawned (no record / stale record).
+        pid: Option<u32>,
+    },
 }
 
 /// Outcome of a stop request. Refusals and timeouts are verdicts (not
@@ -611,14 +703,15 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
     use std::process::Stdio;
 
     let socket = daemon_socket_path(paths);
+    let pidfile = pidfile_path(paths);
     let probe = probe_daemon_at(&socket, DAEMON_PROBE_TIMEOUT);
     if probe.ready {
         return Ok(StartVerdict::AlreadyRunning {
             version: probe.version,
+            pid: live_record_pid(&pidfile),
         });
     }
 
-    let pidfile = pidfile_path(paths);
     if let Some(parent) = pidfile.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -633,6 +726,7 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
                 if probe.ready {
                     return Ok(StartVerdict::AlreadyRunning {
                         version: probe.version,
+                        pid: Some(record.pid),
                     });
                 }
                 if !process_matches_record(&record) {
@@ -722,6 +816,7 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
         process_start_time,
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
+        args: Some(spec.args.clone()),
     };
     if let Err(err) = write_pid_record(&pidfile, &record) {
         kill_and_reap(&mut child);
@@ -771,6 +866,14 @@ pub fn start_managed(paths: &CcteamPaths, spec: &DaemonStartSpec) -> Result<Star
 #[cfg(not(unix))]
 pub fn start_managed(_paths: &CcteamPaths, _spec: &DaemonStartSpec) -> Result<StartVerdict> {
     anyhow::bail!("daemon lifecycle is only supported on Unix")
+}
+
+/// Pid from the launcher's record, but only when it still names a live
+/// process — a stale record must never hand a caller someone else's pid.
+fn live_record_pid(pidfile: &Path) -> Option<u32> {
+    read_pid_record(pidfile)
+        .filter(process_matches_record)
+        .map(|r| r.pid)
 }
 
 /// Stop a managed daemon with default tuning. **Caller must hold the
@@ -1039,6 +1142,7 @@ mod tests {
             process_start_time: read_process_start_time(pid).unwrap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            args: None,
         }
     }
 
@@ -1065,6 +1169,75 @@ mod tests {
         );
         std::fs::write(&path, "not json at all").unwrap();
         assert_eq!(read_pid_record(&path), None);
+    }
+
+    #[test]
+    fn endpoint_roundtrips_and_a_dead_publisher_reads_as_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("run").join(ENDPOINT_NAME);
+        let live = DaemonEndpoint {
+            pid: std::process::id(),
+            web_bind: "127.0.0.1:46303".to_string(),
+        };
+        write_endpoint(&path, &live).unwrap();
+        assert_eq!(read_endpoint(&path), Some(live));
+        assert!(!path.with_extension("tmp").exists());
+
+        // pid 0 is never a live daemon: a publication its author did not
+        // outlive must not hand out an address somebody else may now own.
+        write_endpoint(
+            &path,
+            &DaemonEndpoint {
+                pid: 0,
+                web_bind: "127.0.0.1:46303".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_endpoint(&path), None);
+
+        remove_endpoint(&path);
+        assert_eq!(read_endpoint(&path), None);
+        remove_endpoint(&path); // idempotent
+    }
+
+    #[test]
+    fn arg_value_reads_space_and_equals_forms_and_misses_cleanly() {
+        let args: Vec<String> = [
+            "internal",
+            "daemon-run",
+            "--web-bind",
+            "127.0.0.1:9",
+            "--no-imd",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(arg_value(&args, "--web-bind"), Some("127.0.0.1:9"));
+        // A boolean flag has no value, and an absent flag is not an error.
+        assert_eq!(arg_value(&args, "--no-imd"), None);
+        assert_eq!(arg_value(&args, "--dsh-web-bind"), None);
+        let eq: Vec<String> = vec!["--web-bind=0.0.0.0:1".to_string()];
+        assert_eq!(arg_value(&eq, "--web-bind"), Some("0.0.0.0:1"));
+        // A prefix match must not be mistaken for the flag itself.
+        let other: Vec<String> = vec!["--web-bind-extra".to_string(), "x".to_string()];
+        assert_eq!(arg_value(&other, "--web-bind"), None);
+    }
+
+    #[test]
+    fn pid_record_without_args_still_parses() {
+        // The field is additive: a record written before it existed must
+        // read back as a VALID record (not "stale"), or an upgrade would
+        // orphan the running daemon.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("orchestrator.pid");
+        std::fs::write(
+            &path,
+            br#"{"pid":7,"process_start_time":"1","version":"0.0.0","started_at":"t"}"#,
+        )
+        .unwrap();
+        let record = read_pid_record(&path).expect("legacy record parses");
+        assert_eq!(record.pid, 7);
+        assert_eq!(record.args, None);
     }
 
     #[test]
@@ -1278,6 +1451,7 @@ mod tests {
             process_start_time: "0".into(),
             version: "0.0.0".into(),
             started_at: chrono::Utc::now().to_rfc3339(),
+            args: None,
         };
         write_pid_record(&pidfile_path(&p), &record).unwrap();
         let report = daemon_status(&p);

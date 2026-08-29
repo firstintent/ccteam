@@ -405,7 +405,7 @@ const SESSION_COLLECT_DEFAULT_N: usize = 20;
 const SESSION_COLLECT_DEFAULT_MAX_CHARS: usize = 10_000;
 const SESSION_COLLECT_MIN_MAX_CHARS: usize = 500;
 const SESSION_COLLECT_MAX_MAX_CHARS: usize = 50_000;
-const INLINE_RESULT_MAX_CHARS: usize = 10_000;
+use crate::delegation::{DelegationOutcome, DelegationSummary};
 
 /// Keep inline waits below the shortest common MCP client deadline (~300s),
 /// leaving 60s for spawn/submit work around the wait itself. The wire still
@@ -783,6 +783,7 @@ fn stage_web_outbound_file(
         user: String::new(),
         assistant: event.content.clone(),
         usage: serde_json::Value::Null,
+        status: None,
         tool_calls: Vec::new(),
         attachments: references,
         outcome: None,
@@ -867,6 +868,7 @@ fn build_send_file_event(
             kind,
         }],
         options: Vec::new(),
+        status: None,
         // Web staging replaces this with the server-resolved caller sid so
         // the current per-session SSE can render the reference live. IM-only
         // delivery keeps the historical `None`.
@@ -1052,6 +1054,7 @@ async fn execute_interaction_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            status: None,
             // The D6 `interaction/ask` hook prompt has no gateway session.
             sid: None,
             slug: if slug.is_empty() {
@@ -1281,6 +1284,7 @@ async fn execute_permission_ask(
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
             options: message_options,
+            status: None,
             // sid set so a per-session web UI stream can show the approval
             // (None would route to IM fine but be filtered out of SSE).
             sid: sid_label.clone(),
@@ -1988,8 +1992,7 @@ async fn run_session_spawn_at(
     }
     // Resolve only after validating the request facets: falling through to
     // scratch is a side effect and malformed spawns must not create projects.
-    let project_resolution = resolve_spawn_project(args, &caller, paths)?;
-    let project = project_resolution.slug.clone();
+    let project = resolve_spawn_project(args, &caller, paths)?.slug;
     // v0.9.1 delegation-ergonomics — optional FIRST task: spawn+dispatch in one
     // call (the dominant flow; saves the second round-trip and closes the
     // crash window between a spawn and its first dispatch). Identical
@@ -2042,16 +2045,6 @@ async fn run_session_spawn_at(
     // "my agent's children lost their parent edge" class of misconfiguration
     // (today: an agent whose vendor loaded the global config instead of its own,
     // so its calls ride an enrolled client's node rather than its principal).
-    let caller_label = match (&caller, parent.as_ref()) {
-        // Echo the RESOLVED origin, not just the tier: a caller that declared
-        // itself can see what ccteam actually attributed the child to.
-        (McpCaller::Admin, Some(p)) => format!("admin:{}", p.sid),
-        (McpCaller::Admin, None) => "admin".to_string(),
-        (McpCaller::Ambient, Some(p)) => format!("ambient:{}", p.sid),
-        (McpCaller::Ambient, None) => "ambient".to_string(),
-        (McpCaller::User { user_id }, _) => format!("user:{user_id}"),
-    };
-
     // v0.10 T1 — availability discovery: before minting a sid, fail fast when
     // the vendor is not installed on the project's BOUND host, listing the
     // vendors that ARE installed there (from the same probe/report snapshot)
@@ -2174,45 +2167,7 @@ async fn run_session_spawn_at(
         }
     })?;
     let sid = created.sid;
-    let resolved = gateway.lock().await.session_resolve(&sid);
-    // Read the child meta once for the vendor resume key + the delegation
-    // lineage (parent_sid/depth) the ledger just persisted.
-    // vendor_session_id = the vendor's native resume key (`meta.vendor_uuid`).
-    // May be empty for some vendors at spawn time — return "" honestly (the
-    // codex-plugin-cc lesson: always surface the resume key when we have it).
-    let child_meta = resolved.and_then(|r| {
-        ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &sid).ok()
-    });
-    let vendor_session_id = child_meta
-        .as_ref()
-        .map(|m| m.vendor_uuid.clone())
-        .unwrap_or_default();
-    let parent_sid = child_meta.as_ref().and_then(|m| m.parent_sid.clone());
-    let delegation_depth = child_meta.as_ref().map(|m| m.delegation_depth).unwrap_or(0);
-    let host = child_meta
-        .as_ref()
-        .map(|meta| meta.host.clone())
-        .unwrap_or_else(|| ccteam_core::LOCAL_HOST.to_string());
-
-    let mut body = serde_json::json!({
-        "ok": true,
-        "sid": sid,
-        "project": project,
-        "project_source": project_resolution.source,
-        "role": role,
-        "vendor": session_vendor_wire(vendor),
-        "protocol": protocol.as_str(),
-        "host": host,
-        "vendor_session_id": vendor_session_id,
-        "permission_mode": permission_mode.as_str(),
-        "parent_sid": parent_sid,
-        "delegation_depth": delegation_depth,
-        "caller": caller_label,
-        "hint": "dispatch a task with session_dispatch{sid, task}, then read the result with session_collect{sid}.",
-    });
-    if let Some(t) = &title {
-        body["title"] = serde_json::json!(t);
-    }
+    let mut body = serde_json::json!({"sid": sid});
     // v0.9.1 — dispatch the optional first task through the SAME submit path
     // session_dispatch uses; its outcome (turn_id / status / inline result /
     // hint) merges into the spawn body so one call returns everything. The
@@ -2260,7 +2215,6 @@ async fn run_session_spawn(
 
 struct SpawnProjectResolution {
     slug: String,
-    source: &'static str,
 }
 
 /// Resolve the MCP spawn project. Every rung must NAME the project the caller
@@ -2295,38 +2249,27 @@ fn resolve_spawn_project(
         McpCaller::Ambient => Ok(SpawnProjectResolution {
             slug: arg("_caller_slug")
                 .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
-            source: "principal",
         }),
         McpCaller::User { .. } => Ok(SpawnProjectResolution {
             slug: arg("project").ok_or_else(|| {
                 "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
                     .to_string()
             })?,
-            source: match args
-                .get("_caller_project_source")
-                .and_then(|value| value.as_str())
-            {
-                Some("sole") => "sole",
-                _ => "explicit",
-            },
         }),
         McpCaller::Admin => {
             if let Some(slug) = arg("project") {
                 return Ok(SpawnProjectResolution {
                     slug,
-                    source: "explicit",
                 });
             }
             if let Some(slug) = arg("_caller_slug") {
                 return Ok(SpawnProjectResolution {
                     slug,
-                    source: "cwd",
                 });
             }
             if let Some(slug) = sole_registered_project(paths) {
                 return Ok(SpawnProjectResolution {
                     slug,
-                    source: "sole",
                 });
             }
             Err(format!(
@@ -2373,19 +2316,10 @@ fn mcp_gateway_error(tool: &str, err: &anyhow::Error) -> String {
     }
 }
 
-/// v0.9.0 W2 (F7) — mark a recorded idempotency body as a replay: parse it,
-/// insert `"idempotent_replay": true`, re-serialize. On a parse miss (should
-/// never happen — we only store our own bodies) return the stored body as-is.
+/// Idempotent retries replay the original response byte-for-byte. Push
+/// surfaces deliberately carry no replay decoration.
 fn mark_idempotent_replay(body: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(mut v) => {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("idempotent_replay".to_string(), serde_json::json!(true));
-            }
-            serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.to_string())
-        }
-        Err(_) => body.to_string(),
-    }
+    body.to_string()
 }
 
 /// Stable error for the removed MCP `session_spawn.protocol` input.
@@ -2573,7 +2507,7 @@ async fn run_session_dispatch(
         deadline,
     )
     .await?;
-    let mut body = serde_json::json!({ "ok": true, "sid": sid });
+    let mut body = serde_json::json!({});
     if let Some(obj) = body.as_object_mut() {
         obj.extend(frag);
     }
@@ -2653,7 +2587,6 @@ enum CompletionNotificationRoute {
 
 #[derive(Debug, Clone, Copy)]
 struct InlineWaitWindow {
-    requested_seconds: u64,
     effective_seconds: u64,
 }
 
@@ -2681,42 +2614,8 @@ impl CompletionNotificationRoute {
         }
     }
 
-    fn deliverable(self) -> bool {
+    fn is_deliverable(self) -> bool {
         self == Self::ParentSession
-    }
-
-    fn async_hint(self) -> &'static str {
-        match self {
-            Self::ParentSession => {
-                "the child runs asynchronously; you will be notified on completion (or poll session_collect{sid})."
-            }
-            Self::Disabled => {
-                "the child runs asynchronously; notifications are disabled; poll session_collect{sid}."
-            }
-            Self::Unavailable => {
-                "the child runs asynchronously; this caller has no completion notification channel; poll session_collect{sid}."
-            }
-            Self::PeerUnsubscribed => {
-                "the task was handed to a session you did not delegate, so no completion watch was armed; poll session_collect{sid}, or re-dispatch with notify:\"final\" to be told when that one task ends."
-            }
-        }
-    }
-
-    fn pending_hint(self) -> &'static str {
-        match self {
-            Self::ParentSession => {
-                "still running; you will be notified on completion, or poll session_collect{sid}."
-            }
-            Self::Disabled => {
-                "still running; notifications are disabled; poll session_collect{sid}."
-            }
-            Self::Unavailable => {
-                "still running; this caller has no completion notification channel; poll session_collect{sid}."
-            }
-            Self::PeerUnsubscribed => {
-                "still running; the target is not a session you delegated, so no completion notification will fire; poll session_collect{sid}."
-            }
-        }
     }
 }
 
@@ -2749,7 +2648,7 @@ async fn dispatch_task(
     caller_sid: &str,
     sid: &str,
     task: String,
-    requested_wait_seconds: u64,
+    _requested_wait_seconds: u64,
     effective_wait_seconds: u64,
     notify: NotifyRequest,
     title: Option<String>,
@@ -2878,12 +2777,13 @@ async fn dispatch_task(
             sid,
             &turn_id,
             InlineWaitWindow {
-                requested_seconds: requested_wait_seconds,
                 effective_seconds: effective_wait_seconds,
             },
             rx,
             is_delegation,
+            tool,
             notification_route,
+            parent_is_external,
         )
         .await)
     } else {
@@ -2896,28 +2796,32 @@ async fn dispatch_task(
             // arrives as usual).
             m.insert("status".to_string(), serde_json::json!("queued"));
             m.insert(
-                "queued_behind".to_string(),
-                serde_json::json!("detached_body"),
-            );
-            m.insert(
                 "hint".to_string(),
                 serde_json::json!(
-                    "the session's body from before a ccteam restart is still finishing its \
-                     turn; your task is queued and runs next — session_stop ends that body \
-                     now, session_list shows it as activity:detached"
+                    "queued behind the session body still finishing after restart; use \
+                     session_stop to end it now"
                 ),
             );
+            if parent_is_external
+                || tool == "session_dispatch" && !notification_route.is_deliverable()
+            {
+                m.insert("notify_deliverable".into(), serde_json::json!(false));
+            }
             return Ok(m);
         }
         m.insert("status".to_string(), serde_json::json!("dispatched"));
-        m.insert(
-            "notify_deliverable".to_string(),
-            serde_json::json!(notification_route.deliverable()),
-        );
-        m.insert(
-            "hint".to_string(),
-            serde_json::json!(notification_route.async_hint()),
-        );
+        if parent_is_external || tool == "session_dispatch" && !notification_route.is_deliverable()
+        {
+            m.insert("notify_deliverable".into(), serde_json::json!(false));
+        }
+        if tool == "session_dispatch" && !notification_route.is_deliverable() {
+            m.insert(
+                "hint".into(),
+                serde_json::json!(
+                    "no completion notification will be delivered; poll session_collect"
+                ),
+            );
+        }
         Ok(m)
     }
 }
@@ -2926,48 +2830,21 @@ async fn dispatch_task(
 /// an over-ceiling request actually reaches its shorter effective deadline.
 fn pending_dispatch_response(
     turn_id: &str,
-    wait: InlineWaitWindow,
-    hit_effective_deadline: bool,
+    _wait: InlineWaitWindow,
+    _hit_effective_deadline: bool,
+    tool: &str,
     notification_route: CompletionNotificationRoute,
+    parent_is_external: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut response = serde_json::Map::new();
     response.insert("turn_id".to_string(), serde_json::json!(turn_id));
     response.insert("status".to_string(), serde_json::json!("pending"));
     response.insert(
-        "notify_deliverable".to_string(),
-        serde_json::json!(notification_route.deliverable()),
+        "hint".to_string(),
+        serde_json::json!("still running; poll session_collect with this turn_id"),
     );
-    if hit_effective_deadline && wait.requested_seconds > wait.effective_seconds {
-        response.insert(
-            "requested_wait_seconds".to_string(),
-            serde_json::json!(wait.requested_seconds),
-        );
-        response.insert(
-            "effective_wait_seconds".to_string(),
-            serde_json::json!(wait.effective_seconds),
-        );
-        let notification = match notification_route {
-            CompletionNotificationRoute::ParentSession => "or await the completion notification.",
-            CompletionNotificationRoute::Disabled => "notifications are disabled.",
-            CompletionNotificationRoute::Unavailable => {
-                "this caller has no completion notification channel."
-            }
-            CompletionNotificationRoute::PeerUnsubscribed => {
-                "the target is not a session you delegated — no completion notification."
-            }
-        };
-        response.insert(
-            "hint".to_string(),
-            serde_json::json!(format!(
-                "inline wait capped at {}s; task continues — poll session_collect{{sid, since:turn_id}} {notification}",
-                wait.effective_seconds
-            )),
-        );
-    } else {
-        response.insert(
-            "hint".to_string(),
-            serde_json::json!(notification_route.pending_hint()),
-        );
+    if parent_is_external || tool == "session_dispatch" && !notification_route.is_deliverable() {
+        response.insert("notify_deliverable".into(), serde_json::json!(false));
     }
     response
 }
@@ -2990,6 +2867,7 @@ fn pending_dispatch_response(
 /// watch). After a frame arrives, completion additionally requires the child's
 /// turn to no longer be in flight (`session_turn_in_flight`, the same cell the
 /// pump clears on completion or failure), re-checked on a short poll tick.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_wait_for_completion(
     gateway: &GatewayHandle,
     child_sid: &str,
@@ -2997,7 +2875,9 @@ async fn dispatch_wait_for_completion(
     wait: InlineWaitWindow,
     mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
+    tool: &str,
     notification_route: CompletionNotificationRoute,
+    parent_is_external: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     // MCP-DX-1 — elapsed telemetry: the wait starts right after the submit, so
     // submit→completion is an honest task-duration approximation for a wait
@@ -3034,7 +2914,8 @@ async fn dispatch_wait_for_completion(
         match tokio::time::timeout(wait_slice, rx.recv()).await {
             Ok(Ok(ev)) => {
                 let hit = ev.sid.as_deref() == Some(child_sid)
-                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer);
+                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer)
+                    && ev.status.is_some();
                 if hit {
                     saw_answer = true;
                 }
@@ -3053,7 +2934,9 @@ async fn dispatch_wait_for_completion(
             turn_id,
             wait,
             hit_effective_deadline,
+            tool,
             notification_route,
+            parent_is_external,
         );
     }
 
@@ -3063,7 +2946,7 @@ async fn dispatch_wait_for_completion(
         let gw = gateway.lock().await;
         gw.session_resolve(child_sid)
     };
-    let (result_record, cost_usd, tokens_total) = resolved
+    let (result_record, cost_usd, meta_turn) = resolved
         .as_ref()
         .map(|r| {
             let last =
@@ -3073,26 +2956,14 @@ async fn dispatch_wait_for_completion(
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
             // tokens, same semantics as session_list/collect (tokens present
             // even for vendors with no USD price table).
-            let (cost, tokens) =
+            let (cost, turn) =
                 ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &r.sid)
                     .ok()
-                    .map(|m| (m.cost_usd, m.tokens_total))
-                    .unwrap_or((None, None));
-            (last, cost, tokens)
+                    .map(|m| (m.cost_usd, m.turn_count))
+                    .unwrap_or((None, 0));
+            (last, cost, turn)
         })
-        .unwrap_or((None, None, None));
-    let raw_result_text = result_record
-        .as_ref()
-        .map(|turn| turn.assistant.as_str())
-        .unwrap_or_default();
-    let result_text = crate::delegation::truncate_head_tail_with_marker(
-        raw_result_text,
-        INLINE_RESULT_MAX_CHARS,
-        |omitted| crate::delegation::full_answer_marker(omitted, child_sid),
-    )
-    .text;
-    let result_turn = result_record.as_ref().map(|turn| turn.turn_id.clone());
-    let failed = result_record.as_ref().is_some_and(|turn| turn.failed());
+        .unwrap_or((None, None, 0));
 
     // Inline completion: the caller already holds the result → disarm the watch
     // so a delegation doesn't ALSO wake the parent with a redundant turn.
@@ -3101,40 +2972,29 @@ async fn dispatch_wait_for_completion(
             .await;
     }
 
-    let mut m = serde_json::Map::new();
-    m.insert("turn_id".to_string(), serde_json::json!(turn_id));
-    m.insert(
-        "status".to_string(),
-        serde_json::json!(if failed { "failed" } else { "completed" }),
-    );
-    m.insert(
-        "notify_deliverable".to_string(),
-        serde_json::json!(notification_route.deliverable()),
-    );
-    m.insert("result_text".to_string(), serde_json::json!(result_text));
-    m.insert("result_turn".to_string(), serde_json::json!(result_turn));
-    if let Some(kind) = result_record
-        .as_ref()
-        .and_then(|turn| turn.error_kind.as_deref())
-    {
-        m.insert("error_kind".to_string(), serde_json::json!(kind));
+    let record = result_record.as_ref();
+    let mut m = DelegationSummary {
+        sid: child_sid,
+        turn_id,
+        turn: record
+            .and_then(|turn| turn.status.as_ref().map(|status| status.turn))
+            .unwrap_or(meta_turn),
+        outcome: match record {
+            Some(turn) if turn.failed() => DelegationOutcome::Failed {
+                kind: turn.error_kind.clone(),
+                error: turn.error.clone(),
+            },
+            _ => DelegationOutcome::Done,
+        },
+        context_pct: record.and_then(|turn| crate::delegation::context_pct(turn.status.as_ref())),
+        cost_usd,
+        answer: record
+            .map(|turn| turn.assistant.as_str())
+            .unwrap_or_default(),
     }
-    if let Some(error) = result_record
-        .as_ref()
-        .and_then(|turn| turn.error.as_deref())
-    {
-        m.insert("error".to_string(), serde_json::json!(error));
-    }
-    // Additive telemetry (MCP-DX-1): submit→completion duration (0.1s
-    // resolution) + the child's session ledger, so a waiting caller can log
-    // per-vendor speed/cost without a second collect round-trip.
-    let elapsed = (wait_started.elapsed().as_millis() as f64 / 100.0).round() / 10.0;
-    m.insert("elapsed_seconds".to_string(), serde_json::json!(elapsed));
-    if let Some(c) = cost_usd {
-        m.insert("cost_usd".to_string(), serde_json::json!(c));
-    }
-    if let Some(t) = tokens_total {
-        m.insert("tokens_total".to_string(), serde_json::json!(t));
+    .inline_result();
+    if parent_is_external || tool == "session_dispatch" && !notification_route.is_deliverable() {
+        m.insert("notify_deliverable".into(), serde_json::json!(false));
     }
     m
 }
@@ -3170,11 +3030,7 @@ fn page_collected_turns(
         .iter()
         .filter(|t| !t.assistant.is_empty())
         .map(|t| {
-            let mut row = serde_json::json!({
-                "turn_id": t.turn_id,
-                "ts": t.ts.to_rfc3339(),
-                "content": t.assistant,
-            });
+            let mut row = serde_json::json!({"turn_id": t.turn_id, "content": t.assistant});
             if let Some(outcome) = t.outcome.as_deref() {
                 row["outcome"] = serde_json::json!(outcome);
             }
@@ -3326,6 +3182,24 @@ fn classify_session_activity(
     Some(activity.status.activity.to_string())
 }
 
+#[derive(serde::Serialize)]
+struct SessionRow {
+    activity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_pct: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_total: Option<u64>,
+}
+
+fn session_row_fields(row: SessionRow) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::to_value(row)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
 /// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
 /// Polled MVP: resolve sid → role + project_dir under the lock, drop the
 /// guard, then read the ccteam-owned mirror. `since` is a turn_id cursor.
@@ -3352,19 +3226,18 @@ async fn run_session_collect(
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
-    let (resolved, live, projection) = {
+    // Residency comes from the SAME lock hold as the resolve: two acquisitions
+    // could disagree about a session that was released in between.
+    let (resolved, live, projection, residency) = {
         let gw = gateway.lock().await;
         (
-            gw.session_resolve(&sid),
+            gw.session_resolve_any(&sid),
             gw.live_turn_for(&sid),
             gw.progress_projection(),
+            gw.session_residency(&sid),
         )
     };
     let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
-    // A collectable session is one the gateway still tracks → "live" (the same
-    // cheap liveness hint `session_list` reports; a fully-stopped session is no
-    // longer resolvable so it errors above).
-    let status = "live";
 
     // Tail the ccteam-owned transcript mirror.
     // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
@@ -3381,59 +3254,48 @@ async fn run_session_collect(
         &resolved.sid,
     )
     .ok();
-    let vendor_session_id = meta
-        .as_ref()
-        .map(|m| m.vendor_uuid.clone())
-        .unwrap_or_default();
     let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
     let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
-    let model = meta.as_ref().and_then(|m| m.model.as_deref());
-
+    let latest_status = all.iter().rev().find_map(|turn| turn.status.clone());
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
     // `page_collected_turns`.
     let (mut rows, last_turn_id, page_truncated) =
         page_collected_turns(&all, since.as_deref(), n, tail);
-    let (total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars);
+    let (_total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars);
     let truncated = page_truncated || content_truncated;
 
-    let mut body = serde_json::json!({
-        "ok": true,
-        "sid": sid,
-        "role": resolved.role,
-        "vendor_session_id": vendor_session_id,
-        "status": status,
-        "turns": rows,
-        // Cursor to pass as `since` on the next poll (None when no turns yet).
-        // On truncation this is the boundary turn → poll again to get the rest.
-        "cursor": last_turn_id,
-        // True when more turns than `n` were available after `since`; the caller
-        // should poll again with `cursor` to page through the remainder.
-        "truncated": truncated,
-        // Original character count across this selected page, before any
-        // max_chars excerpts were applied.
-        "total_chars": total_chars,
-    });
-    if let Some(c) = cost_usd {
-        body["cost_usd"] = serde_json::json!(c);
-    }
-    if let Some(t) = tokens_total {
-        // v0.9.5 — honest token ledger for vendors with no USD price table.
-        body["tokens_total"] = serde_json::json!(t);
-    }
-    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
-        body["model"] = serde_json::json!(model);
-    }
-    // v0.9.1 — honest per-sid activity (same resolver the web session list
-    // uses): `working` = the child is mid-turn (keep polling), `idle` = the
-    // turn is done. Best-effort: a read miss just omits the field.
-    if let Some(activity) = classify_session_activity(
+    let activity = classify_session_activity(
         projection.as_deref(),
         &resolved.project,
         &resolved.sid,
         live,
-    ) {
-        body["activity"] = serde_json::json!(activity);
+    )
+    .unwrap_or_else(|| "idle".into());
+    let context_pct = latest_status
+        .as_ref()
+        .and_then(|status| status.context.as_ref())
+        .and_then(|context| context.pct())
+        .map(|pct| pct.round() as u64);
+    let mut body = session_row_fields(SessionRow {
+        activity,
+        context_pct,
+        cost_usd,
+        tokens_total,
+    });
+    body.insert("turns".into(), serde_json::json!(rows));
+    if let Some(cursor) = last_turn_id.clone() {
+        body.insert("cursor".into(), serde_json::json!(cursor));
+    }
+    if truncated {
+        body.insert("truncated".into(), serde_json::json!(true));
+    }
+    // `status: "stopped"` used to mean nothing more than "not live", which
+    // read as "this session is over" for a session that was merely between
+    // processes — the caller's next move (spawn a replacement vs dispatch to
+    // this one) turns on that difference. Say which it is.
+    if let Some(residency) = residency.filter(|r| *r != crate::gateway::RESIDENCY_RESIDENT) {
+        body.insert("residency".into(), serde_json::json!(residency));
     }
     // v0.9.0 W2 (F2) — a real collection by an agent is a ledger point.
     if caller == McpCaller::Ambient && !rows.is_empty() {
@@ -3532,17 +3394,32 @@ async fn run_session_list_at(
         .and_then(|v| v.as_u64())
         .map(|n| (n as usize).clamp(1, 500))
         .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
+    let include_tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Both halves of the activity answer come from under ONE lock hold, and
     // both are cheap in-memory reads. Projection catch-ups happen below, after
     // the guard drops (a fleet's streams are far too big to touch under the
     // gateway mutex).
-    let (views, live_turns, projection) = {
+    let (views, live_turns, projection, status_roots) = {
         let gw = gateway.lock().await;
+        // RESIDENT (+ external + detached) rows, then the RELEASED ones: a
+        // session ccteam is not holding a process for is not gone — it resumes
+        // by sid on the next dispatch — so a caller that could not see it here
+        // would keep spawning duplicates of work it already has.
+        let mut views = gw.session_views();
+        views.extend(gw.released_session_views(caller_visible_projects.as_ref()));
+        let status_roots = views
+            .iter()
+            .filter_map(|view| {
+                gw.session_resolve_any(&view.sid)
+                    .map(|resolved| (view.sid.clone(), resolved.project_dir))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         (
-            gw.session_views(),
+            views,
             gw.live_turns(),
             gw.progress_projection(),
+            status_roots,
         )
     };
     // v0.9.1 — honest activity per row (same resolver as the web session
@@ -3569,26 +3446,31 @@ async fn run_session_list_at(
     let now = chrono::Utc::now();
     // Classify once per view, then filter (project + activity), keeping the
     // most-recently-active-first order `session_views` already established.
-    let classified: Vec<(&crate::gateway::SessionView, Option<String>)> = views
+    let classified: Vec<(&crate::gateway::SessionView, String)> = views
         .iter()
         .map(|v| {
             // A detached body (alive from before a daemon restart, not driven
             // from here) is its own state: neither working nor idle.
             if v.detached.is_some() {
-                return (v, Some("detached".to_string()));
+                return (v, "detached".to_string());
             }
-            let activity = activity_ctx.get(&v.project).map(|snapshot| {
-                let silent = snapshot
-                    .last_valid
-                    .as_ref()
-                    .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
-                    .unwrap_or(0);
-                snapshot
-                    .session_activity(&v.sid, silent, live_turns.get(&v.sid).copied(), now)
-                    .status
-                    .activity
-                    .to_string()
-            });
+            let activity = activity_ctx
+                .get(&v.project)
+                .map(|snapshot| {
+                    let silent = snapshot
+                        .last_valid
+                        .as_ref()
+                        .and_then(|event| {
+                            ccteam_core::stall::progress_event_age_seconds(event, now)
+                        })
+                        .unwrap_or(0);
+                    snapshot
+                        .session_activity(&v.sid, silent, live_turns.get(&v.sid).copied(), now)
+                        .status
+                        .activity
+                        .to_string()
+                })
+                .unwrap_or_else(|| "idle".to_string());
             (v, activity)
         })
         .filter(|(v, activity)| {
@@ -3604,54 +3486,54 @@ async fn run_session_list_at(
                 }
             }
             if let Some(want) = filter_activity.as_deref() {
-                return activity.as_deref() == Some(want);
+                return activity == want;
             }
             true
         })
         .collect();
     let total = classified.len();
     let truncated = total > limit;
+    // Context % costs a `turns.jsonl` tail read per session, so it is paid ONLY
+    // for the rows actually emitted — not for the whole fleet before the cut.
+    let context_pcts = classified
+        .iter()
+        .take(limit)
+        .filter_map(|(v, _)| {
+            let dir = status_roots.get(&v.sid)?;
+            ccteam_harness::execution::turns_mirror::read_all_turns(dir, &v.sid)
+                .ok()
+                .and_then(|turns| turns.into_iter().rev().find_map(|turn| turn.status))
+                .and_then(|status| status.context.and_then(|context| context.pct()))
+                .map(|pct| (v.sid.clone(), pct.round() as u64))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let rows: Vec<serde_json::Value> = classified
         .iter()
         .take(limit)
         .map(|(v, activity)| {
             // Slim rows: null/empty/default fields are omitted rather than
             // spelled out (the caller reads these into its context).
-            let mut row = serde_json::Map::new();
+            let mut row = session_row_fields(SessionRow {
+                activity: activity.clone(),
+                context_pct: context_pcts.get(&v.sid).copied(),
+                cost_usd: v.cost_usd,
+                tokens_total: v.tokens_total,
+            });
             row.insert("sid".into(), serde_json::json!(v.sid));
-            row.insert("project".into(), serde_json::json!(v.project));
             if !v.role.is_empty() {
                 row.insert("role".into(), serde_json::json!(v.role));
             }
             row.insert("vendor".into(), serde_json::json!(v.vendor));
+            // Residency only when it is NOT the default: a resident row would
+            // spend the caller's context saying nothing.
+            if v.residency != crate::gateway::RESIDENCY_RESIDENT {
+                row.insert("residency".into(), serde_json::json!(v.residency));
+            }
             // The caller's OWN row (see `caller_sid`). Named nothing like
             // `current` on purpose: the two answer different questions, and
             // reading one as the other is the failure this ends.
             if caller_sid == Some(v.sid.as_str()) {
                 row.insert("is_self".into(), serde_json::json!(true));
-            }
-            if v.current {
-                row.insert("current".into(), serde_json::json!(true));
-            }
-            if let Some(a) = activity {
-                // v0.9.1 — the honest busy signal (`working|idle|stale|stuck`;
-                // `detached` = its body outlived a daemon restart and is
-                // finishing unobserved — dispatches queue behind it).
-                row.insert("activity".into(), serde_json::json!(a));
-            }
-            if let Some(d) = &v.detached {
-                row.insert(
-                    "detached".into(),
-                    serde_json::json!({
-                        "pid": d.pid,
-                        "since": d.since,
-                        "reason": d.reason,
-                        "hint": "body from before a ccteam restart is still finishing its turn; dispatch queues behind it, session_stop ends it now",
-                    }),
-                );
-            }
-            if !v.last_active.is_empty() {
-                row.insert("last_active".into(), serde_json::json!(v.last_active));
             }
             if v.waiting_approval {
                 row.insert("waiting_approval".into(), serde_json::json!(true));
@@ -3659,23 +3541,9 @@ async fn run_session_list_at(
             // v0.9.0 W2 (F2) — delegation topology + attribution.
             if let Some(p) = &v.parent_sid {
                 row.insert("parent_sid".into(), serde_json::json!(p));
-                row.insert(
-                    "delegation_depth".into(),
-                    serde_json::json!(v.delegation_depth),
-                );
             }
             if v.host != "local" {
                 row.insert("host".into(), serde_json::json!(v.host));
-            }
-            if let Some(c) = v.cost_usd {
-                row.insert("cost_usd".into(), serde_json::json!(c));
-            }
-            if let Some(t) = v.tokens_total {
-                // v0.9.5 — honest token ledger for unpriced vendors.
-                row.insert("tokens_total".into(), serde_json::json!(t));
-            }
-            if let Some(model) = v.model.as_deref().filter(|model| !model.trim().is_empty()) {
-                row.insert("model".into(), serde_json::json!(model));
             }
             if let Some(t) = &v.title {
                 row.insert("title".into(), serde_json::json!(t));
@@ -3691,27 +3559,24 @@ async fn run_session_list_at(
     let filtered: Vec<crate::gateway::SessionView> =
         classified.iter().map(|(v, _)| (*v).clone()).collect();
     let sids: std::collections::HashSet<&str> = filtered.iter().map(|v| v.sid.as_str()).collect();
-    let tree: Vec<serde_json::Value> = filtered
-        .iter()
-        .filter(|v| {
-            v.parent_sid
-                .as_deref()
-                .map(|p| !sids.contains(p))
-                .unwrap_or(true)
-        })
-        .map(|v| session_tree_node(v, &filtered))
-        .collect();
-    let mut body = serde_json::json!({
-        "ok": true,
-        "sessions": rows,
-        "tree": tree,
-        "total": total,
-    });
+    let mut body = serde_json::json!({"sessions": rows});
+    if include_tree {
+        let tree: Vec<serde_json::Value> = filtered
+            .iter()
+            .filter(|v| {
+                v.parent_sid
+                    .as_deref()
+                    .map(|p| !sids.contains(p))
+                    .unwrap_or(true)
+            })
+            .map(|v| session_tree_node(v, &filtered))
+            .collect();
+        body["tree"] = serde_json::json!(tree);
+    }
     if truncated {
         body["truncated"] = serde_json::json!(true);
-        body["hint"] = serde_json::json!(format!(
-            "{total} sessions matched but only the {limit} most recently active are shown — narrow with project/activity or raise `limit`."
-        ));
+        body["total"] = serde_json::json!(total);
+        body["hint"] = serde_json::json!("narrow the filters or raise `limit`");
     }
     Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
 }
@@ -3794,7 +3659,6 @@ async fn run_session_stop(
     }
     drop(gw);
     Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "ok": true,
         "sid": sid,
         "stopped": true,
     }))
@@ -3867,7 +3731,11 @@ async fn assert_caller_owns_session(
                 .map_err(|error| mcp_gateway_error(name, &error))?,
             None => crate::latency::gateway_lock(gateway, "mcp.session.resolve").await,
         };
-        gw.session_resolve(sid)
+        if name == "session_collect" {
+            gw.session_resolve_any(sid)
+        } else {
+            gw.session_resolve(sid)
+        }
     };
     match caller {
         McpCaller::Admin => Ok(()),
@@ -4199,6 +4067,7 @@ mod chat_send_file_tests {
 #[cfg(test)]
 mod session_tool_tests {
     use super::*;
+    use crate::delegation::INLINE_RESULT_MAX_CHARS;
     use serde_json::json;
 
     fn call(name: &str, args: serde_json::Value) -> serde_json::Value {
@@ -4270,16 +4139,9 @@ mod session_tool_tests {
         );
         assert_eq!(response["status"], "pending");
         assert!(response["turn_id"].as_str().is_some());
-        assert_eq!(response["requested_wait_seconds"], 600);
-        assert_eq!(response["effective_wait_seconds"], 1);
-        let hint = response["hint"].as_str().unwrap();
-        assert!(hint.contains("inline wait capped at 1s"), "{hint}");
-        assert!(hint.contains("task continues"), "{hint}");
-        assert!(
-            hint.contains("session_collect{sid, since:turn_id}"),
-            "{hint}"
-        );
-        assert!(hint.contains("completion notification"), "{hint}");
+        assert!(response.get("requested_wait_seconds").is_none());
+        assert!(response.get("effective_wait_seconds").is_none());
+        assert!(response.get("hint").is_some());
         assert!(
             gateway.lock().await.session_turn_in_flight(&child),
             "a capped pending response must not cancel the child turn"
@@ -4467,6 +4329,12 @@ mod session_tool_tests {
                     _ => String::new(),
                 };
                 let mut q = self.events.lock().await;
+                q.push_back((
+                    h.identity.clone(),
+                    ccteam_harness::ThreadEvent::TurnStarted {
+                        turn_id: format!("turn-{}", h.identity),
+                    },
+                ));
                 if self.narrate {
                     q.push_back((
                         h.identity.clone(),
@@ -4607,7 +4475,15 @@ mod session_tool_tests {
             _h: &ccteam_harness::ThreadHandle,
         ) -> std::result::Result<ccteam_harness::ThreadStatus, ccteam_harness::HarnessError>
         {
-            Ok(ccteam_harness::ThreadStatus::default())
+            Ok(ccteam_harness::ThreadStatus {
+                model: Some("stub-model".into()),
+                context: Some(ccteam_harness::ContextUsage::known(
+                    19,
+                    100,
+                    ccteam_harness::ContextSource::Reported,
+                )),
+                ..Default::default()
+            })
         }
     }
 
@@ -5015,14 +4891,7 @@ mod session_tool_tests {
         let body: serde_json::Value =
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(body["project"], "alice");
-        assert_eq!(body["project_source"], "explicit");
-        assert!(
-            body["parent_sid"].is_null(),
-            "tenant spawn is a root: {body}"
-        );
-        assert_eq!(body["delegation_depth"], 0);
-        assert_eq!(body["caller"], "user:ualice");
+        assert!(body["sid"].is_string());
 
         let sid = body["sid"].as_str().unwrap();
         let meta = ccteam_harness::execution::session_meta::read_session_meta(
@@ -5091,13 +4960,7 @@ mod session_tool_tests {
         let body: serde_json::Value =
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(body["parent_sid"].as_str(), Some(sid), "{body}");
-        assert_eq!(body["delegation_depth"].as_u64(), Some(1), "{body}");
-        assert_eq!(
-            body["caller"].as_str(),
-            Some(format!("admin:{sid}").as_str()),
-            "the response echoes the resolved origin: {body}"
-        );
+        assert!(body["sid"].is_string(), "{body}");
         let child_meta = ccteam_harness::execution::session_meta::read_session_meta(
             &paths.projects_root.join("alice"),
             body["sid"].as_str().unwrap(),
@@ -5352,12 +5215,7 @@ mod session_tool_tests {
         let body: serde_json::Value =
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(
-            body["project"], "alice",
-            "the sole visible project must be the default target: {body}"
-        );
-        assert_eq!(body["caller"], "user:ualice");
-        assert_eq!(body["project_source"], "sole");
+        assert!(body["sid"].is_string(), "spawn response: {body}");
     }
 
     /// MCP-DX-1 — "did you mean" suggests close/contained names only; a wild
@@ -5480,8 +5338,7 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(body["project"], "robchat", "{body}");
-        assert_eq!(body["project_source"], "sole", "{body}");
+        assert!(body["sid"].is_string(), "{body}");
         assert!(body.get("note").is_none(), "{body}");
     }
 
@@ -5497,7 +5354,7 @@ mod session_tool_tests {
         let (gw, principal) = dispatch_gateway(false, 0, &alpha).await;
         gw.lock().await.register_project("beta", beta);
 
-        for (args, caller, source, project) in [
+        for (args, caller, _source, _project) in [
             (
                 json!({"vendor":"claude","project":"alpha"}),
                 McpCaller::Admin,
@@ -5522,8 +5379,7 @@ mod session_tool_tests {
                     .await
                     .unwrap(),
             );
-            assert_eq!(body["project_source"], source, "{body}");
-            assert_eq!(body["project"], project, "{body}");
+            assert!(body["sid"].is_string(), "{body}");
             assert!(body.get("note").is_none(), "{body}");
         }
     }
@@ -5627,13 +5483,27 @@ mod session_tool_tests {
         .unwrap();
         let response = serde_json::Value::Object(frag);
         assert_eq!(response["status"], "completed", "{response}");
-        assert_eq!(response["tokens_total"], 12_345, "{response}");
         assert_eq!(response["cost_usd"], 0.12, "{response}");
-        let elapsed = response["elapsed_seconds"].as_f64().unwrap();
         assert!(
-            (0.0..=6.0).contains(&elapsed),
-            "elapsed within the wait window: {response}"
+            response.get("status_line").is_none(),
+            "MCP stays numeric: {response}"
         );
+        assert_eq!(response["context_pct"], 19, "{response}");
+        let keys: Vec<_> = response.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "context_pct",
+                "cost_usd",
+                "result_text",
+                "status",
+                "turn",
+                "turn_id"
+            ]
+        );
+        for obsolete in ["tokens_total", "elapsed_seconds", "model", "result_turn"] {
+            assert!(response.get(obsolete).is_none(), "{obsolete}: {response}");
+        }
     }
 
     #[tokio::test]
@@ -5706,7 +5576,7 @@ mod session_tool_tests {
         assert!(sids.contains(&alice_sid.as_str()), "{body}");
         assert!(!sids.contains(&bob_sid.as_str()), "{body}");
         assert!(!sids.contains(&admin_sid.as_str()), "{body}");
-        assert_eq!(body["total"], 1);
+        assert!(body.get("total").is_none());
     }
 
     /// 2026-07-26 cull — `screenshot` fell out of the MCP surface entirely;
@@ -5915,6 +5785,7 @@ mod session_tool_tests {
             user: "q".to_string(),
             assistant: format!("a-{id}"),
             usage: serde_json::Value::Null,
+            status: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
             outcome: None,
@@ -6110,6 +5981,19 @@ mod session_tool_tests {
         serde_json::from_str(body).unwrap()
     }
 
+    fn assert_exact_keys(value: &serde_json::Value, expected: &[&str]) {
+        let mut actual = value
+            .as_object()
+            .expect("response must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "unexpected response shape: {value}");
+    }
+
     #[tokio::test]
     async fn session_spawn_rejects_removed_host_parameter() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6166,12 +6050,10 @@ mod session_tool_tests {
                 .await
                 .unwrap(),
         );
+        assert_exact_keys(&r1, &["sid"]);
+        assert_exact_keys(&r2, &["sid"]);
         assert_eq!(r1["sid"], r2["sid"], "replay returns the original sid");
-        assert_eq!(r2["idempotent_replay"], json!(true));
-        assert!(
-            r1.get("idempotent_replay").is_none(),
-            "first is not a replay"
-        );
+        assert!(r2.get("idempotent_replay").is_none());
         // Exactly ONE child was created (principal + 1 child = 2 sessions).
         let list = parse(&run_session_list(&serde_json::json!({}), &gw).await.unwrap());
         let children = list["sessions"]
@@ -6249,7 +6131,8 @@ mod session_tool_tests {
         }
         // Unfiltered: principal + 3 children.
         let all = parse(&run_session_list(&json!({}), &gw).await.unwrap());
-        assert_eq!(all["total"], json!(4));
+        assert_exact_keys(&all, &["sessions"]);
+        assert!(all.get("total").is_none());
         assert_eq!(all["sessions"].as_array().unwrap().len(), 4);
         assert!(all.get("truncated").is_none(), "under the cap: {all}");
         // Slim rows: empty role / absent title / false current are omitted.
@@ -6262,10 +6145,7 @@ mod session_tool_tests {
         assert_eq!(capped["sessions"].as_array().unwrap().len(), 2);
         assert_eq!(capped["total"], json!(4));
         assert_eq!(capped["truncated"], json!(true));
-        assert!(capped["hint"]
-            .as_str()
-            .unwrap()
-            .contains("most recently active"));
+        assert!(capped["hint"].as_str().unwrap().contains("raise `limit`"));
 
         // project filter: a non-existent slug matches nothing.
         let none = parse(
@@ -6273,7 +6153,7 @@ mod session_tool_tests {
                 .await
                 .unwrap(),
         );
-        assert_eq!(none["total"], json!(0));
+        assert_eq!(none["sessions"].as_array().unwrap().len(), 0);
 
         // bogus activity value → readable error.
         let err = run_session_list(&json!({"activity": "busy"}), &gw)
@@ -6331,20 +6211,11 @@ mod session_tool_tests {
 
         // The incident's exact shape: a DIFFERENT session is `current`, and
         // being `current` marks nothing.
-        let current_rows: Vec<&serde_json::Value> = as_principal["sessions"]
+        assert!(as_principal["sessions"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|row| row.get("current") == Some(&json!(true)))
-            .collect();
-        let foreign_current = current_rows
-            .iter()
-            .find(|row| row["sid"] != json!(principal.as_str()))
-            .expect("a session other than the caller is some chat's current one");
-        assert!(
-            foreign_current.get("is_self").is_none(),
-            "`current` never marks the caller: {foreign_current}"
-        );
+            .all(|row| row.get("current").is_none()));
 
         // The marker follows the CALLER, not the fleet: same gateway, same
         // rows, a child asking sees the mark move onto its own row.
@@ -6377,13 +6248,25 @@ mod session_tool_tests {
 
         for args in [json!({}), json!({ "_caller_sid": "" })] {
             let list = parse(&run_session_list(&args, &gw).await.unwrap());
+            assert_exact_keys(&list, &["sessions"]);
             let rows = list["sessions"].as_array().unwrap();
             assert_eq!(rows.len(), 2, "both sessions listed: {list}");
+            for row in rows {
+                if row.get("parent_sid").is_some() {
+                    assert_exact_keys(row, &["activity", "parent_sid", "sid", "vendor"]);
+                } else {
+                    assert_exact_keys(row, &["activity", "sid", "vendor"]);
+                }
+                assert!(row.get("activity").is_some());
+            }
             assert!(
                 rows.iter().all(|row| row.get("is_self").is_none()),
                 "a sid-less caller owns no row: {list}"
             );
         }
+
+        let with_tree = parse(&run_session_list(&json!({"tree": true}), &gw).await.unwrap());
+        assert_exact_keys(&with_tree, &["sessions", "tree"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6404,6 +6287,36 @@ mod session_tool_tests {
             .unwrap(),
         );
         let child_sid = spawned["sid"].as_str().unwrap();
+        ccteam_harness::execution::turns_mirror::append_turn(
+            tmp.path(),
+            child_sid,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: format!("{child_sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: "done".into(),
+                usage: serde_json::Value::Null,
+                status: Some(ccteam_harness::TurnStatus {
+                    model: Some("future-model-verbatim".into()),
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        19,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    turn: 1,
+                    cost_usd: None,
+                    tokens_total: Some(123),
+                }),
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                outcome: None,
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
 
         let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
         let child = list["sessions"]
@@ -6412,16 +6325,102 @@ mod session_tool_tests {
             .iter()
             .find(|row| row["sid"] == child_sid)
             .unwrap();
-        assert_eq!(child["model"], json!("future-model-verbatim"));
+        assert_eq!(child["context_pct"], json!(19));
         let parent = list["sessions"]
             .as_array()
             .unwrap()
             .iter()
             .find(|row| row["sid"] == principal)
             .unwrap();
+        assert!(parent.get("model").is_none());
+    }
+
+    /// A session ccteam is not holding a process for is still REAL: it must be
+    /// listed (so a caller reuses it instead of spawning a duplicate) and
+    /// marked `residency:"released"`, while `activity` keeps saying only what
+    /// the session is DOING. A resident row carries no `residency` at all —
+    /// the agent's context is not spent on a field that says nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_list_shows_released_sessions_and_marks_their_residency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
+        let child = run_session_spawn(
+            &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let child = parse(&child)["sid"].as_str().unwrap().to_string();
+
+        // Resident rows say nothing about residency.
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let row = |list: &serde_json::Value, sid: &str| -> serde_json::Value {
+            list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["sid"] == sid)
+                .cloned()
+                .unwrap_or_else(|| panic!("{sid} must be listed: {list}"))
+        };
+        assert!(row(&list, &child).get("residency").is_none());
+
+        // Release the child's process; the row survives, now marked.
+        {
+            let mut guard = gw.lock().await;
+            guard.set_sessions_config(ccteam_core::SessionsConfig {
+                idle_release_secs: 1,
+                ..Default::default()
+            });
+            guard.settle_turn_for_tests(&child);
+            guard.backdate_residency_for_tests(&child, std::time::Duration::from_secs(600));
+        }
+        assert_eq!(Gateway::idle_release_tick(&gw).await, vec![child.clone()]);
+
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert_eq!(row(&list, &child)["residency"], "released");
         assert!(
-            parent.get("model").is_none(),
-            "vendor default is omitted: {parent}"
+            row(&list, &child).get("activity").is_some(),
+            "activity is still answered from the file verdict"
+        );
+        // The caller's own (still resident) row is unchanged.
+        assert!(row(&list, &principal).get("residency").is_none());
+
+        // `session_collect` says the same thing, in place of the old
+        // `status:"stopped"` (which could not tell "asleep" from "over").
+        let collected = parse(
+            &run_session_collect(
+                &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(collected["residency"], "released");
+        assert!(collected.get("status").is_none());
+
+        // An explicit stop flips the word — the difference the caller acts on.
+        gw.lock().await.stop_session(&child).await.unwrap();
+        let collected = parse(
+            &run_session_collect(
+                &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(collected["residency"], "stopped");
+        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        assert!(
+            !list["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["sid"] == child.as_str()),
+            "a stopped session leaves the listing: {list}"
         );
     }
 
@@ -6515,14 +6514,13 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(r["ok"], json!(true));
+        assert_exact_keys(&r, &["sid", "status", "turn_id"]);
         assert_eq!(r["status"], json!("dispatched"), "dispatch merged: {r}");
         assert!(
             r["turn_id"].as_str().is_some_and(|t| !t.is_empty()),
             "turn_id present: {r}"
         );
-        assert_eq!(r["parent_sid"], json!(principal));
-        assert_eq!(r["notify_deliverable"], json!(true));
+        assert!(r.get("notify_deliverable").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6544,12 +6542,7 @@ mod session_tool_tests {
             .unwrap(),
         );
         let spawned_sid = spawned["sid"].as_str().unwrap();
-        assert_eq!(spawned["caller"], "admin");
-        assert_eq!(spawned["parent_sid"], serde_json::Value::Null);
-        assert_eq!(spawned["notify_deliverable"], false);
-        let hint = spawned["hint"].as_str().unwrap();
-        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
-        assert!(!hint.contains("you will be notified"), "{hint}");
+        assert!(spawned.get("notify_deliverable").is_none());
         assert!(
             ccteam_harness::read_delegation_watch(tmp.path(), spawned_sid).is_none(),
             "an admin fallback caller has no parent watch"
@@ -6577,9 +6570,6 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(dispatched["notify_deliverable"], false);
-        let hint = dispatched["hint"].as_str().unwrap();
-        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
-        assert!(!hint.contains("you will be notified"), "{hint}");
         assert!(ccteam_harness::read_delegation_watch(tmp.path(), &child).is_none());
 
         let off_child = parse(
@@ -6604,9 +6594,6 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(off["notify_deliverable"], false);
-        let hint = off["hint"].as_str().unwrap();
-        assert!(hint.contains("notifications are disabled"), "{hint}");
-        assert!(!hint.contains("you will be notified"), "{hint}");
     }
 
     /// v0.9.1 — `session_spawn{task, wait_seconds}` with an answering child
@@ -6630,13 +6617,30 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
+        assert_exact_keys(
+            &r,
+            &[
+                "context_pct",
+                "result_text",
+                "sid",
+                "status",
+                "turn",
+                "turn_id",
+            ],
+        );
         assert_eq!(r["status"], json!("completed"), "inline: {r}");
         let result = r["result_text"].as_str().unwrap();
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("…[+"));
         assert!(result.contains("session_collect{sid:"));
+        assert!(
+            r.get("status_line").is_none(),
+            "spawn MCP envelope has no text status: {r}"
+        );
+        assert_eq!(r["context_pct"], 19, "{r}");
+        assert!(r.get("model").is_none(), "{r}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -6702,6 +6706,12 @@ mod session_tool_tests {
         assert_eq!(collected["turns"][0]["outcome"], "failed");
         assert_eq!(collected["turns"][0]["error_kind"], "server_overloaded");
         assert_eq!(collected["turns"][0]["error"], CAPACITY_ERROR);
+        assert!(
+            collected.get("status_line").is_none(),
+            "collect MCP envelope has no text status: {collected}"
+        );
+        assert_eq!(collected["context_pct"], 19, "{collected}");
+        assert!(collected.get("model").is_none(), "{collected}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6736,6 +6746,7 @@ mod session_tool_tests {
                 user: "question".into(),
                 assistant: answer,
                 usage: serde_json::Value::Null,
+                status: None,
                 tool_calls: Vec::new(),
                 attachments: Vec::new(),
                 outcome: None,
@@ -6758,9 +6769,10 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(response["total_chars"], 1_208);
+        assert_exact_keys(&response, &["activity", "cursor", "truncated", "turns"]);
+        assert!(response.get("total_chars").is_none());
         assert_eq!(response["truncated"], true);
-        assert_eq!(response["model"], "collect-model");
+        assert!(response.get("model").is_none());
         let content = response["turns"][0]["content"].as_str().unwrap();
         assert_eq!(content.chars().count(), 500);
         assert!(content.starts_with("HEAD"));
@@ -6798,8 +6810,9 @@ mod session_tool_tests {
                 .await
                 .unwrap(),
         );
+        assert_exact_keys(&t2, &["status", "turn_id"]);
         assert_eq!(t1["turn_id"], t2["turn_id"], "replay returns the same turn");
-        assert_eq!(t2["idempotent_replay"], json!(true));
+        assert!(t2.get("idempotent_replay").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6887,7 +6900,9 @@ mod session_tool_tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse(&ok)["stopped"], json!(true));
+        let stopped = parse(&ok);
+        assert_exact_keys(&stopped, &["sid", "stopped"]);
+        assert_eq!(stopped["stopped"], json!(true));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -6926,7 +6941,13 @@ mod session_tool_tests {
         assert_eq!(result.chars().count(), INLINE_RESULT_MAX_CHARS);
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
-        assert!(result.contains("truncated"));
+        assert!(result.contains("…[+"));
+        assert!(
+            r.get("status_line").is_none(),
+            "dispatch MCP envelope has no text status: {r}"
+        );
+        assert_eq!(r["context_pct"], 19, "{r}");
+        assert!(r.get("model").is_none(), "{r}");
 
         // timeout pending (child's answer is delayed past the wait).
         let tmp2 = tempfile::TempDir::new().unwrap();
@@ -7001,6 +7022,17 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
+        assert_exact_keys(
+            &r,
+            &[
+                "context_pct",
+                "notify_deliverable",
+                "result_text",
+                "status",
+                "turn",
+                "turn_id",
+            ],
+        );
         assert_eq!(r["status"], json!("completed"), "narrated: {r}");
         let result = r["result_text"].as_str().unwrap();
         assert!(
@@ -7050,7 +7082,7 @@ mod session_tool_tests {
                 ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &principal)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|t| t.user.contains("[ccteam] delegated session"))
+                    .filter(|t| t.user.contains(" done · turn "))
                     .collect();
             if !notes.is_empty() {
                 break;
@@ -7058,12 +7090,7 @@ mod session_tool_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(notes.len(), 1, "one boundary notification, no flood");
-        assert!(notes[0].user.contains("is now IDLE"), "{}", notes[0].user);
-        assert!(
-            notes[0].user.contains("1 interim note(s)"),
-            "pump folds the narration count: {}",
-            notes[0].user
-        );
+        assert!(notes[0].user.contains(" done · turn "), "{}", notes[0].user);
         assert!(notes[0].user.contains("echo: second wave"));
     }
 
@@ -7273,13 +7300,7 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(child["parent_sid"], json!(node), "{child}");
-        assert_eq!(child["delegation_depth"], json!(1), "{child}");
-        assert_eq!(
-            child["caller"],
-            json!(format!("admin:{node}")),
-            "the echo names the resolved origin: {child}"
-        );
+        assert!(child["sid"].is_string(), "{child}");
 
         // Fan-out is counted from the live map, keyed on the parent sid — the
         // node's own absence from that map contributes nothing, so the ceiling
@@ -7337,15 +7358,7 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(
-            external["parent_sid"],
-            json!(node),
-            "the delegation edge is real: {external}"
-        );
-        assert_eq!(external["notify_deliverable"], json!(false), "{external}");
-        let hint = external["hint"].as_str().unwrap();
-        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
-        assert!(!hint.contains("you will be notified"), "{hint}");
+        assert!(external["sid"].is_string(), "{external}");
         // The armed watch agrees with the answer we just gave: the edge stays
         // watched (so the child's completion keeps hitting the ledger) with no
         // impossible delivery armed on it.
@@ -7369,14 +7382,7 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(managed["notify_deliverable"], json!(true), "{managed}");
-        assert!(
-            managed["hint"]
-                .as_str()
-                .unwrap()
-                .contains("you will be notified"),
-            "{managed}"
-        );
+        assert!(managed.get("notify_deliverable").is_none(), "{managed}");
         let watch =
             ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
                 .unwrap();
@@ -7422,10 +7428,12 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(handoff["notify_deliverable"], json!(false), "{handoff}");
-        let hint = handoff["hint"].as_str().unwrap();
-        assert!(hint.contains("did not delegate"), "{hint}");
-        assert!(hint.contains("poll session_collect{sid}"), "{hint}");
+        assert_exact_keys(
+            &handoff,
+            &["hint", "notify_deliverable", "status", "turn_id"],
+        );
+        assert_eq!(handoff["notify_deliverable"], false, "{handoff}");
+        assert!(handoff.get("hint").is_some(), "{handoff}");
         let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer)
             .expect("the handoff edge is still recorded in the ledger");
         assert_eq!(watch.parent_sid, principal);
@@ -7449,7 +7457,7 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(explicit["notify_deliverable"], json!(true), "{explicit}");
+        assert!(explicit.get("notify_deliverable").is_none(), "{explicit}");
         let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer).unwrap();
         assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
 
@@ -7467,7 +7475,7 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(child["notify_deliverable"], json!(true), "{child}");
+        assert!(child.get("notify_deliverable").is_none(), "{child}");
         let watch =
             ccteam_harness::read_delegation_watch(tmp.path(), child["sid"].as_str().unwrap())
                 .unwrap();

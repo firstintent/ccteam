@@ -19,10 +19,11 @@ use ccteam_harness::execution::dsh_acp::handshake::{
     DEFAULT_DSH_MODEL, DEFAULT_DSH_PROVIDER, MIN_DSH_CLIENT_VERSION,
 };
 use ccteam_harness::execution::dsh_acp::spawn_spec::{
-    build_web_spawn_spec, dsh_bin, dsh_config_source, identity_dsh_home, identity_socket_path,
-    tenant_home_segment, DshConfigSource, DshWebSpawnOptions, DEEPSEEK_API_KEY_ENV,
-    DEEPSEEK_BASE_URL_ENV, DSH_HOME_ENV, DSH_NATIVE_WEB_PROFILE, DSH_SOCKET_ENV,
-    DSH_SYSTEM_PROMPT_ENV, DSH_TELEMETRY_DISABLED_ENV, DSH_TELEMETRY_MODE_ENV, DSH_WEB_PROFILE,
+    build_web_spawn_spec, dsh_bin, dsh_config_source, dsh_home_for_identity, identity_dsh_home,
+    identity_socket_path, tenant_home_segment, DshConfigSource, DshWebSpawnOptions,
+    DEEPSEEK_API_KEY_ENV, DEEPSEEK_BASE_URL_ENV, DSH_HOME_ENV, DSH_NATIVE_WEB_PROFILE,
+    DSH_SOCKET_ENV, DSH_SYSTEM_PROMPT_ENV, DSH_TELEMETRY_DISABLED_ENV, DSH_TELEMETRY_MODE_ENV,
+    DSH_WEB_PROFILE,
 };
 use ccteam_harness::execution::mcp_config::BRIDGE_MCP_URL_ENV;
 use ccteam_harness::{
@@ -100,6 +101,10 @@ struct FakeRuntime {
 }
 
 static SOCKET_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// A tenant's own ccteam REST bearer, in the wire form the API accepts. Only
+/// ever reaches that tenant's own profile.
+const TENANT_REST_TOKEN: &str = "ccteam:0123456789abcdef0123456789abcdef";
 
 #[derive(Default)]
 struct FakeRuntimeBuilder {
@@ -231,6 +236,7 @@ fn adapter() -> DshAcpAdapter {
     DshAcpAdapter::new(Arc::new(DshRuntimeManager::new(
         PathBuf::from("/nonexistent/ccteam-home"),
         Arc::new(|_root, _owner| anyhow::bail!("no enrollment resolver in tests")),
+        Arc::new(|_root, _owner| anyhow::bail!("no REST token resolver in tests")),
     )))
 }
 
@@ -264,6 +270,7 @@ fn write_meta(project: &Path, sid: &str, vendor_uuid: &str) {
     let meta = SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Dsh,
@@ -352,16 +359,23 @@ fn find_method<'a>(records: &'a [Value], method: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("expected a {method} record, got {records:?}"))
 }
 
+/// ccteam's one row in a profile's patch list — every face is configured from it.
 fn patch_config(profile_dir: &Path) -> serde_yaml::Mapping {
+    let row_id = "ccteam-ui";
     let raw = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap();
     let patch: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
-    patch
+    let row = patch
         .as_sequence()
         .expect("patch is a sequence")
         .iter()
-        .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some("ccteam-client"))
-        .unwrap_or_else(|| panic!("no ccteam-client row in {raw}"))
-        .get("config")
+        .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some(row_id))
+        .unwrap_or_else(|| panic!("no {row_id} row in {raw}"));
+    assert!(
+        row.get("insert").is_none(),
+        "ccteam rows OVERRIDE the bundle-inserted entry; a duplicate id aborts \
+         the Cordis boot: {raw}"
+    );
+    row.get("config")
         .and_then(serde_yaml::Value::as_mapping)
         .expect("flat plugin config")
         .clone()
@@ -435,6 +449,33 @@ fn dsh_config_source_resolves_all_authorized_arms() {
     assert_eq!(dsh_config_source("user:alice", &root), DshConfigSource::Env);
 }
 
+/// A tenant who has their own credentials is served from their own home; a
+/// tenant who does not falls back to the operator's.
+#[test]
+#[serial(dsh_env)]
+fn config_source_prefers_tenant_home_with_credentials() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    let root = ccteam_home(&tmp);
+
+    let operator_home = operator_dsh_home(&tmp);
+    write_config_pair(&operator_home, b"operator", Some(b"operator-settings"));
+    let tenant_home = tenant_web_home(&tmp, "alice");
+    write_config_pair(&tenant_home, b"tenant", None);
+
+    assert_eq!(
+        dsh_config_source("user:alice", &root),
+        DshConfigSource::TenantHome(tenant_home)
+    );
+    assert_eq!(
+        dsh_config_source("user:bob", &root),
+        DshConfigSource::OperatorHome(operator_home)
+    );
+}
+
 /// The identity home resolver and the socket path are what make the adapter and
 /// the runtime manager meet in the same place.
 #[test]
@@ -468,6 +509,44 @@ fn identity_home_and_socket_agree_with_the_managed_tenant_layout() {
     );
 }
 
+/// One person, one DSH home — and the same one no matter which key shape
+/// the caller holds (`owner_tag` on the adapter path, `operator` + `id` on
+/// the runtime-manager path). A drift here would put the adapter's socket
+/// in one home and the runtime's process in another.
+#[test]
+#[serial(dsh_env)]
+fn identity_home_maps_tenants_managed_and_everyone_else_to_the_operator_home() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let root = ccteam_home(&tmp);
+
+    let tenant = identity_dsh_home("user:alice", &root).unwrap();
+    assert_eq!(tenant, root.join("runtime/dsh/web/alice"));
+    assert_eq!(
+        identity_dsh_home("user:alice", &root).unwrap(),
+        tenant,
+        "same owner must always resolve to the same home"
+    );
+    assert_eq!(
+        dsh_home_for_identity(false, "alice", &root).unwrap(),
+        tenant,
+        "the runtime manager's key shape must agree with the owner tag"
+    );
+
+    let operator = operator_dsh_home(&tmp);
+    for tag in ["user:web-api", "user:", "telegram:123", ""] {
+        assert_eq!(
+            identity_dsh_home(tag, &root).unwrap(),
+            operator,
+            "`{tag}` is the operator and owns ~/.dsh"
+        );
+    }
+    assert_eq!(
+        dsh_home_for_identity(true, "admin", &root).unwrap(),
+        operator
+    );
+}
+
 #[test]
 #[serial(dsh_env)]
 fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
@@ -488,6 +567,7 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: Some(&socket),
+        rest_token: Some(TENANT_REST_TOKEN),
     })
     .expect("web spawn spec");
 
@@ -536,6 +616,26 @@ fn web_spawn_spec_uses_ccteam_web_profile_and_publishes_the_transport_socket() {
         serde_yaml::Value::String("ccteam-enroll:abc:secret".into())
     );
 
+    // Zero user steps: the same row credentials the workbench in the tenant's
+    // own home by the same start.
+    assert_eq!(
+        config["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into())
+    );
+    assert_eq!(
+        config["restToken"],
+        serde_yaml::Value::String(TENANT_REST_TOKEN.into())
+    );
+    assert!(
+        profile_dir
+            .join("node_modules")
+            .join("@ccteam")
+            .join("ccteam-ui")
+            .join("package.json")
+            .is_file(),
+        "the panel package is materialized into the tenant profile"
+    );
+
     let socket_dir = socket.parent().unwrap();
     assert!(
         socket_dir.is_dir(),
@@ -581,6 +681,7 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
         enrollment: None,
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: Some(&socket),
+        rest_token: None,
     })
     .expect("operator web spawn spec");
 
@@ -589,7 +690,7 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     assert_eq!(package["name"], "dsh-web-profile");
     assert_eq!(
         package["dsh"]["profile"]["bundles"],
-        serde_json::json!(["@deepseek-ai/dsh-web-app", "@ccteam/dsh-client"]),
+        serde_json::json!(["@deepseek-ai/dsh-web-app", "@ccteam/ccteam-ui"]),
         "only ccteam's own bundle is appended"
     );
     let raw_patch = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap();
@@ -605,6 +706,354 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     assert!(
         config.get("enrollment").is_none(),
         "ccteam never injects enrollment into the operator's own home: {config:?}"
+    );
+
+    // The same row points the workbench at this daemon; the spec writes
+    // exactly the token the runtime resolved (none was given here), so the
+    // row carries none.
+    assert_eq!(
+        config["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into())
+    );
+    assert!(
+        config.get("restToken").is_none(),
+        "no token given, none written: {config:?}"
+    );
+}
+
+/// The operator ran `dsh plugin --profile web add @ccteam/ccteam-ui`
+/// themselves; ccteam web's DSH menu then attaches to that same DSH. The
+/// attach must arm their copy and install nothing — a second copy of the same
+/// plugin id is what aborts the whole Cordis boot (`duplicate loader entry
+/// id`), and the version they pinned is theirs, not ccteam's, to change.
+#[test]
+#[serial(dsh_env)]
+fn operator_web_spawn_leaves_a_self_installed_ccteam_plugin_alone() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dsh_home = operator_dsh_home(&tmp);
+    let profile_dir = dsh_home.join("profiles").join(DSH_NATIVE_WEB_PROFILE);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    // Exactly what `dsh plugin add` leaves behind: pnpm's dependency line, the
+    // bundle reconciled into the layer list, and the package itself.
+    std::fs::write(
+        profile_dir.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-web-profile",
+            "dependencies": {"@ccteam/ccteam-ui": "^0.10.4"},
+            "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-web-app", "@ccteam/ccteam-ui"]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let package_dir = profile_dir
+        .join("node_modules")
+        .join("@ccteam")
+        .join("ccteam-ui");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        serde_json::json!({"name": "@ccteam/ccteam-ui", "version": "9.9.9-theirs"}).to_string(),
+    )
+    .unwrap();
+    let socket = identity_socket_path("user:web-api", &ccteam_home(&tmp));
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:web-api",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_NATIVE_WEB_PROFILE,
+        materialize_profile: false,
+        enrollment: None,
+        daemon_url: Some("http://127.0.0.1:7331"),
+        transport_socket: Some(&socket),
+        rest_token: None,
+    })
+    .expect("operator web spawn spec");
+
+    let package: Value =
+        serde_json::from_slice(&std::fs::read(profile_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        package["dsh"]["profile"]["bundles"],
+        serde_json::json!(["@deepseek-ai/dsh-web-app", "@ccteam/ccteam-ui"]),
+        "the bundle list is unchanged — a second entry is a duplicate loader entry id"
+    );
+    assert_eq!(
+        package["dependencies"]["@ccteam/ccteam-ui"],
+        serde_json::json!("^0.10.4"),
+        "pnpm's dependency table is not ccteam's to edit"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&package_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the operator's own package directory is not replaced by a ccteam link"
+    );
+    let installed: Value =
+        serde_json::from_slice(&std::fs::read(package_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        installed["version"], "9.9.9-theirs",
+        "their version stays installed"
+    );
+
+    // What ccteam DOES write: the flat config row that arms their copy.
+    let config = patch_config(&profile_dir);
+    assert_eq!(
+        config["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into())
+    );
+    assert_eq!(
+        config["transportSocket"],
+        serde_yaml::Value::String(socket.to_string_lossy().into_owned())
+    );
+
+    let findings = ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
+        &ccteam_home(&tmp),
+        &dsh_home,
+        DSH_NATIVE_WEB_PROFILE,
+    );
+    assert_eq!(findings.len(), 1, "the drift is reported: {findings:?}");
+    assert!(
+        matches!(
+            &findings[0].kind,
+            ccteam_harness::execution::dsh_acp::materialize::DshPluginFindingKind::VersionMismatch {
+                installed,
+                ..
+            } if installed == "9.9.9-theirs"
+        ),
+        "the finding names the version they pinned: {findings:?}"
+    );
+    assert!(
+        findings[0]
+            .report()
+            .starts_with("@ccteam/ccteam-ui plugin_version_mismatch{installed=9.9.9-theirs,"),
+        "one wording for doctor and the Hosts panel: {}",
+        findings[0].report()
+    );
+    assert!(
+        findings[0]
+            .remedy
+            .contains("`dsh plugin --profile web update @ccteam/ccteam-ui`"),
+        "and one remedy: {}",
+        findings[0].remedy
+    );
+}
+
+/// The same attach, against a profile carrying an unrelated `@ccteam/*`
+/// package of the operator's AND a `dsh plugin add` that pnpm never finished
+/// (a dependency line with no package directory).
+///
+/// ccteam owns the `@ccteam/` scope only for the entries it wrote itself: a
+/// package the operator installed under that scope is theirs whatever this
+/// build's plugin table knows, and a declaration with nothing behind it is
+/// their broken install — ccteam neither takes it over nor drops a second copy
+/// beside it, it reports.
+#[test]
+#[serial(dsh_env)]
+fn operator_web_spawn_keeps_their_scoped_packages_and_reports_a_broken_install() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dsh_home = operator_dsh_home(&tmp);
+    let profile_dir = dsh_home.join("profiles").join(DSH_NATIVE_WEB_PROFILE);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::write(
+        profile_dir.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-web-profile",
+            "dependencies": {"@ccteam/other": "^1.0.0", "@ccteam/ccteam-ui": "^0.10.4"},
+            "dsh": {"profile": {"bundles": [
+                "@deepseek-ai/dsh-web-app",
+                "@ccteam/other",
+                "@ccteam/ccteam-ui"
+            ]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = profile_dir
+        .join("node_modules")
+        .join("@ccteam")
+        .join("other");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::write(
+        theirs.join("package.json"),
+        serde_json::json!({"name": "@ccteam/other", "version": "1.0.0"}).to_string(),
+    )
+    .unwrap();
+    let socket = identity_socket_path("user:web-api", &ccteam_home(&tmp));
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:web-api",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_NATIVE_WEB_PROFILE,
+        materialize_profile: false,
+        enrollment: None,
+        daemon_url: Some("http://127.0.0.1:7331"),
+        transport_socket: Some(&socket),
+        rest_token: None,
+    })
+    .expect("operator web spawn spec");
+
+    let package: Value =
+        serde_json::from_slice(&std::fs::read(profile_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        package["dsh"]["profile"]["bundles"],
+        serde_json::json!([
+            "@deepseek-ai/dsh-web-app",
+            "@ccteam/other",
+            "@ccteam/ccteam-ui"
+        ]),
+        "every row of theirs survives, and ccteam adds none"
+    );
+    assert_eq!(
+        std::fs::read(theirs.join("package.json")).unwrap(),
+        serde_json::json!({"name": "@ccteam/other", "version": "1.0.0"})
+            .to_string()
+            .into_bytes(),
+        "a `@ccteam/*` package they installed is not ccteam's to prune"
+    );
+    assert!(
+        std::fs::symlink_metadata(
+            profile_dir
+                .join("node_modules")
+                .join("@ccteam")
+                .join("ccteam-ui")
+        )
+        .is_err(),
+        "ccteam installs nothing where their unfinished install belongs"
+    );
+    assert_eq!(
+        patch_config(&profile_dir)["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+        "the config row is still written"
+    );
+
+    let findings = ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_findings(
+        &ccteam_home(&tmp),
+        &dsh_home,
+        DSH_NATIVE_WEB_PROFILE,
+    );
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(
+        findings[0].report(),
+        "@ccteam/ccteam-ui plugin_missing_on_disk{id=@ccteam/ccteam-ui}"
+    );
+    assert!(
+        findings[0]
+            .remedy
+            .contains("`dsh plugin --profile web add @ccteam/ccteam-ui`"),
+        "the remedy finishes THEIR install: {}",
+        findings[0].remedy
+    );
+}
+
+/// The daemon registers on every start, so the operator's DSH profile is
+/// re-registered over and over. The second pass must touch NOTHING: not the
+/// bytes, not the mtime — not even after they reformatted the files ccteam
+/// wrote (a comment above the rows, a manifest they compacted). ccteam rebuilds
+/// both files from a parsed model, so the only honest comparison is by meaning;
+/// comparing bytes would flatten their formatting on every daemon start and
+/// take their YAML comments with it.
+#[test]
+#[serial(dsh_env)]
+fn a_repeated_operator_web_spawn_leaves_their_profile_untouched() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dsh_home = operator_dsh_home(&tmp);
+    let profile_dir = dsh_home.join("profiles").join(DSH_NATIVE_WEB_PROFILE);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    std::fs::write(
+        profile_dir.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-web-profile",
+            "dependencies": {"@ccteam/whatever": "^2.0.0"},
+            "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-web-app", "@ccteam/whatever"]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let theirs = profile_dir
+        .join("node_modules")
+        .join("@ccteam")
+        .join("whatever");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::write(
+        theirs.join("package.json"),
+        serde_json::json!({"name": "@ccteam/whatever", "version": "2.0.0"}).to_string(),
+    )
+    .unwrap();
+    let socket = identity_socket_path("user:web-api", &ccteam_home(&tmp));
+    let spawn = || {
+        build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: "user:web-api",
+            ccteam_home: ccteam_home(&tmp),
+            dsh_home: dsh_home.clone(),
+            profile: DSH_NATIVE_WEB_PROFILE,
+            materialize_profile: false,
+            enrollment: None,
+            daemon_url: Some("http://127.0.0.1:7331"),
+            transport_socket: Some(&socket),
+            rest_token: None,
+        })
+        .expect("operator web spawn spec");
+    };
+
+    spawn();
+
+    let package_path = profile_dir.join("package.json");
+    let patch_path = profile_dir.join("cordis.patch.yml");
+    let package_body = format!(
+        "{}\n",
+        serde_json::to_string(
+            &serde_json::from_slice::<Value>(&std::fs::read(&package_path).unwrap()).unwrap()
+        )
+        .unwrap()
+    );
+    let patch_body = format!(
+        "# ccteam writes these rows; the file is mine.\n{}\n",
+        std::fs::read_to_string(&patch_path).unwrap()
+    );
+    std::fs::write(&package_path, &package_body).unwrap();
+    std::fs::write(&patch_path, &patch_body).unwrap();
+    let package_stamp = std::fs::metadata(&package_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let patch_stamp = std::fs::metadata(&patch_path).unwrap().modified().unwrap();
+
+    // Far enough apart that a rewrite would move the mtime.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    spawn();
+
+    assert_eq!(
+        std::fs::read_to_string(&package_path).unwrap(),
+        package_body,
+        "a repeated spawn rewrote their manifest"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&patch_path).unwrap(),
+        patch_body,
+        "a repeated spawn rewrote their patch file — and took the comment"
+    );
+    assert_eq!(
+        std::fs::metadata(&package_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        package_stamp,
+        "their manifest was written again with the same bytes"
+    );
+    assert_eq!(
+        std::fs::metadata(&patch_path).unwrap().modified().unwrap(),
+        patch_stamp,
+        "their patch file was written again with the same bytes"
+    );
+    assert_eq!(
+        patch_config(&profile_dir)["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into()),
+        "the config row is still the one ccteam configured"
     );
 }
 
@@ -632,6 +1081,7 @@ fn web_profile_factory_seeds_operator_credentials_and_marker_for_tenant_home() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: None,
+        rest_token: None,
     })
     .expect("web spawn spec");
 
@@ -674,6 +1124,7 @@ fn web_profile_factory_empty_without_source_writes_no_marker() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: None,
+        rest_token: None,
     })
     .expect("web spawn spec");
 
@@ -706,6 +1157,7 @@ fn web_profile_refreshes_seeded_files_that_tenant_did_not_touch() {
             enrollment: Some("ccteam-enroll:abc:secret"),
             daemon_url: Some("http://127.0.0.1:7331"),
             transport_socket: None,
+            rest_token: None,
         })
         .expect("web spawn spec");
     };
@@ -737,6 +1189,71 @@ fn web_profile_refreshes_seeded_files_that_tenant_did_not_touch() {
     );
 }
 
+/// The seed-then-refresh ladder observed at BOTH stops: the marker must be
+/// right after the first seed (not just after a later refresh), because that
+/// first marker is what the refresh arm compares against to decide the tenant
+/// has not touched the file.
+///
+/// Reaches `seed_or_refresh_tenant_web_config_home` (private) through the same
+/// public door as its neighbours: `build_web_spawn_spec` with
+/// `materialize_profile: true` calls it with exactly these three arguments.
+#[test]
+#[serial(dsh_env)]
+fn tenant_web_seed_refreshes_unmodified_files_from_operator_home() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    unsafe {
+        std::env::remove_var(DEEPSEEK_API_KEY_ENV);
+    }
+    let operator_home = operator_dsh_home(&tmp);
+    let tenant_home = tenant_web_home(&tmp, "alice");
+    let seed_or_refresh = || {
+        build_web_spawn_spec(DshWebSpawnOptions {
+            owner_tag: "user:alice",
+            ccteam_home: ccteam_home(&tmp),
+            dsh_home: tenant_home.clone(),
+            profile: DSH_WEB_PROFILE,
+            materialize_profile: true,
+            enrollment: Some("ccteam-enroll:abc:secret"),
+            daemon_url: Some("http://127.0.0.1:7331"),
+            transport_socket: None,
+            rest_token: None,
+        })
+        .expect("web spawn spec");
+    };
+    write_config_pair(&operator_home, b"creds-v1", Some(b"settings-v1"));
+
+    seed_or_refresh();
+    assert_eq!(
+        std::fs::read(tenant_home.join(".credentials.yaml")).unwrap(),
+        b"creds-v1"
+    );
+    assert_eq!(
+        std::fs::read(tenant_home.join("settings.yaml")).unwrap(),
+        b"settings-v1"
+    );
+    let marker = read_seed_marker(&tenant_home);
+    assert_eq!(
+        marker["credentials_sha256"].as_str(),
+        Some(file_sha256(b"creds-v1").as_str())
+    );
+    assert_eq!(
+        marker["settings_sha256"].as_str(),
+        Some(file_sha256(b"settings-v1").as_str())
+    );
+
+    write_config_pair(&operator_home, b"creds-v2", Some(b"settings-v2"));
+    seed_or_refresh();
+    assert_eq!(
+        std::fs::read(tenant_home.join(".credentials.yaml")).unwrap(),
+        b"creds-v2"
+    );
+    assert_eq!(
+        std::fs::read(tenant_home.join("settings.yaml")).unwrap(),
+        b"settings-v2"
+    );
+}
+
 #[test]
 #[serial(dsh_env)]
 fn web_profile_keeps_tenant_modified_seeded_files() {
@@ -761,6 +1278,7 @@ fn web_profile_keeps_tenant_modified_seeded_files() {
             enrollment: Some("ccteam-enroll:abc:secret"),
             daemon_url: Some("http://127.0.0.1:7331"),
             transport_socket: None,
+            rest_token: None,
         })
         .expect("web spawn spec");
     };
@@ -814,6 +1332,7 @@ fn web_profile_keeps_preexisting_files_without_marker() {
         enrollment: Some("ccteam-enroll:abc:secret"),
         daemon_url: Some("http://127.0.0.1:7331"),
         transport_socket: None,
+        rest_token: None,
     })
     .expect("web spawn spec");
 
@@ -846,7 +1365,7 @@ async fn session_new_never_sends_acp_mcp_servers_even_with_secret() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-new"),
+            &spawn_ctx_with_model(&tmp, "s-new"),
         ),
     )
     .await
@@ -1069,7 +1588,7 @@ async fn meta_vendor_uuid_loads_before_new() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, sid),
+            &spawn_ctx_with_model(&tmp, sid),
         )
         .await
         .expect("load start");
@@ -1109,7 +1628,7 @@ async fn load_failure_falls_back_to_session_new_with_fresh_uuid() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, sid),
+            &spawn_ctx_with_model(&tmp, sid),
         )
         .await
         .expect("fallback start");
@@ -1150,7 +1669,7 @@ async fn prompt_roundtrip_uses_shared_acp_turn_runner() {
             &AgentSpecBrief {
                 role: String::new(),
             },
-            &spawn_ctx(&tmp, "s-prompt"),
+            &spawn_ctx_with_model(&tmp, "s-prompt"),
         )
         .await
         .expect("start ok");
@@ -1219,7 +1738,7 @@ async fn version_gate_refuses_a_plugin_older_than_the_socket_transport() {
     assert!(message.contains("0.10.2"), "got {message}");
     assert!(message.contains(MIN_DSH_CLIENT_VERSION), "got {message}");
     assert!(
-        message.contains("dsh plugin add @ccteam/dsh-client"),
+        message.contains("dsh plugin add @ccteam/ccteam-ui"),
         "the error must name the remedy: {message}"
     );
 }

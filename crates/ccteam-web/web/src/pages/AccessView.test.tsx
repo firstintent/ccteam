@@ -14,6 +14,21 @@ const identity = vi.hoisted(() => {
   return { isAdmin: true };
 });
 
+// The scope defaults to a project when one is visible, so the label rule (only
+// the machine-user slot needs one) is only reachable with the store settled.
+const projectsState = vi.hoisted(() => ({
+  projects: null as { slug: string }[] | null,
+  loading: true,
+}));
+
+vi.mock("../hooks/useProjectsStore", () => ({
+  useProjectsStore: () => ({
+    projects: projectsState.projects,
+    loading: projectsState.loading,
+    error: null,
+  }),
+}));
+
 vi.mock("../hooks/useMe", () => ({
   useMe: () => ({
     me: identity.isAdmin
@@ -30,9 +45,20 @@ import AccessView, {
   LoginLinkRow,
 } from "./AccessView";
 
+/** The mint `<button>`'s own attributes, minus `class` — Tailwind ships a
+ *  `disabled:` variant in there, which would match any naive substring check. */
+function mintButtonTag(html: string): string {
+  const at = html.indexOf('data-testid="access-mcp-mint"');
+  expect(at).toBeGreaterThan(-1);
+  const tag = html.slice(html.lastIndexOf("<", at), html.indexOf(">", at) + 1);
+  return tag.replace(/ class="[^"]*"/, "");
+}
+
 describe("AccessView", () => {
   beforeEach(() => {
     identity.isAdmin = true;
+    projectsState.projects = null;
+    projectsState.loading = true;
     window.localStorage.setItem("aoe_auth_token", "fake-login-token");
     window.localStorage.setItem("aoe_auth_token_exp", String(Date.now() + 60_000));
     globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
@@ -55,6 +81,31 @@ describe("AccessView", () => {
     expect(html).not.toContain('data-testid="access-mcp-snippet"');
     expect(html).not.toContain("fake-login-token");
     expect(html).not.toContain("mcpServers");
+  });
+
+  // The unlabelled machine-user slot is the daemon's own credential — the one
+  // written into the harness global configs — so the form must not offer a
+  // user-scoped mint without a label. The API refuses it regardless; this is
+  // the half that stops the console from asking.
+  it("requires a label for the machine-user slot and offers no mint until it has one", () => {
+    projectsState.projects = [];
+    projectsState.loading = false;
+    const html = renderToString(<ExternalAgentCard lang="en" />);
+    expect(html).toContain("Label (required)");
+    expect(html).toContain('data-testid="access-mcp-label-why"');
+    expect(html).toContain("machine-user slot is the daemon");
+    expect(mintButtonTag(html)).toContain("disabled");
+  });
+
+  // ...and the rule is the USER slot's alone: a project-scoped credential
+  // cannot collide with it, so that mint keeps working unlabelled.
+  it("leaves the label optional for a project-scoped credential", () => {
+    projectsState.projects = [{ slug: "alpha" }];
+    projectsState.loading = false;
+    const html = renderToString(<ExternalAgentCard lang="en" />);
+    expect(html).toContain("Label (optional)");
+    expect(html).not.toContain('data-testid="access-mcp-label-why"');
+    expect(mintButtonTag(html)).not.toContain("disabled");
   });
 
   it("keeps the admin shape with all six access cards in people → programs → machines order", () => {

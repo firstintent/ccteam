@@ -62,6 +62,8 @@ make install
 curl -sSL https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh
 ```
 
+**4 · 从 DeepSeek Harness 安装** —— 不需要工具链,也不用单独装 ccteam:`dsh plugin --profile web add @ccteam/ccteam-ui`,重启 `dsh web`,插件会从它的平台包把引擎装到与脚本相同的位置并启动 daemon。它与其它安装方式是同一个二进制、同一个 daemon —— 之后再装的 `ccteam` CLI 会直接接上它。细节见 [dsh-plugin-cn.md](dsh-plugin-cn.md)。
+
 装完验证:
 
 ```bash
@@ -77,22 +79,45 @@ pi --version        # 可选,用 Pi 会话才需要(0.83.0 及以上)
 
 > 若提示 `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"` 后重开终端。
 
-**装到哪里。** 所有安装方式(一键脚本 / `make install` / `ccteam update`)共用**同一条落点阶梯**,不会给你留下两个互相打架的 `ccteam`:显式 `CCTEAM_INSTALL_DIR` 优先 → 否则装到 `ccteam` 现在所在的目录(**原地升级**,软链会先解析)→ 否则 `~/.local/bin`。装完脚本还会点名 PATH 上**其它**的 `ccteam` 副本(**只报告、绝不删**)—— PATH 里靠前的旧副本,正是「我明明升级了却毫无变化」的元凶。
+**装到哪里。** 所有安装方式(一键脚本 / `make install` / `ccteam update` / DSH 插件)共用**同一条落点阶梯**,不会给你留下两个互相打架的 `ccteam`:显式 `CCTEAM_INSTALL_DIR` 优先 → 否则装到 `ccteam` 现在所在的目录(**原地升级**,软链会先解析)→ 否则 `~/.local/bin`。装完脚本还会点名 PATH 上**其它**的 `ccteam` 副本(**只报告、绝不删**)—— PATH 里靠前的旧副本,正是「我明明升级了却毫无变化」的元凶。
 
 ### 2. 服务
 
-`make install`(以及一键脚本检测到升级时)已经用 **`ccteam daemon start`** 把服务起好了:唯一的常驻进程(Web 控制台 + IM 网关 + 标准资源 API + MCP socket),用 `setsid` 脱离终端,关掉 shell、断开 SSH 都不死。Linux / macOS / WSL **同一套机制** —— **systemd 与 launchd unit 已于 v0.9.7 整体退役**:
+`make install`(以及一键脚本检测到升级时)已经用 **`ccteam start`** 把服务起好了:唯一的常驻进程(Web 控制台 + IM 网关 + 标准资源 API + MCP socket)。daemon **只有一种起法 = launcher**:`ccteam start` 就是 `ccteam daemon start` —— 用 `setsid` 把 daemon 脱离终端(关掉 shell、断开 SSH 都不死),等它就绪,把 pid 记进 `~/.ccteam/state/orchestrator.pid`,打印 Web 控制台链接,然后退出。它是幂等的 —— 再敲一次 `ccteam start` 只会找到正在跑的 daemon 并报告它,不会再起一个 —— 而且**没有前台模式**(`nohup ccteam start &` 也只是 launcher,daemon 起来后它就退出)。DSH 插件的自动启动跑的也是同一个 launcher,所以从 DSH 起的 daemon 和从 CLI 起的是同一个(见 [dsh-plugin-cn.md](dsh-plugin-cn.md) 的「共存」一节)。Linux / macOS / WSL **同一套机制** —— ccteam **不安装 systemd 或 launchd unit**。各平台一样管:
 
 ```bash
+ccteam start             # ≡ ccteam daemon start:脱离终端、等就绪、打印 web 链接(幂等)
 ccteam daemon status     # pid · ready · 运行中版本 vs 二进制版本(脚本用 --json)
 ccteam daemon logs -f    # 跟踪 ~/.ccteam/daemon.log
 ccteam daemon restart    # 优雅 SIGTERM 停 + 重新脱离(也可 `make daemon-restart`)
-ccteam daemon stop       # 优雅停;会话下次启动按 sid 恢复
+ccteam stop              # ≡ ccteam daemon stop:优雅停;agent 进程永不被杀 —— 见下文「daemon 重启对活会话意味着什么」
 ```
 
-诚实的取舍:没有 OS supervisor,就**没有崩溃自动重启、也不开机自启** —— 重启机器后再跑一次 `ccteam daemon start`(`ccteam status` / `ccteam doctor` 一眼看出 daemon 没起;想要开机自启,自己加一行 `@reboot ccteam daemon start` cron)。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除二进制,但保留 `~/.ccteam`。完全不脱离(开发 / 容器 / 你自己的 supervisor `ExecStart`)则用 `ccteam start` 前台跑。
+运行时 flag(`--web-bind`、`--dsh-web-bind`、`--no-web`、`--no-imd`、`--web-no-auth`、`--web-token-file`、`--no-clipboard`)都是 launcher flag,逐字转发给 daemon;`ccteam daemon restart` 不带 flag 时重放 daemon 当初启动用的 flag。带 `--json` 时 `ccteam start` 恰好打印一行:`{"status":"started","pid":…,"version":"…","home":"…"}` 或 `{"status":"alreadyRunning","pid":…,"version":"…","home":"…"}` —— 两者都算成功(`home` = 规范化的 `$CCTEAM_HOME`,调用方据此判断找到的是不是自己的 daemon);失败则是 `{"status":"error","code":"…","message":"…"}`。
 
-**从 v0.9.7 之前的安装升级(systemd/launchd)**:重跑一次安装器或 `ccteam daemon start` 即可 —— 一次性接管会停用并删除旧的 ccteam service unit,再把 daemon 自管地拉起来;你自己手写的 unit 一动不动(ccteam 会把那个实例报成「非托管」且不去停它)。
+**跑着的是谁。** web 端口上的 `GET /health` 不需要令牌,回答 daemon 的身份:`status`、`version`、`build`(构建时记录了 commit 才有)、`home`(规范化 `$CCTEAM_HOME`)、`pid`、`web_bind`(实际服务的地址 —— 请求 `:0` 时报的是分到的端口)、`dsh_web_bind`(伴生监听关闭时为 `null`)、`uptime_secs`。`ccteam daemon status --json` 打印同一组字段,取自正在跑的 daemon(HTTP 够不着时 —— `--no-web`,或本机拨不通的绑定地址 —— 相应字段为 `null`),外加 `binary`(你调用的这个 `ccteam` 的绝对路径)、`ready`、`managed`、`runningVersion`、`binaryVersion`、`socket`。DSH 插件、CLI 和你自己的脚本都先比对 `home`,再把一个 daemon 当成自己的。
+
+诚实的取舍:没有 OS supervisor,就**没有崩溃自动重启、也不开机自启** —— 重启机器后再跑一次 `ccteam start`(`ccteam status` / `ccteam doctor` 一眼看出 daemon 没起;想要开机自启,自己加一行 `@reboot ccteam start` cron)。想交给 systemd 托管,launcher 的形状就是 `Type=forking`:
+
+```ini
+# ~/.config/systemd/user/ccteam.service
+[Unit]
+Description=ccteam daemon
+
+[Service]
+Type=forking
+ExecStart=%h/.local/bin/ccteam start
+ExecStop=%h/.local/bin/ccteam stop
+# 只有 daemon 属于这个 unit:它拉起的 agent 进程必须在 stop 之后活下来。
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+不要设 `PIDFile=`:`~/.ccteam/state/orchestrator.pid` 是一条 JSON 记录(pid + 进程启动时间 + 版本),不是裸 pid,systemd 会自己在 unit 的 cgroup 里找到 daemon。之后 `systemctl --user enable --now ccteam` 就会一直拉着它;`ccteam daemon status` 仍报它为托管(它是 launcher 起的),在 shell 里敲 `ccteam start` 报 `alreadyRunning`,DSH 插件也像对待任何 daemon 一样 attach 上去 —— 插件「引擎」段的「停止」仍是真的 `ccteam stop`,之后 systemd 可能把 daemon 再拉起来。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除二进制,但保留 `~/.ccteam`。
+
+**从曾由 ccteam 写过 systemd/launchd unit 的安装升级**:重跑一次安装器或 `ccteam start` 即可 —— 一次性接管会停用并删除旧的 ccteam service unit,再把 daemon 自管地拉起来;你自己手写的 unit 一动不动(ccteam 会把那个实例报成「非托管」且不去停它)。后续升级见[更新](#更新)。
 
 `make install` 结束时(或随时 `ccteam status`)会打印 Web 控制台地址,形如:
 
@@ -112,9 +137,9 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 注册 MCP(一次性,让 agent 能用 ccteam 的能力)
 
-每次 `ccteam daemon start`(以及前台 `ccteam start`)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
+每次 daemon 启动(`ccteam start` / `ccteam daemon start`,含 DSH 插件的自动启动)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
 
-**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 直接接进该身份唯一的 DSH web 运行时——就是 **DSH** 菜单看到的那个空间(普通用户 `$CCTEAM_HOME/runtime/dsh/web/<user>/`,owner 真 `~/.dsh`)——所以雇出来的会话会实时出现在 DSH 侧栏、按项目 workspace 分组,同 sid 可冷恢复,token 用量会入账。ccteam 托管的运行时都预载了 `@ccteam/dsh-client`;你自己手起的 `dsh web`,在 **Hosts** 页一键注册插件(或 `dsh plugin --profile web add @ccteam/dsh-client`)后自行重启即可。你自己的 DSH 会话也能编排团队:到 DSH Settings 粘贴 daemon URL(默认 `http://127.0.0.1:7331`)和 **Settings → Access** 里复制的 enrollment 凭据,即拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
+**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 直接接进该身份唯一的 DSH web 运行时——就是 **DSH** 菜单看到的那个空间(普通用户 `$CCTEAM_HOME/runtime/dsh/web/<user>/`,owner 真 `~/.dsh`)——所以雇出来的会话会实时出现在 DSH 侧栏、按项目 workspace 分组,同 sid 可冷恢复,token 用量会入账。ccteam 托管的运行时都预载了 `@ccteam/ccteam-ui`;你自己手起的 `dsh web`,在 **Hosts** 页一键注册插件(或 `dsh plugin --profile web add @ccteam/ccteam-ui`)后自行重启即可。你自己的 DSH 会话也能编排团队:在 daemon 所在机器上,插件会自己向 daemon 领取 enrollment 凭据(每个 DSH profile 一份,`dsh-plugin:<profile>`,幂等由 daemon 保证);daemon 在别处时,到 DSH Settings 粘贴 daemon URL 和 **Settings → Access** 里复制的 enrollment 凭据。两种情况下都拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
 
 **Pi 也刻意不在 config-writer 表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要给可写配置的 vendor 手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
@@ -124,10 +149,12 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`session_spawn`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `standard`,`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它;雇佣会话权限 preset 默认 `danger-full-access`(全文件访问、免审批),spawn 时选 `hitl` 则保留逐次审批。
 
-- **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程——此时雇 DSH 需要那个实例里装有 ccteam 插件(**Hosts** 页一键注册,然后你自己重启它;ccteam 绝不重启不是它起的进程)。没有原生实例时 ccteam 自己在临时 loopback 端口启动,插件已注册。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
-- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/dsh-client`;从 ccteam 雇的 DSH 会话也住这个家,所以会出现在 DSH 页里。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件物化每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
+- **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程——此时雇 DSH 需要那个实例里装有 ccteam 插件(**Hosts** 页一键注册,然后你自己重启它;ccteam 绝不重启不是它起的进程)。没有原生实例时 ccteam 自己在临时 loopback 端口启动,插件已注册,且 ccteam 工作台已带上你自己的 REST token(即 admin web token,0600 写进你自己的 profile),无需粘贴。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
+- **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/ccteam-ui`;从 ccteam 雇的 DSH 会话也住这个家,所以会出现在 DSH 页里。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件物化每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
 - **模型密钥**:在 DSH 原生 **Settings → Models** 里配置自己的 provider。同身份的所有 DSH 会话——你在这页打开的和在 ccteam 里雇出来的——都跑在同一个运行时、用同一份配置,改一次全体生效。ccteam 只逐字节复制和 hash 这些 DSH 配置文件,不解析 vendor YAML。
 - **账本**:DSH Web 里原生跑的 turn 不是 ccteam session,不会在 ccteam 账本里伪装成 `$0` 或其它值;同一条规则在雇出来的会话里同样成立——你从 DSH 侧直接输入的 turn 是 vendor 原生 turn,ccteam 的 transcript 与账本只记 ccteam 路由的部分,完整对话以 DSH 家为准。从 DSH 通过 ccteam 插件委派出去的工作照常入账。
+- **局域网明文 HTTP**:DSH Web 是按 loopback 源写的,浏览器只在安全上下文里给它 `crypto.randomUUID` 等 API;把 UI 搬离 loopback 的是 ccteam,所以伴生监听会在它下发的 HTML 里补回这一个 API(真 `crypto.getRandomValues` 生成的 UUID v4),浏览器自带时则不介入。走 HTTPS 或在 daemon 本机打开都不需要这些。
+- **局域网浏览器改设置**:DSH 把设置文档(所有 Settings 页,含「插件配置」)当作「操作者本机」才可触及的特权面,而且由客户端按页面地址判断——原生 `dsh web` 从局域网地址打开时,「插件配置」页一片空白、设置只读。经伴生监听访问时这个「本机」就是你的 ccteam 身份:实例只属于你,页面已经过 ccteam 鉴权,所以伴生监听用 DSH 自己的传输钩子(`__DSH_TRANSPORT__.ownsHost`)声明「本页拥有其 Host」,任何浏览器都能改设置。DSH 从 0.1.1-rc.2 之后的版本才原生读这个钩子(已在 DSH main 上);对 rc.2 及更早版本(客户端只按页面主机名判断),伴生监听把这一处读取回填进它下发的 client-connection bundle(精确到行的改写,其它版本上零操作),所以 rc.2 上同样任何浏览器都能改设置。一个连带后果:DSH 的产出文件动作会作用在 daemon 所在机器(即工作区机器)上。
 - **信任边界**:租户 DSH Web 是同一 OS 用户下的软隔离。DSH agent 能跑 shell,用户自装 DSH 插件也是任意 npm 代码,信任级等同这个系统账号。同一个 OS 用户下的配置可见性只是便利边界,不是硬安全边界。
 - **局域网明文访问**:DSH Web 是按 loopback 源写的 —— 浏览器只在安全上下文里给它 `crypto.randomUUID`,而它用这个 API 生成**每一个** RPC 请求 id;换成局域网地址 + 明文 HTTP,这个 API 就没了。把界面搬离 loopback 的是 ccteam,所以伴生监听会在下发的 HTML 里补回这一个 API(用 `crypto.getRandomValues` 实现的标准 v4 UUID,不降随机强度);浏览器本来就提供时它自动让位。用 HTTPS 访问控制台、或直接在 daemon 本机打开,都不需要这层补丁。
 
@@ -200,7 +227,8 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 ```
 
 - **凭据只说明「这份配置是谁的」,身份由 daemon 在 `initialize` 时签发**:响应里的 `Mcp-Session-Id` 让**这个进程**成为一个独立 caller —— 它在账本里有自己的会话行(`managed_by: external`),它 spawn 的会话真的挂在它下面,而不是变成一堆根节点。之后每个请求必须同时带凭据与该 id(id 本身不是凭据,且 binding 只对开它的那枚凭据生效);id 过期返回 `404` 提示重新 `initialize`,用完可 `DELETE /mcp` 关闭。
-- **两种作用域**:每次 `ccteam daemon start` 会把一枚**用户域**凭据写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;DSH 在 `@ccteam/dsh-client` 插件连上粘贴的 enrollment 凭据后走同一套身份模型。用户域凭据不钉项目,故首个 `session_*` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
+- **两种作用域**:每次 `ccteam daemon start` 会把**用户域**的机器凭据——无 label 的那个槽位,跨重启复用、从不重铸——写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;DSH 经 `@ccteam/ccteam-ui` 插件走同一套身份模型:插件向本机 daemon 领取自己的用户域凭据(label `dsh-plugin:<profile>`),daemon 在别处时用粘贴的那枚。用户域凭据不钉项目,故首个 `session_*` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
+- **反复启动的程序用 ensure 而不是 mint**:`POST /api/v1/enroll` 带 `ensure: true` 和 `label` 时按 (身份, label) 幂等——daemon 新建记录答 `201` 并附 bearer,记录已存在则答 `200` 且只附 `bearer_prefix`(secret 永不第二次回传);丢了自己那份的调用方发 `rotate: true` 换掉记录,而不是再堆一条。控制台自己的 mint(不带 `ensure`)仍每次新铸一枚。
 - **不做任何推断**:不看工作目录、不看来源地址、没有「最近用过的项目」—— 没有依据就直接拒绝,并告诉你可以点名哪些 slug。无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数;web 控制台令牌(那是 `/api/v1/**` 的凭据)在这里会被 401 拒绝并说明本端点认哪两族凭据。
 
 ---
@@ -353,12 +381,19 @@ ccteam init --slug demo        # 覆盖自动推断的 slug
 ccteam init --owner user:u123  # 多用户:把项目归属给某租户
 ccteam config                  # 一次性配置:① 注册 MCP ② 配 IM bot ③ 偏好(交互菜单)
 ccteam config mcp              # 注册/刷新可写配置 vendor 的 ccteam MCP;DSH 走插件粘贴凭据,Pi 走受管会话 bridge
-ccteam start                   # 起常驻服务(见「开始之前」;加 & 后台跑)
-ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌)
+ccteam start [--json]          # 后台起 daemon(≡ `ccteam daemon start`:setsid 脱离、等就绪;幂等)
+ccteam start --web-bind 127.0.0.1:7331   # 只绑本机(免令牌;launcher flag 会转发给 daemon)
 ccteam start --dsh-web-bind off          # 关闭 DSH Web 伴生监听
 ccteam start --no-web | --no-imd         # 只要网关 / 只要 web
-ccteam stop                    # 优雅停 daemon
-ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链接
+ccteam stop                    # `ccteam daemon stop` 的别名
+ccteam daemon start            # 与 `ccteam start` 同一个 launcher
+ccteam daemon stop [--force]   # 优雅停;--force 超时后升级为 SIGKILL(只杀 daemon)
+ccteam daemon restart          # 优雅停 + 重新脱离,同一把锁(不带 flag 时重放当初的 flag)
+ccteam daemon status [--json]  # pid · ready · 运行中版本 vs 二进制版本;--json = /health 身份 + 二进制路径
+ccteam daemon logs [-f] [-n N] # 看 / 跟踪 ~/.ccteam/daemon.log
+ccteam update [--now] [--no-restart] [--json]   # 原地更新,然后把 daemon 重启到新二进制上
+ccteam update --channel npm --binary <path>     # 把一个已下载的 ccteam(如 DSH 插件的平台包)经同一条落点阶梯装上 + 同一套重启合同
+ccteam status                  # daemon 心跳 + 各项目及其会话 + web 链接 + 版本 / 更新提示
 ccteam doctor                  # 安装 / 依赖体检(--verify-mcp 校验 MCP 表面)
 ```
 
@@ -421,10 +456,10 @@ ccteam session ls              # 网关会话状态(daemon 离线降级标注)
 ccteam doctor --verify-mcp     # MCP 表面验收(8 工具 / 0 stub,漂移退出码 1)
 ```
 
-重启(只停 daemon,重启后按会话 id 自动接回):
+只重启 daemon(会话在重启后按 id 自动接回;正在跑 turn 的会话会被等到跑完,绝不重复起进程):
 
 ```bash
-systemctl --user restart ccteam    # 或 make daemon-restart(先重编译再重启)
+ccteam daemon restart              # 或 make daemon-restart(先重编译再重启)
 ```
 
 状态文件速查(`~/.ccteam` 按职责分组:`secrets/` 凭证、`state/` daemon 写的、`cache/` 可删、`run/` 套接字):
@@ -448,6 +483,22 @@ CCTEAM_CLAUDE_BIN=... CCTEAM_CODEX_BIN=... CCTEAM_GROK_BIN=... CCTEAM_OPENCODE_B
 # 覆盖 vendor CLI 路径
 ```
 
+### 更新
+
+```bash
+ccteam update                      # 原地更新,然后把 daemon 重启到新二进制上
+ccteam update --no-restart         # 只换二进制;之后自己 `ccteam daemon restart` 生效
+ccteam update --now                # 跳过等待在飞 turn 的排空,立即重启
+```
+
+`ccteam update` 会识别 ccteam 是怎么装的,再走同一条安装路:一键脚本 / 预编译安装重放 `install.sh`(同一套下载 + SHA-256 校验 + 原子替换;没有第二个下载器)。源码 checkout 不会替你重新编译:它只打印 `git pull && make install`。二进制换好后,若有托管 daemon 在跑,`update` 会等在飞的 turn 空闲(最多 5 分钟;`--now` 跳过),把 daemon 优雅重启到新二进制上,并核对运行中版本一致。
+
+**`ccteam update --channel npm --binary <path>`** 是同一套更新,只是二进制已经在磁盘上 —— DSH 插件的「更新引擎」按钮就是拿它平台包 `@ccteam/engine-<os>-<cpu>` 里的 `bin/ccteam` 跑这条命令,你也可以拿任意 ccteam 二进制自己跑。它先检查 `<path>` 是可执行文件且能回答 `--version`,再经与 `install.sh` 相同的落点阶梯装入(`CCTEAM_INSTALL_DIR` → `ccteam` 现在所在的目录 → `~/.local/bin`;目标是软链或归包管理器所有时拒绝并说明,绝不覆盖;`--binary` 指向已装文件本身时报 `alreadyInstalled`),记录安装渠道,然后跑同一套「排空 + 优雅重启 + 版本核对」合同(`--no-restart`、`--now` 同样适用)。`--binary` 只接受 `--channel npm|bun|pnpm`;standalone 渠道自己下载。
+
+重启永远不会把 daemon 搬到别处:`ccteam update`(与不带 flag 的 `ccteam daemon restart` 一样)重放 launcher 记录的 flag,daemon 早于这份记录时则用它在 `/health` 上报的绑定地址。两者都拿不到 —— 既无 launcher 记录、`/health` 也不应答(用 `--no-web` 起的 daemon,或早于身份面的旧构建)—— 就只换二进制、**拒绝**重启而不是瞎猜,并在提示里写出该跑的那条重启命令:带上 daemon 正在用的 flag 执行 `ccteam stop && ccteam start --web-bind <addr> [...]`,或 `ccteam daemon restart --web-bind <addr>`。
+
+daemon 重启对活会话意味着什么 = 按 id 恢复的合同,再加一条规则 —— **一个会话一个进程**:`terminal`/tmux 会话照常跑(独立进程树);默认 `stream-json` 会话的进程是被「放手」而不是被杀 —— 空闲的自己退出,turn 进行中的跑完这个 turn。新 daemon 凭 body 记录(`<project>/.ccteam/chat/<sid>/body.json`)认出这样的幸存者,绝不为同一会话再起第二个进程:会话显示为 `detached`(web 侧栏、`session_list activity:detached`、IM `/sessions`),发给它的消息排队、等该进程一退出就投递,`/stop` / `session_stop` 立即结束它;它退出后 ccteam 从 Claude 自己的 transcript 里找回它这段时间给出的回答并投递(IM/web 回复、委派通知),再按 id 重建会话。ACP(grok/kimi/opencode)与 codex 进程随 daemon 一起结束;在飞的 turn 被打断,下条消息按 id 恢复上下文。`ccteam status` 与 `ccteam doctor` 显示安装渠道、运行中 vs 二进制版本、以及是否有新版本(惰性检查,最多每 ~20h 一次;`preferences.toml` 的 `check_for_update` 可关)。**卫星自己更新** —— 在每台上跑 `ccteam update`;控制台的主机页与 `ccteam status` 会标出版本落后于 daemon 的主机。
+
 ### 多机(卫星节点)
 
 每台机器都跑同一个 `ccteam start`。join 过另一台 daemon 的节点就是它的**卫星**——之后由卫星**主动出站**连接 daemon(反向连接):只有 daemon 需要可达地址/端口(`:7331`),卫星零暴露、在 NAT/防火墙后也能用。给 daemon 前置 HTTPS 反代即可全链路 wss。
@@ -458,7 +509,7 @@ ccteam host mint-token --daemon http://daemon-host:7331 --web-token <admin-hex>
 
 # 卫星侧(任何跑着 ccteam start 的机器):
 ccteam host join --daemon http://daemon-host:7331 --token <join-token>
-# 本机运行中的 ccteam start 30 秒内自动拨出上线。
+# 本机运行中的 daemon 30 秒内自动拨出上线。
 
 ccteam host ls                     # 查看本机卫星凭据(如已 join)
 
@@ -472,7 +523,7 @@ ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex
 - **远程新建**:web 控制台 → 新建项目 → 主机选择器选那台卫星 → 填它机器上的绝对路径,daemon 请卫星就地 bootstrap 并注册。
 - **接入既有 checkout**:在那台机器仓库里 `ccteam init`,然后主机页对上报的项目点「接入」。slug 撞名会得到独立 catalog slug(`demo` → `demo2`)——跨机 slug 相同不代表同一项目。
 
-远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:daemon 全局最多 50 个 live 会话(`sessions.max_live` 可配);超限时优雅挤停最久无活动的 idle 会话,被停会话可随时恢复。
+远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:一个会话超过 `sessions.idle_release_secs`(默认 3600 秒 = 一小时,对齐 Claude 的 prompt-cache TTL —— 进程只握到「再握也省不下缓存」为止;`0` = 永不释放,`sessions.idle_release_by_vendor: {claude: 7200, codex: 0, …}` 可按 harness 覆盖)没人说话,ccteam 就放掉它的 harness 进程。**释放 ≠ 结束**:transcript 还在、`/sessions` 里照样列出(带 💤)、这个 chat 的当前会话也还指着它 —— 下一条消息就按同一个 sid 恢复(约 1 秒)。在飞 turn、等待审批、harness 自报还有后台任务的会话都不会被释放。`sessions.max_live`(默认 50)保留为突发场景的硬上限:超限时优雅释放最久无活动的合格会话。只有 `/stop` 才是真正结束一个会话。
 
 ---
 
@@ -483,7 +534,7 @@ ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex
 ```bash
 ccteam doctor
 ccteam status
-journalctl --user -u ccteam -n 120
+ccteam daemon logs -n 120
 ```
 
 1. **`ccteam: command not found`** — `~/.local/bin` 不在 PATH:`export PATH="$HOME/.local/bin:$PATH"`。

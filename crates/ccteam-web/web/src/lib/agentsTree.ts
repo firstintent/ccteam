@@ -103,7 +103,7 @@ export function groupDelegationTrees(
 
       return {
         slug,
-        liveCount: projectNodes.filter((node) => node.status === "live").length,
+        liveCount: projectNodes.filter((node) => node.residency === "resident").length,
         totalCount: projectNodes.length,
         rows: collapsedProjects.has(slug) ? [] : filterCollapsedTreeRows(rows, collapsed),
       };

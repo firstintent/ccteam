@@ -53,6 +53,7 @@ import {
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
+import { contextPct, formatTurnStatus } from "../lib/statusLine";
 
 function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -162,6 +163,9 @@ export default function SessionView({
   const [pendingTitle, setPendingTitle] = useState<string | null>(null);
   const [busyMark, setBusyMark] = useState<number | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
+  const [statusModel, setStatusModel] = useState<string | null>(null);
+  const [statusEffort, setStatusEffort] = useState<string | null>(null);
+  const [ctxPct, setCtxPct] = useState<number | null>(null);
 
   const { events, lastError, gatewayUnavailable, connectionEpoch } =
     useSessionEvents(sid);
@@ -191,6 +195,11 @@ export default function SessionView({
         if (cancelled || request !== historyRequestRef.current) return;
         const seeded = historyToRows(h.events);
         if (seeded.length > 0) setRows(seeded);
+        const latest = [...seeded].reverse().find((row) => row.kind === "assistant" && row.status);
+        if (latest?.status) {
+          setStatusModel(latest.status.model ?? null);
+          setCtxPct(contextPct(latest.status.context));
+        }
         setHistoryPage({
           hasMore: h.has_more === true,
           nextBefore: h.next_before ?? null,
@@ -274,9 +283,6 @@ export default function SessionView({
   }, [sid, rows]);
 
   // ---- per-session status (model + effort + ctx%) --------------------------
-  const [statusModel, setStatusModel] = useState<string | null>(null);
-  const [statusEffort, setStatusEffort] = useState<string | null>(null);
-  const [ctxPct, setCtxPct] = useState<number | null>(null);
   const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
   const busy = busyMark !== null && doneCount === busyMark;
   useEffect(() => {
@@ -298,7 +304,20 @@ export default function SessionView({
     return () => {
       cancelled = true;
     };
-  }, [sid, doneCount]);
+  }, [sid]);
+
+  const latestTurnStatus = [...rows]
+    .reverse()
+    .find((row) => row.kind === "assistant" && row.status)?.status;
+  const latestEventStatus = [...events]
+    .reverse()
+    .find((event) => event.kind === "answer" && event.status)?.status;
+  const displayStatusModel = latestEventStatus?.model ?? latestTurnStatus?.model ?? statusModel;
+  const displayCtxPct = latestEventStatus
+    ? contextPct(latestEventStatus.context)
+    : latestTurnStatus
+      ? contextPct(latestTurnStatus.context)
+      : ctxPct;
 
   const pushRow = useCallback((row: Omit<TranscriptRow, "id">) => {
     setRows((current) => appendRow(current, { ...row, id: nextRowId(row.kind) }));
@@ -447,13 +466,18 @@ export default function SessionView({
     }
   }, [rows, showTerminal]);
 
-  // conv-head status dot: busy amber › SESSION state. The base is the rail's
-  // REST `session.status`; this sid's live `session_lifecycle` frames fold on
-  // top, so a capacity eviction greys the dot immediately, without waiting
-  // for the rail's next REST reconcile. The SSE CONNECTION state is a
+  // conv-head status dot: busy amber › SESSION RESIDENCY. The base is the
+  // rail's REST `session.residency`; this sid's live `session_lifecycle`
+  // frames fold on top, so a release greys the dot immediately, without
+  // waiting for the rail's next REST reconcile. The SSE CONNECTION state is a
   // different fact and no longer drives this dot (an open stream on a dead
   // session is what made it "always green").
-  const sessionLive = foldSessionLiveness(session?.status === "live", events);
+  //
+  // It reads `residency`, not `status`: `status` carries the ACTIVITY word
+  // (`working|idle|stale|stuck`) the list endpoint resolves, so the old
+  // `status === "live"` test could never be true and the dot was permanently
+  // grey until a lifecycle frame happened to arrive.
+  const sessionLive = foldSessionLiveness(session?.residency === "resident", events);
   const headDot = busy ? "dot busy" : sessionLive ? "dot on" : "dot off";
   // A broken stream (retries exhausted / no gateway) stays visible as its own
   // red connection dot next to the status dot.
@@ -462,7 +486,7 @@ export default function SessionView({
   const serverTitle = session ? railSessionLabel(session) : sid;
   const title = pendingTitle ?? serverTitle;
   const vendor = session?.vendor ?? "claude";
-  const who = `${vendor} · ${sid}${statusModel ? ` · ${statusModel}` : ""}`;
+  const who = `${vendor} · ${sid}${displayStatusModel ? ` · ${displayStatusModel}` : ""}`;
 
   // The conversation composer reflects this session's FIXED spawn parameters
   // (locked: picking toasts; /model via the input still works). What the live
@@ -475,11 +499,11 @@ export default function SessionView({
       normalizeDraft({
         ...defaultDraft(),
         vendor: vendorSpec(vendor).id,
-        model: statusModel ?? "",
+        model: displayStatusModel ?? "",
         hitl: session?.permission_mode === "hitl",
         effort: statusEffort ?? "",
       }),
-    [vendor, statusModel, statusEffort, session?.permission_mode],
+    [vendor, displayStatusModel, statusEffort, session?.permission_mode],
   );
 
   return (
@@ -537,10 +561,10 @@ export default function SessionView({
           {session?.host && session.host !== "local" ? (
             <span className="chip">@ {session.host}</span>
           ) : null}
-          {statusModel ? (
+          {displayStatusModel ? (
             <span className="chip" title="model · context window">
-              {statusModel}
-              {ctxPct !== null ? ` · ctx ${Math.round(ctxPct)}%` : ""}
+              {displayStatusModel}
+              {displayCtxPct !== null ? ` · ctx ${Math.round(displayCtxPct)}%` : ""}
             </span>
           ) : null}
         </div>
@@ -672,7 +696,20 @@ export default function SessionView({
                           attachments={row.attachments}
                         />
                       </div>
-                      <RowTime ts={row.ts} lang={lang} />
+                      {(() => {
+                        // One footer line: `HH:MM · s12 · turn N · ctx N%` — the
+                        // model already heads the bubble, the ledger lives on
+                        // the session pages.
+                        const footer = formatTurnStatus(row.status);
+                        const tail = footer ? `${sid} · ${footer.text}` : null;
+                        if (!row.ts && !tail) return null;
+                        return (
+                          <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
+                            <RowTime ts={row.ts} lang={lang} />
+                            {tail ? (row.ts ? ` · ${tail}` : tail) : null}
+                          </span>
+                        );
+                      })()}
                     </div>
                   );
                 })}
@@ -743,7 +780,7 @@ export default function SessionView({
                 draft={lockedDraft}
                 onDraftChange={() => {}}
                 locked
-                modelLabel={statusModel ?? ""}
+                modelLabel={displayStatusModel ?? ""}
                 effortLabel={statusEffort ?? ""}
                 uploadSlug={session?.project}
                 onSchedule={scheduleText}

@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::{deny_non_admin, Identity};
+use crate::dsh_web::DshPluginFindingView;
 use crate::state::AppState;
 
 /// The id of this machine — the single host until the v0.9 host axis adds
@@ -75,6 +76,12 @@ pub struct AgentHealth {
     pub status: String,
     /// Copy-paste remediation when not `ready`; `null` when ready.
     pub hint: Option<String>,
+    /// `dsh` only: what the operator's OWN `~/.dsh` profile carries that
+    /// ccteam left alone — version drift from the embedded copy, a duplicated
+    /// bundle id, an install pnpm never finished. Reports, never repairs:
+    /// touching someone else's package is theirs to do.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dsh_plugin_findings: Vec<DshPluginFindingView>,
 }
 
 /// Collection row for `GET /api/v1/hosts`.
@@ -152,7 +159,7 @@ pub struct HostProjectView {
 
 /// Is the ccteam MCP server registered in this vendor's config? Read-only,
 /// best-effort (a missing / unreadable config reads as `false`).
-fn mcp_registered(vendor: &str) -> bool {
+fn mcp_registered(vendor: &str, ccteam_root: &std::path::Path) -> bool {
     match vendor {
         "claude" => ccteam_core::projects::resolve_claude_json_path()
             .map(|p| ccteam_core::mcp_register::claude_mcp_registered(&p))
@@ -169,16 +176,39 @@ fn mcp_registered(vendor: &str) -> bool {
         "kimi" => ccteam_core::mcp_register::resolve_kimi_config_path()
             .map(|p| ccteam_core::mcp_register::kimi_mcp_registered(&p))
             .unwrap_or(false),
+        // DSH has no vendor MCP config file: "registered" means ccteam's
+        // Cordis plugins (each bundle + its configured patch row) are present
+        // in the operator's own `~/.dsh` web profile — exactly what
+        // `register-mcp?vendor=dsh` writes. A profile carrying only some of
+        // them reads as `false`, so the button is offered until every plugin
+        // is in. Read-only; a home we cannot resolve or read is `false`.
+        "dsh" => ccteam_harness::execution::dsh_acp::spawn_spec::dsh_home_for_identity(
+            true,
+            "",
+            ccteam_root,
+        )
+        .map(|home| {
+            ccteam_harness::execution::dsh_acp::materialize::ccteam_plugins_registered_in_profile(
+                &home,
+                ccteam_harness::DSH_NATIVE_WEB_PROFILE,
+            )
+        })
+        .unwrap_or(false),
         _ => false,
     }
 }
 
 /// Build one agent's health row (probe + MCP-registration check + tri-state).
-fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
+fn agent_health(
+    spec: &AgentProbeSpec,
+    refresh: bool,
+    ccteam_root: &std::path::Path,
+) -> AgentHealth {
     let bin = resolve_bin(spec);
     let (installed, version) = probe_bin_cached(&bin, refresh);
-    let native_mcp = spec.tool_surface.uses_native_mcp_config();
-    let registered = native_mcp && mcp_registered(spec.vendor);
+    // `mcp_registered` answers per vendor (bridge vendors without a
+    // registration surface answer `false`), so no tool-surface gate here.
+    let registered = mcp_registered(spec.vendor, ccteam_root);
     let status = classify_status(installed, registered, spec.tool_surface);
     let hint: Option<String> = match status {
         // VENDOR-INSTALL-1 — recipe-backed vendors get the one-click pointer
@@ -207,6 +237,13 @@ fn agent_health(spec: &AgentProbeSpec, refresh: bool) -> AgentHealth {
         _ => None,
     };
     AgentHealth {
+        // Only DSH has an operator-installed ccteam plugin to report on; every
+        // other vendor answers "nothing" by construction.
+        dsh_plugin_findings: if spec.vendor == "dsh" {
+            crate::dsh_web::operator_dsh_plugin_findings(ccteam_root)
+        } else {
+            Vec::new()
+        },
         vendor: spec.vendor.to_string(),
         harness_id: spec.harness_id.to_string(),
         installed,
@@ -253,11 +290,11 @@ fn local_hostname() -> String {
 }
 
 /// Probe every spec (off the async runtime — each shells out).
-async fn probe_all_agents(refresh: bool) -> Vec<AgentHealth> {
+async fn probe_all_agents(refresh: bool, ccteam_root: std::path::PathBuf) -> Vec<AgentHealth> {
     tokio::task::spawn_blocking(move || {
         AGENT_PROBE_SPECS
             .iter()
-            .map(|spec| agent_health(spec, refresh))
+            .map(|spec| agent_health(spec, refresh, &ccteam_root))
             .collect::<Vec<_>>()
     })
     .await
@@ -284,7 +321,7 @@ async fn probe_npm_available(refresh: bool) -> bool {
     responses((status = 200, description = "Hosts ccteam drives (today one: `local`)", body = HostsResponse)),
 )]
 pub(crate) async fn handle_hosts(State(app): State<crate::state::AppState>) -> Response {
-    let agents = probe_all_agents(false).await;
+    let agents = probe_all_agents(false, app.paths.root.clone()).await;
     let agents_ready = agents.iter().filter(|a| a.status == "ready").count();
     let mut hosts = vec![HostSummary {
         host: LOCAL_HOST.to_string(),
@@ -345,7 +382,7 @@ pub(crate) async fn handle_host_detail(
     Query(q): Query<HostDetailQuery>,
 ) -> Response {
     if host == LOCAL_HOST {
-        let agents = probe_all_agents(q.refresh).await;
+        let agents = probe_all_agents(q.refresh, app.paths.root.clone()).await;
         let npm_available = probe_npm_available(q.refresh).await;
         let projects = ccteam_core::config::load(&app.paths.root)
             .map(|cfg| {
@@ -401,6 +438,9 @@ pub(crate) async fn handle_host_detail(
                             tool_surface_note: spec.and_then(AgentProbeSpec::tool_surface_notice),
                             status: a.status.clone(),
                             hint: None,
+                            // A satellite's own `~/.dsh` is not this machine's
+                            // to read; its report belongs to its own doctor.
+                            dsh_plugin_findings: Vec::new(),
                         }
                     })
                     .collect();
@@ -479,9 +519,10 @@ pub struct RegisterMcpQuery {
 
 /// `POST /api/v1/hosts/{host}/register-mcp` — register ccteam's OWN entry
 /// into the vendor's config surface. For the five config-file vendors that is
-/// the MCP server entry; for `?vendor=dsh` it is ccteam's plugin bundle +
-/// patch row in the operator's `~/.dsh` web profile (which the human loads by
-/// restarting their `dsh web`). **Idempotent** (merge, never clobber), and
+/// the MCP server entry; for `?vendor=dsh` it is ccteam's plugin bundles +
+/// patch rows (tool/transport client and team panel alike) in the operator's
+/// `~/.dsh` web profile, which the human loads by restarting their `dsh web`.
+/// **Idempotent** (merge, never clobber), and
 /// only ccteam's own entries. ccteam never writes a vendor login/key; vendor
 /// CLI installs live in the separate VENDOR-INSTALL-1 job surface
 /// (`.../vendors/{vendor}/install`). 404 for a non-`local` host; 400 for an
@@ -523,12 +564,14 @@ pub(crate) async fn handle_register_mcp(
     }
     let want: Option<String> = match q.vendor.as_deref().map(str::trim) {
         None | Some("") => None,
-        // DSH's "register ccteam" is not a vendor-config write: its tool and
-        // transport surface is the `@ccteam/dsh-client` Cordis plugin. This
-        // action merges ccteam's OWN bundle entry + `ccteam-client` patch row
-        // (carrying this daemon's transportSocket/URL) into the operator's
-        // real `~/.dsh` web profile — gate ①, idempotent, merge-only — so a
-        // hand-started `dsh web` can serve hires after its owner restarts it.
+        // DSH's "register ccteam" is not a vendor-config write: ccteam reaches
+        // DSH through one Cordis plugin — `@ccteam/ccteam-ui`, which carries
+        // the tool face, the ACP transport and the team panel. This action
+        // merges ccteam's OWN bundle entry + patch row (carrying this daemon's
+        // transportSocket/URL and the operator's own REST token) into the
+        // operator's real `~/.dsh` web profile — gate ①, idempotent,
+        // merge-only — so a hand-started `dsh web` can serve hires after its
+        // owner restarts it.
         // Deliberately NOT part of register-all: it only takes effect after
         // the human restarts their own instance, so it stays an explicit ask.
         Some("dsh") => {
@@ -538,7 +581,7 @@ pub(crate) async fn handle_register_mcp(
                     Json(serde_json::json!({
                         "registered": ["dsh"],
                         "paths": {"dsh": profile_dir},
-                        "note": "restart your DSH web instance to load the ccteam plugin",
+                        "note": "restart your DSH web instance to load the ccteam plugins",
                     })),
                 )
                     .into_response(),
@@ -1349,7 +1392,11 @@ mod tests {
             manual_install_url: None,
             quota_probe: None,
         };
-        let h = agent_health(&spec, true);
+        let h = agent_health(
+            &spec,
+            true,
+            std::path::Path::new("/nonexistent/ccteam-home-zzz"),
+        );
         assert!(!h.installed);
         assert_eq!(h.status, "not_installed");
         assert!(h.hint.is_some());

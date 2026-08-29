@@ -305,7 +305,15 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
   const snippets = useMemo(() => orderSnippets(minted?.snippets ?? []), [minted]);
   const current = snippets.find((s) => s.vendor === shown) ?? snippets[0] ?? null;
 
+  // The unlabelled MACHINE-USER slot is the daemon's own credential (the one
+  // written into the harness global configs), so a user-scoped mint has to name
+  // its slot. The API refuses it either way — this just stops the form from
+  // offering a request that cannot succeed.
+  const labelRequired = scope === "user";
+  const canMint = Boolean(scope) && (!labelRequired || label.trim().length > 0);
+
   const onMint = async () => {
+    if (!canMint) return;
     setBusy(true);
     setError(null);
     const trimmed = label.trim();
@@ -316,7 +324,9 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
     try {
       const res =
         scope === "user"
-          ? await mintUserEnrollment(req)
+          ? // `canMint` above is what guarantees the non-empty label the route
+            // (and this function's type) demands.
+            await mintUserEnrollment({ label: trimmed })
           : await mintProjectEnrollment(scope.replace(/^project:/, ""), req);
       setMinted(res);
       setShown(res.snippets[0]?.vendor ?? "");
@@ -366,14 +376,22 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
             />
           </div>
           <div className="flex flex-col gap-1">
-            <Label htmlFor="enroll-label">{t("accessMcpLabelLabel")}</Label>
+            <Label htmlFor="enroll-label">
+              {t(labelRequired ? "accessMcpLabelLabelRequired" : "accessMcpLabelLabel")}
+            </Label>
             <Input
               id="enroll-label"
               data-testid="access-mcp-label"
               value={label}
+              required={labelRequired}
               placeholder={t("accessMcpLabelPh")}
               onChange={(e) => setLabel(e.target.value)}
             />
+            {labelRequired ? (
+              <p data-testid="access-mcp-label-why" className="text-xs text-text-dim">
+                {t("accessMcpLabelWhy")}
+              </p>
+            ) : null}
           </div>
         </div>
         {projects?.length === 0 ? (
@@ -384,7 +402,7 @@ export function ExternalAgentCard({ lang }: { lang: Lang }) {
           data-testid="access-mcp-mint"
           size="sm"
           className="self-start"
-          disabled={busy || !scope}
+          disabled={busy || !canMint}
           onClick={() => void onMint()}
         >
           {busy ? t("accessMcpMinting") : t("accessMcpMint")}

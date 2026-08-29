@@ -212,7 +212,7 @@ export function VendorRosterCards({
                 <div className="charter-roster" data-testid={`charter-roster-cards-${host}`}>
                   {agents.map((agent) => {
                     const mine = nodes.filter((n) => n.host === host && n.vendor === agent.vendor);
-                    const live = mine.filter((n) => n.status === "live").length;
+                    const live = mine.filter((n) => n.residency === "resident").length;
                     const cost = mine.reduce((sum, n) => sum + (n.cost_usd ?? 0), 0);
                     const badge = rosterBadge(agent.status, t);
                     // `isOutdated` already returns false when either side

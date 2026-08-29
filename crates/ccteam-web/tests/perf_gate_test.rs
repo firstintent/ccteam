@@ -162,6 +162,7 @@ async fn perf_gate() {
     let mut gateway = Gateway::new_with_factory(factory, SLUG, fixture.project_dir.clone());
     gateway.set_sessions_config(ccteam_core::SessionsConfig {
         max_live: LIVE_SESSIONS as u32,
+        ..Default::default()
     });
     for _ in 0..LIVE_SESSIONS {
         gateway

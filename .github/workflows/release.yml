@@ -248,8 +248,143 @@ jobs:
           case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
           # Only ship the user-facing archives + the aggregated SHA256SUMS;
           # the per-asset .sha256 files are intermediate.
-          gh release create "${TAG}" ${PRERELEASE} \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "ccteam ${TAG}" \
-            --notes-file ../release-notes.md \
-            ccteam-*.tar.gz SHA256SUMS
+          # Idempotent: a release may already exist for this tag (e.g. someone
+          # cut it by hand before the build finished). Creating it again is a
+          # 422 that used to fail the whole job and leave the release with NO
+          # binaries. Upload into the existing release instead.
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber \
+              ccteam-*.tar.gz SHA256SUMS
+          else
+            gh release create "${TAG}" ${PRERELEASE} \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "ccteam ${TAG}" \
+              --notes-file ../release-notes.md \
+              ccteam-*.tar.gz SHA256SUMS
+          fi
+
+  # npm channel (PRD v0.10.5 D2 / PLUG-5): the same four binaries ride into
+  # `@ccteam/engine-<os>-<cpu>` platform packages, and `@ccteam/ccteam-ui`
+  # (the DSH plugin) pins them as optionalDependencies at the SAME version,
+  # so `dsh plugin --profile <name> add @ccteam/ccteam-ui` brings an engine with it and
+  # `ccteam update --channel npm` has something to install from. Runs only
+  # after the GitHub release succeeded, and only when the repository secret
+  # `NPM_TOKEN` (publish rights on the `@ccteam` org) is set — without it the
+  # job explains itself in the run summary and skips, never fails the tag.
+  npm:
+    name: publish-npm
+    needs: [build, release]
+    if: github.repository == 'firstintent/ccteam'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Gate on NPM_TOKEN
+        id: gate
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## npm publish skipped"
+              echo "Repository secret \`NPM_TOKEN\` is not set (it needs publish rights on the \`@ccteam\` npm org)."
+              echo "The GitHub release above is complete; \`dsh plugin --profile <name> add @ccteam/ccteam-ui\` will not see this version until the packages are published."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        if: steps.gate.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Node
+        if: steps.gate.outputs.publish == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish engine platform packages
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # A pre-release-shaped tag lands under the `next` dist-tag so
+          # `latest` (what a bare `dsh plugin add` resolves) stays clean.
+          DIST_TAG=latest
+          case "$TAG" in *-*) DIST_TAG=next ;; esac
+          mkdir -p out
+          # release asset suffix -> npm platform tuple (`os`/`cpu` of the template)
+          for pair in linux-x64:linux-x64 linux-arm64:linux-arm64 macos-arm64:darwin-arm64 macos-x64:darwin-x64; do
+            suffix="${pair%%:*}"
+            tuple="${pair##*:}"
+            archive="dist/ccteam-${TAG}-${suffix}.tar.gz"
+            [ -f "$archive" ] || { echo "::error::missing release asset ${archive}"; exit 1; }
+            work="$(mktemp -d)"
+            tar -xzf "$archive" -C "$work"
+            bin="${work}/ccteam-${TAG}-${suffix}/ccteam"
+            [ -x "$bin" ] || { echo "::error::no executable ccteam inside ${archive}"; exit 1; }
+            tgz="$(plugins/engine-packages/pack-engine.sh "$tuple" "$bin" "$VERSION" out | head -n1)"
+            pkg="@ccteam/engine-${tuple}"
+            # Idempotent: re-running the tag must not fail on an already-published version.
+            if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${pkg}@${VERSION} already on the registry; skipping"
+            else
+              npm publish "$tgz" --access public --tag "$DIST_TAG"
+            fi
+          done
+
+      - name: Publish @ccteam/ccteam-ui
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          DIST_TAG=latest
+          case "$TAG" in *-*) DIST_TAG=next ;; esac
+          cd plugins/ccteam-ui
+          # Plain `npm ci`: the four @ccteam/engine-* optionalDependencies 404 until
+          # the previous step publishes them (npm tolerates a missing optional dep),
+          # and `--omit=optional` must NOT be used — rolldown's native binding is
+          # itself an optional dependency, so omitting optionals breaks the build.
+          npm ci
+          npm run build
+          # Stamp the tag onto a copy of the manifest: package version, the four
+          # optionalDependencies, and `ccteam.engine` (the pinned engine version the
+          # plugin's supervisor enforces) all equal the tag — pre-1.0 lockstep (D5).
+          node -e '
+            const fs = require("node:fs")
+            const v = process.argv[1]
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"))
+            pkg.version = v
+            for (const k of Object.keys(pkg.optionalDependencies || {})) pkg.optionalDependencies[k] = v
+            pkg.ccteam = { ...(pkg.ccteam || {}), engine: v }
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n")
+          ' "$VERSION"
+          if npm view "@ccteam/ccteam-ui@${VERSION}" version >/dev/null 2>&1; then
+            echo "@ccteam/ccteam-ui@${VERSION} already on the registry; skipping"
+          else
+            npm publish --access public --tag "$DIST_TAG"
+          fi
+          {
+            echo "## npm"
+            echo "Published \`@ccteam/ccteam-ui@${VERSION}\` (dist-tag \`${DIST_TAG}\`) with \`@ccteam/engine-{linux-x64,linux-arm64,darwin-x64,darwin-arm64}@${VERSION}\`."
+            echo "Install: \`dsh plugin --profile <name> add @ccteam/ccteam-ui\` (DSH requires the profile flag)"
+          } >> "$GITHUB_STEP_SUMMARY"

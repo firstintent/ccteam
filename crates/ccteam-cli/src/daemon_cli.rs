@@ -27,10 +27,11 @@ use crate::legacy_takeover;
 /// `CCTEAM_{CLAUDE,CODEX}_BIN`.
 pub const DAEMON_BIN_ENV: &str = "CCTEAM_DAEMON_BIN";
 /// Default embedded-web bind, shared by the daemon verbs' clap defaults
-/// and `ccteam update`'s upgrade-restart (which has no `--web-bind` of its
-/// own — same posture as `daemon restart`).
+/// and [`LauncherFlags::default`]. The DSH companion bind has no constant
+/// of its own: it is always derived from the web bind
+/// ([`default_dsh_web_bind`]), so a non-default web bind can never be
+/// paired with a stale hardcoded companion port.
 pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:7331";
-pub const DEFAULT_DSH_WEB_BIND: &str = "0.0.0.0:7332";
 /// Hidden test hooks: shrink the ready-wait / stop-wait budgets so
 /// failure-path integration tests don't burn the production timeouts.
 const READY_TIMEOUT_ENV: &str = "CCTEAM_DAEMON_READY_TIMEOUT_MS";
@@ -88,21 +89,72 @@ fn spawn_program() -> Result<PathBuf> {
     ccteam_core::current_ccteam_bin().context("resolve daemon binary to detach")
 }
 
-fn start_spec(
-    paths: &CcteamPaths,
-    web_bind: &str,
-    dsh_web_bind: Option<&str>,
-) -> Result<dcore::DaemonStartSpec> {
-    let dsh_web_bind = effective_dsh_web_bind(web_bind, dsh_web_bind)?;
+/// v0.10.5 D7 — the daemon's runtime flags as the launcher holds them.
+/// Plain data (no clap) so `ccteam update`'s restart path can build one
+/// without a parsed command line, and so [`daemon_run_argv`] is a pure
+/// function the unit tests can pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LauncherFlags {
+    pub no_web: bool,
+    pub no_imd: bool,
+    pub web_bind: String,
+    pub dsh_web_bind: Option<String>,
+    pub web_no_auth: bool,
+    pub web_token_file: Option<PathBuf>,
+    pub no_clipboard: bool,
+}
+
+impl Default for LauncherFlags {
+    fn default() -> Self {
+        Self {
+            no_web: false,
+            no_imd: false,
+            web_bind: DEFAULT_WEB_BIND.to_string(),
+            dsh_web_bind: None,
+            web_no_auth: false,
+            web_token_file: None,
+            no_clipboard: false,
+        }
+    }
+}
+
+/// argv (program excluded) for the detached daemon. v0.10.5 D7: the exec
+/// target is the hidden `internal daemon-run`, NOT `start` — `start` is
+/// now the launcher itself, so pointing the launcher at it would fork
+/// bomb. Pure so the forwarding contract is unit-tested without spawning.
+pub(crate) fn daemon_run_argv(flags: &LauncherFlags) -> Result<Vec<String>> {
+    let dsh_web_bind = effective_dsh_web_bind(&flags.web_bind, flags.dsh_web_bind.as_deref())?;
+    let mut args = vec![
+        "internal".to_string(),
+        "daemon-run".to_string(),
+        "--web-bind".to_string(),
+        flags.web_bind.clone(),
+        "--dsh-web-bind".to_string(),
+        dsh_web_bind,
+    ];
+    if flags.no_web {
+        args.push("--no-web".to_string());
+    }
+    if flags.no_imd {
+        args.push("--no-imd".to_string());
+    }
+    if flags.web_no_auth {
+        args.push("--web-no-auth".to_string());
+    }
+    if let Some(path) = &flags.web_token_file {
+        args.push("--web-token-file".to_string());
+        args.push(path.display().to_string());
+    }
+    if flags.no_clipboard {
+        args.push("--no-clipboard".to_string());
+    }
+    Ok(args)
+}
+
+fn start_spec(paths: &CcteamPaths, args: Vec<String>) -> Result<dcore::DaemonStartSpec> {
     Ok(dcore::DaemonStartSpec {
         program: spawn_program()?,
-        args: vec![
-            "start".to_string(),
-            "--web-bind".to_string(),
-            web_bind.to_string(),
-            "--dsh-web-bind".to_string(),
-            dsh_web_bind,
-        ],
+        args,
         log_path: dcore::daemon_log_path(paths),
         ready_timeout: env_duration_ms(READY_TIMEOUT_ENV, dcore::START_READY_TIMEOUT),
     })
@@ -121,12 +173,32 @@ fn effective_dsh_web_bind(web_bind: &str, dsh_web_bind: Option<&str>) -> Result<
             let web: std::net::SocketAddr = web_bind
                 .parse()
                 .with_context(|| format!("--web-bind {web_bind} is not a valid socket address"))?;
-            let port = web.port().checked_add(1).context(
-                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
-            )?;
-            Ok(std::net::SocketAddr::new(web.ip(), port).to_string())
+            Ok(default_dsh_web_bind(web)?.to_string())
         }
     }
+}
+
+/// The DSH companion bind derived from the web bind, for every entry point
+/// that does not get an explicit `--dsh-web-bind` (the launcher's forwarded
+/// argv, the daemon body, standalone `ccteam internal web`). ONE derivation:
+/// a second copy is how one of them ends up on a different port than the
+/// other two.
+///
+/// `port + 1` is a convenience for a FIXED web port, never a contract — the
+/// companion's real address is read back from its listener after bind and
+/// reported through `/health.dsh_web_bind`. So an EPHEMERAL web port
+/// (`:0` = "any free port") derives an EPHEMERAL companion port: `0 + 1` is
+/// port 1, which only root may bind, and the whole process died on it right
+/// after announcing its own address (red locally, green only in root CI).
+pub(crate) fn default_dsh_web_bind(web_bind: std::net::SocketAddr) -> Result<std::net::SocketAddr> {
+    if web_bind.port() == 0 {
+        return Ok(std::net::SocketAddr::new(web_bind.ip(), 0));
+    }
+    let port = web_bind
+        .port()
+        .checked_add(1)
+        .context("--dsh-web-bind default cannot be derived because --web-bind uses port 65535")?;
+    Ok(std::net::SocketAddr::new(web_bind.ip(), port))
 }
 
 fn stop_tuning() -> dcore::StopTuning {
@@ -170,6 +242,9 @@ pub(crate) fn takeover_pre_step() {
 }
 
 /// Human-facing pointer printed after a successful start.
+/// `web_bind` here must be what the daemon SERVES: with `--web-bind
+/// 127.0.0.1:0` the requested string ends in `:0`, and printing a URL
+/// with port 0 sends the operator to an address nothing listens on.
 fn web_hint(web_bind: &str) -> String {
     let port = web_bind.rsplit(':').next().unwrap_or("7331");
     let host = crate::first_lan_ipv4()
@@ -181,37 +256,136 @@ fn web_hint(web_bind: &str) -> String {
     )
 }
 
-pub fn run_daemon_start(web_bind: &str, dsh_web_bind: Option<&str>, json: bool) -> Result<()> {
+pub fn run_daemon_start(flags: &LauncherFlags, json: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
+    // v0.10.5 — `home` rides on BOTH verdicts, not just `started`: a
+    // plugin treats "I started it" and "it was already up" as the same
+    // success and then has to answer one question — is this daemon MY
+    // home's? Answering it on only one branch would leave the other
+    // needing a second lookup to be safe.
+    let home = canonical_home(&paths);
     takeover_pre_step();
     let _lock = match dcore::acquire_operation_lock(&paths) {
         Ok(lock) => lock,
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     };
-    let spec = start_spec(&paths, web_bind, dsh_web_bind)?;
+    let spec = start_spec(&paths, daemon_run_argv(flags)?)?;
     match dcore::start_managed(&paths, &spec) {
         Ok(dcore::StartVerdict::Started { pid, version }) => {
             let v = version.clone().unwrap_or_else(|| "unknown".into());
             emit(
                 json,
-                serde_json::json!({ "status": "started", "pid": pid, "version": version }),
+                serde_json::json!({
+                    "status": "started",
+                    "pid": pid,
+                    "version": version,
+                    "home": home,
+                }),
                 &format!(
                     "ccteam daemon started (pid {pid}, version {v}).\n{}",
-                    web_hint(web_bind)
+                    // The daemon is ready by now, so ask it where it
+                    // actually landed rather than echoing the request.
+                    web_hint(
+                        served_web_bind(&paths)
+                            .as_deref()
+                            .unwrap_or(&flags.web_bind)
+                    )
                 ),
             );
         }
-        Ok(dcore::StartVerdict::AlreadyRunning { version }) => {
+        Ok(dcore::StartVerdict::AlreadyRunning { version, pid }) => {
             let v = version.clone().unwrap_or_else(|| "unknown".into());
+            let who = pid
+                .map(|p| format!("pid {p}"))
+                .unwrap_or_else(|| "pid unknown — not started by the launcher".to_string());
             emit(
                 json,
-                serde_json::json!({ "status": "alreadyRunning", "version": version }),
-                &format!("ccteam daemon already running (version {v})."),
+                serde_json::json!({
+                    "status": "alreadyRunning",
+                    "pid": pid,
+                    "version": version,
+                    "home": home,
+                }),
+                &format!("ccteam daemon already running ({who}, version {v}) in {home}."),
             );
         }
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     }
     Ok(())
+}
+
+/// How long we wait on the running daemon's `/health`. It is a loopback
+/// GET against a process we already know is answering its MCP socket, so
+/// a second is generous; the point of the cap is that `ccteam daemon
+/// status` must stay fast when the answer is "not reachable".
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ask the RUNNING daemon who it is.
+///
+/// The identity source of truth is the live process, never the launcher's
+/// recorded argv: `--web-bind 127.0.0.1:0` records `:0` and *serves*
+/// `127.0.0.1:46303`, so reporting the record would report a request as
+/// if it were a fact. `run/daemon-endpoint.json` supplies only the
+/// address; `/health` supplies the answer.
+///
+/// `None` whenever the daemon cannot be reached that way (web disabled
+/// with `--no-web`, a bind this host cannot dial, a build older than the
+/// identity surface). Callers must then report *unknown*, never a guess.
+pub(crate) fn live_health(paths: &CcteamPaths) -> Option<serde_json::Value> {
+    let endpoint = dcore::read_endpoint(&dcore::endpoint_path(paths))?;
+    let addr: std::net::SocketAddr = endpoint.web_bind.parse().ok()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    // An unspecified bind (0.0.0.0) is reachable on loopback; a specific
+    // address is dialled as published.
+    let host = if addr.ip().is_unspecified() {
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        )
+    } else {
+        addr
+    };
+    let body: serde_json::Value = runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(HEALTH_TIMEOUT)
+            .build()
+            .ok()?;
+        client
+            .get(format!("http://{host}/health"))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()
+    })?;
+    // A stale publication can outlive its daemon and point at whatever now
+    // owns the port. Only an answer from OUR home is this daemon's.
+    (body.get("home").and_then(|v| v.as_str()) == Some(canonical_home(paths).as_str()))
+        .then_some(body)
+}
+
+/// The address the running daemon serves, for prose that would otherwise
+/// echo the request. `None` = unknown; callers fall back to what was
+/// asked for, which is at least honest about being the request.
+fn served_web_bind(paths: &CcteamPaths) -> Option<String> {
+    live_health(paths)?
+        .get("web_bind")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Canonical `$CCTEAM_HOME` as a string — the same resolution
+/// `GET /health` reports, so a client comparing the two never sees a
+/// symlinked path differ from a resolved one.
+fn canonical_home(paths: &CcteamPaths) -> String {
+    std::fs::canonicalize(&paths.root)
+        .unwrap_or_else(|_| paths.root.clone())
+        .display()
+        .to_string()
 }
 
 pub fn run_daemon_stop(force: bool, json: bool) -> Result<()> {
@@ -278,6 +452,57 @@ pub(crate) enum RestartOutcome {
     StopTimedOut { pid: u32 },
     /// After the stop, an unmanaged instance already serves the socket.
     AlreadyServing { version: Option<String> },
+    /// A replay restart was asked for but the running daemon's invocation
+    /// could not be reconstructed. NOTHING was stopped.
+    ReplayUnavailable { hint: String },
+}
+
+/// How a replay restart reconstructs the invocation to bring back, decided
+/// BEFORE the daemon is stopped so a refusal costs nothing. Pure over its
+/// two inputs so every rung is unit-tested without a daemon.
+///
+/// Rungs, in order of fidelity:
+/// 1. the launcher's recorded argv — the only source carrying EVERY flag
+///    (`--no-web`, `--no-imd`, `--web-token-file`, …);
+/// 2. the binds the running daemon reports on `/health` — fewer flags,
+///    but the addresses are the ones actually being served;
+/// 3. refuse. Falling through to the compiled-in defaults is what moved a
+///    daemon serving `127.0.0.1:17436` onto `0.0.0.0:7331` and killed
+///    `/health` on the original port. "Restart" may never mean "restart
+///    somewhere else".
+pub(crate) fn plan_replay(
+    recorded: Option<Vec<String>>,
+    health: Option<&serde_json::Value>,
+) -> std::result::Result<Vec<String>, String> {
+    if let Some(args) = recorded {
+        return Ok(args);
+    }
+    let web_bind = health
+        .and_then(|h| h.get("web_bind"))
+        .and_then(|v| v.as_str());
+    if let Some(web_bind) = web_bind {
+        // A daemon with the companion proxy disabled reports null; `off`
+        // is how that is spelled on the command line.
+        let dsh_web_bind = health
+            .and_then(|h| h.get("dsh_web_bind"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "off".to_string());
+        return daemon_run_argv(&LauncherFlags {
+            web_bind: web_bind.to_string(),
+            dsh_web_bind: Some(dsh_web_bind),
+            ..LauncherFlags::default()
+        })
+        .map_err(|err| format!("{err:#}"));
+    }
+    Err(
+        "the running daemon has no launcher record and does not report its bind on \
+         `/health` (a build older than the identity surface, or one started with \
+         `--no-web`), so a restart could only guess where to put it back. Restart it \
+         yourself with the flags it is running: `ccteam stop && ccteam start --web-bind \
+         <addr> [...]`, or name them on `ccteam daemon restart --web-bind <addr>`"
+            .to_string(),
+    )
 }
 
 /// Reusable restart core: acquire the operation lock, then stop (if
@@ -286,11 +511,27 @@ pub(crate) enum RestartOutcome {
 /// (`daemon start/restart` and `ccteam update` all do). Shared by
 /// [`run_daemon_restart`] and the `ccteam update` upgrade-restart contract
 /// so the lock/stop/start logic lives in exactly one place.
+///
+/// `flags = None` means **replay the running invocation**: `ccteam update`
+/// restarts a daemon it did not launch and must not move it anywhere. See
+/// [`plan_replay`] for the rungs — and for why the missing rung is a
+/// refusal rather than the compiled-in defaults.
 pub(crate) fn restart_managed(
     paths: &CcteamPaths,
-    web_bind: &str,
-    dsh_web_bind: Option<&str>,
+    flags: Option<&LauncherFlags>,
 ) -> Result<RestartOutcome> {
+    let replay = match flags {
+        Some(f) => daemon_run_argv(f)?,
+        None => {
+            // Decided while the daemon is still UP (it has to answer
+            // `/health`) and before the lock, so a refusal stops nothing.
+            let recorded = dcore::read_pid_record(&dcore::pidfile_path(paths)).and_then(|r| r.args);
+            match plan_replay(recorded, live_health(paths).as_ref()) {
+                Ok(args) => args,
+                Err(hint) => return Ok(RestartOutcome::ReplayUnavailable { hint }),
+            }
+        }
+    };
     // ONE lock across stop + start.
     let _lock = dcore::acquire_operation_lock(paths)?;
     let was_running = match dcore::stop_managed_with(paths, false, stop_tuning())? {
@@ -301,14 +542,14 @@ pub(crate) fn restart_managed(
         }
         dcore::StopVerdict::TimedOut { pid } => return Ok(RestartOutcome::StopTimedOut { pid }),
     };
-    let spec = start_spec(paths, web_bind, dsh_web_bind)?;
+    let spec = start_spec(paths, replay)?;
     match dcore::start_managed(paths, &spec)? {
         dcore::StartVerdict::Started { pid, version } => Ok(if was_running {
             RestartOutcome::Restarted { pid, version }
         } else {
             RestartOutcome::Started { pid, version }
         }),
-        dcore::StartVerdict::AlreadyRunning { version } => {
+        dcore::StartVerdict::AlreadyRunning { version, .. } => {
             Ok(RestartOutcome::AlreadyServing { version })
         }
     }
@@ -379,6 +620,10 @@ fn restart_command_action(
             code: "notManaged",
             message: hint,
         },
+        RestartOutcome::ReplayUnavailable { hint } => RestartCommandAction::Fail {
+            code: "replayUnavailable",
+            message: hint,
+        },
         RestartOutcome::StopTimedOut { pid } => RestartCommandAction::Fail {
             code: "stopTimeout",
             message: format!(
@@ -389,21 +634,16 @@ fn restart_command_action(
     }
 }
 
-pub fn run_daemon_restart(
-    web_bind: &str,
-    dsh_web_bind: Option<&str>,
-    json: bool,
-    if_managed: bool,
-) -> Result<()> {
+pub fn run_daemon_restart(flags: &LauncherFlags, json: bool, if_managed: bool) -> Result<()> {
     let paths = CcteamPaths::from_env()?;
     // Restart is the verb `make install` runs on upgraded dev boxes, so
     // it carries the same takeover pre-step as start.
     takeover_pre_step();
-    let outcome = match restart_managed(&paths, web_bind, dsh_web_bind) {
+    let outcome = match restart_managed(&paths, Some(flags)) {
         Ok(outcome) => outcome,
         Err(err) => fail(json, error_code(&err), &format!("{err:#}")),
     };
-    match restart_command_action(outcome, if_managed, web_bind) {
+    match restart_command_action(outcome, if_managed, &flags.web_bind) {
         RestartCommandAction::Emit { machine, human } => emit(json, machine, &human),
         RestartCommandAction::Fail { code, message } => fail(json, code, &message),
     }
@@ -415,10 +655,37 @@ pub fn run_daemon_status(json: bool) -> Result<()> {
     let report = dcore::daemon_status(&paths);
     let binary_version = env!("CARGO_PKG_VERSION");
     let pid = report.record.as_ref().map(|r| r.pid);
+    // v0.10.5 — the `GET /health` field set, sourced from the RUNNING
+    // daemon. The launcher's recorded argv is NOT an identity: it records
+    // what was requested, and `--web-bind 127.0.0.1:0` requests "any free
+    // port" while the daemon serves a concrete one. The record is used for
+    // exactly two things — `managed`, and the replay args a restart needs.
+    //
+    // What survives when `/health` is unreachable (`--no-web`, an old
+    // build, a bind this host cannot dial) is only what is true BY
+    // CONSTRUCTION: the home whose socket we just probed, the version that
+    // socket answered with, and the record's pid when it matches a live
+    // process. The bind/uptime/build fields go `null` — "unknown" is a
+    // usable answer, a requested value dressed up as a served one is not.
+    let health = live_health(&paths);
+    let field = |name: &str| health.as_ref().and_then(|h| h.get(name)).cloned();
     let machine = serde_json::json!({
+        "status": if report.ready { "ok" } else { "down" },
+        "version": field("version").unwrap_or(serde_json::json!(report.running_version)),
+        "build": field("build").unwrap_or(serde_json::Value::Null),
+        "home": field("home").unwrap_or(serde_json::json!(canonical_home(&paths))),
+        "pid": field("pid").unwrap_or(serde_json::json!(report
+            .managed
+            .then_some(pid)
+            .flatten())),
+        "web_bind": field("web_bind").unwrap_or(serde_json::Value::Null),
+        "dsh_web_bind": field("dsh_web_bind").unwrap_or(serde_json::Value::Null),
+        "uptime_secs": field("uptime_secs").unwrap_or(serde_json::Value::Null),
+        "binary": ccteam_core::current_ccteam_bin()
+            .ok()
+            .map(|p| p.display().to_string()),
         "ready": report.ready,
         "managed": report.managed,
-        "pid": report.managed.then_some(pid).flatten(),
         "runningVersion": report.running_version,
         "binaryVersion": binary_version,
         "socket": report.socket.display().to_string(),
@@ -441,7 +708,8 @@ pub fn run_daemon_status(json: bool) -> Result<()> {
         ),
         (Some(_), false) => human.push_str("  managed: no   (stale pid record)\n"),
         (None, _) if report.ready => human.push_str(
-            "  managed: no   (foreground `ccteam start` or a self-supervised instance)\n",
+            "  managed: no   (a hand-run `internal daemon-run` or a self-supervised \
+             instance; `ccteam start` always produces a managed one)\n",
         ),
         (None, _) => human.push_str("  managed: no\n"),
     }
@@ -667,6 +935,177 @@ mod tests {
 
         assert_eq!(code, "notManaged");
         assert_eq!(message, hint);
+    }
+
+    #[test]
+    fn daemon_run_argv_targets_the_internal_entry_and_forwards_every_flag() {
+        // The exec target must NOT be `start`: since v0.10.5 D7 `start` IS
+        // the launcher, so pointing the launcher at it would fork bomb.
+        let flags = LauncherFlags {
+            no_web: true,
+            no_imd: true,
+            web_bind: "127.0.0.1:9000".to_string(),
+            dsh_web_bind: Some("off".to_string()),
+            web_no_auth: true,
+            web_token_file: Some(PathBuf::from("/tmp/tok")),
+            no_clipboard: true,
+        };
+        let argv = daemon_run_argv(&flags).unwrap();
+        assert_eq!(
+            &argv[..2],
+            &["internal".to_string(), "daemon-run".to_string()]
+        );
+        for expected in [
+            "--web-bind",
+            "127.0.0.1:9000",
+            "--dsh-web-bind",
+            "off",
+            "--no-web",
+            "--no-imd",
+            "--web-no-auth",
+            "--web-token-file",
+            "/tmp/tok",
+            "--no-clipboard",
+        ] {
+            assert!(
+                argv.iter().any(|a| a == expected),
+                "missing {expected} in {argv:?}"
+            );
+        }
+        assert!(!argv.contains(&"start".to_string()), "{argv:?}");
+    }
+
+    /// An ephemeral web port asks for "any free port"; deriving `0 + 1` asks
+    /// for port 1, which only root may bind — so the whole process died right
+    /// after announcing its own address, and the derivation must stay
+    /// ephemeral instead. The real port is read back from the listener and
+    /// reported through `/health.dsh_web_bind`.
+    #[test]
+    fn an_ephemeral_web_bind_derives_an_ephemeral_companion_bind() {
+        for (web, expected) in [
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("0.0.0.0:0", "0.0.0.0:0"),
+            ("127.0.0.1:7331", "127.0.0.1:7332"),
+        ] {
+            let derived = default_dsh_web_bind(web.parse().unwrap()).unwrap();
+            assert_eq!(derived.to_string(), expected, "derived from {web}");
+            assert_ne!(derived.port(), 1, "port 1 is privileged: {web}");
+        }
+        // The launcher forwards the same answer into the daemon's argv, so an
+        // ephemeral web bind never reaches the daemon body as `:1`.
+        let argv = daemon_run_argv(&LauncherFlags {
+            web_bind: "127.0.0.1:0".to_string(),
+            ..LauncherFlags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&argv, "--dsh-web-bind"),
+            Some("127.0.0.1:0"),
+            "{argv:?}"
+        );
+        // An explicit value is still passed through untouched.
+        assert_eq!(
+            effective_dsh_web_bind("127.0.0.1:0", Some("127.0.0.1:8080")).unwrap(),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            effective_dsh_web_bind("127.0.0.1:0", Some("off")).unwrap(),
+            "off"
+        );
+        assert!(
+            default_dsh_web_bind("127.0.0.1:65535".parse().unwrap()).is_err(),
+            "a fixed port with no successor is still an error"
+        );
+    }
+
+    #[test]
+    fn daemon_run_argv_omits_flags_that_are_off_and_derives_the_companion_bind() {
+        let argv = daemon_run_argv(&LauncherFlags {
+            web_bind: "127.0.0.1:7331".to_string(),
+            ..LauncherFlags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "internal",
+                "daemon-run",
+                "--web-bind",
+                "127.0.0.1:7331",
+                "--dsh-web-bind",
+                "127.0.0.1:7332",
+            ]
+        );
+        // The recorded argv is what a restart replays, so it must round
+        // trip through the accessor `daemon status --json` reads.
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&argv, "--web-bind"),
+            Some("127.0.0.1:7331")
+        );
+    }
+
+    #[test]
+    fn plan_replay_prefers_the_record_then_the_served_binds_then_refuses() {
+        let recorded: Vec<String> = [
+            "internal",
+            "daemon-run",
+            "--web-bind",
+            "127.0.0.1:9",
+            "--no-imd",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let health = serde_json::json!({
+            "web_bind": "127.0.0.1:46303",
+            "dsh_web_bind": "127.0.0.1:46304",
+        });
+
+        // Rung 1 — the record carries every flag, so it wins even when
+        // `/health` is also available.
+        assert_eq!(
+            plan_replay(Some(recorded.clone()), Some(&health)).unwrap(),
+            recorded
+        );
+
+        // Rung 2 — no record: put the daemon back on the binds it is
+        // ACTUALLY serving, not on the compiled-in defaults.
+        let args = plan_replay(None, Some(&health)).unwrap();
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&args, "--web-bind"),
+            Some("127.0.0.1:46303")
+        );
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&args, "--dsh-web-bind"),
+            Some("127.0.0.1:46304")
+        );
+        assert!(!args.iter().any(|a| a == DEFAULT_WEB_BIND), "{args:?}");
+
+        // A daemon with the companion disabled reports null; `off` is how
+        // that is spelled back on the command line.
+        let no_companion = serde_json::json!({
+            "web_bind": "127.0.0.1:46303",
+            "dsh_web_bind": serde_json::Value::Null,
+        });
+        let args = plan_replay(None, Some(&no_companion)).unwrap();
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&args, "--dsh-web-bind"),
+            Some("off")
+        );
+
+        // Rung 3 — neither source knows where it is running. Restarting
+        // onto the defaults would move a live daemon to another port and
+        // kill /health on the original one, so REFUSE and say how to fix
+        // it by hand.
+        for health in [None, Some(&serde_json::json!({ "status": "ok" }))] {
+            let err = plan_replay(None, health).expect_err("must refuse, not guess");
+            assert!(err.contains("ccteam start --web-bind"), "{err}");
+            assert!(err.contains("daemon restart --web-bind"), "{err}");
+            assert!(
+                !err.contains(DEFAULT_WEB_BIND),
+                "must not suggest a guess: {err}"
+            );
+        }
     }
 
     #[test]

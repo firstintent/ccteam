@@ -65,6 +65,7 @@ pub fn external_node_meta(
     };
     let mut meta = SessionMeta {
         managed_by: ManagedBy::External,
+        stopped_at: None,
         sid: sid.to_string(),
         slug: slug.to_string(),
         // Unrecognised clients are still real callers; Claude is the display
