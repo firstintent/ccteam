@@ -44,7 +44,7 @@ const PACKAGE_ROOT = fileURLToPath(new URL('.', import.meta.url))
  * Context merges without a runtime edge.
  */
 const purityGate = {
-  name: 'ccteam-client-bundle-purity',
+  name: 'ccteam-ui-bundle-purity',
   resolveId(source: string): null {
     assertBundlePurity(source)
     return null

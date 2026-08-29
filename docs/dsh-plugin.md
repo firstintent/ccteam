@@ -167,7 +167,6 @@ since 0.1.0-rc.7.
 | **401** | A REST request on the wire uses `Bearer ccteam:<hex>`. The card's **REST API token** is that personal token (paste it without `Bearer`); the **enrollment credential** is the `ccteam-enroll:<id>:<secret>` string. They are different credentials — check you did not paste one into the other's field. |
 | **`duplicate loader entry id` at boot** | The plugin was inserted twice (for example, registry plus bundle patch, or a hand-edited `cordis.patch.yml`). Keep exactly one entry and remove the duplicate. |
 | **No ccteam button in the sidebar** | The plugin needs DSH 0.1.0-rc.7 or newer (the native sidebar footer and overlay seats). Update DSH; then check Settings → Plugins → Plugin list shows `ccteam-ui` as Enabled. |
-| **A stale `ccteam-client` entry** | Nothing to do by hand: ccteam owns the `@ccteam/` scope in every profile it writes and prunes bundles, patch rows and links of its own retired packages on the next write. In a profile you maintain yourself, remove the entry with `dsh plugin --profile web remove @ccteam/ccteam-client`. |
 | **Plain-HTTP LAN problems** | See [usage.md](usage.md) → “Access and security” for the DSH Web security-context note. |
 | **Human DSH turns missing from ccteam** | Expected: turns typed in DSH’s own UI remain harness-native. ccteam’s ledger and transcript contain only turns ccteam routed; DSH keeps the complete conversation. |
 

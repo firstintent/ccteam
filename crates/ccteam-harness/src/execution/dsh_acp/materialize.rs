@@ -1579,7 +1579,8 @@ mod tests {
         }
     }
 
-    /// Renaming a ccteam plugin must not strand its old name in a profile:
+    /// Renaming or retiring a ccteam plugin must not strand its old name in a
+    /// profile:
     /// `@ccteam/*` is ccteam's scope, so a bundle, patch row, or scope link
     /// under it that the table no longer knows is pruned — a stale bundle's
     /// own patch layer would otherwise re-insert a row id the new package also
@@ -1596,12 +1597,12 @@ mod tests {
             profile_dir.join("package.json"),
             serde_json::json!({
                 "name": "dsh-web-profile",
-                "dependencies": {"@ccteam/dsh-client": "link:/somewhere"},
+                "dependencies": {"@ccteam/dsh-retired": "link:/somewhere"},
                 "dsh": {"profile": {"bundles": [
                     "@deepseek-ai/dsh-base",
-                    "@ccteam/dsh-client",
+                    "@ccteam/dsh-retired",
                     "@user/my-plugin",
-                    "@ccteam/ccteam-client"
+                    "@ccteam/ccteam-retired"
                 ]}}
             })
             .to_string(),
@@ -1609,8 +1610,8 @@ mod tests {
         .unwrap();
         fs::write(
             profile_dir.join(PATCH_FILE),
-            "- id: ccteam-client\n  name: '@ccteam/dsh-client'\n  config:\n    daemonUrl: http://old\n\
-             - id: ccteam-client\n  name: '@ccteam/ccteam-client'\n  config:\n    daemonUrl: http://old\n\
+            "- id: ccteam-retired\n  name: '@ccteam/dsh-retired'\n  config:\n    daemonUrl: http://old\n\
+             - id: ccteam-retired\n  name: '@ccteam/ccteam-retired'\n  config:\n    daemonUrl: http://old\n\
              - id: my-plugin\n  name: '@user/my-plugin'\n  config:\n    keepMe: true\n",
         )
         .unwrap();
@@ -1618,8 +1619,8 @@ mod tests {
         fs::create_dir_all(&stale_target).unwrap();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&stale_target, scope_dir.join("dsh-client")).unwrap();
-            std::os::unix::fs::symlink(&stale_target, scope_dir.join("ccteam-client")).unwrap();
+            std::os::unix::fs::symlink(&stale_target, scope_dir.join("dsh-retired")).unwrap();
+            std::os::unix::fs::symlink(&stale_target, scope_dir.join("ccteam-retired")).unwrap();
         }
 
         operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
@@ -1631,7 +1632,7 @@ mod tests {
             "stale ccteam bundles go, the user's bundle stays, ours are appended"
         );
         assert_eq!(
-            package["dependencies"]["@ccteam/dsh-client"],
+            package["dependencies"]["@ccteam/dsh-retired"],
             serde_json::json!("link:/somewhere"),
             "pnpm's dependency table is not ours to edit"
         );
@@ -1689,7 +1690,7 @@ mod tests {
         );
         fs::write(
             &path,
-            "- id: keep\n  name: '@user/keep'\n- id: old\n  name: '@ccteam/ccteam-client'\n",
+            "- id: keep\n  name: '@user/keep'\n- id: old\n  name: '@ccteam/ccteam-retired'\n",
         )
         .unwrap();
         let rewritten = merged_profile_patch_yaml(&path, &spec)
