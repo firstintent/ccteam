@@ -66,7 +66,7 @@
 - **DoD**:typecheck 0 + vitest 绿;沙箱截图:引擎段四按钮 + autoStart + 日志尾;首屏「引擎未运行 → 一键启动」「无项目 → 添加工作区」「就绪」;版本横幅两向文案;Esc/菜单 `aria-haspopup` 纪律。
 
 ### PLUG-5 发布面 + 文档:`release.yml` npm publish + 两种安装方式(v0.10.5 L3,规划亲自)
-- **状态**:gated(PLUG-1..4 后;**人工门**:owner 建 `@ccteam` npm org + `NPM_TOKEN` secret) · **冲突域**:`.github/workflows/release.yml` + `docs/dsh-plugin*.md` + `README.md` + `docs/usage.md` + `docs/dev/tech-design.md` · **建议入口**:规划亲自(`.github/` + docs 治理面)。PRD §4 L3。
+- **状态**:进行中(规划·2026-08-29;`release.yml` npm job 已落 `eba5dbb1`:tag → 4 平台包 + 插件同版本发布、无 `NPM_TOKEN` 则 summary 说明并 skip、预发布 tag 走 `next` dist-tag、已发布版本幂等跳过;docs 部分等 PLUG-2/3/4 + MERGE 修复全部落地后写;**人工门**:owner 建 `@ccteam` npm org + `NPM_TOKEN` secret) · **冲突域**:`.github/workflows/release.yml` + `docs/dsh-plugin*.md` + `README.md` + `docs/usage.md` + `docs/dev/tech-design.md` · **建议入口**:规划亲自(`.github/` + docs 治理面)。PRD §4 L3。
 - **DoD**:tag 时发 4 平台包 + 插件(`optionalDependencies` 同版本、`ccteam.engine` = tag);`NPM_TOKEN` 缺失 job skip 且 summary 说明;docs 写「两种安装方式」+ 共存语义(§5 表)+ `ccteam update --channel npm`;README 能力句;tech-design 指针表。
 
 ### WEB-DSH-PORT-1 临时 web 端口(`:0`)时伴生端口派生成特权端口 1(PLUG-1 maker 自报 2026-08-29,待排)
