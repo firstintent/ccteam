@@ -270,6 +270,7 @@ fn write_meta(project: &Path, sid: &str, vendor_uuid: &str) {
     let meta = SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Dsh,

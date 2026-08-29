@@ -558,6 +558,7 @@ mod tests {
         let meta = super::super::session_meta::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: crate::AgentVendor::Opencode,
@@ -630,6 +631,7 @@ mod tests {
         let meta = super::super::session_meta::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: crate::AgentVendor::Claude,

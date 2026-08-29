@@ -234,6 +234,7 @@ fn idle_meta(
     let m = ccteam_harness::SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.to_string(),
         slug: "demo".to_string(),
         vendor: AgentVendor::Claude,

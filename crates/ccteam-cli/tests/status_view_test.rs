@@ -80,6 +80,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
         let meta = ccteam_harness::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: sid.to_string(),
             slug: slug.to_string(),
             vendor,

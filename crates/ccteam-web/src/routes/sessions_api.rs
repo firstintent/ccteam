@@ -2635,6 +2635,7 @@ mod tests {
     fn view(sid: &str) -> SessionView {
         SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: sid.into(),
             project: "demo".into(),
@@ -2714,6 +2715,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: "s1".into(),
             project: "demo".into(),
@@ -2766,6 +2768,7 @@ mod tests {
         let mut views = vec![
             SessionView {
                 driveable: true,
+                residency: "resident".to_string(),
                 detached: None,
                 sid: "s1".into(),
                 project: "demo".into(),
@@ -2790,6 +2793,7 @@ mod tests {
             },
             SessionView {
                 driveable: true,
+                residency: "resident".to_string(),
                 detached: None,
                 sid: "s2".into(),
                 project: "demo".into(),
@@ -2849,6 +2853,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: "s1".into(),
             project: "demo".into(),
@@ -2895,6 +2900,7 @@ mod tests {
         let projection = test_projection(&paths);
         let mut views = vec![SessionView {
             driveable: true,
+            residency: "resident".to_string(),
             detached: None,
             sid: "s1".into(),
             project: "demo".into(),

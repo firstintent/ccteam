@@ -17,6 +17,7 @@ fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionM
     SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.into(),
         slug: slug.into(),
         vendor: AgentVendor::Claude,

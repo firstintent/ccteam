@@ -3064,6 +3064,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
     let meta = ccteam_harness::SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: "codex-r1".into(),
         slug: "demo".into(),
         vendor: AgentVendor::Codex,

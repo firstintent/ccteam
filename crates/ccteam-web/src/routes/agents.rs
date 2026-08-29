@@ -479,6 +479,7 @@ mod tests {
         let mut m = ccteam_harness::SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: sid.to_string(),
             slug: "demo".to_string(),
             vendor,
@@ -582,6 +583,7 @@ mod tests {
                 host: "local".to_string(),
                 current: false,
                 status: "live".to_string(),
+                residency: "resident".to_string(),
                 last_activity_seconds: None,
                 created_at: String::new(),
                 last_active: String::new(),
@@ -645,6 +647,7 @@ mod tests {
                 host: "local".to_string(),
                 current: false,
                 status: "live".to_string(),
+                residency: "resident".to_string(),
                 last_activity_seconds: None,
                 created_at: String::new(),
                 last_active: String::new(),

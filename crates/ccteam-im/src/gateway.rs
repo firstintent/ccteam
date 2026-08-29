@@ -279,6 +279,11 @@ struct GatewaySession {
     /// Mirrors `meta.delegation_depth`; the source for a child's depth on its
     /// next spawn and the `delegation.max_depth` guardrail.
     delegation_depth: u32,
+    /// When this live-map entry was installed (every insertion sets it fresh).
+    /// The FLOOR of the idle-release clock: `last_event_at` alone would read a
+    /// just-resumed session — which has produced no pump event yet — as
+    /// infinitely idle and release it the moment it becomes resident.
+    resident_since: Instant,
 }
 
 #[derive(Clone)]
@@ -350,6 +355,88 @@ fn select_live_capacity_eviction(
                 .then_with(|| a.sid.cmp(&b.sid))
         })
         .map(|candidate| candidate.sid.clone())
+}
+
+/// Why a session left the live map. Both residency policies release through
+/// the same core; this is the only thing that differs, and it rides all the
+/// way out to the durable `session_evicted` event and the live lifecycle
+/// frame so an operator can tell a burst-cap eviction from a routine
+/// idle release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReason {
+    /// `sessions.max_live` was reached and this was the LRU eligible session.
+    Capacity,
+    /// Nobody spoke to it for its harness's `sessions.idle_release_secs`.
+    Idle,
+}
+
+impl ReleaseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReleaseReason::Capacity => "capacity",
+            ReleaseReason::Idle => "idle",
+        }
+    }
+}
+
+/// One resident session as BOTH residency policies see it — the single
+/// snapshot idle release and capacity eviction rank over, taken under one
+/// brief lock and consumed after it drops.
+#[derive(Clone)]
+struct ResidencySnapshot {
+    sid: String,
+    /// Live-entry epoch, presented back when releasing so a session replaced
+    /// between snapshot and release is never stopped stale.
+    generation: u64,
+    /// Vendor wire name — the key `sessions.idle_release_by_vendor` uses.
+    vendor: String,
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ThreadHandle,
+    turn_in_flight: bool,
+    waiting_approval: bool,
+    /// Persisted `meta.json::last_active` (see [`LiveCapacityCandidate`]).
+    last_active: String,
+    /// Time since the later of "installed in the live map" and "last event".
+    idle_for: std::time::Duration,
+}
+
+/// The sids whose vendor reports a turn-OUTLIVING task still running
+/// (background shell / workflow / async agent). Adapter round-trips, so this
+/// runs OFF the gateway lock; `running_tasks` is an in-memory snapshot clone
+/// for every adapter that implements it and `vec![]` for the rest.
+async fn outliving_task_sids(snapshot: &[ResidencySnapshot]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for row in snapshot {
+        if row
+            .adapter
+            .running_tasks(&row.thread)
+            .await
+            .iter()
+            .any(|task| task.outlives_turn())
+        {
+            out.insert(row.sid.clone());
+        }
+    }
+    out
+}
+
+/// Project the shared residency snapshot onto the capacity selector's ranking
+/// inputs. A session carrying a turn-outliving background task ranks as BUSY
+/// even between turns: its process is still doing real work, so it must not be
+/// picked ahead of a genuinely quiet session.
+fn live_capacity_candidates(
+    snapshot: &[ResidencySnapshot],
+    outliving: &HashSet<String>,
+) -> Vec<LiveCapacityCandidate> {
+    snapshot
+        .iter()
+        .map(|row| LiveCapacityCandidate {
+            sid: row.sid.clone(),
+            idle: !row.turn_in_flight && !outliving.contains(&row.sid),
+            last_active: row.last_active.clone(),
+            waiting_approval: row.waiting_approval,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1040,6 +1127,26 @@ pub struct SessionView {
     pub current: bool,
     /// Cheap synchronous liveness hint (`"live"` for any tracked session).
     pub status: String,
+    /// Whether ccteam is holding an execution attachment for this session
+    /// right now — the RESIDENCY axis, orthogonal to what the session is
+    /// DOING ([`Self::status`] once a surface has folded in the activity
+    /// resolver). One of:
+    ///
+    /// | value | meaning |
+    /// |---|---|
+    /// | `resident` | ccteam holds a vendor process/connection for it |
+    /// | `released` | no process; the next message resumes THIS sid |
+    /// | `stopped` | the user ended it (`meta.stopped_at`) |
+    /// | `detached` | its body outlived the daemon; the watcher owns it |
+    /// | `external` | a hand-started client's ledger node — ccteam never held a thread and never will (see [`ccteam_harness::execution::session_meta::ManagedBy::External`]) |
+    ///
+    /// Exists because `status: "live"` was doing both jobs and could only
+    /// answer one: a persisted-but-not-resident session read as "working" on
+    /// every surface that trusted it. `#[serde(default = "…")]` reads back
+    /// `resident` for a payload written before the field existed, where every
+    /// row WAS in the live map.
+    #[serde(default = "session_view_residency_default")]
+    pub residency: String,
     /// Seconds since this session's latest progress event when known.
     #[serde(default)]
     pub last_activity_seconds: Option<u64>,
@@ -1115,6 +1222,22 @@ pub struct SessionView {
 fn session_view_driveable_default() -> bool {
     true
 }
+
+/// Pre-`residency` payloads only ever described live-map rows.
+fn session_view_residency_default() -> String {
+    RESIDENCY_RESIDENT.to_string()
+}
+
+/// ccteam holds a vendor process / connection for this session right now.
+pub const RESIDENCY_RESIDENT: &str = "resident";
+/// No process is held; the next message resumes THIS sid from `meta.json`.
+pub const RESIDENCY_RELEASED: &str = "released";
+/// The user explicitly ended it (`SessionMeta::stopped_at`).
+pub const RESIDENCY_STOPPED: &str = "stopped";
+/// Its OS body outlived the daemon that spawned it; the body watcher owns it.
+pub const RESIDENCY_DETACHED: &str = "detached";
+/// A hand-started client's ledger node — never ccteam's to hold.
+pub const RESIDENCY_EXTERNAL: &str = "external";
 
 /// The detached-body facts a session row carries (see [`SessionView::detached`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2137,7 +2260,7 @@ impl Gateway {
     /// — it lives in each session's `meta.json` (the v0.8.21 Wave-2 SoT); this
     /// only restores the per-chat focus + the live-set, then cold-start rebuilds
     /// those sessions from their meta.json (async, via
-    /// [`resume_restored_sessions_shared`](Self::resume_restored_sessions_shared)).
+    /// [`reconcile_restored_sessions_shared`](Self::reconcile_restored_sessions_shared)).
     ///
     /// The daemon uses this for spawn-on-demand continuity across restarts.
     /// Unit tests keep the default in-memory mode (or pass a tempdir root).
@@ -2386,6 +2509,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
                 tool_face_primed: Arc::new(AtomicBool::new(false)),
+                resident_since: Instant::now(),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -2395,6 +2519,9 @@ impl Gateway {
             },
         );
         self.spawn_event_pump(&sid);
+        // Every resume/rebuild path funnels through here, so the "a session
+        // being driven again is no longer stopped" rule is written ONCE.
+        self.clear_session_stopped(&sid);
         if let Some((slug, cwd, body)) = post_mortem {
             // The previous body exited unobserved: let the watcher recover
             // what it said (vendor record) and report it — AFTER the session
@@ -2433,64 +2560,65 @@ impl Gateway {
             .await
     }
 
-    /// Drop `current_session` routes pointing at a missing or foreign session.
-    /// The ownership check also scrubs routes persisted by an older buggy
-    /// session_spawn that bound a tenant project's sid to the admin web chat.
+    /// Drop `current_session` routes pointing at a GONE or foreign session.
+    ///
+    /// "Gone" means the sid can no longer be driven at all — an unknown sid, a
+    /// hand-started external node, or a session the user explicitly stopped.
+    /// Being merely non-resident is NOT gone: a released session (and a
+    /// detached body) keeps its chat's focus, because the next message resumes
+    /// exactly that sid. The ownership check also scrubs routes persisted by an
+    /// older buggy session_spawn that bound a tenant project's sid to the admin
+    /// web chat.
     fn drop_dead_session_routes(&self) {
         let mut memo = ProjectPrincipalMemo::new();
         self.current_session.write().unwrap().retain(|chat, sid| {
             // A detached body is still this chat's session — it comes back
             // (rebuilt by sid) the moment the body exits; keep the focus.
-            self.detached.contains_key(sid)
-                || self
-                    .sessions
-                    .get(sid)
-                    .is_some_and(|session| self.chat_can_access_with(chat, session, &mut memo))
+            if self.detached.contains_key(sid) {
+                return true;
+            }
+            if let Some(session) = self.sessions.get(sid) {
+                return self.chat_can_access_with(chat, session, &mut memo);
+            }
+            // RELEASED (not resident, not stopped): the session is real, its
+            // transcript is on disk, and the next message resumes THAT sid.
+            // Dropping the focus here is what made an idle release — or a
+            // restart — silently mint a brand-new session on the chat's next
+            // plain message.
+            self.find_meta_for_sid(sid)
+                .map(|(slug, _dir, meta)| {
+                    meta.is_resumable()
+                        && self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo)
+                })
+                .unwrap_or(false)
         });
     }
 
-    /// v0.8.21 Wave-2 — cold-start rebuild the sessions that were live at last
-    /// persist (stashed in `restore_pending` by `load_state`) from their
-    /// `meta.json`. A daemon restart kills every child (stream-json children are
-    /// the daemon's own subprocesses; a terminal session also loses its tmux
-    /// pane — authorized breaking), so there is nothing to reattach to: each
-    /// session is re-spawned and resumes its conversation from the transcript
-    /// (`--resume`). Routes to a session that fails to rebuild are dropped, then
-    /// routing is re-persisted to reflect the rebuilt live-set. (The `&mut self`
-    /// form holds the lock across spawns; the daemon uses the `_shared` form.)
-    pub async fn resume_restored_sessions(&mut self) {
+    /// Cold-start RECONCILE of the sessions that were resident at last persist
+    /// (stashed in `restore_pending` by `load_state`) — it deliberately spawns
+    /// NOTHING.
+    ///
+    /// The old shape re-spawned a vendor process for every sid that had been
+    /// live, on the theory that a restart should restore the fleet. It didn't
+    /// buy what it looked like it bought: spawning never touches the model, so
+    /// there is no prompt cache to keep warm, no context to preserve (that
+    /// lives in the vendor's transcript, replayed by `--resume`) and nothing a
+    /// user can observe — only N vendor processes (≈300 MB each for claude)
+    /// standing by in case someone types. Resume-by-sid already covers the
+    /// real need: the first message to a session pays ~1–2 s of startup and
+    /// gets the SAME conversation back.
+    ///
+    /// What the pass still does, per pending sid: run the body gate, which
+    /// registers a body that outlived the previous daemon as DETACHED (the
+    /// watcher owns it from there — never a twin, never a kill) and queues a
+    /// post-mortem for a stale body record so an unobserved turn is still
+    /// recovered and reported. Then routes to a genuinely gone session are
+    /// scrubbed and routing is re-persisted. (The `&mut self` form is used by
+    /// tests; the daemon uses the `_shared` form.)
+    pub async fn reconcile_restored_sessions(&mut self) {
         let pending = std::mem::take(&mut self.restore_pending);
         for sid in pending {
-            if self.sessions.contains_key(&sid) {
-                continue;
-            }
-            let Ok((slug, cwd, meta)) = self.find_meta_for_sid(&sid) else {
-                tracing::warn!(session = %sid, "ccteam-im: restore skipped; no meta.json found");
-                continue;
-            };
-            let reply_to = self
-                .tenant_project_owner_reply_target(&slug)
-                .or_else(|| {
-                    ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
-                })
-                .unwrap_or_else(web_api_chat);
-            if let Err(err) = self
-                .rebuild_session_from_meta(&slug, cwd, &meta, reply_to)
-                .await
-            {
-                if is_body_detached_error(&err) {
-                    tracing::info!(
-                        session = %sid,
-                        "ccteam-im: restore deferred; the session's body from before the restart is still running (watched, not duplicated)"
-                    );
-                    continue;
-                }
-                tracing::warn!(
-                    session = %sid,
-                    error = %err,
-                    "ccteam-im: restored gateway session rebuild failed; left for on-demand resume"
-                );
-            }
+            self.reconcile_one(&sid);
         }
         self.drop_dead_session_routes();
         if let Err(err) = self.persist_routing() {
@@ -2498,23 +2626,56 @@ impl Gateway {
         }
     }
 
-    /// Startup-restore variant that does NOT hold the gateway lock across the
-    /// slow `start_thread` await. Per session it: locks → builds the rebuild
-    /// plan (sync, cheap) → UNLOCKS → spawns the thread (slow; stream-json may
-    /// block on `system:init`) → re-locks → inserts. So a concurrent web `POST
-    /// /sessions` never waits behind a stale session's startup.
-    pub async fn resume_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
+    /// [`Self::reconcile_restored_sessions`] for the daemon: one brief lock per
+    /// sid instead of one long one, so a concurrent web `POST /sessions` never
+    /// waits behind the whole boot pass.
+    pub async fn reconcile_restored_sessions_shared(gateway: Arc<tokio::sync::Mutex<Self>>) {
         let pending = {
             let mut g = gateway.lock().await;
             std::mem::take(&mut g.restore_pending)
         };
         for sid in pending {
-            Self::restore_one_shared(&gateway, &sid).await;
+            gateway.lock().await.reconcile_one(&sid);
         }
         let g = gateway.lock().await;
         g.drop_dead_session_routes();
         if let Err(err) = g.persist_routing() {
             tracing::warn!(error = %err, "ccteam-im: failed to persist restored routing");
+        }
+    }
+
+    /// Reconcile ONE previously-resident sid against reality: does it have a
+    /// body still running from before the restart? Sync — no spawn, no `.await`.
+    fn reconcile_one(&mut self, sid: &str) {
+        if self.sessions.contains_key(sid) {
+            return;
+        }
+        let Ok((slug, cwd, meta)) = self.find_meta_for_sid(sid) else {
+            tracing::warn!(session = %sid, "ccteam-im: reconcile skipped; no meta.json found");
+            return;
+        };
+        // An external node's process is not ccteam's, and an explicitly
+        // stopped session is finished: neither has a body ccteam should adopt.
+        if !meta.is_resumable() {
+            return;
+        }
+        match self.gate_session_body(sid, &slug, &cwd, &meta.role, meta.delegation_depth) {
+            Ok(BodyGate::Clear) => {}
+            Ok(BodyGate::PostMortem(body)) => {
+                // The previous body exited unobserved: let the watcher recover
+                // what it said (from the vendor's own record) and report it.
+                self.post_mortem_pending
+                    .push((sid.to_string(), slug, cwd, body));
+                self.body_watch_notify.notify_one();
+            }
+            Err(_) => {
+                // The typed detached refusal — `gate_session_body` already
+                // registered the body and woke the watcher.
+                tracing::info!(
+                    session = %sid,
+                    "ccteam-im: session body from before the restart is still running (watched, not duplicated)"
+                );
+            }
         }
     }
 
@@ -2868,7 +3029,7 @@ impl Gateway {
         tracing::info!(session = %d.sid, pid = d.body.pid, "ccteam-im: detached body exited; recovering + rebuilding by sid");
         Self::recover_and_report_shared(gateway, &d.sid, &d.slug, &d.cwd, d.body.pid, "exited")
             .await;
-        Self::restore_one_shared(gateway, &d.sid).await;
+        Self::rebuild_one_shared(gateway, &d.sid).await;
         let mut g = gateway.lock().await;
         if g.sessions.contains_key(&d.sid) {
             g.emit_session_lifecycle(&d.sid, &d.slug, "resumed", "body_exited");
@@ -3090,10 +3251,12 @@ impl Gateway {
     }
 
     /// Rebuild ONE sid from its meta.json with the lock held only around the
-    /// plan and the apply (the spawn runs unlocked) — the batch restore's loop
-    /// body, also used by the body watcher after a body exits. A typed
-    /// detached refusal is an info (the watcher keeps it); anything else warns.
-    async fn restore_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
+    /// plan and the apply (the spawn runs unlocked) — used by the body watcher
+    /// after a detached body exits, so its queued turns land on a live session.
+    /// A typed detached refusal is an info (the watcher keeps it); anything
+    /// else warns. Boot no longer calls this: see
+    /// [`Self::reconcile_restored_sessions`] for why a restart spawns nothing.
+    async fn rebuild_one_shared(gateway: &Arc<tokio::sync::Mutex<Self>>, sid: &str) {
         let plan_and_reply = {
             let mut g = gateway.lock().await;
             if g.sessions.contains_key(sid) {
@@ -3542,7 +3705,7 @@ impl Gateway {
     /// guard held only across synchronous work; the slow
     /// `adapter.start_thread` await (tmux/subprocess spawn, stream-json
     /// `system:init`) runs with NO gateway lock held at all — the same shape
-    /// [`Self::resume_restored_sessions_shared`] already established. Two
+    /// [`Self::reconcile_restored_sessions_shared`] already established. Two
     /// concurrent inbound messages for the SAME chat that both observe "no
     /// session yet" are serialized through [`SpawnClaims`] (a lock separate
     /// from the gateway's own — the `PendingInteractions` house pattern) so
@@ -4078,11 +4241,26 @@ impl Gateway {
                 .await
             {
                 Ok(resumed_sid) => {
-                    // Move current project to this session's project.
+                    // Move current project to this session's project, and bind
+                    // BOTH the focus and the reply target to THIS chat key.
+                    // `resume_stopped_session` can only route by the caller's
+                    // canonical IDENTITY (`ChatKey::from_identity` forces
+                    // `user_id = chat_id`), which is not the real key this chat
+                    // is addressed by — leaving the focus keyed to a chat that
+                    // never speaks, so the next plain message still went to the
+                    // OLD session.
                     if let Some(s) = self.sessions.get(&resumed_sid) {
                         let proj = s.project.clone();
+                        if let Ok(mut target) = s.reply_to.lock() {
+                            *target = chat.clone();
+                        }
                         self.current_project.insert(chat.clone(), proj);
                     }
+                    self.current_session
+                        .write()
+                        .unwrap()
+                        .insert(chat.clone(), resumed_sid.clone());
+                    self.persist_routing()?;
                     return Ok(format!("resumed session {resumed_sid}"));
                 }
                 Err(_) => return Ok(format!("unknown session for this chat: {id}")),
@@ -4237,11 +4415,13 @@ impl Gateway {
         options
     }
 
-    /// One "switch session" button per live, chat-visible session
-    /// (`nav:use:<sid>`), the current one marked `✓`. Scoped + ordered like
+    /// One "switch session" button per chat-visible session — RESIDENT and
+    /// RELEASED alike (`nav:use:<sid>`), the current one marked `✓` and a
+    /// released one `💤`. Scoped, ordered and bounded like
     /// [`Self::render_sessions`] (current project unless `all`; recency then
-    /// numeric-sid descending) so the buttons track the text list. Ended
-    /// (history) sessions switch only via their text `→ /use <sid>` hint.
+    /// numeric-sid descending) so the buttons track the text list row for row.
+    /// `/use` cold-resumes a released sid, so the button is as real as any
+    /// other; only an explicitly STOPPED session has no button.
     fn session_switch_options(&self, chat: &ChatKey, all: bool) -> Vec<MessageOption> {
         let cur = self.current_project_for(chat).unwrap_or_default();
         let mut memo = ProjectPrincipalMemo::new();
@@ -4257,10 +4437,28 @@ impl Gateway {
             lb.cmp(&la)
                 .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
         });
-        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
-        let mut options: Vec<MessageOption> = visible
+        let released: Vec<(String, SessionMeta)> = self
+            .released_session_metas(None)
             .into_iter()
-            .map(|s| {
+            .filter(|(slug, meta)| {
+                (all || slug == &cur)
+                    && self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+            })
+            .collect();
+        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
+        let rows: Vec<SessionRowSource<'_>> = visible
+            .iter()
+            .map(|s| SessionRowSource::Resident(s))
+            .chain(
+                released
+                    .iter()
+                    .map(|(slug, meta)| SessionRowSource::Released(slug, meta)),
+            )
+            .take(IM_SESSIONS_MAX_ROWS)
+            .collect();
+        let mut options: Vec<MessageOption> = rows
+            .iter()
+            .map(|source| {
                 // Label = `sid vendor (title)` (✓ prefixes the current
                 // session), arranged sid → vendor → title — same `sid vendor`
                 // opening as the text rows. The button carries the human name;
@@ -4268,22 +4466,29 @@ impl Gateway {
                 // display cols so one verbose title can't widen every button
                 // (the left-align padding below pads all labels to the widest).
                 // Callback `data` is unchanged.
-                let marker = if Some(&s.id) == current_sid.as_ref() {
+                let sid = source.sid();
+                let marker = if current_sid.as_deref() == Some(sid) {
                     "✓ "
+                } else if source.is_released() {
+                    "💤 "
                 } else {
                     ""
                 };
-                let mut label = format!("{marker}{} {}", s.id, vendor_str(s.vendor));
-                if let Some(title) = self.session_title(s) {
+                let mut label = format!("{marker}{sid} {}", source.vendor());
+                let title = match source {
+                    SessionRowSource::Resident(s) => self.session_title(s),
+                    SessionRowSource::Released(_, meta) => meta.title.clone(),
+                };
+                if let Some(title) = title {
                     label.push_str(&format!(
                         " ({})",
                         truncate_cols(&title, SESSION_BUTTON_TITLE_MAX_COLS)
                     ));
                 }
                 MessageOption {
-                    data: format!("nav:use:{}", s.id),
+                    data: format!("nav:use:{sid}"),
                     label,
-                    id: s.id.clone(),
+                    id: sid.to_string(),
                 }
             })
             .filter(|o| o.data.len() <= TELEGRAM_CALLBACK_MAX)
@@ -4890,6 +5095,7 @@ impl Gateway {
         });
         let mut meta = SessionMeta {
             managed_by: Default::default(),
+            stopped_at: None,
             sid: plan.id.clone(),
             slug: plan.project.clone(),
             vendor: plan.vendor,
@@ -5022,6 +5228,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
                 tool_face_primed: Arc::new(AtomicBool::new(false)),
+                resident_since: Instant::now(),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -5202,6 +5409,7 @@ impl Gateway {
                 turn_started_at: Arc::new(std::sync::Mutex::new(None)),
                 steered_this_turn: Arc::new(AtomicBool::new(false)),
                 tool_face_primed: Arc::new(AtomicBool::new(false)),
+                resident_since: Instant::now(),
                 last_event_at: Arc::new(std::sync::Mutex::new(None)),
                 latest_activity: Arc::new(std::sync::Mutex::new(None)),
                 watched_turn: Arc::new(std::sync::Mutex::new(None)),
@@ -6716,7 +6924,7 @@ impl Gateway {
     /// v0.8.21 Wave-2 — restore ROUTING + the sid counter (sync). The live map
     /// is left EMPTY; the sids that were live at last persist are stashed in
     /// `restore_pending` for the async
-    /// [`resume_restored_sessions_shared`](Self::resume_restored_sessions_shared)
+    /// [`reconcile_restored_sessions_shared`](Self::reconcile_restored_sessions_shared)
     /// step to cold-start rebuild from each session's `meta.json` (the SoT).
     /// No session content is read here (spawning is async; load_state is not).
     fn load_state(&mut self) -> Result<()> {
@@ -6772,19 +6980,18 @@ impl Gateway {
     /// `/use <sid>` (surfaced by `/sessions`, which reads the live map this
     /// populates) to reattach.
     ///
-    /// Best-effort and one-time: `meta.json` carries no "explicitly stopped"
-    /// marker (`/stop` never touches it), so a session the owner stopped long
-    /// ago could get resurrected here too. That's an acceptable one-off cost
-    /// (a stray `/stop` afterwards) against the alternative of silently
-    /// dropping genuinely-live conversations.
+    /// `meta.json` now carries `stopped_at`, so a session the owner explicitly
+    /// stopped is skipped here instead of being resurrected — the one-off
+    /// "stray `/stop` afterwards" cost this used to accept is gone.
     fn recover_routing_from_meta(&mut self) {
         let mut pending = Vec::new();
         for dir in self.projects.values() {
             for meta in list_session_metas(dir) {
                 self.session_catalog.insert(dir, &meta);
                 // An external node's metadata describes a process ccteam never
-                // started and whose client died with the daemon.
-                if meta.managed_by != ccteam_harness::execution::session_meta::ManagedBy::External {
+                // started and whose client died with the daemon; a stopped
+                // session is finished. Neither is ccteam's to reconcile.
+                if meta.is_resumable() {
                     pending.push(meta.sid);
                 }
             }
@@ -9069,6 +9276,15 @@ impl Gateway {
             .collect()
     }
 
+    /// The IM/web `/sessions` listing.
+    ///
+    /// Lists RESIDENT ∪ RELEASED sessions: a session that is not holding a
+    /// vendor process right now is not gone — its transcript is on disk and
+    /// the next message resumes exactly that sid — so hiding it (which is what
+    /// listing only the live map did once idle release started letting go of
+    /// processes) would make the fleet look like it evaporated. Released rows
+    /// render from persisted facts (`meta.json` + the session's `status.json`)
+    /// and carry a trailing 💤.
     async fn render_sessions(&self, chat: &ChatKey, all: bool) -> String {
         // v0.8.18 柱2 档0 — own-only: a chat lists only the sessions it owns
         // (the web-global + same-project leaks are gone). Soft per-chat isolation.
@@ -9092,7 +9308,7 @@ impl Gateway {
         // full fleet. `elsewhere` counts accessible sessions in OTHER projects so
         // the IM footer can point at `/sessions all`.
         let cur = self.current_project_label(chat);
-        let (mut visible, elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
+        let (mut visible, mut elsewhere): (Vec<&GatewaySession>, usize) = if all || is_web {
             (accessible, 0)
         } else {
             let elsewhere = accessible.iter().filter(|s| s.project != cur).count();
@@ -9114,6 +9330,26 @@ impl Gateway {
             lb.cmp(&la)
                 .then_with(|| session_index(&b.id).cmp(&session_index(&a.id)))
         });
+        // ── the web bare-row feed: RESIDENT rows only ──────────────────────
+        // `parse_sessions_reply` rejects the whole reply if any line is not
+        // `sid:project:vendor:role`, and the SPA reads released sessions from
+        // its own REST rail rather than this frame, so the released set stays
+        // out of the web variant by design.
+        if is_web {
+            if visible.is_empty() {
+                return "no sessions".to_string();
+            }
+            let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
+            for s in &visible {
+                let status = (s.adapter.thread_status(&s.thread).await).ok();
+                let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
+                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
+                    Some(sfx) => format!("{base} — {sfx}"),
+                    None => base,
+                });
+            }
+            return web_rows.join("\n");
+        }
         // v0.8.23 review §1.3-D item 9 — the IM `/sessions` view (NOT the web
         // bare-row feed `parse_sessions_reply` depends on) pins a session
         // waiting on a HITL approval to the top: a stable sort on top of the
@@ -9121,9 +9357,7 @@ impl Gateway {
         // keep their recency order. Cheap — reuses the existing pending
         // registry (already shared with the daemon's `permission/ask`
         // handler), no new progress.jsonl read.
-        let waiting_sids: HashSet<String> = if is_web {
-            HashSet::new()
-        } else {
+        let waiting_sids: HashSet<String> = {
             let pend = self.pending.lock().await;
             visible
                 .iter()
@@ -9134,15 +9368,29 @@ impl Gateway {
         if !waiting_sids.is_empty() {
             visible.sort_by_key(|s| !waiting_sids.contains(&s.id));
         }
+        // Released sessions of the same scope, ACL-filtered on the persisted
+        // owner (the stopped-session gate `chat_can_access_sid` walks), sharing
+        // this render's project-principal memo so one `state.json` read covers
+        // every row of a slug.
+        let released: Vec<(String, SessionMeta)> = self
+            .released_session_metas(None)
+            .into_iter()
+            .filter(|(slug, meta)| {
+                self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+            })
+            .collect();
+        let released_here: Vec<&(String, SessionMeta)> = if all {
+            released.iter().collect()
+        } else {
+            elsewhere += released.iter().filter(|(slug, _)| slug != &cur).count();
+            released.iter().filter(|(slug, _)| slug == &cur).collect()
+        };
         let detached_here = self
             .detached
             .values()
             .filter(|d| (all || d.slug == cur) && self.chat_can_access_sid(chat, &d.sid))
             .count();
-        if visible.is_empty() && is_web {
-            return "no sessions".to_string();
-        }
-        if visible.is_empty() && detached_here == 0 {
+        if visible.is_empty() && released_here.is_empty() && detached_here == 0 {
             if elsewhere > 0 {
                 return format!(
                     "📁 当前项目: {cur}\n本项目暂无会话 —— ↓ 其他项目还有 {elsewhere} 个 → /sessions all"
@@ -9150,28 +9398,51 @@ impl Gateway {
             }
             return format!("📁 当前项目: {cur}\n暂无会话 —— /new 开一个");
         }
-        // Render each visible session's row (async `thread_status`) once,
-        // keyed by sid for the IM tree; web keeps the flat bare-row feed.
-        let mut web_rows: Vec<String> = Vec::with_capacity(visible.len());
+        // One merged, bounded, recency-ordered candidate set. Residents keep
+        // their HITL pin (they are the only rows that can be waiting), then
+        // released rows follow — a session ccteam is holding open is the one
+        // the reader is most likely to act on.
+        let mut candidates: Vec<SessionRowSource<'_>> = visible
+            .iter()
+            .map(|s| SessionRowSource::Resident(s))
+            .chain(
+                released_here
+                    .iter()
+                    .map(|(slug, meta)| SessionRowSource::Released(slug, meta)),
+            )
+            .collect();
+        let total = candidates.len();
+        candidates.truncate(IM_SESSIONS_MAX_ROWS);
+        // Render each candidate's row once, keyed by sid for the tree below.
         let mut rendered: std::collections::HashMap<String, String> =
-            std::collections::HashMap::with_capacity(visible.len());
-        for s in &visible {
-            // P3 — model + ctx from the owning adapter's `thread_status`.
+            std::collections::HashMap::with_capacity(candidates.len());
+        for source in &candidates {
+            // P3 — model + ctx from the owning adapter's `thread_status` for a
+            // resident session; from the session's persisted `status.json` for
+            // a released one (the same file the adapter falls back to), so a
+            // released row is as informative as ccteam can honestly make it.
             // Statusless adapters (bg / default) report `ThreadStatus::default()`
             // (no model / no context). Per-session failures degrade to the bare
             // row (never break the listing).
-            let status = (s.adapter.thread_status(&s.thread).await).ok();
-            // Web rows stay the machine-parsed `sid:project:vendor:role` feed +
-            // the full, shared `status_suffix()` (matches Codex /status;
-            // `parse_sessions_reply` splits on exactly 4 colon fields).
-            if is_web {
-                let base = format!("{}:{}:{}:{}", s.id, s.project, vendor_str(s.vendor), s.role);
-                web_rows.push(match status.as_ref().and_then(|st| st.status_suffix()) {
-                    Some(sfx) => format!("{base} — {sfx}"),
-                    None => base,
-                });
-                continue;
-            }
+            let status = match source {
+                SessionRowSource::Resident(s) => (s.adapter.thread_status(&s.thread).await).ok(),
+                SessionRowSource::Released(slug, meta) => self
+                    .projects
+                    .get(*slug)
+                    .and_then(|dir| {
+                        ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
+                    })
+                    .or_else(|| {
+                        meta.model
+                            .clone()
+                            .or_else(|| meta.observed_model.clone())
+                            .map(|model| ccteam_harness::ThreadStatus {
+                                model: Some(model),
+                                effort: meta.effort.clone(),
+                                ..Default::default()
+                            })
+                    }),
+            };
             // IM row: COMPACT, single-line, `.`-joined with no padding. Leads
             // with `sid vendor` (the SAME opening as the switch button —
             // `session_switch_options`: `sid vendor (title)`), then — when the
@@ -9183,13 +9454,12 @@ impl Gateway {
             // spans projects without a per-row slug), NO role, NO `ctx` label
             // (all on /status); the title lives on the button; the vendor tag
             // + activity dot are gone.
-            let mut row = format!("{} {}", s.id, vendor_str(s.vendor));
+            let vendor = source.vendor();
+            let sid = source.sid().to_string();
+            let mut row = format!("{sid} {vendor}");
             if let Some(st) = &status {
                 if let Some(m) = st.model.as_deref().filter(|m| !m.is_empty()) {
-                    row.push_str(&format!(
-                        ".{}",
-                        strip_vendor_prefix(vendor_str(s.vendor), m)
-                    ));
+                    row.push_str(&format!(".{}", strip_vendor_prefix(vendor, m)));
                 }
                 if let Some(e) = st.effort.as_deref().filter(|e| !e.is_empty()) {
                     row.push_str(&format!(".{e}"));
@@ -9206,49 +9476,51 @@ impl Gateway {
                 }
             }
             // v0.9.0 W2 (F2) — annotate the IM row with a non-local host.
-            if !s.host.is_empty() && s.host != "local" {
-                row.push_str(&format!(" @{}", s.host));
+            let host = source.host();
+            if !host.is_empty() && host != "local" {
+                row.push_str(&format!(" @{host}"));
+            }
+            // 💤 = released: real, resumable, just not holding a process.
+            if source.is_released() {
+                row.push_str(" 💤");
             }
             // v0.8.23 review item 9 — ⏳ marks a session pinned to the top for
             // an outstanding HITL approval. Prefixed last so it stays the
             // leftmost glance cue.
-            if waiting_sids.contains(&s.id) {
+            if waiting_sids.contains(&sid) {
                 row = format!("⏳ {row}");
             }
-            rendered.insert(s.id.clone(), row);
-        }
-        if is_web {
-            return web_rows.join("\n");
+            rendered.insert(sid, row);
         }
         // v0.9.0 W2 (F2) — IM tree: roots (a session with no VISIBLE parent —
         // a true root, or a parent in another project) sorted by sid, each
         // followed by its children indented `└─ ` (recursively). A parent-chain
         // cycle can never orphan a session: any unvisited row is appended flat.
         let visible_sids: std::collections::HashSet<&str> =
-            visible.iter().map(|s| s.id.as_str()).collect();
+            candidates.iter().map(|s| s.sid()).collect();
         let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
-        for s in &visible {
-            if let Some(p) = s.parent_sid.as_deref() {
+        for source in &candidates {
+            if let Some(p) = source.parent_sid() {
                 if visible_sids.contains(p) {
-                    children_of.entry(p).or_default().push(s.id.as_str());
+                    children_of.entry(p).or_default().push(source.sid());
                 }
             }
         }
-        // Roots + children keep the ALREADY-computed `visible` order (recency +
+        // Roots + children keep the ALREADY-computed candidate order (recency +
         // waiting-approval pin); the tree only adds indentation, never reorders
         // (so the ⏳ pin + recency sort above are preserved).
-        let roots: Vec<&str> = visible
+        let roots: Vec<&str> = candidates
             .iter()
-            .filter(|s| {
-                s.parent_sid
-                    .as_deref()
+            .filter(|source| {
+                source
+                    .parent_sid()
                     .map(|p| !visible_sids.contains(p))
                     .unwrap_or(true)
             })
-            .map(|s| s.id.as_str())
+            .map(|source| source.sid())
             .collect();
-        let mut tree_rows: Vec<String> = Vec::with_capacity(visible.len());
+        let mut tree_rows: Vec<String> = Vec::with_capacity(candidates.len());
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut stack: Vec<(&str, usize)> = roots.iter().rev().map(|r| (*r, 0usize)).collect();
         while let Some((sid, depth)) = stack.pop() {
@@ -9270,9 +9542,9 @@ impl Gateway {
             }
         }
         // Cycle-orphaned leftovers → flat, sorted by sid (never drop a row).
-        let mut leftovers: Vec<&str> = visible
+        let mut leftovers: Vec<&str> = candidates
             .iter()
-            .map(|s| s.id.as_str())
+            .map(|source| source.sid())
             .filter(|sid| !visited.contains(sid))
             .collect();
         leftovers.sort_by_key(|sid| session_index(sid));
@@ -9300,6 +9572,12 @@ impl Gateway {
         if !detached_rows.is_empty() {
             out.push('\n');
             out.push_str(&detached_rows.join("\n"));
+        }
+        if total > candidates.len() {
+            out.push_str(&format!(
+                "\n… 另有 {} 个会话(共 {total})—— /use <id> 直接进",
+                total - candidates.len()
+            ));
         }
         if elsewhere > 0 {
             out.push_str(&format!(
@@ -9444,6 +9722,82 @@ impl Gateway {
     /// authoritative "still working" straight from the vendor, so it upgrades
     /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
     /// which a fleet listing does not pay).
+    /// `/status` for a focused sid ccteam holds no process for — the RELEASED
+    /// twin of the live header, in the SAME five-line shape so the two read
+    /// identically apart from the state word. Every fact comes from what was
+    /// persisted (`meta.json` + the session's own `status.json`); nothing that
+    /// requires a running thread (running tasks, account usage, goal) is
+    /// invented. `None` when the sid is unknown, not visible to `chat`, or is
+    /// not actually released (stopped / external / detached), so the caller can
+    /// fall through to its normal paths.
+    fn render_released_status(
+        &self,
+        chat: &ChatKey,
+        sid: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> Option<String> {
+        if self.sessions.contains_key(sid) || self.detached.contains_key(sid) {
+            return None;
+        }
+        let (slug, dir, meta) = self.find_meta_for_sid(sid).ok()?;
+        if !meta.is_resumable() || !self.project_owner_visible_with(chat, &slug, &meta.owner, memo)
+        {
+            return None;
+        }
+        let status = ccteam_harness::execution::session_status::read_status_file(&dir, sid);
+        let turn_status = ccteam_harness::TurnStatus {
+            model: status
+                .as_ref()
+                .and_then(|status| status.model.clone())
+                .or_else(|| meta.observed_model.clone().or_else(|| meta.model.clone())),
+            context: status.as_ref().and_then(|status| status.context),
+            turn: meta.turn_count,
+            cost_usd: meta.cost_usd,
+            tokens_total: meta.tokens_total,
+        };
+        let mut head = format!("🧭 → {slug}/{sid}");
+        if let Some(title) = meta.title.as_deref().filter(|title| !title.is_empty()) {
+            head.push_str(&format!(
+                " 「{}」",
+                ccteam_harness::truncate_status_title(title)
+            ));
+        }
+        let second = format!(
+            "💤 released · {}",
+            ccteam_harness::render_status_metrics(&turn_status)
+        );
+        let mut identity = match turn_status
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            Some(model) => format!("{} {model}", vendor_str(meta.vendor)),
+            None => vendor_str(meta.vendor).to_string(),
+        };
+        if let Some(effort) = status
+            .as_ref()
+            .and_then(|st| st.effort.as_deref())
+            .or(meta.effort.as_deref())
+            .filter(|e| !e.is_empty())
+        {
+            identity.push_str(&format!(" · {effort}"));
+        }
+        if !meta.role.is_empty() {
+            identity.push_str(&format!(" · {}", meta.role));
+        }
+        let mut out = format!(
+            "{head}\n📍 {second}\n   {identity}\n   📁 {}",
+            dir.display()
+        );
+        let resume = if meta.vendor_uuid.is_empty() {
+            "resume —".to_string()
+        } else {
+            format!("resume {}", meta.vendor_uuid)
+        };
+        out.push_str(&format!("\n   {resume}"));
+        Some(out)
+    }
+
     async fn render_status(&self, chat: &ChatKey) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
@@ -9451,9 +9805,6 @@ impl Gateway {
             .values()
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
-        if visible.is_empty() {
-            return "no sessions — start one with /new".to_string();
-        }
         // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
         // the full fleet list. Resolve the focused sid; if none is set (or it has
         // gone), point at /use rather than guess which session is "current".
@@ -9462,15 +9813,40 @@ impl Gateway {
             .read()
             .ok()
             .and_then(|m| m.get(chat).cloned());
-        let Some(s) = cur_sid
+        let focused_resident = cur_sid
             .as_ref()
-            .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid))
-        else {
+            .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid));
+        // A focus pointing at a RELEASED session is not a missing focus: the
+        // session is real, the next message resumes it, and the reader wants to
+        // know which one they are pointed at. Render it from persisted facts.
+        if focused_resident.is_none() {
+            if let Some(sid) = cur_sid.as_deref() {
+                if let Some(rendered) = self.render_released_status(chat, sid, &mut memo) {
+                    return rendered;
+                }
+            }
+        }
+        let Some(s) = focused_resident else {
             // No focused session — keep the user oriented by leading with the
             // current project, then point at the right next step: a fresh project
             // wants a first message; a project with sessions wants `/use`.
+            // Released sessions count: they are exactly what `/use` can reach.
+            let released_visible: Vec<(String, SessionMeta)> = self
+                .released_session_metas(None)
+                .into_iter()
+                .filter(|(slug, meta)| {
+                    self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+                })
+                .collect();
+            if visible.is_empty() && released_visible.is_empty() {
+                return "no sessions — start one with /new".to_string();
+            }
             let cur = self.current_project_label(chat);
-            let in_proj = visible.iter().filter(|s| s.project == cur).count();
+            let in_proj = visible.iter().filter(|s| s.project == cur).count()
+                + released_visible
+                    .iter()
+                    .filter(|(slug, _)| slug == &cur)
+                    .count();
             return if in_proj > 0 {
                 format!(
                     "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
@@ -9855,6 +10231,7 @@ impl Gateway {
                     },
                     current: current.contains(&s.id),
                     status: "live".to_string(),
+                    residency: RESIDENCY_RESIDENT.to_string(),
                     last_activity_seconds: None,
                     created_at,
                     last_active,
@@ -9892,6 +10269,86 @@ impl Gateway {
                 .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
         });
         views
+    }
+
+    /// **The one residency resolver.** Where a sid sits on the residency axis
+    /// right now: `resident` | `detached` | `external` | `stopped` |
+    /// `released`, or `None` for a sid ccteam has never heard of.
+    ///
+    /// Every surface that wants to say "is ccteam holding this session"
+    /// answers here, the same way every surface that wants to say "what is it
+    /// doing" answers through `ccteam_core::stall::classify_session_activity`.
+    /// Two axes, two resolvers, no third opinion.
+    pub fn session_residency(&self, sid: &str) -> Option<&'static str> {
+        if self.sessions.contains_key(sid) {
+            return Some(RESIDENCY_RESIDENT);
+        }
+        if self.detached.contains_key(sid) {
+            return Some(RESIDENCY_DETACHED);
+        }
+        let (_slug, _dir, meta) = self.find_meta_for_sid(sid).ok()?;
+        Some(residency_of_meta(&meta))
+    }
+
+    /// Every RELEASED session of the given projects — real, resumable, and
+    /// simply not holding a process right now. `slugs = None` means every
+    /// project the gateway has loaded.
+    ///
+    /// Rows are built from persisted facts only (`meta.json`), because that IS
+    /// all there is: `status`/`last_activity_seconds` are left for the caller's
+    /// activity resolver to fill from the progress projection, exactly as they
+    /// are for a resident row. `driveable` is `true` — sending one work
+    /// resumes it (`cold_resume_absent_sid`), which is the whole point of
+    /// releasing rather than stopping.
+    ///
+    /// Reads each project's `.ccteam/chat/*/meta.json` set from disk, so this
+    /// is for user-/agent-triggered listings, not for a poll loop.
+    pub fn released_session_views(
+        &self,
+        slugs: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<SessionView> {
+        let current: std::collections::HashSet<String> = self
+            .current_session
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        self.released_session_metas(slugs)
+            .iter()
+            .map(|(slug, meta)| released_session_view(meta, slug, &current))
+            .collect()
+    }
+
+    /// The `(slug, meta)` pairs behind [`Self::released_session_views`], for
+    /// callers that also need a fact the view does not carry (the IM listing
+    /// ACL-filters on `meta.owner`). Recency-ordered, catalog-warming.
+    pub(crate) fn released_session_metas(
+        &self,
+        slugs: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<(String, SessionMeta)> {
+        let mut out: Vec<(String, SessionMeta)> = Vec::new();
+        for (slug, dir) in &self.projects {
+            if slugs.is_some_and(|wanted| !wanted.contains(slug)) {
+                continue;
+            }
+            for meta in list_session_metas(dir) {
+                if !meta.is_resumable()
+                    || self.sessions.contains_key(&meta.sid)
+                    || self.detached.contains_key(&meta.sid)
+                {
+                    continue;
+                }
+                self.session_catalog.insert(dir, &meta);
+                out.push((slug.clone(), meta));
+            }
+        }
+        out.sort_by(|(_, a), (_, b)| {
+            b.last_active
+                .cmp(&a.last_active)
+                .then_with(|| session_index(&b.sid).cmp(&session_index(&a.sid)))
+        });
+        out
     }
 
     /// Number of lazy catalog disk reads since gateway construction.
@@ -10220,6 +10677,7 @@ impl Gateway {
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
             managed_by: Default::default(),
+            stopped_at: None,
             sid: sid.clone(),
             slug: slug.to_string(),
             vendor: AgentVendor::Claude,
@@ -10324,6 +10782,7 @@ impl Gateway {
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
                 managed_by: Default::default(),
+                stopped_at: None,
                 sid: sid.clone(),
                 slug: slug.to_string(),
                 vendor: AgentVendor::Claude,
@@ -10802,7 +11261,27 @@ impl Gateway {
         Ok(CreateSessionOutcome { sid: outcome.id })
     }
 
-    // ── live-session capacity (v0.9.2) ──────────────────────────────────────
+    // ── session residency: idle release + capacity ceiling ──────────────────
+    //
+    // RESIDENCY is not the same axis as ACTIVITY. Activity says what a session
+    // is DOING (`working|idle|stale|stuck`, resolved once in
+    // `ccteam_core::stall::classify_session_activity`); residency says whether
+    // ccteam is holding a vendor process for it right now. A session can be
+    // idle and resident (a process sitting on a warm prompt cache), idle and
+    // released (nothing running; the next message resumes it by sid), or
+    // stopped (the user said so). Conflating the two is what made every
+    // history row read as "working" on the surfaces that only had `"live"`.
+    //
+    // The policy is a two-level ladder, in this order of importance:
+    //   1. IDLE RELEASE (primary) — a session nobody has spoken to for its
+    //      harness's `sessions.idle_release_secs` window is released. The
+    //      default window is the vendor's prompt-cache TTL, so a process is
+    //      held exactly as long as holding it can still save a cache re-read.
+    //   2. CAPACITY (secondary) — `sessions.max_live` still caps the burst
+    //      case, evicting the least-recently-active eligible session at
+    //      admission time.
+    // Both funnel through ONE release core, so "released" means the same thing
+    // and emits the same durable event whichever policy fired.
 
     fn sessions_config(&self) -> ccteam_core::SessionsConfig {
         if let Some(cfg) = &self.sessions_config_override {
@@ -10815,8 +11294,8 @@ impl Gateway {
             .unwrap_or_default()
     }
 
-    /// Override the daemon-wide live-session cap. Production reads the hot
-    /// config; deterministic tests use this to make eviction cheap to exercise.
+    /// Override the daemon-wide residency policy. Production reads the hot
+    /// config; deterministic tests use this to make release cheap to exercise.
     pub fn set_sessions_config(&mut self, cfg: ccteam_core::SessionsConfig) {
         self.sessions_config_override = Some(cfg);
     }
@@ -10853,10 +11332,11 @@ impl Gateway {
 
     /// Append the durable progress event and broadcast its live lifecycle twin
     /// from the same call site so state and web surfaces cannot drift.
-    fn emit_session_evicted(&self, sid: &str, slug: &str) {
+    fn emit_session_evicted(&self, sid: &str, slug: &str, reason: ReleaseReason) {
         if let Some(paths) = self.project_paths.as_ref() {
             let event = ccteam_harness::execution::progress_bridge::build_session_evicted_event(
-                sid, "capacity",
+                sid,
+                reason.as_str(),
             );
             let path = paths.progress_jsonl(slug);
             let sid = sid.to_string();
@@ -10876,7 +11356,7 @@ impl Gateway {
             content: format!("session evicted: {sid}"),
             kind: GatewayEventKind::SessionLifecycle {
                 state: "evicted".to_string(),
-                reason: "capacity".to_string(),
+                reason: reason.as_str().to_string(),
             },
             attachments: Vec::new(),
             options: Vec::new(),
@@ -10886,9 +11366,119 @@ impl Gateway {
         });
     }
 
-    /// Ensure one more live session can be admitted. Capacity never rejects a
-    /// creation/revival: eligible sessions are gracefully stopped LRU-first;
-    /// if every live session is protected, admission proceeds over cap.
+    /// One in-memory snapshot row per resident session — the SINGLE input both
+    /// residency policies rank over, so idle release and capacity eviction can
+    /// never disagree about what a session is doing. Everything here is a
+    /// cheap peek (no I/O, no adapter round-trip) except `last_active`, which
+    /// is the catalog's copy of `meta.json` (already in memory).
+    async fn residency_snapshot(&self) -> Vec<ResidencySnapshot> {
+        let now = Instant::now();
+        let pending = self.pending.lock().await;
+        self.sessions
+            .values()
+            .map(|session| {
+                let turn_in_flight = session
+                    .turn_started_at
+                    .lock()
+                    .map(|started| started.is_some())
+                    .unwrap_or(true);
+                // The idle clock runs from the LATER of "installed in the live
+                // map" and "last pump event": a session resumed a second ago
+                // has no events yet and must not read as ancient.
+                let last_event = session.last_event_at.lock().ok().and_then(|g| *g);
+                let floor = last_event.map_or(session.resident_since, |event| {
+                    event.max(session.resident_since)
+                });
+                ResidencySnapshot {
+                    sid: session.id.clone(),
+                    generation: session.generation,
+                    vendor: vendor_str(session.vendor).to_string(),
+                    adapter: Arc::clone(&session.adapter),
+                    thread: session.thread.clone(),
+                    turn_in_flight,
+                    waiting_approval: pending.pending_for_sid(&session.id).is_some(),
+                    last_active: self.session_last_active(session),
+                    idle_for: now.saturating_duration_since(floor),
+                }
+            })
+            .collect()
+    }
+
+    /// Fence one sid OUT of the live map without touching chat focus routes.
+    ///
+    /// Releasing a session is NOT the same as ending it: the chat that was
+    /// driving it keeps pointing at it, and the next message resumes THAT sid
+    /// (`cold_resume_absent_sid`). Dropping the route here is what used to
+    /// make a capacity eviction silently mint a brand-new session on the
+    /// chat's next plain message — the context the user was mid-way through
+    /// was still on disk, and nothing ever went back to it. Only an EXPLICIT
+    /// stop drops routes ([`Self::stop_session`]).
+    ///
+    /// Returns what the caller must close AFTER dropping the lock, or `None`
+    /// when the entry changed generation underneath us (a replacement is a
+    /// different session and gets ranked afresh).
+    fn fence_out_session(
+        &mut self,
+        sid: &str,
+        generation: u64,
+    ) -> Option<(String, Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle)> {
+        let session = self.sessions.get(sid)?.clone();
+        if session.generation != generation {
+            return None;
+        }
+        self.principals.forget(sid);
+        if let Some(pump) = self.event_pumps.remove(sid) {
+            pump.abort();
+        }
+        let removed = self.sessions.remove(sid);
+        if removed
+            .as_ref()
+            .is_none_or(|current| current.generation != generation)
+        {
+            return None;
+        }
+        Some((
+            session.project.clone(),
+            Arc::clone(&session.adapter),
+            session.thread.clone(),
+        ))
+    }
+
+    /// Release one resident session (lock-narrowed): fence it out under the
+    /// lock, close the vendor thread outside it, re-persist routing, then emit
+    /// the durable + live eviction pair. `true` when the session was actually
+    /// released. Shared by BOTH residency policies.
+    async fn release_session_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+        generation: u64,
+        reason: ReleaseReason,
+    ) -> Result<bool> {
+        let fenced = {
+            let mut guard = gateway.lock().await;
+            guard.fence_out_session(sid, generation)
+        };
+        let Some((slug, adapter, thread)) = fenced else {
+            return Ok(false);
+        };
+        // Graceful vendor close is the slow half and never occupies the
+        // registry lock. The entry is already fenced out, so new work cannot
+        // race onto the retiring handle.
+        if let Err(error) = adapter.close_thread(&thread).await {
+            tracing::warn!(%sid, %error, reason = reason.as_str(), "session release close failed");
+        }
+        Self::persist_latest_routing_shared(gateway).await?;
+        gateway
+            .lock()
+            .await
+            .emit_session_evicted(sid, &slug, reason);
+        tracing::info!(sid, %slug, reason = reason.as_str(), "ccteam-im: released session");
+        Ok(true)
+    }
+
+    /// Ensure one more session can be admitted. Capacity never rejects a
+    /// creation/revival: eligible sessions are gracefully released LRU-first;
+    /// if every resident session is protected, admission proceeds over cap.
     async fn ensure_live_capacity(&mut self, exclude: &[String]) {
         let configured = self.sessions_config().max_live;
         let max_live = configured.max(1) as usize;
@@ -10900,22 +11490,9 @@ impl Gateway {
         let excluded: HashSet<String> = exclude.iter().cloned().collect();
 
         while self.sessions.len() >= max_live {
-            let candidates = {
-                let pending = self.pending.lock().await;
-                self.sessions
-                    .values()
-                    .map(|session| LiveCapacityCandidate {
-                        sid: session.id.clone(),
-                        idle: session
-                            .turn_started_at
-                            .lock()
-                            .map(|started| started.is_none())
-                            .unwrap_or(false),
-                        last_active: self.session_last_active(session),
-                        waiting_approval: pending.pending_for_sid(&session.id).is_some(),
-                    })
-                    .collect::<Vec<_>>()
-            };
+            let snapshot = self.residency_snapshot().await;
+            let candidates =
+                live_capacity_candidates(&snapshot, &outliving_task_sids(&snapshot).await);
             let Some(candidate_sid) = select_live_capacity_eviction(&candidates, &excluded) else {
                 tracing::warn!(
                     live = self.sessions.len(),
@@ -10925,31 +11502,35 @@ impl Gateway {
                 );
                 break;
             };
-            let slug = self
-                .sessions
-                .get(&candidate_sid)
-                .map(|session| session.project.clone())
-                .unwrap_or_default();
-            let stop_result = self.stop_session(&candidate_sid).await;
-            if !self.sessions.contains_key(&candidate_sid) {
-                self.emit_session_evicted(&candidate_sid, &slug);
-                tracing::info!(
-                    sid = %candidate_sid,
-                    %slug,
-                    reason = "capacity",
-                    max_live,
-                    "ccteam-im: gracefully evicted live session"
-                );
-            }
-            if let Err(err) = stop_result {
-                tracing::warn!(sid = %candidate_sid, error = %err,
-                    "ccteam-im: capacity eviction stop reported an error");
-            }
-            if self.sessions.contains_key(&candidate_sid) {
+            let Some(generation) = snapshot
+                .iter()
+                .find(|row| row.sid == candidate_sid)
+                .map(|row| row.generation)
+            else {
+                break;
+            };
+            let Some((slug, adapter, thread)) = self.fence_out_session(&candidate_sid, generation)
+            else {
                 tracing::warn!(sid = %candidate_sid,
                     "ccteam-im: capacity eviction left candidate live; admitting over cap");
                 break;
+            };
+            if let Err(error) = adapter.close_thread(&thread).await {
+                tracing::warn!(sid = %candidate_sid, %error,
+                    "ccteam-im: capacity eviction close reported an error");
             }
+            if let Err(error) = self.persist_routing() {
+                tracing::warn!(sid = %candidate_sid, %error,
+                    "ccteam-im: failed to persist routing after capacity eviction");
+            }
+            self.emit_session_evicted(&candidate_sid, &slug, ReleaseReason::Capacity);
+            tracing::info!(
+                sid = %candidate_sid,
+                %slug,
+                reason = "capacity",
+                max_live,
+                "ccteam-im: gracefully released live session"
+            );
         }
     }
 
@@ -10959,79 +11540,130 @@ impl Gateway {
     ) -> Result<()> {
         let excluded: HashSet<String> = exclude.iter().cloned().collect();
         loop {
-            let victim = {
-                let mut guard = gateway.lock().await;
+            let snapshot = {
+                let guard = gateway.lock().await;
                 let configured = guard.sessions_config().max_live;
                 let max_live = configured.max(1) as usize;
                 if guard.sessions.len() < max_live {
                     return Ok(());
                 }
-                let candidates = {
-                    let pending = guard.pending.lock().await;
-                    guard
-                        .sessions
-                        .values()
-                        .map(|session| LiveCapacityCandidate {
-                            sid: session.id.clone(),
-                            idle: session
-                                .turn_started_at
-                                .lock()
-                                .map(|started| started.is_none())
-                                .unwrap_or(false),
-                            last_active: guard.session_last_active(session),
-                            waiting_approval: pending.pending_for_sid(&session.id).is_some(),
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let Some(sid) = select_live_capacity_eviction(&candidates, &excluded) else {
-                    tracing::warn!(
-                        live = guard.sessions.len(),
-                        max_live,
-                        "ccteam-im: no eligible capacity victim; admitting over cap"
-                    );
-                    return Ok(());
-                };
-                // Re-check the selected entry under the same short lock that
-                // removes it. A replacement gets a new generation and will be
-                // selected afresh on the next loop rather than stopped stale.
-                let Some(session) = guard.sessions.get(&sid).cloned() else {
-                    continue;
-                };
-                guard.principals.forget(&sid);
-                if let Some(pump) = guard.event_pumps.remove(&sid) {
-                    pump.abort();
-                }
-                let removed = guard.sessions.remove(&sid);
-                if removed
-                    .as_ref()
-                    .is_none_or(|current| current.generation != session.generation)
-                {
-                    continue;
-                }
-                guard
-                    .current_session
-                    .write()
-                    .unwrap()
-                    .retain(|_, current| current != &sid);
-                (
-                    sid,
-                    session.project.clone(),
-                    Arc::clone(&session.adapter),
-                    session.thread.clone(),
-                )
+                guard.residency_snapshot().await
             };
-            let (sid, slug, adapter, thread) = victim;
-            // Graceful vendor close is the slow half and never occupies the
-            // registry lock. The entry is already fenced out, so new work
-            // cannot race onto the retiring handle.
-            if let Err(error) = adapter.close_thread(&thread).await {
-                tracing::warn!(%sid, %error, "capacity eviction close failed");
-            }
-            Self::persist_latest_routing_shared(gateway).await?;
-            gateway.lock().await.emit_session_evicted(&sid, &slug);
+            let candidates =
+                live_capacity_candidates(&snapshot, &outliving_task_sids(&snapshot).await);
+            let Some(sid) = select_live_capacity_eviction(&candidates, &excluded) else {
+                tracing::warn!(
+                    live = snapshot.len(),
+                    "ccteam-im: no eligible capacity victim; admitting over cap"
+                );
+                return Ok(());
+            };
+            let generation = snapshot
+                .iter()
+                .find(|row| row.sid == sid)
+                .map(|row| row.generation)
+                .unwrap_or_default();
+            // A replacement gets a new generation and is ranked afresh on the
+            // next loop rather than stopped stale.
+            Self::release_session_shared(gateway, &sid, generation, ReleaseReason::Capacity)
+                .await?;
         }
     }
 
+    // ── idle release (the primary residency policy) ─────────────────────────
+
+    /// How often the idle-release sweeper wakes. The TTL it enforces is on the
+    /// order of minutes-to-hours, so a minute of granularity costs nothing and
+    /// keeps the daemon's idle wakeups to one per minute.
+    const IDLE_RELEASE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The idle-release sweeper: releases the vendor process of every resident
+    /// session that has been idle past its harness's TTL. Runs for the
+    /// daemon's whole life, next to the body watcher. Never returns.
+    ///
+    /// This is NOT a content decision loop (`daemon 无自主内容决策循环`): it
+    /// produces no work, selects no task and sends nothing to any model — it
+    /// only lets go of an OS process whose session is untouched and resumes by
+    /// sid on the next message.
+    pub async fn run_idle_release_sweeper(gateway: Arc<tokio::sync::Mutex<Self>>) {
+        let mut ticker = tokio::time::interval(Self::IDLE_RELEASE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            Self::idle_release_tick(&gateway).await;
+        }
+    }
+
+    /// One idle-release pass. Public so a test can drive it deterministically
+    /// instead of waiting out a real interval. Returns the released sids.
+    ///
+    /// Eligibility (ALL required): no turn in flight, no outstanding HITL
+    /// approval, no turn-OUTLIVING background task (a background shell /
+    /// workflow / async agent is real work the session's process is still
+    /// carrying — the same `RunningTask::outlives_turn` authority the status
+    /// surfaces use), and an idle clock past the harness's TTL.
+    pub async fn idle_release_tick(gateway: &Arc<tokio::sync::Mutex<Self>>) -> Vec<String> {
+        let (snapshot, config) = {
+            let guard = gateway.lock().await;
+            (guard.residency_snapshot().await, guard.sessions_config())
+        };
+        // Candidates first (cheap, in-memory), so the adapter round-trip below
+        // is paid only for sessions that are otherwise ready to be released.
+        let ripe: Vec<&ResidencySnapshot> = snapshot
+            .iter()
+            .filter(|row| {
+                !row.turn_in_flight
+                    && !row.waiting_approval
+                    && config
+                        .idle_release_for(&row.vendor)
+                        .is_some_and(|ttl| row.idle_for >= ttl)
+            })
+            .collect();
+        if ripe.is_empty() {
+            return Vec::new();
+        }
+        let mut released = Vec::new();
+        for row in ripe {
+            // Off the lock: the vendor's own answer to "is background work
+            // still running here".
+            if row
+                .adapter
+                .running_tasks(&row.thread)
+                .await
+                .iter()
+                .any(|task| task.outlives_turn())
+            {
+                continue;
+            }
+            match Self::release_session_shared(
+                gateway,
+                &row.sid,
+                row.generation,
+                ReleaseReason::Idle,
+            )
+            .await
+            {
+                Ok(true) => released.push(row.sid.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(sid = %row.sid, %error, "ccteam-im: idle release failed");
+                }
+            }
+        }
+        released
+    }
+
+    /// Test seam: pretend `sid` has been resident and silent for `by`, so an
+    /// idle-release pass can be exercised without sleeping through a real TTL.
+    #[cfg(test)]
+    fn backdate_residency_for_tests(&mut self, sid: &str, by: std::time::Duration) {
+        if let Some(session) = self.sessions.get_mut(sid) {
+            session.resident_since -= by;
+            if let Ok(mut last) = session.last_event_at.lock() {
+                *last = last.map(|event| event - by);
+            }
+        }
+    }
     // ── delegation (v0.9.0 W2 — F2/F5/F7) ──────────────────────────────────
 
     /// The active delegation guardrail posture (hot-reloaded config, else the
@@ -12862,21 +13494,31 @@ impl Gateway {
     /// [`switch_current_role`](Self::switch_current_role) teardown: abort
     /// the event pump, `close_thread` on the owning adapter, drop the
     /// session record, clear any `current_session` route that pointed at
-    /// it, then persist. Idempotent-ish: an unknown `sid` is an error so
-    /// the API can surface a 404, but a missing tmux pane inside
-    /// `close_thread` is tolerated (adapter close is idempotent). Never
+    /// it, record the stop in `meta.json`, then persist. A missing tmux pane
+    /// inside `close_thread` is tolerated (adapter close is idempotent). Never
     /// file-purges — deregister-only, per the locked W5b decision.
+    ///
+    /// This is the ONLY thing that ends a session. It works on a RELEASED sid
+    /// too (a session ccteam holds no process for right now): there is no
+    /// thread to close, but the user's "stop" is still a real decision and has
+    /// to stick — otherwise the very next message would resume it again. So a
+    /// released sid records `stopped_at`, drops routes and broadcasts the same
+    /// lifecycle frame the live path does. Idempotent: stopping an
+    /// already-stopped sid is `Ok`. Only a genuinely unknown sid (no live
+    /// entry, no detached body, no `meta.json`) is an error, so the API can
+    /// still 404.
     pub async fn stop_session(&mut self, sid: &str) -> Result<()> {
         // A body that outlived the previous daemon is not in the live map but
         // IS this sid's body: an explicit stop ends it (the one case the daemon
         // signals such a process — on the user's word, never on its own).
         if self.stop_detached_body(sid).await? {
+            self.mark_session_stopped(sid);
             return Ok(());
         }
-        let session = self
-            .sessions
-            .get(sid)
-            .ok_or_else(|| anyhow!("unknown session: {sid}"))?;
+        let Some(session) = self.sessions.get(sid) else {
+            return self.stop_released_session(sid);
+        };
+        let slug = session.project.clone();
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
         // The secret dies with the session — before the close, so a racing
@@ -12890,13 +13532,78 @@ impl Gateway {
         let _ = adapter.close_thread(&thread).await;
         self.sessions.remove(sid);
         // Drop every current-session route that pointed at this sid so a
-        // chat doesn't keep addressing a dead session.
+        // chat doesn't keep addressing a dead session. (Only an EXPLICIT stop
+        // does this — an idle release / capacity eviction keeps the focus so
+        // the next message resumes the SAME sid.)
         self.current_session
             .write()
             .unwrap()
             .retain(|_, v| v != sid);
+        self.mark_session_stopped(sid);
+        self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         self.persist_routing()?;
         Ok(())
+    }
+
+    /// [`Self::stop_session`] for a sid ccteam holds no process for. Nothing to
+    /// close — the whole job is to make the decision durable so no resume path
+    /// brings it back.
+    fn stop_released_session(&mut self, sid: &str) -> Result<()> {
+        let (slug, _cwd, meta) = self
+            .find_meta_for_sid(sid)
+            .map_err(|_| anyhow!("unknown session: {sid}"))?;
+        if !meta.managed_by.is_driveable() {
+            return Err(anyhow!(
+                "session {sid} is a hand-started agent that enrolled with ccteam (external); \
+                 ccteam holds no thread for it and cannot stop it"
+            ));
+        }
+        let already_stopped = meta.stopped_at.is_some();
+        self.principals.forget(sid);
+        self.current_session
+            .write()
+            .unwrap()
+            .retain(|_, v| v != sid);
+        self.mark_session_stopped(sid);
+        if !already_stopped {
+            self.emit_session_lifecycle(sid, &slug, "stopped", "user");
+        }
+        self.persist_routing()?;
+        Ok(())
+    }
+
+    /// Record an explicit stop in `meta.json` (through the catalog, so the
+    /// in-memory index stays in lockstep with disk). Best-effort and
+    /// idempotent — the first stop's timestamp stands.
+    fn mark_session_stopped(&self, sid: &str) {
+        let Some(entry) = self.session_catalog.find_or_load(sid, &self.projects) else {
+            return;
+        };
+        if entry.meta.stopped_at.is_some() {
+            return;
+        }
+        let mut meta = entry.meta;
+        meta.stopped_at = Some(chrono::Utc::now().to_rfc3339());
+        if let Err(error) = self.session_catalog.write(&entry.project_dir, &meta) {
+            tracing::warn!(%sid, %error, "ccteam-im: failed to record session stop in meta.json");
+        }
+    }
+
+    /// Clear the explicit-stop marker: the user is driving this session again,
+    /// so it is no longer stopped. Called from the ONE rebuild apply point
+    /// every resume path funnels through.
+    fn clear_session_stopped(&self, sid: &str) {
+        let Some(entry) = self.session_catalog.find_or_load(sid, &self.projects) else {
+            return;
+        };
+        if entry.meta.stopped_at.is_none() {
+            return;
+        }
+        let mut meta = entry.meta;
+        meta.stopped_at = None;
+        if let Err(error) = self.session_catalog.write(&entry.project_dir, &meta) {
+            tracing::warn!(%sid, %error, "ccteam-im: failed to clear session stop in meta.json");
+        }
     }
 
     /// Interrupt a session's CURRENTLY-RUNNING turn without destroying it (the
@@ -13097,6 +13804,7 @@ fn detached_body_view(
             .unwrap_or_else(|| "local".to_string()),
         current: current.contains(&d.sid),
         status: "detached".to_string(),
+        residency: RESIDENCY_DETACHED.to_string(),
         last_activity_seconds: None,
         created_at: m(&|m| m.created_at.clone()),
         last_active: m(&|m| m.last_active.clone()),
@@ -13119,6 +13827,109 @@ fn is_body_detached_error(err: &anyhow::Error) -> bool {
         err.downcast_ref::<GatewayRequestError>(),
         Some(GatewayRequestError::SessionBodyDetached { .. })
     )
+}
+
+/// Cap on the rows one IM `/sessions` message prints. Now that a listing
+/// spans resident ∪ released sessions, a long-lived project's full history
+/// would otherwise arrive as a wall of text on a phone; the truncated count is
+/// reported in the footer and `/use <id>` still reaches any of them.
+const IM_SESSIONS_MAX_ROWS: usize = 15;
+
+/// One row of the IM `/sessions` listing, from whichever side of the residency
+/// axis it came. Lets the renderer treat both alike for ordering, tree
+/// building and formatting while keeping their DATA sources distinct — a
+/// resident row asks its adapter, a released row reads what was persisted.
+enum SessionRowSource<'a> {
+    Resident(&'a GatewaySession),
+    Released(&'a str, &'a SessionMeta),
+}
+
+impl SessionRowSource<'_> {
+    fn sid(&self) -> &str {
+        match self {
+            SessionRowSource::Resident(s) => &s.id,
+            SessionRowSource::Released(_, meta) => &meta.sid,
+        }
+    }
+
+    fn vendor(&self) -> &'static str {
+        match self {
+            SessionRowSource::Resident(s) => vendor_str(s.vendor),
+            SessionRowSource::Released(_, meta) => vendor_str(meta.vendor),
+        }
+    }
+
+    fn host(&self) -> &str {
+        match self {
+            SessionRowSource::Resident(s) => &s.host,
+            SessionRowSource::Released(_, meta) => &meta.host,
+        }
+    }
+
+    fn parent_sid(&self) -> Option<&str> {
+        match self {
+            SessionRowSource::Resident(s) => s.parent_sid.as_deref(),
+            SessionRowSource::Released(_, meta) => meta.parent_sid.as_deref(),
+        }
+    }
+
+    fn is_released(&self) -> bool {
+        matches!(self, SessionRowSource::Released(..))
+    }
+}
+
+/// Residency as the DURABLE record alone can tell it (no live map): a
+/// hand-started node, an explicitly stopped session, or a released one.
+fn residency_of_meta(meta: &SessionMeta) -> &'static str {
+    if !meta.managed_by.is_driveable() {
+        RESIDENCY_EXTERNAL
+    } else if meta.stopped_at.is_some() {
+        RESIDENCY_STOPPED
+    } else {
+        RESIDENCY_RELEASED
+    }
+}
+
+/// The row a RELEASED session contributes to a listing — everything from
+/// `meta.json`, nothing invented. `status` starts at `"idle"` and is replaced
+/// by the caller's activity resolver (the file verdict), the same treatment a
+/// resident row's `"live"` placeholder gets.
+fn released_session_view(
+    meta: &SessionMeta,
+    slug: &str,
+    current: &std::collections::HashSet<String>,
+) -> SessionView {
+    SessionView {
+        sid: meta.sid.clone(),
+        project: slug.to_string(),
+        role: meta.role.clone(),
+        vendor: vendor_str(meta.vendor).to_string(),
+        permission_mode: meta.permission_mode.as_str().to_string(),
+        protocol: meta.protocol.as_str().to_string(),
+        host: if meta.host.is_empty() {
+            "local".to_string()
+        } else {
+            meta.host.clone()
+        },
+        current: current.contains(&meta.sid),
+        status: "idle".to_string(),
+        residency: RESIDENCY_RELEASED.to_string(),
+        last_activity_seconds: None,
+        created_at: meta.created_at.clone(),
+        last_active: meta.last_active.clone(),
+        title: meta.title.clone(),
+        turn_count: meta.turn_count,
+        cost_usd: meta.cost_usd,
+        tokens_total: meta.tokens_total,
+        model: meta.model.clone().or_else(|| meta.observed_model.clone()),
+        // ccteam relays no permission request for a thread it does not hold.
+        waiting_approval: false,
+        parent_sid: meta.parent_sid.clone(),
+        delegation_depth: meta.delegation_depth,
+        // Sending it work resumes it by sid — that IS the contract.
+        driveable: true,
+        detached: None,
+    }
 }
 
 fn external_node_view(meta: &SessionMeta) -> SessionView {
@@ -13145,6 +13956,7 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
         // routes no chat to a client it cannot submit a turn to.
         current: false,
         status: "idle".to_string(),
+        residency: RESIDENCY_EXTERNAL.to_string(),
         last_activity_seconds: silent_seconds,
         created_at: meta.created_at.clone(),
         last_active: meta.last_active.clone(),
@@ -14956,6 +15768,385 @@ mod tests {
         ));
     }
 
+    // ── idle release (the primary residency policy) ─────────────────────────
+
+    /// Idle release is what makes a fleet of 10–30 sessions affordable: a
+    /// session nobody has spoken to past its harness's TTL gives up its vendor
+    /// process, and — the load-bearing half — the chat that was driving it
+    /// KEEPS pointing at it, so the next plain message resumes the SAME sid
+    /// instead of silently opening a new session on a fresh context.
+    #[tokio::test]
+    async fn idle_release_frees_the_process_and_the_next_message_resumes_the_same_sid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 60,
+            ..Default::default()
+        });
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        assert_eq!(reply.len(), 1);
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+        // The fake emits no turn boundary, so close the turn by hand — exactly
+        // what the pump's `TurnCompleted` does after a real answer.
+        *gateway
+            .sessions
+            .get("s1")
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+
+        // Not yet idle: a fresh session is never released out from under its user.
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert!(Gateway::idle_release_tick(&gateway).await.is_empty());
+        assert!(gateway.lock().await.is_session_live("s1"));
+
+        // Past the TTL.
+        gateway
+            .lock()
+            .await
+            .backdate_residency_for_tests("s1", std::time::Duration::from_secs(120));
+        let mut events = gateway.lock().await.subscribe_events();
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+        {
+            let g = gateway.lock().await;
+            assert!(!g.is_session_live("s1"));
+            assert_eq!(g.session_residency("s1"), Some("released"));
+            // The FOCUS survives — only an explicit stop drops routes.
+            assert_eq!(
+                g.current_session.read().unwrap().values().next().cloned(),
+                Some("s1".to_string())
+            );
+        }
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.sid.as_deref(), Some("s1"));
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, ref reason }
+                if state == "evicted" && reason == "idle"
+        ));
+
+        // The next plain message resumes THAT sid — no new session is minted.
+        let reply = gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha--s1 echo: still here?"]);
+        let g = gateway.lock().await;
+        assert!(g.is_session_live("s1"));
+        assert_eq!(g.session_residency("s1"), Some("resident"));
+        assert_eq!(g.next_session, 1, "no new sid was minted");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2, "one cold resume");
+    }
+
+    /// Everything that means "this process is still carrying work" holds the
+    /// release off: a turn in flight, an outstanding HITL approval, and a
+    /// turn-OUTLIVING background task (the vendor's own answer, via
+    /// `RunningTask::outlives_turn` — the same authority `/status` uses).
+    /// `idle_release_secs: 0` disables the policy entirely.
+    #[tokio::test]
+    async fn idle_release_never_lets_go_of_a_session_that_is_still_working() {
+        // (a) a background task the vendor reports as outliving its turn.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let busy = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_background_task());
+        let mut gateway = Gateway::new(busy, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert!(
+            Gateway::idle_release_tick(&gateway).await.is_empty(),
+            "a running background task keeps the process"
+        );
+
+        // (b) a turn in flight.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw2 = Gateway::new(fake, "alpha", tmp2.path());
+        gw2.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        let sid2 = spawn_managed(&mut gw2).await;
+        *gw2.sessions
+            .get(&sid2)
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = Some(Instant::now());
+        gw2.backdate_residency_for_tests(&sid2, std::time::Duration::from_secs(600));
+        let gw2 = Arc::new(tokio::sync::Mutex::new(gw2));
+        assert!(
+            Gateway::idle_release_tick(&gw2).await.is_empty(),
+            "a turn in flight keeps the process"
+        );
+        // …and with the turn closed it goes.
+        *gw2.lock()
+            .await
+            .sessions
+            .get(&sid2)
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+        assert_eq!(Gateway::idle_release_tick(&gw2).await, vec![sid2.clone()]);
+
+        // (c) `0` disables the policy: an ancient session stays resident.
+        let tmp3 = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gw3 = Gateway::new(fake, "alpha", tmp3.path());
+        gw3.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 0,
+            ..Default::default()
+        });
+        let sid3 = spawn_managed(&mut gw3).await;
+        gw3.backdate_residency_for_tests(&sid3, std::time::Duration::from_secs(86_400));
+        let gw3 = Arc::new(tokio::sync::Mutex::new(gw3));
+        assert!(Gateway::idle_release_tick(&gw3).await.is_empty());
+    }
+
+    /// Prompt-cache TTL is a VENDOR fact, so the per-harness override wins over
+    /// the global window.
+    #[tokio::test]
+    async fn idle_release_honours_the_per_harness_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 3600,
+            idle_release_by_vendor: std::collections::BTreeMap::from([("claude".into(), 30)]),
+            ..Default::default()
+        });
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(60));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid],
+            "60s idle beats claude's 30s override even though the global TTL is an hour"
+        );
+    }
+
+    /// Capacity eviction and idle release are the same release: neither may
+    /// drop the chat's focus. This was the bug — an eviction scrubbed
+    /// `current_session`, so the chat's next plain message opened a BRAND NEW
+    /// session while the one the user was mid-conversation with sat on disk.
+    #[tokio::test]
+    async fn capacity_eviction_keeps_the_chat_focus_so_the_next_message_resumes_the_same_sid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 1,
+            idle_release_secs: 0,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "first")
+            .await
+            .unwrap();
+        assert!(gateway.is_session_live("s1"));
+
+        // A second chat's session forces s1 out on capacity.
+        gateway
+            .handle_text("mock", "chat-2", "bob", "second")
+            .await
+            .unwrap();
+        assert!(
+            !gateway.is_session_live("s1"),
+            "s1 was evicted for capacity"
+        );
+        assert_eq!(gateway.session_residency("s1"), Some("released"));
+        assert_eq!(
+            gateway
+                .current_session
+                .read()
+                .unwrap()
+                .get(&ChatKey::new("mock", "chat-1", "alice"))
+                .cloned(),
+            Some("s1".to_string()),
+            "capacity eviction must not drop the chat's focus"
+        );
+
+        // chat-1 speaks again → the SAME sid comes back.
+        let reply = gateway
+            .handle_text("mock", "chat-1", "alice", "again")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha--s1 echo: again"]);
+        assert!(gateway.is_session_live("s1"));
+    }
+
+    /// `session_dispatch` funnels into the same submit core, so dispatching to
+    /// a released sid resumes it rather than failing or minting a twin.
+    #[tokio::test]
+    async fn dispatch_to_a_released_session_resumes_it_in_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.backdate_residency_for_tests(&sid, std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(
+            Gateway::idle_release_tick(&gateway).await,
+            vec![sid.clone()]
+        );
+
+        let mut guard = gateway.lock().await;
+        guard
+            .submit_to_sid(&sid, "pick this back up".into())
+            .await
+            .unwrap();
+        assert_eq!(guard.session_residency(&sid), Some("resident"));
+        assert_eq!(guard.next_session, 1, "no new sid was minted");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// `/status` on a focus that points at a released session must render the
+    /// session — same five-line shape as the live header, with `💤 released` in
+    /// place of the run state — not "无当前会话".
+    #[tokio::test]
+    async fn status_renders_a_released_focus_from_persisted_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let status = gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            vec![format!(
+                "🧭 → alpha/s1\n📍 💤 released · turn 0\n   claude · reviewer\n   📁 {}\n   resume —",
+                alpha.display()
+            )]
+        );
+    }
+
+    /// An explicit stop works on a RELEASED sid — the user's decision has to
+    /// stick, or the very next message would resume the session they just
+    /// ended. Idempotent; only a sid that does not exist at all is an error.
+    #[tokio::test]
+    async fn stop_on_a_released_session_is_durable_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        *gateway
+            .sessions
+            .get("s1")
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let mut guard = gateway.lock().await;
+        let mut events = guard.subscribe_events();
+        guard.stop_session("s1").await.unwrap();
+        assert_eq!(guard.session_residency("s1"), Some("stopped"));
+        assert!(
+            read_session_meta(&alpha, "s1")
+                .unwrap()
+                .stopped_at
+                .is_some(),
+            "the stop is recorded in meta.json, not just in memory"
+        );
+        assert!(
+            guard.current_session.read().unwrap().is_empty(),
+            "an EXPLICIT stop drops the chat focus (unlike a release)"
+        );
+        assert!(guard.released_session_views(None).is_empty());
+        let event = events.recv().await.unwrap();
+        assert!(matches!(
+            event.kind,
+            GatewayEventKind::SessionLifecycle { ref state, .. } if state == "stopped"
+        ));
+
+        // Idempotent; unknown sid still errors so the API can 404.
+        guard.stop_session("s1").await.unwrap();
+        assert!(guard.stop_session("s404").await.is_err());
+
+        // A stopped session does not come back on its own: the next message
+        // opens a NEW sid rather than resuming the one the user ended.
+        let reply = guard
+            .handle_text("mock", "chat-1", "alice", "new topic")
+            .await
+            .unwrap();
+        assert_eq!(reply, vec!["alpha--s2 echo: new topic"]);
+        assert_eq!(guard.session_residency("s1"), Some("stopped"));
+    }
+
+    /// Resuming a stopped session clears the marker — a session being driven
+    /// again is not stopped. Written once, at the shared rebuild apply point.
+    #[tokio::test]
+    async fn resuming_a_stopped_session_clears_the_stop_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        let sid = spawn_managed(&mut gateway).await;
+        gateway.stop_session(&sid).await.unwrap();
+        assert_eq!(gateway.session_residency(&sid), Some("stopped"));
+
+        gateway
+            .resume_stopped_session(&sid, "user:web-api", None)
+            .await
+            .unwrap();
+        assert_eq!(gateway.session_residency(&sid), Some("resident"));
+        assert!(read_session_meta(tmp.path(), &sid)
+            .unwrap()
+            .stopped_at
+            .is_none());
+    }
+
     // ── external ledger nodes (hand-started clients) ──────────────────────────
 
     /// A roleless managed session in project `alpha` — the foil every external
@@ -15249,13 +16440,28 @@ mod tests {
             vec![managed.clone()],
             "only the managed session is rebuildable"
         );
-        restarted.resume_restored_sessions().await;
-        assert!(restarted.is_session_live(&managed));
+        restarted.reconcile_restored_sessions().await;
+        // Boot spawns nothing at all now, so "did it resurrect the external
+        // node" is asked of the LISTINGS: the managed session is there as a
+        // released row, the external one is not — it is neither resident nor
+        // resumable, and `released_session_views` filters on the same
+        // `is_resumable` predicate the reconcile pass does.
+        assert!(
+            restarted
+                .released_session_views(None)
+                .iter()
+                .any(|v| v.sid == managed),
+            "the managed session is released, not gone"
+        );
         assert!(
             !restarted.is_external_node(&node),
             "the external index starts empty; the client re-enrolls if it returns"
         );
         assert!(!restarted.session_views().iter().any(|v| v.sid == node));
+        assert!(!restarted
+            .released_session_views(None)
+            .iter()
+            .any(|v| v.sid == node));
         assert!(
             read_session_meta(&project_dir, &node).is_ok(),
             "the ledger row stays on disk as audit"
@@ -15326,7 +16532,7 @@ mod tests {
         let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
         restarted.enable_persistence(tmp.path()).unwrap();
         assert_eq!(restarted.restore_pending, vec![sid.clone()]);
-        restarted.resume_restored_sessions().await;
+        restarted.reconcile_restored_sessions().await;
 
         assert!(!restarted.is_session_live(&sid), "no twin is spawned");
         assert!(restarted.is_session_detached(&sid));
@@ -15429,7 +16635,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut restarted = Gateway::new(fake.clone(), "alpha", &project_dir);
         restarted.enable_persistence(tmp.path()).unwrap();
-        restarted.resume_restored_sessions().await;
+        restarted.reconcile_restored_sessions().await;
         assert!(restarted.is_session_detached(&sid));
         let pid = child.id();
 
@@ -15515,12 +16721,15 @@ mod tests {
         let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
         restarted.set_delegation_notifier_tx(dtx);
         let mut events = restarted.subscribe_events();
-        restarted.resume_restored_sessions().await;
+        restarted.reconcile_restored_sessions().await;
         assert!(
-            restarted.is_session_live(&sid),
-            "rebuilt at once: nothing to wait for"
+            !restarted.is_session_detached(&sid),
+            "the body record was stale: nothing to wait for"
         );
-        assert!(!restarted.is_session_detached(&sid));
+        assert!(
+            !restarted.is_session_live(&sid),
+            "boot spawns nothing — recovering the unobserved turn does not need a live thread"
+        );
         assert_eq!(restarted.post_mortem_pending.len(), 1);
 
         let gateway = Arc::new(tokio::sync::Mutex::new(restarted));
@@ -16165,6 +17374,11 @@ mod tests {
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
+        /// What `running_tasks` reports. A test seeds a turn-OUTLIVING task
+        /// (background shell / workflow / async agent) to prove the idle
+        /// sweeper never lets go of a session whose vendor is still carrying
+        /// work.
+        running_tasks: Arc<Mutex<Vec<RunningTask>>>,
     }
 
     impl Default for FakeAdapter {
@@ -16224,6 +17438,7 @@ mod tests {
                 title_surface: false,
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
+                running_tasks: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -16298,6 +17513,22 @@ mod tests {
 
         fn with_start_delay(mut self, start_delay: std::time::Duration) -> Self {
             self.start_delay = start_delay;
+            self
+        }
+
+        /// Report one turn-OUTLIVING background task from `running_tasks`.
+        fn with_background_task(self) -> Self {
+            self.running_tasks
+                .try_lock()
+                .expect("uncontended at construction")
+                .push(RunningTask {
+                    task_id: "bg-1".into(),
+                    kind: "general-purpose".into(),
+                    description: "long shell".into(),
+                    task_type: "local_bash".into(),
+                    started: Instant::now(),
+                    backgrounded: true,
+                });
             self
         }
 
@@ -16547,6 +17778,10 @@ mod tests {
         async fn close_thread(&self, _h: &ThreadHandle) -> Result<(), HarnessError> {
             self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
+            self.running_tasks.lock().await.clone()
         }
 
         async fn handle_directive(
@@ -16960,11 +18195,19 @@ mod tests {
         // Submit to an unknown sid is an error (→ 404 at the API edge).
         assert!(gateway.submit_to_sid("s99", "x".into()).await.is_err());
 
-        // Stop by sid → session gone, view list empty; idempotent-not (a
-        // second stop is an error so the API can 404).
+        // Stop by sid → session gone from the live map, view list empty, and
+        // the decision is durable (`meta.stopped_at`) so no resume path brings
+        // it back. Idempotent: a second stop is `Ok` (the session IS stopped —
+        // 404 is reserved for a sid that does not exist at all).
         gateway.stop_session("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
-        assert!(gateway.stop_session("s1").await.is_err());
+        assert_eq!(gateway.session_residency("s1"), Some("stopped"));
+        assert!(
+            gateway.released_session_views(None).is_empty(),
+            "a stopped session is never listed as released"
+        );
+        gateway.stop_session("s1").await.unwrap();
+        assert!(gateway.stop_session("s99").await.is_err());
     }
 
     /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors
@@ -19762,14 +21005,18 @@ mod tests {
         );
     }
 
-    /// Startup restore can be slow (e.g. stream-json waits for `system:init`).
-    /// The web API shares the same Gateway mutex, so restore work must not hold
-    /// that lock while awaiting the adapter; otherwise `POST /sessions` blocks
-    /// behind every stale restored session. v0.8.21 Wave-2 — restore now
-    /// COLD-STARTS (`start_thread`, not `resume_thread`); the `_shared` path
-    /// builds the plan under the lock, then spawns OUTSIDE it.
+    /// Resuming a released session can be slow (e.g. stream-json waits for
+    /// `system:init`). The web API shares the same Gateway mutex, so the resume
+    /// must not hold that lock while awaiting the adapter; otherwise every
+    /// other request blocks behind one cold start. The `_shared` path builds
+    /// the rebuild plan under the lock, then spawns OUTSIDE it.
+    ///
+    /// (This used to exercise the BOOT restore, which cold-started every
+    /// previously-live sid. Boot spawns nothing now — see
+    /// `reconcile_restored_sessions` — so the same lock discipline is asserted
+    /// where the cold start actually happens: the on-demand resume.)
     #[tokio::test]
-    async fn restored_session_resume_does_not_hold_gateway_lock_while_adapter_waits() {
+    async fn released_session_resume_does_not_hold_gateway_lock_while_adapter_waits() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().join("alpha");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -19801,9 +21048,29 @@ mod tests {
         restored.enable_persistence(tmp.path()).unwrap();
         let gateway = Arc::new(tokio::sync::Mutex::new(restored));
 
-        let resume_task = tokio::spawn(Gateway::resume_restored_sessions_shared(Arc::clone(
-            &gateway,
-        )));
+        // The boot pass itself is now pure bookkeeping: no spawn, no lock held
+        // across an adapter await.
+        Gateway::reconcile_restored_sessions_shared(Arc::clone(&gateway)).await;
+        assert_eq!(
+            slow.starts.load(Ordering::SeqCst),
+            0,
+            "boot must not cold-start anything"
+        );
+
+        let resume_task = tokio::spawn({
+            let gateway = Arc::clone(&gateway);
+            async move {
+                Gateway::resume_stopped_session_shared(
+                    gateway,
+                    "s1",
+                    "user:web-api",
+                    None,
+                    GatewayDeadline::start(),
+                )
+                .await
+                .unwrap()
+            }
+        });
         // Wait until the cold-start spawn is in flight.
         for _ in 0..50 {
             if slow.starts.load(Ordering::SeqCst) > 0 {
@@ -19819,15 +21086,15 @@ mod tests {
         {
             let guard = tokio::time::timeout(std::time::Duration::from_millis(50), gateway.lock())
                 .await
-                .expect("gateway lock must stay available while restored spawn awaits adapter");
+                .expect("gateway lock must stay available while a resume awaits the adapter");
             assert!(
                 guard.session_views().is_empty(),
                 "rebuilt session is applied only after the spawn completes"
             );
         }
 
-        resume_task.await.unwrap();
-        // After restore completes, the session is live.
+        assert_eq!(resume_task.await.unwrap(), "s1");
+        // After the resume completes, the session is resident again.
         assert_eq!(gateway.lock().await.session_views().len(), 1);
     }
 
@@ -20761,9 +22028,10 @@ mod tests {
     }
 
     /// v0.8.7 W2 (DB.1) — a hitl session's mode survives a daemon restart:
-    /// persist → reload → cold-start rebuild → the restored session reports
-    /// hitl. v0.8.21 Wave-2 — the posture round-trips through `meta.json`
-    /// (`permission_mode`), and the live map is rebuilt by the async restore.
+    /// persist → reload → the released row still reports hitl → the first
+    /// message RE-APPLIES it on resume. The posture round-trips through
+    /// `meta.json` (`permission_mode`), which is exactly why boot no longer
+    /// has to re-spawn anything to keep it.
     #[tokio::test]
     async fn hitl_mode_persists_across_reload() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -20785,18 +22053,28 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Fresh gateway loading the same persisted root. Wave-2: load_state
-        // restores routing (sync); the live map is cold-start rebuilt from
-        // meta.json by the async restore step (mirrors daemon startup).
+        // Fresh gateway loading the same persisted root (mirrors daemon
+        // startup): load_state restores routing, the reconcile pass spawns
+        // nothing, so the session comes back RELEASED.
         let fake2 = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gw2 = Gateway::new(fake2.clone(), "alpha", project_dir);
         gw2.enable_persistence(tmp.path()).unwrap();
-        gw2.resume_restored_sessions().await;
+        gw2.reconcile_restored_sessions().await;
+        assert!(gw2.session_views().is_empty(), "boot holds no processes");
+        let released = gw2.released_session_views(None);
+        assert_eq!(released.len(), 1, "the session is listed from disk");
+        assert_eq!(
+            released[0].permission_mode, "hitl",
+            "the hitl posture must survive the persist/reload round-trip (via meta.json)"
+        );
+        // …and the resume re-applies it to the real vendor thread.
+        gw2.submit_to_sid("s1", "back".into()).await.unwrap();
         let views = gw2.session_views();
-        assert_eq!(views.len(), 1, "the session restored from disk");
+        assert_eq!(views.len(), 1, "the first message resumed the same sid");
+        assert_eq!(views[0].sid, "s1");
         assert_eq!(
             views[0].permission_mode, "hitl",
-            "the hitl posture must survive the persist/reload round-trip (via meta.json)"
+            "the resumed live session carries the persisted posture"
         );
     }
 
@@ -22396,6 +23674,7 @@ mod tests {
         let meta = SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -22472,6 +23751,7 @@ mod tests {
         let meta = SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "alpha".into(),
             vendor: AgentVendor::Claude,
@@ -23633,70 +24913,51 @@ mod tests {
         let mut restored = Gateway::new(fake.clone(), "alpha", alpha);
         restored.register_project("beta", beta);
         restored.enable_persistence(tmp.path()).unwrap();
-        // Wave-2 — load_state restores routing (sync); the live map is cold-start
-        // rebuilt from each live sid's meta.json by the async restore step.
-        restored.resume_restored_sessions().await;
-
-        // v0.8.21 Wave-2 — the cto-gate secret is NOT persisted; a cold-start
-        // rebuild MINTS a fresh one (the prior child died with the prior process,
-        // so its secret is gone). The re-spawned child's env gets this new value,
-        // so pane-env + the gate map stay in lockstep at a fresh 32-char secret
-        // that differs from the pre-restart one.
-        let restored_s1 = restored.sessions.get("s1").unwrap().secret.clone();
-        let restored_s2 = restored.sessions.get("s2").unwrap().secret.clone();
-        assert_eq!(restored_s1.len(), 32);
-        assert_eq!(restored_s2.len(), 32);
-        assert_ne!(
-            restored_s1, original_secret_s1,
-            "secret is re-minted on cold-start rebuild, not persisted"
+        // `load_state` restores routing (sync); the boot pass only RECONCILES —
+        // it spawns nothing, because spawning never touches the model and so
+        // buys no warm cache, only N resident vendor processes.
+        restored.reconcile_restored_sessions().await;
+        assert!(
+            !restored.is_session_live("s1") && !restored.is_session_live("s2"),
+            "a restart must not re-spawn a vendor process for every sid"
         );
-        assert_ne!(
-            restored_s2, original_secret_s2,
-            "secret is re-minted on cold-start rebuild, not persisted"
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            2,
+            "boot spawns nothing: only the 2 original creates"
         );
 
-        // v0.9.0 W5 (real-machine smoke fix) — the curated Claude stream-json
-        // mcp.json MUST be re-written on cold-start rebuild with the FRESH
-        // secret, else the resumed session keeps a stale bearer and loses every
-        // ccteam MCP tool (can no longer delegate). Assert each session's
-        // mcp.json now carries the RESTORED secret and NOT the original one.
-        for (sid, restored_secret, original_secret) in [
-            ("s1", &restored_s1, &original_secret_s1),
-            ("s2", &restored_s2, &original_secret_s2),
-        ] {
-            let mcp = tmp
-                .path()
-                .join("beta")
-                .join(".ccteam")
-                .join("chat")
-                .join(sid)
-                .join("mcp.json");
-            let body = std::fs::read_to_string(&mcp)
-                .unwrap_or_else(|e| panic!("read {} after rebuild: {e}", mcp.display()));
-            assert!(
-                body.contains(restored_secret.as_str()),
-                "{sid} mcp.json must be rewritten with the fresh secret after resume"
-            );
-            assert!(
-                !body.contains(original_secret.as_str()),
-                "{sid} mcp.json must NOT keep the stale pre-restart secret"
-            );
-        }
+        // The chat's FOCUS survives, pointing at a RELEASED session — that is
+        // what makes the next plain message land on the SAME sid instead of
+        // minting a new one.
+        assert_eq!(
+            restored
+                .current_session
+                .read()
+                .unwrap()
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("s2")
+        );
 
         // v0.8.22 P0-3 — ordered by last_active desc: s2 (spawned after s1,
-        // pre-restart) sorts first.
+        // pre-restart) sorts first. Both are listed, marked 💤 released.
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns2 claude\ns1 claude"]);
+        assert_eq!(
+            sessions,
+            vec!["📁 当前项目: beta\ns2 claude 💤\ns1 claude 💤"]
+        );
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["resumed session s1\n↓ 查看状态 → /status"]
         );
         let reply_s1 = restored
             .handle_text("mock", "chat-1", "alice", "after restart")
@@ -23709,24 +24970,69 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/use s2")
                 .await
                 .unwrap(),
-            vec!["using session s2\n↓ 查看状态 → /status"]
+            vec!["resumed session s2\n↓ 查看状态 → /status"]
         );
         let reply_s2 = restored
             .handle_text("mock", "chat-1", "alice", "after restart two")
             .await
             .unwrap();
         assert_eq!(reply_s2, vec!["beta-reviewer-s2 echo: after restart two"]);
-        // 2 original creates + 2 cold-start rebuilds on restart (Wave-2 re-spawns
-        // each live session; both were live, so both restart via start_thread).
-        // /use s1 + /use s2 then hit the already-rebuilt sessions (no new spawn).
+        // 2 original creates + 2 on-demand resumes (one per `/use`) — the
+        // vendor process is paid for when someone actually drives the session.
         assert_eq!(fake.starts.load(Ordering::SeqCst), 4);
+
+        // v0.8.21 Wave-2 — the cto-gate secret is NOT persisted; a cold resume
+        // MINTS a fresh one (the prior child died with the prior process, so
+        // its secret is gone). The re-spawned child's env gets this new value,
+        // so pane-env + the gate map stay in lockstep at a fresh 32-char secret
+        // that differs from the pre-restart one.
+        let restored_s1 = restored.sessions.get("s1").unwrap().secret.clone();
+        let restored_s2 = restored.sessions.get("s2").unwrap().secret.clone();
+        assert_eq!(restored_s1.len(), 32);
+        assert_eq!(restored_s2.len(), 32);
+        assert_ne!(
+            restored_s1, original_secret_s1,
+            "secret is re-minted on cold resume, not persisted"
+        );
+        assert_ne!(
+            restored_s2, original_secret_s2,
+            "secret is re-minted on cold resume, not persisted"
+        );
+
+        // v0.9.0 W5 (real-machine smoke fix) — the curated Claude stream-json
+        // mcp.json MUST be re-written on cold resume with the FRESH secret,
+        // else the resumed session keeps a stale bearer and loses every ccteam
+        // MCP tool (can no longer delegate). Assert each session's mcp.json now
+        // carries the RESUMED secret and NOT the original one.
+        for (sid, restored_secret, original_secret) in [
+            ("s1", &restored_s1, &original_secret_s1),
+            ("s2", &restored_s2, &original_secret_s2),
+        ] {
+            let mcp = tmp
+                .path()
+                .join("beta")
+                .join(".ccteam")
+                .join("chat")
+                .join(sid)
+                .join("mcp.json");
+            let body = std::fs::read_to_string(&mcp)
+                .unwrap_or_else(|e| panic!("read {} after resume: {e}", mcp.display()));
+            assert!(
+                body.contains(restored_secret.as_str()),
+                "{sid} mcp.json must be rewritten with the fresh secret after resume"
+            );
+            assert!(
+                !body.contains(original_secret.as_str()),
+                "{sid} mcp.json must NOT keep the stale pre-restart secret"
+            );
+        }
     }
 
     /// Guards the fix for the incident where a breaking routing-schema jump
     /// (or any other loss of `routing.json`) made a live chat session read as
     /// "vanished": with no routing.json to load, `load_state` must fall back
-    /// to each project's `meta.json` to rebuild the live-set, so the session
-    /// is findable again via `/sessions` + `/use` instead of gone for good.
+    /// to each project's `meta.json`, so the session is findable again via
+    /// `/sessions` + `/use` instead of gone for good.
     #[tokio::test]
     async fn gateway_recovers_live_sessions_from_meta_when_routing_json_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -23751,23 +25057,24 @@ mod tests {
 
         let mut restored = Gateway::new(fake.clone(), "beta", beta);
         restored.enable_persistence(tmp.path()).unwrap();
-        restored.resume_restored_sessions().await;
+        restored.reconcile_restored_sessions().await;
 
-        // s1 is live again and listed — not silently gone — even though
-        // routing.json never said so. The chat's FOCUS wasn't (and can't
-        // losslessly be) restored, so `/use` is still needed once.
+        // s1 is listed — not silently gone — even though routing.json never
+        // said so. It is RELEASED (a restart holds no process for it), and the
+        // chat's FOCUS wasn't (and can't losslessly be) restored, so `/use` is
+        // still needed once; that resumes the SAME sid.
         let sessions = restored
             .handle_text("mock", "chat-1", "alice", "/sessions")
             .await
             .unwrap();
-        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude"]);
+        assert_eq!(sessions, vec!["📁 当前项目: beta\ns1 claude 💤"]);
 
         assert_eq!(
             restored
                 .handle_text("mock", "chat-1", "alice", "/use s1")
                 .await
                 .unwrap(),
-            vec!["using session s1\n↓ 查看状态 → /status"]
+            vec!["resumed session s1\n↓ 查看状态 → /status"]
         );
         let reply = restored
             .handle_text("mock", "chat-1", "alice", "after routing.json loss")
@@ -23782,11 +25089,12 @@ mod tests {
     /// v0.8.8 F1 (acceptance b) — sids are stable AND never reused across a
     /// daemon restart, even after a session is stopped. Concretely: spawn two
     /// SAME-role sessions (s1 + s2), stop s1, then rebuild the Gateway from the
-    /// persisted state. The reload must (1) restore s2 (proving the load_state
-    /// seen-panes collapse is gone — both same-role records survive) and (2)
-    /// resume the monotonic counter so the NEXT create is s3, never recycling
-    /// the freed s1. (next_session is persisted, so non-reuse holds by
-    /// construction.)
+    /// persisted state. The reload must (1) bring s2 back as RELEASED and
+    /// resumable while s1 stays STOPPED (proving the load_state seen-panes
+    /// collapse is gone — both same-role records survive independently) and
+    /// (2) resume the monotonic counter so the NEXT create is s3, never
+    /// recycling the freed s1. (next_session is persisted, so non-reuse holds
+    /// by construction.)
     #[tokio::test]
     async fn sid_stable_and_not_reused_across_restart() {
         let tmp = tempfile::tempdir().unwrap();
@@ -23828,16 +25136,24 @@ mod tests {
         // Rebuild from the same on-disk state (routing.json + next-sid + meta).
         let mut restored = Gateway::new(fake.clone(), "alpha", project_dir);
         restored.enable_persistence(tmp.path()).unwrap();
-        // Wave-2 — cold-start rebuild the live set (only s2; s1 was stopped, so
-        // it left live_sids and is not rebuilt — its meta.json lingers as history).
-        restored.resume_restored_sessions().await;
-        assert!(
-            restored.session_resolve("s2").is_some(),
-            "the surviving same-role session must restore after restart"
+        restored.reconcile_restored_sessions().await;
+        assert_eq!(
+            restored.session_residency("s2"),
+            Some("released"),
+            "the surviving same-role session comes back resumable after restart"
+        );
+        assert_eq!(
+            restored.session_residency("s1"),
+            Some("stopped"),
+            "the stopped session must not resurrect (history only)"
         );
         assert!(
-            restored.session_resolve("s1").is_none(),
-            "the stopped session must not resurrect (left live_sids; history only)"
+            restored
+                .released_session_views(None)
+                .iter()
+                .map(|v| v.sid.clone())
+                .eq(["s2".to_string()]),
+            "only s2 is listed as released"
         );
         // The NEXT create resumes the counter → s3, NEVER recycling s1.
         let s3 = restored
@@ -23891,7 +25207,7 @@ mod tests {
         let mut restored = Gateway::new(fake.clone(), "alpha", project_dir);
         restored.enable_persistence(tmp.path()).unwrap();
         // Nothing to rebuild (routing + meta gone) — but the counter survives.
-        restored.resume_restored_sessions().await;
+        restored.reconcile_restored_sessions().await;
         let next = restored
             .create_session_api(
                 "alpha".into(),

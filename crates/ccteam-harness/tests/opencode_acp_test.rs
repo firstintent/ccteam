@@ -265,6 +265,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let meta = SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Opencode,
@@ -359,6 +360,7 @@ async fn resume_carries_mcp_servers() {
     let meta = SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Opencode,

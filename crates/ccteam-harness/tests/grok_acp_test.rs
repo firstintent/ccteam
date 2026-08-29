@@ -460,6 +460,7 @@ async fn load_resume_filters_is_replay() {
     let meta = SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Grok,
@@ -752,6 +753,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     let meta = SessionMeta {
         mode: None,
         managed_by: Default::default(),
+        stopped_at: None,
         sid: sid_load.into(),
         slug: "demo".into(),
         vendor: AgentVendor::Grok,

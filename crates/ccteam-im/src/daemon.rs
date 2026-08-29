@@ -516,12 +516,12 @@ where
     let restore_gateway = Arc::clone(&gateway);
     let (restore_complete_tx, restore_complete_rx) = tokio::sync::watch::channel(false);
     let scheduled_scheduler = tokio::spawn(async move {
-        // Catch up due rows BEFORE the general live-set restore. A due target
-        // cold-resumes itself; the restore then observes it live and skips a
-        // duplicate spawn. This keeps restart delivery from waiting behind a
-        // long batch of unrelated vendor resumes.
+        // Catch up due rows BEFORE the boot reconcile. A due target
+        // cold-resumes itself; the reconcile then observes it resident and
+        // leaves it alone. This keeps restart delivery from waiting behind a
+        // long batch of unrelated bookkeeping.
         Gateway::catch_up_scheduled(Arc::clone(&restore_gateway)).await;
-        Gateway::resume_restored_sessions_shared(Arc::clone(&restore_gateway)).await;
+        Gateway::reconcile_restored_sessions_shared(Arc::clone(&restore_gateway)).await;
         let _ = restore_complete_tx.send(true);
         Gateway::run_scheduled_scheduler(restore_gateway).await;
     });
@@ -533,6 +533,16 @@ where
     let body_watch_gateway = Arc::clone(&gateway);
     let body_watcher = tokio::spawn(async move {
         Gateway::run_body_watcher(body_watch_gateway).await;
+    });
+    // The idle-release sweeper: the PRIMARY residency policy. A resident
+    // session nobody has spoken to for its harness's `sessions.idle_release_secs`
+    // window gives up its vendor process — the session itself is untouched and
+    // resumes by sid on the next message. Not a content decision loop: it
+    // produces no work and calls no model, it only stops holding an OS process
+    // past the point where holding it can still save a prompt-cache read.
+    let idle_release_gateway = Arc::clone(&gateway);
+    tokio::spawn(async move {
+        Gateway::run_idle_release_sweeper(idle_release_gateway).await;
     });
     // v0.9.0 W2 (F2/F7) — the delegation notifier: startup reconcile (deliver
     // notifications missed while the daemon was down) + live delivery of every

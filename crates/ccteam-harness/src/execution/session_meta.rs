@@ -260,6 +260,32 @@ pub struct SessionMeta {
     /// metas parse as [`ManagedBy::Ccteam`], which is what they all are.
     #[serde(default)]
     pub managed_by: ManagedBy,
+    /// RFC3339 timestamp of the user's EXPLICIT stop (`/stop`, `POST
+    /// /sessions/{sid}/stop`, `session_stop`), or `None` for a session that is
+    /// merely not resident right now.
+    ///
+    /// This is the one fact that separates the two ways a session can be
+    /// absent from the live map. Without it they are indistinguishable, so
+    /// every surface had to guess — and guessed the same wrong answer twice:
+    /// a boot restore resurrected sessions the user had stopped, and a
+    /// listing had no way to say "this one is done" instead of "this one is
+    /// asleep". Set at stop; CLEARED by every resume/rebuild path (a session
+    /// the user drives again is no longer stopped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_at: Option<String>,
+}
+
+impl SessionMeta {
+    /// True when ccteam can bring this session back by sid on the next
+    /// message: a managed session the user has not explicitly stopped.
+    ///
+    /// The single predicate behind "released" everywhere — the boot
+    /// reconcile, the route scrub, the `/sessions` + `session_list` listings
+    /// and the `/status` fleet count all ask it here so they cannot drift
+    /// into three different ideas of which sessions still exist.
+    pub fn is_resumable(&self) -> bool {
+        self.managed_by.is_driveable() && self.stopped_at.is_none()
+    }
 }
 
 // ── path helpers ──────────────────────────────────────────────────────────────
@@ -506,6 +532,7 @@ mod title_tests {
         SessionMeta {
             mode: None,
             managed_by: Default::default(),
+            stopped_at: None,
             sid: "s1".into(),
             slug: "demo".into(),
             vendor: AgentVendor::Claude,
