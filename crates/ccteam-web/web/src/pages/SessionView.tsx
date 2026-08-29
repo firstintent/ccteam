@@ -466,13 +466,18 @@ export default function SessionView({
     }
   }, [rows, showTerminal]);
 
-  // conv-head status dot: busy amber › SESSION state. The base is the rail's
-  // REST `session.status`; this sid's live `session_lifecycle` frames fold on
-  // top, so a capacity eviction greys the dot immediately, without waiting
-  // for the rail's next REST reconcile. The SSE CONNECTION state is a
+  // conv-head status dot: busy amber › SESSION RESIDENCY. The base is the
+  // rail's REST `session.residency`; this sid's live `session_lifecycle`
+  // frames fold on top, so a release greys the dot immediately, without
+  // waiting for the rail's next REST reconcile. The SSE CONNECTION state is a
   // different fact and no longer drives this dot (an open stream on a dead
   // session is what made it "always green").
-  const sessionLive = foldSessionLiveness(session?.status === "live", events);
+  //
+  // It reads `residency`, not `status`: `status` carries the ACTIVITY word
+  // (`working|idle|stale|stuck`) the list endpoint resolves, so the old
+  // `status === "live"` test could never be true and the dot was permanently
+  // grey until a lifecycle frame happened to arrive.
+  const sessionLive = foldSessionLiveness(session?.residency === "resident", events);
   const headDot = busy ? "dot busy" : sessionLive ? "dot on" : "dot off";
   // A broken stream (retries exhausted / no gateway) stays visible as its own
   // red connection dot next to the status dot.

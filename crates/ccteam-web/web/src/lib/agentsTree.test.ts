@@ -13,7 +13,8 @@ function node(sid: string, parent: string | null): AgentNode {
     role: "",
     vendor: "claude",
     host: "local",
-    status: "live",
+    status: "idle",
+    residency: "resident",
     parent_sid: parent,
     depth: 0,
     last_active: "2026-07-13T00:00:00Z",
@@ -28,7 +29,7 @@ describe("groupDelegationTrees", () => {
     const newRoot = node("s2", null);
     newRoot.last_active = "2026-07-13T01:00:00Z";
     const child = node("s3", "s2");
-    const otherProject = { ...node("s4", null), slug: "alpha", status: "idle" };
+    const otherProject = { ...node("s4", null), slug: "alpha", residency: "released" };
 
     const groups = groupDelegationTrees([oldRoot, child, otherProject, newRoot]);
     expect(groups.map((group) => group.slug)).toEqual(["alpha", "demo"]);
@@ -36,6 +37,17 @@ describe("groupDelegationTrees", () => {
     expect(groups[1]!.rows.map((row) => row.node.sid)).toEqual(["s2", "s3", "s1"]);
     expect(groups[1]!.rows.map((row) => row.indent)).toEqual([0, 1, 0]);
     expect(groups[1]!.rows[0]!.hasChildren).toBe(true);
+  });
+
+  it("counts RESIDENCY, not the activity word — an idle resident session is still held", () => {
+    const groups = groupDelegationTrees([
+      { ...node("s1", null), status: "idle" }, // resident, between turns
+      { ...node("s2", null), status: "working", residency: "released" }, // stale file verdict, no process
+      { ...node("s3", null), residency: "stopped" },
+    ]);
+    // Only the resident one is being held open — the header count is about
+    // processes, not about what any of them happens to be doing.
+    expect(groups[0]).toMatchObject({ liveCount: 1, totalCount: 3 });
   });
 
   it("hides a collapsed node's full subtree but keeps later roots", () => {

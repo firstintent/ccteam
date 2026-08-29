@@ -17,8 +17,14 @@ export interface AgentNode {
    *  vendors with no effort axis. */
   effort?: string | null;
   host: string;
-  /** `"live"` (gateway-tracked) or `"idle"` (persisted, not tracked). */
+  /** What the session is DOING: `working` | `idle` | `stale` | `stuck`, or
+   *  `detached` for a body that outlived the daemon. */
   status: string;
+  /** Whether ccteam is HOLDING an execution attachment: `resident` |
+   *  `released` (real + resumable, no process) | `stopped` | `detached` |
+   *  `external`. Orthogonal to `status` — a resident session is usually idle,
+   *  and a released one is not "gone". */
+  residency: string;
   parent_sid?: string | null;
   depth: number;
   cost_usd?: number | null;

@@ -36,7 +36,10 @@ const SESSION: SessionSummary = {
   vendor: "claude",
   permission_mode: "skip",
   current: true,
-  status: "live",
+  // Two axes: the rail's `status` carries the ACTIVITY word, `residency`
+  // says whether ccteam is holding a process — the dot reads the latter.
+  status: "idle",
+  residency: "resident",
 };
 
 function render(
@@ -639,9 +642,12 @@ describe("SessionView header status dot (WEB-STATUS-1)", () => {
   it("reads SESSION state (REST base + lifecycle frames), never the SSE connection", async () => {
     const box = { stream: healthyStream() };
     try {
-      const render = await mountDotView(box, SESSION); // SESSION.status = "live"
+      const render = await mountDotView(box, SESSION); // SESSION is resident
       let tree = render();
-      // Live session + healthy stream → green.
+      // Resident session + healthy stream → green. NOTE the base is
+      // `residency`, not the activity word: an idle-but-resident session is
+      // green, which is exactly what `status === "live"` could never say once
+      // the list endpoint started reporting real activity.
       expect(dotClass(tree)).toBe("dot on");
 
       // A capacity-eviction lifecycle frame greys the dot IMMEDIATELY — same
@@ -672,10 +678,10 @@ describe("SessionView header status dot (WEB-STATUS-1)", () => {
     }
   });
 
-  it("seeds grey from a stopped session's REST status, with no frame at all", async () => {
+  it("seeds grey from a non-resident session's REST row, with no frame at all", async () => {
     const box = { stream: healthyStream() };
     try {
-      const render = await mountDotView(box, { ...SESSION, status: "off" });
+      const render = await mountDotView(box, { ...SESSION, residency: "released" });
       expect(dotClass(render())).toBe("dot off");
     } finally {
       unmockDotView();
@@ -689,7 +695,7 @@ describe("SessionView header status dot (WEB-STATUS-1)", () => {
     try {
       const render = await mountDotView(box, SESSION);
       const tree = render();
-      expect(dotClass(tree)).toBe("dot on"); // session is still live
+      expect(dotClass(tree)).toBe("dot on"); // session is still resident
       const connDot = findByTestId(tree, "conn-dot");
       expect(connDot?.props.className).toBe("dot err");
       expect(connDot?.props.title).toBe("连接已断开");

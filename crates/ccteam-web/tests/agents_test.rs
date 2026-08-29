@@ -375,7 +375,10 @@ async fn agents_graph_shape_and_tenant_acl_filter() {
     assert_eq!(nodes[0]["sid"], Value::String(child_sid.clone()));
     assert_eq!(nodes[0]["slug"], Value::String("demo".to_string()));
     assert_eq!(nodes[0]["parent_sid"], Value::String("s0".to_string()));
-    assert_eq!(nodes[0]["status"], Value::String("live".to_string()));
+    // Two axes: ccteam is HOLDING this session (residency), and it is not
+    // mid-turn (activity). "Held open" was never the same claim as "working".
+    assert_eq!(nodes[0]["residency"], Value::String("resident".to_string()));
+    assert_eq!(nodes[0]["status"], Value::String("idle".to_string()));
     let edges = body["edges"].as_array().unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0]["parent"], Value::String("s0".to_string()));
@@ -453,11 +456,11 @@ async fn agents_graph_joins_live_session_model_and_falls_back_durably_for_idle()
             .unwrap_or_else(|| panic!("expected node {sid} in {body}"))
     };
     let live = node(&child_sid);
-    assert_eq!(live["status"], Value::String("live".to_string()));
+    assert_eq!(live["residency"], Value::String("resident".to_string()));
     assert_eq!(
         live["model"],
         Value::String("agents-test-model".to_string()),
-        "live node carries the statusline model: {body}"
+        "resident node carries the statusline model: {body}"
     );
     assert_eq!(
         live["effort"],
@@ -536,8 +539,8 @@ async fn agents_graph_survives_a_stalled_adapter() {
         .iter()
         .find(|n| n["sid"] == child_sid.as_str())
         .unwrap_or_else(|| panic!("expected node {child_sid} in {body}"));
-    // Still reported, still honestly LIVE — only its statusline is missing.
-    assert_eq!(node["status"], Value::String("live".to_string()));
+    // Still reported, still honestly RESIDENT — only its statusline is missing.
+    assert_eq!(node["residency"], Value::String("resident".to_string()));
     assert!(
         node["model"].is_null(),
         "a session that missed the deadline reports no model: {body}"

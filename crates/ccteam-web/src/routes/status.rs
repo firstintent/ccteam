@@ -14,14 +14,14 @@
 //!
 //! - `daemon_healthy`: [`ccteam_core::check_daemon_health`]`.is_healthy()`
 //!   (the same MCP-socket probe `ccteam status` prints).
-//! - `sessions_live` / `sessions_idle`: the gateway session map. We prefer the
-//!   **live** map ([`Gateway::session_views`]) when [`AppState::gateway`] is
-//!   attached (the daemon process), else fall back to the on-disk
-//!   [`tracked_chat_sessions`] snapshot (mirrors how `run_status` reads
-//!   sessions out-of-process). Split (matching `run_status`): a tracked session
-//!   counts **live** when the daemon is healthy, **idle** otherwise — the
-//!   gateway carries no finer per-session live/idle bit (`SessionView::status`
-//!   is `"live"` for any tracked session), so daemon health is the split.
+//! - `sessions_live` / `sessions_idle`: the RESIDENCY split. `sessions_live` =
+//!   sessions ccteam holds a vendor process for ([`Gateway::session_views`]);
+//!   `sessions_idle` = sessions that exist and resume on their next message but
+//!   hold no process (the on-disk metas that are `is_resumable()` and not
+//!   resident, counted outside the gateway lock). With no gateway attached
+//!   (standalone web) or the daemon down, nothing can be resident: the on-disk
+//!   [`tracked_chat_sessions`] count lands in `sessions_idle` instead (mirrors
+//!   how `run_status` reads sessions out-of-process).
 //! - `cost_24h_usd` + `cost_24h_by_vendor`: sum the shared incremental
 //!   progress projection across every registered project.
 //! - `budget_cap_24h`: the aggregate 24h cap. Budgets are declared per project
@@ -150,9 +150,12 @@ pub struct StatusResponse {
     /// Whether the daemon MCP socket is reachable (`ccteam status`'s daemon
     /// line). `false` from a standalone web process or when the daemon is down.
     pub daemon_healthy: bool,
-    /// Tracked sessions counted **live** (daemon healthy).
+    /// Sessions ccteam is holding a vendor process for right now (RESIDENT).
+    /// `0` when the daemon is down — nothing is held.
     pub sessions_live: u32,
-    /// Tracked sessions counted **idle** (daemon down → none are live).
+    /// Sessions that exist and resume on their next message but hold no
+    /// process (RELEASED). With the daemon down this carries the last known
+    /// tracked count instead, since nothing can be resident.
     pub sessions_idle: u32,
     /// Sum of every project's rolling-24h cost (USD).
     pub cost_24h_usd: f64,
@@ -311,12 +314,13 @@ pub(crate) async fn handle_status(
 fn aggregate_status(app: &AppState) -> StatusResponse {
     let daemon_healthy = ccteam_core::check_daemon_health(&app.paths).is_healthy();
 
-    // ── sessions: prefer the live gateway map; else the on-disk snapshot. ──
-    // Either way we only need the COUNT of tracked sessions; the live/idle
-    // split is daemon health (the gateway has no finer per-session bit).
+    // ── sessions: RESIDENT (a process ccteam is holding) vs RELEASED (real,
+    // resumable, no process). The split used to be daemon health, because the
+    // gateway carried no finer per-session bit; it does now, and the honest
+    // numbers are what tell an operator whether the fleet is costing memory.
     let mut active_watches = 0;
     let mut views = Vec::new();
-    let tracked_count: u32 = if let Some(gw) = app.gateway.as_ref() {
+    let resident_count: u32 = if let Some(gw) = app.gateway.as_ref() {
         let guard = ccteam_im::latency::gateway_blocking_lock(gw, "web.status.snapshot");
         views = guard.session_views();
         active_watches = guard.armed_delegation_watch_count();
@@ -328,11 +332,6 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
         ccteam_im::gateway::tracked_chat_sessions(&app.paths.root)
             .map(|rows| rows.len() as u32)
             .unwrap_or(0)
-    };
-    let (sessions_live, sessions_idle) = if daemon_healthy {
-        (tracked_count, 0)
-    } else {
-        (0, tracked_count)
     };
 
     // ── cost: sum each project's 24h cost + merge the per-vendor breakdown. ──
@@ -351,6 +350,29 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
             .or_insert_with(|| app.progress_projection.project_snapshot(&view.project));
     }
     let session_rows = build_session_cost_rows(&projections, &views);
+    // Released = every on-disk session that is resumable and not resident. The
+    // scan runs OUTSIDE the gateway lock (metadata reads per project), through
+    // the same `is_resumable` predicate the gateway's own listings use.
+    let tracked: std::collections::HashSet<&str> =
+        views.iter().map(|view| view.sid.as_str()).collect();
+    let released_count = if daemon_healthy {
+        projects
+            .iter()
+            .map(|project| {
+                ccteam_harness::list_session_metas(&app.paths.project_dir(&project.state.slug))
+                    .into_iter()
+                    .filter(|meta| meta.is_resumable() && !tracked.contains(meta.sid.as_str()))
+                    .count() as u32
+            })
+            .sum()
+    } else {
+        0
+    };
+    let (sessions_live, sessions_idle) = if daemon_healthy {
+        (resident_count, released_count)
+    } else {
+        (0, resident_count)
+    };
 
     let mut cost_24h_usd = 0.0_f64;
     let mut cost_24h_by_vendor: BTreeMap<String, f64> = BTreeMap::new();

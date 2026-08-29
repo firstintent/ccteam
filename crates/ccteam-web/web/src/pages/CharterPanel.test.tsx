@@ -46,7 +46,8 @@ function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
     role: "brain",
     vendor: "claude",
     host: "local",
-    status: "live",
+    status: "idle",
+    residency: "resident",
     depth: 0,
     last_active: "2026-01-01T00:00:00Z",
     turn_count: 3,
@@ -169,10 +170,10 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
     }),
   ];
   const nodes = [
-    fixtureNode({ sid: "s0", vendor: "claude", status: "live", cost_usd: 0.25 }),
-    fixtureNode({ sid: "s1", vendor: "claude", status: "live", cost_usd: 0.1 }),
-    fixtureNode({ sid: "s2", vendor: "claude", status: "idle", cost_usd: 0.05 }),
-    fixtureNode({ sid: "s3", vendor: "codex", status: "idle", cost_usd: 0.02 }),
+    fixtureNode({ sid: "s0", vendor: "claude", cost_usd: 0.25 }),
+    fixtureNode({ sid: "s1", vendor: "claude", cost_usd: 0.1 }),
+    fixtureNode({ sid: "s2", vendor: "claude", residency: "released", cost_usd: 0.05 }),
+    fixtureNode({ sid: "s3", vendor: "codex", residency: "released", cost_usd: 0.02 }),
     // Another host's claude session must NOT count into local's card.
     fixtureNode({ sid: "s4", vendor: "claude", host: "gpu-1", cost_usd: 9.99 }),
   ];
@@ -502,7 +503,7 @@ describe("VendorRosterCards (grouped by host — health + graph aggregation)", (
     const en = renderToString(
       <VendorRosterCards hosts={hosts} nodes={nodes} lang="en" onVendorPick={() => {}} />,
     );
-    expect(en).toContain("View this vendor&#x27;s sessions in the topology");
+    expect(en).toContain("View this harness&#x27;s sessions in the topology");
   });
 });
 

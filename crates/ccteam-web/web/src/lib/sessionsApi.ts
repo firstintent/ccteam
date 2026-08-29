@@ -29,7 +29,13 @@ export interface SessionView {
   vendor: string;
   permission_mode: string;
   current: boolean;
+  /** What the session is DOING: `working` | `idle` | `stale` | `stuck`, or
+   *  `detached`. NOT a liveness flag — see `residency`. */
   status: string;
+  /** Whether ccteam is HOLDING an execution attachment: `resident` |
+   *  `released` | `stopped` | `detached` | `external`. Optional for
+   *  backward-compat; absent reads as resident. */
+  residency?: string;
   last_activity_seconds?: number | null;
   /** Wire protocol: `"stream-json"` (the薄/default, no pane) | `"terminal"`
    *  (advanced, owns a tmux/rmux pane). Optional for backward-compat — a

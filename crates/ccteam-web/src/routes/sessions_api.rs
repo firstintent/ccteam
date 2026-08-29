@@ -220,20 +220,63 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
     }
 }
 
-/// Replace the gateway's cheap `"live"` hint with the real activity
-/// (`working|idle|stale|stuck`) through the SHARED resolver — the same
-/// `ccteam_core::stall::classify_session_activity` IM `/status` and MCP
-/// `session_list` answer through, so the SPA rail and a phone's `/status` card
-/// can never tell the user different things about one session.
+/// One project's activity resolver, snapshotted once and asked per session —
+/// the SHARED path every web surface answers "what is this session doing"
+/// through (`working|idle|stale|stuck`), so the session rail, the team graph,
+/// MCP `session_list` and a phone's `/status` card can never tell the user
+/// different things about one session.
 ///
-/// `live_turns` is the daemon's in-flight-turn snapshot, taken under the same
-/// lock that produced `views`. Persisted activity comes from the incremental
-/// projection after the lock is released.
+/// The project snapshot + its staleness baseline are computed ONCE per project
+/// (they are per-project facts), which is why this is a value rather than a
+/// free function: the team graph asks it for every session of a project, and
+/// recomputing the baseline per row was the duplication that let the two
+/// surfaces drift.
 ///
-/// A project the catalog can't price for staleness no longer bails out (that
+/// A project the catalog can't price for staleness does NOT bail out (that
 /// left every row saying `"live"`, i.e. green, on a surface whose whole job is
 /// to say what a session is doing): fall back to `0` silent seconds, the same
 /// fallback the IM side uses.
+pub(crate) struct ProjectActivity {
+    snapshot: ccteam_im::progress_projection::ProjectProjectionSnapshot,
+    silent_seconds: u64,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+impl ProjectActivity {
+    pub(crate) fn new(
+        projection: &ccteam_im::progress_projection::ProgressProjection,
+        slug: &str,
+    ) -> Self {
+        let now = chrono::Utc::now();
+        let snapshot = projection.project_snapshot(slug);
+        let silent_seconds = snapshot
+            .last_valid
+            .as_ref()
+            .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, now))
+            .unwrap_or(0);
+        Self {
+            snapshot,
+            silent_seconds,
+            now,
+        }
+    }
+
+    /// The file verdict for one sid, folded with the daemon's in-flight turn
+    /// when the caller holds one.
+    pub(crate) fn resolve(
+        &self,
+        sid: &str,
+        live: Option<ccteam_core::stall::LiveTurn>,
+    ) -> ccteam_core::stall::ProgressActivityStatus {
+        self.snapshot
+            .session_activity_borrowed(sid, self.silent_seconds, live, self.now)
+    }
+}
+
+/// Replace the gateway's cheap `"live"` hint on each row with its real
+/// activity. `live_turns` is the daemon's in-flight-turn snapshot, taken under
+/// the same lock that produced `views`; persisted activity comes from the
+/// incremental projection after the lock is released.
 fn apply_progress_activity_status(
     projection: &ccteam_im::progress_projection::ProgressProjection,
     slug: &str,
@@ -243,13 +286,7 @@ fn apply_progress_activity_status(
     if views.is_empty() {
         return;
     }
-    let snapshot = projection.project_snapshot(slug);
-    let silent_seconds = snapshot
-        .last_valid
-        .as_ref()
-        .and_then(|event| ccteam_core::stall::progress_event_age_seconds(event, chrono::Utc::now()))
-        .unwrap_or(0);
-    let now = chrono::Utc::now();
+    let activity = ProjectActivity::new(projection, slug);
     for view in views {
         // A detached body (alive from before a daemon restart, not driven from
         // here) is neither working nor idle in the activity sense — its own
@@ -257,14 +294,9 @@ fn apply_progress_activity_status(
         if view.detached.is_some() {
             continue;
         }
-        let activity = snapshot.session_activity_borrowed(
-            &view.sid,
-            silent_seconds,
-            live_turns.get(&view.sid).copied(),
-            now,
-        );
-        view.last_activity_seconds = activity.last_activity_seconds;
-        view.status = activity.status.activity.to_string();
+        let resolved = activity.resolve(&view.sid, live_turns.get(&view.sid).copied());
+        view.last_activity_seconds = resolved.last_activity_seconds;
+        view.status = resolved.status.activity.to_string();
     }
 }
 
