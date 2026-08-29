@@ -569,6 +569,11 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
           event.stopPropagation()
           return
         }
+        // An open menu (row / workspace / model picker) owns this Esc: DSH's
+        // Menu closes itself from a document-level listener without
+        // preventDefault, so the pane must step aside — and must NOT stop
+        // propagation, or that listener never sees the key.
+        if (event.currentTarget.querySelector('[aria-haspopup="menu"][aria-expanded="true"]') !== null) return
         event.stopPropagation()
         if (state.details.open) {
           dispatch({ type: 'close_details' })
