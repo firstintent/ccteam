@@ -25,7 +25,7 @@
 //!
 //! Architecture refs: `docs/versions/v0-3/prd.md` §3.2.3,
 //! `docs/dev-coupling-audit.md` F45,
-//! `docs/dev/tech-design.md` §6.4 channel layer.
+//! `docs-local/dev/tech-design.md` §6.4 channel layer.
 
 use std::path::PathBuf;
 

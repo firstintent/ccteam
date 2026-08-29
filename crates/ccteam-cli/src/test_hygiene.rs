@@ -13,7 +13,7 @@
 //! touched a backlog file (`web_chat_newproject_scaffolds_registers_and_cd_works`,
 //! reading a `config.yaml` some other test's restore had moved).
 //!
-//! The rule (AGENTS.md §六) is: take the root as an argument (`_in(root)` /
+//! The rule (AGENTS.md §五) is: take the root as an argument (`_in(root)` /
 //! an injected backend), and if a case genuinely exercises env RESOLUTION
 //! itself, move it to that crate's `crates/<crate>/tests/*.rs`, where Cargo
 //! gives it its own process. This test enforces that rule mechanically so the
@@ -22,7 +22,7 @@
 //! It lives in `ccteam-cli` because that is the workspace's top-level binary
 //! crate and `--bins` puts it inside `make test-baseline`; it deliberately
 //! scans the whole workspace rather than only its own crate — one fallback
-//! missed usually has siblings (AGENTS.md §五 総纲「同形扫一遍」).
+//! missed usually has siblings (AGENTS.md §四 総纲「同形扫一遍」).
 //!
 //! Scope note: only `#[cfg(test)]` regions are scanned. Production code
 //! legitimately sets env (`ccteam-cli/src/main.rs` pins `CCTEAM_HOME` and

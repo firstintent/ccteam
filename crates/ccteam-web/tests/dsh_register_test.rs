@@ -1,7 +1,7 @@
 //! `POST /api/v1/hosts/local/register-mcp?vendor=dsh` — the Hosts-page
 //! "register the ccteam DSH plugin" action (v0.10.3 gate ①). Own process:
 //! this test pins `HOME`/`CCTEAM_HOME`, so it must stay the only test here
-//! (env mutation is per-process, AGENTS §六).
+//! (env mutation is per-process, AGENTS §五).
 
 use std::net::SocketAddr;
 use std::sync::Arc;

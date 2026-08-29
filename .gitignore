@@ -1,5 +1,5 @@
 # References cloned for inspiration (not vendored).
-# See CLAUDE.md §3.7: 参考实现不是依赖,不进 ccteam 仓库。
+# See AGENTS.md §三 vendor 红线: 参考实现不是依赖,不进 ccteam 仓库。
 /references/
 
 # Rust build artifacts

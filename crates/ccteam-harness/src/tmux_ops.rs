@@ -10,7 +10,7 @@
 //! delegates to internally — the trait is async because rmux is, but
 //! the tmux ops underneath are blocking `Command::output()` either way.
 //!
-//! Lifecycle (`docs/dev/tech-design.md` §6.1):
+//! Lifecycle (`docs-local/dev/tech-design.md` §6.1):
 //! - **First launch**: `tmux new-session -d -s ccteam-<slug> -c <wd> <cmd>`
 //!   where `<cmd>` is `claude --dangerously-skip-permissions` for prod
 //!   and a sleeping shell for tests.

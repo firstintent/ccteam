@@ -1,7 +1,7 @@
 //! `model_catalog`'s environment-resolved seam (`record_vendor_models_best_effort`).
 //!
 //! Lives in an integration binary, not the lib target, because it mutates
-//! process-wide `HOME`/`CCTEAM_HOME` — AGENTS.md §六: env-mutating tests get
+//! process-wide `HOME`/`CCTEAM_HOME` — AGENTS.md §五: env-mutating tests get
 //! their own process, since the lib target runs everything in ONE process at
 //! full parallelism and a pinned `HOME` there is visible to every other test.
 //! The lib module keeps the four `_in(root)`-injected tests, which need no env.

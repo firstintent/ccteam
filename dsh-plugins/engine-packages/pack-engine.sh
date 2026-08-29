@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build one `@ccteam/engine-<os>-<cpu>` tarball from a prebuilt ccteam binary.
 #
-#   plugins/engine-packages/pack-engine.sh <os-cpu> <binary> <version> [outdir]
+#   dsh-plugins/engine-packages/pack-engine.sh <os-cpu> <binary> <version> [outdir]
 #
 # The four platform packages are how `dsh plugin add @ccteam/ccteam-ui` brings
 # an engine with it (PRD v0.10.5 D2). They carry `os`/`cpu`, so npm and pnpm

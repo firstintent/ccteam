@@ -201,7 +201,7 @@ mod tests {
     /// `pre_trust_project` step writes a trust entry into `~/.claude.json` —
     /// the ONE path in this stack that resolves off `$HOME` rather than off
     /// the injected root. Switch it off process-wide, once, exactly as
-    /// AGENTS.md §六 prescribes. Monotone (never restored, never unset), so
+    /// AGENTS.md §五 prescribes. Monotone (never restored, never unset), so
     /// unlike a set/restore pair it cannot race a concurrent reader: the value
     /// only ever goes absent → set, and both states keep the operator's real
     /// `~/.claude.json` untouched.

@@ -168,13 +168,14 @@ check: fmt-check clippy
 test: require-node
 	cargo test --workspace --exclude ccteam-web --no-fail-fast
 
-# Deterministic baseline gate — the subset whose pass-count is recorded as the
-# baseline in `.loop/state.md` (「基线只增不减」). The target selectors keep the
+# Deterministic baseline gate — the subset whose pass-count must never regress
+# (「基线只增不减」; CI `check.yml::test` runs the same selection, so a green CI
+# run is the clean-environment arbiter). The target selectors keep the
 # hang-prone / env-flaky integration tests (`tests/*.rs`) out, so the count is
 # stable. `--bins` is load-bearing: a binary-only crate has NO lib target, so a
 # `--lib`-only run covered ZERO of `ccteam-cli`'s tests — that blind spot let a
-# broken `web_chat_bridge` restart test rot unnoticed on main. Lives here, not
-# as prose in `.loop/`, so the gate has one executable home.
+# broken `web_chat_bridge` restart test rot unnoticed on main. This Makefile is
+# the gate's one executable home; there is no prose copy elsewhere.
 test-baseline: require-node
 	cargo test --workspace --exclude ccteam-web --lib --bins --no-fail-fast
 

@@ -652,7 +652,7 @@ mod tests {
     use super::*;
 
     // Every env-mutating DSH spawn-spec test lives in
-    // `tests/dsh_acp_test.rs` (AGENTS.md §六): the lib target is one process
+    // `tests/dsh_acp_test.rs` (AGENTS.md §五): the lib target is one process
     // at full parallelism, so a `HOME`/`DEEPSEEK_API_KEY` write here is
     // visible to every other lib test. What stays below is pure or injected.
 

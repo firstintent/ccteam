@@ -243,7 +243,7 @@ describe('CSS modules (lightningcss, the DSH preset pipeline)', () => {
    * so an absolute virtual id puts the build machine's checkout path into
    * `lib/client.js` — and therefore into the tarball `materialize.rs` embeds
    * and caches by sha256. Two worktrees of the same commit then produce
-   * different bytes, which is exactly what `plugins/pack-assets.sh` promises
+   * different bytes, which is exactly what `dsh-plugins/pack-assets.sh` promises
    * they do not (found by the DSH2-MERGE checker: 7bddf3… vs abac17…).
    */
   it('anchors virtual ids to the package root, so no checkout path reaches the bundle', async () => {

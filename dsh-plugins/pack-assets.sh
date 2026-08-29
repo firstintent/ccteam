@@ -2,7 +2,7 @@
 # Rebuild the embedded plugin tarball that `execution/dsh_acp/materialize.rs`
 # ships with `include_bytes!`.
 #
-#   plugins/ccteam-ui -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz
+#   dsh-plugins/ccteam-ui -> crates/ccteam-harness/src/execution/dsh_acp/assets/ccteam-ui.tgz
 #
 # Rust builds must never require npm or node (same rule as the checked-in Pi
 # bridge asset), so the tarballs are produced here and committed alongside the
@@ -15,7 +15,7 @@
 # `//#region` comments, so a build whose virtual ids were absolute embedded the
 # checkout path (found by the DSH2-MERGE checker: the committed tarball hashed
 # 7bddf3… while a fresh pack from another worktree hashed abac17…). The ids are
-# package-relative now (plugins/ccteam-ui/build/css-plugins.ts), and the
+# package-relative now (dsh-plugins/ccteam-ui/build/css-plugins.ts), and the
 # two-path check below is what keeps them that way: it rebuilds and re-packs
 # each plugin from a second, differently-named directory and refuses to publish
 # a tarball whose bytes depend on where the repo happens to live.
@@ -27,7 +27,7 @@
 # because they only assert the archive extracts. Refuse to publish such a
 # tarball instead.
 #
-# Usage: plugins/pack-assets.sh [plugin ...]   (default: every embedded plugin)
+# Usage: dsh-plugins/pack-assets.sh [plugin ...]   (default: every embedded plugin)
 set -euo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +44,7 @@ staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 
 for plugin in "${plugins[@]}"; do
-  src="$repo/plugins/$plugin"
+  src="$repo/dsh-plugins/$plugin"
   [ -d "$src" ] || { echo "pack-assets: no such plugin: $plugin" >&2; exit 1; }
   echo "==> $plugin"
 

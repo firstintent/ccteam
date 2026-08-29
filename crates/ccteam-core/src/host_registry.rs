@@ -12,7 +12,7 @@
 //! Online/offline is TTL-based on the last `report` frame received over
 //! the satellite's control channel (live-channel presence gates the
 //! actual exec dial); terminal protocol is never multi-host. See
-//! `docs/dev/tech-design.md` §2.7.
+//! `docs-local/dev/tech-design.md` §2.7.
 
 use std::collections::BTreeMap;
 use std::fs;

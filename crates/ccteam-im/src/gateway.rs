@@ -17491,8 +17491,8 @@ mod tests {
         /// permit to an ARBITRARY waiter: a pump for a different session wakes,
         /// finds nothing matching its own identity, consumes the permit and
         /// goes back to sleep — stalling the pump the event was actually for.
-        /// That is the `turn_answer_*_context_echo_*` flake registered in
-        /// `.loop/verify/README.md` (a test-double race, never a gateway bug).
+        /// That was the `turn_answer_*_context_echo_*` CI flake (a
+        /// test-double race, never a gateway bug).
         /// One wakeup per identity means a permit can only reach its target.
         events_notify:
             Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>>,

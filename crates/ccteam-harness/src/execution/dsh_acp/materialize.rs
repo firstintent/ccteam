@@ -9,7 +9,7 @@
 //! code path.
 //!
 //! The embedded `assets/*.tgz` are checked-in assets: run
-//! `plugins/pack-assets.sh` to rebuild them from `plugins/<name>/` and commit
+//! `dsh-plugins/pack-assets.sh` to rebuild them from `dsh-plugins/<name>/` and commit
 //! the result with the Rust change. This mirrors the checked-in Pi bridge
 //! asset: Rust builds must not require npm or node.
 
@@ -1071,7 +1071,7 @@ fn merged_profile_package_json(
 ///
 /// An OVERRIDE patch, never an `insert` one. Each ccteam bundle is in the
 /// profile's `dsh.profile.bundles`, and each bundle's own patch layer
-/// (`plugins/<name>/cordis.patch.yml`) inserts its row — inserting it a second
+/// (`dsh-plugins/<name>/cordis.patch.yml`) inserts its row — inserting it a second
 /// time here makes Cordis abort the whole boot with `duplicate loader entry
 /// id: <row>`. That shipped once (v0.10.0) and killed every tenant instance
 /// before readiness; it holds for the operator's own profile just as much, so
@@ -2249,7 +2249,7 @@ mod tests {
     /// tarball packed without installing first extracts fine and then fails at
     /// runtime on `import Schema from '@deepseek-ai/schemastery'`. Assert the
     /// dependency is actually inside each embedded archive
-    /// (`plugins/pack-assets.sh` refuses to publish one that is not).
+    /// (`dsh-plugins/pack-assets.sh` refuses to publish one that is not).
     #[test]
     fn embedded_archives_carry_their_bundled_runtime_dependency() {
         let root = tempfile::tempdir().unwrap();

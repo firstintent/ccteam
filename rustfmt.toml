@@ -5,7 +5,7 @@
 # **Drift-zero policy**: workspace `cargo fmt --all` clean as of the chore
 # fmt-sweep PR. Commit-front `cargo fmt --all` is mandatory; CI gate
 # (`.github/workflows/check.yml::fmt`) enforces `cargo fmt --all -- --check`
-# on push / PR. See CLAUDE.md §七 for the rule.
+# on push / PR. See AGENTS.md §五 for the rule.
 
 edition = "2021"
 max_width = 100

@@ -338,7 +338,7 @@ jobs:
             tar -xzf "$archive" -C "$work"
             bin="${work}/ccteam-${TAG}-${suffix}/ccteam"
             [ -x "$bin" ] || { echo "::error::no executable ccteam inside ${archive}"; exit 1; }
-            tgz="$(plugins/engine-packages/pack-engine.sh "$tuple" "$bin" "$VERSION" out | head -n1)"
+            tgz="$(dsh-plugins/engine-packages/pack-engine.sh "$tuple" "$bin" "$VERSION" out | head -n1)"
             pkg="@ccteam/engine-${tuple}"
             # Idempotent: re-running the tag must not fail on an already-published version.
             if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
@@ -359,7 +359,7 @@ jobs:
           VERSION="${TAG#v}"
           DIST_TAG=latest
           case "$TAG" in *-*) DIST_TAG=next ;; esac
-          cd plugins/ccteam-ui
+          cd dsh-plugins/ccteam-ui
           # Plain `npm ci`: the four @ccteam/engine-* optionalDependencies 404 until
           # the previous step publishes them (npm tolerates a missing optional dep),
           # and `--omit=optional` must NOT be used — rolldown's native binding is
