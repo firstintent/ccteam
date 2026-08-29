@@ -74,11 +74,70 @@ const CCTEAM_PLUGINS: [PluginAsset; 1] = [UI_PLUGIN];
 
 #[derive(Debug, Clone)]
 pub struct MaterializedDshProfile {
-    /// Extraction cache of each plugin in [`CCTEAM_PLUGINS`], same order.
+    /// Extraction cache of each plugin ccteam materialized, in
+    /// [`CCTEAM_PLUGINS`] order. A plugin the operator installed themselves is
+    /// absent: ccteam extracted nothing for it (see [`OperatorInstall`]).
     pub cache_dirs: Vec<PathBuf>,
     pub profile_dir: PathBuf,
     /// `true` when at least one plugin cache had to be re-extracted.
     pub cache_rebuilt: bool,
+    /// Plugins this profile already carried from the operator's own
+    /// `dsh plugin add` — ccteam wrote their config row and nothing else.
+    pub operator_installed: Vec<OperatorInstall>,
+}
+
+/// One ccteam plugin a merge-only profile already carries from the operator's
+/// OWN `dsh plugin add`.
+///
+/// ccteam materializes exactly one shape: the bare bundle name in
+/// `dsh.profile.bundles`, a `node_modules/@ccteam/<pkg>` symlink into
+/// `<ccteam_home>/runtime/dsh/`, and never a line in pnpm's dependency table.
+/// So a dependency entry, or a package directory that is not that symlink, can
+/// only be the operator's. Materializing over it would swap their chosen copy
+/// for ccteam's embedded one and leave the profile carrying the same plugin
+/// TWICE — the shape Cordis aborts the whole boot for (`duplicate loader entry
+/// id`). ccteam therefore installs nothing and writes only the config override
+/// row that arms it (credentials, `daemonUrl`, transport socket).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorInstall {
+    /// npm name, as it appears in `dsh.profile.bundles`.
+    pub bundle: &'static str,
+    /// `version` from the installed package's own manifest, when readable — a
+    /// dependency pnpm has not installed yet reads as `None`.
+    pub version: Option<String>,
+}
+
+/// An operator-installed plugin whose version differs from the copy ccteam
+/// embeds. Reported by `doctor` and the Hosts surface, never repaired:
+/// overwriting someone else's install is exactly what this module stopped
+/// doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginVersionMismatch {
+    pub bundle: &'static str,
+    pub installed: String,
+    pub embedded: String,
+}
+
+impl PluginVersionMismatch {
+    /// The one wording both surfaces print, so `doctor` and the Hosts panel
+    /// can never word the same finding differently.
+    pub fn report(&self) -> String {
+        format!(
+            "{} plugin_version_mismatch{{installed={}, embedded={}}}",
+            self.bundle, self.installed, self.embedded
+        )
+    }
+}
+
+/// What this call does about one plugin in one profile.
+enum PluginPlan {
+    /// ccteam installs it: extract on a cache miss, link it, list its bundle.
+    /// Carries the extraction cache the profile links to.
+    Materialize(PathBuf),
+    /// The operator installed it themselves: touch none of its files and add
+    /// no bundle row — only its config row (see [`OperatorInstall`], which the
+    /// caller reports).
+    KeepOperatorInstall,
 }
 
 /// Register ccteam's plugins into a profile ccteam does NOT own — the
@@ -168,20 +227,160 @@ pub fn materialize_profile_in(
     dsh_home: &Path,
     spec: ProfileSpec<'_>,
 ) -> Result<MaterializedDshProfile, HarnessError> {
+    // Decide BEFORE extracting anything: a plugin the operator installed
+    // themselves needs no cache, no link and no bundle row — extracting one
+    // would only spend disk on a copy nothing may point at.
+    let profile_dir = profile_dir_of(dsh_home, spec.name);
+    let mut plans = Vec::with_capacity(CCTEAM_PLUGINS.len());
     let mut cache_dirs = Vec::with_capacity(CCTEAM_PLUGINS.len());
+    let mut operator_installed = Vec::new();
     let mut cache_rebuilt = false;
     for plugin in CCTEAM_PLUGINS.iter() {
-        let (cache_dir, rebuilt) = ensure_plugin_cache_dir(ccteam_root, plugin)?;
-        cache_rebuilt |= rebuilt;
-        cache_dirs.push(cache_dir);
+        match operator_install_of(&profile_dir, ccteam_root, plugin, spec.manifest) {
+            Some(install) => {
+                operator_installed.push(install);
+                plans.push(PluginPlan::KeepOperatorInstall);
+            }
+            None => {
+                let (cache_dir, rebuilt) = ensure_plugin_cache_dir(ccteam_root, plugin)?;
+                cache_rebuilt |= rebuilt;
+                cache_dirs.push(cache_dir.clone());
+                plans.push(PluginPlan::Materialize(cache_dir));
+            }
+        }
     }
-    let profile_dir = materialize_profile_files(dsh_home, &cache_dirs, &spec)?;
+    materialize_profile_files(&profile_dir, &plans, &spec)?;
 
     Ok(MaterializedDshProfile {
         cache_dirs,
         profile_dir,
         cache_rebuilt,
+        operator_installed,
     })
+}
+
+fn profile_dir_of(dsh_home: &Path, profile: &str) -> PathBuf {
+    dsh_home.join("profiles").join(profile)
+}
+
+/// Where ccteam extracts every plugin it materializes. A `node_modules` entry
+/// pointing in here is one ccteam wrote; anything else is someone else's.
+fn ccteam_plugin_cache_root(ccteam_root: &Path) -> PathBuf {
+    ccteam_root.join("runtime").join("dsh")
+}
+
+/// The operator's own copy of one plugin in this profile, or `None` when the
+/// only copy is ccteam's (or there is none).
+///
+/// [`ManifestPolicy::Owned`] answers `None` unconditionally: ccteam names,
+/// writes and owns that home end to end, so there is no third party to defer
+/// to and the tenant path keeps its semantics exactly.
+fn operator_install_of(
+    profile_dir: &Path,
+    ccteam_root: &Path,
+    plugin: &PluginAsset,
+    manifest: ManifestPolicy,
+) -> Option<OperatorInstall> {
+    if manifest == ManifestPolicy::Owned {
+        return None;
+    }
+    let package_dir = profile_dir
+        .join("node_modules")
+        .join(CCTEAM_SCOPE)
+        .join(plugin.package);
+    // pnpm's dependency table is the operator's declaration and outlives any
+    // one `node_modules` layout — including a profile an older ccteam already
+    // linked over, which is how such a profile stops being clobbered.
+    let declared = profile_declares_dependency(profile_dir, plugin.bundle);
+    let ours = fs::read_link(&package_dir)
+        .is_ok_and(|target| target.starts_with(ccteam_plugin_cache_root(ccteam_root)));
+    let installed = package_dir.join("package.json").is_file();
+    if !declared && (ours || !installed) {
+        return None;
+    }
+    Some(OperatorInstall {
+        bundle: plugin.bundle,
+        version: installed_package_version(&package_dir),
+    })
+}
+
+/// Is this bundle in the profile's own dependency table? Read-only,
+/// best-effort; ccteam never writes any of these three keys.
+fn profile_declares_dependency(profile_dir: &Path, bundle: &str) -> bool {
+    let Some(manifest) = fs::read_to_string(profile_dir.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .any(|table| {
+            manifest
+                .get(table)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|deps| deps.contains_key(bundle))
+        })
+}
+
+fn installed_package_version(package_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(package_dir.join("package.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("version")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// `version` of the plugin ccteam embeds, read out of the tarball itself so it
+/// can never drift from the bytes that get installed.
+fn embedded_plugin_version(plugin: &PluginAsset) -> Option<String> {
+    use std::io::Read as _;
+    let mut archive = Archive::new(GzDecoder::new(plugin.tgz));
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let path = entry.path().ok()?.into_owned();
+        if strip_npm_package_prefix(&path).as_deref() != Some(Path::new("package.json")) {
+            continue;
+        }
+        let mut raw = String::new();
+        entry.read_to_string(&mut raw).ok()?;
+        return serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()?
+            .get("version")?
+            .as_str()
+            .map(str::to_string);
+    }
+    None
+}
+
+/// Read-only, best-effort: ccteam plugins this profile carries from the
+/// operator's OWN install whose version differs from the embedded copy.
+///
+/// ccteam does not overwrite an install it did not make, so drift is REPORTED
+/// (`doctor`, the Hosts surface) and left for the operator's own
+/// `dsh plugin ... update` to fix. Anything missing or unreadable answers "no
+/// mismatch": not knowing is not a finding. Never writes.
+pub fn ccteam_plugin_version_mismatches(
+    ccteam_root: &Path,
+    dsh_home: &Path,
+    profile: &str,
+) -> Vec<PluginVersionMismatch> {
+    let profile_dir = profile_dir_of(dsh_home, profile);
+    CCTEAM_PLUGINS
+        .iter()
+        .filter_map(|plugin| {
+            let installed =
+                operator_install_of(&profile_dir, ccteam_root, plugin, ManifestPolicy::MergeOnly)?
+                    .version?;
+            let embedded = embedded_plugin_version(plugin)?;
+            (installed != embedded).then_some(PluginVersionMismatch {
+                bundle: plugin.bundle,
+                installed,
+                embedded,
+            })
+        })
+        .collect()
 }
 
 /// The `ccteam-ui` row's own plugin config. Reaches `apply(ctx, config)`
@@ -407,16 +606,15 @@ fn strip_npm_package_prefix(path: &Path) -> Option<PathBuf> {
 }
 
 fn materialize_profile_files(
-    dsh_home: &Path,
-    cache_dirs: &[PathBuf],
+    profile_dir: &Path,
+    plans: &[PluginPlan],
     spec: &ProfileSpec<'_>,
-) -> Result<PathBuf, HarnessError> {
-    let profile_dir = dsh_home.join("profiles").join(spec.name);
-    fs::create_dir_all(&profile_dir).map_err(|e| {
+) -> Result<(), HarnessError> {
+    fs::create_dir_all(profile_dir).map_err(|e| {
         HarnessError::SpawnFailed(format!("create DSH profile {}: {e}", profile_dir.display()))
     })?;
 
-    let package_json = merged_profile_package_json(&profile_dir, spec)?;
+    let package_json = merged_profile_package_json(profile_dir, plans, spec)?;
     write_if_changed(&profile_dir.join("package.json"), package_json.as_bytes())?;
     let patch_path = profile_dir.join(PATCH_FILE);
     if let Some(patch_yaml) = merged_profile_patch_yaml(&patch_path, spec)? {
@@ -436,8 +634,13 @@ fn materialize_profile_files(
             scope_dir.display()
         ))
     })?;
-    for (plugin, cache_dir) in CCTEAM_PLUGINS.iter().zip(cache_dirs) {
-        ensure_symlink(&scope_dir.join(plugin.package), cache_dir)?;
+    for (plugin, plan) in CCTEAM_PLUGINS.iter().zip(plans) {
+        // An operator-installed plugin keeps every file pnpm put there: the
+        // link is theirs, and replacing it would install ccteam's copy of the
+        // same plugin id alongside their own.
+        if let PluginPlan::Materialize(cache_dir) = plan {
+            ensure_symlink(&scope_dir.join(plugin.package), cache_dir)?;
+        }
     }
     // The scope dir is ccteam's too (see [`is_stale_ccteam_bundle`]): a link
     // left behind by a former plugin name points at a cache nobody maintains.
@@ -453,7 +656,7 @@ fn materialize_profile_files(
             remove_existing(&entry.path())?;
         }
     }
-    Ok(profile_dir)
+    Ok(())
 }
 
 /// A bundle name under ccteam's npm scope that is NOT one of [`CCTEAM_PLUGINS`].
@@ -475,6 +678,7 @@ fn is_stale_ccteam_bundle(name: Option<&str>) -> bool {
 
 fn merged_profile_package_json(
     profile_dir: &Path,
+    plans: &[PluginPlan],
     spec: &ProfileSpec<'_>,
 ) -> Result<String, HarnessError> {
     let path = profile_dir.join("package.json");
@@ -553,7 +757,15 @@ fn merged_profile_package_json(
     }
     let bundles = bundles.as_array_mut().expect("bundles coerced to array");
     bundles.retain(|v| !is_stale_ccteam_bundle(v.as_str()));
-    let ours = CCTEAM_PLUGINS.iter().map(|plugin| plugin.bundle);
+    // Only the plugins ccteam installs get a bundle row. An operator-installed
+    // one is already a layer by `dsh plugin`'s own reconciliation — and if
+    // that reconciliation dropped it, adding it back is ccteam overruling DSH
+    // about the operator's own package.
+    let ours = CCTEAM_PLUGINS
+        .iter()
+        .zip(plans)
+        .filter(|(_, plan)| matches!(plan, PluginPlan::Materialize(_)))
+        .map(|(plugin, _)| plugin.bundle);
     for required in scaffold
         .iter()
         .copied()
@@ -858,12 +1070,58 @@ mod tests {
             .join(plugin.package)
     }
 
+    /// The cache this call extracted for one plugin, found by its namespace —
+    /// a plugin ccteam did not materialize has no entry at all.
     fn cache_of(out: &MaterializedDshProfile, plugin: &PluginAsset) -> PathBuf {
-        let index = CCTEAM_PLUGINS
+        out.cache_dirs
             .iter()
-            .position(|p| p.package == plugin.package)
-            .expect("plugin is in the table");
-        out.cache_dirs[index].clone()
+            .find(|dir| dir.parent().and_then(Path::file_name) == Some(OsStr::new(plugin.cache_ns)))
+            .expect("plugin was materialized")
+            .clone()
+    }
+
+    /// A profile carrying the operator's OWN `dsh plugin add` of the plugin:
+    /// pnpm's dependency line, the bundle already reconciled into the layer
+    /// list, and a real package directory (not one of ccteam's symlinks).
+    fn operator_installed_profile(dsh_home: &Path, version: &str) -> PathBuf {
+        let profile_dir = dsh_home.join("profiles").join("web");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "name": "dsh-web-profile",
+                "private": true,
+                "dependencies": {CCTEAM_UI_BUNDLE: "^0.10.4", "@user/other": "1.0.0"},
+                "dsh": {"profile": {"bundles": [
+                    "@deepseek-ai/dsh-base",
+                    "@deepseek-ai/dsh-web-app",
+                    CCTEAM_UI_BUNDLE
+                ]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let package_dir = profile_dir
+            .join("node_modules")
+            .join(CCTEAM_SCOPE)
+            .join(UI_PLUGIN.package);
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            serde_json::json!({"name": CCTEAM_UI_BUNDLE, "version": version}).to_string(),
+        )
+        .unwrap();
+        fs::write(package_dir.join("marker.txt"), b"pnpm put me here").unwrap();
+        profile_dir
+    }
+
+    fn bundle_entries(profile_dir: &Path) -> Vec<String> {
+        read_package(profile_dir)["dsh"]["profile"]["bundles"]
+            .as_array()
+            .expect("bundles is an array")
+            .iter()
+            .map(|v| v.as_str().expect("bundle is a string").to_string())
+            .collect()
     }
 
     fn read_patch(profile_dir: &Path) -> serde_yaml::Value {
@@ -1667,6 +1925,235 @@ mod tests {
             links,
             vec![UI_PLUGIN.package.to_string()],
             "the scope dir holds exactly the table's packages"
+        );
+    }
+
+    /// The operator ran `dsh plugin add @ccteam/ccteam-ui` themselves. ccteam
+    /// must add NOTHING that would make the profile carry that plugin twice —
+    /// no second bundle row, no link of its own, not even an extraction — and
+    /// still arm the copy that is there with this daemon's config row.
+    #[test]
+    fn an_operator_installed_plugin_is_configured_never_materialized() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = operator_installed_profile(dsh_home.path(), "0.10.4-alpha.0");
+
+        let out = operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        assert_eq!(
+            out.operator_installed,
+            vec![OperatorInstall {
+                bundle: CCTEAM_UI_BUNDLE,
+                version: Some("0.10.4-alpha.0".to_string()),
+            }],
+            "the operator's install is recognized as theirs"
+        );
+        assert!(
+            out.cache_dirs.is_empty() && !out.cache_rebuilt,
+            "nothing to extract when the profile already carries the plugin"
+        );
+        assert!(
+            !root.path().join("runtime").join("dsh").join("ui").exists(),
+            "the embedded tarball is not unpacked for a plugin ccteam does not install"
+        );
+
+        assert_eq!(
+            bundle_entries(&profile_dir),
+            vec![
+                "@deepseek-ai/dsh-base".to_string(),
+                "@deepseek-ai/dsh-web-app".to_string(),
+                CCTEAM_UI_BUNDLE.to_string(),
+            ],
+            "exactly one row for the plugin: a second is `duplicate loader entry id`"
+        );
+        assert_eq!(
+            read_package(&profile_dir)["dependencies"][CCTEAM_UI_BUNDLE],
+            serde_json::json!("^0.10.4"),
+            "pnpm's dependency table is not ours to edit"
+        );
+
+        let package_dir = plugin_link(&profile_dir, &UI_PLUGIN);
+        assert!(
+            !fs::symlink_metadata(&package_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the operator's own package directory is left in place"
+        );
+        assert!(
+            package_dir.join("marker.txt").is_file(),
+            "no file of theirs is replaced"
+        );
+
+        // The one thing ccteam does write: the row that arms their copy.
+        let ours = ccteam_row(&read_patch(&profile_dir));
+        assert!(ours.get("insert").is_none(), "an override, never an insert");
+        assert_eq!(
+            ours["name"],
+            serde_yaml::Value::String(CCTEAM_UI_BUNDLE.into()),
+            "the row names the plugin it patches"
+        );
+        let config = ours["config"]
+            .as_mapping()
+            .expect("flat plugin config")
+            .clone();
+        assert_eq!(
+            config["daemonUrl"],
+            serde_yaml::Value::String("http://127.0.0.1:7331".into())
+        );
+        assert_eq!(
+            config["transportSocket"],
+            serde_yaml::Value::String(SOCKET.into())
+        );
+        assert_eq!(
+            config["restToken"],
+            serde_yaml::Value::String(REST_TOKEN.into()),
+            "credentials still reach the operator's own install"
+        );
+        assert!(
+            config.keys().all(|key| key.as_str() != Some("ccteam-ui")),
+            "config stays flat — a namespace nests it out of reach: {config:?}"
+        );
+    }
+
+    /// A version the operator pinned that is not the one ccteam embeds is a
+    /// report, not a repair: `doctor` and the Hosts surface print it and the
+    /// files stay exactly as pnpm left them.
+    #[test]
+    fn a_version_mismatch_is_reported_and_never_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = operator_installed_profile(dsh_home.path(), "0.0.1-theirs");
+
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+
+        let embedded = embedded_plugin_version(&UI_PLUGIN).expect("the tarball carries a version");
+        let mismatches = ccteam_plugin_version_mismatches(root.path(), dsh_home.path(), "web");
+        assert_eq!(
+            mismatches,
+            vec![PluginVersionMismatch {
+                bundle: CCTEAM_UI_BUNDLE,
+                installed: "0.0.1-theirs".to_string(),
+                embedded: embedded.clone(),
+            }]
+        );
+        assert_eq!(
+            mismatches[0].report(),
+            format!(
+                "{CCTEAM_UI_BUNDLE} plugin_version_mismatch{{installed=0.0.1-theirs, embedded={embedded}}}"
+            ),
+            "one wording for both surfaces"
+        );
+        assert_eq!(
+            installed_package_version(&plugin_link(&profile_dir, &UI_PLUGIN)),
+            Some("0.0.1-theirs".to_string()),
+            "the operator's version is still the installed one"
+        );
+    }
+
+    /// The same version is no finding, and neither is a profile ccteam
+    /// materialized itself — that one matches the embedded copy by
+    /// construction.
+    #[test]
+    fn matching_and_ccteam_owned_installs_report_no_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let embedded = embedded_plugin_version(&UI_PLUGIN).expect("the tarball carries a version");
+        operator_installed_profile(dsh_home.path(), &embedded);
+        operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+        assert!(
+            ccteam_plugin_version_mismatches(root.path(), dsh_home.path(), "web").is_empty(),
+            "same version, nothing to report"
+        );
+
+        let fresh_root = tempfile::tempdir().unwrap();
+        let fresh_home = tempfile::tempdir().unwrap();
+        operator_register(fresh_root.path(), fresh_home.path(), SOCKET).unwrap();
+        assert!(
+            ccteam_plugin_version_mismatches(fresh_root.path(), fresh_home.path(), "web")
+                .is_empty(),
+            "ccteam's own materialization is the embedded copy"
+        );
+        assert!(
+            ccteam_plugin_version_mismatches(fresh_root.path(), fresh_home.path(), "no-such")
+                .is_empty(),
+            "an absent profile is not a finding"
+        );
+    }
+
+    /// ccteam keeps upgrading the copy it installed itself: its own link is
+    /// not an "operator install", so a new embedded sha still re-points it.
+    #[test]
+    fn ccteams_own_link_is_still_refreshed_on_a_merge_only_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let first = operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+        let profile_dir = first.profile_dir.clone();
+        assert_eq!(first.operator_installed, vec![]);
+
+        // A stand-in for the next ccteam version's cache: the link points into
+        // ccteam's runtime dir but at a sha this build no longer ships.
+        let old_cache = ccteam_plugin_cache_root(root.path())
+            .join(UI_PLUGIN.cache_ns)
+            .join("0000000000000000000000000000000000000000000000000000000000000000");
+        fs::create_dir_all(&old_cache).unwrap();
+        fs::write(old_cache.join("package.json"), b"{\"version\":\"0.0.0\"}").unwrap();
+        let link = plugin_link(&profile_dir, &UI_PLUGIN);
+        remove_existing(&link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&old_cache, &link).unwrap();
+
+        let again = operator_register(root.path(), dsh_home.path(), SOCKET).unwrap();
+        assert_eq!(
+            again.operator_installed,
+            vec![],
+            "a link into ccteam's own cache is ccteam's, whatever its sha"
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            cache_of(&again, &UI_PLUGIN),
+            "it is re-pointed at the cache this build ships"
+        );
+    }
+
+    /// A tenant home ccteam owns end to end keeps its semantics: there is no
+    /// third party to defer to there, so a dependency line someone dropped in
+    /// changes nothing.
+    #[test]
+    fn an_owned_profile_materializes_even_with_a_dependency_line() {
+        let root = tempfile::tempdir().unwrap();
+        let dsh_home = tempfile::tempdir().unwrap();
+        let profile_dir = dsh_home.path().join("profiles").join(WEB_PROFILE);
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("package.json"),
+            serde_json::json!({
+                "dependencies": {CCTEAM_UI_BUNDLE: "^0.10.4"},
+                "dsh": {"profile": {"bundles": [CCTEAM_UI_BUNDLE]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let out = materialize_profile_in(root.path(), dsh_home.path(), wired_web()).unwrap();
+
+        assert_eq!(out.operator_installed, vec![], "Owned defers to nobody");
+        assert_eq!(
+            fs::read_link(plugin_link(&out.profile_dir, &UI_PLUGIN)).unwrap(),
+            cache_of(&out, &UI_PLUGIN),
+            "the managed home still links ccteam's own cache"
+        );
+        assert_eq!(
+            bundle_entries(&out.profile_dir)
+                .iter()
+                .filter(|bundle| bundle.as_str() == CCTEAM_UI_BUNDLE)
+                .count(),
+            1,
+            "and still lists the bundle exactly once"
+        );
+        assert!(
+            ccteam_plugin_version_mismatches(root.path(), dsh_home.path(), WEB_PROFILE).is_empty(),
+            "a managed home has no operator install to drift from"
         );
     }
 

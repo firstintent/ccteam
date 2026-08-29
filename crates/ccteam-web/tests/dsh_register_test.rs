@@ -185,4 +185,85 @@ async fn register_dsh_writes_only_ccteam_rows_into_the_operator_profile() {
         manifest_again["dsh"]["profile"]["bundles"], manifest["dsh"]["profile"]["bundles"],
         "re-registration must not grow the bundle list"
     );
+
+    // The operator installs the plugin themselves (`dsh plugin add`): pnpm's
+    // dependency line plus a real package directory where ccteam's link was.
+    // The next click must arm THAT copy and install nothing — a second copy of
+    // the same plugin id aborts the whole Cordis boot.
+    let package_dir = profile
+        .join("node_modules")
+        .join("@ccteam")
+        .join("ccteam-ui");
+    std::fs::remove_file(&package_dir).expect("ccteam materialized a symlink");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        serde_json::json!({"name": "@ccteam/ccteam-ui", "version": "9.9.9-theirs"}).to_string(),
+    )
+    .unwrap();
+    let mut theirs: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(profile.join("package.json")).unwrap())
+            .unwrap();
+    theirs["dependencies"] = serde_json::json!({"@ccteam/ccteam-ui": "^0.10.4"});
+    std::fs::write(
+        profile.join("package.json"),
+        serde_json::to_string_pretty(&theirs).unwrap(),
+    )
+    .unwrap();
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "registering onto their install still works"
+    );
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(profile.join("package.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        after["dsh"]["profile"]["bundles"], manifest["dsh"]["profile"]["bundles"],
+        "no second bundle entry for a plugin the operator installed"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&package_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "their package directory is left in place"
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(package_dir.join("package.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        installed["version"], "9.9.9-theirs",
+        "ccteam does not overwrite the version they pinned"
+    );
+    let rows: Vec<serde_yaml::Value> =
+        serde_yaml::from_str(&std::fs::read_to_string(profile.join("cordis.patch.yml")).unwrap())
+            .unwrap();
+    let ours = rows
+        .iter()
+        .find(|row| row.get("id").and_then(serde_yaml::Value::as_str) == Some("ccteam-ui"))
+        .expect("their copy still gets its config row");
+    let config = ours
+        .get("config")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("flat plugin config");
+    assert_eq!(
+        config[&serde_yaml::Value::String("restToken".into())],
+        serde_yaml::Value::String(format!("ccteam:{ADMIN_HEX}")),
+        "credentials still reach the operator's own install: {config:?}"
+    );
+
+    // Same profile, read back through the surface the Hosts panel calls.
+    let mismatches = ccteam_web::dsh_web::operator_plugin_version_mismatches(&ccteam_root);
+    assert_eq!(mismatches.len(), 1, "the drift is reported: {mismatches:?}");
+    assert_eq!(mismatches[0].installed, "9.9.9-theirs");
+    assert_eq!(mismatches[0].bundle, "@ccteam/ccteam-ui");
 }

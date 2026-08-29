@@ -721,6 +721,110 @@ fn operator_web_spawn_registers_only_ccteam_rows_in_the_native_profile() {
     );
 }
 
+/// The operator ran `dsh plugin --profile web add @ccteam/ccteam-ui`
+/// themselves; ccteam web's DSH menu then attaches to that same DSH. The
+/// attach must arm their copy and install nothing — a second copy of the same
+/// plugin id is what aborts the whole Cordis boot (`duplicate loader entry
+/// id`), and the version they pinned is theirs, not ccteam's, to change.
+#[test]
+#[serial(dsh_env)]
+fn operator_web_spawn_leaves_a_self_installed_ccteam_plugin_alone() {
+    let tmp = TempDir::new().unwrap();
+    let _guard = isolate(&tmp);
+    let dsh_home = operator_dsh_home(&tmp);
+    let profile_dir = dsh_home.join("profiles").join(DSH_NATIVE_WEB_PROFILE);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    // Exactly what `dsh plugin add` leaves behind: pnpm's dependency line, the
+    // bundle reconciled into the layer list, and the package itself.
+    std::fs::write(
+        profile_dir.join("package.json"),
+        serde_json::json!({
+            "name": "dsh-web-profile",
+            "dependencies": {"@ccteam/ccteam-ui": "^0.10.4"},
+            "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-web-app", "@ccteam/ccteam-ui"]}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let package_dir = profile_dir
+        .join("node_modules")
+        .join("@ccteam")
+        .join("ccteam-ui");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        serde_json::json!({"name": "@ccteam/ccteam-ui", "version": "9.9.9-theirs"}).to_string(),
+    )
+    .unwrap();
+    let socket = identity_socket_path("user:web-api", &ccteam_home(&tmp));
+
+    build_web_spawn_spec(DshWebSpawnOptions {
+        owner_tag: "user:web-api",
+        ccteam_home: ccteam_home(&tmp),
+        dsh_home: dsh_home.clone(),
+        profile: DSH_NATIVE_WEB_PROFILE,
+        materialize_profile: false,
+        enrollment: None,
+        daemon_url: Some("http://127.0.0.1:7331"),
+        transport_socket: Some(&socket),
+        rest_token: None,
+    })
+    .expect("operator web spawn spec");
+
+    let package: Value =
+        serde_json::from_slice(&std::fs::read(profile_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        package["dsh"]["profile"]["bundles"],
+        serde_json::json!(["@deepseek-ai/dsh-web-app", "@ccteam/ccteam-ui"]),
+        "the bundle list is unchanged — a second entry is a duplicate loader entry id"
+    );
+    assert_eq!(
+        package["dependencies"]["@ccteam/ccteam-ui"],
+        serde_json::json!("^0.10.4"),
+        "pnpm's dependency table is not ccteam's to edit"
+    );
+    assert!(
+        !std::fs::symlink_metadata(&package_dir)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the operator's own package directory is not replaced by a ccteam link"
+    );
+    let installed: Value =
+        serde_json::from_slice(&std::fs::read(package_dir.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        installed["version"], "9.9.9-theirs",
+        "their version stays installed"
+    );
+
+    // What ccteam DOES write: the flat config row that arms their copy.
+    let config = patch_config(&profile_dir);
+    assert_eq!(
+        config["daemonUrl"],
+        serde_yaml::Value::String("http://127.0.0.1:7331".into())
+    );
+    assert_eq!(
+        config["transportSocket"],
+        serde_yaml::Value::String(socket.to_string_lossy().into_owned())
+    );
+
+    let mismatches =
+        ccteam_harness::execution::dsh_acp::materialize::ccteam_plugin_version_mismatches(
+            &ccteam_home(&tmp),
+            &dsh_home,
+            DSH_NATIVE_WEB_PROFILE,
+        );
+    assert_eq!(mismatches.len(), 1, "the drift is reported: {mismatches:?}");
+    assert_eq!(mismatches[0].installed, "9.9.9-theirs");
+    assert!(
+        mismatches[0]
+            .report()
+            .starts_with("@ccteam/ccteam-ui plugin_version_mismatch{installed=9.9.9-theirs,"),
+        "one wording for doctor and the Hosts panel: {}",
+        mismatches[0].report()
+    );
+}
+
 #[test]
 #[serial(dsh_env)]
 fn web_profile_factory_seeds_operator_credentials_and_marker_for_tenant_home() {
