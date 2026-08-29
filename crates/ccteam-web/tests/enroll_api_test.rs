@@ -259,7 +259,7 @@ async fn transport_honesty_follows_the_request() {
     let c = client();
 
     // Browsing over loopback: the operator IS on this machine.
-    let (status, local) = mint_user(&c, addr, ADMIN_HEX, None).await;
+    let (status, local) = mint_user(&c, addr, ADMIN_HEX, Some("loopback")).await;
     assert_eq!(status, 201);
     assert_eq!(
         local["insecure_transport"], true,
@@ -270,7 +270,7 @@ async fn transport_honesty_follows_the_request() {
         .post(format!("http://{addr}/api/v1/enroll"))
         .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
         .header("Host", "127.0.0.1:7331")
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({"label": "ci"}))
         .send()
         .await
         .unwrap()
@@ -290,7 +290,7 @@ async fn transport_honesty_follows_the_request() {
         .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
         .header("Host", "team.example")
         .header("X-Forwarded-Proto", "https")
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({"label": "ci"}))
         .send()
         .await
         .unwrap()
@@ -322,7 +322,7 @@ async fn listing_never_returns_a_secret() {
     let addr = spawn(state).await;
     let c = client();
 
-    let (_, first) = mint_user(&c, addr, ADMIN_HEX, None).await;
+    let (_, first) = mint_user(&c, addr, ADMIN_HEX, Some("laptop")).await;
     let (_, second) = mint_project(&c, addr, ADMIN_HEX, "alpha", Some("reviewer")).await;
     let secrets: Vec<String> = [&first, &second]
         .iter()
@@ -482,7 +482,7 @@ async fn revoke_kills_one_bearer_and_only_for_its_owner() {
     let addr = spawn(state).await;
     let c = client();
 
-    let (_, doomed) = mint_user(&c, addr, ADMIN_HEX, None).await;
+    let (_, doomed) = mint_user(&c, addr, ADMIN_HEX, Some("doomed")).await;
     let (_, keeper) = mint_user(&c, addr, ADMIN_HEX, Some("keep")).await;
     let doomed_bearer = doomed["bearer"].as_str().unwrap().to_string();
     let keeper_bearer = keeper["bearer"].as_str().unwrap().to_string();
@@ -550,7 +550,7 @@ async fn a_crafted_host_falls_back_to_the_recorded_bind() {
         .post(format!("http://{addr}/api/v1/enroll"))
         .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
         .header("Host", "evil.example/mcp?x=1")
-        .json(&serde_json::json!({}))
+        .json(&serde_json::json!({"label": "ci"}))
         .send()
         .await
         .unwrap();
@@ -788,6 +788,104 @@ async fn ensure_rotate_mints_a_replacement_and_revokes_the_old() {
     assert!(new_bearer.starts_with(after["credential"]["bearer_prefix"].as_str().unwrap()));
 }
 
+/// The unlabelled user slot belongs to the DAEMON: it is the machine
+/// credential written into the five vendor global configs, and
+/// `ensure_user_credential_in` is its only writer. So a user-scoped REST
+/// request must name its own label — a plain unlabelled mint would otherwise
+/// become the record the next daemon start resolves to, silently rewriting
+/// five config files with a bearer the console happened to hand out.
+#[tokio::test]
+async fn a_user_scoped_request_without_a_label_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    // The slot as the daemon holds it: minted by daemon start, not by REST.
+    let machine = enroll::ensure_user_credential_in(&paths.root, "user:web-api").unwrap();
+
+    // Missing, empty and whitespace-only are the same request: none of them
+    // names a slot. Mint and ensure alike, so no door is left open.
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"label": ""}),
+        serde_json::json!({"label": "   "}),
+        serde_json::json!({"label": null}),
+        serde_json::json!({"ensure": true}),
+        serde_json::json!({"label": "  ", "ensure": true, "rotate": true}),
+    ] {
+        let (status, err) = post_mint(&c, addr, ADMIN_HEX, "/api/v1/enroll", body.clone()).await;
+        assert_eq!(status, 400, "{body} must be refused: {err:#?}");
+        assert!(
+            err["error"].as_str().is_some_and(|m| m.contains("label")),
+            "the message has to say which field: {err:#?}"
+        );
+    }
+    assert_eq!(
+        enroll::list_in(&paths.root).len(),
+        1,
+        "a refused request mints nothing"
+    );
+    assert_eq!(
+        enroll::ensure_user_credential_in(&paths.root, "user:web-api")
+            .unwrap()
+            .id,
+        machine.id,
+        "the machine slot still holds the daemon's own credential"
+    );
+
+    // Naming a slot is all it takes — and that record is NOT the machine one.
+    let (status, minted) = mint_user(&c, addr, ADMIN_HEX, Some("  rob's laptop  ")).await;
+    assert_eq!(status, 201, "{minted:#?}");
+    assert_eq!(
+        minted["credential"]["label"], "rob's laptop",
+        "the label is stored trimmed"
+    );
+    assert_ne!(minted["credential"]["id"], serde_json::json!(machine.id));
+    assert_eq!(
+        enroll::ensure_user_credential_in(&paths.root, "user:web-api")
+            .unwrap()
+            .id,
+        machine.id,
+        "a labelled console mint never becomes the machine credential"
+    );
+}
+
+/// The reservation is on the USER slot only. A project-scoped mint cannot
+/// collide with the machine credential (scope is part of the key), so the
+/// copy-button flow keeps working with no label — but `ensure` still needs one
+/// anywhere, because there the label IS the lookup key.
+#[tokio::test]
+async fn a_project_scoped_mint_may_stay_unlabelled_but_its_ensure_may_not() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    seed_project(&paths, "alpha", "user:web-api");
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    let (status, minted) = mint_project(&c, addr, ADMIN_HEX, "alpha", None).await;
+    assert_eq!(
+        status, 201,
+        "the copy button still mints unlabelled: {minted:#?}"
+    );
+    assert_eq!(minted["credential"]["project"], "alpha");
+
+    let (status, err) = post_mint(
+        &c,
+        addr,
+        ADMIN_HEX,
+        "/api/v1/projects/alpha/enroll",
+        serde_json::json!({"ensure": true}),
+    )
+    .await;
+    assert_eq!(status, 400, "ensure without its key: {err:#?}");
+    assert_eq!(enroll::list_in(&paths.root).len(), 1);
+}
+
 /// The spec at `/api/docs` is what an external client reads, so the ensure
 /// contract has to be IN it: the flag, its rotate companion, and the fact that
 /// a reused credential answers 200 without a bearer.
@@ -841,4 +939,61 @@ async fn the_spec_documents_the_ensure_contract() {
         assert!(!responses["201"].is_null(), "{path}: {responses:#?}");
         assert!(!responses["400"].is_null(), "{path}: {responses:#?}");
     }
+}
+
+/// A client reading `/api/docs` must learn the label rule from the SPEC, not
+/// from a 400 it discovers at runtime: the field says it is required for the
+/// user-scoped mint, and that route's 400 says why.
+#[tokio::test]
+async fn the_spec_says_a_user_scoped_mint_must_name_a_label() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+    let c = client();
+
+    let spec: serde_json::Value = c
+        .get(format!("http://{addr}/api/v1/openapi.json"))
+        .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let label = &spec["components"]["schemas"]["MintEnrollForm"]["properties"]["label"];
+    let doc = label["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        doc.contains("required") && doc.contains("machine credential"),
+        "the label field must document the reservation: {label:#?}"
+    );
+    let flat = spec["paths"]["/api/v1/enroll"]["post"]["responses"]["400"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        flat.contains("label"),
+        "the user-scoped 400 must name the field: {flat:?}"
+    );
+    // The project route keeps its own contract: no label needed for a plain
+    // mint, so its 400 must NOT claim one is.
+    let pinned = spec["paths"]["/api/v1/projects/{slug}/enroll"]["post"]["responses"]["400"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            spec["paths"]["/api/v1/projects/{slug}/enroll"]["post"]["responses"]["400"]
+                ["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        });
+    assert!(
+        pinned.contains("ensure"),
+        "the project 400 documents the ensure key, not a blanket label rule: {pinned:?}"
+    );
 }

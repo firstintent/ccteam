@@ -38,9 +38,15 @@
 //! disk per restart. Both routes therefore take `ensure` + `label` in the body
 //! and go through `ccteam_core::enroll::ensure_in`, keyed by
 //! (identity, scope, label) — the same function the machine credential and the
-//! Hosts "register MCP" button use. A label is REQUIRED here, because the
-//! unlabelled slot is that machine credential and no REST caller may resolve
-//! or rotate it.
+//! Hosts "register MCP" button use.
+//!
+//! **The unlabelled user slot is reserved.** It is the daemon's machine
+//! credential, and `enroll::ensure_user_credential_in` is its only writer, so
+//! every user-scoped request through this file must name a label — a plain
+//! unlabelled mint would otherwise become the record the next daemon start
+//! resolves to and writes into five vendor global configs. `ensure` needs a
+//! label under any scope (it is the key); a plain project-scoped mint does not
+//! (scope is in the key, so it cannot collide with the machine slot).
 //!
 //! That flag lives in the BODY rather than in a new `PUT /api/v1/enroll/{label}`
 //! for three reasons, in order of weight: (a) the scope lives in the ROUTE, so
@@ -125,7 +131,11 @@ pub struct EnrollListResponse {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct MintEnrollForm {
     /// Free-text reminder of where the snippet went ("rob's laptop", "ci").
-    /// With `ensure` it is the KEY, so it must be non-empty there.
+    /// REQUIRED for a user-scoped mint (`POST /api/v1/enroll`): the unlabelled
+    /// user slot is the daemon's own machine credential and no REST request may
+    /// land in it. With `ensure` it is also the lookup KEY, so it must be
+    /// non-empty there under any scope. Optional only for a plain
+    /// project-scoped mint.
     #[serde(default)]
     pub label: Option<String>,
     /// Get-or-mint instead of mint: idempotent per (caller identity, scope,
@@ -262,7 +272,7 @@ pub(crate) async fn handle_list_enrollments(
     responses(
         (status = 201, description = "Minted (or `ensure` created it); carries the bearer + per-vendor snippets", body = MintedEnrollment),
         (status = 200, description = "`ensure` resolved to an existing credential; NO bearer (not recoverable) — compare `bearer_prefix`, or retry with `rotate`", body = EnsuredEnrollment),
-        (status = 400, description = "`ensure` with no label, or `rotate` without `ensure`"),
+        (status = 400, description = "No `label` (required here: the unlabelled user slot is the daemon's machine credential), or `rotate` without `ensure`"),
     ),
 )]
 pub(crate) async fn handle_mint_enrollment(
@@ -336,13 +346,26 @@ async fn mint_and_render(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    // An empty label is not "no key": the unlabelled slot is the MACHINE
-    // credential daemon start writes into the vendor global configs, and no
-    // REST caller may resolve — or rotate — that one.
-    if form.ensure && label.is_none() {
-        return bad_request(
-            "ensure needs a non-empty label: it is the key the credential is looked up by",
-        );
+    // An empty label is not "no key": the unlabelled USER slot is the MACHINE
+    // credential daemon start writes into the five vendor global configs
+    // (`enroll::ensure_user_credential_in` is its ONLY writer), so a
+    // user-scoped request that names no slot would land in that one — mint as
+    // well as ensure, since a plain unlabelled mint becomes the record the next
+    // `ensure_user_credential_in` resolves to. Reserve it here, at the only
+    // door REST has. A project-scoped mint carries no such reservation (scope
+    // is part of the key, so it can never collide with the machine slot), but
+    // `ensure` needs a label under ANY scope: the label IS the lookup key.
+    if label.is_none() {
+        if matches!(scope, EnrollScope::User) {
+            return bad_request(
+                "label required; the unlabelled slot is the daemon's machine credential",
+            );
+        }
+        if form.ensure {
+            return bad_request(
+                "ensure needs a non-empty label: it is the key the credential is looked up by",
+            );
+        }
     }
     if form.rotate && !form.ensure {
         return bad_request(

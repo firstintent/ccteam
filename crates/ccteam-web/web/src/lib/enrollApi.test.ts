@@ -92,11 +92,13 @@ describe("enrollApi", () => {
     );
     globalThis.fetch = fetchMock as unknown as typeof fetch;
 
-    const res = await mintUserEnrollment();
+    // The label is not decoration on this route: the unlabelled machine-user
+    // slot is the daemon's own credential, so every mint here names its slot.
+    const res = await mintUserEnrollment({ label: "ci runner" });
     expect(res.credential.scope).toBe("user");
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/v1/enroll");
-    expect(JSON.parse(init.body as string)).toEqual({});
+    expect(JSON.parse(init.body as string)).toEqual({ label: "ci runner" });
   });
 
   it("lists credentials and tolerates a body with no credentials key", async () => {
