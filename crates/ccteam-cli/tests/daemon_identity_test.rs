@@ -62,6 +62,24 @@ impl Sandbox {
     }
 }
 
+/// `GET http://<addr>/health`, parsed. Hand-rolled over std so the test
+/// needs no HTTP client: one loopback request, one JSON body.
+fn http_get_json(addr: &str) -> serde_json::Value {
+    use std::io::{Read, Write};
+    let mut stream =
+        std::net::TcpStream::connect(addr).unwrap_or_else(|err| panic!("connect {addr}: {err}"));
+    stream
+        .write_all(format!("GET /health HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+        .expect("write request");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("read response");
+    let body = raw
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header/body split in {raw:?}"))
+        .1;
+    serde_json::from_str(body).unwrap_or_else(|err| panic!("parse {body:?}: {err}"))
+}
+
 /// The canonical form of a path, matching what the daemon reports.
 fn canonical(p: &Path) -> String {
     std::fs::canonicalize(p)
@@ -111,10 +129,11 @@ fn second_start_reports_already_running_with_pid_and_home() {
     assert_eq!(status["home"], canonical(&sb.ccteam_home), "{status}");
     assert!(status["version"].as_str().is_some(), "{status}");
     assert!(status["uptime_secs"].is_u64(), "{status}");
-    assert_eq!(
-        status["web_bind"].as_str(),
-        Some("127.0.0.1:0"),
-        "the bind comes from the launcher's recorded argv: {status}"
+    assert!(
+        status["web_bind"]
+            .as_str()
+            .is_some_and(|b| b.starts_with("127.0.0.1:") && !b.ends_with(":0")),
+        "the bind is the one the daemon SERVES, resolved from `:0`: {status}"
     );
     assert!(
         status["dsh_web_bind"].is_null(),
@@ -130,6 +149,131 @@ fn second_start_reports_already_running_with_pid_and_home() {
     let stopped = sb.json(&["daemon", "stop", "--json"]);
     assert_eq!(stopped["status"], "stopped", "{stopped}");
     assert_eq!(stopped["pid"].as_u64(), Some(started_pid), "{stopped}");
+}
+
+#[test]
+#[cfg(unix)]
+fn status_reports_the_bind_the_daemon_serves_not_the_one_that_was_requested() {
+    // `--web-bind 127.0.0.1:0` asks for "any free port". The launcher's
+    // pid record can only ever say `:0`; the daemon serves a concrete
+    // port. `daemon status` must report the served one — a client that
+    // dials what status reported has to reach the daemon.
+    let sb = Sandbox::new();
+    let started = sb.json(&[
+        "start",
+        "--json",
+        "--web-bind",
+        "127.0.0.1:0",
+        "--dsh-web-bind",
+        "off",
+        "--no-imd",
+    ]);
+    assert_eq!(started["status"], "started", "{started}");
+
+    let status = sb.json(&["daemon", "status", "--json"]);
+    let reported = status["web_bind"]
+        .as_str()
+        .unwrap_or_else(|| panic!("web_bind must be reported: {status}"));
+    assert_ne!(
+        reported, "127.0.0.1:0",
+        "status must not echo the REQUESTED bind: {status}"
+    );
+    let addr: std::net::SocketAddr = reported
+        .parse()
+        .unwrap_or_else(|err| panic!("web_bind {reported:?} must parse ({err}): {status}"));
+    assert_ne!(
+        addr.port(),
+        0,
+        "an ephemeral request resolves to a real port"
+    );
+    assert!(
+        status["uptime_secs"].is_u64(),
+        "uptime comes from the running daemon: {status}"
+    );
+
+    // The reported address is the one /health actually answers on, and it
+    // is the same daemon (same pid, same home).
+    let health = http_get_json(reported);
+    assert_eq!(health["pid"], status["pid"], "{health} vs {status}");
+    assert_eq!(health["home"], status["home"], "{health} vs {status}");
+    assert_eq!(
+        health["web_bind"], status["web_bind"],
+        "{health} vs {status}"
+    );
+    assert_eq!(health["build"], status["build"], "{health} vs {status}");
+    assert!(
+        status["dsh_web_bind"].is_null(),
+        "`off` stays absent, never the literal string: {status}"
+    );
+
+    sb.json(&["daemon", "stop", "--json"]);
+    // Once it is down there is nothing to ask, so the served-only fields
+    // go null rather than falling back to the recorded request.
+    let after = sb.json(&["daemon", "status", "--json"]);
+    assert_eq!(after["status"], "down", "{after}");
+    assert!(after["web_bind"].is_null(), "{after}");
+    assert!(after["uptime_secs"].is_null(), "{after}");
+}
+
+#[test]
+#[cfg(unix)]
+fn update_refuses_a_replay_restart_it_cannot_reconstruct() {
+    // A pid record with no `args` (written by a launcher older than the
+    // identity surface) used to fall through to the compiled-in defaults:
+    // a daemon on 127.0.0.1:<port> came back on 0.0.0.0:7331 and /health
+    // on the original port died. It must refuse instead — and refuse
+    // WITHOUT stopping the running daemon.
+    let sb = Sandbox::new();
+    let started = sb.json(&[
+        "start",
+        "--json",
+        "--web-bind",
+        "127.0.0.1:0",
+        // No web => no /health => nothing to reconstruct from either.
+        "--dsh-web-bind",
+        "off",
+        "--no-web",
+        "--no-imd",
+    ]);
+    assert_eq!(started["status"], "started", "{started}");
+    let pid = started["pid"].as_u64().expect("pid");
+
+    // Strip `args` exactly as a pre-v0.10.5 launcher would have left it.
+    let pidfile = sb.ccteam_home.join("state").join("orchestrator.pid");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pidfile).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("args");
+    std::fs::write(&pidfile, serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let out = sb.run(&[
+        "update",
+        "--channel",
+        "npm",
+        "--binary",
+        ccteam_bin(),
+        "--json",
+        "--now",
+    ]);
+    assert!(!out.status.success(), "a refusal must exit non-zero");
+    let verdict: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).expect("json verdict");
+    assert_eq!(verdict["status"], "error", "{verdict}");
+    assert_eq!(verdict["code"], "notManaged", "{verdict}");
+    let message = verdict["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ccteam start --web-bind"),
+        "the refusal must name the remedy: {verdict}"
+    );
+    assert!(
+        !message.contains("0.0.0.0:7331"),
+        "it must not offer a guessed bind: {verdict}"
+    );
+
+    // Still running, still the same process, still on its own bind.
+    let status = sb.json(&["daemon", "status", "--json"]);
+    assert_eq!(status["ready"], true, "the daemon must survive: {status}");
+    assert_eq!(status["pid"].as_u64(), Some(pid), "{status}");
+    sb.json(&["daemon", "stop", "--json"]);
 }
 
 #[test]

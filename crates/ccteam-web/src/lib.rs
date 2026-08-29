@@ -95,6 +95,12 @@ pub struct ServeOpts {
     /// captures it, so the CLI passes it down; `None` (library / test
     /// callers) reports `build: null` rather than a guess.
     pub build: Option<String>,
+    /// Publish `run/daemon-endpoint.json` (the address `ccteam daemon
+    /// status` dials to reach `/health`) while serving. ONLY the daemon
+    /// body sets this: a standalone `ccteam internal web` shares the same
+    /// `$CCTEAM_HOME` but is not the daemon, and letting it publish would
+    /// point every `daemon status` at the wrong server.
+    pub publish_endpoint: bool,
 }
 
 impl Default for ServeOpts {
@@ -116,6 +122,7 @@ impl Default for ServeOpts {
             ),
             no_auth_grace_secs: Some(5),
             build: None,
+            publish_endpoint: false,
         }
     }
 }
@@ -334,6 +341,23 @@ where
         local.to_string(),
         companion_local.map(|a| a.to_string()),
     );
+    // Address discovery for anything that has to ASK the running daemon
+    // who it is (`ccteam daemon status`, `ccteam update`'s restart). The
+    // launcher's recorded argv cannot answer it — `:0` requests "any free
+    // port" — so the process that owns the port publishes it, and the
+    // answer itself still comes from `/health`.
+    let endpoint = ccteam_core::daemon::endpoint_path(&paths);
+    if opts.publish_endpoint {
+        if let Err(err) = ccteam_core::daemon::write_endpoint(
+            &endpoint,
+            &ccteam_core::daemon::DaemonEndpoint {
+                pid: std::process::id(),
+                web_bind: local.to_string(),
+            },
+        ) {
+            tracing::warn!(error = %err, "could not publish the daemon endpoint");
+        }
+    }
     let state = build_state(paths, auth_state)
         .with_dsh_web(std::sync::Arc::clone(&supervisor))
         .with_health_identity(health);
@@ -370,6 +394,9 @@ where
     })
     .await
     .context("axum serve loop terminated with error")?;
+    if opts.publish_endpoint {
+        ccteam_core::daemon::remove_endpoint(&endpoint);
+    }
     let _ = shutdown_task.await;
     if let Some(handle) = companion_handle {
         handle
@@ -482,6 +509,7 @@ mod tests {
             dsh_web_bind: Some("127.0.0.1:7332".parse().unwrap()),
             no_auth_grace_secs: Some(5),
             build: Some("abc1234".to_string()),
+            publish_endpoint: false,
         };
         assert_eq!(opts.build.as_deref(), Some("abc1234"));
         assert!(!opts.no_auth);

@@ -2203,6 +2203,9 @@ fn parse_web_opts(web: &StartWebOpts) -> Result<ccteam_web::ServeOpts> {
         dsh_web_bind,
         no_auth_grace_secs: Some(5),
         build: build_commit(),
+        // This IS the daemon body (`internal daemon-run`), so it owns the
+        // endpoint publication; `ccteam internal web` deliberately does not.
+        publish_endpoint: true,
     })
 }
 

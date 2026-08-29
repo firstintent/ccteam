@@ -124,6 +124,65 @@ pub fn daemon_socket_path(paths: &CcteamPaths) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// endpoint publication (address discovery for `GET /health`)
+// ---------------------------------------------------------------------------
+
+/// `~/.ccteam/run/daemon-endpoint.json` — where the RUNNING daemon
+/// publishes the address it actually bound, after it bound it.
+///
+/// This is a **pointer, not an identity**: its only consumer uses it to
+/// find `GET /health`, and `/health` — answered by the live process — is
+/// the identity source of truth. Keeping the split is the whole point:
+/// the launcher's recorded argv says what was *requested* (`:0` means
+/// "any free port"), which is not what the daemon ends up serving.
+pub const ENDPOINT_NAME: &str = "daemon-endpoint.json";
+
+/// Resolve `~/.ccteam/run/daemon-endpoint.json`.
+pub fn endpoint_path(paths: &CcteamPaths) -> PathBuf {
+    paths.root.join("run").join(ENDPOINT_NAME)
+}
+
+/// The running daemon's actual web address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonEndpoint {
+    /// Pid of the process that published it, so a reader can tell a live
+    /// publication from one a SIGKILL left behind.
+    pub pid: u32,
+    /// `local_addr()` of the bound web listener — the assigned port, not
+    /// the requested one.
+    pub web_bind: String,
+}
+
+/// Publish the endpoint atomically (tmp + rename in the same dir).
+pub fn write_endpoint(path: &Path, endpoint: &DaemonEndpoint) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    let body = serde_json::to_vec(endpoint).context("serialize daemon endpoint")?;
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("publish {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Read the endpoint, but only while the publishing process is alive. A
+/// SIGKILLed daemon leaves the file behind, and handing that address to a
+/// caller would point it at whatever now owns the port.
+pub fn read_endpoint(path: &Path) -> Option<DaemonEndpoint> {
+    let endpoint: DaemonEndpoint =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    process_exists(endpoint.pid).then_some(endpoint)
+}
+
+/// Drop the publication (daemon shutdown). Idempotent.
+pub fn remove_endpoint(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+// ---------------------------------------------------------------------------
 // pid record
 // ---------------------------------------------------------------------------
 
@@ -1110,6 +1169,35 @@ mod tests {
         );
         std::fs::write(&path, "not json at all").unwrap();
         assert_eq!(read_pid_record(&path), None);
+    }
+
+    #[test]
+    fn endpoint_roundtrips_and_a_dead_publisher_reads_as_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("run").join(ENDPOINT_NAME);
+        let live = DaemonEndpoint {
+            pid: std::process::id(),
+            web_bind: "127.0.0.1:46303".to_string(),
+        };
+        write_endpoint(&path, &live).unwrap();
+        assert_eq!(read_endpoint(&path), Some(live));
+        assert!(!path.with_extension("tmp").exists());
+
+        // pid 0 is never a live daemon: a publication its author did not
+        // outlive must not hand out an address somebody else may now own.
+        write_endpoint(
+            &path,
+            &DaemonEndpoint {
+                pid: 0,
+                web_bind: "127.0.0.1:46303".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_endpoint(&path), None);
+
+        remove_endpoint(&path);
+        assert_eq!(read_endpoint(&path), None);
+        remove_endpoint(&path); // idempotent
     }
 
     #[test]

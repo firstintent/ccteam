@@ -1793,6 +1793,9 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
         // a chance to abort before the LAN-RCE surface goes live.
         no_auth_grace_secs: Some(5),
         build: crate::build_commit(),
+        // Standalone `ccteam internal web` shares the home but is not the
+        // daemon; publishing would point `daemon status` at this process.
+        publish_endpoint: false,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

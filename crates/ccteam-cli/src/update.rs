@@ -234,7 +234,11 @@ pub(crate) fn run_restart_contract(
         }
     };
     match outcome {
-        daemon_cli::RestartOutcome::NotManaged { hint } => {
+        // Both refusals leave the daemon RUNNING and untouched — the
+        // binary is swapped, the process is not. `RestartRefused` already
+        // says exactly that, so the reconstruction refusal reuses it.
+        daemon_cli::RestartOutcome::NotManaged { hint }
+        | daemon_cli::RestartOutcome::ReplayUnavailable { hint } => {
             RestartContractStatus::RestartRefused { hint }
         }
         daemon_cli::RestartOutcome::StopTimedOut { pid } => RestartContractStatus::RestartError {
@@ -610,28 +614,87 @@ pub(crate) fn classify_destination(dest: &Path) -> DestVerdict {
 /// install.sh's ONE ladder, in Rust. install.sh cannot be reused here:
 /// the npm channel's whole point is that the binary is already on disk,
 /// so there is no installer script to replay (and no network). The rungs
-/// are kept identical to `resolve_install_dir()` in `install.sh` —
-/// explicit override → wherever ccteam already lives (writable, and not a
-/// cargo build tree) → `$HOME/.local/bin` — because two ladders that
-/// disagree is exactly the "two ccteam binaries, whichever sorts first on
-/// PATH wins" failure install.sh documents.
+/// therefore have to be a faithful copy of `resolve_install_dir()` in
+/// `install.sh` — two ladders that disagree is exactly the "two ccteam
+/// binaries, whichever sorts first on PATH wins" failure that file
+/// documents. `install_sh_ladder_rungs_match_the_rust_copy` reads the
+/// shell source so drift fails a test rather than a user's upgrade.
+///
+/// Rungs (mirroring install.sh:68-86):
+/// 1. `$CCTEAM_INSTALL_DIR`, when non-empty;
+/// 2. `command -v ccteam` — the binary a shell would RUN, symlink-resolved
+///    to its real directory, excluding a cargo build tree, and only if
+///    that directory is writable. Note this is a PATH lookup, not
+///    `current_exe()`: "where does ccteam live" and "which binary is
+///    running right now" are different questions, and answering the wrong
+///    one installs beside the shadowing copy instead of over it;
+/// 3. `$HOME/.local/bin`.
 pub(crate) fn resolve_install_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("CCTEAM_INSTALL_DIR").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
-    if let Some(dir) = ccteam_core::current_ccteam_bin()
-        .ok()
-        .as_deref()
-        .and_then(Path::parent)
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .filter(|dir| !is_cargo_build_tree(dir))
-        .filter(|dir| is_writable_dir(dir))
-        .map(Path::to_path_buf)
-    {
-        return Ok(dir);
-    }
     let home = dirs::home_dir().context("resolve home directory for the install ladder")?;
-    Ok(home.join(".local").join("bin"))
+    Ok(resolve_install_dir_with(
+        std::env::var("CCTEAM_INSTALL_DIR").ok(),
+        std::env::var("PATH").ok(),
+        &home,
+        &|p| is_executable_file(p),
+        &|d| is_writable_dir(d),
+    ))
+}
+
+/// Testable core of the ladder: every environment input is injected, so a
+/// table test can walk the rungs without a real PATH or a real filesystem.
+pub(crate) fn resolve_install_dir_with(
+    install_dir_env: Option<String>,
+    path_env: Option<String>,
+    home: &Path,
+    is_exec: &dyn Fn(&Path) -> bool,
+    is_writable: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
+    // Rung 1 — explicit override.
+    if let Some(dir) = install_dir_env.filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    // Rung 2 — wherever a shell would find ccteam today.
+    if let Some(existing) = which_on_path("ccteam", path_env.as_deref(), is_exec) {
+        if let Some(dir) = canonical_bin(&existing)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .filter(|dir| !is_cargo_build_tree(dir))
+            .filter(|dir| is_writable(dir))
+            .map(Path::to_path_buf)
+        {
+            return dir;
+        }
+    }
+    // Rung 3 — the default.
+    home.join(".local").join("bin")
+}
+
+/// `command -v <name>`: the first executable of that name on `PATH`.
+/// Empty PATH entries mean "the current directory" in POSIX, which is
+/// exactly the kind of surprise an installer must not honour, so they are
+/// skipped.
+pub(crate) fn which_on_path(
+    name: &str,
+    path_env: Option<&str>,
+    is_exec: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    path_env?
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| Path::new(entry).join(name))
+        .find(|candidate| is_exec(candidate))
+}
+
+/// install.sh's `canonical_bin`: resolve a link to its target so a link
+/// and its target are recognised as the SAME binary rather than two rival
+/// installs. Falls back to the path as-given when it cannot be resolved
+/// (the shell helper does the same).
+fn canonical_bin(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(&m))
 }
 
 /// `<…>/target/{debug,release}` is a build output, not an install
@@ -1196,6 +1259,124 @@ mod tests {
         let plain = tmp.path().join("plain");
         std::fs::write(&plain, b"x").unwrap();
         assert_eq!(classify_destination(&plain), DestVerdict::Writable);
+    }
+
+    /// Rung-by-rung parity with the shell ladder. Each case names the
+    /// rung it exercises, in install.sh's order.
+    #[test]
+    fn install_dir_ladder_walks_install_sh_rungs_in_order() {
+        let home = Path::new("/home/u");
+        let exec = |p: &Path| {
+            matches!(
+                p.to_str(),
+                Some("/opt/first/ccteam")
+                    | Some("/home/u/.local/bin/ccteam")
+                    | Some("/ro/ccteam")
+                    | Some("/src/target/debug/ccteam")
+            )
+        };
+        let writable = |d: &Path| d != Path::new("/ro");
+        let ladder = |env: Option<&str>, path: Option<&str>| {
+            resolve_install_dir_with(
+                env.map(str::to_string),
+                path.map(str::to_string),
+                home,
+                &exec,
+                &writable,
+            )
+        };
+
+        // Rung 1 — the explicit override wins over everything.
+        assert_eq!(
+            ladder(Some("/custom"), Some("/opt/first:/home/u/.local/bin")),
+            Path::new("/custom")
+        );
+        // ...but an EMPTY override is not an override.
+        assert_eq!(
+            ladder(Some(""), Some("/opt/first")),
+            Path::new("/opt/first")
+        );
+
+        // Rung 2 — `command -v ccteam`: the FIRST PATH hit, which is the
+        // binary a shell would run. Not `current_exe()`: installing beside
+        // a shadowing copy instead of over it is the whole failure.
+        assert_eq!(
+            ladder(None, Some("/nope:/opt/first:/home/u/.local/bin")),
+            Path::new("/opt/first")
+        );
+        // Rung 2 skips a cargo build tree (`cargo clean` would delete it)…
+        assert_eq!(
+            ladder(None, Some("/src/target/debug:/home/u/.local/bin")),
+            Path::new("/home/u/.local/bin"),
+            "a build tree is not an install location"
+        );
+        // …and a directory it cannot write.
+        assert_eq!(
+            ladder(None, Some("/ro")),
+            Path::new("/home/u/.local/bin"),
+            "an unwritable dir falls through to the default"
+        );
+
+        // Rung 3 — nothing on PATH, no PATH at all.
+        assert_eq!(ladder(None, Some("/nope")), Path::new("/home/u/.local/bin"));
+        assert_eq!(ladder(None, None), Path::new("/home/u/.local/bin"));
+    }
+
+    /// Drift guard: the Rust ladder is a COPY of install.sh's, and a copy
+    /// with no test rots. Read the shell source and require every rung to
+    /// still be there — if install.sh's ladder changes, this fails and
+    /// whoever changed it has to update the Rust copy too.
+    #[test]
+    fn install_sh_ladder_rungs_match_the_rust_copy() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../install.sh")
+            .canonicalize()
+            .expect("install.sh is two levels above the crate");
+        let body = std::fs::read_to_string(&script).expect("read install.sh");
+        let ladder = body
+            .split_once("resolve_install_dir() {")
+            .expect("install.sh still defines resolve_install_dir()")
+            .1
+            .split_once("\n}")
+            .expect("resolve_install_dir() is brace-terminated")
+            .0;
+        for (rung, marker) in [
+            ("1: explicit override", "CCTEAM_INSTALL_DIR"),
+            ("2: PATH lookup", "command -v ccteam"),
+            ("2: symlink resolution", "canonical_bin"),
+            ("2: build-tree exclusion", "*/target/release|*/target/debug"),
+            ("2: writability", "-w \"$_dir\""),
+            ("3: default", "$HOME/.local/bin"),
+        ] {
+            assert!(
+                ladder.contains(marker),
+                "install.sh's ladder lost rung {rung} (marker {marker:?}); \
+                 `update::resolve_install_dir_with` mirrors it and must be \
+                 updated in the same change.\n--- ladder ---\n{ladder}"
+            );
+        }
+        // Order matters: the override is checked before the PATH lookup.
+        assert!(
+            ladder.find("CCTEAM_INSTALL_DIR").unwrap() < ladder.find("command -v ccteam").unwrap(),
+            "install.sh checks the override first; the Rust copy assumes it"
+        );
+    }
+
+    #[test]
+    fn which_on_path_takes_the_first_hit_and_ignores_empty_entries() {
+        let exec = |p: &Path| p.starts_with("/b") || p.starts_with("/c");
+        assert_eq!(
+            which_on_path("ccteam", Some("/a:/b:/c"), &exec),
+            Some(PathBuf::from("/b/ccteam"))
+        );
+        // An empty PATH entry means "cwd" in POSIX — an installer must not
+        // resolve its destination from wherever it happens to be run.
+        assert_eq!(
+            which_on_path("ccteam", Some(":/b"), &exec),
+            Some(PathBuf::from("/b/ccteam"))
+        );
+        assert_eq!(which_on_path("ccteam", Some("/a"), &exec), None);
+        assert_eq!(which_on_path("ccteam", None, &exec), None);
     }
 
     #[test]
