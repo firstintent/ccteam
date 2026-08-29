@@ -360,8 +360,11 @@ jobs:
           DIST_TAG=latest
           case "$TAG" in *-*) DIST_TAG=next ;; esac
           cd plugins/ccteam-ui
-          # The engine packages are optional deps and are not needed to build the plugin.
-          npm ci --omit=optional
+          # Plain `npm ci`: the four @ccteam/engine-* optionalDependencies 404 until
+          # the previous step publishes them (npm tolerates a missing optional dep),
+          # and `--omit=optional` must NOT be used — rolldown's native binding is
+          # itself an optional dependency, so omitting optionals breaks the build.
+          npm ci
           npm run build
           # Stamp the tag onto a copy of the manifest: package version, the four
           # optionalDependencies, and `ccteam.engine` (the pinned engine version the
