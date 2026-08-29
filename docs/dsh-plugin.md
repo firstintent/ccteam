@@ -63,9 +63,11 @@ Then restart that `dsh web` process and hard-refresh the browser
 3. **Bootstraps credentials.** On the same machine, under the same OS user,
    the workbench needs no pasting: the plugin reads exactly one file,
    `$CCTEAM_HOME/secrets/web-token` (the console token the daemon writes for
-   its own operator), and asks the daemon for the tool face's enrollment
-   credential over REST, storing it in the settings card. A token you enter
-   in the card always wins over the file.
+   its own operator), and asks the daemon for this installation's tool-face
+   enrollment credential — `POST /api/v1/enroll` with `ensure: true` and the
+   label `dsh-plugin:<profile>`, so the daemon keeps exactly one credential
+   per DSH profile no matter how often DSH restarts — storing it in the
+   settings card. A token you enter in the card always wins over the file.
 4. **Gates the workbench on the engine** (§4): until the daemon answers, the
    first screen says **The ccteam engine is not running** with a **Start the
    engine** button; with no project yet it shows **Add a workspace**.
@@ -150,7 +152,9 @@ ccteam-ui** opens with the **Engine** section:
   *Started from the CLI / another entry; the plugin shows it*) · **Starting**
   · **Installing** · **Stopped** (installed, daemon not running) · **Not
   installed** · **Platform not supported** · **Home mismatch** · **Version
-  mismatch** (§3 / §7).
+  mismatch** (§3 / §7). Under a mismatch or an unsupported platform the
+  host's own sentence is printed underneath; in the healthy states the facts
+  line stands in for it.
 - **Facts** — `engine v<installed>` (hover shows the binary's path),
   `daemon v<running>` only when the running daemon differs from the installed
   binary, `pid <n>`, `$CCTEAM_HOME` (middle-truncated; hover shows it whole),
@@ -200,9 +204,9 @@ closes it. On first use the workbench is gated on the engine:
   simply absent.
 - The **version banner** across the top: *Engine v… is older than the plugin
   requires (v…)* with an **Update engine** button, or *Plugin v… is older than
-  the engine (v…)* with a copyable `dsh plugin update @ccteam/ccteam-ui` (DSH
-  requires the profile flag, so run it as
-  `dsh plugin --profile web update @ccteam/ccteam-ui`); **Dismiss** hides it.
+  the engine (v…)* with a copyable
+  `dsh plugin --profile <name> update @ccteam/ccteam-ui` and the hint *profile
+  = the one you started dsh web with*; **Dismiss** hides it.
   The repair is one-way — the running binary is never swapped silently.
 
 ## 5. Configure the faces
@@ -218,7 +222,7 @@ ccteam back-ports that read into the served client bundle); a native
 |---|---|---|
 | **ccteam daemon URL** | the daemon every face talks to; default `http://127.0.0.1:7331` | only for a daemon elsewhere (another port, a LAN machine); a non-loopback URL makes the Engine section attach-only |
 | **REST API token** | identifies **you**, so the workbench can read your team | bootstrapped from `$CCTEAM_HOME/secrets/web-token` on the same machine; paste it (ccteam web → **Settings → Account**, prefix-less accepted) only for a daemon whose home you cannot read |
-| **Enrollment credential** | identifies **this DSH process**, so its agent can call ccteam tools | asked of a local daemon automatically and stored here; paste one from ccteam web → **Settings → Access** (`ccteam-enroll:<id>:<secret>`) for a daemon elsewhere |
+| **Enrollment credential** | identifies **this DSH process**, so its agent can call ccteam tools | asked of a local daemon automatically — one slot per DSH profile (`dsh-plugin:<profile>`), the daemon answers the same record on every restart — and stored here; paste one from ccteam web → **Settings → Access** (`ccteam-enroll:<id>:<secret>`) for a daemon elsewhere |
 | **Default project** (optional) | the project new sessions land in when the workbench names none | a project slug; blank means the workbench asks |
 
 The two credentials are **not** interchangeable — one is a person, the other a
@@ -310,7 +314,7 @@ since 0.1.0-rc.7.
 |---|---|
 | **Not connected** / **The ccteam engine is not running** | Press **Start the engine** on the first screen (or **Start** in the settings card's Engine section, or run `ccteam start`; the panel also shows a copyable command). **Stopped** means the binary is there and the daemon is not; **Not installed** means no binary — starting installs it from the platform package first. |
 | **Home mismatch** (first screen: **Engine home mismatch**) | A daemon is answering at the configured URL from a different `$CCTEAM_HOME`; the panel lists both homes. The plugin will not start a second one. Point both at one `CCTEAM_HOME` and restart DSH, or point the card's daemon URL at the daemon you mean. |
-| **Version mismatch** / version banner | The running engine is not the version this plugin ships against. *Engine … is older than the plugin requires* → **Update engine** (drain + graceful restart + verify). *Plugin … is older than the engine* → `dsh plugin --profile web update @ccteam/ccteam-ui` (the banner's copy chip omits the profile flag DSH requires) and restart DSH. The running binary is never swapped silently. |
+| **Version mismatch** / version banner | The running engine is not the version this plugin ships against. *Engine … is older than the plugin requires* → **Update engine** (drain + graceful restart + verify). *Plugin … is older than the engine* → copy the banner's `dsh plugin --profile <name> update @ccteam/ccteam-ui` (`<name>` = the profile you started `dsh web` with, usually `web`) and restart DSH. The running binary is never swapped silently. |
 | **Platform not supported** | ccteam publishes engines for Linux and macOS on x64 and arm64; nothing is installed on other platforms (Windows is unsupported; WSL counts as Linux). Install ccteam another way and point the card at it, or use ccteam web. |
 | **Install refused: symlink / package-managed destination** | The ladder landed on a `ccteam` that belongs to something else (a symlink, Homebrew, nix, snap, a `node_modules` tree). Update it with that tool, or set `CCTEAM_INSTALL_DIR=<dir>` for the DSH process so the plugin installs elsewhere. |
 | **401** | A REST request on the wire uses `Bearer ccteam:<hex>`. The card's **REST API token** is that personal token (paste it without `Bearer`); the **enrollment credential** is the `ccteam-enroll:<id>:<secret>` string. They are different credentials — check you did not paste one into the other's field. |

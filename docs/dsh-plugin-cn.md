@@ -56,8 +56,10 @@ Cmd+Shift+R）。插件启动时会：
    home 已有 daemon 在应答，则直接接上（§3）。
 3. **自动配好凭据。** 同一台机器、同一个 OS 用户下，工作台不需要粘贴任何
    东西：插件只读一个文件 `$CCTEAM_HOME/secrets/web-token`（daemon 为自己的
-   operator 写下的控制台 token），并通过 REST 向 daemon 领取工具面的
-   enrollment 凭据、存进设置卡。你在卡里手填的 token 永远优先于文件。
+   operator 写下的控制台 token），并向 daemon 领取这份安装自己的工具面
+   enrollment 凭据——`POST /api/v1/enroll` 带 `ensure: true` 和标签
+   `dsh-plugin:<profile>`，daemon 对每个 DSH profile 只保留一份，DSH 重启多少次
+   都不会堆出新记录——然后存进设置卡。你在卡里手填的 token 永远优先于文件。
 4. **把工作台闸在引擎上**（§4）：daemon 应答之前，首屏显示「ccteam 引擎未运行」和一个
    「启动引擎」按钮；还没有项目时显示「添加工作区」。
 
@@ -121,7 +123,8 @@ home、一个 daemon。规则如下：
 - **状态** —— 一个状态点加下列之一：「正在读取引擎状态…」·「运行中」（本插件起的）·
   「已挂靠」（别处起的；提示行「由 CLI/其他入口启动，插件已接管显示」）·「启动中」·
   「安装中」·「已停止」（已装、daemon 未跑）·「未安装」·「不支持此平台」·
-  「家目录不一致」·「版本不一致」（§3 / §7）。
+  「家目录不一致」·「版本不一致」（§3 / §7）。不一致或平台不支持时，下面会再印
+  一行 host 自己的说明；健康状态下由事实行代替它。
 - **事实行** —— `引擎 v<已装版本>`（悬停显示二进制路径）、`daemon v<运行版本>`（只在
   运行中的 daemon 与已装二进制版本不同时出现）、`pid <n>`、`$CCTEAM_HOME`（中截；
   悬停显示全文）、web 绑定地址，以及 daemon 应答时的「打开 ccteam web」链接。
@@ -157,9 +160,8 @@ home、一个 daemon。规则如下：
   「slug（可选）」（留空按目录名生成）、「添加」。DSH 自己有工作区时，会多出一个
   「从 DSH 导入」列表，每个工作区一行、一键添加；没有工作区则这个列表不出现。
 - 顶部的**版本横幅**：「引擎 v… 低于插件要求 v…」配「更新引擎」按钮，或
-  「插件 v… 低于引擎 v…」配可复制的 `dsh plugin update @ccteam/ccteam-ui`（DSH 要求
-  带 profile，实际请执行 `dsh plugin --profile web update @ccteam/ccteam-ui`）；
-  「关闭提示」隐藏它。修复是单向的——正在跑的二进制绝不会被悄悄换掉。
+  「插件 v… 低于引擎 v…」配可复制的 `dsh plugin --profile <name> update @ccteam/ccteam-ui`
+  和提示「profile = 启动 dsh web 时用的那个」；「关闭提示」隐藏它。修复是单向的——正在跑的二进制绝不会被悄悄换掉。
 
 ## 5. 配置三个面
 
@@ -173,7 +175,7 @@ home、一个 daemon。规则如下：
 |---|---|---|
 | **ccteam daemon 地址** | 三个面共用的 daemon 地址；默认 `http://127.0.0.1:7331` | 只在 daemon 在别处时填（别的端口、局域网另一台机器）；非 loopback 地址会让「引擎」段变成只 attach |
 | **REST API token** | 标识**你这个人**，工作台凭它读你的团队 | 同机时自动从 `$CCTEAM_HOME/secrets/web-token` 读取；只有 daemon 的 home 你读不到时才需要粘贴（ccteam web → **Settings → Account**，可不带前缀） |
-| **Enrollment 凭据** | 标识**这个 DSH 进程**，它的 agent 凭此调用 ccteam 工具 | 本机 daemon 会自动领取并存在这里；daemon 在别处时从 ccteam web → **Settings → Access** 复制一枚 `ccteam-enroll:<id>:<secret>` 粘贴 |
+| **Enrollment 凭据** | 标识**这个 DSH 进程**，它的 agent 凭此调用 ccteam 工具 | 本机 daemon 会自动领取——每个 DSH profile 一个槽位（`dsh-plugin:<profile>`），每次重启 daemon 答的都是同一条记录——并存在这里；daemon 在别处时从 ccteam web → **Settings → Access** 复制一枚 `ccteam-enroll:<id>:<secret>` 粘贴 |
 | **默认项目**（可选） | 工作台没点名项目时新会话落到哪个项目 | 一个项目 slug；留空则每次询问 |
 
 两个凭据**不能互换**——一个是人，一个是进程。凭据字段是只写的：卡片只显示
@@ -241,7 +243,7 @@ harness 的目录里选**模型**和 **effort**（留空即 harness 默认），
 |---|---|
 | **未连接** / **「ccteam 引擎未运行」** | 首屏点「启动引擎」（或设置卡「引擎」段的「启动」，或执行 `ccteam start`；面板也会显示可复制的命令）。「已停止」= 二进制在、daemon 没跑；「未安装」= 没有二进制——启动会先从平台包把它装上。 |
 | **「家目录不一致」**（首屏：「引擎家目录不一致」） | 配置的地址上有个 daemon 在应答，但它的 `$CCTEAM_HOME` 不是插件的；面板并列两个 home。插件不会起第二个。统一 `CCTEAM_HOME` 后重启 DSH，或把卡上的 daemon 地址指向你要的那个 daemon。 |
-| **「版本不一致」** / 版本横幅 | 正在跑的引擎不是本插件钉死的版本。「引擎 … 低于插件要求 …」→ 点「更新引擎」（等 turn 跑完 + 优雅重启 + 核对版本）。「插件 … 低于引擎 …」→ `dsh plugin --profile web update @ccteam/ccteam-ui`（横幅的复制片没带 DSH 要求的 profile 参数）后重启 DSH。正在跑的二进制绝不会被悄悄换掉。 |
+| **「版本不一致」** / 版本横幅 | 正在跑的引擎不是本插件钉死的版本。「引擎 … 低于插件要求 …」→ 点「更新引擎」（等 turn 跑完 + 优雅重启 + 核对版本）。「插件 … 低于引擎 …」→ 复制横幅里的 `dsh plugin --profile <name> update @ccteam/ccteam-ui`（`<name>` = 启动 `dsh web` 时用的 profile，通常是 `web`）后重启 DSH。正在跑的二进制绝不会被悄悄换掉。 |
 | **「不支持此平台」** | ccteam 只为 Linux 和 macOS 的 x64 / arm64 发布引擎；其它平台什么都不装（Windows 不支持；WSL 算 Linux）。请另行安装 ccteam 并把卡指向它，或直接用 ccteam web。 |
 | **安装被拒：目标是软链 / 归包管理器** | 安装梯度落到了一个属于别人的 `ccteam`（软链、Homebrew、nix、snap、`node_modules` 目录）。用那个工具更新它，或给 DSH 进程设 `CCTEAM_INSTALL_DIR=<dir>` 让插件装到别处。 |
 | **401** | HTTP 请求中的 REST 形式是 `Bearer ccteam:<hex>`。卡片里的 **REST API token** 就是这枚个人 token（粘贴时不要加 `Bearer`）；**Enrollment 凭据** 是 `ccteam-enroll:<id>:<secret>`。二者是不同凭据——先确认没有把其中一个填进了另一个的框。 |
