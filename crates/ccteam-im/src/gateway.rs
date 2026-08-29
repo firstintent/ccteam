@@ -301,6 +301,9 @@ struct UnlockedTurnPlan {
     provisional_inject: bool,
     prior_steered: bool,
     prime_tool_surface: bool,
+    /// Snapshot of [`Gateway::reply_wait`] taken while the lock was held, so
+    /// the unlocked commit does not have to re-read it (or re-read the env).
+    reply_wait: std::time::Duration,
 }
 
 /// How often a paneless session's pump mirrors a mid-turn "still working"
@@ -603,6 +606,12 @@ pub struct Gateway {
     /// `None` in unit tests that don't exercise project creation; the
     /// daemon sets it via [`Gateway::enable_project_creation`].
     project_paths: Option<CcteamPaths>,
+    /// How long a paneless turn waits for the vendor's first event before
+    /// answering without one. Resolved ONCE here (see
+    /// [`gateway_reply_wait_duration`]) instead of re-read from the
+    /// environment on every turn; tests set it with
+    /// [`Gateway::set_reply_wait`].
+    reply_wait: std::time::Duration,
     /// Hot-reloaded view of `~/.ccteam/config.yaml` (re-parsed only on mtime
     /// change; pull-based, no watcher). `Some` once the daemon calls
     /// [`Gateway::enable_project_creation`]; lets `/cd` resolve a project
@@ -2110,6 +2119,7 @@ impl Gateway {
                 crate::pending::PendingInteractions::new(),
             )),
             project_paths: None,
+            reply_wait: gateway_reply_wait_duration(),
             config: None,
             progress_projection: None,
             im_reload_tx: None,
@@ -2225,6 +2235,14 @@ impl Gateway {
     /// which of the two it is.
     pub fn pending_handle(&self) -> Arc<tokio::sync::Mutex<crate::pending::PendingInteractions>> {
         Arc::clone(&self.pending)
+    }
+
+    /// Override the paneless first-event wait (default:
+    /// [`gateway_reply_wait_duration`], i.e. `CCTEAM_IM_GATEWAY_REPLY_WAIT_MS`
+    /// or 5ms). Lets a test widen the window for a deliberately slow adapter
+    /// without touching the process environment.
+    pub fn set_reply_wait(&mut self, wait: std::time::Duration) {
+        self.reply_wait = wait;
     }
 
     /// Enable `/newproject <slug> <path>` by giving the gateway the path
@@ -8504,7 +8522,7 @@ impl Gateway {
         } else {
             let mut replies = Vec::new();
             let mut events = session.adapter.events(&session.thread);
-            let wait = gateway_reply_wait_duration();
+            let wait = self.reply_wait;
             while let Ok(Some(evt)) = tokio::time::timeout(wait, events.next()).await {
                 if let Some(text) = event_text(&evt) {
                     replies.push(text);
@@ -13135,7 +13153,16 @@ impl Gateway {
         origin: TurnOrigin,
         deadline: GatewayDeadline,
     ) -> Result<Vec<String>> {
-        let (chat, session, generation, start_visible_events, project_paths, event_sink, pending) = {
+        let (
+            chat,
+            session,
+            generation,
+            start_visible_events,
+            project_paths,
+            event_sink,
+            pending,
+            reply_wait,
+        ) = {
             let guard = deadline.lock(&gateway).await?;
             let session = guard
                 .sessions
@@ -13156,6 +13183,7 @@ impl Gateway {
                 guard.project_paths.clone(),
                 guard.event_sink.clone(),
                 Arc::clone(&guard.pending),
+                guard.reply_wait,
             )
         };
         deadline.ensure_vendor_phase_can_start()?;
@@ -13220,8 +13248,9 @@ impl Gateway {
                     Ok(Vec::new())
                 } else {
                     let mut events = session.adapter.events(&session.thread);
-                    let wait = gateway_reply_wait_duration();
-                    while let Ok(Some(event)) = tokio::time::timeout(wait, events.next()).await {
+                    while let Ok(Some(event)) =
+                        tokio::time::timeout(reply_wait, events.next()).await
+                    {
                         if let Some(text) = event_text(&event) {
                             return Ok(vec![text]);
                         }
@@ -13319,6 +13348,7 @@ impl Gateway {
             requested_routing,
             provisional_inject,
             prior_steered,
+            reply_wait: self.reply_wait,
         })
     }
 
@@ -13369,8 +13399,7 @@ impl Gateway {
             }
         } else {
             let mut events = plan.session.adapter.events(&plan.session.thread);
-            let wait = gateway_reply_wait_duration();
-            let _ = tokio::time::timeout(wait, events.next()).await;
+            let _ = tokio::time::timeout(plan.reply_wait, events.next()).await;
         }
         Ok(submitted.turn_id.0)
     }
@@ -15038,6 +15067,11 @@ mod open_work_items_tests {
     }
 }
 
+/// How long a paneless turn waits for the vendor's first event before it
+/// answers without one. Read ONCE per gateway, at construction — the value
+/// then lives on [`Gateway::reply_wait`] so every turn path uses the same
+/// number and a test can set it directly rather than `set_var` it under every
+/// sibling test in this binary (CLI-ENVTEST-1).
 fn gateway_reply_wait_duration() -> std::time::Duration {
     const DEFAULT_MS: u64 = 5;
     let ms = std::env::var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS")
@@ -15611,14 +15645,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex as StdMutex, OnceLock};
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     fn agent_msg(kind: fn(ThreadItem) -> ThreadEvent, text: &str) -> ThreadEvent {
         kind(ThreadItem {
@@ -24504,17 +24530,19 @@ mod tests {
         assert_eq!(s3.role, "reviewer", "/new claude reviewer → explicit role");
     }
 
-    #[allow(clippy::await_holding_lock)]
+    /// CLI-ENVTEST-1: the wait is set on the gateway, not in the process
+    /// environment — the old `set_var`/`remove_var` pair raced every sibling
+    /// test in this binary, and any turn that ran while it was in force
+    /// silently used a 20× wider window.
     #[tokio::test]
     async fn gateway_reply_wait_can_capture_realistic_delayed_event() {
-        let _guard = env_lock();
-        std::env::set_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS", "100");
         let fake = Arc::new(FakeAdapter::new_with_event_delay(
             AgentVendor::Claude,
             std::time::Duration::from_millis(25),
         ));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.set_reply_wait(std::time::Duration::from_millis(100));
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
@@ -24524,7 +24552,6 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "hi after delay")
             .await
             .unwrap();
-        std::env::remove_var("CCTEAM_IM_GATEWAY_REPLY_WAIT_MS");
 
         assert_eq!(replies, vec!["alpha-reviewer-s1 echo: hi after delay"]);
     }

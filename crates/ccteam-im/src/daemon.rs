@@ -2411,22 +2411,6 @@ mod tests {
             .expect("non-telegram creds → Ok no-op");
     }
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex as StdMutex, OnceLock};
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
-        if let Some(value) = value {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
-        }
-    }
-
     #[cfg(feature = "telegram")]
     fn tg_bot_reg(im_chat_id: &str) -> BotRegistration {
         BotRegistration {
@@ -2466,19 +2450,18 @@ mod tests {
         assert_eq!(out, vec!["339498819", "chat-1", "chat-2"]);
     }
 
-    #[allow(clippy::await_holding_lock)]
+    /// CLI-ENVTEST-1: the tempdir is INJECTED, not pinned through `HOME` /
+    /// `CCTEAM_HOME`. `ccteam_root` covers everything the daemon resolves off
+    /// the ccteam home (credentials, bot registry, config.yaml, routing state,
+    /// the durable outbox) and `registry` covers `projects_root`, which is the
+    /// only other thing `HOME` was standing in for here.
     #[tokio::test(flavor = "current_thread", start_paused = false)]
     async fn daemon_boots_and_exits_on_max_runtime() {
-        let _guard = env_lock();
-        // Point HOME at a tempdir so no real credentials are read.
         let tmp = TempDir::new().unwrap();
-        let old_home = std::env::var_os("HOME");
-        let old_ccteam_home = std::env::var_os("CCTEAM_HOME");
-        std::env::set_var("HOME", tmp.path());
-        std::env::set_var("CCTEAM_HOME", tmp.path().join(".ccteam"));
         let args = DaemonArgs {
             credentials: None,
-            registry: None,
+            registry: Some(tmp.path().join("projects")),
+            ccteam_root: Some(tmp.path().join(".ccteam")),
             max_runtime: Some(Duration::from_millis(120)),
             adapter_factory: None,
             channels_override: None,
@@ -2486,8 +2469,6 @@ mod tests {
             ..Default::default()
         };
         run_daemon(args).await.unwrap();
-        restore_env("CCTEAM_HOME", old_ccteam_home);
-        restore_env("HOME", old_home);
     }
 
     /// `default_adapter_factory` must route the Codex arm to the mode-3

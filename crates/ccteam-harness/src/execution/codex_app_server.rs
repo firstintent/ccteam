@@ -359,12 +359,28 @@ impl CodexAppServerAdapter {
     /// otherwise `$CODEX_HOME/app-server-control/app-server-control.sock`
     /// with `CODEX_HOME` falling back to `~/.codex`.
     pub fn resolve_socket_path() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os(APP_SERVER_SOCKET_ENV) {
+        Self::resolve_socket_path_from(
+            std::env::var_os(APP_SERVER_SOCKET_ENV),
+            std::env::var_os("CODEX_HOME"),
+            dirs::home_dir(),
+        )
+    }
+
+    /// Pure resolution rule behind [`Self::resolve_socket_path`], factored out
+    /// so unit tests can exercise all three tiers without mutating process env
+    /// (which would race every parallel test in the same binary — same reason
+    /// `ccteam_core::projects::resolve_claude_json_path_from_env` is split).
+    fn resolve_socket_path_from(
+        socket_override: Option<std::ffi::OsString>,
+        codex_home: Option<std::ffi::OsString>,
+        home: Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        if let Some(p) = socket_override {
             return Some(PathBuf::from(p));
         }
-        let home = std::env::var_os("CODEX_HOME")
+        let home = codex_home
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
+            .or_else(|| home.map(|h| h.join(".codex")))?;
         Some(
             home.join("app-server-control")
                 .join("app-server-control.sock"),
@@ -3848,12 +3864,40 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// All three tiers of the socket rule, asserted on the pure resolver so
+    /// nothing here touches the process environment (CLI-ENVTEST-1). The old
+    /// version only covered the override, and covered it by `set_var`-ing
+    /// `CODEX_APP_SERVER_SOCKET` under every sibling test in this binary.
     #[test]
-    fn resolve_socket_env_override_wins() {
-        std::env::set_var(APP_SERVER_SOCKET_ENV, "/tmp/ccteam-test-codex.sock");
-        let p = CodexAppServerAdapter::resolve_socket_path().unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/ccteam-test-codex.sock"));
-        std::env::remove_var(APP_SERVER_SOCKET_ENV);
+    fn resolve_socket_prefers_the_override_then_codex_home_then_the_home_dir() {
+        use std::ffi::OsString;
+        let resolve = CodexAppServerAdapter::resolve_socket_path_from;
+
+        // 1. An explicit socket override wins outright, even with the others set.
+        assert_eq!(
+            resolve(
+                Some(OsString::from("/tmp/ccteam-test-codex.sock")),
+                Some(OsString::from("/codex-home")),
+                Some(PathBuf::from("/home/u")),
+            ),
+            Some(PathBuf::from("/tmp/ccteam-test-codex.sock"))
+        );
+        // 2. Else CODEX_HOME's control socket.
+        assert_eq!(
+            resolve(None, Some(OsString::from("/codex-home")), None),
+            Some(PathBuf::from(
+                "/codex-home/app-server-control/app-server-control.sock"
+            ))
+        );
+        // 3. Else `~/.codex`.
+        assert_eq!(
+            resolve(None, None, Some(PathBuf::from("/home/u"))),
+            Some(PathBuf::from(
+                "/home/u/.codex/app-server-control/app-server-control.sock"
+            ))
+        );
+        // Nothing to go on → no socket (never a bare relative path).
+        assert_eq!(resolve(None, None, None), None);
     }
 
     #[test]

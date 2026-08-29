@@ -1,32 +1,45 @@
-//! CLI-ENVTEST-1 — a guard test that keeps `#[cfg(test)]` code in this crate
-//! out of the process environment.
+//! CLI-ENVTEST-1 — a workspace-wide guard test that keeps `#[cfg(test)]` code
+//! in EVERY `crates/*/src/**` out of the process environment.
 //!
-//! `ccteam-cli` ships a single binary and no lib target, so EVERY
-//! `#[cfg(test)]` module under `src/` compiles into one test binary and runs
-//! in one process. A test that `set_var`s `HOME` / `CCTEAM_HOME` /
-//! `CCTEAM_MUX_BACKEND` and restores it afterwards therefore mutates shared
-//! state under every sibling test that resolves a root from the environment —
-//! the loser writes its files into a stranger's tempdir. That is not a
-//! hypothetical: it turned CI's deterministic-baseline job red twice in one
-//! day on commits that only touched a backlog file
-//! (`web_chat_newproject_scaffolds_registers_and_cd_works`, reading a
-//! `config.yaml` some other test's restore had moved out from under it).
+//! A crate's unit tests all share ONE test process (one per lib target, one
+//! per bin target — and `ccteam-cli` has no lib at all, so its whole `src/`
+//! is a single binary). A test that `set_var`s `HOME` / `CCTEAM_HOME` /
+//! `CLAUDE_CONFIG_HOME` / `CCTEAM_MUX_BACKEND` and restores it afterwards
+//! therefore mutates shared state under every sibling test in that process
+//! that resolves a root from the environment — the loser writes its files
+//! into a stranger's tempdir, or reads a root that has already been restored
+//! out from under it. That is not a hypothetical: it turned CI's
+//! deterministic-baseline job red twice in one day on commits that only
+//! touched a backlog file (`web_chat_newproject_scaffolds_registers_and_cd_works`,
+//! reading a `config.yaml` some other test's restore had moved).
 //!
-//! The rule (AGENTS.md §六) is: take the root/backend as an argument
-//! (`_in(root)` / an injected backend), and if a case genuinely needs the
-//! environment, move it to `crates/ccteam-cli/tests/*.rs`, where Cargo gives
-//! it its own process. This test enforces that rule mechanically so the next
-//! `set_var` never has to be diagnosed as a flake again.
+//! The rule (AGENTS.md §六) is: take the root as an argument (`_in(root)` /
+//! an injected backend), and if a case genuinely exercises env RESOLUTION
+//! itself, move it to that crate's `crates/<crate>/tests/*.rs`, where Cargo
+//! gives it its own process. This test enforces that rule mechanically so the
+//! next `set_var` never has to be diagnosed as a flake again.
 //!
-//! Scope note: only `#[cfg(test)]` regions are scanned. Production code in
-//! this crate legitimately sets env (`main.rs` pins `CCTEAM_HOME` and
-//! `RMUX_SDK_DAEMON_BINARY` for child processes) — that is a process-startup
-//! decision, not a test racing its siblings.
+//! It lives in `ccteam-cli` because that is the workspace's top-level binary
+//! crate and `--bins` puts it inside `make test-baseline`; it deliberately
+//! scans the whole workspace rather than only its own crate — one fallback
+//! missed usually has siblings (AGENTS.md §五 総纲「同形扫一遍」).
+//!
+//! Scope note: only `#[cfg(test)]` regions are scanned. Production code
+//! legitimately sets env (`ccteam-cli/src/main.rs` pins `CCTEAM_HOME` and
+//! `RMUX_SDK_DAEMON_BINARY` for child processes; `ccteam-core`'s
+//! `disable_tool_surface_bootstrap_for_tests` is a monotone, never-restored
+//! switch) — a process-startup decision is not a test racing its siblings.
 
 use std::path::{Path, PathBuf};
 
 /// Byte range of one `#[cfg(test)]` item body, `[start, end)`.
 type Region = (usize, usize);
+
+/// Identifier bytes, so a trailing `r` in `four` cannot be mistaken for the
+/// start of a raw string literal.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
 
 /// Lexer state, so `#[cfg(test)]` inside a doc comment and `{` inside a
 /// string literal cannot be mistaken for code.
@@ -50,6 +63,9 @@ enum Mode {
 /// `#[cfg(test)]` marker nor the `set_var` hit can come from prose or from a
 /// fixture string — this very file quotes both.
 fn cfg_test_regions(src: &str) -> (Vec<Region>, Vec<bool>) {
+    // Byte operations only: this workspace's sources are full of CJK comments
+    // and `…`, and slicing `src` at a byte index that lands mid-character
+    // panics (it did, the first time this guard was pointed at the workspace).
     let bytes = src.as_bytes();
     let mut mode = Mode::Code;
     let mut raw_hashes = 0usize;
@@ -102,7 +118,7 @@ fn cfg_test_regions(src: &str) -> (Vec<Region>, Vec<bool>) {
                 }
             }
             Mode::RawStr => {
-                if b == b'"' && src[i + 1..].starts_with(&"#".repeat(raw_hashes)) {
+                if b == b'"' && bytes[i + 1..].iter().take(raw_hashes).all(|c| *c == b'#') {
                     mode = Mode::Code;
                     i += 1 + raw_hashes;
                 } else {
@@ -119,12 +135,11 @@ fn cfg_test_regions(src: &str) -> (Vec<Region>, Vec<bool>) {
                 } else if b == b'"' {
                     mode = Mode::Str;
                     i += 1;
-                } else if (b == b'r' || b == b'b')
-                    && src[i..].starts_with('r')
-                    && src[i + 1..].starts_with('#')
-                {
-                    let hashes = src[i + 1..].bytes().take_while(|c| *c == b'#').count();
-                    if src[i + 1 + hashes..].starts_with('"') {
+                } else if b == b'r' && !i.checked_sub(1).is_some_and(|p| is_ident_byte(bytes[p])) {
+                    // `r"…"` / `r#"…"#` (and the `br` byte-string forms, whose
+                    // `b` is just an identifier byte before this `r`).
+                    let hashes = bytes[i + 1..].iter().take_while(|c| **c == b'#').count();
+                    if bytes.get(i + 1 + hashes) == Some(&b'"') {
                         mode = Mode::RawStr;
                         raw_hashes = hashes;
                         i += 2 + hashes;
@@ -135,7 +150,7 @@ fn cfg_test_regions(src: &str) -> (Vec<Region>, Vec<bool>) {
                     // A char literal; a lifetime (`'a`) has no closing quote.
                     mode = Mode::Char;
                     i += 1;
-                } else if src[i..].starts_with("#[cfg(test)]") {
+                } else if bytes[i..].starts_with(b"#[cfg(test)]") {
                     pending.push(depth as usize);
                     i += "#[cfg(test)]".len();
                 } else if b == b'{' {
@@ -183,11 +198,27 @@ fn rust_sources_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Every `set_var` / `remove_var` call site that sits inside a
-/// `#[cfg(test)]` region, as `path:line`.
-fn env_mutations_in_test_regions(src_dir: &Path) -> Vec<String> {
+/// Every `crates/<crate>/src` directory in the workspace.
+fn workspace_crate_src_dirs(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(workspace_root.join("crates")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let src = entry.path().join("src");
+        if src.is_dir() {
+            out.push(src);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every `set_var` / `remove_var` call site under `scan_dir` that sits inside
+/// a `#[cfg(test)]` region, reported as `path:line` relative to `display_root`.
+fn env_mutations_in_test_regions(scan_dir: &Path, display_root: &Path) -> Vec<String> {
     let mut hits = Vec::new();
-    for file in rust_sources_under(src_dir) {
+    for file in rust_sources_under(scan_dir) {
         let Ok(text) = std::fs::read_to_string(&file) else {
             continue;
         };
@@ -207,9 +238,7 @@ fn env_mutations_in_test_regions(src_dir: &Path) -> Vec<String> {
                     continue;
                 }
                 let line = text[..at].lines().count();
-                let shown = file
-                    .strip_prefix(src_dir.parent().and_then(Path::parent).unwrap_or(src_dir))
-                    .unwrap_or(&file);
+                let shown = file.strip_prefix(display_root).unwrap_or(&file);
                 hits.push(format!("{}:{line}", shown.display()));
             }
         }
@@ -221,23 +250,38 @@ fn env_mutations_in_test_regions(src_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn src_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
+    /// `crates/ccteam-cli` → the workspace root two levels up.
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/<crate> lives two levels under the workspace root")
+            .to_path_buf()
     }
 
-    /// The guard itself. See the module docs for why this crate cannot
-    /// tolerate env mutation in `#[cfg(test)]` code.
+    /// The guard itself, over every crate in the workspace. See the module
+    /// docs for why unit tests here cannot tolerate env mutation.
     #[test]
-    fn no_cfg_test_code_in_this_crate_mutates_the_process_environment() {
-        let hits = env_mutations_in_test_regions(&src_dir());
+    fn no_cfg_test_code_in_the_workspace_mutates_the_process_environment() {
+        let root = workspace_root();
+        let dirs = workspace_crate_src_dirs(&root);
+        assert!(
+            dirs.len() >= 6,
+            "the scan found almost no crates ({dirs:?}) — a guard that scans \
+             nothing passes for the wrong reason"
+        );
+        let hits: Vec<String> = dirs
+            .iter()
+            .flat_map(|dir| env_mutations_in_test_regions(dir, &root))
+            .collect();
         assert!(
             hits.is_empty(),
-            "`#[cfg(test)]` code in ccteam-cli must not set/remove env vars — \
-             this crate has no lib target, so all of src/ shares ONE test \
-             process and the mutation races every sibling test that resolves \
-             a root from env (CLI-ENVTEST-1). Take the root/backend as an \
-             argument, or move the case to crates/ccteam-cli/tests/*.rs where \
-             it gets its own process. Offenders: {hits:?}"
+            "`#[cfg(test)]` code under crates/*/src must not set/remove env \
+             vars — a crate's unit tests share ONE process, so the mutation \
+             races every sibling test that resolves a root from env \
+             (CLI-ENVTEST-1). Take the root as an argument (`_in(root)`), or \
+             move the case to crates/<crate>/tests/<name>_env_test.rs where it \
+             gets its own process. Offenders: {hits:?}"
         );
     }
 
@@ -259,7 +303,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            env_mutations_in_test_regions(&src).is_empty(),
+            env_mutations_in_test_regions(&src, dir.path()).is_empty(),
             "production set_var, and #[cfg(test)] inside a comment or string, must not trip it"
         );
 
@@ -269,7 +313,7 @@ mod tests {
              std::env::set_var(\"CCTEAM_HOME\", \"/tmp/x\");\n    }\n}\n",
         )
         .unwrap();
-        let hits = env_mutations_in_test_regions(&src);
+        let hits = env_mutations_in_test_regions(&src, dir.path());
         assert_eq!(
             hits.len(),
             1,

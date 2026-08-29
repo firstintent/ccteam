@@ -652,14 +652,35 @@ fn attach_interactive_by_name(session_name: &str) -> Result<()> {
 /// trailing segment is the sid, and the same `(project, role)` can host
 /// several independent sessions, so a role no longer uniquely names one.
 pub fn resolve_chat_session_name(slug_or_name: &str, sid: Option<&str>) -> Result<Option<String>> {
+    resolve_chat_session_name_with(
+        ccteam_harness::default_process_backend().as_ref(),
+        slug_or_name,
+        sid,
+    )
+}
+
+/// [`resolve_chat_session_name`] with the backend handed in.
+///
+/// The enumeration below is a real backend round-trip — under the default
+/// rmux backend it will `connect_or_start` a daemon and can block for seconds
+/// — so a caller that already holds a backend must pass THAT one rather than
+/// build a second, and a test must be able to hand in a double instead of
+/// pinning `CCTEAM_MUX_BACKEND` to whatever fails fastest on the host
+/// (CLI-ENVTEST-1: doing the latter is what made this path's test pass on a
+/// tmux-less CI runner only by accident, then time out for 5s and fail once
+/// the env pin was removed).
+pub fn resolve_chat_session_name_with(
+    backend: &dyn ccteam_harness::ProcessBackend,
+    slug_or_name: &str,
+    sid: Option<&str>,
+) -> Result<Option<String>> {
     if slug_or_name.starts_with(ccteam_harness::CHAT_SESSION_PREFIX) {
         return Ok(Some(slug_or_name.to_string()));
     }
     if let Some(sid) = sid {
         return Ok(Some(ccteam_harness::chat_session_name(slug_or_name, sid)));
     }
-    let backend = ccteam_harness::default_process_backend();
-    let live = block_on_async(ccteam_harness::list_chat_sessions(backend.as_ref()))??;
+    let live = block_on_async(ccteam_harness::list_chat_sessions(backend))??;
     let mut matches: Vec<(String, String)> = live
         .iter()
         .filter_map(|name| {
@@ -1089,30 +1110,41 @@ pub fn run_peek_with_role(
     slug_or_name: &str,
     sid: Option<&str>,
 ) -> Result<String> {
-    let session_name = resolve_peek_session_name(paths, slug_or_name, sid)?;
-    peek_session_by_name(&session_name)
+    // ONE backend for the whole command: `CCTEAM_MUX_BACKEND` is read here,
+    // at the CLI boundary, and the same handle serves both the name lookup
+    // and the capture (they used to build two).
+    let backend = ccteam_harness::from_env()?;
+    run_peek_with_backend(backend.as_ref(), paths, slug_or_name, sid)
 }
 
-/// Which mux session `ccteam peek <target>` reads: an explicit chat session
-/// name/sid when the target resolves to one, else the project's own pane
-/// (`ProjectState::tmux_session`). Pure — no backend, no shell-out, no env —
-/// so the resolution rule is testable on its own.
-fn resolve_peek_session_name(
+/// [`run_peek_with_role`] with the backend handed in — see
+/// [`peek_session_by_name_with`] for why the env read stays above this line.
+fn run_peek_with_backend(
+    backend: &dyn ccteam_harness::PaneBackend,
     paths: &CcteamPaths,
     slug_or_name: &str,
     sid: Option<&str>,
 ) -> Result<String> {
-    Ok(match resolve_chat_session_name(slug_or_name, sid)? {
-        Some(name) => name,
-        None => session_name_for_project(paths, slug_or_name),
-    })
+    let session_name = resolve_peek_session_name(backend, paths, slug_or_name, sid)?;
+    peek_session_by_name_with(backend, &session_name)
 }
 
-/// Capture a 1000-line plain-text tail of a session pane by its exact
-/// tmux/rmux name (chat or project — the caller already resolved it),
-/// through the backend `CCTEAM_MUX_BACKEND` selects.
-fn peek_session_by_name(session_name: &str) -> Result<String> {
-    peek_session_by_name_with(ccteam_harness::from_env()?.as_ref(), session_name)
+/// Which mux session `ccteam peek <target>` reads: an explicit chat session
+/// name/sid when the target resolves to one, else the project's own pane
+/// (`ProjectState::tmux_session`). Not pure — resolving an unqualified slug
+/// enumerates live sessions through `backend` — hence the injected backend.
+fn resolve_peek_session_name(
+    backend: &dyn ccteam_harness::PaneBackend,
+    paths: &CcteamPaths,
+    slug_or_name: &str,
+    sid: Option<&str>,
+) -> Result<String> {
+    Ok(
+        match resolve_chat_session_name_with(backend, slug_or_name, sid)? {
+            Some(name) => name,
+            None => session_name_for_project(paths, slug_or_name),
+        },
+    )
 }
 
 /// [`peek_session_by_name`] with the backend handed in rather than resolved
@@ -3702,24 +3734,57 @@ mod tests {
         Ok(slug)
     }
 
+    /// CLI-ENVTEST-1: this used to pin `CCTEAM_MUX_BACKEND=tmux` so peek would
+    /// fail on the tmux branch and leak the resolved name through the error
+    /// string. Removing the pin exposed that the resolution step is NOT pure —
+    /// an unqualified slug enumerates live sessions through the backend, so on
+    /// CI it fell to the default rmux backend and spent 5s failing to start a
+    /// daemon (`dev@be368490`). With the backend injected the assertion is
+    /// structural and the host has no say: no live chat session for this slug
+    /// ⇒ the project's own pane name, taken from `ProjectState::tmux_session`.
     #[test]
     fn run_peek_uses_state_tmux_session_for_meta_project() {
-        // CLI-ENVTEST-1: this used to pin `CCTEAM_MUX_BACKEND=tmux` so peek
-        // would fail on the tmux branch and leak the resolved name through the
-        // error string. The rule under test is pure name resolution, so assert
-        // it directly — exact equality instead of a substring of an error, no
-        // backend, no `tmux` shell-out, no process-wide env mutation.
         let tmp = TempDir::new().unwrap();
         let paths = fresh_paths(&tmp);
         let mut state = ProjectState::initial_for_team("meta-cto".into(), "meta-agent".into());
         state.tmux_session = "ccteam-meta-cto".into();
         state.save(&paths.project_state("meta-cto")).unwrap();
 
+        // Live panes exist, but none of them belongs to `meta-cto`.
+        let backend = fake_pane(true, "").with_sessions(["ccteam-chat-other-s1"]);
         assert_eq!(
-            resolve_peek_session_name(&paths, "meta-cto", None).unwrap(),
+            resolve_peek_session_name(&backend, &paths, "meta-cto", None).unwrap(),
             "ccteam-meta-cto",
-            "peek should target state.tmux_session",
+            "no live chat session for the slug ⇒ peek targets state.tmux_session",
         );
+    }
+
+    /// The other half of the same rule: a live chat session for the slug wins
+    /// over the project pane, and the sid disambiguator short-circuits the
+    /// enumeration entirely (so `ccteam peek <slug> <sid>` never pays for a
+    /// backend round-trip).
+    #[test]
+    fn run_peek_prefers_a_live_chat_session_and_a_named_sid_skips_the_lookup() {
+        let tmp = TempDir::new().unwrap();
+        let paths = fresh_paths(&tmp);
+        let mut state = ProjectState::initial_for_team("demo".into(), "dev".into());
+        state.tmux_session = "ccteam-demo".into();
+        state.save(&paths.project_state("demo")).unwrap();
+
+        let live = ccteam_harness::chat_session_name("demo", "s3");
+        let backend = fake_pane(true, "").with_sessions([live.as_str()]);
+        assert_eq!(
+            resolve_peek_session_name(&backend, &paths, "demo", None).unwrap(),
+            live,
+        );
+
+        // An explicit sid is answered without listing anything.
+        let no_listing = fake_pane(true, "");
+        assert_eq!(
+            resolve_peek_session_name(&no_listing, &paths, "demo", Some("s7")).unwrap(),
+            ccteam_harness::chat_session_name("demo", "s7"),
+        );
+        assert!(no_listing.listed.lock().unwrap().is_empty());
     }
 
     /// Minimal [`PaneBackend`] double: records the capture it was asked for
@@ -3731,7 +3796,18 @@ mod tests {
         kind: ccteam_harness::BackendKind,
         exists: bool,
         text: &'static str,
+        sessions: Vec<String>,
         captured: Mutex<Vec<(String, usize, bool)>>,
+        /// One entry per `list_sessions` round-trip, so a test can assert the
+        /// enumeration was skipped rather than merely empty.
+        listed: Mutex<Vec<()>>,
+    }
+
+    impl FakePane {
+        fn with_sessions<'a>(mut self, names: impl IntoIterator<Item = &'a str>) -> Self {
+            self.sessions = names.into_iter().map(str::to_string).collect();
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -3769,7 +3845,12 @@ mod tests {
             unimplemented!("peek never kills")
         }
         async fn list_sessions(&self) -> Result<Vec<ccteam_harness::MuxSessionId>> {
-            unimplemented!("peek reads one session by name")
+            self.listed.lock().unwrap().push(());
+            Ok(self
+                .sessions
+                .iter()
+                .map(|n| ccteam_harness::MuxSessionId::new(n.clone()))
+                .collect())
         }
         fn backend_kind(&self) -> ccteam_harness::BackendKind {
             self.kind
@@ -3817,7 +3898,9 @@ mod tests {
             kind: ccteam_harness::BackendKind::Rmux,
             exists,
             text,
+            sessions: Vec::new(),
             captured: Mutex::new(Vec::new()),
+            listed: Mutex::new(Vec::new()),
         }
     }
 

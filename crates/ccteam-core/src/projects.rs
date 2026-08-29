@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::paths::CcteamPaths;
 use crate::state::ProjectState;
-use crate::templates::{write_project_settings, EnabledPluginsSetting};
+use crate::templates::{write_project_settings_in, EnabledPluginsSetting};
 
 /// Slugify a free-text project request: keep `[a-z0-9]`, collapse other
 /// runs to `-`, trim, lower-case, and cap at 40 chars. When the cap
@@ -375,7 +375,9 @@ pub fn bootstrap_project_at_dir(
     // `~/.claude/agents/` layer.
     let enabled_plugins = EnabledPluginsSetting::default();
 
-    write_project_settings(&project_dir, &enabled_plugins)?;
+    // The root is already in hand — render the hook path from IT, never from
+    // `$CCTEAM_HOME` (which may point at a different home entirely).
+    write_project_settings_in(paths, &project_dir, &enabled_plugins)?;
     // v0.8.6 (review-fix #3): no longer stamp `~/.ccteam/templates/`.
     // `HELPER_TEMPLATES` has been empty since V0.5.0 F101, so the writer
     // only ever created an empty `templates/` dir that is *not* in
@@ -1194,13 +1196,12 @@ mod tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        // Point CCTEAM_HOME at the tempdir so `effective_hook_sh_path`
-        // returns the predictable per-test path.
-        std::env::set_var("CCTEAM_HOME", &paths.root);
+        // CLI-ENVTEST-1: no `CCTEAM_HOME` pin. `bootstrap_project` was already
+        // handed `paths`, and now renders the hook path from it — so this
+        // asserts the real contract (the hook belongs to the root the caller
+        // passed) instead of to whatever the environment happened to say.
         let expected_hook = paths.hooks_script();
-        let result = bootstrap_project(&paths, "demo", "demo request", "dev");
-        std::env::remove_var("CCTEAM_HOME");
-        result.unwrap();
+        bootstrap_project(&paths, "demo", "demo request", "dev").unwrap();
 
         let settings = paths
             .project_dir("demo")
