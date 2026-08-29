@@ -51,6 +51,12 @@
 - **状态**:gated(PLUG-1..4 后;**人工门**:owner 建 `@ccteam` npm org + `NPM_TOKEN` secret) · **冲突域**:`.github/workflows/release.yml` + `docs/dsh-plugin*.md` + `README.md` + `docs/usage.md` + `docs/dev/tech-design.md` · **建议入口**:规划亲自(`.github/` + docs 治理面)。PRD §4 L3。
 - **DoD**:tag 时发 4 平台包 + 插件(`optionalDependencies` 同版本、`ccteam.engine` = tag);`NPM_TOKEN` 缺失 job skip 且 summary 说明;docs 写「两种安装方式」+ 共存语义(§5 表)+ `ccteam update --channel npm`;README 能力句;tech-design 指针表。
 
+### WEB-DSH-PORT-1 临时 web 端口(`:0`)时伴生端口派生成特权端口 1(PLUG-1 maker 自报 2026-08-29,待排)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli/src/daemon_cli.rs`(伴生端口派生 = web 端口 + 1)+ `crates/ccteam-cli/tests/web_subcommand_test.rs` · **建议入口**:opus maker(小卡;PLUG-2/3 波顺手)。
+- **现象**:`ccteam web --bind 127.0.0.1:0` 把 DSH 伴生端口算成 `0+1` = `127.0.0.1:1`(特权端口),非 root 绑定失败,进程在打印 listening 行后即退出;`web_subcommand_test::ccteam_web_serves_health_then_exits_when_killed` 本机(非 root)恒红、CI(root)偶绿 —— **环境依赖的潜伏 bug**,不在 `make test-baseline` 内。
+- **做法**(根治,一层修一次):web 端口为 0(临时)⇒ 伴生端口也取临时(`:0`),真实端口从绑定后回读并进 `/health.dsh_web_bind` / `daemon status`(PLUG-1 已让 `/health` 在双 listener 绑定后再构造身份);显式 `--dsh-web-bind` 不受影响。
+- **DoD**:该测试本机非 root 绿;新增单测「web `:0` ⇒ 伴生 `:0` 且回读端口 ≠ 1」;`cargo test -p ccteam-cli --bins` + `--test web_subcommand_test` 绿;基线不降。
+
 ### LIFE-1 会话生命周期重设计:活动驱动的常驻(idle-release TTL + 懒重建 + residency 轴)(owner 直驱 2026-08-29,opus xhigh maker)
 - **状态**:完成(cfc112a0) · **冲突域**:`crates/ccteam-core/src/config.rs` + `crates/ccteam-im/src/{gateway.rs,daemon.rs,mcp/}` + `crates/ccteam-harness/src/execution/{session_meta.rs,progress_bridge.rs}` + `crates/ccteam-web/src/routes/{agents.rs,sessions_api.rs,status.rs}` + `crates/ccteam-web/web/src` + `docs/dev/tech-design.md` + `docs/usage*.md` + `README.md` · **建议入口**:opus xhigh subagent(owner 2026-08-29:「一般需求让 opus xhigh 去开发,ui 让 fable 亲自来开发」)。
 - **owner 原话**:「ccteam-ui 的会话状态不对,历史会话都显示成"正在工作"。其余会话只有一个绿点。从 ccteam 的会话底层重新设计会话生命周期管理。核心是让 llm 缓存不过期(比如 claude 是 1 小时后会过期)的前提下,减少 ccteam 启动的 vendor 进程数量。review 以前按照数量上限淘汰进程的设计是否合理,进行架构改进」。
