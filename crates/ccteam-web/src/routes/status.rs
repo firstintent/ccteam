@@ -308,6 +308,18 @@ pub(crate) async fn handle_status(
     }
 }
 
+/// RESIDENT rows of a `session_views()` snapshot — the sessions this daemon
+/// holds a vendor process (or DSH connection) for. Not every row is one: an
+/// `external` row is the ledger entry of a hand-started client ccteam never
+/// spawned, and a `detached` row is a body the daemon is WAITING on, not
+/// holding. Counting them as live overstated the fleet's memory cost.
+fn count_resident(views: &[ccteam_im::gateway::SessionView]) -> u32 {
+    views
+        .iter()
+        .filter(|view| view.residency == ccteam_im::gateway::RESIDENCY_RESIDENT)
+        .count() as u32
+}
+
 /// Compute the global snapshot synchronously inside `spawn_blocking`. The
 /// gateway section is now a pure catalog snapshot; progress reads are byte-
 /// cursor catch-ups outside that lock and normally reduce to metadata stats.
@@ -320,18 +332,15 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
     // numbers are what tell an operator whether the fleet is costing memory.
     let mut active_watches = 0;
     let mut views = Vec::new();
-    let resident_count: u32 = if let Some(gw) = app.gateway.as_ref() {
+    // `Some(n)` = RESIDENT rows of the live snapshot; `None` = standalone web
+    // (no gateway in this process), where nothing can be resident at all.
+    let resident_count: Option<u32> = if let Some(gw) = app.gateway.as_ref() {
         let guard = ccteam_im::latency::gateway_blocking_lock(gw, "web.status.snapshot");
         views = guard.session_views();
         active_watches = guard.armed_delegation_watch_count();
-        views.len() as u32
+        Some(count_resident(&views))
     } else {
-        // Standalone web (no daemon gateway): fall back to the persisted route
-        // table the CLI's `run_status` reads. A missing / unreadable file is an
-        // empty list, never an error. No live map ⇒ no per-session fleet rows.
-        ccteam_im::gateway::tracked_chat_sessions(&app.paths.root)
-            .map(|rows| rows.len() as u32)
-            .unwrap_or(0)
+        None
     };
 
     // ── cost: sum each project's 24h cost + merge the per-vendor breakdown. ──
@@ -355,7 +364,7 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
     // the same `is_resumable` predicate the gateway's own listings use.
     let tracked: std::collections::HashSet<&str> =
         views.iter().map(|view| view.sid.as_str()).collect();
-    let released_count = if daemon_healthy {
+    let released_count = if daemon_healthy && resident_count.is_some() {
         projects
             .iter()
             .map(|project| {
@@ -368,10 +377,21 @@ fn aggregate_status(app: &AppState) -> StatusResponse {
     } else {
         0
     };
-    let (sessions_live, sessions_idle) = if daemon_healthy {
-        (resident_count, released_count)
-    } else {
-        (0, resident_count)
+    let (sessions_live, sessions_idle) = match resident_count {
+        Some(resident) if daemon_healthy => (resident, released_count),
+        // The gateway is here but the daemon record says unhealthy: report
+        // what it holds as idle rather than claim a healthy resident fleet.
+        Some(resident) => (0, resident),
+        // Standalone web (no daemon gateway): fall back to the persisted route
+        // table the CLI's `run_status` reads — sessions that exist, none of
+        // them held here, so they are idle by definition. A missing /
+        // unreadable file is an empty list, never an error.
+        None => (
+            0,
+            ccteam_im::gateway::tracked_chat_sessions(&app.paths.root)
+                .map(|rows| rows.len() as u32)
+                .unwrap_or(0),
+        ),
     };
 
     let mut cost_24h_usd = 0.0_f64;
@@ -663,6 +683,22 @@ mod tests {
             parent_sid: None,
             delegation_depth: 0,
         }
+    }
+
+    /// `sessions_live` is the RESIDENT count: `session_views()` also carries
+    /// external (hand-started) and detached (body outliving a restart) rows,
+    /// and neither is a process this daemon holds.
+    #[test]
+    fn count_resident_ignores_external_and_detached_rows() {
+        let resident = view("s1", "demo", "claude");
+        let mut external = view("s2", "demo", "claude");
+        external.residency = "external".to_string();
+        external.driveable = false;
+        let mut detached = view("s3", "demo", "claude");
+        detached.residency = "detached".to_string();
+        detached.driveable = false;
+        assert_eq!(count_resident(&[resident, external, detached]), 1);
+        assert_eq!(count_resident(&[]), 0);
     }
 
     #[test]
