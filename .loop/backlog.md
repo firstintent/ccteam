@@ -82,6 +82,12 @@
 - **做法**(根治,一层修一次):ACP 传输层把 EOF / socket 关闭 / 子进程退出统一成一个「connection lost」信号,进行中的 turn 立即以可读错误结束(`error_kind` 独立词,不混 timeout),会话标记为需要 resume(下一条消息按 sid 冷 resume,与 released 路同一条);三个 ACP vendor 同门受益。
 - **DoD**:新测试:fake ACP 对端 turn 中途关连接 → 1s 内 turn 失败且 `error_kind` 非 timeout → 下一条消息同 sid 复活;`cargo test -p ccteam-harness --lib` + `--test dsh_acp_test` 绿;基线不降;真机:SIGKILL 常驻 DSH 进程后下一条消息秒级失败并自动复活。
 
+### CLI-ENVTEST-1 `ccteam-cli` bins 单测进程内改 `HOME`/`CCTEAM_HOME` 的竞态(CI `82faddb4` 一次红,规划 2026-08-29 立卡,待排)
+- **状态**:待排 · **冲突域**:`crates/ccteam-cli/src/web_chat_bridge.rs`(`#[cfg(test)]` 段)+ `crates/ccteam-cli/tests/` · **建议入门**:opus maker(小卡)。
+- **现象**:CI「deterministic baseline」job 在 `82faddb4`(只改 backlog 文案)上红:`web_chat_bridge::tests::web_chat_newproject_scaffolds_registers_and_cd_works` 读 `ccteam_home/config.yaml` NotFound(`web_chat_bridge.rs:882`);前后提交全绿。`web_chat_bridge.rs:200-216` 的测试在**进程内** `set_var("HOME"/"CCTEAM_HOME")` 并恢复,与同一 bins 测试进程里任何按 env 解析根目录的测试(PLUG-1 新增的 `daemon_cli`/`update` 单测按 `CcteamPaths::from_env` 读 env,虽不写)并发 —— 正是 AGENTS.md §六「env-mutating 测试放 `crates/*/tests/*.rs`,不放 lib/bins `#[cfg(test)]`」的坑;`ccteam-cli` 无 lib,bins 单测同样共享一个进程。
+- **做法**(治病根):①`web_chat_bridge` 的项目注册/`/cd` 路径改为注入式根(`_in(root)` API)后测试不再碰 env;②仍需 env 的用例整体搬到 `crates/ccteam-cli/tests/web_chat_bridge_env_test.rs`(独立进程);③新增守卫测试:扫描 `crates/ccteam-cli/src/**` 的 `#[cfg(test)]` 段不得出现 `set_var/remove_var`。
+- **DoD**:`cargo test -p ccteam-cli --bins` 连跑 20 次零红(`for i in $(seq 20)`);守卫测试有牙(临时塞一个 `set_var` 即红);基线不降。
+
 ### LIFE-1 会话生命周期重设计:活动驱动的常驻(idle-release TTL + 懒重建 + residency 轴)(owner 直驱 2026-08-29,opus xhigh maker)
 - **状态**:完成(cfc112a0) · **冲突域**:`crates/ccteam-core/src/config.rs` + `crates/ccteam-im/src/{gateway.rs,daemon.rs,mcp/}` + `crates/ccteam-harness/src/execution/{session_meta.rs,progress_bridge.rs}` + `crates/ccteam-web/src/routes/{agents.rs,sessions_api.rs,status.rs}` + `crates/ccteam-web/web/src` + `docs/dev/tech-design.md` + `docs/usage*.md` + `README.md` · **建议入口**:opus xhigh subagent(owner 2026-08-29:「一般需求让 opus xhigh 去开发,ui 让 fable 亲自来开发」)。
 - **owner 原话**:「ccteam-ui 的会话状态不对,历史会话都显示成"正在工作"。其余会话只有一个绿点。从 ccteam 的会话底层重新设计会话生命周期管理。核心是让 llm 缓存不过期(比如 claude 是 1 小时后会过期)的前提下,减少 ccteam 启动的 vendor 进程数量。review 以前按照数量上限淘汰进程的设计是否合理,进行架构改进」。
