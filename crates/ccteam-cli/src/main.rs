@@ -2218,12 +2218,7 @@ fn parse_dsh_web_bind(
         Some(value) => value.parse().map(Some).with_context(|| {
             format!("--dsh-web-bind {value} is not a valid socket address or `off`")
         }),
-        None => {
-            let port = web_bind.port().checked_add(1).context(
-                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
-            )?;
-            Ok(Some(std::net::SocketAddr::new(web_bind.ip(), port)))
-        }
+        None => daemon_cli::default_dsh_web_bind(*web_bind).map(Some),
     }
 }
 

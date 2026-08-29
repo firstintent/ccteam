@@ -28,8 +28,8 @@ use crate::legacy_takeover;
 pub const DAEMON_BIN_ENV: &str = "CCTEAM_DAEMON_BIN";
 /// Default embedded-web bind, shared by the daemon verbs' clap defaults
 /// and [`LauncherFlags::default`]. The DSH companion bind has no constant
-/// of its own: it is always derived as `web port + 1`
-/// ([`effective_dsh_web_bind`]), so a non-default web bind can never be
+/// of its own: it is always derived from the web bind
+/// ([`default_dsh_web_bind`]), so a non-default web bind can never be
 /// paired with a stale hardcoded companion port.
 pub const DEFAULT_WEB_BIND: &str = "0.0.0.0:7331";
 /// Hidden test hooks: shrink the ready-wait / stop-wait budgets so
@@ -173,12 +173,32 @@ fn effective_dsh_web_bind(web_bind: &str, dsh_web_bind: Option<&str>) -> Result<
             let web: std::net::SocketAddr = web_bind
                 .parse()
                 .with_context(|| format!("--web-bind {web_bind} is not a valid socket address"))?;
-            let port = web.port().checked_add(1).context(
-                "--dsh-web-bind default cannot be derived because --web-bind uses port 65535",
-            )?;
-            Ok(std::net::SocketAddr::new(web.ip(), port).to_string())
+            Ok(default_dsh_web_bind(web)?.to_string())
         }
     }
+}
+
+/// The DSH companion bind derived from the web bind, for every entry point
+/// that does not get an explicit `--dsh-web-bind` (the launcher's forwarded
+/// argv, the daemon body, standalone `ccteam internal web`). ONE derivation:
+/// a second copy is how one of them ends up on a different port than the
+/// other two.
+///
+/// `port + 1` is a convenience for a FIXED web port, never a contract — the
+/// companion's real address is read back from its listener after bind and
+/// reported through `/health.dsh_web_bind`. So an EPHEMERAL web port
+/// (`:0` = "any free port") derives an EPHEMERAL companion port: `0 + 1` is
+/// port 1, which only root may bind, and the whole process died on it right
+/// after announcing its own address (red locally, green only in root CI).
+pub(crate) fn default_dsh_web_bind(web_bind: std::net::SocketAddr) -> Result<std::net::SocketAddr> {
+    if web_bind.port() == 0 {
+        return Ok(std::net::SocketAddr::new(web_bind.ip(), 0));
+    }
+    let port = web_bind
+        .port()
+        .checked_add(1)
+        .context("--dsh-web-bind default cannot be derived because --web-bind uses port 65535")?;
+    Ok(std::net::SocketAddr::new(web_bind.ip(), port))
 }
 
 fn stop_tuning() -> dcore::StopTuning {
@@ -953,6 +973,49 @@ mod tests {
             );
         }
         assert!(!argv.contains(&"start".to_string()), "{argv:?}");
+    }
+
+    /// An ephemeral web port asks for "any free port"; deriving `0 + 1` asks
+    /// for port 1, which only root may bind — so the whole process died right
+    /// after announcing its own address, and the derivation must stay
+    /// ephemeral instead. The real port is read back from the listener and
+    /// reported through `/health.dsh_web_bind`.
+    #[test]
+    fn an_ephemeral_web_bind_derives_an_ephemeral_companion_bind() {
+        for (web, expected) in [
+            ("127.0.0.1:0", "127.0.0.1:0"),
+            ("0.0.0.0:0", "0.0.0.0:0"),
+            ("127.0.0.1:7331", "127.0.0.1:7332"),
+        ] {
+            let derived = default_dsh_web_bind(web.parse().unwrap()).unwrap();
+            assert_eq!(derived.to_string(), expected, "derived from {web}");
+            assert_ne!(derived.port(), 1, "port 1 is privileged: {web}");
+        }
+        // The launcher forwards the same answer into the daemon's argv, so an
+        // ephemeral web bind never reaches the daemon body as `:1`.
+        let argv = daemon_run_argv(&LauncherFlags {
+            web_bind: "127.0.0.1:0".to_string(),
+            ..LauncherFlags::default()
+        })
+        .unwrap();
+        assert_eq!(
+            ccteam_core::daemon::arg_value(&argv, "--dsh-web-bind"),
+            Some("127.0.0.1:0"),
+            "{argv:?}"
+        );
+        // An explicit value is still passed through untouched.
+        assert_eq!(
+            effective_dsh_web_bind("127.0.0.1:0", Some("127.0.0.1:8080")).unwrap(),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            effective_dsh_web_bind("127.0.0.1:0", Some("off")).unwrap(),
+            "off"
+        );
+        assert!(
+            default_dsh_web_bind("127.0.0.1:65535".parse().unwrap()).is_err(),
+            "a fixed port with no successor is still an error"
+        );
     }
 
     #[test]

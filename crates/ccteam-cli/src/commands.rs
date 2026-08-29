@@ -1776,12 +1776,7 @@ pub fn run_web(opts: WebOptions) -> Result<()> {
                 .parse()
                 .with_context(|| format!("parse --dsh-web-bind `{value}` as SocketAddr"))?,
         ),
-        None => Some(SocketAddr::new(
-            bind.ip(),
-            bind.port()
-                .checked_add(1)
-                .context("derive --dsh-web-bind from --bind port")?,
-        )),
+        None => Some(crate::daemon_cli::default_dsh_web_bind(bind)?),
     };
     let serve_opts = ccteam_web::ServeOpts {
         bind,
