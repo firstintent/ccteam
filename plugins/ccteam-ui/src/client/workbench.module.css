@@ -389,6 +389,44 @@
   color: var(--dsw-alias-label-dimmed);
 }
 
+/* Global fold toggle, riding inside the search box's trailing edge — same
+ * bare-glyph language as `.projectIconBtn` / `.rowMore`. The chevron points
+ * down (click folds everything) or right (click unfolds everything), the
+ * same rotation `.projectChevron` uses for one project's own state. */
+.foldAllBtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: -4px;
+  border: none;
+  border-radius: 6px;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.foldAllBtn:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover-solid);
+  color: var(--dsw-alias-label-primary);
+}
+
+.foldAllBtn:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.foldAllIcon {
+  transition: transform var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.foldAllIcon[data-collapsed] {
+  transform: rotate(-90deg);
+}
+
 .teamList {
   flex: 1;
   min-height: 0;

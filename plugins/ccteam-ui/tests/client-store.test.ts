@@ -386,6 +386,14 @@ describe('tree utils', () => {
     expect(reduce(initialState(), { type: 'collapse_all' }).collapsed).toEqual({})
   })
 
+  it('expand-all reopens every project, the global fold\'s inverse of collapse-all', () => {
+    const two: TeamGraph = { projects: [{ slug: 'a', nodes: [] }, { slug: 'b', nodes: [] }] }
+    const loaded = run([{ type: 'graph_loaded', graph: two }, { type: 'collapse_all' }])
+    expect(loaded.collapsed).toEqual({ a: true, b: true })
+    expect(reduce(loaded, { type: 'expand_all' }).collapsed).toEqual({ a: false, b: false })
+    expect(reduce(initialState(), { type: 'expand_all' }).collapsed).toEqual({})
+  })
+
   it('finds nodes anywhere and maps activity to dot states', () => {
     expect(findNode(graph, 's3')?.sid).toBe('s3')
     expect(findNode(graph, 'nope')).toBeUndefined()

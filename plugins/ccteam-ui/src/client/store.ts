@@ -174,6 +174,7 @@ export type Action =
   | { type: 'set_filter'; filter: string }
   | { type: 'toggle_project'; slug: string }
   | { type: 'expand_only'; slug: string }
+  | { type: 'expand_all' }
   | { type: 'collapse_all' }
   | { type: 'toggle_team' }
   | { type: 'toggle_details' }
@@ -526,6 +527,11 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
     case 'expand_only': {
       const collapsed: Record<string, boolean> = {}
       for (const project of state.graph?.projects ?? []) collapsed[project.slug] = project.slug !== action.slug
+      return { ...state, collapsed }
+    }
+    case 'expand_all': {
+      const collapsed: Record<string, boolean> = {}
+      for (const project of state.graph?.projects ?? []) collapsed[project.slug] = false
       return { ...state, collapsed }
     }
     case 'collapse_all': {

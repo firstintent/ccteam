@@ -24,6 +24,7 @@ import {
   Menu,
   Modal,
   StateDot,
+  Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TeamGraph, TeamNode } from '../shared/contract.js'
@@ -56,6 +57,9 @@ export interface TeamColumnProps {
   onInterrupt(sid: string): void
   onStop(sid: string): void
   onDetails(sid: string): void
+  /** Global fold: expand every project (nothing left collapsed), or collapse every project. */
+  onExpandAll(): void
+  onCollapseAll(): void
 }
 
 /**
@@ -370,6 +374,10 @@ export function TeamColumn(props: TeamColumnProps) {
   const [renamingSid, setRenamingSid] = useState<string | null>(null)
   const [pendingStop, setPendingStop] = useState<TeamNode | null>(null)
   const projects = graph?.projects ?? []
+  // The global fold button reflects and flips the AGGREGATE of the underlying
+  // `collapsed` record, not the filtered `isCollapsed` a search narrows to —
+  // a search only forces rows open for the view, it never clears the record.
+  const anyCollapsed = projects.some(project => collapsed[project.slug] === true)
   const groups = projects
     .map(project => ({ slug: project.slug, rows: filterRows(flattenNodes(project.nodes), filter), total: sumCost(project.nodes) }))
     .filter(group => group.rows.length > 0 || filter.trim() === '')
@@ -422,6 +430,20 @@ export function TeamColumn(props: TeamColumnProps) {
               props.onFilter(event.currentTarget.value)
             }}
           />
+          <Tooltip label={anyCollapsed ? t('tree.expandAll') : t('tree.collapseAll')} delayMs={400}>
+            <button
+              type="button"
+              className={css.foldAllBtn}
+              aria-label={anyCollapsed ? t('tree.expandAll') : t('tree.collapseAll')}
+              disabled={projects.length === 0}
+              onClick={() => {
+                if (anyCollapsed) props.onExpandAll()
+                else props.onCollapseAll()
+              }}
+            >
+              <IconChevronDownOutline14 className={css.foldAllIcon} data-collapsed={anyCollapsed ? '' : undefined} size={12} />
+            </button>
+          </Tooltip>
         </label>
       </div>
       <div className={css.teamList}>

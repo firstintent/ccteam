@@ -397,6 +397,12 @@ export function Workbench({ useConsole, dispatch, api, t }: WorkbenchProps) {
       onToggleProject={(slug) => {
         dispatch({ type: 'toggle_project', slug })
       }}
+      onExpandAll={() => {
+        dispatch({ type: 'expand_all' })
+      }}
+      onCollapseAll={() => {
+        dispatch({ type: 'collapse_all' })
+      }}
       onProjectAction={(action, slug) => {
         switch (action) {
           case 'new':
