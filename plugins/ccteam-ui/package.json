@@ -18,6 +18,9 @@
     "cordis.patch.yml",
     "README.md"
   ],
+  "ccteam": {
+    "engine": "0.10.3"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -44,6 +47,12 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "optionalDependencies": {
+    "@ccteam/engine-darwin-arm64": "0.10.3",
+    "@ccteam/engine-darwin-x64": "0.10.3",
+    "@ccteam/engine-linux-arm64": "0.10.3",
+    "@ccteam/engine-linux-x64": "0.10.3"
   },
   "bundledDependencies": [
     "@deepseek-ai/schemastery"

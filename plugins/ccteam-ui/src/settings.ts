@@ -30,6 +30,18 @@ export interface CcteamSettings {
   restToken: string
   defaultProject: string
   connectionStatus: string
+  /**
+   * Install the engine and start its daemon when this plugin loads. ON by
+   * default: `dsh plugin add @ccteam/ccteam-ui` is meant to be the whole
+   * install. Turning it off never STOPS anything — the daemon outlives this
+   * plugin either way (PRD D1); it only means the plugin waits to be asked.
+   */
+  autoStart: boolean
+  /**
+   * Advanced: an explicit `ccteam` binary. Empty = find it the way the shell
+   * does (PATH, then the canonical install path).
+   */
+  enginePath: string
 }
 
 export const CcteamSettingsSchema: Schema<CcteamSettings> = Schema.object({
@@ -46,11 +58,23 @@ export const CcteamSettingsSchema: Schema<CcteamSettings> = Schema.object({
     .default('')
     .description('Project slug new sessions land in when the panel does not name one.'),
   connectionStatus: Schema.string().default(UNCHECKED_STATUS),
+  autoStart: Schema.boolean()
+    .default(true)
+    .description('Install the ccteam engine and start its daemon when this plugin loads.'),
+  enginePath: Schema.string()
+    .default('')
+    .description('Advanced: path to the ccteam binary. Empty = PATH, then the canonical install path.'),
 })
 
 export interface SettingsScope<T> {
   get(): T
   watch?(callback: (next: T, prev: T) => void | Promise<void>): () => void
+  /**
+   * Merge a patch into the user layer. Present on the real service
+   * (`@deepseek-ai/dsh-settings`); optional here because the no-service
+   * fallback below has nowhere to write.
+   */
+  update?(patch: object): Promise<void>
 }
 
 export interface SettingsContext {
@@ -80,6 +104,8 @@ export function registerCcteamSettings(
         restToken: base?.restToken ?? '',
         defaultProject: base?.defaultProject ?? '',
         connectionStatus: base?.connectionStatus ?? NO_SERVICE_STATUS,
+        autoStart: base?.autoStart ?? true,
+        enginePath: base?.enginePath ?? '',
       }),
     }
   }

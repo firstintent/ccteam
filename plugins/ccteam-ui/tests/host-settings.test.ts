@@ -82,14 +82,35 @@ describe('settings registration', () => {
     const { type, fields } = describeSchema(registration!.schema)
     expect(type).toBe('object')
     expect(Object.keys(fields).sort()).toEqual([
+      'autoStart',
       'connectionStatus',
       'daemonUrl',
       'defaultProject',
+      'enginePath',
       'enrollment',
       'restToken',
     ])
     expect(fields.daemonUrl!.type).toBe('string')
     expect(fields.daemonUrl!.meta!.default).toBe(DEFAULT_DAEMON_URL)
+  })
+
+  /**
+   * `autoStart` is ON by default because `dsh plugin add @ccteam/ccteam-ui` is
+   * meant to be the whole install (PRD G2). It is also the one key whose
+   * default is load-bearing in the OTHER direction: it lives on the settings
+   * card and NOT in the profile row schema, because Cordis fills every row
+   * default before `apply` and a row-level boolean would arrive `true` for
+   * every profile, leaving the user's `false` unreachable.
+   */
+  it('defaults auto-start on and leaves the engine path unset', () => {
+    const { service, registrations } = fakeSettings()
+    registerCcteamSettings({ settings: service })
+
+    const { fields } = describeSchema(registrations[0]!.schema)
+    expect(fields.autoStart!.type).toBe('boolean')
+    expect(fields.autoStart!.meta!.default).toBe(true)
+    expect(fields.enginePath!.type).toBe('string')
+    expect(fields.enginePath!.meta!.default).toBe('')
   })
 
   it('marks both credentials secret so the settings UI never renders them in the clear', () => {

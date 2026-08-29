@@ -22,6 +22,15 @@ import Schema from '@deepseek-ai/schemastery'
 import { registerBff, type BffContext } from './bff.js'
 import { SessionCredentialStore } from './credentials.js'
 import {
+  EngineSupervisor,
+  createTokenBootstrap,
+  defaultEnvironment,
+  discoverDaemonUrl,
+  isLoopbackUrl,
+  resolveCcteamHome,
+} from './host/engine/index.js'
+import { createEnrollmentBootstrap } from './host/engine/bootstrap.js'
+import {
   DEFAULT_DAEMON_URL,
   UNCHECKED_STATUS,
   registerCcteamSettings,
@@ -41,10 +50,29 @@ export const inject = ['settings']
 /** Services the tool + transport faces cannot work without. */
 const HOST_SERVICES = ['agents', 'tools', 'agentDefaultModel']
 
-/** Services the workbench's BFF cannot work without. */
+/**
+ * Services the workbench's BFF cannot work without.
+ *
+ * The ENGINE face rides this list too, and that placement is deliberate: a
+ * runtime with no web server has no card to show a state on and no button to
+ * press, so installing a binary and starting a daemon behind its back would be
+ * an invisible side effect of loading a plugin.
+ */
 const WEB_SERVICES = ['webServer']
 
-export interface Config extends Partial<CcteamSettings> {
+/**
+ * The profile ROW config, as ccteam's materializer writes it and Cordis
+ * validates it. Deliberately NARROWER than the settings card: `autoStart` and
+ * `enginePath` are card-only.
+ *
+ * The reason is the same trap the `resolve()` helper below documents, in its
+ * boolean form. Cordis fills every schema default before `apply`, so a key
+ * listed here arrives with a value whether or not the row mentioned it — which
+ * is survivable for a string (empty means "not pinned") but not for a boolean:
+ * `autoStart` would arrive `true` for every profile and the user's `false`
+ * could never win.
+ */
+export interface Config extends Partial<Omit<CcteamSettings, 'autoStart' | 'enginePath'>> {
   completionPollIntervalMs?: number
   completionMaxPolls?: number
   transportSocket?: string
@@ -76,6 +104,18 @@ export const Config: Schema<Config> = Schema.object({
  */
 export const PACKAGE_VERSION = '0.10.4-alpha.0'
 
+/**
+ * The engine version this plugin is published against — package.json
+ * `ccteam.engine`, and the version of the platform packages in
+ * `optionalDependencies` (all three asserted equal by tests/host-engine-bff.test.ts).
+ *
+ * Pre-1.0 the two move in lockstep (PRD D5): a running daemon whose version
+ * differs is REPORTED, never silently replaced. Both directions are one-way
+ * repairs — the engine is older, so update the engine; the plugin is older, so
+ * update the plugin.
+ */
+export const ENGINE_VERSION = '0.10.3'
+
 export interface ApplyContext extends BffContext {
   /**
    * Cordis's own "run once these services exist" hook (`ctx.inject`). Each
@@ -93,26 +133,39 @@ export interface ApplyContext extends BffContext {
 }
 
 /**
- * Resolve one field: the value pinned in the profile's patch row wins,
- * otherwise the user's settings card decides.
+ * Resolve one field: the value the profile's patch row PINNED wins, otherwise
+ * the user's settings card decides.
  *
- * An EMPTY config value is "not pinned", not "pinned to empty". That
- * distinction is the whole function: this plugin declares a `Config` schema
- * with defaults, and Cordis validates the row against it before `apply`, so
- * every key the row omits arrives as `''` (or the schema default) rather than
- * `undefined`. A plain `??` therefore never falls through, and the settings
- * card — the documented way a hand-started `dsh web` supplies its credentials
- * — would be silently dead for every field.
+ * What counts as "pinned" is the whole function, and it has two halves —
+ * because Cordis validates the row against this plugin's `Config` schema and
+ * fills in every default BEFORE `apply` runs, so a row that mentioned nothing
+ * still arrives fully populated:
+ *
+ *   - an EMPTY value is a blank, not a pin (shipped as a bug once: every
+ *     credential field defaults to `''`, so a plain `??` never fell through and
+ *     the settings card — the documented way a hand-started `dsh web` supplies
+ *     its credentials — was silently dead);
+ *   - a value equal to the SCHEMA DEFAULT is also a blank, for exactly the same
+ *     reason. This half only bites fields whose default is not empty, which
+ *     today means `daemonUrl`: its default is a real URL, so without this the
+ *     card's daemon URL could never win either, and every profile would report
+ *     itself as one whose engine somebody else owns.
  *
  * @param pinned - the value from the row config, if any.
  * @param stored - the value from the settings card, if any.
+ * @param schemaDefault - what this field's schema fills a blank row with.
  * @returns the effective value, or `undefined` when neither layer has one.
  */
-function resolve(pinned: string | undefined, stored: string | undefined): string | undefined {
-  for (const candidate of [pinned, stored]) {
-    if (typeof candidate === 'string' && candidate.trim() !== '') return candidate
-  }
-  return undefined
+function resolve(
+  pinned: string | undefined,
+  stored: string | undefined,
+  schemaDefault = '',
+): string | undefined {
+  const named = (value: string | undefined): string | undefined =>
+    typeof value === 'string' && value.trim() !== '' ? value : undefined
+  const row = named(pinned)
+  if (row !== undefined && row.trim() !== schemaDefault) return row
+  return named(stored) ?? row
 }
 
 /**
@@ -130,10 +183,82 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
     defaultProject: config.defaultProject,
     connectionStatus: config.connectionStatus,
   })
-  const daemonUrl = (): string =>
-    resolve(config.daemonUrl, settings.get().daemonUrl) ?? DEFAULT_DAEMON_URL
+  // The engine's lifetime is NOT this plugin's (PRD D1), so nothing below ever
+  // stops a daemon. `managed` and `pinnedDaemonUrl` are the two runtimes where
+  // it must not even start one — see host/engine/supervisor.ts's header.
+  const environment = defaultEnvironment()
+  const managed = isPinned(config.transportSocket)
+  /**
+   * The row describes an engine somebody else set up. A ccteam-materialized
+   * profile is recognized by the CREDENTIALS in its row — ccteam writes them,
+   * a human's `dsh plugin add` never does — rather than by the daemon URL,
+   * whose schema default is present in every row and would otherwise mark
+   * every profile as somebody else's.
+   */
+  const externallyOwned =
+    !managed &&
+    (isPinned(config.restToken) ||
+      isPinned(config.enrollment) ||
+      (isPinned(config.daemonUrl) &&
+        config.daemonUrl!.trim().replace(/\/+$/, '') !== DEFAULT_DAEMON_URL))
+
+  /**
+   * The console token, bootstrapped from `$CCTEAM_HOME/secrets/web-token` when
+   * — and only when — nobody supplied one and the daemon is on loopback. A
+   * user-entered token names a daemon this home knows nothing about, so it
+   * always wins; a non-loopback URL means the local file describes a different
+   * engine and must not be read at all.
+   */
+  /**
+   * Where the daemon is. Three layers, in this order:
+   *
+   *   1. what a human or a profile row NAMED — always wins, and is the only
+   *      layer that can point off this machine;
+   *   2. what the RUNNING daemon published in
+   *      `$CCTEAM_HOME/run/daemon-endpoint.json` (pid-gated) — this is what
+   *      makes a CLI user who started their daemon on another port visible to
+   *      the plugin instead of getting a second one started next to it;
+   *   3. the compiled default.
+   *
+   * Layer 2 is memoized for a second: every upstream REST call resolves this,
+   * and a daemon does not move that often.
+   */
+  const configuredDaemonUrl = (): string | undefined => {
+    const value = (resolve(config.daemonUrl, settings.get().daemonUrl, DEFAULT_DAEMON_URL) ?? '')
+      .trim()
+      .replace(/\/+$/, '')
+    // The compiled default is not an instruction — it is what a blank resolves
+    // to, and treating it as one would keep endpoint discovery from ever running.
+    return value === '' || value === DEFAULT_DAEMON_URL ? undefined : value
+  }
+  const discovered = memoize(() => discoverDaemonUrl(resolveCcteamHome(environment)), 1_000)
+  const daemonUrl = (): string => configuredDaemonUrl() ?? discovered() ?? DEFAULT_DAEMON_URL
+
+  const tokens = createTokenBootstrap({
+    home: () => resolveCcteamHome(environment),
+    logger: ctx.logger,
+  })
+  const restToken = (): string => {
+    const supplied = resolve(config.restToken, settings.get().restToken)
+    if (supplied !== undefined) return supplied
+    return isLoopbackUrl(daemonUrl()) ? tokens.read() ?? '' : ''
+  }
+
+  /**
+   * The tool face's credential is ASKED OF THE DAEMON, never scavenged from a
+   * file: `POST /api/v1/enroll` mints one and the plugin stores it in its own
+   * settings, so the next boot finds it there instead of minting again.
+   */
+  const enrollmentBootstrap = createEnrollmentBootstrap({
+    daemonUrl,
+    authorization: () => authorizationFor(restToken()),
+    persist: async (bearer: string) => {
+      await settings.update?.({ enrollment: bearer })
+    },
+    logger: ctx.logger,
+  })
   const enrollment = (): string | undefined =>
-    resolve(config.enrollment, settings.get().enrollment)
+    resolve(config.enrollment, settings.get().enrollment) ?? enrollmentBootstrap.value()
 
   // One identity per ccteam session, never one per process: this runtime serves
   // many hires plus the human at the DSH UI.
@@ -141,16 +266,79 @@ export function apply(ctx: ApplyContext, config: Config = {}): void {
 
   ctx.inject(HOST_SERVICES, (hostCtx: never) => {
     applyHostFaces(hostCtx as unknown as ApplyContext, config, { daemonUrl, enrollment, credentials })
+    // Ask only a LOCAL daemon, and only when nobody already supplied one.
+    if (enrollment() === undefined && isLoopbackUrl(daemonUrl())) {
+      void enrollmentBootstrap.ensure()
+    }
   })
 
   ctx.inject(WEB_SERVICES, (webCtx: never) => {
-    registerBff(webCtx as unknown as BffContext, {
+    const webContext = webCtx as unknown as BffContext
+    const supervisor = new EngineSupervisor({
       daemonUrl,
-      restToken: () => resolve(config.restToken, settings.get().restToken) ?? '',
+      configuredDaemonUrl,
+      autoStart: () => settings.get().autoStart !== false,
+      enginePath: () => settings.get().enginePath,
+      pinnedVersion: ENGINE_VERSION,
+      managed,
+      externallyOwned,
+      environment,
+      logger: webContext.logger,
+    })
+    // Releases probes and log handles ONLY. Never the daemon: a DSH restart is
+    // not a reason to drop somebody else's IM gateway (D1).
+    webContext.effect?.(() => () => supervisor.dispose(), 'ccteam-ui.engine')
+
+    registerBff(webContext, {
+      daemonUrl,
+      restToken,
       defaultProject: () => resolve(config.defaultProject, settings.get().defaultProject) ?? '',
-      logger: (webCtx as unknown as BffContext).logger,
+      engine: supervisor,
+      logger: webContext.logger,
+    })
+
+    // Install + start on load, when the user left auto-start on. Fire and
+    // forget: a plugin that cannot reach an engine must still load its panel.
+    void supervisor.ensure().catch((error: unknown) => {
+      webContext.logger?.warn(`ccteam-ui: engine bootstrap failed: ${describeError(error)}`)
     })
   })
+}
+
+/** Cache a cheap-but-not-free lookup for `ttlMs`, without a timer. */
+function memoize<T>(read: () => T, ttlMs: number): () => T {
+  let at = 0
+  let cached: T
+  let primed = false
+  return (): T => {
+    const now = Date.now()
+    if (!primed || now - at >= ttlMs) {
+      cached = read()
+      at = now
+      primed = true
+    }
+    return cached
+  }
+}
+
+/** A row value the profile actually pinned (the schema default is `''`). */
+function isPinned(value: string | undefined): boolean {
+  return typeof value === 'string' && value.trim() !== ''
+}
+
+/**
+ * ccteam presents web tokens as `Authorization: Bearer ccteam:<hex>` and
+ * rejects a bare hex there (crates/ccteam-web/src/auth.rs). Same normalization
+ * as the BFF's, applied to the one call this file makes itself.
+ */
+function authorizationFor(token: string): string | undefined {
+  const trimmed = token.trim()
+  if (trimmed === '') return undefined
+  return `Bearer ${trimmed.includes(':') ? trimmed : `ccteam:${trimmed}`}`
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** The tool surface plus, when a socket is configured, the ACP transport. */

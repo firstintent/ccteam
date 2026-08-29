@@ -8,6 +8,10 @@
 import { API_PREFIX, ATTACHMENT_PATH, EVENTS_PATH, UPLOAD_PATH } from '../shared/contract.js'
 import type {
   ApiMethod,
+  EngineActionResult,
+  EngineLogRequest,
+  EngineLogResponse,
+  EngineStatus,
   HistoryRequest,
   HistoryResponse,
   ModelsCatalog,
@@ -32,6 +36,12 @@ import type {
 /** Request/response pair per contract method. */
 export interface MethodMap {
   'status': { req: Record<string, never>; res: StatusResponse }
+  'engine.status': { req: Record<string, never>; res: EngineStatus }
+  'engine.start': { req: Record<string, never>; res: EngineActionResult }
+  'engine.stop': { req: Record<string, never>; res: EngineActionResult }
+  'engine.restart': { req: Record<string, never>; res: EngineActionResult }
+  'engine.update': { req: Record<string, never>; res: EngineActionResult }
+  'engine.log': { req: EngineLogRequest; res: EngineLogResponse }
   'team.graph': { req: Record<string, never>; res: TeamGraph }
   'catalog.projects': { req: Record<string, never>; res: { projects: ProjectInfo[] } }
   'catalog.models': { req: Record<string, never>; res: ModelsCatalog }

@@ -20,6 +20,12 @@ export const ATTACHMENT_PATH = '/attachment'
 
 export type ApiMethod =
   | 'status' // connectivity + vendor availability (drives empty/error states)
+  | 'engine.status' // ccteam engine + daemon state (install / attach / mismatch)
+  | 'engine.start' // start the daemon (installing the engine first if needed)
+  | 'engine.stop' // stop the daemon — explicit user command, never automatic
+  | 'engine.restart' // stop then start
+  | 'engine.update' // swap the binary through `ccteam update` (drain + verify)
+  | 'engine.log' // tail of the daemon's own log file
   | 'team.graph' // delegation tree across vendors, grouped by project
   | 'catalog.projects' // projects the identity can spawn into
   | 'catalog.models' // per-vendor model ids + effort ladders (advisory)
@@ -32,6 +38,96 @@ export type ApiMethod =
   | 'session.stop' // stop the session (explicit user command)
   | 'session.resolve' // answer a pending human-in-the-loop choice
   | 'session.rename' // set the session title
+
+// ------------------------------------------------------------------- engine
+
+/**
+ * The ccteam engine as the plugin sees it. `attached` and `running` are both
+ * healthy — they differ only in who started the daemon, which is the coexistence
+ * fact the card reports (this plugin, or the CLI / systemd / another front end).
+ * `mismatch` is honest rather than corrective: a daemon in another home, or of
+ * another version, is REPORTED and left alone.
+ */
+export type EngineState =
+  | 'unsupported'
+  | 'missing'
+  | 'installing'
+  | 'stopped'
+  | 'starting'
+  | 'running'
+  | 'attached'
+  | 'mismatch'
+
+export type EngineMismatch = 'home' | 'version'
+
+/** How the located binary was found. */
+export type EngineBinarySource = 'configured' | 'path' | 'canonical'
+
+/**
+ * Why this plugin will not install or start anything here:
+ * - `managed`: ccteam started this DSH runtime; the daemon is its parent.
+ * - `pinned`: the profile row names the daemon, so somebody else owns it.
+ * - `remote`: the daemon is not on loopback; there is nothing local to start.
+ * - `unsupported`: no engine is published for this platform.
+ */
+export type EngineUnsupervisedReason = 'managed' | 'pinned' | 'remote' | 'unsupported'
+
+/** Facts only — no credential is ever part of this response. */
+export interface EngineStatus {
+  state: EngineState
+  mismatch?: EngineMismatch
+  /** A daemon answered `/health` (true even under `mismatch`). */
+  reachable: boolean
+  /** False when the four actions are refused; `unsupervisedReason` says why. */
+  supervised: boolean
+  unsupervisedReason?: EngineUnsupervisedReason
+  daemonUrl: string
+  /**
+   * How `daemonUrl` was arrived at: a human or profile row named it
+   * (`configured`), the running daemon published it in
+   * `$CCTEAM_HOME/run/daemon-endpoint.json` (`endpoint`), or nothing did and
+   * this is the compiled default (`default`).
+   */
+  daemonUrlSource?: 'configured' | 'endpoint' | 'default'
+  /** Engine version this plugin is published against (package.json `ccteam.engine`). */
+  pinnedVersion: string
+  /** `$CCTEAM_HOME` as the plugin resolves it (canonical). */
+  home: string
+  /** `$CCTEAM_HOME` the daemon reports; a difference is `mismatch: 'home'`. */
+  daemonHome?: string
+  binary?: string
+  binarySource?: EngineBinarySource
+  binaryVersion?: string
+  runningVersion?: string
+  platform?: string
+  pid?: number
+  webBind?: string
+  dshWebBind?: string
+  uptimeSecs?: number
+  autoStart: boolean
+  /** Where `engine.log` reads from. */
+  logPath: string
+  /** One honest sentence: what is true, and what the next step is. */
+  detail: string
+}
+
+export interface EngineActionResult {
+  ok: boolean
+  status: EngineStatus
+  errorKind?: string
+  error?: string
+}
+
+export interface EngineLogRequest {
+  lines?: number
+}
+
+export interface EngineLogResponse {
+  ok: boolean
+  path: string
+  lines: string[]
+  error?: string
+}
 
 export type Activity = 'working' | 'idle' | 'stale' | 'stuck'
 

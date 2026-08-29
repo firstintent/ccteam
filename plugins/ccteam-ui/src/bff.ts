@@ -44,6 +44,10 @@ import {
   type ApiMethod,
   type AttachmentRef,
   type ChoiceOption,
+  type EngineActionResult,
+  type EngineLogRequest,
+  type EngineLogResponse,
+  type EngineStatus,
   type HistoryRequest,
   type HistoryResponse,
   type ModelsCatalog,
@@ -75,6 +79,12 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 const API_METHODS: ReadonlySet<string> = new Set<ApiMethod>([
   'status',
+  'engine.status',
+  'engine.start',
+  'engine.stop',
+  'engine.restart',
+  'engine.update',
+  'engine.log',
   'team.graph',
   'catalog.projects',
   'catalog.models',
@@ -96,6 +106,20 @@ const MAX_HISTORY_LIMIT = 1000
 /** Upload cap mirrors ccteam's (25 MiB). */
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
+/**
+ * The engine face the BFF exposes to the browser. Supplied only where the
+ * plugin may actually manage a daemon; absent, the `engine.*` methods answer
+ * honestly instead of pretending (see {@link ENGINE_UNAVAILABLE}).
+ */
+export interface EngineFace {
+  status(): Promise<EngineStatus>
+  start(): Promise<EngineActionResult>
+  stop(): Promise<EngineActionResult>
+  restart(): Promise<EngineActionResult>
+  update(): Promise<EngineActionResult>
+  log(lines?: number): Promise<EngineLogResponse>
+}
+
 export interface BffOptions {
   /** Read live so a settings edit takes effect without a restart. */
   daemonUrl: () => string
@@ -103,6 +127,8 @@ export interface BffOptions {
   /** Project a spawn lands in when the request does not name one. */
   defaultProject?: () => string
   fetchImpl?: FetchLike
+  /** Absent on a runtime with no engine to manage; the methods say so. */
+  engine?: EngineFace
   logger?: { warn(message: string): void }
   heartbeatMs?: number
   retryBaseMs?: number
@@ -427,6 +453,47 @@ export function createBff(options: BffOptions): Bff {
     return simple(`/api/v1/sessions/${encodeURIComponent(sid)}`, { method: 'PATCH', body: { title } })
   }
 
+  // ---------------------------------------------------------------- engine
+
+  /**
+   * What a runtime with no engine face reports. Honest, not empty: the panel
+   * still renders a state, and the sentence names the reason rather than
+   * leaving the card blank.
+   */
+  const ENGINE_UNAVAILABLE = (): EngineStatus => ({
+    state: 'unsupported',
+    reachable: false,
+    supervised: false,
+    unsupervisedReason: 'unsupported',
+    daemonUrl: options.daemonUrl().trim(),
+    pinnedVersion: '',
+    home: '',
+    autoStart: false,
+    logPath: '',
+    detail: 'this runtime does not manage a ccteam engine.',
+  })
+
+  async function engineStatus(): Promise<EngineStatus> {
+    return options.engine === undefined ? ENGINE_UNAVAILABLE() : await options.engine.status()
+  }
+
+  async function engineAction(
+    body: (face: EngineFace) => Promise<EngineActionResult>,
+  ): Promise<EngineActionResult> {
+    if (options.engine === undefined) {
+      const status = ENGINE_UNAVAILABLE()
+      return { ok: false, status, errorKind: 'unavailable', error: status.detail }
+    }
+    return await body(options.engine)
+  }
+
+  async function engineLog(request: EngineLogRequest): Promise<EngineLogResponse> {
+    if (options.engine === undefined) {
+      return { ok: false, path: '', lines: [], error: 'this runtime does not manage a ccteam engine.' }
+    }
+    return await options.engine.log(request?.lines)
+  }
+
   async function dispatch(method: string, payload: unknown): Promise<unknown> {
     const record = asRecord(payload) ?? {}
     switch (method as ApiMethod) {
@@ -456,6 +523,18 @@ export function createBff(options: BffOptions): Bff {
         return await resolve(record as unknown as ResolveRequest)
       case 'session.rename':
         return await rename(record as unknown as RenameRequest)
+      case 'engine.status':
+        return await engineStatus()
+      case 'engine.start':
+        return await engineAction(face => face.start())
+      case 'engine.stop':
+        return await engineAction(face => face.stop())
+      case 'engine.restart':
+        return await engineAction(face => face.restart())
+      case 'engine.update':
+        return await engineAction(face => face.update())
+      case 'engine.log':
+        return await engineLog(record as unknown as EngineLogRequest)
       default:
         return undefined
     }
