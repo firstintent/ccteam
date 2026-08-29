@@ -88,6 +88,12 @@
 - **做法**(治病根):①`web_chat_bridge` 的项目注册/`/cd` 路径改为注入式根(`_in(root)` API)后测试不再碰 env;②仍需 env 的用例整体搬到 `crates/ccteam-cli/tests/web_chat_bridge_env_test.rs`(独立进程);③新增守卫测试:扫描 `crates/ccteam-cli/src/**` 的 `#[cfg(test)]` 段不得出现 `set_var/remove_var`。
 - **DoD**:`cargo test -p ccteam-cli --bins` 连跑 20 次零红(`for i in $(seq 20)`);守卫测试有牙(临时塞一个 `set_var` 即红);基线不降。
 
+### ENROLL-ENSURE-1 `POST /api/v1/enroll` 只 mint 不 ensure:插件/手起客户端无法幂等领取 enrollment 凭据(PLUG-3 checker 2026-08-29 指出,待排)
+- **状态**:待排 · **冲突域**:`crates/ccteam-web/src/routes/enroll.rs` + `crates/ccteam-core/src/enroll.rs` + `crates/ccteam-web/tests/enroll*` + `plugins/ccteam-ui/src/host/engine/bootstrap.ts`(调用点一处切换) · **建议入门**:opus maker(小卡;Rust 先,插件调用点随后)。
+- **现象**:`POST /api/v1/enroll` 每次都铸一份新凭据(secret 只回一次);Hosts「注册 DSH 插件」按钮走的是 `ccteam_core::enroll::ensure_user_credential`(幂等)但**没有 REST 面**。PLUG-3 的插件 bootstrap 只能靠进程内状态 + settings 持久化近似「至多一次」(`bootstrap.ts:112-119,181-207`),并发的新 profile 或持久化失败会铸多份。
+- **做法**(治病根,一层一次):REST 暴露 ensure 语义 —— `PUT /api/v1/enroll/{label}`(或 `POST /api/v1/enroll` 带 `label` + `ensure:true`)按「身份 × label」幂等:已存在且未吊销 → 返回同一 id(secret 不可再回,但返回 `bearer_prefix` 供客户端核对自己持有的是否同一份;客户端持有的 secret 丢失时须显式 `rotate`);与按钮共用 `ensure_user_credential`;ACL 与既有 enroll 路由同门(`project_acl_layer` / operator 或 tenant 自己的池)。插件 `bootstrap.ts` 改调 ensure(label = `dsh-plugin:<profile>`),移除进程内「至多一次」补丁。
+- **DoD**:新测试:同 label 两次 → 同 id 不铸新;不同身份同 label 隔离;`rotate` 铸新并吊旧;`cargo test -p ccteam-web --test enroll*`(存在者)+ `-p ccteam-core --lib` 绿;插件 vitest 含「ensure 幂等 → 只持一份」;基线不降;`docs/orchestration*.md` enrollment 段同步(若描述了 mint 语义)。
+
 ### LIFE-1 会话生命周期重设计:活动驱动的常驻(idle-release TTL + 懒重建 + residency 轴)(owner 直驱 2026-08-29,opus xhigh maker)
 - **状态**:完成(cfc112a0) · **冲突域**:`crates/ccteam-core/src/config.rs` + `crates/ccteam-im/src/{gateway.rs,daemon.rs,mcp/}` + `crates/ccteam-harness/src/execution/{session_meta.rs,progress_bridge.rs}` + `crates/ccteam-web/src/routes/{agents.rs,sessions_api.rs,status.rs}` + `crates/ccteam-web/web/src` + `docs/dev/tech-design.md` + `docs/usage*.md` + `README.md` · **建议入口**:opus xhigh subagent(owner 2026-08-29:「一般需求让 opus xhigh 去开发,ui 让 fable 亲自来开发」)。
 - **owner 原话**:「ccteam-ui 的会话状态不对,历史会话都显示成"正在工作"。其余会话只有一个绿点。从 ccteam 的会话底层重新设计会话生命周期管理。核心是让 llm 缓存不过期(比如 claude 是 1 小时后会过期)的前提下,减少 ccteam 启动的 vendor 进程数量。review 以前按照数量上限淘汰进程的设计是否合理,进行架构改进」。
