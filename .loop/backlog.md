@@ -59,6 +59,13 @@
 - **做法**(根治,一层修一次):web 端口为 0(临时)⇒ 伴生端口也取临时(`:0`),真实端口从绑定后回读并进 `/health.dsh_web_bind` / `daemon status`(PLUG-1 已让 `/health` 在双 listener 绑定后再构造身份);显式 `--dsh-web-bind` 不受影响。
 - **DoD**:该测试本机非 root 绿;新增单测「web `:0` ⇒ 伴生 `:0` 且回读端口 ≠ 1」;`cargo test -p ccteam-cli --bins` + `--test web_subcommand_test` 绿;基线不降。
 
+### ACP-DISCONNECT-1 常驻 ACP 会话的对端进程被 SIGKILL 后,下一 turn 卡满 300s 才判 `stuck`(DSH2-MERGE maker 自报 2026-08-29,待排)
+- **状态**:待排 · **冲突域**:`crates/ccteam-harness/src/execution/acp/`(共享 ACP 门:kimi/grok/dsh 同门)+ `crates/ccteam-harness/tests/dsh_acp_test.rs` · **建议入门**:opus maker(引擎面;PLUG-2 后串行,同 crate 不同目录可并行)。
+- **现象**:daemon 持有 **live** ACP 连接时对端(真 DSH 进程)被 SIGKILL,下一条消息不立即失败,而是等满 `chat_turn_timeout`(300s)才记 `chat_turn_timeout{stuck:true}`(两次复现);会话非常驻(released)时按 sid 冷 resume 正常。
+- **病根**:`execution/acp/` 的断连检测——对端 stdio/socket 关闭没有被当成「连接死亡」立即传播到 turn 驱动,只靠 turn 超时兜底。
+- **做法**(根治,一层修一次):ACP 传输层把 EOF / socket 关闭 / 子进程退出统一成一个「connection lost」信号,进行中的 turn 立即以可读错误结束(`error_kind` 独立词,不混 timeout),会话标记为需要 resume(下一条消息按 sid 冷 resume,与 released 路同一条);三个 ACP vendor 同门受益。
+- **DoD**:新测试:fake ACP 对端 turn 中途关连接 → 1s 内 turn 失败且 `error_kind` 非 timeout → 下一条消息同 sid 复活;`cargo test -p ccteam-harness --lib` + `--test dsh_acp_test` 绿;基线不降;真机:SIGKILL 常驻 DSH 进程后下一条消息秒级失败并自动复活。
+
 ### LIFE-1 会话生命周期重设计:活动驱动的常驻(idle-release TTL + 懒重建 + residency 轴)(owner 直驱 2026-08-29,opus xhigh maker)
 - **状态**:完成(cfc112a0) · **冲突域**:`crates/ccteam-core/src/config.rs` + `crates/ccteam-im/src/{gateway.rs,daemon.rs,mcp/}` + `crates/ccteam-harness/src/execution/{session_meta.rs,progress_bridge.rs}` + `crates/ccteam-web/src/routes/{agents.rs,sessions_api.rs,status.rs}` + `crates/ccteam-web/web/src` + `docs/dev/tech-design.md` + `docs/usage*.md` + `README.md` · **建议入口**:opus xhigh subagent(owner 2026-08-29:「一般需求让 opus xhigh 去开发,ui 让 fable 亲自来开发」)。
 - **owner 原话**:「ccteam-ui 的会话状态不对,历史会话都显示成"正在工作"。其余会话只有一个绿点。从 ccteam 的会话底层重新设计会话生命周期管理。核心是让 llm 缓存不过期(比如 claude 是 1 小时后会过期)的前提下,减少 ccteam 启动的 vendor 进程数量。review 以前按照数量上限淘汰进程的设计是否合理,进行架构改进」。
