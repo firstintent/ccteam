@@ -248,6 +248,7 @@ harness 的目录里选**模型**和 **effort**（留空即 harness 默认），
 | **安装被拒：目标是软链 / 归包管理器** | 安装梯度落到了一个属于别人的 `ccteam`（软链、Homebrew、nix、snap、`node_modules` 目录）。用那个工具更新它，或给 DSH 进程设 `CCTEAM_INSTALL_DIR=<dir>` 让插件装到别处。 |
 | **401** | HTTP 请求中的 REST 形式是 `Bearer ccteam:<hex>`。卡片里的 **REST API token** 就是这枚个人 token（粘贴时不要加 `Bearer`）；**Enrollment 凭据** 是 `ccteam-enroll:<id>:<secret>`。二者是不同凭据——先确认没有把其中一个填进了另一个的框。 |
 | **启动时报 `duplicate loader entry id`** | 同一个插件被插入了两次（常见于 registry 和 bundle patch 都有，或手改了 `cordis.patch.yml`）。只保留一条，删除重复项。ccteam 自己的注册绝不会在你装的那份旁边再加一条。 |
+| **`cordis.patch.yml` 被重新排版 / 注释没了** | ccteam 第一次向你手管的 profile 注册时会把 patch 文件重新序列化：格式被规范化，YAML 注释不保留（`serde_yaml` 没有保注释的往返）。之后只要内容不变 ccteam 就不再重写该文件——重复注册字节完全一致——且每次写入都是原子的（临时文件 + rename，权限 0600）。备注请放在 patch 文件之外。 |
 | **`ccteam doctor` 报 `plugin_version_mismatch`** | 你自己 `dsh plugin add` 的那份与这个 ccteam 内嵌的版本不一致。ccteam 不动它；执行 `dsh plugin --profile web update @ccteam/ccteam-ui`。 |
 | **侧栏里没有 ccteam 按钮** | 插件需要 DSH 0.1.0-rc.7 或更新（原生侧栏底部座位与 overlay 座位）。升级 DSH 后，到 设置 → 插件 → 插件列表 确认 `ccteam-ui` 为 Enabled。 |
 | **局域网明文 HTTP 异常** | 参阅 [usage.md](usage.md) 的“Access and security”安全上下文说明。 |
