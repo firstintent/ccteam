@@ -14890,7 +14890,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 2 });
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 2,
+            ..Default::default()
+        });
 
         let first = gateway
             .create_session_api(
@@ -15072,7 +15075,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 8 });
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 8,
+            ..Default::default()
+        });
         for _ in 0..6 {
             spawn_managed(&mut gateway).await;
         }
@@ -15175,7 +15181,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
-        gateway.set_sessions_config(ccteam_core::SessionsConfig { max_live: 1 });
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            max_live: 1,
+            ..Default::default()
+        });
 
         let node = gateway
             .register_external_node("alpha", "user:web-api", "codex/0.144.3")

@@ -28,6 +28,7 @@
 //! the prior contents to `config.yaml.bak` first — same shape as
 //! `ProjectState::save` so a crash mid-write doesn't corrupt the SoT.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -81,9 +82,9 @@ pub struct CcteamConfig {
     #[serde(default = "default_claude_jobs_retention_days")]
     pub claude_jobs_retention_days: u32,
 
-    /// v0.9.2 — daemon-wide live-session capacity. Absent → the documented
-    /// default; the gateway gracefully evicts the least-recently-active live
-    /// session before admitting a fresh or revived one.
+    /// Session residency policy — how long a vendor process stays attached to
+    /// an idle session, and how many may be resident at once. Absent → the
+    /// documented defaults (see [`SessionsConfig`]).
     #[serde(default, skip_serializing_if = "SessionsConfig::is_default")]
     pub sessions: SessionsConfig,
 
@@ -143,23 +144,59 @@ impl DaemonConfig {
     }
 }
 
-/// v0.9.2 — daemon-wide live-session capacity. Every field defaults so older
-/// config files remain valid and zero-config installs get the standard cap.
+/// Session RESIDENCY policy — how long ccteam keeps a vendor process attached
+/// to a session, and how many it may hold at once. Every field defaults so
+/// older config files remain valid and zero-config installs get the documented
+/// posture.
+///
+/// The two knobs answer different questions and neither replaces the other:
+///
+/// - [`Self::idle_release_secs`] is the PRIMARY policy: a session nobody has
+///   spoken to for that long has its vendor process released (the session
+///   itself is untouched — it resumes by sid on the next message). The default
+///   tracks the longest prompt-cache TTL a vendor offers (Claude: 1h), so the
+///   process is held exactly as long as keeping it alive can still save a
+///   cache re-read, and no longer. A 10–30 session fleet at ~300 MB per
+///   resident claude is the case this exists for.
+/// - [`Self::max_live`] is the SECONDARY ceiling: a hard cap for the burst
+///   case (many sessions active inside one TTL window), enforced by evicting
+///   the least-recently-active eligible session at admission time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionsConfig {
-    /// Maximum number of concurrently live sessions daemon-wide.
+    /// Maximum number of concurrently RESIDENT sessions daemon-wide.
     #[serde(default = "default_sessions_max_live")]
     pub max_live: u32,
+    /// Seconds a resident session may sit idle (no in-flight turn, no pending
+    /// approval, no turn-outliving background task) before ccteam releases its
+    /// vendor process. `0` disables idle release entirely (every session stays
+    /// resident until the capacity cap evicts it).
+    #[serde(default = "default_sessions_idle_release_secs")]
+    pub idle_release_secs: u64,
+    /// Per-harness override of [`Self::idle_release_secs`], keyed by the vendor
+    /// wire name (`claude` | `codex` | `grok` | `opencode` | `kimi` | `pi` |
+    /// `dsh`). Absent key ⇒ the global value; `0` ⇒ never release that harness.
+    /// Exists because prompt-cache TTL is a VENDOR fact, not a ccteam one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub idle_release_by_vendor: BTreeMap<String, u64>,
 }
 
 pub fn default_sessions_max_live() -> u32 {
     50
 }
 
+/// One hour — Claude's prompt-cache TTL, the longest window in which holding
+/// the process open can still save the model a cache re-read. Past it, a
+/// resident process buys nothing but RAM.
+pub fn default_sessions_idle_release_secs() -> u64 {
+    3600
+}
+
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
             max_live: default_sessions_max_live(),
+            idle_release_secs: default_sessions_idle_release_secs(),
+            idle_release_by_vendor: BTreeMap::new(),
         }
     }
 }
@@ -169,6 +206,17 @@ impl SessionsConfig {
     /// serialization to omit it for byte-stability on untouched installs.
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The idle-release TTL that applies to `vendor` (its own override, else
+    /// the global value). `None` means "never release" (`0`).
+    pub fn idle_release_for(&self, vendor: &str) -> Option<std::time::Duration> {
+        let secs = self
+            .idle_release_by_vendor
+            .get(vendor)
+            .copied()
+            .unwrap_or(self.idle_release_secs);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 }
 
@@ -547,6 +595,8 @@ mod tests {
         let cfg = CcteamConfig::default();
         assert_eq!(cfg.daemon.workers, 4);
         assert_eq!(cfg.sessions.max_live, 50);
+        assert_eq!(cfg.sessions.idle_release_secs, 3600);
+        assert!(cfg.sessions.idle_release_by_vendor.is_empty());
         assert_eq!(cfg.delegation.max_depth, 2);
         assert_eq!(cfg.delegation.max_children, 10);
         assert_eq!(cfg.delegation.max_delegated, 50);
@@ -572,7 +622,10 @@ mod tests {
     fn session_and_delegation_yaml_overrides_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let cfg = CcteamConfig {
-            sessions: SessionsConfig { max_live: 7 },
+            sessions: SessionsConfig {
+                max_live: 7,
+                ..Default::default()
+            },
             delegation: DelegationConfig {
                 max_depth: 3,
                 max_children: 12,
@@ -586,5 +639,63 @@ mod tests {
         let yaml = std::fs::read_to_string(config_path(tmp.path())).unwrap();
         assert!(yaml.contains("sessions:\n  max_live: 7"));
         assert!(yaml.contains("delegation:\n  max_depth: 3"));
+    }
+
+    #[test]
+    fn idle_release_yaml_overrides_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = CcteamConfig {
+            sessions: SessionsConfig {
+                max_live: 12,
+                idle_release_secs: 900,
+                idle_release_by_vendor: BTreeMap::from([
+                    ("codex".to_string(), 0),
+                    ("dsh".to_string(), 60),
+                ]),
+            },
+            ..Default::default()
+        };
+        save(tmp.path(), &cfg).unwrap();
+        assert_eq!(load(tmp.path()).unwrap(), cfg);
+
+        let yaml = std::fs::read_to_string(config_path(tmp.path())).unwrap();
+        assert!(yaml.contains("idle_release_secs: 900"), "{yaml}");
+        assert!(yaml.contains("idle_release_by_vendor:"), "{yaml}");
+    }
+
+    #[test]
+    fn idle_release_for_applies_the_vendor_override_then_the_global_value() {
+        let cfg = SessionsConfig {
+            idle_release_secs: 300,
+            idle_release_by_vendor: BTreeMap::from([
+                ("codex".to_string(), 0),
+                ("dsh".to_string(), 60),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.idle_release_for("claude"),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            cfg.idle_release_for("dsh"),
+            Some(std::time::Duration::from_secs(60))
+        );
+        // `0` on a vendor means "never release", even with a global TTL set.
+        assert_eq!(cfg.idle_release_for("codex"), None);
+        // `0` globally disables idle release for every unlisted vendor.
+        let off = SessionsConfig {
+            idle_release_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(off.idle_release_for("claude"), None);
+    }
+
+    #[test]
+    fn sessions_section_stays_omitted_when_untouched() {
+        let tmp = TempDir::new().unwrap();
+        save(tmp.path(), &CcteamConfig::default()).unwrap();
+        let yaml = std::fs::read_to_string(config_path(tmp.path())).unwrap();
+        assert!(!yaml.contains("sessions:"), "{yaml}");
     }
 }
