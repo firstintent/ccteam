@@ -115,7 +115,7 @@ KillMode=process
 WantedBy=default.target
 ```
 
-不要设 `PIDFile=`:`~/.ccteam/state/orchestrator.pid` 是一条 JSON 记录(pid + 进程启动时间 + 版本),不是裸 pid,systemd 会自己在 unit 的 cgroup 里找到 daemon。之后 `systemctl --user enable --now ccteam` 就会一直拉着它;`ccteam daemon status` 仍报它为托管(它是 launcher 起的),在 shell 里敲 `ccteam start` 报 `alreadyRunning`,DSH 插件也像对待任何 daemon 一样 attach 上去 —— 插件卡上的「停止」仍是真的 `ccteam stop`,之后 systemd 可能把 daemon 再拉起来。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除二进制,但保留 `~/.ccteam`。
+不要设 `PIDFile=`:`~/.ccteam/state/orchestrator.pid` 是一条 JSON 记录(pid + 进程启动时间 + 版本),不是裸 pid,systemd 会自己在 unit 的 cgroup 里找到 daemon。之后 `systemctl --user enable --now ccteam` 就会一直拉着它;`ccteam daemon status` 仍报它为托管(它是 launcher 起的),在 shell 里敲 `ccteam start` 报 `alreadyRunning`,DSH 插件也像对待任何 daemon 一样 attach 上去 —— 插件「引擎」段的「停止」仍是真的 `ccteam stop`,之后 systemd 可能把 daemon 再拉起来。卸载:源码装用 `make uninstall`、预编译装用 `install.sh --uninstall`,都会停掉并删除二进制,但保留 `~/.ccteam`。
 
 **从曾由 ccteam 写过 systemd/launchd unit 的安装升级**:重跑一次安装器或 `ccteam start` 即可 —— 一次性接管会停用并删除旧的 ccteam service unit,再把 daemon 自管地拉起来;你自己手写的 unit 一动不动(ccteam 会把那个实例报成「非托管」且不去停它)。后续升级见[更新](#更新)。
 

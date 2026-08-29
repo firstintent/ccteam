@@ -22,7 +22,7 @@ Installing it once gives you three faces and an engine supervisor:
 | **Workbench** | people using DSH Web | The ccteam workbench in DSH — a whole-page surface with the cross-harness team tree, a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, interrupt) and a details column, opened with the ccteam button at the bottom of DSH’s own sidebar. |
 | **Tools** | DSH agents (the LLM) | The eight ccteam MCP tools inside DSH sessions, so a DSH agent can hire and drive the rest of the team. |
 | **Transport** | ccteam | The ACP server that lets ccteam hire DSH sessions. It arms itself only when the profile row carries a socket path, which only a ccteam-managed runtime writes. |
-| **Engine** | you | The ccteam daemon itself: the plugin ships the `ccteam` binary as a platform package, installs it, starts the daemon, and shows an **Engine** card (state, version, start / stop / restart / update) in its settings. |
+| **Engine** | you | The ccteam daemon itself: the plugin ships the `ccteam` binary as a platform package, installs it, starts the daemon, and shows an **Engine** section (state, version, **Start / Stop / Restart / Update engine**) at the top of its settings card. |
 
 Each face activates on its own: a profile without DSH's web app still gets the
 tools, and a profile without an agent runtime still gets the workbench.
@@ -55,7 +55,8 @@ Then restart that `dsh web` process and hard-refresh the browser
    `--version` before swapping it in. A destination that is a symlink or
    inside a package manager's tree (`node_modules`, Homebrew, nix, snap) is
    reported, never overwritten; set `CCTEAM_INSTALL_DIR` to install elsewhere.
-2. **Starts the daemon.** With **auto-start** on (the default) it runs
+2. **Starts the daemon.** With **Start the engine when the plugin loads** on
+   (the default) it runs
    `ccteam start --json` — the same detached, idempotent launcher the CLI
    uses — and waits for `GET /health`. If a daemon is already answering for
    this home it simply attaches (§3).
@@ -65,11 +66,12 @@ Then restart that `dsh web` process and hard-refresh the browser
    its own operator), and asks the daemon for the tool face's enrollment
    credential over REST, storing it in the settings card. A token you enter
    in the card always wins over the file.
-4. **Shows the Engine card** (§4) and, when there is no project yet, the
-   workbench's first screen asks you to add a workspace.
+4. **Gates the workbench on the engine** (§4): until the daemon answers, the
+   first screen says **The ccteam engine is not running** with a **Start the
+   engine** button; with no project yet it shows **Add a workspace**.
 
-Auto-start can be turned off in the card; turning it off never stops a
-daemon, it only means the plugin waits to be asked.
+The switch can be turned off in the settings card; off, the plugin only
+probes — it installs and starts nothing, and a running daemon is unaffected.
 
 ### 2.2 Path B — the CLI first
 
@@ -91,8 +93,9 @@ of three ways:
 - **Installed by hand.** `dsh plugin --profile web add @ccteam/ccteam-ui`,
   then restart `dsh web`. The plugin finds the running daemon and attaches.
 
-In every Path B variant the Engine card shows **attached**: the daemon was
-started by the CLI, and the plugin manages nothing it did not start (§3).
+In every Path B variant the Engine section reads **Attached** (*Started from
+the CLI / another entry; the plugin shows it*): the plugin manages nothing it
+did not start (§3).
 
 ## 3. Coexistence: one `$CCTEAM_HOME`, one daemon
 
@@ -101,8 +104,8 @@ same OS user all share one home and one daemon. The rules:
 
 - **Whoever starts first wins; everyone else attaches.** The plugin probes
   `GET /health` before doing anything. A daemon whose `home` equals the
-  plugin's resolved `$CCTEAM_HOME` is *the* daemon: the card shows
-  **attached** (started elsewhere) or **running** (started by this plugin).
+  plugin's resolved `$CCTEAM_HOME` is *the* daemon: the Engine section reads
+  **Attached** (started elsewhere) or **Running** (started by this plugin).
   Typing `ccteam start` while the plugin's daemon is up answers
   `alreadyRunning{pid,home}` with the same pid — there is no second instance,
   and no foreground mode to start one with.
@@ -110,13 +113,16 @@ same OS user all share one home and one daemon. The rules:
   `dsh plugin update`, or disabling the plugin releases the plugin's probes
   and nothing else; your Telegram gateway and running delegations continue,
   and the plugin re-attaches on its next boot.
-- **Stop is explicit and total.** The card's **Stop** runs
-  `ccteam daemon stop`: it stops the one daemon, so ccteam web and the IM
-  gateway stop with it (agent processes are never killed). Under systemd, the
-  unit may bring it back.
+- **Stop is explicit and total.** **Stop** in the Engine section confirms
+  first (*Stop the engine?* — “ccteam web and the IM gateway stop with it;
+  existing sessions are unaffected and resume on their next message.”) and
+  then runs `ccteam daemon stop`: it stops the one daemon (agent processes are
+  never killed). **Restart** confirms the same way, since it takes the daemon
+  down too. Under systemd, the unit may bring it back.
 - **A different home is reported, never fixed.** If `/health` reports a
-  `home` other than the plugin's, the card shows a **home mismatch** and the
-  plugin will not start a second daemon; point `CCTEAM_HOME` (or the card's
+  `home` other than the plugin's, the Engine section reads **Home mismatch** (the
+  first screen: **Engine home mismatch**, both homes listed) and the plugin
+  will not start a second daemon; point `CCTEAM_HOME` (or the card's
   daemon URL) at the same home so both halves share one engine.
 - **Your own install is never duplicated.** When ccteam registers or
   materializes its plugin into your `~/.dsh` web profile and finds
@@ -131,33 +137,73 @@ same OS user all share one home and one daemon. The rules:
 - **Remote or managed daemons are attach-only.** A daemon URL that is not
   loopback, a runtime ccteam itself started (the daemon is its parent), or a
   profile row ccteam materialized with credentials all mean somebody else
-  owns the engine: the card reports its state and offers no start / stop.
+  owns the engine: the Engine section shows the state and one sentence saying
+  why, and no buttons.
 
-## 4. The Engine card
+## 4. The Engine section, the first screen and the banner
 
-DSH **Settings → Plugins → Plugin configuration → ccteam-ui** carries the
-**Engine** section:
+**Settings card.** DSH **Settings → Plugins → Plugin configuration →
+ccteam-ui** opens with the **Engine** section:
 
-- **State** — `unsupported` (no engine is published for this OS/CPU; nothing
-  is installed) · `missing` (no `ccteam` binary yet) · `installing` ·
-  `stopped` (installed, daemon not running) · `starting` · `running`
-  (started by this plugin) · `attached` (started elsewhere) · `mismatch`
-  (home or version, §3 / §7).
-- **Version** — the pinned engine version this plugin ships against, the
-  installed binary's version, and the running daemon's version.
-- **pid · home · bind** — from `/health`: process id, `$CCTEAM_HOME`, the
-  web address actually served (and the DSH companion listener when on).
-- **Start / Stop / Restart / Update engine** — `ccteam start`,
+- **State** — a dot and one of: *Reading engine state…* · **Running**
+  (started by this plugin) · **Attached** (started elsewhere; the hint reads
+  *Started from the CLI / another entry; the plugin shows it*) · **Starting**
+  · **Installing** · **Stopped** (installed, daemon not running) · **Not
+  installed** · **Platform not supported** · **Home mismatch** · **Version
+  mismatch** (§3 / §7).
+- **Facts** — `engine v<installed>` (hover shows the binary's path),
+  `daemon v<running>` only when the running daemon differs from the installed
+  binary, `pid <n>`, `$CCTEAM_HOME` (middle-truncated; hover shows it whole),
+  the web bind, and an **Open ccteam web** link while the daemon answers.
+- **Start · Stop · Restart · Update engine** — `ccteam start`,
   `ccteam daemon stop`, stop-then-start, and
-  `ccteam update --channel npm --binary <platform package bin>`. Update goes
-  through the engine's own updater on purpose: it drains in-flight turns,
-  restarts gracefully and verifies the new version, none of which copying a
-  file over a running daemon would do.
-- **Auto-start** — install and start when the plugin loads (default on).
-- **Engine path** (advanced) — an explicit `ccteam` binary; empty means the
-  shell's `PATH`, then the canonical install path.
-- **Engine log** — the tail of `$CCTEAM_HOME/daemon.log`, the same file
-  `ccteam daemon logs` prints.
+  `ccteam update --channel npm --binary <platform package bin>`. **Update
+  engine** appears only when that is the fix (a version mismatch with an older
+  engine). **Stop** and **Restart** ask first — *Stop the engine?* / *Restart
+  the engine?* — because both take the daemon down: “ccteam web and the IM
+  gateway stop with it; existing sessions are unaffected and resume on their
+  next message.” Update goes through the engine's own updater on purpose: it
+  drains in-flight turns, restarts gracefully and verifies the new version,
+  none of which copying a file over a running daemon would do.
+- **Start the engine when the plugin loads** — the auto-start switch, on by
+  default; off, “the plugin only probes — it installs and starts nothing; a
+  running daemon is unaffected.”
+- **Advanced** → **Engine path override** (“Blank = ccteam on PATH, then the
+  default install location; applies on save.”) and **Resolved binary** — the
+  `ccteam` actually in use and how it was found (`configured` · `path` ·
+  `canonical`).
+- **Engine log** — the last 50 lines of `$CCTEAM_HOME/daemon.log` (the file
+  `ccteam daemon logs` prints), with **Refresh**.
+
+When the plugin does not supervise the engine (§3), the buttons are replaced
+by one sentence saying why — for example *ccteam started this DSH; the plugin
+does not manage the engine's lifecycle and only shows its state.* or *The
+engine is not on this machine; there is nothing here to start or stop.*
+
+**Inside the workbench.** The header carries an **Engine: <state>** dot;
+clicking it opens the same engine panel inside the workbench (DSH gives a
+plugin no way to jump to its settings page, so the panel ends with *Engine
+settings: DSH Settings → Plugins → Plugin configuration → ccteam-ui*); **Esc**
+closes it. On first use the workbench is gated on the engine:
+
+- **The ccteam engine is not running** — with the reason (*The engine is
+  installed; the daemon is not running.* or *No engine is installed yet;
+  starting installs it from the plugin's platform package.*) and one **Start
+  the engine** button. **Engine home mismatch** lists the plugin's home and
+  the daemon's with *Point both at one CCTEAM_HOME, then restart DSH*;
+  **Platform not supported** says that ccteam publishes engines for linux and
+  macOS on x64 / arm64 only.
+- **Add a workspace** — once the engine answers and there is no project yet:
+  **Directory (absolute path)**, **slug (optional)** (blank = from the
+  directory name), **Add**. When DSH itself has workspaces, an **Import from
+  DSH** list offers each of them as a one-click row; with none, the list is
+  simply absent.
+- The **version banner** across the top: *Engine v… is older than the plugin
+  requires (v…)* with an **Update engine** button, or *Plugin v… is older than
+  the engine (v…)* with a copyable `dsh plugin update @ccteam/ccteam-ui` (DSH
+  requires the profile flag, so run it as
+  `dsh plugin --profile web update @ccteam/ccteam-ui`); **Dismiss** hides it.
+  The repair is one-way — the running binary is never swapped silently.
 
 ## 5. Configure the faces
 
@@ -262,10 +308,10 @@ since 0.1.0-rc.7.
 
 | Symptom | Fix |
 |---|---|
-| **Not connected** | Open the Engine card: **Start** (or run `ccteam start`; the workbench also shows a copyable command). `stopped` means the binary is there and the daemon is not; `missing` means no binary — **Start** installs it from the platform package first. |
-| **Engine card says home mismatch** | A daemon is answering at the configured URL from a different `$CCTEAM_HOME`. The plugin will not start a second one. Run DSH with the same `CCTEAM_HOME` as that daemon, or point the card's daemon URL at the daemon you mean. |
-| **Engine card says version mismatch** | The running engine is not the version this plugin ships against. Engine older → **Update engine** (drain + graceful restart + verify). Plugin older → `dsh plugin --profile web update @ccteam/ccteam-ui` and restart DSH. The running binary is never swapped silently. |
-| **Engine card says unsupported** | ccteam publishes engines for Linux and macOS on x64 and arm64; nothing is installed on other platforms (Windows is unsupported; WSL counts as Linux). Install ccteam another way and point the card at it, or use ccteam web. |
+| **Not connected** / **The ccteam engine is not running** | Press **Start the engine** on the first screen (or **Start** in the settings card's Engine section, or run `ccteam start`; the panel also shows a copyable command). **Stopped** means the binary is there and the daemon is not; **Not installed** means no binary — starting installs it from the platform package first. |
+| **Home mismatch** (first screen: **Engine home mismatch**) | A daemon is answering at the configured URL from a different `$CCTEAM_HOME`; the panel lists both homes. The plugin will not start a second one. Point both at one `CCTEAM_HOME` and restart DSH, or point the card's daemon URL at the daemon you mean. |
+| **Version mismatch** / version banner | The running engine is not the version this plugin ships against. *Engine … is older than the plugin requires* → **Update engine** (drain + graceful restart + verify). *Plugin … is older than the engine* → `dsh plugin --profile web update @ccteam/ccteam-ui` (the banner's copy chip omits the profile flag DSH requires) and restart DSH. The running binary is never swapped silently. |
+| **Platform not supported** | ccteam publishes engines for Linux and macOS on x64 and arm64; nothing is installed on other platforms (Windows is unsupported; WSL counts as Linux). Install ccteam another way and point the card at it, or use ccteam web. |
 | **Install refused: symlink / package-managed destination** | The ladder landed on a `ccteam` that belongs to something else (a symlink, Homebrew, nix, snap, a `node_modules` tree). Update it with that tool, or set `CCTEAM_INSTALL_DIR=<dir>` for the DSH process so the plugin installs elsewhere. |
 | **401** | A REST request on the wire uses `Bearer ccteam:<hex>`. The card's **REST API token** is that personal token (paste it without `Bearer`); the **enrollment credential** is the `ccteam-enroll:<id>:<secret>` string. They are different credentials — check you did not paste one into the other's field. |
 | **`duplicate loader entry id` at boot** | The plugin was inserted twice (for example, registry plus bundle patch, or a hand-edited `cordis.patch.yml`). Keep exactly one entry and remove the duplicate. ccteam's own registration never adds a second entry next to one you installed. |
@@ -289,8 +335,8 @@ the plugin is older. The CLI's `ccteam update` reaches the same engine, and
 `ccteam status` shows the running-vs-binary version.
 
 **Platforms.** `@ccteam/engine-linux-x64`, `-linux-arm64`, `-darwin-x64`,
-`-darwin-arm64`. Windows has no engine package; the card reports
-`unsupported` and installs nothing.
+`-darwin-arm64`. Windows has no engine package; the Engine section reads
+**Platform not supported** and nothing is installed.
 
 Update or remove the plugin with the same profile-scoped command family (the
 package name is required):

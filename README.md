@@ -113,7 +113,7 @@ ccteam also lives natively inside [DeepSeek Harness](https://www.npmjs.com/packa
 | **Workbench** | People using DSH Web | A full-page ccteam workbench opened from a button at the bottom of DSH's sidebar: the cross-harness team tree (search, per-project fold/unfold, hover ⋯ menu), a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, mid-turn model/effort switch, interrupt), and a details column — docks beside DSH's own panes or expands full-page. |
 | **Tools** | DSH agents (the LLM) | The same eight MCP tools described above, callable from inside a DSH session. |
 | **Transport** | ccteam | The channel that lets ccteam hire a DSH session the way it hires any other harness. |
-| **Engine** | You | The ccteam daemon itself, shipped with the plugin as a platform package (`@ccteam/engine-<os>-<cpu>`): installed, started and supervised from an engine card in the plugin's settings — state, version, start / stop / restart / update engine, auto-start, log. |
+| **Engine** | You | The ccteam daemon itself, shipped with the plugin as a platform package (`@ccteam/engine-<os>-<cpu>`): installed, started and supervised from the **Engine** section of the plugin's settings card — state, version, **Start / Stop / Restart / Update engine**, a *Start the engine when the plugin loads* switch, the engine log. |
 
 Install it with `dsh plugin --profile web add @ccteam/ccteam-ui` and restart `dsh web`: the plugin brings the engine, starts the daemon, and picks up your console token from `~/.ccteam` on the same machine — nothing to paste. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `session_spawn` with `vendor:"dsh"`), the plugin and its credentials are materialized for you. Either way it is one daemon shared with the CLI and ccteam web: the plugin attaches to a running one, never starts a second one against another `~/.ccteam`, and never stops it when DSH restarts. The full setup (both install paths, coexistence rules, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
 
@@ -148,7 +148,7 @@ One static binary into `~/.local/bin`, no sudo. Every install mode — the scrip
 dsh plugin --profile web add @ccteam/ccteam-ui
 ```
 
-Restart `dsh web` and the plugin installs the ccteam engine from its platform package through the same ladder, starts the daemon, and shows an engine card in its settings. It is one shared daemon: the `ccteam` CLI, ccteam web and the plugin all use the same `~/.ccteam` — whoever starts first wins and the others attach ([details](docs/dsh-plugin.md)).
+Restart `dsh web` and the plugin installs the ccteam engine from its platform package through the same ladder, starts the daemon, and shows an **Engine** section in its settings card. It is one shared daemon: the `ccteam` CLI, ccteam web and the plugin all use the same `~/.ccteam` — whoever starts first wins and the others attach ([details](docs/dsh-plugin.md)).
 
 **3 · Let an agent do it** — paste into any agent you already have:
 
@@ -242,7 +242,7 @@ It stays deliberately underneath:
 ccteam update                # update in place; restarts the daemon onto the new binary
 ```
 
-`ccteam status` shows your version and flags a newer release. From DSH, the plugin's engine card does the same with **Update engine** (the engine from its platform package, through the same drain + restart + verify); `dsh plugin --profile web update @ccteam/ccteam-ui` updates the plugin itself. (Details: [usage](docs/usage.md#updating).)
+`ccteam status` shows your version and flags a newer release. From DSH, the plugin's Engine section does the same with **Update engine** (the engine from its platform package, through the same drain + restart + verify); `dsh plugin --profile web update @ccteam/ccteam-ui` updates the plugin itself. (Details: [usage](docs/usage.md#updating).)
 
 ## Uninstall
 

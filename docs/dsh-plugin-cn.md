@@ -21,7 +21,7 @@ web 控制台的移植。
 | **工作台** | 使用 DSH Web 的人 | DSH 里的 ccteam 工作台：整页界面，含跨 harness 团队树、原生级会话（流式 Markdown、工具步骤、选择提示、附件、打断）和详情栏，入口是 DSH 自己侧栏底部的 ccteam 按钮。 |
 | **工具** | DSH 会话里的 agent（LLM） | 在 DSH 会话中注册 ccteam 的 8 个 MCP 工具，让 DSH agent 也能雇用与驱动团队其他成员。 |
 | **传输** | ccteam | ccteam 雇用 DSH 会话所走的 ACP 通道。只有 profile 行里带 socket 路径时才启用，而那只有 ccteam 托管的运行时才会写。 |
-| **引擎** | 你 | ccteam daemon 本身：插件把 `ccteam` 二进制作为平台包一起带来，负责安装、启动，并在设置卡里给出「引擎」段（状态、版本、启动 / 停止 / 重启 / 更新）。 |
+| **引擎** | 你 | ccteam daemon 本身：插件把 `ccteam` 二进制作为平台包一起带来，负责安装、启动，并在设置卡最上面给出「引擎」段（状态、版本、启动 / 停止 / 重启 / 更新引擎）。 |
 
 三个面各自独立生效：没有 DSH web app 的 profile 照样拿到工具面，没有 agent
 运行时的 profile 照样拿到工作台。
@@ -51,16 +51,17 @@ Cmd+Shift+R）。插件启动时会：
    目录（先解软链），否则 `~/.local/bin`——复制件先要能回答 `--version` 才会
    被换上。目标若是软链或位于包管理器目录（`node_modules`、Homebrew、nix、
    snap），只报告、绝不覆盖；想装到别处就设 `CCTEAM_INSTALL_DIR`。
-2. **启动 daemon。** 「自动启动」开着（默认）时执行 `ccteam start --json`——
+2. **启动 daemon。** 「插件启动时自动启动引擎」开着（默认）时执行 `ccteam start --json`——
    与 CLI 同一个脱离终端、幂等的 launcher——并等待 `GET /health` 就绪。若这个
    home 已有 daemon 在应答，则直接接上（§3）。
 3. **自动配好凭据。** 同一台机器、同一个 OS 用户下，工作台不需要粘贴任何
    东西：插件只读一个文件 `$CCTEAM_HOME/secrets/web-token`（daemon 为自己的
    operator 写下的控制台 token），并通过 REST 向 daemon 领取工具面的
    enrollment 凭据、存进设置卡。你在卡里手填的 token 永远优先于文件。
-4. **显示「引擎」段**（§4）；还没有项目时，工作台首屏会让你添加一个工作区。
+4. **把工作台闸在引擎上**（§4）：daemon 应答之前，首屏显示「ccteam 引擎未运行」和一个
+   「启动引擎」按钮；还没有项目时显示「添加工作区」。
 
-「自动启动」可在卡上关掉；关掉它不会停止任何 daemon，只是插件从此等你来点。
+这个开关可在设置卡里关掉；关闭后插件只探测，不安装、不启动，正在运行的 daemon 不受影响。
 
 ### 2.2 方式 B——先装 CLI
 
@@ -78,8 +79,8 @@ https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh`，
 - **手动安装。** `dsh plugin --profile web add @ccteam/ccteam-ui`，然后重启
   `dsh web`。插件会找到正在跑的 daemon 并接上。
 
-方式 B 的三种来法下，「引擎」段都显示 **attached**：daemon 是 CLI 起的，插件
-不管任何不是它起的东西（§3）。
+方式 B 的三种来法下，「引擎」段都显示「已挂靠」（提示行「由 CLI/其他入口启动，插件已
+接管显示」）：插件不管任何不是它起的东西（§3）。
 
 ## 3. 共存：一个 `$CCTEAM_HOME`，一个 daemon
 
@@ -87,18 +88,19 @@ https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh`，
 home、一个 daemon。规则如下：
 
 - **谁先起谁赢，其余 attach。** 插件动手前先探 `GET /health`。应答里的
-  `home` 与插件解析出的 `$CCTEAM_HOME` 相同，那就是*这个* daemon：卡上显示
-  **attached**（别处起的）或 **running**（本插件起的）。插件的 daemon 在跑时
+  `home` 与插件解析出的 `$CCTEAM_HOME` 相同，那就是*这个* daemon：「引擎」段显示
+  「已挂靠」（别处起的）或「运行中」（本插件起的）。插件的 daemon 在跑时
   敲 `ccteam start`，得到的是 `alreadyRunning{pid,home}`、同一个 pid——不会有
   第二个实例，也没有前台模式可以起出第二个。
 - **插件被释放不停 daemon。** DSH 重启、`dsh plugin update`、禁用插件，都只
   释放插件自己的探针，别的一概不动；你的 Telegram 网关和进行中的委派照常，
   插件下次启动重新 attach。
-- **停止是显式的、整体的。** 卡上的「停止」执行 `ccteam daemon stop`：停的
-  是那唯一的 daemon，所以 ccteam web 和 IM 网关随之一起停（agent 进程永不被
-  杀）。systemd 托管时 unit 可能把它再拉起来。
-- **home 不同只报告、不修。** `/health` 报的 `home` 与插件的不一致时，卡上
-  显示 **home 不匹配**，插件不会去起第二个 daemon；把 `CCTEAM_HOME`（或卡上
+- **停止是显式的、整体的。** 「引擎」段的「停止」先确认（「停止引擎？」——「同时会
+  停止 ccteam web 与 IM 网关；已有会话不受影响，下条消息自动恢复。」），再执行
+  `ccteam daemon stop`：停的是那唯一的 daemon（agent 进程永不被杀）。「重启」同样
+  先确认，因为它也会把 daemon 拉下来。systemd 托管时 unit 可能把它再拉起来。
+- **home 不同只报告、不修。** `/health` 报的 `home` 与插件的不一致时，「引擎」段
+  显示「家目录不一致」（首屏：「引擎家目录不一致」并列出两个 home），插件不会去起第二个 daemon；把 `CCTEAM_HOME`（或卡上
   的 daemon 地址）指向同一个 home，两边就共用一个引擎。
 - **你自己装的插件绝不被重复安装。** ccteam 往你的 `~/.dsh` web profile 注册
   或物化插件时，若发现 `@ccteam/ccteam-ui` 已由你自己 `dsh plugin add` 装过，
@@ -110,29 +112,54 @@ home、一个 daemon。规则如下：
   自己的 override 行。
 - **远端或受管 daemon 只 attach。** daemon 地址不是 loopback、运行时本身由
   ccteam 起（daemon 是它的父进程）、或 profile 行是 ccteam 带着凭据物化的——
-  这些都意味着引擎属于别人：卡上只报状态，不提供启动 / 停止。
+  这些都意味着引擎属于别人：「引擎」段只显示状态和一句原因，没有按钮。
 
-## 4. 「引擎」段
+## 4. 「引擎」段、首屏与横幅
 
-DSH **设置 → 插件 → 插件配置 → ccteam-ui** 卡里有「引擎」段：
+**设置卡。** DSH **设置 → 插件 → 插件配置 → ccteam-ui** 卡的最上面就是「引擎」段：
 
-- **状态** —— `unsupported`（本 OS/CPU 没有发布引擎，不装任何东西）·
-  `missing`（还没有 `ccteam` 二进制）· `installing` · `stopped`（已装、daemon
-  未跑）· `starting` · `running`（本插件起的）· `attached`（别处起的）·
-  `mismatch`（home 或版本不一致，§3 / §7）。
-- **版本** —— 本插件钉死的引擎版本、已装二进制的版本、正在跑的 daemon 的版本。
-- **pid · home · 绑定地址** —— 来自 `/health`：进程 id、`$CCTEAM_HOME`、实际
-  服务的 web 地址（以及开着时的 DSH 伴生监听地址）。
-- **启动 / 停止 / 重启 / 更新引擎** —— 分别是 `ccteam start`、
-  `ccteam daemon stop`、先停后起、以及
-  `ccteam update --channel npm --binary <平台包里的 bin>`。更新刻意走引擎自己
-  的更新器：它会等在飞的 turn 跑完、优雅重启、核对新版本——直接把文件盖到正
-  在跑的 daemon 上做不到这些。
-- **自动启动** —— 插件加载时安装并启动（默认开）。
-- **引擎路径**（高级）—— 显式指定 `ccteam` 二进制；留空 = 先 shell 的 `PATH`，
-  再规范安装路径。
-- **引擎日志** —— `$CCTEAM_HOME/daemon.log` 的尾部，与 `ccteam daemon logs`
-  读的是同一个文件。
+- **状态** —— 一个状态点加下列之一：「正在读取引擎状态…」·「运行中」（本插件起的）·
+  「已挂靠」（别处起的；提示行「由 CLI/其他入口启动，插件已接管显示」）·「启动中」·
+  「安装中」·「已停止」（已装、daemon 未跑）·「未安装」·「不支持此平台」·
+  「家目录不一致」·「版本不一致」（§3 / §7）。
+- **事实行** —— `引擎 v<已装版本>`（悬停显示二进制路径）、`daemon v<运行版本>`（只在
+  运行中的 daemon 与已装二进制版本不同时出现）、`pid <n>`、`$CCTEAM_HOME`（中截；
+  悬停显示全文）、web 绑定地址，以及 daemon 应答时的「打开 ccteam web」链接。
+- **启动 · 停止 · 重启 · 更新引擎** —— 分别是 `ccteam start`、`ccteam daemon stop`、
+  先停后起、以及 `ccteam update --channel npm --binary <平台包里的 bin>`。「更新引擎」
+  只在它就是修法时出现（版本不一致且引擎较旧）。「停止」和「重启」都先确认——
+  「停止引擎？」/「重启引擎？」——因为两者都会把 daemon 拉下来：「同时会停止
+  ccteam web 与 IM 网关；已有会话不受影响，下条消息自动恢复。」更新刻意走引擎
+  自己的更新器：它会等在飞的 turn 跑完、优雅重启、核对新版本——直接把文件盖到
+  正在跑的 daemon 上做不到这些。
+- **插件启动时自动启动引擎** —— 自动启动开关，默认开；「关闭后插件只探测，不安装、
+  不启动；正在运行的 daemon 不受影响。」
+- **高级** → **引擎路径覆盖**（「留空 = 先找 PATH 里的 ccteam，再找默认安装位置；
+  保存后生效。」）和**当前解析到的二进制** —— 实际在用的 `ccteam` 及其来路
+  （`configured` · `path` · `canonical`）。
+- **引擎日志** —— `$CCTEAM_HOME/daemon.log` 的最后 50 行（与 `ccteam daemon logs`
+  读的是同一个文件），带「刷新」。
+
+插件不托管引擎时（§3），按钮换成一句说明原因的话——例如「此 DSH 由 ccteam 启动；
+引擎的生命周期不由插件管理，这里只显示状态。」或「引擎不在本机；这里没有可启动或
+停止的进程。」
+
+**工作台内。** 头部有一个「引擎：<状态>」状态点；点它在工作台内打开同一个引擎面板
+（DSH 没给插件跳到设置页的入口，所以面板末尾写着「引擎设置在 DSH 设置 → 插件 →
+插件配置 → ccteam-ui」）；**Esc** 关闭。首次使用时工作台闸在引擎上：
+
+- **「ccteam 引擎未运行」** —— 附原因（「引擎已安装，但 daemon 没有运行。」或
+  「还没有安装引擎；启动时会从插件自带的平台包安装。」）和一个「启动引擎」按钮。
+  「引擎家目录不一致」会并列插件与 daemon 两个 home，并提示「统一 CCTEAM_HOME 后
+  重启 DSH」；「不支持此平台」说明「ccteam 只为 linux 与 macOS 的 x64 / arm64
+  发布引擎。」
+- **「添加工作区」** —— 引擎应答后、还没有项目时显示：「目录（绝对路径）」、
+  「slug（可选）」（留空按目录名生成）、「添加」。DSH 自己有工作区时，会多出一个
+  「从 DSH 导入」列表，每个工作区一行、一键添加；没有工作区则这个列表不出现。
+- 顶部的**版本横幅**：「引擎 v… 低于插件要求 v…」配「更新引擎」按钮，或
+  「插件 v… 低于引擎 v…」配可复制的 `dsh plugin update @ccteam/ccteam-ui`（DSH 要求
+  带 profile，实际请执行 `dsh plugin --profile web update @ccteam/ccteam-ui`）；
+  「关闭提示」隐藏它。修复是单向的——正在跑的二进制绝不会被悄悄换掉。
 
 ## 5. 配置三个面
 
@@ -212,10 +239,10 @@ harness 的目录里选**模型**和 **effort**（留空即 harness 默认），
 
 | 现象 | 处理方式 |
 |---|---|
-| **未连接** | 打开「引擎」段点「启动」（或执行 `ccteam start`；面板也会显示可复制的命令）。`stopped` = 二进制在、daemon 没跑；`missing` = 没有二进制——「启动」会先从平台包把它装上。 |
-| **「引擎」段报 home 不匹配** | 配置的地址上有个 daemon 在应答，但它的 `$CCTEAM_HOME` 不是插件的。插件不会起第二个。用与那个 daemon 相同的 `CCTEAM_HOME` 启动 DSH，或把卡上的 daemon 地址指向你要的那个 daemon。 |
-| **「引擎」段报版本不匹配** | 正在跑的引擎不是本插件钉死的版本。引擎旧 → 点「更新引擎」（等 turn 跑完 + 优雅重启 + 核对版本）。插件旧 → `dsh plugin --profile web update @ccteam/ccteam-ui` 后重启 DSH。正在跑的二进制绝不会被悄悄换掉。 |
-| **「引擎」段报 unsupported** | ccteam 只为 Linux 和 macOS 的 x64 / arm64 发布引擎；其它平台什么都不装（Windows 不支持；WSL 算 Linux）。请另行安装 ccteam 并把卡指向它，或直接用 ccteam web。 |
+| **未连接** / **「ccteam 引擎未运行」** | 首屏点「启动引擎」（或设置卡「引擎」段的「启动」，或执行 `ccteam start`；面板也会显示可复制的命令）。「已停止」= 二进制在、daemon 没跑；「未安装」= 没有二进制——启动会先从平台包把它装上。 |
+| **「家目录不一致」**（首屏：「引擎家目录不一致」） | 配置的地址上有个 daemon 在应答，但它的 `$CCTEAM_HOME` 不是插件的；面板并列两个 home。插件不会起第二个。统一 `CCTEAM_HOME` 后重启 DSH，或把卡上的 daemon 地址指向你要的那个 daemon。 |
+| **「版本不一致」** / 版本横幅 | 正在跑的引擎不是本插件钉死的版本。「引擎 … 低于插件要求 …」→ 点「更新引擎」（等 turn 跑完 + 优雅重启 + 核对版本）。「插件 … 低于引擎 …」→ `dsh plugin --profile web update @ccteam/ccteam-ui`（横幅的复制片没带 DSH 要求的 profile 参数）后重启 DSH。正在跑的二进制绝不会被悄悄换掉。 |
+| **「不支持此平台」** | ccteam 只为 Linux 和 macOS 的 x64 / arm64 发布引擎；其它平台什么都不装（Windows 不支持；WSL 算 Linux）。请另行安装 ccteam 并把卡指向它，或直接用 ccteam web。 |
 | **安装被拒：目标是软链 / 归包管理器** | 安装梯度落到了一个属于别人的 `ccteam`（软链、Homebrew、nix、snap、`node_modules` 目录）。用那个工具更新它，或给 DSH 进程设 `CCTEAM_INSTALL_DIR=<dir>` 让插件装到别处。 |
 | **401** | HTTP 请求中的 REST 形式是 `Bearer ccteam:<hex>`。卡片里的 **REST API token** 就是这枚个人 token（粘贴时不要加 `Bearer`）；**Enrollment 凭据** 是 `ccteam-enroll:<id>:<secret>`。二者是不同凭据——先确认没有把其中一个填进了另一个的框。 |
 | **启动时报 `duplicate loader entry id`** | 同一个插件被插入了两次（常见于 registry 和 bundle patch 都有，或手改了 `cordis.patch.yml`）。只保留一条，删除重复项。ccteam 自己的注册绝不会在你装的那份旁边再加一条。 |
@@ -237,7 +264,7 @@ harness 的目录里选**模型**和 **effort**（留空即 harness 默认），
 的版本。
 
 **平台。** `@ccteam/engine-linux-x64`、`-linux-arm64`、`-darwin-x64`、
-`-darwin-arm64`。Windows 没有引擎包；卡上显示 `unsupported`，不装任何东西。
+`-darwin-arm64`。Windows 没有引擎包；「引擎」段显示「不支持此平台」，不装任何东西。
 
 更新或移除插件时，继续使用同一组 profile 命令（必须写出包名）：
 
