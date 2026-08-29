@@ -104,6 +104,17 @@ The daemon routes and records — at-least-once notifications across restarts, i
 - Plain-language walkthrough → [orchestration guide](docs/orchestration.md)
 - Every command → manual ([English](docs/usage.md) · [中文](docs/usage-cn.md))
 
+## Inside DeepSeek Harness
+
+ccteam also lives natively inside [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)'s own web UI, as two DSH client plugins — not a port of the console above, built with DSH's own slots, primitives and locale:
+
+| Plugin | For | What it gives you |
+|---|---|---|
+| **`@ccteam/ccteam-ui`** | People using DSH Web | A full-page ccteam workbench opened from a button at the bottom of DSH's sidebar: the cross-vendor team tree (search, per-project fold/unfold, hover ⋯ menu), a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, mid-turn model/effort switch, interrupt), and a details column — docks beside DSH's own panes or expands full-page. |
+| **`@ccteam/ccteam-client`** | DSH agents (the LLM) | The same eight MCP tools described above, callable from inside a DSH session, plus the transport that lets ccteam hire a DSH session the way it hires any other vendor. |
+
+Install either one or both from DSH **Settings → Plugins**. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `session_spawn` with `vendor:"dsh"`), both plugins and their credentials are already there — nothing to install or paste. For a standalone `dsh web` you run yourself, the plugins need a reachable ccteam daemon and a REST token; the full setup (both modes, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
+
 ## Install
 
 Runs on **macOS**, **Linux**, and **Windows (via WSL)**.
