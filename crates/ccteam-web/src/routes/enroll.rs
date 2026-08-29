@@ -38,7 +38,9 @@
 //! disk per restart. Both routes therefore take `ensure` + `label` in the body
 //! and go through `ccteam_core::enroll::ensure_in`, keyed by
 //! (identity, scope, label) — the same function the machine credential and the
-//! Hosts "register MCP" button use.
+//! Hosts "register MCP" button use. A label is REQUIRED here, because the
+//! unlabelled slot is that machine credential and no REST caller may resolve
+//! or rotate it.
 //!
 //! That flag lives in the BODY rather than in a new `PUT /api/v1/enroll/{label}`
 //! for three reasons, in order of weight: (a) the scope lives in the ROUTE, so
@@ -334,6 +336,9 @@ async fn mint_and_render(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // An empty label is not "no key": the unlabelled slot is the MACHINE
+    // credential daemon start writes into the vendor global configs, and no
+    // REST caller may resolve — or rotate — that one.
     if form.ensure && label.is_none() {
         return bad_request(
             "ensure needs a non-empty label: it is the key the credential is looked up by",

@@ -198,10 +198,6 @@ pub fn revoke_in(root: &Path, id: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Label the machine-user credential carries. It is part of that record's
-/// IDENTITY, not decoration: see [`ensure_in`].
-pub const MACHINE_LABEL: &str = "this machine";
-
 /// What [`ensure_in`] resolved to.
 pub struct Ensured {
     pub credential: EnrollCredential,
@@ -216,12 +212,17 @@ pub struct Ensured {
 /// purpose rather than *another* one.
 ///
 /// The key includes the LABEL because a label is how a caller names its own
-/// slot ("this machine", "dsh-plugin:web"), and dropping it made the lookup
-/// return whichever user-scoped record happened to be newest: one console mint
-/// and the next daemon start would rewrite five vendor configs with a
-/// different bearer. Owner is in the key because a credential speaks for one
-/// identity, and scope because a project-pinned record must never satisfy a
-/// request for an unpinned one (it reaches less than the caller asked for).
+/// slot (`dsh-plugin:web`, `ci`), and dropping it made the lookup return
+/// whichever user-scoped record happened to be newest: one console mint and
+/// the next daemon start would rewrite five vendor configs with a different
+/// bearer. `None` is a slot too — **the machine credential**, the unlabelled
+/// one daemon start writes into the vendor configs (see
+/// [`ensure_user_credential_in`]). Matching is exact in both directions, so a
+/// labelled record never shadows the machine one and the machine one never
+/// satisfies a request for a named slot. Owner is in the key because a
+/// credential speaks for one identity, and scope because a project-pinned
+/// record must never satisfy a request for an unpinned one (it reaches less
+/// than the caller asked for).
 ///
 /// `rotate` is the escape hatch for a caller that LOST its secret: the record
 /// is unreadable by then (only the id is public), so the only way back is a
@@ -259,10 +260,14 @@ pub fn ensure_in(
 /// The machine-user credential, minted once and reused — this is what daemon
 /// start writes into the vendor global configs, so it must be stable across
 /// restarts or every restart would rewrite five config files with a new value.
-/// One slot, named by [`MACHINE_LABEL`]; see [`ensure_in`] for why the name is
-/// part of the key.
+///
+/// Its slot is the UNLABELLED one: a label names a caller's own slot, and this
+/// credential is nobody's slot but the machine's — it is what an installation
+/// has always had, so every record already on disk matches by construction and
+/// no restart re-mints. The REST ensure face cannot reach it (it rejects an
+/// empty label), so only daemon start resolves this key.
 pub fn ensure_user_credential_in(root: &Path, owner: &str) -> Result<EnrollCredential> {
-    Ok(ensure_in(root, EnrollScope::User, owner, Some(MACHINE_LABEL), false)?.credential)
+    Ok(ensure_in(root, EnrollScope::User, owner, None, false)?.credential)
 }
 
 /// Convenience wrappers for callers that already hold [`CcteamPaths`].
@@ -459,7 +464,10 @@ mod tests {
     fn the_machine_credential_is_not_shadowed_by_a_newer_labelled_one() {
         let (_tmp, root) = root();
         let machine = ensure_user_credential_in(&root, "user:web-api").unwrap();
-        assert_eq!(machine.label.as_deref(), Some(MACHINE_LABEL));
+        assert!(
+            machine.label.is_none(),
+            "the machine slot is the unlabelled one"
+        );
         let newer = mint_in(
             &root,
             EnrollScope::User,
@@ -476,6 +484,54 @@ mod tests {
             ensure_user_credential_in(&root, "user:web-api").unwrap().id,
             machine.id,
             "daemon start must keep writing the SAME bearer"
+        );
+    }
+
+    /// Every installation that predates labels holds its machine credential as
+    /// an UNLABELLED record. That record IS the machine slot — daemon start
+    /// must resolve to it, not mint a replacement and rewrite five vendor
+    /// configs on the very upgrade that was supposed to stop doing exactly
+    /// that. Fixture is a hand-written record with no `label` key at all.
+    #[test]
+    fn legacy_unlabeled_machine_credential_is_reused_not_reminted() {
+        let (_tmp, root) = root();
+        std::fs::create_dir_all(enroll_dir_in(&root)).unwrap();
+        std::fs::write(
+            enroll_dir_in(&root).join("0123456789abcdef.json"),
+            r#"{"id":"0123456789abcdef","secret":"legacy","scope":{"kind":"user"},"owner":"user:web-api","created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        for pass in 1..=2 {
+            let cred = ensure_user_credential_in(&root, "user:web-api").unwrap();
+            assert_eq!(cred.id, "0123456789abcdef", "pass {pass} must reuse it");
+            assert_eq!(cred.secret, "legacy", "same bearer for the vendor configs");
+            assert_eq!(
+                list_in(&root)
+                    .iter()
+                    .filter(|c| c.scope == EnrollScope::User)
+                    .count(),
+                1,
+                "pass {pass} minted a second machine credential"
+            );
+        }
+
+        // A named slot is a different key: it mints its own record and leaves
+        // the machine one exactly where it was.
+        let plugin = ensure_in(
+            &root,
+            EnrollScope::User,
+            "user:web-api",
+            Some("dsh-plugin:web"),
+            false,
+        )
+        .unwrap();
+        assert!(plugin.created);
+        assert_ne!(plugin.credential.id, "0123456789abcdef");
+        assert_eq!(
+            ensure_user_credential_in(&root, "user:web-api").unwrap().id,
+            "0123456789abcdef",
+            "a labelled ensure must not touch the machine record"
         );
     }
 
