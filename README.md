@@ -196,7 +196,7 @@ ccteam adds a team to your repo without taking it over:
 
 - **Roleless by default** — the brain reads *your* `CLAUDE.md` / `AGENTS.md` through the vendor's own mechanism; ccteam never rewrites project knowledge.
 - **Small footprint** — exactly `.ccteam/` (state), `.claude/agents/` (personas you install), and ccteam's own section of `.claude/settings.local.json` — never your `settings.json`.
-- **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
+- **Durable sessions** — ids (`s1`, `s2`, …) survive daemon restarts and cold-resume from disk; state is plain files in your repo. A session you are not talking to releases its harness process after an idle window (default one hour, matching the prompt-cache TTL) and comes straight back on your next message, on the same id and the same conversation — so a fleet of thirty sessions costs thirty transcripts, not thirty resident processes. One session, one process: a restart never kills an agent mid-turn and never starts a second one beside it — the daemon lets the process finish, queues what you send it meanwhile, recovers the answer it gave from the vendor's own record, and resumes the session by id.
 
 ## Extras
 

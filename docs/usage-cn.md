@@ -474,7 +474,7 @@ ccteam host rm <host-id> --daemon http://daemon-host:7331 --web-token <admin-hex
 - **远程新建**:web 控制台 → 新建项目 → 主机选择器选那台卫星 → 填它机器上的绝对路径,daemon 请卫星就地 bootstrap 并注册。
 - **接入既有 checkout**:在那台机器仓库里 `ccteam init`,然后主机页对上报的项目点「接入」。slug 撞名会得到独立 catalog slug(`demo` → `demo2`)——跨机 slug 相同不代表同一项目。
 
-远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:daemon 全局最多 50 个 live 会话(`sessions.max_live` 可配);超限时优雅挤停最久无活动的 idle 会话,被停会话可随时恢复。
+远程执行当前支持 Claude stream-json 会话;连接断了自动退避重连,exec 链路断开后下次 spawn 经 vendor `--resume` 续上下文。Pi 和 DSH 都是 local-only:会话只跑在 daemon 本机,把它们 spawn 进绑定卫星的项目会直接报错,不会悄悄换到本机跑。舰队容量:一个会话超过 `sessions.idle_release_secs`(默认 3600 秒 = 一小时,对齐 Claude 的 prompt-cache TTL —— 进程只握到「再握也省不下缓存」为止;`0` = 永不释放,`sessions.idle_release_by_vendor: {claude: 7200, codex: 0, …}` 可按 harness 覆盖)没人说话,ccteam 就放掉它的 harness 进程。**释放 ≠ 结束**:transcript 还在、`/sessions` 里照样列出(带 💤)、这个 chat 的当前会话也还指着它 —— 下一条消息就按同一个 sid 恢复(约 1 秒)。在飞 turn、等待审批、harness 自报还有后台任务的会话都不会被释放。`sessions.max_live`(默认 50)保留为突发场景的硬上限:超限时优雅释放最久无活动的合格会话。只有 `/stop` 才是真正结束一个会话。
 
 ---
 
