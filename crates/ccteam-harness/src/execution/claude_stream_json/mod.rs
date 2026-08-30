@@ -607,7 +607,13 @@ async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::Acc
     if body.subtype != "success" {
         return None;
     }
-    let resp = body.response.as_ref()?;
+    parse_get_usage_response(body.response.as_ref()?)
+}
+
+/// The `get_usage` response body → [`crate::AccountUsage`]. Pure, so the wire
+/// shape is testable without a live child (the transport half above is the
+/// only part that needs one).
+fn parse_get_usage_response(resp: &serde_json::Value) -> Option<crate::AccountUsage> {
     let rl = resp.get("rate_limits");
     let five = rl.and_then(|r| r.get("five_hour"));
     let seven = rl.and_then(|r| r.get("seven_day"));
@@ -643,12 +649,109 @@ async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::Acc
         weekly_resets_at: resets(seven),
         weekly_severity,
         credits_pct: pct(extra),
+        model_windows: model_windows(rl),
     };
     if usage == crate::AccountUsage::default() {
         None
     } else {
         Some(usage)
     }
+}
+
+/// Per-model weekly windows out of the `rate_limits` object.
+///
+/// Claude meters some models on their OWN weekly clock, and spells that three
+/// different ways depending on build + server feature flag. All three are read,
+/// most-specific first, and the first that yields rows wins — they describe the
+/// same fact, so merging them would double-count it:
+///
+/// 1. `rate_limits.model_scoped: [{display_name, utilization, resets_at}]` —
+///    the current, server-gated shape. `resets_at` is already ISO-8601 (the CLI
+///    converts the epoch before emitting) and `utilization` is 0-100.
+/// 2. Fixed siblings `rate_limits.seven_day_{opus,sonnet}` — the same
+///    `{utilization, resets_at}` shape as the shared `seven_day` window.
+/// 3. `rate_limits.limits[]` entries with `kind == "weekly_scoped"`:
+///    `{scope: {model: {display_name}}, percent, resets_at}`.
+///
+/// The model name is whatever the vendor called it (`display_name`, e.g.
+/// `"Fable"`), passed through verbatim — ccteam never maps a vendor bucket onto
+/// a model id, because they are not the same namespace.
+fn model_windows(rate_limits: Option<&serde_json::Value>) -> Vec<crate::ModelWindow> {
+    let Some(rl) = rate_limits else {
+        return Vec::new();
+    };
+    let row = |model: Option<&str>, pct: Option<u8>, resets_at: Option<String>| {
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        // A bucket the vendor named but reported nothing about is not a fact.
+        (pct.is_some() || resets_at.is_some()).then(|| crate::ModelWindow {
+            model: model.to_string(),
+            pct,
+            resets_at,
+        })
+    };
+    let pct_of = |v: &serde_json::Value, key: &str| {
+        v.get(key)
+            .and_then(|v| v.as_f64())
+            .map(|f| f.round().clamp(0.0, 100.0) as u8)
+    };
+    let resets_of = |v: &serde_json::Value| {
+        v.get("resets_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+
+    // (1) the declared per-model array.
+    if let Some(entries) = rl.get("model_scoped").and_then(|v| v.as_array()) {
+        let rows: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                row(
+                    entry.get("display_name").and_then(|v| v.as_str()),
+                    pct_of(entry, "utilization"),
+                    resets_of(entry),
+                )
+            })
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+
+    // (2) the fixed per-model siblings of the shared weekly window.
+    let rows: Vec<_> = [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")]
+        .iter()
+        .filter_map(|(key, model)| {
+            let window = rl.get(key)?;
+            row(
+                Some(model),
+                pct_of(window, "utilization"),
+                resets_of(window),
+            )
+        })
+        .collect();
+    if !rows.is_empty() {
+        return rows;
+    }
+
+    // (3) the raw `limits[]` feed, model-scoped entries only.
+    rl.get("limits")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("weekly_scoped"))
+                .filter_map(|entry| {
+                    row(
+                        entry
+                            .pointer("/scope/model/display_name")
+                            .and_then(|v| v.as_str()),
+                        pct_of(entry, "percent"),
+                        resets_of(entry),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The reasoning-effort levels claude accepts (Opus 4.6+), low→high. Mirrors
@@ -2125,6 +2228,155 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         Ok(crate::execution::vendor_title::push_claude_custom_title(
             &target, title,
         ))
+    }
+}
+
+#[cfg(test)]
+mod account_usage_tests {
+    use super::parse_get_usage_response;
+    use serde_json::json;
+
+    /// The `get_usage` response for a Max account whose server DOES send the
+    /// declared per-model array. Key set pinned against a live claude 2.1.245.
+    fn live_shaped_response() -> serde_json::Value {
+        json!({
+            "subscription_type": "max",
+            "rate_limits": {
+                "five_hour": {"utilization": 8.2, "resets_at": "2026-08-31T14:00:00Z"},
+                "seven_day": {"utilization": 23.4, "resets_at": "2026-09-03T00:00:00Z"},
+                "model_scoped": [
+                    {"display_name": "Fable", "utilization": 16.0, "resets_at": "2026-09-03T00:00:00Z"},
+                    {"display_name": "Sonnet", "utilization": 4.4, "resets_at": "2026-09-03T00:00:00Z"}
+                ],
+                "extra_usage": {"utilization": 3.0},
+                "limits": [{"group": "weekly", "severity": "warning"}]
+            }
+        })
+    }
+
+    #[test]
+    fn reads_every_window_including_the_per_model_ones() {
+        let usage = parse_get_usage_response(&live_shaped_response()).expect("a real observation");
+        assert_eq!(usage.subscription.as_deref(), Some("max"));
+        assert_eq!(usage.five_hour_pct, Some(8));
+        assert_eq!(
+            usage.five_hour_resets_at.as_deref(),
+            Some("2026-08-31T14:00:00Z")
+        );
+        assert_eq!(usage.weekly_pct, Some(23));
+        assert_eq!(usage.credits_pct, Some(3));
+
+        // Per-model rows carry the vendor's OWN display name, verbatim and in
+        // the order it listed them.
+        let rows: Vec<(&str, Option<u8>)> = usage
+            .model_windows
+            .iter()
+            .map(|w| (w.model.as_str(), w.pct))
+            .collect();
+        assert_eq!(rows, vec![("Fable", Some(16)), ("Sonnet", Some(4))]);
+        assert_eq!(
+            usage.model_windows[0].resets_at.as_deref(),
+            Some("2026-09-03T00:00:00Z")
+        );
+    }
+
+    /// Without the server-gated array, the fixed `seven_day_<model>` siblings
+    /// carry the same fact — and only one of the two spellings is ever read, so
+    /// a build that sends both cannot double-count.
+    #[test]
+    fn falls_back_to_the_fixed_per_model_siblings() {
+        let usage = parse_get_usage_response(&json!({
+            "rate_limits": {
+                "seven_day": {"utilization": 23.0},
+                "seven_day_opus": {"utilization": 61.0, "resets_at": "2026-09-03T00:00:00Z"},
+                "seven_day_sonnet": {"utilization": 2.0}
+            }
+        }))
+        .unwrap();
+        let rows: Vec<(&str, Option<u8>)> = usage
+            .model_windows
+            .iter()
+            .map(|w| (w.model.as_str(), w.pct))
+            .collect();
+        assert_eq!(rows, vec![("Opus", Some(61)), ("Sonnet", Some(2))]);
+
+        // The declared array wins when both are present.
+        let both = parse_get_usage_response(&json!({
+            "rate_limits": {
+                "model_scoped": [{"display_name": "Fable", "utilization": 9.0}],
+                "seven_day_opus": {"utilization": 61.0}
+            }
+        }))
+        .unwrap();
+        assert_eq!(both.model_windows.len(), 1);
+        assert_eq!(both.model_windows[0].model, "Fable");
+    }
+
+    /// Last resort: the raw `limits[]` feed. Only `weekly_scoped` entries are
+    /// per-model; anything else there describes the shared pool.
+    #[test]
+    fn falls_back_to_the_scoped_limits_feed() {
+        let usage = parse_get_usage_response(&json!({
+            "rate_limits": {
+                "limits": [
+                    {"kind": "weekly", "percent": 23.0},
+                    {
+                        "kind": "weekly_scoped",
+                        "scope": {"model": {"display_name": "Fable"}},
+                        "percent": 71.0,
+                        "resets_at": "2026-09-03T00:00:00Z"
+                    }
+                ]
+            }
+        }))
+        .expect("a scoped entry alone is worth reporting");
+        assert_eq!(usage.model_windows.len(), 1);
+        assert_eq!(usage.model_windows[0].model, "Fable");
+        assert_eq!(usage.model_windows[0].pct, Some(71));
+    }
+
+    /// An account metered as ONE pool reports no per-model rows — the list is
+    /// empty, never invented from the shared weekly window.
+    #[test]
+    fn a_single_pool_account_gets_no_model_rows() {
+        let usage = parse_get_usage_response(&json!({
+            "subscription_type": "pro",
+            "rate_limits": {"five_hour": {"utilization": 1.0}}
+        }))
+        .unwrap();
+        assert!(usage.model_windows.is_empty());
+    }
+
+    /// Fail-closed on every shape that says nothing: a named-but-empty bucket
+    /// is not a row, a nameless one is never emitted, and a response with no
+    /// numbers at all is `None` (the caller keeps whatever it knew before).
+    #[test]
+    fn refuses_to_invent_rows_from_an_empty_answer() {
+        assert!(parse_get_usage_response(&json!({})).is_none());
+        assert!(parse_get_usage_response(&json!({"rate_limits": {}})).is_none());
+        assert!(parse_get_usage_response(&json!({
+            "rate_limits": {"seven_day_opus": {}, "model_scoped": [{"utilization": 5.0}]}
+        }))
+        .is_none());
+        assert!(parse_get_usage_response(&json!({
+            "rate_limits": {"limits": [{"kind": "weekly_scoped", "percent": 5.0}]}
+        }))
+        .is_none());
+    }
+
+    /// A per-model bucket is a real observation on its own: an account whose
+    /// shared windows are absent still reports that model's headroom.
+    #[test]
+    fn a_model_only_answer_is_still_an_observation() {
+        let usage = parse_get_usage_response(&json!({
+            "rate_limits": {"model_scoped": [
+                {"display_name": "Fable", "utilization": 61.0, "resets_at": "2026-09-03T00:00:00Z"}
+            ]}
+        }))
+        .expect("a per-model window alone is worth reporting");
+        assert_eq!(usage.weekly_pct, None);
+        assert_eq!(usage.model_windows.len(), 1);
+        assert_eq!(usage.model_windows[0].model, "Fable");
     }
 }
 

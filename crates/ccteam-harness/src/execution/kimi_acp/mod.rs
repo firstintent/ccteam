@@ -46,6 +46,21 @@
 //! user gets meanwhile is the gateway's silence watchdog, which now reports the
 //! turn's elapsed time and last observed activity. Fix belongs upstream.
 //!
+//! ## No account-level usage surface (why `account_usage` stays `None`)
+//!
+//! Kimi's ACP contract publishes two usage-shaped commands and NEITHER is
+//! account-scoped: `/status` reports this session's model/permission/context
+//! and `/usage` reports this session's token counters (`formatUsageReport` in
+//! `references/kimi-code` `packages/acp-adapter/src/session.ts` — total /
+//! current turn / per-model token totals, then the same context line). There
+//! is no subscription tier, no rate-limit window, and no reset time anywhere on
+//! the wire, so this adapter keeps the trait's default `None` and the vendor
+//! simply does not appear in the usage map. The account-level numbers kimi
+//! does publish live behind an authenticated HTTP endpoint against its
+//! credential file, which is a different surface with a different owner (the
+//! admin-gated vendor-quota probe), not something a session adapter reaches
+//! into. Reading kimi's private session logs to synthesize one is a red line.
+//!
 //! ## Context usage arrives by pull, not push
 //!
 //! Kimi emits no `usage_update` and its `session/prompt` result carries no

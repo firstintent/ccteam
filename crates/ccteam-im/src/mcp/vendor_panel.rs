@@ -109,6 +109,10 @@ pub(crate) enum StatusDetail {
     Models,
     Vendors,
     Routing,
+    /// The caller's own context headroom + every harness account's remaining
+    /// quota windows — the two numbers a session needs to decide whether to
+    /// keep working here, start fresh, or hire a different harness.
+    Usage,
     Full,
 }
 
@@ -120,11 +124,20 @@ impl StatusDetail {
             "models" => Ok(Self::Models),
             "vendors" => Ok(Self::Vendors),
             "routing" => Ok(Self::Routing),
+            "usage" => Ok(Self::Usage),
             "full" => Ok(Self::Full),
             other => Err(format!(
-                "status: invalid `detail` `{other}` (expected `brief` | `models` | `vendors` | `routing` | `full`)"
+                "status: invalid `detail` `{other}` (expected `brief` | `models` | `vendors` | `routing` | `usage` | `full`)"
             )),
         }
+    }
+
+    /// Whether this tier carries the account-usage + `you` block. Unlike the
+    /// other tiers it is NOT built from the vendor panel (which is a pure
+    /// filesystem probe): the answer comes from the gateway, so `dispatch`
+    /// bolts it on rather than `status_value`.
+    pub(crate) fn wants_usage(self) -> bool {
+        matches!(self, Self::Usage | Self::Full)
     }
 
     fn wants_models(self) -> bool {
@@ -894,10 +907,38 @@ mod tests {
             StatusDetail::Models
         );
         assert_eq!(
+            StatusDetail::parse(Some("vendors")).unwrap(),
+            StatusDetail::Vendors
+        );
+        assert_eq!(
+            StatusDetail::parse(Some("routing")).unwrap(),
+            StatusDetail::Routing
+        );
+        assert_eq!(
+            StatusDetail::parse(Some("usage")).unwrap(),
+            StatusDetail::Usage
+        );
+        assert_eq!(
             StatusDetail::parse(Some(" full ")).unwrap(),
             StatusDetail::Full
         );
         assert!(StatusDetail::parse(Some("everything")).is_err());
+        // The rejection names every tier the caller could have meant.
+        let message = StatusDetail::parse(Some("quota")).unwrap_err();
+        for tier in ["brief", "models", "vendors", "routing", "usage", "full"] {
+            assert!(message.contains(tier), "{message}");
+        }
+        // Only these two tiers carry the account-usage block.
+        assert!(StatusDetail::Usage.wants_usage());
+        assert!(StatusDetail::Full.wants_usage());
+        for quiet in [
+            StatusDetail::Brief,
+            StatusDetail::Models,
+            StatusDetail::Vendors,
+            StatusDetail::Routing,
+        ] {
+            assert!(!quiet.wants_usage());
+        }
     }
 
     /// G2 — the default body is a few hundred bytes and lists only what a

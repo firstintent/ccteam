@@ -76,6 +76,10 @@ pub mod session;
 // Project-local skill listing remains in `uploads`.
 pub mod skills;
 pub mod uploads;
+// `GET /api/v1/usage` — per-harness ACCOUNT quota windows, from the daemon's
+// own recorded observations (no network, no credentials — the script-side twin
+// of the MCP `status{detail:"usage"}` body, rendered by `ccteam_im::usage_view`).
+pub mod usage;
 // VENDOR-INSTALL-1 — admin one-click vendor install/update jobs on the local
 // host (`POST/GET /api/v1/hosts/{host}/vendors/{vendor}/install[/{job_id}]`).
 // Recipe argv lives in `AgentProbeSpec::install_recipe`, executed shell-free.

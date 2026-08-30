@@ -64,12 +64,41 @@ Responses (compact JSON): async → `{sid, turn_id, status:"pending"}` (`status:
 
 ### `status` — who can be hired, what it costs; tiered
 
-`{detail?: "brief" | "models" | "vendors" | "routing" | "full"}` — read-only, default `brief` (~100–200 B): `{project, host, cost_24h_usd, hire:[…]}` where `hire` lists the vendors actually installed on the host your project is bound to, plus `host_online:false` / `stale:true` when a satellite is offline or its snapshot old, and `budget_disabled:[…]` when a vendor hit its cap. `detail` buys more, only when asked:
+`{detail?: "brief" | "models" | "vendors" | "routing" | "usage" | "full"}` — read-only, default `brief` (~100–200 B): `{project, host, cost_24h_usd, hire:[…]}` where `hire` lists the vendors actually installed on the host your project is bound to, plus `host_online:false` / `stale:true` when a satellite is offline or its snapshot old, and `budget_disabled:[…]` when a vendor hit its cap. `detail` buys more, only when asked:
 
 - `models` — observed model ids + reasoning-effort ladders per vendor (runtime last-seen, with a seen-at) and the hub `models.json` catalog, kept as two separately labeled sources. Advisory, never a hiring allowlist.
 - `vendors` — per-vendor installed / version / auth (`unknown` — honest: being on PATH never masquerades as logged in, and it never blocks a hire) / budget posture, an observed timestamp, and the pi/dsh bridge notes.
 - `routing` — your routing notes verbatim (`source`, `sha256`, `updated_at`, `truncated`, `text`; project `<project>/.ccteam/routing.md` replaces the global `~/.ccteam/routing.md`, never merged), or `{missing:[…]}` naming both paths.
+- `usage` — how much room is left, on both axes. See below.
 - `full` — all of the above plus daemon health and every visible project's 24 h cost. Operator data lives only here.
+
+#### `detail:"usage"` — your context headroom + each harness account's remaining quota
+
+Two numbers a session needs before it hires anything, in one call (`full` carries them too):
+
+```json
+{"you": {"sid": "s42", "context_pct": 63},
+ "usage": {
+   "claude": {"observed": "2026-08-31T09:12:03+00:00", "source": "status card", "subscription": "max",
+              "windows": [{"w": "5h", "pct": 8, "resets": "2026-08-31T14:00:00Z"},
+                          {"w": "7d", "pct": 23, "resets": "2026-09-03T00:00:00Z", "severity": "warning"},
+                          {"w": "7d", "model": "Fable", "pct": 16, "resets": "2026-09-03T00:00:00Z"},
+                          {"w": "credits", "pct": 3}]},
+   "codex":  {"observed": "…", "source": "session release", "windows": [{"w": "7d", "pct": 12, "resets": "…"}]}}}
+```
+
+Read `you.context_pct` first — it decides *continue here vs. start fresh* — then the harness windows decide *whom to hire*: a harness at 8 % of its 5-hour window has room for a long job; one at 92 % of its weekly does not. `pct` is percent **consumed** (higher = less left). A `7d` row carrying `model` is that model's own weekly bucket, which is the one that constrains a spawn naming it; a `7d` row without one is the shared pool.
+
+Honest by construction: **a harness appears only when ccteam has actually observed its account** — no live session of it and no unexpired observation means no row at all, never a zeroed one you could misread as headroom. Each window disappears at the harness's *own* declared reset rather than at some staleness cutoff, so nothing stale is ever shown as current; `observed` says when ccteam heard it. Reading costs no probe: live same-harness sessions are asked for state they already hold (never a turn), and otherwise the recorded observation is read back.
+
+The same map, for scripts: **`GET /api/v1/usage`** → `{"usage": {…}}`, identical shape, optional `?vendor=claude`. It sits inside the ordinary web-token gate (any logged-in identity), so:
+
+```bash
+curl -sS -H "Authorization: Bearer ccteam:$(cat ~/.ccteam/secrets/web-token)" \
+     http://127.0.0.1:7331/api/v1/usage | jq '.usage.claude.windows'
+```
+
+The token file holds bare hex; you add the `ccteam:` prefix. On a loopback bind the web gate may be disabled entirely, in which case the header is simply ignored. The port comes from `~/.ccteam/run/daemon-endpoint.json` (`web_bind`). Not to be confused with `GET /api/v1/vendors/quota`, which is an admin-only *network* probe of vendor billing APIs; this route costs no network and no credentials.
 
 ### `grok_claude_codex_kimi` — the bare-name discovery alias
 

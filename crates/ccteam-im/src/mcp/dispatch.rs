@@ -1484,58 +1484,125 @@ async fn execute_status(
         }
     };
 
-    if let Some(user_id) = caller.user_id() {
-        return execute_user_status(id, &args, paths, user_id, detail).await;
-    }
-
-    // Resolve the caller's project scope (server-side; never trust a
-    // self-reported project on the Ambient path).
-    let ctx = if caller == McpCaller::Ambient {
-        let sid = args
-            .get("_caller_sid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let secret = args
-            .get("_caller_secret")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        match gateway {
-            Some(gw) => gw.lock().await.verify_session_principal(sid, secret),
-            None => None,
+    // The caller's OWN session, when it has one (Ambient only). Drives the
+    // `you` row of the usage tier — an Admin/tenant token is not a session and
+    // has no context window to report.
+    let mut caller_sid: Option<String> = None;
+    let mut body = if let Some(user_id) = caller.user_id() {
+        match user_status_body(&args, paths, user_id, detail).await {
+            Ok(body) => body,
+            Err(message) => return session_tool_response(id, message, true),
         }
     } else {
-        None
+        // Resolve the caller's project scope (server-side; never trust a
+        // self-reported project on the Ambient path).
+        let ctx = if caller == McpCaller::Ambient {
+            let sid = args
+                .get("_caller_sid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let secret = args
+                .get("_caller_secret")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match gateway {
+                Some(gw) => gw.lock().await.verify_session_principal(sid, secret),
+                None => None,
+            }
+        } else {
+            None
+        };
+        caller_sid = ctx.as_ref().map(|ctx| ctx.sid.clone());
+        let project = match super::vendor_panel::resolve_status_project(
+            caller,
+            args.get("project").and_then(|v| v.as_str()),
+            args.get("_caller_slug").and_then(|v| v.as_str()),
+            ctx.as_ref(),
+        ) {
+            Ok(p) => p,
+            Err(note) => {
+                // Ambient caller with no project scope: the fleet ledger it
+                // could already read, plus an honest note — never another
+                // project's host, and no account state either. An enrolled
+                // binding that has simply not named a workspace is a DIFFERENT
+                // fact from a bearer that failed, and the route already told
+                // us which one this is by injecting `_enroll_reachable`.
+                let note = match enroll_reachable_arg(&args) {
+                    Some(reachable) => {
+                        super::vendor_panel::enrolled_unbound_status_note(&reachable)
+                    }
+                    None => note,
+                };
+                let body = serde_json::json!({
+                    "projects": protocol::status_project_rows(paths, |_| true),
+                    "note": note,
+                });
+                return status_response(id, body);
+            }
+        };
+        build_status_body(paths, project.clone(), detail, || {
+            protocol::status_project_rows(paths, |_| true)
+        })
+        .await
     };
-    let project = match super::vendor_panel::resolve_status_project(
-        caller,
-        args.get("project").and_then(|v| v.as_str()),
-        args.get("_caller_slug").and_then(|v| v.as_str()),
-        ctx.as_ref(),
-    ) {
-        Ok(p) => p,
-        Err(note) => {
-            // Ambient caller with no project scope: the fleet ledger it could
-            // already read, plus an honest note — never another project's host.
-            // An enrolled binding that has simply not named a workspace is a
-            // DIFFERENT fact from a bearer that failed, and the route already
-            // told us which one this is by injecting `_enroll_reachable`.
-            let note = match enroll_reachable_arg(&args) {
-                Some(reachable) => super::vendor_panel::enrolled_unbound_status_note(&reachable),
-                None => note,
-            };
-            let body = serde_json::json!({
-                "projects": protocol::status_project_rows(paths, |_| true),
-                "note": note,
-            });
-            return status_response(id, body);
-        }
-    };
-
-    let body = build_status_body(paths, project.clone(), detail, || {
-        protocol::status_project_rows(paths, |_| true)
-    })
-    .await;
+    // One decoration point for every authenticated caller shape, so a tier
+    // that carries account state cannot silently skip one of them.
+    append_usage_sections(&mut body, detail, gateway, caller_sid.as_deref()).await;
     status_response(id, body)
+}
+
+/// The `you` + `usage` half of the body, for the tiers that ask for it.
+///
+/// Two facts, deliberately together: `you.context_pct` says whether THIS
+/// session still has room to keep working, and `usage` says which harness
+/// accounts still have quota to hire from. A caller deciding "continue here /
+/// start fresh / hand it to a different harness" needs both in one call, which
+/// is the whole reason this tier exists.
+///
+/// No probing engine and no polling: the map is
+/// [`Gateway::account_usage_snapshot`](crate::gateway::Gateway::account_usage_snapshot),
+/// which asks live same-vendor adapters for state they already hold (never a
+/// turn) and otherwise reads the recorded observation. A vendor nobody has
+/// heard from is absent rather than zeroed.
+async fn append_usage_sections(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    detail: super::vendor_panel::StatusDetail,
+    gateway: Option<&GatewayHandle>,
+    caller_sid: Option<&str>,
+) {
+    if !detail.wants_usage() {
+        return;
+    }
+    let Some(gateway) = gateway else {
+        return;
+    };
+    // Both reads under one guard: the snapshot is async (it may ask a live
+    // adapter), the sid resolution is a cheap in-memory lookup.
+    let (usage, own_project_dir) = {
+        let gw = gateway.lock().await;
+        let dir = caller_sid.and_then(|sid| gw.session_resolve_any(sid).map(|r| r.project_dir));
+        (gw.account_usage_snapshot(None).await, dir)
+    };
+    if let Some(sid) = caller_sid {
+        let mut you = serde_json::Map::new();
+        you.insert("sid".into(), serde_json::json!(sid));
+        // Omitted, never zeroed: a session with no turn yet has no measured
+        // occupancy, and "0%" would read as "all the room in the world".
+        if let Some(pct) = own_project_dir
+            .as_deref()
+            .and_then(|dir| crate::delegation::latest_context_pct(dir, sid))
+        {
+            you.insert("context_pct".into(), serde_json::json!(pct));
+        }
+        body.insert("you".into(), serde_json::Value::Object(you));
+    }
+    if !usage.is_empty() {
+        let rendered: serde_json::Map<String, serde_json::Value> = usage
+            .iter()
+            .map(|(vendor, entry)| (vendor.clone(), crate::usage_view::vendor_usage_value(entry)))
+            .collect();
+        body.insert("usage".into(), serde_json::Value::Object(rendered));
+    }
 }
 
 /// `_enroll_reachable`, injected by `POST /mcp` for an enrolled binding that
@@ -1551,14 +1618,14 @@ fn enroll_reachable_arg(args: &serde_json::Value) -> Option<Vec<String>> {
     )
 }
 
-/// Tenant `status`: the same tiers, scoped by the shared owner policy.
-async fn execute_user_status(
-    id: serde_json::Value,
+/// Tenant `status` body: the same tiers, scoped by the shared owner policy.
+/// `Err` carries the caller-facing refusal text.
+async fn user_status_body(
     args: &serde_json::Value,
     paths: &CcteamPaths,
     user_id: &str,
     detail: super::vendor_panel::StatusDetail,
-) -> serde_json::Value {
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let explicit = args
         .get("project")
         .and_then(|project| project.as_str())
@@ -1567,7 +1634,7 @@ async fn execute_user_status(
         .map(str::to_string);
     if let Some(project) = explicit.as_deref() {
         if !user_can_see_project(paths, user_id, project) {
-            return session_tool_response(id, "status: project not found".to_string(), true);
+            return Err("status: project not found".to_string());
         }
     }
     let rows = || {
@@ -1588,7 +1655,7 @@ async fn execute_user_status(
             ),
         );
     }
-    status_response(id, body)
+    Ok(body)
 }
 
 /// Build the tiered `status` body for an optional project scope. With a
@@ -3625,11 +3692,7 @@ async fn run_agent_read_transcript(
         live,
     )
     .unwrap_or_else(|| "idle".into());
-    let context_pct = latest_status
-        .as_ref()
-        .and_then(|status| status.context.as_ref())
-        .and_then(|context| context.pct())
-        .map(|pct| pct.round() as u64);
+    let context_pct = crate::delegation::context_pct(latest_status.as_ref());
     let mut body = session_row_fields(SessionRow {
         activity,
         context_pct,
@@ -3848,11 +3911,7 @@ async fn run_agent_read_roster_at(
         .take(limit)
         .filter_map(|(v, _)| {
             let dir = status_roots.get(&v.sid)?;
-            ccteam_harness::execution::turns_mirror::read_all_turns(dir, &v.sid)
-                .ok()
-                .and_then(|turns| turns.into_iter().rev().find_map(|turn| turn.status))
-                .and_then(|status| status.context.and_then(|context| context.pct()))
-                .map(|pct| (v.sid.clone(), pct.round() as u64))
+            crate::delegation::latest_context_pct(dir, &v.sid).map(|pct| (v.sid.clone(), pct))
         })
         .collect::<std::collections::HashMap<_, _>>();
     let rows: Vec<serde_json::Value> = classified
@@ -9071,6 +9130,228 @@ mod tool_face_tests {
         }
         let bad = call_status("status", Some("everything")).await;
         assert!(bad.contains("invalid `detail`"), "{bad}");
+    }
+
+    /// U1 — `status{detail:"usage"}`: the caller's own context headroom plus
+    /// every harness account ccteam has an unexpired observation for. The two
+    /// scheduling numbers, one call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_usage_reports_your_context_and_every_observed_account() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let paths = CcteamPaths {
+            root: home.clone(),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, secrets) = face_gateway(tmp.path()).await;
+        // The catalog lives under the gateway's injected state root.
+        gateway
+            .lock()
+            .await
+            .enable_persistence(home.clone())
+            .unwrap();
+        let secret = secret_for(&secrets, &root).await;
+
+        let now = chrono::Utc::now();
+        let iso = |hours: i64| (now + chrono::Duration::hours(hours)).to_rfc3339();
+        // claude: every window, including a per-model one.
+        ccteam_harness::usage_catalog::record_vendor_usage_in(
+            &home,
+            "claude",
+            "status card",
+            &ccteam_harness::AccountUsage {
+                subscription: Some("max".into()),
+                five_hour_pct: Some(8),
+                five_hour_resets_at: Some(iso(2)),
+                weekly_pct: Some(23),
+                weekly_resets_at: Some(iso(48)),
+                weekly_severity: Some("warning".into()),
+                credits_pct: Some(3),
+                model_windows: vec![ccteam_harness::ModelWindow {
+                    model: "Fable".into(),
+                    pct: Some(16),
+                    resets_at: Some(iso(48)),
+                }],
+            },
+        )
+        .unwrap();
+        // codex: one live window plus one the vendor's own reset already
+        // passed — the expired one must not be rendered as current.
+        ccteam_harness::usage_catalog::record_vendor_usage_in(
+            &home,
+            "codex",
+            "session release",
+            &ccteam_harness::AccountUsage {
+                five_hour_pct: Some(90),
+                five_hour_resets_at: Some(iso(-1)),
+                weekly_pct: Some(12),
+                weekly_resets_at: Some(iso(72)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // grok: proves the map is vendor-generic, not a claude/codex pair.
+        ccteam_harness::usage_catalog::record_vendor_usage_in(
+            &home,
+            "grok",
+            "status card",
+            &ccteam_harness::AccountUsage {
+                subscription: Some("SuperGrok Heavy".into()),
+                weekly_pct: Some(42),
+                weekly_resets_at: Some(iso(24)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The caller's own session has reported its context once.
+        let resolved = gateway.lock().await.session_resolve_any(&root).unwrap();
+        ccteam_harness::execution::turns_mirror::append_turn(
+            &resolved.project_dir,
+            &root,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: format!("{root}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: "ok".into(),
+                usage: serde_json::Value::Null,
+                status: Some(ccteam_harness::TurnStatus {
+                    model: None,
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        63,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    turn: 1,
+                    cost_usd: None,
+                    tokens_total: None,
+                }),
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                outcome: None,
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let call = |caller: McpCaller, args: serde_json::Value| {
+            let gateway = std::sync::Arc::clone(&gateway);
+            let paths = paths.clone();
+            async move {
+                let req = json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "status", "arguments": args }
+                });
+                let resp = execute_status(&req, Some(&gateway), caller, &paths).await;
+                serde_json::from_str::<serde_json::Value>(
+                    resp["result"]["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap()
+            }
+        };
+
+        let body = call(
+            McpCaller::Ambient,
+            json!({ "_caller_sid": root, "_caller_secret": secret, "detail": "usage" }),
+        )
+        .await;
+
+        // The brief body is still underneath — `usage` ADDS, never replaces.
+        assert_eq!(body["project"], "alpha");
+        assert!(body["hire"].is_array());
+
+        // `you`: the caller's own sid + its latest context percentage.
+        assert_eq!(body["you"]["sid"], json!(root));
+        assert_eq!(body["you"]["context_pct"], json!(63));
+
+        // One entry per harness with a live observation, keyed by harness.
+        let usage = body["usage"].as_object().expect("a usage map");
+        assert_eq!(
+            usage.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["claude", "codex", "grok"],
+            "only observed harnesses, and every one of them: {body}"
+        );
+        assert_eq!(usage["claude"]["subscription"], json!("max"));
+        assert_eq!(usage["claude"]["source"], json!("status card"));
+        assert!(usage["claude"]["observed"].is_string());
+        let claude: Vec<&serde_json::Value> = usage["claude"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(claude[0]["w"], json!("5h"));
+        assert_eq!(claude[0]["pct"], json!(8));
+        assert_eq!(claude[1]["w"], json!("7d"));
+        assert_eq!(claude[1]["severity"], json!("warning"));
+        assert_eq!(claude[2]["w"], json!("7d"));
+        assert_eq!(claude[2]["model"], json!("Fable"));
+        assert_eq!(claude[2]["pct"], json!(16));
+        assert_eq!(claude[3], &json!({"w": "credits", "pct": 3}));
+
+        // The codex 5h window's own reset has passed: gone, not stale.
+        let codex = usage["codex"]["windows"].as_array().unwrap();
+        assert_eq!(codex.len(), 1, "expired windows are dropped: {body}");
+        assert_eq!(codex[0]["w"], json!("7d"));
+        assert!(usage["codex"].get("subscription").is_none());
+
+        // A harness nobody has heard from is ABSENT — never a zeroed row.
+        assert!(usage.get("kimi").is_none(), "{body}");
+
+        // `full` carries the same two sections.
+        let full = call(
+            McpCaller::Ambient,
+            json!({ "_caller_sid": root, "_caller_secret": secret, "detail": "full" }),
+        )
+        .await;
+        assert_eq!(full["you"]["context_pct"], json!(63));
+        assert_eq!(full["usage"]["claude"]["subscription"], json!("max"));
+
+        // The quieter tiers pay nothing for it.
+        let brief = call(
+            McpCaller::Ambient,
+            json!({ "_caller_sid": root, "_caller_secret": secret }),
+        )
+        .await;
+        assert!(brief.get("usage").is_none(), "{brief}");
+        assert!(brief.get("you").is_none(), "{brief}");
+
+        // An Admin token is not a session: the account map still answers, but
+        // there is no `you` to report.
+        let admin = call(McpCaller::Admin, json!({ "detail": "usage" })).await;
+        assert!(admin.get("you").is_none(), "{admin}");
+        assert_eq!(
+            admin["usage"]["grok"]["subscription"],
+            json!("SuperGrok Heavy")
+        );
+    }
+
+    /// U1 — a session that has never reported its context says only WHO it is:
+    /// a fabricated `0` would read as "all the room in the world".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_usage_omits_an_unobserved_context_rather_than_zeroing_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, secrets) = face_gateway(tmp.path()).await;
+        let secret = secret_for(&secrets, &root).await;
+        let req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "status", "arguments": {
+                "_caller_sid": root, "_caller_secret": secret, "detail": "usage"
+            }}
+        });
+        let resp = execute_status(&req, Some(&gateway), McpCaller::Ambient, &paths).await;
+        let body: serde_json::Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["you"], json!({ "sid": root }));
+        // No observation anywhere ⇒ no `usage` key at all, not an empty object
+        // dressed up as an answer.
+        assert!(body.get("usage").is_none(), "{body}");
     }
 
     /// G2 — a ten-row roster stays inside its budget, and `tree` describes

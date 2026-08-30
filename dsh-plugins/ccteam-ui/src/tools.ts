@@ -320,11 +320,11 @@ interface McpToolDefinition {
 export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'status',
-    description: 'Which agents this project\'s host can hire and what the team spent today. Brief by default; `detail` adds model ids + effort ladders (models), install/auth/budget per vendor (vendors), your routing notes (routing), or everything (full).',
+    description: 'Which agents this project\'s host can hire and what the team spent today. Brief by default; `detail` adds model ids + efforts (models), install/auth/budget (vendors), routing notes (routing), account quota + context (usage), or everything (full).',
     inputSchema: {
       type: 'object',
       properties: {
-        detail: { type: 'string', enum: ['brief', 'models', 'vendors', 'routing', 'full'], description: 'Default brief.' },
+        detail: { type: 'string', enum: ['brief', 'models', 'vendors', 'routing', 'usage', 'full'], description: 'Default brief.' },
       },
     },
   },
@@ -392,7 +392,7 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
   {
     name: 'agent_read',
-    description: 'Read the team. No `sid` → roster of sessions you can reach, most recently active first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → that session\'s transcript, newest first unless `since` pages forward; empty means no answer yet.',
+    description: 'Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → that session\'s transcript, newest first unless `since` pages forward; empty means no answer yet.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -401,7 +401,7 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
         tail: { type: 'boolean', description: 'With `sid`: newest first (default true unless `since`).' },
         since: { type: 'string', description: 'With `sid`: only turns after this turn_id cursor.' },
         max_chars: { type: 'integer', description: 'With `sid`: char budget across returned turns (default 4000).' },
-        wait: { type: 'integer', description: 'With `sid`: seconds to wait for an in-flight turn to end, 0-240 (default 0).' },
+        wait: { type: 'integer', description: 'With `sid`: seconds to wait for an in-flight turn to end (0-240).' },
         project: { type: 'string', description: 'Roster filter: this project slug only.' },
         activity: {
           type: 'string',

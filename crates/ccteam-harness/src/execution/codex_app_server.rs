@@ -1595,6 +1595,9 @@ fn account_usage_from_codex_snapshot(snapshot: &Value) -> Option<crate::AccountU
         weekly_resets_at: reset_iso(secondary),
         weekly_severity,
         credits_pct: None,
+        // Codex meters one pool across models — no per-model windows on the
+        // wire, so none are reported (never derived).
+        model_windows: Vec::new(),
     };
     if usage == crate::AccountUsage::default() {
         None

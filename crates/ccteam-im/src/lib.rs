@@ -72,6 +72,9 @@ pub mod scheduled;
 mod session_catalog;
 pub mod three_layer_sec;
 pub mod transport;
+/// Wire shape for vendor-account usage, shared by the MCP `status` body and
+/// the REST `/api/v1/usage` route (one fact, one spelling).
+pub mod usage_view;
 
 use std::collections::HashMap;
 use std::fs;

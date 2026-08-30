@@ -64,12 +64,41 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 
 ### `status` —— 能雇谁、花了多少;分级
 
-`{detail?: "brief" | "models" | "vendors" | "routing" | "full"}` —— 只读,默认 `brief`(~100–200 B):`{project, host, cost_24h_usd, hire:[…]}`,`hire` = 项目绑定主机上真正装了的 vendor;卫星离线或快照陈旧时补 `host_online:false` / `stale:true`;有 vendor 触顶时补 `budget_disabled:[…]`。`detail` 要多少买多少:
+`{detail?: "brief" | "models" | "vendors" | "routing" | "usage" | "full"}` —— 只读,默认 `brief`(~100–200 B):`{project, host, cost_24h_usd, hire:[…]}`,`hire` = 项目绑定主机上真正装了的 vendor;卫星离线或快照陈旧时补 `host_online:false` / `stale:true`;有 vendor 触顶时补 `budget_disabled:[…]`。`detail` 要多少买多少:
 
 - `models` —— 每 vendor 观测到的模型 id + reasoning-effort 阶梯(runtime last-seen,带观测时间)+ hub `models.json` 目录,两个来源分开标注。均为参考,绝非雇佣白名单。
 - `vendors` —— 每 vendor 的 installed / version / auth(`unknown` —— 诚实:在 PATH 上不冒充已登录,也从不拦雇佣)/ 预算姿态、观测时间戳、pi/dsh 桥接说明。
 - `routing` —— 你的 routing notes 原文(`source` / `sha256` / `updated_at` / `truncated` / `text`;项目级 `<project>/.ccteam/routing.md` 完整替换全局 `~/.ccteam/routing.md`,不合并),或 `{missing:[…]}` 列出查过的两个路径。
+- `usage` —— 还剩多少余量,两个轴。见下。
 - `full` —— 以上全部 + daemon 健康 + 每个可见项目的 24h 成本。运维数据只住这里。
+
+#### `detail:"usage"` —— 你自己的 context 余量 + 每个 harness 账号的剩余额度
+
+一次调用拿到会话雇人前要看的两个数(`full` 也带):
+
+```json
+{"you": {"sid": "s42", "context_pct": 63},
+ "usage": {
+   "claude": {"observed": "2026-08-31T09:12:03+00:00", "source": "status card", "subscription": "max",
+              "windows": [{"w": "5h", "pct": 8, "resets": "2026-08-31T14:00:00Z"},
+                          {"w": "7d", "pct": 23, "resets": "2026-09-03T00:00:00Z", "severity": "warning"},
+                          {"w": "7d", "model": "Fable", "pct": 16, "resets": "2026-09-03T00:00:00Z"},
+                          {"w": "credits", "pct": 3}]},
+   "codex":  {"observed": "…", "source": "session release", "windows": [{"w": "7d", "pct": 12, "resets": "…"}]}}}
+```
+
+先看 `you.context_pct` —— 它决定**继续在这儿干还是开新会话**;再看各 harness 的 windows 决定**雇谁**:5h 窗口才用了 8% 的 harness 扛得住长任务,周窗口 92% 的扛不住。`pct` 是**已消耗**百分比(越大剩得越少)。带 `model` 的 `7d` 行 = 该模型自己的周窗口,点名这个模型的 spawn 受它约束;不带 `model` 的 `7d` 行 = 共享池。
+
+诚实是构造出来的:**只有 ccteam 真的观测过的 harness 才会出现** —— 既没有它的在线会话、又没有未过期的观测,就干脆没有这一行,绝不给一个能被误读成「还有余量」的零行。每个窗口在 harness **自己声明的 reset 时刻**消失(不是某个人为的陈旧阈值),所以陈旧数字永远不会被当作当前值展示;`observed` 说明 ccteam 是什么时候听到的。读取不产生任何探针:同 harness 的在线会话只被问它内存里已有的状态(绝不发一个 turn),否则就读回已记录的观测。
+
+同一份数据给脚本用:**`GET /api/v1/usage`** → `{"usage": {…}}`,形状完全相同,可选 `?vendor=claude`。它在普通 web-token 门内(任何已登录身份都能读):
+
+```bash
+curl -sS -H "Authorization: Bearer ccteam:$(cat ~/.ccteam/secrets/web-token)" \
+     http://127.0.0.1:7331/api/v1/usage | jq '.usage.claude.windows'
+```
+
+token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑定时 web 门可能整个是关的,那这个 header 会被直接忽略。端口读 `~/.ccteam/run/daemon-endpoint.json`(`web_bind`)。别和 `GET /api/v1/vendors/quota` 搞混:那个是 admin-only、拿凭据打 vendor 计费 API 的**网络**探针;本路由不走网络、不碰凭据。
 
 ### `grok_claude_codex_kimi` —— 裸名发现别名
 

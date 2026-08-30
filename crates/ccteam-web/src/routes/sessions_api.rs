@@ -165,18 +165,34 @@ pub(crate) async fn handle_list_sessions(
     };
     // session_views() is catalog-backed and live_turns() is process state:
     // both are pure in-memory snapshots while the gateway lock is held.
-    let (mut views, live_turns) = {
+    // `session_dirs` is the same lookup, resolved under the SAME guard so the
+    // context read below needs no second lock hold.
+    let (mut views, live_turns, session_dirs) = {
         let guard = ccteam_im::latency::gateway_lock(gw, "web.sessions.list").await;
-        (
-            guard
-                .session_views()
-                .into_iter()
-                .filter(|v| v.project == slug)
-                .collect::<Vec<_>>(),
-            guard.live_turns(),
-        )
+        let views = guard
+            .session_views()
+            .into_iter()
+            .filter(|v| v.project == slug)
+            .collect::<Vec<_>>();
+        let dirs = views
+            .iter()
+            .filter_map(|v| {
+                guard
+                    .session_resolve_any(&v.sid)
+                    .map(|r| (v.sid.clone(), r.project_dir))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        (views, guard.live_turns(), dirs)
     };
     apply_progress_activity_status(&app.progress_projection, &slug, &mut views, &live_turns);
+    // Context headroom is a per-row `turns.jsonl` tail read, so it is paid only
+    // for the rows this project actually emits — never for the whole fleet.
+    // Same reader the MCP roster uses, so the two surfaces cannot disagree.
+    for view in &mut views {
+        view.context_pct = session_dirs
+            .get(&view.sid)
+            .and_then(|dir| ccteam_im::delegation::latest_context_pct(dir, &view.sid));
+    }
     Json(views).into_response()
 }
 
@@ -2669,6 +2685,7 @@ mod tests {
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
+            context_pct: None,
             sid: sid.into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2749,6 +2766,7 @@ mod tests {
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
+            context_pct: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2802,6 +2820,7 @@ mod tests {
                 driveable: true,
                 residency: "resident".to_string(),
                 detached: None,
+                context_pct: None,
                 sid: "s1".into(),
                 project: "demo".into(),
                 role: "cto".into(),
@@ -2827,6 +2846,7 @@ mod tests {
                 driveable: true,
                 residency: "resident".to_string(),
                 detached: None,
+                context_pct: None,
                 sid: "s2".into(),
                 project: "demo".into(),
                 role: "qa".into(),
@@ -2887,6 +2907,7 @@ mod tests {
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
+            context_pct: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),
@@ -2934,6 +2955,7 @@ mod tests {
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
+            context_pct: None,
             sid: "s1".into(),
             project: "demo".into(),
             role: "cto".into(),

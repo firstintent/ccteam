@@ -95,6 +95,9 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("PUT", "/api/v1/users/{id}/im"),
         // v0.8.9 Phase 4 — daemon-wide status snapshot (cost pill + Status view).
         ("GET", "/api/v1/status"),
+        // Per-harness ACCOUNT quota windows (script-side twin of the MCP
+        // `status{detail:"usage"}` body); any authenticated identity.
+        ("GET", "/api/v1/usage"),
         // v0.9.15 DSHWEB — DSH web companion lifecycle.
         ("GET", "/api/v1/dsh/status"),
         ("POST", "/api/v1/dsh/start"),

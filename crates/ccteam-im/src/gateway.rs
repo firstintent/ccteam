@@ -16,6 +16,7 @@ use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
 use ccteam_core::projects::{bootstrap_project_at_dir, validate_slug_format};
 use ccteam_core::{CcteamPaths, HotConfig, RoleDetail};
 use ccteam_harness::execution::session_body::{self, BodyProbe, SessionBody};
+use ccteam_harness::usage_catalog::VendorAccountUsage;
 use ccteam_harness::{
     apply_title, atomic_write_durable, chat_session_name, discover_external_claude_sessions,
     format_tokens, list_session_metas, parse_chat_session_name, truncate_title, AccountUsage,
@@ -1232,6 +1233,18 @@ pub struct SessionView {
     /// messages queue behind the body; `/stop` ends it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detached: Option<DetachedView>,
+    /// How full this session's context window is (%), from its latest turn
+    /// status — the headroom half of "should I keep working here or start
+    /// fresh". `None` when unobserved (no turn yet, or a vendor that reports no
+    /// window); never a fabricated `0`, which would read as "all the room in
+    /// the world".
+    ///
+    /// COSTS A `turns.jsonl` TAIL READ PER ROW, so [`Gateway::session_views`]
+    /// leaves it `None` and the surfaces that publish it fill it in for the
+    /// rows they actually emit (see the web session list). Default-skipped:
+    /// an unfilled row spends no bytes claiming ignorance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pct: Option<u64>,
 }
 
 /// Pre-`driveable` payloads only ever described managed sessions.
@@ -10033,18 +10046,72 @@ impl Gateway {
         vendor: AgentVendor,
         sessions: &[&GatewaySession],
     ) -> Option<AccountUsage> {
+        self.account_usage_entry_for(vendor, sessions)
+            .await
+            .map(|entry| entry.usage)
+    }
+
+    /// [`Gateway::account_usage_for`] plus the PROVENANCE of the answer (when
+    /// it was observed, and what observed it).
+    ///
+    /// The IM card renders one line and has nowhere to put "as of when", but a
+    /// machine-readable surface must publish it: a scheduler deciding whom to
+    /// hire needs to know whether a 92% weekly window was read a minute ago or
+    /// is a cached snapshot from an hour ago. So this is the primitive and the
+    /// percentage-only accessor above is its projection — one live-ask path,
+    /// one cache path, one expiry rule, two shapes.
+    async fn account_usage_entry_for(
+        &self,
+        vendor: AgentVendor,
+        sessions: &[&GatewaySession],
+    ) -> Option<VendorAccountUsage> {
         for session in sessions.iter().filter(|s| s.adapter.vendor() == vendor) {
             if let Some(usage) = session.adapter.account_usage(&session.thread).await {
                 self.record_account_usage(vendor, "status card", &usage);
-                return Some(usage);
+                return Some(VendorAccountUsage {
+                    observed_at: chrono::Utc::now().to_rfc3339(),
+                    source: "status card".to_string(),
+                    usage,
+                });
             }
         }
         let root = self.state_root.as_deref()?;
-        ccteam_harness::usage_catalog::last_known_usage_in(
+        ccteam_harness::usage_catalog::last_known_entry_in(
             root,
             vendor_str(vendor),
             chrono::Utc::now(),
         )
+    }
+
+    /// Every vendor whose ACCOUNT ccteam currently knows something about,
+    /// keyed by vendor token — the one read behind the MCP
+    /// `status{detail:"usage"}` body and `GET /api/v1/usage`.
+    ///
+    /// HONEST ABSENCE: a vendor with no live session and no unexpired
+    /// observation is simply not in the map. There is no "unknown" row to
+    /// misread as "plenty left", and no probing engine — the live half asks
+    /// adapters that already hold the answer in memory (never a turn), the
+    /// cached half reads [`ccteam_harness::usage_catalog`]. Nothing here polls
+    /// or schedules; the map is built when a caller asks for it.
+    ///
+    /// Scope is the DAEMON's own vendor accounts (every session of that vendor
+    /// spends from them), not any one caller's data — the same host-agnostic
+    /// scope the IM `/status` card has always shown. `vendor` narrows it to one.
+    pub async fn account_usage_snapshot(
+        &self,
+        vendor: Option<AgentVendor>,
+    ) -> BTreeMap<String, VendorAccountUsage> {
+        let live: Vec<&GatewaySession> = self.sessions.values().collect();
+        let mut out = BTreeMap::new();
+        for candidate in AgentVendor::ALL.iter().copied() {
+            if vendor.is_some_and(|want| want != candidate) {
+                continue;
+            }
+            if let Some(entry) = self.account_usage_entry_for(candidate, &live).await {
+                out.insert(vendor_str(candidate).to_string(), entry);
+            }
+        }
+        out
     }
 
     /// Persist one account-usage observation. Best-effort by construction: a
@@ -10383,6 +10450,8 @@ impl Gateway {
                     // ccteam holds a thread for.
                     driveable: true,
                     detached: None,
+                    // Filled in by whoever pays the per-row transcript tail read.
+                    context_pct: None,
                 }
             })
             .collect();
@@ -14057,6 +14126,8 @@ fn detached_body_view(
         delegation_depth: meta.map(|m| m.delegation_depth).unwrap_or(0),
         driveable: false,
         detached: Some(d.view()),
+        // Filled in by whoever pays the per-row transcript tail read.
+        context_pct: None,
     }
 }
 
@@ -14225,6 +14296,8 @@ fn released_session_view(
         // Sending it work resumes it by sid — that IS the contract.
         driveable: true,
         detached: None,
+        // Filled in by whoever pays the per-row transcript tail read.
+        context_pct: None,
     }
 }
 
@@ -14266,6 +14339,8 @@ fn external_node_view(meta: &SessionMeta) -> SessionView {
         delegation_depth: meta.delegation_depth,
         driveable: false,
         detached: None,
+        // Filled in by whoever pays the per-row transcript tail read.
+        context_pct: None,
     }
 }
 
@@ -23837,6 +23912,9 @@ mod tests {
             weekly_resets_at: Some("2026-06-29T18:59:59+00:00".into()),
             weekly_severity: Some("warning".into()),
             credits_pct: Some(46),
+            // The phone card is one line and stays that way: per-model windows
+            // belong to the machine-readable surfaces, not here.
+            model_windows: Vec::new(),
         };
         let s = format_account_usage(&u);
         assert!(s.contains("5h 17% (→19:00)"), "{s}");

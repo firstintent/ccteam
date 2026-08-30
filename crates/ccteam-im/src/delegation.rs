@@ -90,6 +90,35 @@ pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option
         .map(|pct| pct.round() as u64)
 }
 
+/// How full one session's context window is right now, read from the LATEST
+/// turn status in its transcript mirror. `None` when the session has no turn
+/// yet, or the vendor reported no window (never a fabricated 0).
+///
+/// One reader, every surface: the MCP roster rows, the caller's own `you` row
+/// on `status{detail:"usage"}`, and the web session list all answer "how much
+/// room is left" from this — a second copy of the read is how two surfaces
+/// start disagreeing about one session.
+///
+/// BOUNDED BY CONSTRUCTION. It costs one BACKWARDS tail of `turns.jsonl`, not a
+/// whole-transcript scan: this is per-row on endpoints a browser polls, and a
+/// long-lived session's transcript is megabytes. A window is a live fact, so
+/// only the recent tail can hold a current one — past [`CONTEXT_TAIL_TURNS`]
+/// statusless turns the honest answer is "unobserved", not a reading from an
+/// hour of work ago. Callers still pay it only for the rows they actually
+/// emit, never for a whole fleet before a cut.
+pub fn latest_context_pct(project_dir: &std::path::Path, sid: &str) -> Option<u64> {
+    let turns =
+        ccteam_harness::execution::turns_mirror::last_n_turns(project_dir, sid, CONTEXT_TAIL_TURNS)
+            .ok()?;
+    let status = turns.into_iter().rev().find_map(|turn| turn.status)?;
+    context_pct(Some(&status))
+}
+
+/// How far back [`latest_context_pct`] looks for a turn that carried a status.
+/// Vendors that report one report it at nearly every turn boundary, so this is
+/// far past "the last one that had it" while keeping the read O(tail).
+const CONTEXT_TAIL_TURNS: usize = 50;
+
 impl DelegationSummary<'_> {
     /// The completion turn the parent receives. `max_chars` is the excerpt cap
     /// its watch asked for ([`NOTIFICATION_ANSWER_MAX_CHARS`] for `final`,
@@ -265,29 +294,6 @@ pub(crate) fn build_notification_text_with_outcome(
     max_chars: usize,
 ) -> String {
     summary.notification_text(max_chars)
-}
-
-/// Build the interim-note notification (an `all`-mode watch only): the child
-/// posted an assistant message but its vendor turn is STILL RUNNING — labeled
-/// so the parent can safely skim it without mistaking it for completion.
-pub fn build_interim_notification_text(
-    child_sid: &str,
-    vendor: AgentVendor,
-    title: Option<&str>,
-    turn_id: &str,
-    assistant_text: &str,
-) -> String {
-    let _ = (vendor, title, turn_id);
-    let excerpt = truncate_head_tail_with_marker(
-        assistant_text.trim(),
-        NOTIFICATION_ANSWER_MAX_CHARS,
-        |omitted| full_answer_marker(omitted, child_sid),
-    );
-    if excerpt.text.is_empty() {
-        format!("{child_sid} interim")
-    } else {
-        format!("{child_sid} interim\n{}", excerpt.text)
-    }
 }
 
 /// Lowercase wire name of a vendor — the key `cost_24h_by_vendor` uses and the

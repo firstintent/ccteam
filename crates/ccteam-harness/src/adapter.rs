@@ -1022,6 +1022,36 @@ pub struct AccountUsage {
     pub weekly_severity: Option<String>,
     /// Pay-as-you-go extra-credit utilization (%), when enabled.
     pub credits_pct: Option<u8>,
+    /// PER-MODEL weekly windows the vendor meters separately from the shared
+    /// one (claude's `seven_day_opus` / `seven_day_sonnet`). Empty for a vendor
+    /// that meters one pool, which is why this is `default`-skipped: the
+    /// on-disk cache and every reader stay valid without it.
+    ///
+    /// Kept OUT of the flat `weekly_*` triple on purpose — the aggregate weekly
+    /// window and a model's own window are different facts, and a caller
+    /// choosing WHICH model to hire needs the one that constrains that model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_windows: Vec<ModelWindow>,
+}
+
+/// One model's own weekly rate-limit window, as the vendor meters it.
+///
+/// `model` is the vendor's own bucket name (claude: `opus` / `sonnet` — the
+/// suffix of its `seven_day_<model>` key), passed through verbatim: ccteam
+/// never maps it onto a model id it did not hear.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelWindow {
+    /// Vendor's model / bucket name, verbatim.
+    pub model: String,
+    /// Window utilization (%), 0-100. `None` when the vendor reported the
+    /// bucket with no number (never a fabricated 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pct: Option<u8>,
+    /// The vendor's own ISO-8601 reset time for THIS window; `None` when it
+    /// declared none (the cache then bounds the row by the weekly natural
+    /// length — see `usage_catalog::last_known_usage_in`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
 }
 
 /// One in-flight subagent / workflow task, reflected from the harness's OWN

@@ -662,6 +662,7 @@ mod tests {
             driveable: true,
             residency: "resident".to_string(),
             detached: None,
+            context_pct: None,
             sid: sid.into(),
             project: project.into(),
             role: "cto".into(),

@@ -124,7 +124,24 @@ pub fn record_vendor_usage_best_effort(root: &Path, vendor: &str, source: &str, 
 /// is shown while it still describes the account, and disappears on its own
 /// once it cannot — no arbitrary staleness cutoff, and no caller-side choice.
 pub fn last_known_usage_in(root: &Path, vendor: &str, now: DateTime<Utc>) -> Option<AccountUsage> {
-    let entry = load_usage_catalog_in(root).0.remove(vendor.trim())?;
+    last_known_entry_in(root, vendor, now).map(|entry| entry.usage)
+}
+
+/// The same answer as [`last_known_usage_in`], keeping the PROVENANCE the
+/// caller was told about (`observed_at` / `source`).
+///
+/// The plain accessor exists for the IM card, which renders one row and has no
+/// place to say when it was seen. Every machine-readable surface (the MCP
+/// `status{detail:"usage"}` body and `GET /api/v1/usage`) has to publish "when"
+/// alongside "what" — a percentage with no observation time is not something a
+/// scheduler can act on — so the provenance-carrying read is the primitive and
+/// the bare one is its projection. One expiry rule, two shapes.
+pub fn last_known_entry_in(
+    root: &Path,
+    vendor: &str,
+    now: DateTime<Utc>,
+) -> Option<VendorAccountUsage> {
+    let mut entry = load_usage_catalog_in(root).0.remove(vendor.trim())?;
     let observed = parse_rfc3339(&entry.observed_at)?;
     let alive = |declared: &Option<String>, natural: Duration| -> bool {
         match declared.as_deref().and_then(parse_rfc3339) {
@@ -132,7 +149,7 @@ pub fn last_known_usage_in(root: &Path, vendor: &str, now: DateTime<Utc>) -> Opt
             None => now < observed + natural,
         }
     };
-    let mut usage = entry.usage;
+    let usage = &mut entry.usage;
     if !alive(&usage.five_hour_resets_at, FIVE_HOUR_NATURAL) {
         usage.five_hour_pct = None;
         usage.five_hour_resets_at = None;
@@ -147,12 +164,21 @@ pub fn last_known_usage_in(root: &Path, vendor: &str, now: DateTime<Utc>) -> Opt
     if !alive(&None, WEEKLY_NATURAL) {
         usage.credits_pct = None;
     }
+    // Each per-model weekly window expires on its OWN clock: the vendor resets
+    // an Opus bucket independently of the shared pool, so one going stale must
+    // not drop the others (and vice versa).
+    usage
+        .model_windows
+        .retain(|window| alive(&window.resets_at, WEEKLY_NATURAL));
     // A surviving subscription tier alone renders no row (it is a tail segment,
     // never a fact on its own), so say so here rather than hand back a usage
     // that formats to nothing.
-    let has_window =
-        usage.five_hour_pct.is_some() || usage.weekly_pct.is_some() || usage.credits_pct.is_some();
-    has_window.then_some(usage)
+    let usage = &entry.usage;
+    let has_window = usage.five_hour_pct.is_some()
+        || usage.weekly_pct.is_some()
+        || usage.credits_pct.is_some()
+        || !usage.model_windows.is_empty();
+    has_window.then_some(entry)
 }
 
 fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
@@ -174,6 +200,7 @@ mod tests {
             weekly_resets_at: Some("2026-09-03T00:00:00Z".into()),
             weekly_severity: Some("normal".into()),
             credits_pct: Some(46),
+            model_windows: Vec::new(),
         }
     }
 
@@ -281,6 +308,70 @@ mod tests {
         std::fs::write(usage_catalog_path_in(root.path()), b"{not-json").unwrap();
         assert_eq!(load_usage_catalog_in(root.path()), UsageCatalog::default());
         assert_eq!(last_known_usage_in(root.path(), "claude", Utc::now()), None);
+    }
+
+    /// Per-model windows survive the round trip verbatim and expire on their
+    /// OWN declared clock — one model's bucket resetting must not drop another.
+    #[test]
+    fn per_model_windows_round_trip_and_expire_independently() {
+        let root = tempfile::tempdir().unwrap();
+        let mut u = usage();
+        u.model_windows = vec![
+            crate::ModelWindow {
+                model: "opus".into(),
+                pct: Some(16),
+                resets_at: Some("2026-09-01T00:00:00Z".into()),
+            },
+            crate::ModelWindow {
+                model: "sonnet".into(),
+                pct: Some(4),
+                resets_at: Some("2026-09-03T00:00:00Z".into()),
+            },
+        ];
+        record_vendor_usage_in(root.path(), "claude", "status card", &u).unwrap();
+
+        // Verbatim on disk (the catalog stores `AccountUsage` as-is).
+        let stored = load_usage_catalog_in(root.path()).0["claude"].usage.clone();
+        assert_eq!(stored.model_windows, u.model_windows);
+
+        let fresh = last_known_usage_in(root.path(), "claude", at("2026-08-31T09:00:00Z")).unwrap();
+        assert_eq!(fresh.model_windows.len(), 2);
+
+        // Past the opus reset only: that row is gone, sonnet's stays.
+        let later = last_known_usage_in(root.path(), "claude", at("2026-09-02T00:00:00Z")).unwrap();
+        assert_eq!(
+            later
+                .model_windows
+                .iter()
+                .map(|w| w.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sonnet"]
+        );
+
+        // Provenance rides along on the entry-shaped read.
+        let entry = last_known_entry_in(root.path(), "claude", at("2026-08-31T09:00:00Z")).unwrap();
+        assert_eq!(entry.source, "status card");
+        assert!(!entry.observed_at.is_empty());
+    }
+
+    /// A capture that carries ONLY per-model windows is a real observation:
+    /// the "vendor answered with nothing" guard must not swallow it.
+    #[test]
+    fn a_model_only_capture_is_worth_recording() {
+        let root = tempfile::tempdir().unwrap();
+        let only_models = AccountUsage {
+            model_windows: vec![crate::ModelWindow {
+                model: "opus".into(),
+                pct: Some(9),
+                resets_at: None,
+            }],
+            ..Default::default()
+        };
+        assert_ne!(only_models, AccountUsage::default());
+        record_vendor_usage_in(root.path(), "claude", "status card", &only_models).unwrap();
+        let got = last_known_usage_in(root.path(), "claude", Utc::now()).unwrap();
+        assert_eq!(got.model_windows.len(), 1);
+        assert_eq!(got.model_windows[0].pct, Some(9));
     }
 
     /// A vendor answering with nothing must not erase what it said before —
