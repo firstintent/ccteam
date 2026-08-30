@@ -42,6 +42,42 @@ pub enum PrincipalState {
     Live,
 }
 
+/// Everything a principal record knows about its session besides the secret.
+///
+/// Minted BEFORE the vendor process starts, which is the whole point: the
+/// session's `meta.json` lands on disk AFTER the child's first `initialize` /
+/// `tools/list`, so anything the tool face needs must be here or the face is
+/// resolved from a file that does not exist yet (measured 2026-08-31: a
+/// `tools:"none"` child was served the full six-tool face on its once-per-
+/// process fetch and went on to call `status`). `meta.tool_face` stays as the
+/// restart-surviving audit copy that a resume backfills this record from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrincipalFacts {
+    /// Project the session belongs to — the scope every tool call is clamped to.
+    pub slug: String,
+    /// Role label, for prompts and receipts (never authorization).
+    pub role: String,
+    /// Delegation depth (root = 0), for the A2A guardrails.
+    pub depth: u32,
+    /// `agent{tools}` as asked for: `None` = full, `"read"` / `"none"` narrow it.
+    pub tool_face: Option<String>,
+    /// The delegation parent's sid; `None` = a root (its own human is at the
+    /// other end, so it always has a chat to answer into).
+    pub parent_sid: Option<String>,
+}
+
+impl PrincipalFacts {
+    /// The common case: identity only, full tool face, no delegation parent.
+    pub fn new(slug: impl Into<String>, role: impl Into<String>, depth: u32) -> Self {
+        Self {
+            slug: slug.into(),
+            role: role.into(),
+            depth,
+            ..Self::default()
+        }
+    }
+}
+
 /// A verified principal: the server-side identity, never the caller's word for
 /// it.
 #[derive(Debug, Clone)]
@@ -56,6 +92,10 @@ pub struct PrincipalMatch {
     pub role: String,
     /// Delegation depth, for the A2A guardrails.
     pub depth: u32,
+    /// The tool face this session was hired with (see [`PrincipalFacts`]).
+    pub tool_face: Option<String>,
+    /// The delegation parent's sid, `None` for a root.
+    pub parent_sid: Option<String>,
     /// Whether the session behind this principal is live yet.
     pub state: PrincipalState,
 }
@@ -63,9 +103,7 @@ pub struct PrincipalMatch {
 #[derive(Debug, Clone)]
 struct Principal {
     secret: String,
-    slug: String,
-    role: String,
-    depth: u32,
+    facts: PrincipalFacts,
     state: PrincipalState,
 }
 
@@ -98,7 +136,32 @@ impl SessionPrincipals {
     /// Idempotent per sid — a re-plan for the same sid (a `/role` switch mints
     /// a fresh secret for a session that already exists) REPLACES the record,
     /// so the superseded secret stops verifying immediately.
-    pub fn reserve(&self, sid: &str, secret: &str, slug: &str, role: &str, depth: u32) {
+    pub fn reserve(&self, sid: &str, secret: &str, facts: PrincipalFacts) {
+        self.write(sid, secret, facts, PrincipalState::Spawning);
+    }
+
+    /// The session is live: the same secret now carries full authority.
+    /// The facts are re-stamped from the applied session, which is the
+    /// authority for them (a plan can be adjusted before it lands).
+    pub fn promote(&self, sid: &str, secret: &str, facts: PrincipalFacts) {
+        self.write(sid, secret, facts, PrincipalState::Live);
+    }
+
+    /// Amend an already-minted record's facts, keeping its secret and state.
+    ///
+    /// The spawn plan is customized (delegation parent, depth, `tools` face)
+    /// AFTER `plan_new_session` mints the principal, and the vendor process
+    /// still has not started — so this closes the window without a second
+    /// secret or a second mint.
+    pub fn amend(&self, sid: &str, facts: PrincipalFacts) {
+        if let Ok(mut map) = self.inner.write() {
+            if let Some(principal) = map.get_mut(sid) {
+                principal.facts = facts;
+            }
+        }
+    }
+
+    fn write(&self, sid: &str, secret: &str, facts: PrincipalFacts, state: PrincipalState) {
         if sid.is_empty() || secret.is_empty() {
             return;
         }
@@ -107,34 +170,19 @@ impl SessionPrincipals {
                 sid.to_string(),
                 Principal {
                     secret: secret.to_string(),
-                    slug: slug.to_string(),
-                    role: role.to_string(),
-                    depth,
-                    state: PrincipalState::Spawning,
+                    facts,
+                    state,
                 },
             );
         }
     }
 
-    /// The session is live: the same secret now carries full authority.
-    /// `slug` / `role` are re-stamped from the applied session, which is the
-    /// authority for them (a plan can be adjusted before it lands).
-    pub fn promote(&self, sid: &str, secret: &str, slug: &str, role: &str, depth: u32) {
-        if sid.is_empty() || secret.is_empty() {
-            return;
-        }
-        if let Ok(mut map) = self.inner.write() {
-            map.insert(
-                sid.to_string(),
-                Principal {
-                    secret: secret.to_string(),
-                    slug: slug.to_string(),
-                    role: role.to_string(),
-                    depth,
-                    state: PrincipalState::Live,
-                },
-            );
-        }
+    /// The face-deciding facts for `sid`, without presenting a secret — the
+    /// daemon-internal read the MCP tool-face resolver uses once the caller's
+    /// principal has already been verified. `None` for an unknown sid.
+    pub fn facts(&self, sid: &str) -> Option<PrincipalFacts> {
+        let map = self.inner.read().ok()?;
+        map.get(sid).map(|principal| principal.facts.clone())
     }
 
     /// The session ended, or never began. The secret is worthless from here —
@@ -192,7 +240,7 @@ impl SessionPrincipals {
         if principal.secret.is_empty() {
             return None;
         }
-        Some((principal.secret.clone(), principal.slug.clone()))
+        Some((principal.secret.clone(), principal.facts.slug.clone()))
     }
 
     /// Resolve `(sid, secret)` to an identity. Constant-time secret compare;
@@ -213,9 +261,11 @@ impl SessionPrincipals {
             }
             PrincipalMatch {
                 sid: sid.to_string(),
-                slug: principal.slug.clone(),
-                role: principal.role.clone(),
-                depth: principal.depth,
+                slug: principal.facts.slug.clone(),
+                role: principal.facts.role.clone(),
+                depth: principal.facts.depth,
+                tool_face: principal.facts.tool_face.clone(),
+                parent_sid: principal.facts.parent_sid.clone(),
                 state: principal.state,
             }
         };
@@ -256,7 +306,7 @@ mod tests {
     fn a_reserved_principal_verifies_before_the_session_is_live() {
         // The whole point: the vendor dials `/mcp` DURING spawn.
         let reg = SessionPrincipals::new();
-        reg.reserve("s1", "sek", "alpha", "cto", 0);
+        reg.reserve("s1", "sek", PrincipalFacts::new("alpha", "cto", 0));
         let m = reg
             .verify("s1", "sek")
             .expect("reserved principal verifies");
@@ -271,8 +321,8 @@ mod tests {
     #[test]
     fn promote_grants_tool_authority_and_forget_revokes_everything() {
         let reg = SessionPrincipals::new();
-        reg.reserve("s1", "sek", "alpha", "cto", 0);
-        reg.promote("s1", "sek", "alpha", "reviewer", 2);
+        reg.reserve("s1", "sek", PrincipalFacts::new("alpha", "cto", 0));
+        reg.promote("s1", "sek", PrincipalFacts::new("alpha", "reviewer", 2));
         let m = reg.verify("s1", "sek").expect("live principal verifies");
         assert_eq!(m.state, PrincipalState::Live);
         assert_eq!(m.role, "reviewer", "apply is the authority for role");
@@ -290,7 +340,7 @@ mod tests {
     #[test]
     fn a_failed_spawn_leaves_no_usable_credential() {
         let reg = SessionPrincipals::new();
-        reg.reserve("s7", "sek", "alpha", "cto", 0);
+        reg.reserve("s7", "sek", PrincipalFacts::new("alpha", "cto", 0));
         reg.forget("s7"); // what the spawn-failure path does
         assert!(reg.verify("s7", "sek").is_none());
     }
@@ -298,7 +348,7 @@ mod tests {
     #[test]
     fn wrong_secret_and_unknown_sid_are_both_rejected() {
         let reg = SessionPrincipals::new();
-        reg.reserve("s1", "sek", "alpha", "cto", 0);
+        reg.reserve("s1", "sek", PrincipalFacts::new("alpha", "cto", 0));
         assert!(reg.verify("s1", "nope").is_none());
         assert!(reg.verify("s2", "sek").is_none());
         assert!(reg.verify("s1", "").is_none());
@@ -310,7 +360,7 @@ mod tests {
     #[test]
     fn first_use_is_recorded_only_on_a_successful_verify() {
         let reg = SessionPrincipals::new();
-        reg.promote("s1", "sek", "alpha", "cto", 0);
+        reg.promote("s1", "sek", PrincipalFacts::new("alpha", "cto", 0));
         assert!(!reg.was_used("s1"), "minted is not used");
 
         assert!(reg.verify("s1", "nope").is_none());
@@ -330,7 +380,7 @@ mod tests {
     #[test]
     fn provenance_attach_reads_the_credential_and_counts_as_use() {
         let reg = SessionPrincipals::new();
-        reg.promote("s5", "sek", "alpha", "", 0);
+        reg.promote("s5", "sek", PrincipalFacts::new("alpha", "", 0));
         assert_eq!(
             reg.credential_for_managed_attach("s5"),
             Some(("sek".to_string(), "alpha".to_string()))
@@ -346,13 +396,42 @@ mod tests {
         assert!(!reg.was_used("s5"), "use dies with the principal");
     }
 
+    /// P1-1 — the face-deciding facts live on the principal, which exists
+    /// BEFORE the vendor process (and therefore before `meta.json`), and a
+    /// post-plan amendment reaches the same record without a second mint.
+    #[test]
+    fn face_facts_ride_the_principal_from_mint_and_survive_an_amendment() {
+        let reg = SessionPrincipals::new();
+        reg.reserve("s42", "sek", PrincipalFacts::new("alpha", "", 0));
+        assert_eq!(reg.facts("s42").unwrap().tool_face, None);
+
+        reg.amend(
+            "s42",
+            PrincipalFacts {
+                tool_face: Some("none".into()),
+                parent_sid: Some("s7".into()),
+                depth: 1,
+                ..PrincipalFacts::new("alpha", "", 0)
+            },
+        );
+        let matched = reg.verify("s42", "sek").expect("the secret is untouched");
+        assert_eq!(matched.tool_face.as_deref(), Some("none"));
+        assert_eq!(matched.parent_sid.as_deref(), Some("s7"));
+        assert_eq!(matched.depth, 1);
+        assert_eq!(matched.state, PrincipalState::Spawning);
+
+        // Amending an unknown sid is a no-op, never a mint.
+        reg.amend("s99", PrincipalFacts::new("alpha", "", 0));
+        assert!(reg.facts("s99").is_none());
+    }
+
     /// A `/role` switch mints a fresh secret for an existing sid. The old one
     /// must stop working the moment the new one is registered.
     #[test]
     fn re_reserving_a_sid_supersedes_the_previous_secret() {
         let reg = SessionPrincipals::new();
-        reg.promote("s1", "old", "alpha", "cto", 0);
-        reg.reserve("s1", "new", "alpha", "auditor", 0);
+        reg.promote("s1", "old", PrincipalFacts::new("alpha", "cto", 0));
+        reg.reserve("s1", "new", PrincipalFacts::new("alpha", "auditor", 0));
         assert!(reg.verify("s1", "old").is_none());
         assert!(reg.verify("s1", "new").is_some());
     }

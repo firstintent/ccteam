@@ -12,7 +12,7 @@
 //! |---|---|
 //! | admin / user / no gateway | all of them |
 //! | session, `tool_face` full, below the depth cap | status + beacon + agent + agent_read + agent_stop |
-//! | session at the depth cap, or spawned `tools:"read"` | agent_read |
+//! | session at the depth cap, or spawned `tools:"read"` | status + agent_read |
 //! | session spawned `tools:"none"` | nothing |
 //! | enrolled client with no project yet | all of them (it still has to name a workspace) |
 //!
@@ -47,6 +47,15 @@ pub enum FaceIdentity {
         depth_capped: bool,
         /// It was spawned with `tools:"none"`.
         no_tools: bool,
+        /// A completion notification from a hire can be DELIVERED to this
+        /// session (ccteam holds or can resume its thread). False for an
+        /// enrolled hand-started client, which dials in and has no inbound
+        /// transport. Stated positively in the instructions because a session
+        /// that has to infer it from a field's absence gets it wrong: a
+        /// managed session read `notify_deliverable`'s absence as "I am
+        /// hand-started" and built a polling side-channel it did not need
+        /// (2026-08-31).
+        pushable: bool,
     },
     /// A hand-started client whose enrollment binding has no project yet.
     EnrolledUnbound {
@@ -89,8 +98,12 @@ const ORCHESTRATOR_TOOLS: &[&str] = &[
     "agent_stop",
 ];
 
-/// A leaf's face: it can see the team, and that is all.
-const READ_TOOLS: &[&str] = &["agent_read"];
+/// A leaf's face: it can see the team and where it stands, and that is all.
+/// `status` is here because it is `readOnlyHint` and answers "which agents
+/// exist / what has this project spent" — the question a leaf asks before it
+/// reports back. The bare-name beacon is NOT: it exists to make hiring
+/// discoverable, and this face cannot hire.
+const READ_TOOLS: &[&str] = &["status", "agent_read"];
 
 impl Default for ToolFace {
     fn default() -> Self {
@@ -134,10 +147,10 @@ impl ToolFace {
 
 /// Compose the face for one `initialize` / `tools/list`.
 ///
-/// Reads the caller's principal + its session `meta.json`; every miss degrades
-/// to the full face (a caller ccteam cannot place is not a caller it may
-/// silently starve of tools — the `tools/call` gates still refuse whatever it
-/// is not allowed to do).
+/// Reads the caller's principal record ONLY; every miss degrades to the full
+/// face (a caller ccteam cannot place is not a caller it may silently starve
+/// of tools — the `tools/call` gates still refuse whatever it is not allowed
+/// to do).
 pub async fn resolve_tool_face(
     req: &Value,
     gateway: Option<&GatewayHandle>,
@@ -168,9 +181,13 @@ async fn resolve_uncapped(
     let sid = arg("_caller_sid");
     let secret = arg("_caller_secret");
 
+    // Discovery-grade verification: a session still SPAWNING has to be able to
+    // build its face — that is the whole point of that state, and its MCP
+    // client asks exactly once, during startup. `tools/call` is gated by
+    // `verify_session_principal`, which still refuses it.
     let ctx = {
         let gw = gateway.lock().await;
-        gw.verify_session_principal(sid, secret)
+        gw.verify_session_principal_for_discovery(sid, secret)
     };
     let Some(ctx) = ctx else {
         // An enrolled binding that has not named a project yet: the route
@@ -190,6 +207,9 @@ async fn resolve_uncapped(
         return ToolFace::full();
     };
 
+    // Everything below is an in-memory read of the principal record + the live
+    // map. Nothing here touches `meta.json`: that file is written after the
+    // child process has already asked for its tool list (P1-1).
     let context = {
         let gw = gateway.lock().await;
         gw.session_face_context(&ctx.sid)
@@ -197,21 +217,16 @@ async fn resolve_uncapped(
     let Some(context) = context else {
         return ToolFace::full();
     };
-    let meta =
-        ccteam_harness::execution::session_meta::read_session_meta(&context.project_dir, &ctx.sid)
-            .ok();
     session_face(
         &ctx.sid,
         &ctx.slug,
         FaceFacts {
-            requested: meta.as_ref().and_then(|meta| meta.tool_face.clone()),
+            requested: context.tool_face,
             depth: ctx.depth,
             max_depth: context.max_depth,
-            is_root: meta
-                .as_ref()
-                .map(|meta| meta.parent_sid.is_none())
-                .unwrap_or(true),
+            is_root: context.is_root,
             has_reply_target: context.has_reply_target,
+            pushable: context.pushable,
         },
     )
 }
@@ -230,6 +245,9 @@ pub(crate) struct FaceFacts {
     pub is_root: bool,
     /// A chat is currently wired to it.
     pub has_reply_target: bool,
+    /// ccteam can deliver a completion notification to it (see
+    /// [`FaceIdentity::Session::pushable`]).
+    pub pushable: bool,
 }
 
 /// The face rules, in one place.
@@ -262,6 +280,7 @@ pub(crate) fn session_face(sid: &str, slug: &str, facts: FaceFacts) -> ToolFace 
             slug: slug.to_string(),
             depth_capped,
             no_tools,
+            pushable: facts.pushable,
         }),
         tools,
     }
@@ -327,6 +346,7 @@ mod tests {
             max_depth: 2,
             is_root,
             has_reply_target: chat,
+            pushable: true,
         }
     }
 
@@ -360,8 +380,8 @@ mod tests {
     fn the_depth_cap_and_an_explicit_read_face_agree() {
         let capped = session_face("s7", "alpha", facts(None, 2, false, false));
         let asked = session_face("s7", "alpha", facts(Some("read"), 0, false, false));
-        assert_eq!(names(&capped), vec!["agent_read"]);
-        assert_eq!(names(&asked), vec!["agent_read"]);
+        assert_eq!(names(&capped), vec!["status", "agent_read"]);
+        assert_eq!(names(&asked), vec!["status", "agent_read"]);
         assert!(!capped.orchestrates && !asked.orchestrates);
         // …but only the CAPPED one says why: an explicit `read` was the
         // parent's choice, not a limit the child ran into.
@@ -372,6 +392,7 @@ mod tests {
                 slug: "alpha".into(),
                 depth_capped: true,
                 no_tools: false,
+                pushable: true,
             })
         );
         assert_eq!(
@@ -381,6 +402,7 @@ mod tests {
                 slug: "alpha".into(),
                 depth_capped: false,
                 no_tools: false,
+                pushable: true,
             })
         );
     }

@@ -255,7 +255,11 @@ async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
         .as_ref()
         .expect("the registry travels with the gateway")
         .clone();
-    principals.reserve("s99", "spawning-secret", "demo", "reviewer", 0);
+    principals.reserve(
+        "s99",
+        "spawning-secret",
+        ccteam_im::principals::PrincipalFacts::new("demo", "reviewer", 0),
+    );
     let addr = spawn_server(app).await;
     let bearer = "ccteam-sid:s99:spawning-secret".to_string();
 
@@ -272,6 +276,32 @@ async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
         .as_array()
         .expect("tools/list answers a spawning principal");
     assert!(!tools.is_empty(), "the tool face must be discoverable");
+
+    // …and it is the face the spawn ASKED for, not the full one. The child's
+    // MCP client fetches this list exactly once, during startup, so a face
+    // resolved later is a face it never sees (measured 2026-08-31: a
+    // `tools:"none"` child was served six tools here and went on to call one).
+    principals.reserve(
+        "s98",
+        "muted-secret",
+        ccteam_im::principals::PrincipalFacts {
+            tool_face: Some("none".into()),
+            parent_sid: Some("s1".into()),
+            ..ccteam_im::principals::PrincipalFacts::new("demo", "", 1)
+        },
+    );
+    let resp = post_mcp(
+        addr,
+        "ccteam-sid:s98:muted-secret",
+        json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}),
+    )
+    .await;
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["tools"].as_array().map(Vec::len),
+        Some(0),
+        "a mid-spawn child hired with no tools must list none: {body}"
+    );
 
     // Authority: withheld until the session is real.
     let resp = post_mcp(
@@ -368,8 +398,10 @@ async fn initialize_under_a_session_bearer_states_the_caller_identity() {
     let body: Value = resp.json().await.unwrap();
     let instructions = body["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains(&format!("You are {sid} in project demo.")),
-        "identity line missing: {instructions}"
+        instructions.contains(&format!(
+            "You are {sid} in project demo. Completion notifications from your hires arrive here."
+        )),
+        "identity + delivery fact missing: {instructions}"
     );
     assert!(
         instructions.contains("Read those files before answering"),

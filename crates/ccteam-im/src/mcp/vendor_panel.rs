@@ -68,6 +68,30 @@ pub(crate) fn resolve_status_project(
     }
 }
 
+/// `status` for an enrolled binding that has authenticated but named no
+/// workspace yet.
+///
+/// The generic ambient refusal ("caller could not be authenticated") was a lie
+/// here — the credential verified fine, it simply carries no project — and it
+/// sent a hand-started agent looking for a broken bearer (measured
+/// 2026-08-31). Same shape as the answer `agent` / `agent_read` give it: what
+/// is missing, how to supply it, and which slugs are reachable.
+pub(crate) fn enrolled_unbound_status_note(reachable: &[String]) -> String {
+    let mut note = "status: no project named yet — this MCP session is authenticated, but \
+         project-scoped host, budget and routing details need a workspace. Name one on your next \
+         `agent` call (`project:\"<slug>\"`)"
+        .to_string();
+    if reachable.is_empty() {
+        note.push_str(
+            "; no project is registered for this credential's owner yet — create one in the web \
+             console first.",
+        );
+    } else {
+        note.push_str(&format!("; reachable: {}.", reachable.join(", ")));
+    }
+    note
+}
+
 /// Cap for the routing-notes body (chars). A note beyond this keeps a 70/30
 /// head-tail excerpt with a full-path pointer (aligns with the delegation
 /// truncation family).

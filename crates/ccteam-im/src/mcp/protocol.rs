@@ -49,6 +49,20 @@ pub fn is_session_tool(name: &str) -> bool {
     SESSION_TOOL_NAMES.contains(&name)
 }
 
+/// True if `name` is a tool this server registers AT ALL (any face).
+///
+/// A front door that refuses a call for a reason of its own — no workspace
+/// named, no chat bound — must answer an unknown NAME with the standard
+/// unknown-tool error instead: a 487-byte lecture about naming a project is a
+/// wrong answer to `bogus`, and it taught a caller that its typo was a
+/// permission problem (2026-08-31). Kept honest by
+/// `known_tool_set_matches_the_definitions`.
+pub fn is_known_tool(name: &str) -> bool {
+    matches!(name, "status" | "chat_send_file")
+        || name == STATUS_BEACON_TOOL_NAME
+        || is_session_tool(name)
+}
+
 // ── instructions ────────────────────────────────────────────────────────────
 
 /// Always: what ccteam is. One sentence, because the tool schemas already say
@@ -99,7 +113,8 @@ pub fn instructions_for(face: &ToolFace) -> String {
         parts.push(format!(
             "You are a hand-started agent with no project yet: name one on your first `agent` \
              call (`project:\"<slug>\"`) {reach}. The first project you name is your workspace \
-             for the rest of this session; ccteam never guesses it from a working directory."
+             for the rest of this session; ccteam never guesses it from a working directory. \
+             Notifications cannot be pushed to you; agent_read{{sid,wait}} awaits a turn instead."
         ));
     }
     if face.chat_capable {
@@ -111,6 +126,7 @@ pub fn instructions_for(face: &ToolFace) -> String {
         slug,
         depth_capped,
         no_tools,
+        pushable,
     }) = &face.identity
     {
         if *no_tools {
@@ -122,8 +138,20 @@ pub fn instructions_for(face: &ToolFace) -> String {
                 "You are {sid} in project {slug}. This session is at the delegation depth cap \
                  and cannot hire agents."
             ));
+        } else if *pushable {
+            // A session that CAN hire is told what happens after it does. The
+            // fact is stated, never inferred: `notify_deliverable:false` is a
+            // per-call deviation marker, and a session that had to read its
+            // absence as "I am hand-started" got it wrong (2026-08-31).
+            parts.push(format!(
+                "You are {sid} in project {slug}. Completion notifications from your hires \
+                 arrive here."
+            ));
         } else {
-            parts.push(format!("You are {sid} in project {slug}."));
+            parts.push(format!(
+                "You are {sid} in project {slug} (client-run: notifications cannot be pushed to \
+                 you; agent_read{{sid,wait}} awaits a turn instead)."
+            ));
         }
     }
     parts.join("\n\n")
@@ -263,7 +291,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a new session and dispatch `task` to it; with `sid` → follow up on that session. `wait` returns the answer inline; 0 (default) is async: one completion notification when the task's turn ends, or poll `agent_read{sid}` when the reply says notify_deliverable:false. Tell children to answer tersely, never to dump code or diffs.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a new session and dispatch `task` to it; with `sid` → follow up on that session. `wait` returns the answer inline; 0 (default) is async: one completion notification when the task's turn ends, or `agent_read{sid,wait}` when the reply says notify_deliverable:false. Tell children to answer tersely, never to dump code or diffs.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
                 "sid": { "type": "string", "description": "Existing session to task; omit to hire a new one." },
@@ -280,8 +308,8 @@ pub fn session_tool_definitions() -> Vec<Value> {
                 "title": { "type": "string", "description": "Ledger label (<=80 chars); never sent to the agent." },
                 "notify": {
                     "type": "string",
-                    "enum": ["final", "brief", "all", "off"],
-                    "description": "Turn-end wake: final (2000-char excerpt, default), brief (500), all, off."
+                    "enum": ["final", "brief", "off"],
+                    "description": "Turn-end wake: final (2000-char excerpt, default), brief (500), off."
                 },
                 "tools": {
                     "type": "string",
@@ -301,13 +329,14 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, most recently active first; a `released` row is idle-but-real and resumes on your next `agent{sid}` call, so reuse it instead of spawning a twin. With `sid` → that session's transcript, newest first unless `since` pages forward; empty means no answer yet.",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, most recently active first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → that session's transcript, newest first unless `since` pages forward; empty means no answer yet.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows/turns (default 10, max 500)." },
-                "tail": { "type": "boolean", "description": "With `sid`: newest first (default true; false + `since` pages forward)." },
+                "tail": { "type": "boolean", "description": "With `sid`: newest first (default true unless `since`)." },
                 "since": { "type": "string", "description": "With `sid`: only turns after this turn_id cursor." },
-                "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 4000, 500-50000)." },
+                "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 4000)." },
+                "wait": { "type": "integer", "description": "With `sid`: seconds to wait for an in-flight turn to end, 0-240 (default 0)." },
                 "project": { "type": "string", "description": "Roster filter: this project slug only." },
                 "activity": {
                     "type": "string",
@@ -461,11 +490,14 @@ mod tests {
     }
 
     /// A leaf worker — read-only face, no chat — is the most common session
-    /// in a team, and its whole ambient bill must stay under 2 KB.
+    /// in a team, and its whole ambient bill is capped. The budget went
+    /// 2000 → 2200 B when `status` joined the read face: a leaf that can see
+    /// which agents exist and what the project has spent is worth ~470 B of a
+    /// bill that is still a fifth of an orchestrator's.
     #[test]
-    fn leaf_ambient_cost_stays_under_two_kilobytes() {
+    fn leaf_ambient_cost_stays_inside_its_budget() {
         let face = ToolFace {
-            tools: vec!["agent_read"],
+            tools: vec!["status", "agent_read"],
             orchestrates: false,
             chat_capable: false,
             identity: Some(FaceIdentity::Session {
@@ -473,10 +505,11 @@ mod tests {
                 slug: "ccteam-src".into(),
                 depth_capped: true,
                 no_tools: false,
+                pushable: true,
             }),
         };
         let ambient = compact_len(&tools_list_response(&face)) + instructions_for(&face).len();
-        assert!(ambient <= 2000, "leaf ambient cost is {ambient} B");
+        assert!(ambient <= 2200, "leaf ambient cost is {ambient} B");
     }
 
     #[test]
@@ -490,6 +523,7 @@ mod tests {
                 slug: "ccteam-src".into(),
                 depth_capped: false,
                 no_tools: true,
+                pushable: true,
             }),
         };
         assert_eq!(tools_list_response(&face), json!({ "tools": [] }));
@@ -513,12 +547,87 @@ mod tests {
                 slug: "alpha".into(),
                 depth_capped: true,
                 no_tools: false,
+                pushable: true,
             }),
         };
         let text = instructions_for(&face);
         assert!(text.contains("You are s7 in project alpha."));
         assert!(text.contains("at the delegation depth cap and cannot hire agents"));
         assert!(!text.contains("never shell out to a vendor CLI"));
+    }
+
+    /// D2 — a session that can hire is TOLD what happens after it does, in a
+    /// plain sentence. The three states are verbatim contract: a managed
+    /// session, a client-run one, and (below) an unbound enrolled binding.
+    #[test]
+    fn a_hiring_session_is_told_where_its_notifications_land() {
+        let face = |pushable: bool| ToolFace {
+            tools: vec!["status", "agent", "agent_read"],
+            orchestrates: true,
+            chat_capable: false,
+            identity: Some(FaceIdentity::Session {
+                sid: if pushable {
+                    "s42".into()
+                } else {
+                    "s900".into()
+                },
+                slug: "cct".into(),
+                depth_capped: false,
+                no_tools: false,
+                pushable,
+            }),
+        };
+        let managed = instructions_for(&face(true));
+        assert!(
+            managed.ends_with(
+                "You are s42 in project cct. Completion notifications from your hires arrive here."
+            ),
+            "{managed}"
+        );
+        let client_run = instructions_for(&face(false));
+        assert!(
+            client_run.ends_with(
+                "You are s900 in project cct (client-run: notifications cannot be pushed to you; \
+                 agent_read{sid,wait} awaits a turn instead)."
+            ),
+            "{client_run}"
+        );
+        // A face that cannot hire says neither: delivery is meaningless to it.
+        for (depth_capped, no_tools) in [(true, false), (false, true)] {
+            let text = instructions_for(&ToolFace {
+                tools: vec![],
+                orchestrates: false,
+                chat_capable: false,
+                identity: Some(FaceIdentity::Session {
+                    sid: "s7".into(),
+                    slug: "cct".into(),
+                    depth_capped,
+                    no_tools,
+                    pushable: true,
+                }),
+            });
+            assert!(!text.contains("notifications"), "{text}");
+            assert!(!text.contains("Completion notifications"), "{text}");
+        }
+    }
+
+    /// [`is_known_tool`] is what a front door checks before lecturing a caller
+    /// about anything, so it must never drift from the registered set.
+    #[test]
+    fn known_tool_set_matches_the_definitions() {
+        for tool in tool_definitions() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(is_known_tool(name), "{name} is registered but unknown");
+        }
+        for stranger in [
+            "bogus",
+            "session_spawn",
+            "agent_bogus",
+            "",
+            "ccteam__status",
+        ] {
+            assert!(!is_known_tool(stranger), "{stranger} must not be known");
+        }
     }
 
     #[test]
@@ -534,6 +643,12 @@ mod tests {
         let text = instructions_for(&face);
         assert!(text.contains("reachable: alpha, beta"));
         assert!(text.contains("never guesses it from a working directory"));
+        assert!(
+            text.contains(
+                "Notifications cannot be pushed to you; agent_read{sid,wait} awaits a turn instead."
+            ),
+            "{text}"
+        );
         assert!(!text.contains("<channel …> envelope; your reply"));
 
         let empty = ToolFace {
@@ -759,7 +874,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(notify, vec!["final", "brief", "all", "off"]);
+        assert_eq!(notify, vec!["final", "brief", "off"]);
         let face: Vec<&str> = props["tools"]["enum"]
             .as_array()
             .unwrap()
@@ -782,6 +897,7 @@ mod tests {
             "tail",
             "since",
             "max_chars",
+            "wait",
             "project",
             "activity",
             "tree",

@@ -24,14 +24,14 @@ The tool list and the server `instructions` are **composed per caller** at conne
 | Caller | `tools/list` |
 |---|---|
 | A session that can still hire (below `delegation.max_depth`, default 2) | `status` · `grok_claude_codex_kimi` · `agent` · `agent_read` · `agent_stop` |
-| A child at the depth cap, or hired with `tools:"read"` | `agent_read` only |
+| A child at the depth cap, or hired with `tools:"read"` | `status` · `agent_read` |
 | Hired with `tools:"none"` | *(empty)* |
 | A hand-started client (before and after naming a project) | all six |
 | …and additionally, any caller with a chat to answer into (a root session, or one currently bound to an IM/web chat) | + `chat_send_file` |
 
 `CCTEAM_DISABLE_TOOLS` (comma list of groups: `admin`, `chat`, `session`) still applies on top. The face is fixed for the life of the process; a resume is a new process and recomputes it. **Hiding a tool is a listing decision, not a permission**: a hidden tool that is called anyway hits the same authorization gates it always did.
 
-`initialize.instructions` stay under ~1 kB and are composed the same way: one line on what ccteam is; the "use `agent`, never shell out to `codex exec` / `claude -p`" policy only when the caller can hire; the chat-envelope note only when a chat can reach it; the attachment rule (a `<channel …>` tag or `[attachment …]` line carrying `image_path=` / `file_path=` means: read those files before answering) always; and one declarative identity fact — `You are s42 in project cct.`, plus the depth-cap fact when it applies. ccteam states who you are and where you work, never how to behave.
+`initialize.instructions` stay under ~1 kB and are composed the same way: one line on what ccteam is; the "use `agent`, never shell out to `codex exec` / `claude -p`" policy only when the caller can hire; the chat-envelope note only when a chat can reach it; the attachment rule (a `<channel …>` tag or `[attachment …]` line carrying `image_path=` / `file_path=` means: read those files before answering) always; and one declarative identity fact — `You are s42 in project cct. Completion notifications from your hires arrive here.`, or, for a client-run session and an enrolled client that has not named a project, the opposite fact (`notifications cannot be pushed to you; agent_read{sid,wait} awaits a turn instead`), plus the depth-cap fact when it applies. Delivery is stated rather than left to be inferred: a managed session that read a missing `notify_deliverable` as "I must be hand-started" built a polling side-channel it did not need. ccteam states who you are and where you work, never how to behave.
 
 ## 3. The six tools
 
@@ -47,19 +47,20 @@ The tool list and the server `instructions` are **composed per caller** at conne
 - `idempotency_key` — a retry with the same key replays the original call instead of doubling it (scoped per project for a hire, per child for a follow-up; in-memory, ~1 h). A replayed response adds `idempotent_replay:true`.
 - There is **no `host`** (the machine follows the project binding) and **no `protocol`** (the wire channel is derived from the vendor); both are hard errors, as is the retired `wait_seconds` (renamed `wait`).
 
-Responses (compact JSON): async → `{sid, turn_id, status:"pending"}` (`status:"queued"` when the task queued behind a pre-restart process; `notify_deliverable:false` when no completion notification can reach you — then poll `agent_read`). Inline → `{sid, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`; `result_text` keeps a 4000-char head/tail excerpt with a pointer to the rest. An unknown `sid` error distinguishes a session that never existed here from one its user explicitly stopped.
+Responses (compact JSON): async → `{sid, turn_id, status:"pending"}` (`status:"queued"` when the task queued behind a pre-restart process; `notify_deliverable:false` when no completion notification can reach you — then use `agent_read{sid,wait}`). Inline → `{sid, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`; `result_text` keeps a 4000-char head/tail excerpt with a pointer to the rest. An unknown `sid` error distinguishes a session that never existed here from one its user explicitly stopped.
 
 ### `agent_read` — the roster, or one transcript
 
-`{sid?, n?, tail?, since?, max_chars?, project?, activity?, tree?}` — read-only; the `sid` decides what you get.
+`{sid?, n?, tail?, since?, max_chars?, wait?, project?, activity?, tree?}` — read-only; the `sid` decides what you get.
 
-- **No `sid` = the roster** of sessions you can reach, most recently active first: `n` rows (default 10, max 500), filters `project` and `activity` (`working` | `idle` | `stale` | `stuck` | `all`), and `tree:true` adds delegation topology **over the returned rows only**. A row is `{sid, vendor, model?, role?, title?, activity, residency?, context_pct?, parent_sid?, is_self?, waiting_approval?, host?, cost_usd?, tokens_total?}` with empty fields omitted; `is_self` marks your own row; `truncated:true` + `total` appear only when the cap bit. `residency` appears only when ccteam holds no process: `released` resumes on your next `agent{sid}` — reuse it instead of hiring a twin — and `stopped` was ended by its user.
+- **No `sid` = the roster** of sessions you can reach, most recently active first — for a managed session that is its own project (naming another is refused, exactly as it is for every other sid-addressed call); a web/tenant caller sees the projects it owns. `n` rows (default 10, max 500), filters `project` and `activity` (`working` | `idle` | `stale` | `stuck` | `all`), and `tree:true` adds delegation topology **over the returned rows only**. A row is `{sid, vendor, model?, role?, title?, activity, residency?, context_pct?, parent_sid?, is_self?, waiting_approval?, host?, cost_usd?, tokens_total?}` with empty fields omitted; `is_self` marks your own row; `truncated:true` + `total` appear only when the cap bit. `residency` appears only when ccteam holds no process: `released` resumes on your next `agent{sid}` — reuse it instead of hiring a twin — and `stopped` was ended by its user.
 - **With `sid` = that session's transcript**, **newest first** by default (`tail` defaults to true unless `since` is given, which pages forward from a `turn_id` cursor). `n` defaults to 10 turns, `max_chars` to 4000 across them (500–50000; longer content keeps a 70 % head / 30 % tail excerpt with an explicit pointer — the full text is always in the ledger). Body: `{activity, context_pct?, cursor?, cost_usd?, tokens_total?, residency?, truncated?, turns:[{turn_id, content, outcome?, error_kind?, error?}]}`. Empty `turns` = no answer yet; `activity:"working"` = mid-turn.
+- `wait` (with `sid`) — seconds to hold the read open while the target's turn is in flight, 0–240 (default 0). At the boundary you get the ordinary body containing the final turn; on timeout the ordinary body with `activity:"working"`; with nothing in flight it returns at once. No new response fields, and a lapsed wait never touches the turn. `agent_read{sid,wait:240,since:<cursor>}` in a loop is the way to sit out a child that runs longer than an inline `agent{wait}` can cover — never tail its `turns.jsonl` yourself. When the wait returns at a boundary and you are the parent that dispatched the task, the completion notification is suppressed: you already have the answer.
 - The retired `limit` parameter is a hard error (renamed `n`).
 
 ### `agent_stop` — explicitly end a session
 
-`{sid}` → `{sid, stopped:true}`. An explicit command, never a proactive kill: the transcript survives and `agent_read{sid}` still reads it. An agent may only stop its own descendants. (ccteam itself has exactly two automatic brakes: the daily per-vendor budget cap refuses *new* work, and live-session capacity releases the least-recently-active idle session — creation never fails for capacity.)
+`{sid}` → `{sid, stopped:true}`. An explicit command, never a proactive kill: the transcript survives and `agent_read{sid}` still reads it. An agent may only stop its own descendants — and a hand-started client that reconnects is a *new* ledger node, so its earlier hires are no longer its descendants: stop those from the web console or `POST /api/v1/sessions/{sid}/stop`, which the refusal itself says. (ccteam itself has exactly two automatic brakes: the daily per-vendor budget cap refuses *new* work, and live-session capacity releases the least-recently-active idle session — creation never fails for capacity.)
 
 ### `status` — who can be hired, what it costs; tiered
 
@@ -86,10 +87,9 @@ Every `agent` task is watched (unless you opt out) and reports **once, at the ve
 |---|---|---|
 | `final` (default) | 2000 chars, head/tail, + a pointer to `agent_read{sid,tail:true}` | everyday delegation |
 | `brief` | 500 chars | wide fan-outs where you only need pass/fail + coordinates |
-| `all` | reserved — today it behaves like `final` | — |
 | `off` | none (ledger only) | fire-and-forget |
 
-Booleans still parse (`true`→final, `false`→off). Delivery needs a managed parent: ccteam appends the notification to the parent's conversation as an ordinary user turn (live = steered in; between processes = queued and delivered on resume). A hand-started parent has no return transport — its dispatch replies say `notify_deliverable:false`, and it uses `wait` or polls `agent_read`. Dispatching to a session you did not hire is a handoff: it runs and is recorded, but subscribes you to nothing unless you pass `notify` explicitly.
+Booleans still parse (`true`→final, `false`→off); the retired `all` is a readable error (it behaved exactly like `final`). Delivery needs a managed parent: ccteam appends the notification to the parent's conversation as an ordinary user turn (live = steered in; between processes = queued and delivered on resume). A hand-started parent has no return transport — its dispatch replies say `notify_deliverable:false`, its `initialize` instructions say so up front, and it uses `agent{wait}` or `agent_read{sid,wait}` instead. Dispatching to a session you did not hire is a handoff: it runs and is recorded, but subscribes you to nothing unless you pass `notify` explicitly.
 
 ## 5. Protocol details
 

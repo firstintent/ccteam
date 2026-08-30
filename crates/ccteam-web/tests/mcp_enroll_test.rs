@@ -331,6 +331,18 @@ async fn initialize_issues_a_per_process_id_and_a_ledger_node() {
     assert_eq!(body["result"]["protocolVersion"], "2024-11-05", "{body}");
 
     // The binding: pinned to the credential's project, owned by its identity.
+    // D2 — a client-run node is told, in a plain sentence, that no completion
+    // notification can be pushed to it. A managed session that had to INFER
+    // its own delivery from a missing field got it backwards (2026-08-31).
+    let instructions = body["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(
+            "client-run: notifications cannot be pushed to you; agent_read{sid,wait} awaits a \
+             turn instead"
+        ),
+        "{instructions}"
+    );
+
     let listed = bindings.list();
     assert_eq!(listed.len(), 1, "one process, one binding");
     let binding = &listed[0];
@@ -1062,6 +1074,98 @@ async fn the_admin_web_token_is_refused_and_cannot_ride_a_binding() {
         bindings.list().len() == 1,
         "a rejected credential binds nothing"
     );
+}
+
+/// P2-4 — an unbound binding asking for `status` is authenticated; it has
+/// simply named no workspace. Saying "caller could not be authenticated" sent a
+/// hand-started agent hunting for a broken bearer (2026-08-31), so the answer
+/// is the same shape `agent` / `agent_read` give it: what is missing, how to
+/// supply it, and which slugs are reachable.
+#[tokio::test]
+#[serial]
+async fn an_unbound_binding_status_says_no_project_named_not_unauthenticated() {
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+    let id = initialize(addr, &cred.bearer()).await;
+
+    let resp = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(2, "status", json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let note = tool_json(&body)["note"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !note.contains("could not be authenticated"),
+        "the credential verified — only the workspace is missing: {note}"
+    );
+    assert!(note.contains("no project named yet"), "{note}");
+    assert!(
+        note.contains("project:"),
+        "it must show how to name one: {note}"
+    );
+    assert!(
+        note.contains(&format!("reachable: {SLUG}")),
+        "…and which ones it may name: {note}"
+    );
+}
+
+/// P3-7 — gate ORDER: a tool name that is not on the surface at all is a typo,
+/// and the projectless lecture (487 B) was a wrong answer to it. Unknown names
+/// get the protocol core's own unknown-tool error, bound or not.
+#[tokio::test]
+#[serial]
+async fn an_unknown_tool_name_is_never_answered_with_the_project_lecture() {
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+    let id = initialize(addr, &cred.bearer()).await;
+
+    let resp = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(2, "bogus", json!({})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let message = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(message, "unknown tool: bogus");
+    assert!(
+        message.len() <= 100,
+        "an unknown name costs a line, not a lecture: {} B",
+        message.len()
+    );
+
+    // …while a KNOWN tool that needs a workspace still gets the full answer.
+    let refused = post_mcp(
+        addr,
+        &cred.bearer(),
+        Some(&id),
+        call_body(3, "agent_read", json!({})),
+    )
+    .await;
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert!(body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("no project"));
 }
 
 // ── 10. a bound client is a project-scoped caller everywhere ───────────────

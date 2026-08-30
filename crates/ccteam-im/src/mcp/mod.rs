@@ -27,7 +27,7 @@ pub use groups::{
     STUB_TOOLS,
 };
 pub use protocol::{
-    chat_tool_definitions, handle_request, instructions_for, is_session_tool,
+    chat_tool_definitions, handle_request, instructions_for, is_known_tool, is_session_tool,
     session_tool_definitions, tool_definitions, MCP_PROTOCOL_VERSION, SESSION_TOOL_NAMES,
     STATUS_BEACON_TOOL_NAME, SUPPORTED_PROTOCOL_VERSIONS,
 };

@@ -16,6 +16,31 @@ describe('ccteam tools', () => {
     ])
   })
 
+  // The definitions are a MIRROR of the daemon's own schema (crates/ccteam-im
+  // /src/mcp/protocol.rs). DSH registers them once at load, so a drifted copy
+  // is a tool the model calls with parameters the daemon rejects.
+  it('mirrors the parameters that changed most recently', () => {
+    const agent = CCTEAM_TOOL_DEFINITIONS.find(tool => tool.name === 'agent')
+    const notify = (agent?.inputSchema as { properties: Record<string, { enum?: string[] }> })
+      .properties.notify
+    expect(notify.enum).toEqual(['final', 'brief', 'off'])
+
+    const read = CCTEAM_TOOL_DEFINITIONS.find(tool => tool.name === 'agent_read')
+    const props = (read?.inputSchema as { properties: Record<string, { type?: string }> }).properties
+    expect(props.wait?.type).toBe('integer')
+    expect(Object.keys(props)).toEqual([
+      'sid',
+      'n',
+      'tail',
+      'since',
+      'max_chars',
+      'wait',
+      'project',
+      'activity',
+      'tree',
+    ])
+  })
+
   it('registers every tool through ctx.tools.register', () => {
     const registered: string[] = []
     const client = {

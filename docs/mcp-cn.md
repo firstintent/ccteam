@@ -24,14 +24,14 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 | caller | `tools/list` |
 |---|---|
 | 还能雇人的会话(深度低于 `delegation.max_depth`,默认 2) | `status` · `grok_claude_codex_kimi` · `agent` · `agent_read` · `agent_stop` |
-| 深度封顶的子会话,或以 `tools:"read"` 雇的 | 只有 `agent_read` |
+| 深度封顶的子会话,或以 `tools:"read"` 雇的 | `status` · `agent_read` |
 | 以 `tools:"none"` 雇的 | *(空)* |
 | 手起 client(点名项目前后) | 全部六个 |
 | …另外,任何有 chat 可回的 caller(root 会话,或当前绑着 IM/web chat 的会话) | 追加 `chat_send_file` |
 
 `CCTEAM_DISABLE_TOOLS`(组名逗号表:`admin` / `chat` / `session`)在此之上再过滤。面在进程生命周期内固定;resume = 新进程 = 重算。**裁面只是列表决策,不是权限**:被藏起的工具硬调,仍走原有的全部鉴权门。
 
-`initialize.instructions` 保持在 ~1 KB 内,同样按面组合:一句「ccteam 是什么」;「用 `agent`,绝不 shell 出去跑 `codex exec` / `claude -p`」的政策只给能雇人的面;chat 信封说明只给 chat 可达的会话;附件规则(`<channel …>` 标签或 `[attachment …]` 行带 `image_path=` / `file_path=` → 先读那些文件再回答)永远在;最后一行陈述身份事实 —— `You are s42 in project cct.`,深度封顶时补一句事实。ccteam 只写你是谁、在哪工作,绝不写你该怎么做。
+`initialize.instructions` 保持在 ~1 KB 内,同样按面组合:一句「ccteam 是什么」;「用 `agent`,绝不 shell 出去跑 `codex exec` / `claude -p`」的政策只给能雇人的面;chat 信封说明只给 chat 可达的会话;附件规则(`<channel …>` 标签或 `[attachment …]` 行带 `image_path=` / `file_path=` → 先读那些文件再回答)永远在;最后一行陈述身份事实 —— `You are s42 in project cct. Completion notifications from your hires arrive here.`;client-run 会话与尚未点名项目的手起 client 拿到的是反向事实(`notifications cannot be pushed to you; agent_read{sid,wait} awaits a turn instead`);深度封顶时补一句事实。送达是**陈述**而非留给推断:一个受管会话曾把 `notify_deliverable` 的缺省读成「我是手起的」,白搭了一套轮询旁路。ccteam 只写你是谁、在哪工作,绝不写你该怎么做。
 
 ## 3. 六个工具
 
@@ -47,19 +47,20 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 - `idempotency_key` —— 同 key 重试重放原调用而非翻倍(新雇按项目、续派按子会话;内存态,~1 小时)。重放响应多一个 `idempotent_replay:true`。
 - **没有 `host`**(机器跟随项目绑定)、**没有 `protocol`**(信道由 vendor 推导);传了都是硬错,退役的 `wait_seconds` 同理(已改名 `wait`)。
 
-响应(紧凑 JSON):async → `{sid, turn_id, status:"pending"}`(任务排在重启前旧进程后面时是 `status:"queued"`;完成通知到不了你时带 `notify_deliverable:false` —— 那就轮询 `agent_read`)。内联 → `{sid, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`;`result_text` 保留 4000 字符头尾节选 + 指向全文的指针。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
+响应(紧凑 JSON):async → `{sid, turn_id, status:"pending"}`(任务排在重启前旧进程后面时是 `status:"queued"`;完成通知到不了你时带 `notify_deliverable:false` —— 那就用 `agent_read{sid,wait}`)。内联 → `{sid, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`;`result_text` 保留 4000 字符头尾节选 + 指向全文的指针。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
 
 ### `agent_read` —— 名册,或一份 transcript
 
-`{sid?, n?, tail?, since?, max_chars?, project?, activity?, tree?}` —— 只读;`sid` 决定你拿到什么。
+`{sid?, n?, tail?, since?, max_chars?, wait?, project?, activity?, tree?}` —— 只读;`sid` 决定你拿到什么。
 
-- **不带 `sid` = 名册**,最近活跃在前:`n` 行(默认 10,最多 500),过滤器 `project` 与 `activity`(`working` | `idle` | `stale` | `stuck` | `all`),`tree:true` **只对返回行**铺委派拓扑。行 = `{sid, vendor, model?, role?, title?, activity, residency?, context_pct?, parent_sid?, is_self?, waiting_approval?, host?, cost_usd?, tokens_total?}`,空字段省略;`is_self` 标你自己那行;`truncated:true` + `total` 只在截断时出现。`residency` 只在 ccteam 不持进程时出现:`released` 在你下次 `agent{sid}` 时复活 —— 复用它,别雇双胞胎;`stopped` 是被用户显式结束的。
+- **不带 `sid` = 名册**,最近活跃在前 —— 受管会话看到的是**自己项目**(点名别的项目会被拒,与其他按 sid 寻址的调用一致),web/租户 caller 看到自己拥有的项目:`n` 行(默认 10,最多 500),过滤器 `project` 与 `activity`(`working` | `idle` | `stale` | `stuck` | `all`),`tree:true` **只对返回行**铺委派拓扑。行 = `{sid, vendor, model?, role?, title?, activity, residency?, context_pct?, parent_sid?, is_self?, waiting_approval?, host?, cost_usd?, tokens_total?}`,空字段省略;`is_self` 标你自己那行;`truncated:true` + `total` 只在截断时出现。`residency` 只在 ccteam 不持进程时出现:`released` 在你下次 `agent{sid}` 时复活 —— 复用它,别雇双胞胎;`stopped` 是被用户显式结束的。
 - **带 `sid` = 该会话的 transcript**,默认**最新在前**(`tail` 默认 true;给了 `since` 则从 turn_id 游标向前翻页)。`n` 默认 10 条,`max_chars` 默认 4000(500–50000;超长保留 70% 头 / 30% 尾节选 + 明确指针,全文永远在账本里)。返回体:`{activity, context_pct?, cursor?, cost_usd?, tokens_total?, residency?, truncated?, turns:[{turn_id, content, outcome?, error_kind?, error?}]}`。空 `turns` = 还没答案;`activity:"working"` = turn 进行中。
+- `wait`(随 `sid`)—— 目标 turn 在飞时挂住这次读的秒数,0–240(默认 0)。到边界 → 含最终 turn 的正常返回体;超时 → 正常返回体 + `activity:"working"`;没有在飞 turn → 立即返回。**零新增字段**,超时也绝不动那个 turn。循环 `agent_read{sid,wait:240,since:<cursor>}` 就是等一个比内联 `agent{wait}` 更久的子会话的正解 —— 不要自己去 tail 它的 `turns.jsonl`。若等到边界的正是派任务的 parent,该任务的完成通知会被抑制:答案已经在你手上。
 - 退役的 `limit` 参数 = 硬错(已改名 `n`)。
 
 ### `agent_stop` —— 显式结束一个会话
 
-`{sid}` → `{sid, stopped:true}`。显式命令,绝非主动 kill:transcript 留在盘上,`agent_read{sid}` 照读。agent 只能 stop 自己的后代。(ccteam 自身只有两个自动刹车:vendor 日预算触顶拒**新**活;live 容量满时优雅释放最久未活跃的空闲会话 —— 创建永不因容量失败。)
+`{sid}` → `{sid, stopped:true}`。显式命令,绝非主动 kill:transcript 留在盘上,`agent_read{sid}` 照读。agent 只能 stop 自己的后代 —— 手起 client 一旦重连就是**新**账本节点,先前雇的会话不再是它的后代:那些去 web 控制台或 `POST /api/v1/sessions/{sid}/stop` 停,拒绝体里就这么写。(ccteam 自身只有两个自动刹车:vendor 日预算触顶拒**新**活;live 容量满时优雅释放最久未活跃的空闲会话 —— 创建永不因容量失败。)
 
 ### `status` —— 能雇谁、花了多少;分级
 
@@ -86,10 +87,9 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 |---|---|---|
 | `final`(默认) | 2000 字符头尾 + 指向 `agent_read{sid,tail:true}` 的指针 | 日常委派 |
 | `brief` | 500 字符 | 大扇出,只要 pass/fail + 坐标 |
-| `all` | 保留档 —— 目前行为等同 `final` | — |
 | `off` | 无(只记账本) | 发完不管 |
 
-布尔仍认(`true`→final,`false`→off)。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话(在线 = 直接注入;进程间隙 = 排队,resume 时送达)。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,用 `wait` 或轮询 `agent_read`。派给不是你雇的会话 = handoff:照跑照记账,但不给你订阅,除非显式传 `notify`。
+布尔仍认(`true`→final,`false`→off);退役的 `all` 传上来是可读错误(它的行为本来就等同 `final`)。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话(在线 = 直接注入;进程间隙 = 排队,resume 时送达)。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,`initialize` 的 instructions 一开始就讲明,用 `agent{wait}` 或 `agent_read{sid,wait}` 代替。派给不是你雇的会话 = handoff:照跑照记账,但不给你订阅,除非显式传 `notify`。
 
 ## 5. 协议细节
 

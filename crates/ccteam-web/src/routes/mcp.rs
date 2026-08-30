@@ -973,7 +973,11 @@ async fn mint_ledger_node(
     // Live immediately: the node exists the moment it is registered, and its very
     // next request is the one that needs to authenticate as it. Roleless (`""`)
     // and depth 0 match the node's own `meta.json`.
-    principals.promote(&sid, &secret, slug, "", 0);
+    principals.promote(
+        &sid,
+        &secret,
+        ccteam_im::principals::PrincipalFacts::new(slug, "", 0),
+    );
     Ok((sid, secret))
 }
 
@@ -1027,6 +1031,14 @@ fn refuse_projectless_call(
 ) -> Option<Response> {
     let tool = called_tool(req)?;
     if matches!(tool, "status" | ccteam_im::mcp::STATUS_BEACON_TOOL_NAME) {
+        return None;
+    }
+    // Gate ORDER: a name that is not on the surface at all is a typo, not a
+    // workspace problem. Answering `bogus` with 487 bytes about naming a
+    // project taught a caller its typo was a permission failure (measured
+    // 2026-08-31); the protocol core's ~26-byte unknown-tool error is the
+    // truth, so unknown names fall straight through to it.
+    if !ccteam_im::mcp::is_known_tool(tool) {
         return None;
     }
     let cause = match binding.project.as_deref() {

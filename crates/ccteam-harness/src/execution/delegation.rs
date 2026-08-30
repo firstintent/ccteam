@@ -41,11 +41,18 @@ pub enum NotifyMode {
     /// parent's context budget, so the two are separate axes and only the cap
     /// differs here.
     Brief,
-    /// Notify on EVERY mirrored assistant message (debug / firehose).
-    All,
     /// Never notify — ledger-only, the parent polls `agent_read`.
     Off,
 }
+
+/// The wire refusal for the retired `all` mode.
+///
+/// It promised a notification per mirrored assistant message; since the
+/// notification unit became the TASK (v0.9.5) the notifier has skipped every
+/// non-boundary signal unconditionally, so `all` was `final` wearing another
+/// name — a decision trap that cost callers a choice and bought them nothing.
+/// Removed rather than kept as an alias (pre-1.0: no compat shims).
+const NOTIFY_ALL_REMOVED: &str = "notify `all` was removed; use final";
 
 impl NotifyMode {
     /// Stable lowercase wire token.
@@ -53,14 +60,15 @@ impl NotifyMode {
         match self {
             NotifyMode::Final => "final",
             NotifyMode::Brief => "brief",
-            NotifyMode::All => "all",
             NotifyMode::Off => "off",
         }
     }
 
-    /// Parse a wire value: `"final"|"brief"|"all"|"off"` — plus the boolean
-    /// form (`true` → `Final`, `false` → `Off`) so existing callers and
-    /// on-disk `delegation.json` watches keep working.
+    /// Parse a WIRE value: `"final"|"brief"|"off"` — plus the boolean form
+    /// (`true` → `Final`, `false` → `Off`) so existing callers keep working.
+    /// The retired `"all"` is a readable error here; only the state-file
+    /// [`Deserialize`] impl still accepts it (as `Final`, which is what it
+    /// always did).
     pub fn parse_value(v: &serde_json::Value) -> Result<Self, String> {
         match v {
             serde_json::Value::Bool(true) => Ok(NotifyMode::Final),
@@ -68,14 +76,14 @@ impl NotifyMode {
             serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
                 "final" | "true" => Ok(NotifyMode::Final),
                 "brief" => Ok(NotifyMode::Brief),
-                "all" => Ok(NotifyMode::All),
                 "off" | "false" | "none" => Ok(NotifyMode::Off),
+                "all" => Err(NOTIFY_ALL_REMOVED.to_string()),
                 other => Err(format!(
-                    "invalid notify mode `{other}` (expected `final` | `brief` | `all` | `off`)"
+                    "invalid notify mode `{other}` (expected `final` | `brief` | `off`)"
                 )),
             },
             other => Err(format!(
-                "invalid notify value {other} (expected `final` | `brief` | `all` | `off` or a boolean)"
+                "invalid notify value {other} (expected `final` | `brief` | `off` or a boolean)"
             )),
         }
     }
@@ -90,6 +98,16 @@ impl Serialize for NotifyMode {
 impl<'de> Deserialize<'de> for NotifyMode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = serde_json::Value::deserialize(d)?;
+        // State-file robustness, NOT an API alias: a `delegation.json` written
+        // before `all` was retired must still load, or a daemon restart would
+        // drop that child's completion notification entirely. It reads as the
+        // `final` the notifier has been treating it as since v0.9.5.
+        if v.as_str()
+            .is_some_and(|raw| raw.trim().eq_ignore_ascii_case("all"))
+        {
+            tracing::warn!("delegation watch carries retired notify `all`; reading it as `final`");
+            return Ok(NotifyMode::Final);
+        }
         NotifyMode::parse_value(&v).map_err(serde::de::Error::custom)
     }
 }
@@ -221,7 +239,6 @@ mod tests {
         for (raw, want) in [
             ("\"final\"", NotifyMode::Final),
             ("\"brief\"", NotifyMode::Brief),
-            ("\"all\"", NotifyMode::All),
             ("\"off\"", NotifyMode::Off),
             ("true", NotifyMode::Final),
             ("false", NotifyMode::Off),
@@ -229,13 +246,39 @@ mod tests {
             let got: NotifyMode = serde_json::from_str(raw).unwrap();
             assert_eq!(got, want, "parsing {raw}");
         }
-        assert_eq!(serde_json::to_string(&NotifyMode::All).unwrap(), "\"all\"");
         assert_eq!(
             serde_json::to_string(&NotifyMode::Brief).unwrap(),
             "\"brief\""
         );
         assert!(serde_json::from_str::<NotifyMode>("\"sometimes\"").is_err());
         assert!(serde_json::from_str::<NotifyMode>("3").is_err());
+    }
+
+    /// The retired `all` is refused on the WIRE with the way out spelled…
+    #[test]
+    fn notify_all_is_refused_on_the_wire() {
+        let err = NotifyMode::parse_value(&serde_json::json!("all")).unwrap_err();
+        assert_eq!(err, "notify `all` was removed; use final");
+        // …and it is not a value this server will ever emit again.
+        for mode in [NotifyMode::Final, NotifyMode::Brief, NotifyMode::Off] {
+            assert_ne!(mode.as_str(), "all");
+        }
+    }
+
+    /// …but a watch persisted before the removal still LOADS: dropping it would
+    /// silently lose that child's completion notification across a restart.
+    #[test]
+    fn persisted_all_watch_degrades_to_final() {
+        let tmp = TempDir::new().unwrap();
+        let path = delegation_path(tmp.path(), "s2");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"parent_sid":"s1","notify":"all","dispatched_at":"2026-01-01T00:00:00Z","notified_turns":[]}"#,
+        )
+        .unwrap();
+        let back = read_delegation_watch(tmp.path(), "s2").expect("retired mode still loads");
+        assert_eq!(back.notify, NotifyMode::Final);
     }
 
     #[test]

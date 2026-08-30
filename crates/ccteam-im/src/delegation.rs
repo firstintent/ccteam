@@ -162,9 +162,9 @@ impl DelegationSummary<'_> {
 }
 
 /// The `notified_turns` key recording that a turn's BOUNDARY notification was
-/// handled. Distinct from the plain turn-id key (used by interim/`all`
-/// notifications) so an `all`-mode watch still gets its "task finished, child
-/// idle" wake-up after having been notified of the same turn's text.
+/// handled. Distinct from the plain turn-id keys the reconcile bookkeeping
+/// records per mirrored turn, so a folded interim turn can never be mistaken
+/// for its task's delivered completion.
 pub fn final_dedup_key(turn_id: &str) -> String {
     format!("{turn_id}#final")
 }
@@ -492,18 +492,6 @@ mod tests {
     }
 
     #[test]
-    fn interim_notification_text_states_still_working() {
-        let t = build_interim_notification_text(
-            "s69",
-            AgentVendor::Codex,
-            Some("wave"),
-            "s69-3",
-            "reading queue",
-        );
-        assert_eq!(t, "s69 interim\nreading queue");
-    }
-
-    #[test]
     fn final_dedup_key_is_distinct_from_plain_turn_id() {
         assert_eq!(final_dedup_key("s7-3"), "s7-3#final");
         assert_ne!(final_dedup_key("s7-3"), "s7-3");
@@ -548,7 +536,7 @@ mod tests {
         assert_eq!(INLINE_RESULT_MAX_CHARS, 4_000);
         assert_eq!(notification_answer_max_chars(NotifyMode::Final), 2_000);
         assert_eq!(notification_answer_max_chars(NotifyMode::Brief), 500);
-        assert_eq!(notification_answer_max_chars(NotifyMode::All), 2_000);
+        assert_eq!(notification_answer_max_chars(NotifyMode::Off), 2_000);
     }
 
     /// The inline result names the session it came from: an `agent` reply is

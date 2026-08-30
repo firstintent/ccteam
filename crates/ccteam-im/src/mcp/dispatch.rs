@@ -435,6 +435,25 @@ fn inline_wait_seconds(args: &serde_json::Value) -> u64 {
         .min(INLINE_WAIT_CEILING_SECONDS)
 }
 
+/// The `agent_read{sid,wait}` window: the same clamp, and zero for the roster
+/// branch — a listing has no turn to wait for, so the parameter is ignored
+/// there rather than refused (the two branches never error on each other's
+/// filters).
+fn read_wait_seconds(args: &serde_json::Value) -> u64 {
+    if !addresses_a_session(args) {
+        return 0;
+    }
+    inline_wait_seconds(args)
+}
+
+/// True when `args` name a session (`sid` present and non-blank) — the one
+/// question `agent` and `agent_read` both branch on.
+fn addresses_a_session(args: &serde_json::Value) -> bool {
+    args.get("sid")
+        .and_then(|sid| sid.as_str())
+        .is_some_and(|sid| !sid.trim().is_empty())
+}
+
 /// v0.8.5 D6 — how long the `interaction/ask` handler waits for the user to
 /// answer before forgetting the prompt + reporting a timeout (the hook then
 /// degrades to deny-with-reason). Matches the gateway pending TTL default.
@@ -1495,8 +1514,15 @@ async fn execute_status(
     ) {
         Ok(p) => p,
         Err(note) => {
-            // Ambient caller not authenticated: the fleet ledger it could
+            // Ambient caller with no project scope: the fleet ledger it could
             // already read, plus an honest note — never another project's host.
+            // An enrolled binding that has simply not named a workspace is a
+            // DIFFERENT fact from a bearer that failed, and the route already
+            // told us which one this is by injecting `_enroll_reachable`.
+            let note = match enroll_reachable_arg(&args) {
+                Some(reachable) => super::vendor_panel::enrolled_unbound_status_note(&reachable),
+                None => note,
+            };
             let body = serde_json::json!({
                 "projects": protocol::status_project_rows(paths, |_| true),
                 "note": note,
@@ -1510,6 +1536,19 @@ async fn execute_status(
     })
     .await;
     status_response(id, body)
+}
+
+/// `_enroll_reachable`, injected by `POST /mcp` for an enrolled binding that
+/// holds no principal yet: the slugs its credential's owner can name. Absent
+/// for every other caller, which is what makes it a reliable discriminator
+/// between "not bound yet" and "not authenticated".
+fn enroll_reachable_arg(args: &serde_json::Value) -> Option<Vec<String>> {
+    let list = args.get("_enroll_reachable")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|slug| slug.as_str().map(str::to_string))
+            .collect(),
+    )
 }
 
 /// Tenant `status`: the same tiers, scoped by the shared owner policy.
@@ -1703,6 +1742,9 @@ async fn execute_session_tool_with_paths(
                 // (server-resolved from CallerCtx, never caller-supplied).
                 obj.insert("_caller_depth".to_string(), serde_json::json!(ctx.depth));
             }
+            if let Err(message) = scope_ambient_roster(&name, &mut args, &ctx.slug) {
+                return session_tool_response(id, message, true);
+            }
         }
         McpCaller::User { user_id } => {
             if let Some(obj) = args.as_object_mut() {
@@ -1725,6 +1767,11 @@ async fn execute_session_tool_with_paths(
     let budget = std::time::Duration::from_secs(match name.as_str() {
         "agent" => 60 + inline_wait_seconds(&args),
         "agent_stop" => 30,
+        // `agent_read{sid,wait}` deliberately holds the request open until the
+        // target's turn ends, so the server deadline has to clear the wait the
+        // caller asked for — a flat 15s would cut every long poll short and
+        // report a busy daemon instead.
+        "agent_read" => 15 + read_wait_seconds(&args),
         _ => 15,
     });
     match tokio::time::timeout(
@@ -1841,7 +1888,7 @@ async fn authorize_user_session_tool(
                 .as_deref()
                 .is_none_or(|project| !user_can_see_project(paths, user_id, project))
             {
-                return Err(format!("{name}: session not found"));
+                return Err(tenant_unreachable_session_error(name));
             }
         }
         "roster" => {
@@ -1867,6 +1914,45 @@ async fn authorize_user_session_tool(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Clamp an ambient caller's ROSTER to the project its principal is bound to.
+///
+/// A session addresses one workspace: `agent` spawns into it, every
+/// sid-addressed call is checked against it, and naming another one is
+/// refused. The roster was the one asymmetry — it spanned every project the
+/// project's OWNER can see, so a caller bound to `ccteam-src` was handed
+/// `total: 1272` rows with its own seven pushed past the default page
+/// (measured 2026-08-31). Naming the caller's own project stays legal (it is a
+/// no-op filter); naming another gets the same refusal every other surface
+/// gives it.
+fn scope_ambient_roster(
+    name: &str,
+    args: &mut serde_json::Value,
+    caller_slug: &str,
+) -> std::result::Result<(), String> {
+    if name != "agent_read" || addresses_a_session(args) {
+        return Ok(());
+    }
+    if let Some(named) = args
+        .get("project")
+        .and_then(|project| project.as_str())
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+    {
+        if named != caller_slug {
+            return Err(format!(
+                "{name}: project not found — this session works in `{caller_slug}`"
+            ));
+        }
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert(
+            "_caller_visible_projects".to_string(),
+            serde_json::json!([caller_slug]),
+        );
     }
     Ok(())
 }
@@ -1933,11 +2019,7 @@ async fn run_agent(
     {
         return Err("agent: missing `task` — say what the agent should do".to_string());
     }
-    let addresses_a_session = args
-        .get("sid")
-        .and_then(|sid| sid.as_str())
-        .is_some_and(|sid| !sid.trim().is_empty());
-    if addresses_a_session {
+    if addresses_a_session(args) {
         let named: Vec<&str> = AGENT_SPAWN_ONLY_PARAMS
             .iter()
             .copied()
@@ -1968,11 +2050,7 @@ async fn run_agent_read(
     if args.get("limit").is_some() {
         return Err("agent_read: `limit` was renamed to `n`".to_string());
     }
-    let addresses_a_session = args
-        .get("sid")
-        .and_then(|sid| sid.as_str())
-        .is_some_and(|sid| !sid.trim().is_empty());
-    if addresses_a_session {
+    if addresses_a_session(args) {
         run_agent_read_transcript(args, gateway, caller).await
     } else {
         run_agent_read_roster_at(args, gateway, Some(paths)).await
@@ -3006,6 +3084,75 @@ fn pending_dispatch_response(
     response
 }
 
+/// Wait until `sid`'s vendor turn is no longer in flight, or `deadline`.
+/// Returns whether a turn boundary was reached.
+///
+/// ONE waiter for both long-poll shapes — an `agent{wait}` dispatch (which
+/// starts before its own task is submitted, so `armed` is false: it must see
+/// this child answer something first) and an `agent_read{sid,wait}` (which has
+/// already established the target is mid-turn, so `armed` is true). Sharing it
+/// is the point: the trap below was found once and must not be re-derived.
+///
+/// **A frame alone is NOT completion.** Codex mirrors interim narration as
+/// separate answers inside one still-running vendor turn, so returning on the
+/// first frame hands back a checkpoint note as the result (and, for a
+/// dispatch, disarms the real completion's watch). After a frame arrives,
+/// completion additionally requires the turn to have left flight
+/// (`session_turn_in_flight`, the same cell the pump clears on completion or
+/// failure), re-checked on a short poll tick — the terminal boundary emits no
+/// frame of its own.
+///
+/// NEVER holds the gateway lock across an await.
+async fn await_turn_boundary(
+    gateway: &GatewayHandle,
+    sid: &str,
+    deadline: tokio::time::Instant,
+    mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
+    armed: bool,
+) -> bool {
+    // Re-check cadence for "answer seen, is the turn still in flight?".
+    const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut saw_answer = armed;
+    loop {
+        if saw_answer {
+            let in_flight = {
+                let gw = gateway.lock().await;
+                gw.session_turn_in_flight(sid)
+            };
+            if !in_flight {
+                return true;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        // While mid-turn with an answer already seen, wake at least every
+        // BOUNDARY_POLL to re-check the in-flight cell.
+        let wait_slice = if saw_answer {
+            remaining.min(BOUNDARY_POLL)
+        } else {
+            remaining
+        };
+        match tokio::time::timeout(wait_slice, rx.recv()).await {
+            Ok(Ok(ev)) => {
+                let hit = ev.sid.as_deref() == Some(sid)
+                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer)
+                    && ev.status.is_some();
+                if hit {
+                    saw_answer = true;
+                }
+            }
+            // Broadcast lag → keep waiting (we may have missed unrelated frames).
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            // Sender gone (daemon shutdown) → give up on the boundary.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return false,
+            // Poll tick (or deadline) → loop re-checks in-flight / remaining.
+            Err(_) => {}
+        }
+    }
+}
+
 /// v0.9.0 W2 (F2) — the OFF-lock half of a `wait_seconds>0` dispatch. Awaits an
 /// `Answer` for `child_sid` on the gateway broadcast until the deadline. NEVER
 /// holds the gateway lock across the await (lock discipline). On completion it
@@ -3017,70 +3164,24 @@ fn pending_dispatch_response(
 /// pending response also reports the requested/effective waits and an honest
 /// collect-or-notification hint.
 ///
-/// v0.9.5 feedback fix — an `Answer` frame alone is NOT completion: codex
-/// mirrors interim narration as separate answers inside one still-running
-/// vendor turn, so returning on the first frame handed back "completed" with
-/// the child's first checkpoint note (and disarmed the real completion's
-/// watch). After a frame arrives, completion additionally requires the child's
-/// turn to no longer be in flight (`session_turn_in_flight`, the same cell the
-/// pump clears on completion or failure), re-checked on a short poll tick.
+/// v0.9.5 feedback fix — an `Answer` frame alone is NOT completion; see
+/// [`await_turn_boundary`], which owns that rule for every long poll.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_wait_for_completion(
     gateway: &GatewayHandle,
     child_sid: &str,
     turn_id: &str,
     wait: InlineWaitWindow,
-    mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
+    rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
     notification_route: CompletionNotificationRoute,
 ) -> serde_json::Map<String, serde_json::Value> {
     // MCP-DX-1 — elapsed telemetry: the wait starts right after the submit, so
     // submit→completion is an honest task-duration approximation for a wait
     // that covers the whole task.
-    let wait_started = tokio::time::Instant::now();
-    let deadline = wait_started + std::time::Duration::from_secs(wait.effective_seconds);
-    // Re-check cadence for "answer seen, is the turn still in flight?".
-    const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
-    let mut saw_answer = false;
-    let completed = loop {
-        if saw_answer {
-            let in_flight = {
-                let gw = gateway.lock().await;
-                gw.session_turn_in_flight(child_sid)
-            };
-            if !in_flight {
-                break true;
-            }
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break false;
-        }
-        // While mid-turn with an answer already seen, wake at least every
-        // BOUNDARY_POLL to re-check the in-flight cell (the pump clears it on
-        // the terminal boundary, which emits no separate completion frame).
-        let wait_slice = if saw_answer {
-            remaining.min(BOUNDARY_POLL)
-        } else {
-            remaining
-        };
-        match tokio::time::timeout(wait_slice, rx.recv()).await {
-            Ok(Ok(ev)) => {
-                let hit = ev.sid.as_deref() == Some(child_sid)
-                    && matches!(ev.kind, crate::gateway::GatewayEventKind::Answer)
-                    && ev.status.is_some();
-                if hit {
-                    saw_answer = true;
-                }
-            }
-            // Broadcast lag → keep waiting (we may have missed unrelated frames).
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            // Sender gone (daemon shutdown) → pending.
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break false,
-            // Poll tick (or deadline) → loop re-checks in-flight / remaining.
-            Err(_) => {}
-        }
-    };
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(wait.effective_seconds);
+    let completed = await_turn_boundary(gateway, child_sid, deadline, rx, false).await;
 
     if !completed {
         return pending_dispatch_response(child_sid, turn_id, notification_route);
@@ -3340,6 +3441,78 @@ fn session_row_fields(row: SessionRow) -> serde_json::Map<String, serde_json::Va
         .unwrap_or_default()
 }
 
+/// Hold an `agent_read{sid,wait}` open until the target's in-flight turn ends.
+///
+/// Returns whether it returned AT a turn boundary (a boundary the caller is now
+/// holding the result of), which is `false` for `wait:0`, for a target that is
+/// not mid-turn, and for a timeout. Subscribes BEFORE it looks at the
+/// in-flight cell so a turn that ends in between cannot be missed, and holds no
+/// gateway lock across the await.
+async fn read_wait_for_turn_boundary(
+    gateway: &GatewayHandle,
+    sid: &str,
+    args: &serde_json::Value,
+) -> bool {
+    let wait = read_wait_seconds(args);
+    if wait == 0 {
+        return false;
+    }
+    let (rx, in_flight, resolved) = {
+        let gw = gateway.lock().await;
+        (
+            gw.subscribe_events(),
+            gw.session_turn_in_flight(sid),
+            gw.session_resolve_any(sid),
+        )
+    };
+    if !in_flight {
+        // Nothing to wait for: the answer (or the emptiness) is already final.
+        return false;
+    }
+    let before = resolved.as_ref().and_then(last_mirrored_turn_id);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
+    if !await_turn_boundary(gateway, sid, deadline, rx, true).await {
+        return false;
+    }
+    if let Some(resolved) = resolved.as_ref() {
+        settle_until_the_final_turn_lands(resolved, before.as_deref()).await;
+    }
+    true
+}
+
+/// The turn_id of the newest row in a session's durable mirror.
+fn last_mirrored_turn_id(resolved: &crate::gateway::SessionResolve) -> Option<String> {
+    ccteam_harness::execution::turns_mirror::read_all_turns(&resolved.project_dir, &resolved.sid)
+        .ok()?
+        .pop()
+        .map(|turn| turn.turn_id)
+}
+
+/// Wait (briefly, bounded) for the boundary's own row to reach `turns.jsonl`.
+///
+/// The event pump clears the in-flight cell in its terminal-accounting step,
+/// which runs BEFORE it mirrors that turn's answer — so "no longer in flight"
+/// leads the durable write by a hair. Returning on the cell alone handed back a
+/// body missing the very turn the caller waited for (observed as a flaky read
+/// under load). This closes the window by watching for the row itself instead
+/// of sleeping a guessed amount: it returns the moment the row lands, and gives
+/// up after [`BOUNDARY_SETTLE`] for a boundary that appends nothing at all (a
+/// completion with no answer text).
+async fn settle_until_the_final_turn_lands(
+    resolved: &crate::gateway::SessionResolve,
+    before: Option<&str>,
+) {
+    const BOUNDARY_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+    let deadline = tokio::time::Instant::now() + BOUNDARY_SETTLE;
+    while tokio::time::Instant::now() < deadline {
+        if last_mirrored_turn_id(resolved).as_deref() != before {
+            return;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// `agent_read{sid}` — tail one session's `turns.jsonl` (assistant turns).
 /// Resolve sid → role + project_dir under the lock, drop the guard, then read
 /// the ccteam-owned mirror. `since` is a turn_id cursor.
@@ -3371,6 +3544,38 @@ async fn run_agent_read_transcript(
     let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
     assert_caller_owns_session("agent_read", args, gateway, &sid, &caller, None).await?;
+    // ---- the long poll (off the gateway lock, after every gate) ----
+    //
+    // The missing primitive was "wait for the turn that is in flight". Without
+    // it a parent that had to sit out a 25-minute child either burned a
+    // dispatch `wait` it could not extend or — measured 2026-08-31 — tailed the
+    // child's private `turns.jsonl` and grepped line shapes, which is the
+    // caller-built side channel this surface exists to make unnecessary. The
+    // read that follows is the ordinary one: every filter still applies, the
+    // body carries no new field, and a timeout just answers
+    // `activity:"working"`.
+    if read_wait_for_turn_boundary(gateway, &sid, args).await {
+        // D4 — the caller now HOLDS the answer, so the completion notification
+        // would be a second copy. Disarmed exactly where an inline dispatch
+        // wait disarms it, and only for the parent the watch names: a third
+        // party reading someone else's child must never take that child's
+        // notification away from the session that hired it.
+        let caller_sid = args
+            .get("_caller_sid")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let is_watching_parent = !caller_sid.is_empty()
+            && gateway
+                .lock()
+                .await
+                .delegation_watch_parent(&sid)
+                .as_deref()
+                == Some(caller_sid);
+        if is_watching_parent {
+            crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), &sid)
+                .await;
+        }
+    }
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
@@ -3779,8 +3984,12 @@ async fn run_agent_stop(
     };
     let mut gw = gateway.lock().await;
     if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
+        // The rule is right and stays; what was missing is the way out. A
+        // hand-started client that reconnects is a NEW ledger node, so the
+        // sessions its previous node hired are nobody's descendants and it
+        // could not stop its own work at all (measured 2026-08-31).
         return Err(format!(
-            "agent_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated)"
+            "agent_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated). A reconnected client is a new ledger node, so its earlier hires are not its descendants: stop it from the web console, or POST /api/v1/sessions/{sid}/stop with a web token"
         ));
     }
     // Capture the delegation event fields + drop the child's own watch BEFORE
@@ -3890,19 +4099,17 @@ async fn assert_caller_owns_session(
     match caller {
         McpCaller::Admin => Ok(()),
         McpCaller::User { user_id } => {
-            let Some(resolved) = resolved else {
-                return Err(format!("{name}: session not found"));
-            };
-            let state_path = CcteamPaths::project_state_in(&resolved.project_dir);
-            let allowed = ccteam_core::ProjectState::load(&state_path)
-                .map(|state| {
+            let allowed = resolved
+                .as_ref()
+                .map(|resolved| CcteamPaths::project_state_in(&resolved.project_dir))
+                .and_then(|state_path| ccteam_core::ProjectState::load(&state_path).ok())
+                .is_some_and(|state| {
                     ccteam_core::identity::can_see_owner(user_id, false, state.owner.as_deref())
-                })
-                .unwrap_or(false);
+                });
             if allowed {
                 Ok(())
             } else {
-                Err(format!("{name}: session not found"))
+                Err(tenant_unreachable_session_error(name))
             }
         }
         McpCaller::Ambient => {
@@ -3912,28 +4119,30 @@ async fn assert_caller_owns_session(
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| format!("{name}: no project scope (ambient slug unset)"))?
                 .to_string();
-            let Some(resolved) = resolved else {
-                return Err(missing_session_error(name, gateway, sid, &caller_slug).await);
-            };
-            if resolved.project != caller_slug {
-                return Err(format!(
-                    "{name}: permission denied — session {sid} runs in project `{}`, but the caller is bound to project `{caller_slug}`",
-                    resolved.project
-                ));
+            // Unknown and unreachable answer the SAME text, from the same
+            // builder: naming the project a sid runs in told a caller that
+            // `s1` exists in somebody else's workspace, which is an
+            // enumerable cross-tenant leak (measured 2026-08-31 — `agent_read`
+            // said "s1 runs in project pm" for a sid `agent` and `agent_stop`
+            // called unknown).
+            match resolved {
+                Some(resolved) if resolved.project == caller_slug => Ok(()),
+                _ => Err(unreachable_session_error(name, gateway, sid, &caller_slug).await),
             }
-            Ok(())
         }
     }
 }
 
-/// Why a sid the caller named is not driveable.
+/// The ONE refusal for a sid an ambient caller cannot reach — `agent`,
+/// `agent_read` and `agent_stop` all answer through it, and unknown,
+/// invisible and another tenant's are deliberately the same bytes.
 ///
 /// "Unknown" and "you stopped it" are the same absence from the live map but
 /// two different next moves — hire a replacement vs. read what it already
 /// said — and collapsing them into "unknown session" sent callers hunting for
 /// a bug in ccteam. The stopped answer is only ever given for a session in the
 /// CALLER'S OWN project: elsewhere, existence itself stays undisclosed.
-async fn missing_session_error(
+async fn unreachable_session_error(
     tool: &str,
     gateway: &GatewayHandle,
     sid: &str,
@@ -3957,6 +4166,13 @@ async fn missing_session_error(
         }
     }
     format!("{tool}: unknown session {sid} in project {caller_slug}")
+}
+
+/// The tenant tier's half of the same rule: one text for a sid this user
+/// cannot see, whatever the reason. Deliberately shorter than the ambient
+/// one — a tenant has no single bound project to name.
+fn tenant_unreachable_session_error(tool: &str) -> String {
+    format!("{tool}: session not found")
 }
 
 /// Parse the optional `vendor` arg (default `claude`), lowercasing first so a
@@ -4255,7 +4471,7 @@ mod session_tool_tests {
     use crate::delegation::INLINE_RESULT_MAX_CHARS;
     use serde_json::json;
 
-    fn call(name: &str, args: serde_json::Value) -> serde_json::Value {
+    pub(super) fn call(name: &str, args: serde_json::Value) -> serde_json::Value {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -4288,6 +4504,370 @@ mod session_tool_tests {
             assert_eq!(inline_wait_seconds(&json!({ "wait": requested })), expected);
         }
         assert_eq!(inline_wait_seconds(&json!({})), 0);
+    }
+
+    /// `agent_read{sid,wait}` clamps like `agent{wait}` and is inert on the
+    /// roster branch, which has no turn to wait for.
+    #[test]
+    fn read_wait_clamps_and_only_applies_to_a_named_session() {
+        for (requested, expected) in [(600, 240), (240, 240), (0, 0), (30, 30)] {
+            assert_eq!(
+                read_wait_seconds(&json!({ "sid": "s5", "wait": requested })),
+                expected
+            );
+        }
+        assert_eq!(read_wait_seconds(&json!({ "wait": 240 })), 0, "roster");
+        assert_eq!(read_wait_seconds(&json!({ "sid": " ", "wait": 240 })), 0);
+        assert_eq!(read_wait_seconds(&json!({ "sid": "s5" })), 0);
+    }
+
+    /// D1 — the primitive that was missing: hold the read open until the
+    /// target's in-flight turn ENDS, then answer the ordinary transcript.
+    /// Without it a parent waiting on a long child had to tail the child's
+    /// private `turns.jsonl` (measured 2026-08-31).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn agent_read_wait_holds_until_the_turn_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal, _drx) =
+            build_dispatch_gateway(true, false, 150, None, tmp.path()).await;
+        let child = parse(
+            &run_agent(
+                &ambient(&principal, "alpha", json!({ "task": "long job" })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            gw.lock().await.session_turn_in_flight(&child),
+            "the child is mid-turn when the read starts"
+        );
+
+        let body = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 20 })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !gw.lock().await.session_turn_in_flight(&child),
+            "the read returned at the turn boundary: {body}"
+        );
+        let turns = body["turns"].as_array().unwrap();
+        assert!(
+            turns
+                .last()
+                .and_then(|turn| turn["content"].as_str())
+                .is_some_and(|content| content.contains("echo: long job")),
+            "the final turn is in the body the wait returned: {body}"
+        );
+        // Zero new response fields: a long poll answers the SAME body shape.
+        for key in body.as_object().unwrap().keys() {
+            assert!(
+                [
+                    "activity",
+                    "context_pct",
+                    "cost_usd",
+                    "cursor",
+                    "residency",
+                    "tokens_total",
+                    "truncated",
+                    "turns"
+                ]
+                .contains(&key.as_str()),
+                "unexpected field `{key}` in a waited read: {body}"
+            );
+        }
+    }
+
+    /// The two branches that must NOT hold: nothing in flight answers now, and
+    /// a wait that runs out answers the ordinary body with `activity:working`
+    /// (the turn is untouched — a timeout never cancels anything).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn agent_read_wait_returns_at_once_when_idle_and_says_working_on_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // 30s before the first event: long enough that only the wait can end.
+        let (gw, principal, _drx) =
+            build_dispatch_gateway(true, false, 30_000, None, tmp.path()).await;
+        // The activity resolver is the same one the web list uses, and it needs
+        // the daemon's progress projection to answer anything but "idle".
+        gw.lock().await.enable_project_creation(paths.clone());
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Idle target: a 240s wait costs nothing at all.
+        let started = std::time::Instant::now();
+        let idle = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 240 })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an idle target must answer immediately: {idle}"
+        );
+        assert!(idle["turns"].as_array().unwrap().is_empty(), "{idle}");
+
+        // Mid-turn target, wait exhausted: the ordinary body, honestly working.
+        dispatch_task(
+            &gw,
+            "agent",
+            &principal,
+            &child,
+            "slow job".to_string(),
+            0,
+            NotifyRequest::defaulted(),
+            None,
+            crate::gateway::GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        let timed_out = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 1 })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(timed_out["activity"], "working", "{timed_out}");
+        assert!(timed_out.get("waited").is_none(), "{timed_out}");
+        assert!(
+            gw.lock().await.session_turn_in_flight(&child),
+            "a lapsed wait never cancels the turn"
+        );
+    }
+
+    /// The codex trap, mirrored from the dispatch-wait side: an interim
+    /// assistant frame arrives INSIDE the still-running turn, and returning on
+    /// it would hand back a checkpoint note as the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn agent_read_wait_does_not_return_on_an_interim_frame() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal, _drx) = build_dispatch_gateway(true, true, 150, None, tmp.path()).await;
+        let child = parse(
+            &run_agent(
+                &ambient(&principal, "alpha", json!({ "task": "narrated job" })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let body = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 20 })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        let last = body["turns"]
+            .as_array()
+            .unwrap()
+            .last()
+            .and_then(|turn| turn["content"].as_str())
+            .unwrap_or_default();
+        assert!(
+            last.contains("echo: narrated job"),
+            "the wait must run past the narration to the real answer: {body}"
+        );
+    }
+
+    /// D4 — a long poll that returns AT the boundary leaves the parent holding
+    /// the answer, so the completion notification would be a second copy: the
+    /// watch is disarmed exactly as an inline dispatch wait disarms it. A
+    /// reader that is not the watch's parent must not touch it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn agent_read_wait_disarms_only_the_watching_parents_own_notification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal, _drx) =
+            build_dispatch_gateway(true, false, 150, None, tmp.path()).await;
+        let child = parse(
+            &run_agent(
+                &ambient(&principal, "alpha", json!({ "task": "first job" })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            gw.lock().await.delegation_watch_parent(&child).as_deref(),
+            Some(principal.as_str()),
+            "the dispatch armed the parent's watch"
+        );
+        run_agent_read(
+            &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 20 })),
+            &gw,
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await
+        .unwrap();
+        assert!(
+            gw.lock().await.delegation_watch_parent(&child).is_none(),
+            "the parent read the answer inline — no redundant notification"
+        );
+
+        // Re-arm, then let a THIRD session read the same child: its own answer
+        // is none of that reader's business to suppress.
+        let stranger = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        dispatch_task(
+            &gw,
+            "agent",
+            &principal,
+            &child,
+            "second job".to_string(),
+            0,
+            NotifyRequest::defaulted(),
+            None,
+            crate::gateway::GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        run_agent_read(
+            &ambient(&stranger, "alpha", json!({ "sid": &child, "wait": 20 })),
+            &gw,
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            gw.lock().await.delegation_watch_parent(&child).as_deref(),
+            Some(principal.as_str()),
+            "a third-party reader must not take the parent's notification away"
+        );
+    }
+
+    /// The server-side deadline has to clear the wait the caller asked for, or
+    /// a long poll is cut short by a "the daemon is busy" timeout at 15s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_long_read_wait_is_not_cut_short_by_the_server_deadline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _drx) =
+            build_dispatch_gateway(true, false, 60_000, None, tmp.path()).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let child = parse(
+            &run_agent(
+                &ambient(&principal, "alpha", json!({ "task": "very slow" })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The read tool's budget is 15s + the requested wait; a 240s wait must
+        // therefore not resolve to the flat 15s the read used to get.
+        assert_eq!(
+            read_wait_seconds(&json!({ "sid": &child, "wait": 240 })),
+            240
+        );
+        // Proof at the dispatch layer: a 3s wait survives past 15s of nothing
+        // happening only because the budget moved with it (the wait itself
+        // still lapses at 3s and answers the ordinary working body).
+        let secret = gw
+            .lock()
+            .await
+            .principals()
+            .credential_for_managed_attach(&principal)
+            .expect("the caller holds a minted principal")
+            .0;
+        let started = std::time::Instant::now();
+        let response = execute_session_tool_with_paths(
+            &call(
+                "agent_read",
+                json!({
+                    "sid": &child,
+                    "wait": 3,
+                    "_caller_sid": &principal,
+                    "_caller_secret": secret,
+                }),
+            ),
+            Some(&gw),
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await;
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(3),
+            "the wait was honoured: {elapsed:?}"
+        );
+        let body = parse(response["result"]["content"][0]["text"].as_str().unwrap());
+        assert!(body["turns"].as_array().is_some(), "{body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -4876,7 +5456,9 @@ mod session_tool_tests {
 
     /// v0.9.0 W1 (F1) — end-to-end: a caller authenticated for project `alpha`
     /// is REJECTED when it tries to dispatch/collect/stop a `beta` sid
-    /// (cross-project). The scope comes from the SERVER-resolved CallerCtx.slug.
+    /// (cross-project). The scope comes from the SERVER-resolved CallerCtx.slug,
+    /// and the refusal says only what the caller may know: the sid is not one
+    /// of ITS sessions.
     #[tokio::test]
     async fn execute_session_tool_rejects_cross_project_sid() {
         let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
@@ -4892,10 +5474,12 @@ mod session_tool_tests {
             let resp = execute_session_tool(&call(tool, args), Some(&gw), McpCaller::Ambient).await;
             assert_eq!(resp["result"]["isError"], true, "{tool} must reject");
             let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(
-                text.contains("permission denied") && text.contains("bound to project `alpha`"),
-                "{tool}: cross-project must be denied with a clear reason, got: {text}"
+            assert_eq!(
+                text,
+                format!("{tool}: unknown session {beta_sid} in project alpha"),
+                "{tool}: a foreign sid is refused without naming its project"
             );
+            assert!(!text.contains("beta"), "{tool} leaked the target project");
         }
     }
 
@@ -4925,8 +5509,12 @@ mod session_tool_tests {
         );
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("bound to project `alpha`"),
+            text.ends_with("in project alpha"),
             "server must use CallerCtx.slug (alpha), not the spoofed `beta`, got: {text}"
+        );
+        assert!(
+            !text.contains("beta"),
+            "the spoofed slug is never echoed back"
         );
     }
 
@@ -5781,6 +6369,130 @@ mod session_tool_tests {
         }
     }
 
+    /// P1-2 — an ambient caller must not learn that a sid it cannot reach
+    /// exists, let alone which project it runs in: `agent_read` answered
+    /// "s1 runs in project pm" for a sid `agent` and `agent_stop` called
+    /// unknown, which made every sid enumerable across tenants (2026-08-31).
+    /// All three tools now answer from one builder.
+    #[tokio::test]
+    async fn ambient_foreign_and_unknown_sid_errors_are_identical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let secret = gateway
+            .lock()
+            .await
+            .principals()
+            .credential_for_managed_attach(&alice_sid)
+            .expect("alice holds a minted principal")
+            .0;
+
+        for tool in ["agent", "agent_read", "agent_stop"] {
+            let invoke = |sid: &str| {
+                let mut args = json!({
+                    "sid": sid,
+                    "_caller_sid": alice_sid.clone(),
+                    "_caller_secret": secret.clone(),
+                });
+                if tool == "agent" {
+                    args["task"] = json!("do not leak");
+                }
+                call(tool, args)
+            };
+            let foreign = execute_session_tool_with_paths(
+                &invoke(&bob_sid),
+                Some(&gateway),
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await;
+            let unknown = execute_session_tool_with_paths(
+                &invoke("s999999"),
+                Some(&gateway),
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await;
+            assert_eq!(foreign["result"]["isError"], true, "{tool}: {foreign}");
+            assert_eq!(unknown["result"]["isError"], true, "{tool}: {unknown}");
+            let foreign_text = foreign["result"]["content"][0]["text"].as_str().unwrap();
+            let unknown_text = unknown["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(
+                foreign_text.replace(&bob_sid, "<sid>"),
+                unknown_text.replace("s999999", "<sid>"),
+                "{tool}: a foreign sid and one that never existed must read alike"
+            );
+            assert!(
+                !foreign_text.contains("bob"),
+                "{tool} named another tenant's project: {foreign_text}"
+            );
+        }
+    }
+
+    /// P1-3 — an ambient caller's roster is its OWN project. It used to span
+    /// every project the owner can see (measured `total: 1272`, the caller's
+    /// own seven rows pushed past the default page), while NAMING another
+    /// project was refused: unasked-for breadth plus a refusal for the honest
+    /// request.
+    #[tokio::test]
+    async fn ambient_roster_is_scoped_to_the_callers_own_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, bob_sid, admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let secret = gateway
+            .lock()
+            .await
+            .principals()
+            .credential_for_managed_attach(&alice_sid)
+            .expect("alice holds a minted principal")
+            .0;
+        let roster = |project: Option<&str>| {
+            let mut args = json!({
+                "_caller_sid": alice_sid.clone(),
+                "_caller_secret": secret.clone(),
+            });
+            if let Some(project) = project {
+                args["project"] = json!(project);
+            }
+            let request = call("agent_read", args);
+            let gateway = std::sync::Arc::clone(&gateway);
+            let paths = paths.clone();
+            async move {
+                execute_session_tool_with_paths(
+                    &request,
+                    Some(&gateway),
+                    McpCaller::Ambient,
+                    &paths,
+                )
+                .await
+            }
+        };
+
+        for scope in [None, Some("alice")] {
+            let response = roster(scope).await;
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let body = parse(response["result"]["content"][0]["text"].as_str().unwrap());
+            let sids: Vec<&str> = body["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|session| session["sid"].as_str())
+                .collect();
+            assert_eq!(sids, vec![alice_sid.as_str()], "{scope:?}: {body}");
+            assert!(!sids.contains(&bob_sid.as_str()));
+            assert!(!sids.contains(&admin_sid.as_str()));
+            assert!(body.get("total").is_none(), "nothing was cut: {body}");
+        }
+
+        // Naming somebody else's project keeps the refusal it always had.
+        let refused = roster(Some("bob")).await;
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert_eq!(
+            refused["result"]["content"][0]["text"],
+            json!("agent_read: project not found — this session works in `alice`")
+        );
+    }
+
     #[tokio::test]
     async fn user_agent_read_filters_to_owned_projects_and_overwrites_spoofed_scope() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6174,6 +6886,30 @@ mod session_tool_tests {
         turn_failure: Option<ccteam_harness::ThreadErrorEvent>,
         project_dir: &std::path::Path,
     ) -> (GatewayHandle, String) {
+        let (handle, principal, drx) =
+            build_dispatch_gateway(answer, narrate, delay_ms, turn_failure, project_dir).await;
+        tokio::spawn(Gateway::run_delegation_notifier(
+            std::sync::Arc::clone(&handle),
+            drx,
+        ));
+        (handle, principal)
+    }
+
+    /// The same wiring with the notifier NOT running, and the signal receiver
+    /// handed back. What that buys a test: nothing but the code under test can
+    /// spend a delegation watch, so "did the long poll disarm it?" is a fact
+    /// rather than a race with the notifier's own boundary delivery.
+    async fn build_dispatch_gateway(
+        answer: bool,
+        narrate: bool,
+        delay_ms: u64,
+        turn_failure: Option<ccteam_harness::ThreadErrorEvent>,
+        project_dir: &std::path::Path,
+    ) -> (
+        GatewayHandle,
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
+    ) {
         let factory: std::sync::Arc<
             dyn Fn(
                     ccteam_harness::AgentVendor,
@@ -6209,11 +6945,7 @@ mod session_tool_tests {
             .unwrap()
             .sid;
         let handle = std::sync::Arc::new(tokio::sync::Mutex::new(gw));
-        tokio::spawn(Gateway::run_delegation_notifier(
-            std::sync::Arc::clone(&handle),
-            drx,
-        ));
-        (handle, principal)
+        (handle, principal, drx)
     }
 
     pub(super) fn parse(body: &str) -> serde_json::Value {
@@ -6765,7 +7497,7 @@ mod session_tool_tests {
             &ambient(
                 &principal,
                 "alpha",
-                json!({ "vendor": "claude", "task": "some task", "title": "my label", "notify": "all" }),
+                json!({ "vendor": "claude", "task": "some task", "title": "my label", "notify": "brief" }),
             ),
             &gw,
             McpCaller::Ambient,
@@ -6796,6 +7528,21 @@ mod session_tool_tests {
         .await
         .unwrap_err();
         assert!(err.contains("invalid notify mode"), "{err}");
+        assert_eq!(gw.lock().await.session_views().len(), before);
+
+        // …and the retired `all` says so by name rather than reading as a typo.
+        let removed = run_agent_spawn(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "vendor": "claude", "task": "t", "notify": "all" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(removed, "agent: notify `all` was removed; use final");
         assert_eq!(gw.lock().await.session_views().len(), before);
     }
 
@@ -7934,8 +8681,8 @@ mod tool_face_tests {
             .collect();
         assert_eq!(
             names,
-            vec!["chat_send_file", "agent_read"],
-            "a capped child may read the team and answer its chat, nothing else"
+            vec!["status", "chat_send_file", "agent_read"],
+            "a capped child may see the board, read the team and answer its chat"
         );
 
         let init = dispatch
@@ -8084,9 +8831,187 @@ mod tool_face_tests {
             .contains("(no ccteam tools)"));
     }
 
+    /// P1-1 — the face is a property of the PRINCIPAL, which exists before the
+    /// vendor process does. The child's MCP client fetches `tools/list` once,
+    /// at startup, and that request beat `meta.json` to disk: a `tools:"none"`
+    /// child was served all six tools and later really called `status`
+    /// (daemon.log, 2026-08-31). Deleting the meta file is the proof that
+    /// nothing on this path reads it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tool_face_is_resolved_without_reading_meta_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, secrets) = face_gateway(tmp.path()).await;
+        let dispatch = dispatcher(&paths, &gateway);
+
+        for (requested, expected) in [
+            ("none", Vec::<&str>::new()),
+            // A hired child that a chat is wired to keeps `chat_send_file`;
+            // the READ part of the face is `status` + `agent_read`.
+            ("read", vec!["status", "chat_send_file", "agent_read"]),
+        ] {
+            let child = parse(
+                &run_agent(
+                    &ambient(&root, "alpha", json!({ "task": "x", "tools": requested })),
+                    &gateway,
+                    McpCaller::Ambient,
+                    &paths,
+                )
+                .await
+                .unwrap(),
+            )["sid"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let child_secret = secret_for(&secrets, &child).await;
+
+            // The face answers the moment the create call returns…
+            let names = |listed: &serde_json::Value| -> Vec<String> {
+                listed["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_string())
+                    .collect()
+            };
+            let listed = dispatch
+                .dispatch_as(
+                    discovery("tools/list", &child, &child_secret),
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap();
+            assert_eq!(names(&listed), expected, "tools:{requested} at create time");
+
+            // …and keeps answering with the file gone, which is what a child
+            // asking before the write lands amounts to.
+            let meta_path = ccteam_harness::execution::turns_mirror::chat_dir(tmp.path(), &child)
+                .join("meta.json");
+            assert!(meta_path.exists(), "the audit copy is still written");
+            std::fs::remove_file(&meta_path).unwrap();
+            let listed = dispatch
+                .dispatch_as(
+                    discovery("tools/list", &child, &child_secret),
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                names(&listed),
+                expected,
+                "tools:{requested} must not depend on meta.json"
+            );
+        }
+    }
+
+    /// P1-1, the earliest moment there is: the child's MCP client asks for its
+    /// tool list DURING the spawn, while its principal is still `Spawning` and
+    /// nothing about the session is on disk. That request used to fail the
+    /// authorization-grade check, leave the resolver with no caller to narrow
+    /// by, and degrade to the full face — the measured `tools=Some(6)` a
+    /// `tools:"none"` child then held for its whole life.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawning_childs_face_is_already_narrowed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, _root, _secrets) = face_gateway(tmp.path()).await;
+        gateway.lock().await.principals().reserve(
+            "s99",
+            "spawning-secret",
+            crate::principals::PrincipalFacts {
+                tool_face: Some("none".into()),
+                parent_sid: Some("s1".into()),
+                ..crate::principals::PrincipalFacts::new("alpha", "", 1)
+            },
+        );
+        let dispatch = dispatcher(&paths, &gateway);
+        let listed = dispatch
+            .dispatch_as(
+                discovery("tools/list", "s99", "spawning-secret"),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["result"],
+            json!({ "tools": [] }),
+            "a mid-spawn child hired with no tools must never see the full face"
+        );
+
+        // Listing is not authority: the same principal still cannot ACT.
+        let denied = execute_session_tool_with_paths(
+            &call(
+                "agent_read",
+                json!({ "_caller_sid": "s99", "_caller_secret": "spawning-secret" }),
+            ),
+            Some(&gateway),
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await;
+        assert_eq!(denied["result"]["isError"], true, "{denied}");
+    }
+
+    /// P2-5 — the descendant rule is right; the refusal was a dead end. A
+    /// reconnected hand-started client is a NEW ledger node, so the sessions
+    /// its previous node hired are nobody's descendants, and it could not stop
+    /// its own work at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_descendant_stop_refusal_names_the_way_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, root, _secrets) = face_gateway(tmp.path()).await;
+        let stranger = parse(
+            &run_agent_spawn(
+                &ambient(&root, "alpha", json!({ "vendor": "claude" })),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // `stranger` is the ROOT's child, so a sibling caller is not its ancestor.
+        let sibling = parse(
+            &run_agent_spawn(
+                &ambient(&root, "alpha", json!({ "vendor": "claude" })),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let refusal = run_agent_stop(
+            &ambient(&sibling, "alpha", json!({ "sid": &stranger })),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refusal.contains("is not a descendant of the caller"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("POST /api/v1/sessions/{stranger}/stop")),
+            "the refusal must name the way out: {refusal}"
+        );
+        assert!(refusal.contains("web console"), "{refusal}");
+    }
+
     /// G2 — the default `status` body, and the beacon that must be the same
     /// bytes (it exists for hosts that see names only; a second shape would be
-    /// a second thing to keep true).
+    /// a second thing to keep true)."""
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_brief_is_tiny_and_the_beacon_is_byte_identical() {
         let tmp = tempfile::TempDir::new().unwrap();

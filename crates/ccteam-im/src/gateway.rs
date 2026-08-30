@@ -704,8 +704,8 @@ struct DelegationMirror {
     generation: u64,
     /// sid of the session to notify on a watched turn (the dispatcher).
     parent_sid: String,
-    /// When completion delivers a notification turn — `final` (turn boundary
-    /// only, default) / `all` (every mirrored message) / `off` (ledger-only).
+    /// How much of the answer rides along when the boundary wakes the parent —
+    /// `final` (default) / `brief` / `off` (ledger-only).
     notify: ccteam_harness::NotifyMode,
     /// Optional dispatch label (ledger/notification only — never a prompt).
     title: Option<String>,
@@ -1618,16 +1618,41 @@ pub struct CallerCtx {
     pub depth: u32,
 }
 
+/// The public projection of a verified principal (the registry's own record
+/// carries face facts the authorization path has no business reading).
+fn caller_ctx(matched: crate::principals::PrincipalMatch) -> CallerCtx {
+    CallerCtx {
+        sid: matched.sid,
+        slug: matched.slug,
+        role: matched.role,
+        depth: matched.depth,
+    }
+}
+
 /// One lock hold's worth of facts for the MCP tool-face resolver
 /// ([`Gateway::session_face_context`]).
+///
+/// Every field is an IN-MEMORY read. The face used to be reconstructed from
+/// the session's `meta.json`, which lands on disk AFTER the child process's
+/// first `initialize` / `tools/list` — so a `tools:"none"` child was served
+/// the full face on the one fetch its MCP client ever makes (measured
+/// 2026-08-31, daemon.log: `tools=Some(6)` at 19:51:21.285, session live at
+/// 19:51:21.329, and a real `status` call at 19:56:08). The face-deciding
+/// facts now ride the principal record, which is minted before the process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionFaceContext {
-    /// Project working dir holding `.ccteam/chat/<sid>/meta.json`.
-    pub project_dir: PathBuf,
+    /// `agent{tools}` as hired: `None` = full, `"read"` / `"none"` narrow it.
+    pub tool_face: Option<String>,
+    /// No delegation parent: its own human is at the other end.
+    pub is_root: bool,
     /// `delegation.max_depth` in force right now.
     pub max_depth: u32,
     /// A chat is wired to this session, so `chat_send_file` can reach one.
     pub has_reply_target: bool,
+    /// ccteam can push a completion notification INTO this session (it holds
+    /// or can resume its thread). False for an enrolled hand-started client:
+    /// MCP is client-dial-in, so there is no conversation to append to.
+    pub pushable: bool,
 }
 
 /// v0.9.0 W2 (F2/F5) — the resolved delegation parent for an `agent` spawn.
@@ -1683,6 +1708,10 @@ struct MetaRebuildPlan {
     permission_mode: PermissionMode,
     parent_sid: Option<String>,
     delegation_depth: u32,
+    /// `meta.tool_face`, replayed so the resumed process is served the SAME
+    /// face its first process was (the principal is the face's home; meta is
+    /// the restart-surviving copy).
+    tool_face: Option<String>,
     /// Canonical owner (from meta, else the rebuild's reply target).
     owner: ChatKey,
     /// @mention handle = role, else sid for a roleless session.
@@ -2352,13 +2381,7 @@ impl Gateway {
         // through here, so the rule is drawn once — a body that outlived the
         // previous daemon is registered as DETACHED and the caller sees a
         // typed error (queue behind it / report it), never a silent twin.
-        let post_mortem = match self.gate_session_body(
-            &meta.sid,
-            slug,
-            &cwd,
-            &meta.role,
-            meta.delegation_depth,
-        )? {
+        let post_mortem = match self.gate_session_body(&meta.sid, slug, &cwd, meta)? {
             BodyGate::Clear => None,
             BodyGate::PostMortem(body) => Some(body),
         };
@@ -2382,12 +2405,20 @@ impl Gateway {
         // Same contract as a fresh plan: the secret has to verify while the
         // vendor is spawning, not only once the rebuilt session is applied.
         let rebuild_secret = ccteam_core::session_secret::mint();
+        // A resume re-mints the principal, so the face facts are BACKFILLED
+        // from `meta.json` here — that file is the restart-surviving audit
+        // copy of what the spawn decided (P1-1: the face is a principal
+        // property; nothing downstream reads meta to answer `tools/list`).
         self.principals.reserve(
             &meta.sid,
             &rebuild_secret,
-            slug,
-            &meta.role,
-            meta.delegation_depth,
+            crate::principals::PrincipalFacts {
+                slug: slug.to_string(),
+                role: meta.role.clone(),
+                depth: meta.delegation_depth,
+                tool_face: meta.tool_face.clone(),
+                parent_sid: meta.parent_sid.clone(),
+            },
         );
         let generation = self.next_live_generation();
         self.rebuild_reservations
@@ -2404,6 +2435,7 @@ impl Gateway {
             permission_mode: meta.permission_mode,
             parent_sid: meta.parent_sid.clone(),
             delegation_depth: meta.delegation_depth,
+            tool_face: meta.tool_face.clone(),
             owner,
             handle,
             model_id,
@@ -2524,9 +2556,13 @@ impl Gateway {
         self.principals.promote(
             &sid,
             &plan.secret,
-            &plan.slug,
-            &plan.role,
-            plan.delegation_depth,
+            crate::principals::PrincipalFacts {
+                slug: plan.slug.clone(),
+                role: plan.role.clone(),
+                depth: plan.delegation_depth,
+                tool_face: plan.tool_face.clone(),
+                parent_sid: plan.parent_sid.clone(),
+            },
         );
         let generation = plan.generation;
         self.sessions.insert(
@@ -2702,7 +2738,7 @@ impl Gateway {
         if !meta.is_resumable() {
             return;
         }
-        match self.gate_session_body(sid, &slug, &cwd, &meta.role, meta.delegation_depth) {
+        match self.gate_session_body(sid, &slug, &cwd, &meta) {
             Ok(BodyGate::Clear) => {}
             Ok(BodyGate::PostMortem(body)) => {
                 // The previous body exited unobserved: let the watcher recover
@@ -2744,8 +2780,7 @@ impl Gateway {
         sid: &str,
         slug: &str,
         cwd: &Path,
-        role: &str,
-        depth: u32,
+        meta: &SessionMeta,
     ) -> Result<BodyGate, GatewayRequestError> {
         if let Some(detached) = self.detached.get(sid) {
             // Still tracked: even if the body died a moment ago, the watcher
@@ -2760,15 +2795,8 @@ impl Gateway {
                 Ok(BodyGate::PostMortem(body))
             }
             BodyProbe::Alive(body) => {
-                let detached = self.register_detached_body(
-                    sid,
-                    slug,
-                    cwd,
-                    body,
-                    role,
-                    depth,
-                    "daemon_restart",
-                );
+                let detached =
+                    self.register_detached_body(sid, slug, cwd, body, meta, "daemon_restart");
                 Err(detached.error())
             }
         }
@@ -2778,21 +2806,31 @@ impl Gateway {
     /// principal its process is still calling `/mcp` with (the bearer baked
     /// into the session's own `mcp.json`), record the lifecycle, and wake the
     /// watcher.
-    #[allow(clippy::too_many_arguments)]
     fn register_detached_body(
         &mut self,
         sid: &str,
         slug: &str,
         cwd: &Path,
         body: SessionBody,
-        role: &str,
-        depth: u32,
+        meta: &SessionMeta,
         reason: &'static str,
     ) -> DetachedBody {
         if let Some(secret) =
             ccteam_harness::execution::mcp_config::read_session_mcp_secret(cwd, sid)
         {
-            self.principals.promote(sid, &secret, slug, role, depth);
+            // Same backfill as a resume: the body predates this daemon, so
+            // `meta.json` is the only record of what face it was hired with.
+            self.principals.promote(
+                sid,
+                &secret,
+                crate::principals::PrincipalFacts {
+                    slug: slug.to_string(),
+                    role: meta.role.clone(),
+                    depth: meta.delegation_depth,
+                    tool_face: meta.tool_face.clone(),
+                    parent_sid: meta.parent_sid.clone(),
+                },
+            );
         }
         let detached = DetachedBody {
             sid: sid.to_string(),
@@ -5005,7 +5043,14 @@ impl Gateway {
         // Registering it only at apply made those handshakes authenticate
         // against a session that did not exist yet — a 401 the vendor answers
         // by burning its 30s MCP startup timeout, on EVERY managed spawn.
-        self.principals.reserve(&id, &secret, &project, &role, 0);
+        self.principals.reserve(
+            &id,
+            &secret,
+            crate::principals::PrincipalFacts::new(&project, &role, 0),
+        );
+        // …with the delegation lineage and the `tools` face still unknown here
+        // — a caller that customizes the plan re-stamps them through
+        // `restamp_plan_principal` before the vendor process starts.
         let adapter = (self.adapter_factory)(vendor, protocol);
         // Ownership is decided HERE, the one sync core every fresh spawn funnels
         // through (IM `/new` → `start_session`, REST `POST …/sessions` →
@@ -5049,6 +5094,28 @@ impl Gateway {
             ccteam_root: self.project_paths.as_ref().map(|paths| paths.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
         })
+    }
+
+    /// Re-stamp a customized plan's principal record — the LAST thing a spawn
+    /// path does before the vendor process starts.
+    ///
+    /// `plan_new_session` mints the principal with identity only, because the
+    /// delegation lineage and the `tools` face are decided by the caller after
+    /// it returns. The child's MCP client fetches `tools/list` ONCE, during
+    /// startup, and that request beats `meta.json` to disk by seconds
+    /// (measured 2026-08-31), so the face has to be true in memory here or it
+    /// is not true at all for the life of that process.
+    fn restamp_plan_principal(&self, plan: &NewSessionPlan) {
+        self.principals.amend(
+            &plan.id,
+            crate::principals::PrincipalFacts {
+                slug: plan.project.clone(),
+                role: plan.role.clone(),
+                depth: plan.delegation_depth,
+                tool_face: plan.tool_face.clone(),
+                parent_sid: plan.parent_sid.clone(),
+            },
+        );
     }
 
     /// v0.8.x (concurrency review §4.1 P1) — the SLOW await for a
@@ -5249,8 +5316,17 @@ impl Gateway {
         }
         // The session is live: the same secret now carries full authority
         // (`Spawning` only ever allowed tool-face discovery).
-        self.principals
-            .promote(&id, &secret, &project, &role, delegation_depth);
+        self.principals.promote(
+            &id,
+            &secret,
+            crate::principals::PrincipalFacts {
+                slug: project.clone(),
+                role: role.clone(),
+                depth: delegation_depth,
+                tool_face: meta.tool_face.clone(),
+                parent_sid: parent_sid.clone(),
+            },
+        );
         self.sessions.insert(
             id.clone(),
             GatewaySession {
@@ -6594,10 +6670,8 @@ impl Gateway {
                                         // the TASK: a TurnFailed/Error text IS the
                                         // turn boundary (flush immediately, folding
                                         // any interim notes); an ordinary assistant
-                                        // message flows as an interim signal (only
-                                        // an `all` watch notifies) and is remembered
-                                        // as the boundary candidate flushed on
-                                        // `TurnCompleted` above.
+                                        // message is only remembered as the boundary
+                                        // candidate flushed on `TurnCompleted` above.
                                         let is_boundary_evt = matches!(
                                             &evt,
                                             ThreadEvent::TurnFailed { .. }
@@ -6631,27 +6705,17 @@ impl Gateway {
                                                 });
                                             }
                                         } else {
+                                            // Interim narration: counted and
+                                            // remembered as the boundary
+                                            // candidate, never signalled. The
+                                            // notification unit is the TASK,
+                                            // so no watch has woken on a
+                                            // mid-turn message since v0.9.5.
                                             turn_notes = turn_notes.saturating_add(1);
                                             turn_last_answer = Some((
                                                 record.turn_id.clone(),
                                                 text.clone(),
                                             ));
-                                            if let Some(dtx) = delegation_tx.as_ref() {
-                                                let _ = dtx.send(crate::delegation::DelegationSignal {
-                                                    child_sid: session_id.clone(),
-                                                    turn_id: record.turn_id.clone(),
-                                                    tail: text.clone(),
-                                                    vendor: pump_vendor,
-                                                    host: pump_host.clone(),
-                                                    boundary: false,
-                                                    vendor_error: false,
-                                                    interim_notes: 0,
-                                                    covered_turns: vec![record.turn_id.clone()],
-                                                    context_pct: None,
-                                                    turn: vendor_turn,
-                                                    error_kind: None,
-                                                });
-                                            }
                                         }
                                     }
                                     Err(err) => {
@@ -11046,15 +11110,28 @@ impl Gateway {
         // is valid from the moment it is minted (the vendor uses it during
         // spawn), and only a live principal may invoke tools.
         let matched = self.principals.verify(sid, presented_secret)?;
-        if !crate::principals::may_invoke_tools(matched.state) {
-            return None;
-        }
-        Some(CallerCtx {
-            sid: matched.sid,
-            slug: matched.slug,
-            role: matched.role,
-            depth: matched.depth,
-        })
+        crate::principals::may_invoke_tools(matched.state).then(|| caller_ctx(matched))
+    }
+
+    /// The same credential check for a caller that is only ASKING WHICH TOOLS
+    /// EXIST — `initialize` / `tools/list`.
+    ///
+    /// A spawning principal must pass here, because building the tool face is
+    /// the entire reason the `Spawning` state exists: the vendor dials `/mcp`
+    /// inside its own startup, before the session lands in the live map, and
+    /// its MCP client fetches the list exactly once. Refusing it left the
+    /// resolver with no caller to narrow by, so it degraded to the FULL face —
+    /// and a `tools:"none"` child spent its whole life holding six tools it
+    /// was never meant to see (measured 2026-08-31). Listing is not authority:
+    /// [`Self::verify_session_principal`] still gates every `tools/call`.
+    pub fn verify_session_principal_for_discovery(
+        &self,
+        sid: &str,
+        presented_secret: &str,
+    ) -> Option<CallerCtx> {
+        self.principals
+            .verify(sid, presented_secret)
+            .map(caller_ctx)
     }
 
     /// A spawn that never became a session takes its credential with it. The
@@ -11791,16 +11868,20 @@ impl Gateway {
     }
 
     /// Everything the MCP tool-face resolver needs about one session, in ONE
-    /// lock hold: where its `meta.json` lives, the delegation depth cap in
-    /// force, and whether a chat can still reach it. Asked here rather than
-    /// through three separate accessors so the three facts can never describe
-    /// two different moments. Read-only, holds no `.await`.
+    /// lock hold: what it was hired with, whether it is a root, the delegation
+    /// depth cap in force, whether a chat can still reach it, and whether
+    /// ccteam can push a completion notification to it. Asked here rather than
+    /// through five separate accessors so the facts can never describe two
+    /// different moments. NO `meta.json` read (see [`SessionFaceContext`]).
+    /// Read-only, holds no `.await`.
     pub fn session_face_context(&self, sid: &str) -> Option<SessionFaceContext> {
-        let resolved = self.session_resolve_any(sid)?;
+        let facts = self.principals.facts(sid)?;
         Some(SessionFaceContext {
-            project_dir: resolved.project_dir,
+            tool_face: facts.tool_face,
+            is_root: facts.parent_sid.is_none(),
             max_depth: self.delegation_config().max_depth,
             has_reply_target: self.reply_target_for(sid).is_some(),
+            pushable: !self.is_external_node(sid),
         })
     }
 
@@ -12092,6 +12173,7 @@ impl Gateway {
         plan.spawned_by_role = spawned_by_role;
         plan.delegation_depth = child_depth;
         plan.title = title.clone();
+        self.restamp_plan_principal(&plan);
         let child_sid = plan.id.clone();
         let thread = match Self::spawn_for_new_session_plan(&plan).await {
             Ok(thread) => thread,
@@ -12261,6 +12343,7 @@ impl Gateway {
             plan.delegation_depth = child_depth;
             plan.title = title.clone();
             plan.tool_face = tool_face;
+            guard.restamp_plan_principal(&plan);
             if let Some(parent_sid) = plan.parent_sid.clone() {
                 guard.delegation_spawn_reservations.insert(
                     plan.id.clone(),
@@ -12648,6 +12731,20 @@ impl Gateway {
     /// Number of currently armed durable completion watches in memory.
     pub fn armed_delegation_watch_count(&self) -> u32 {
         self.delegations.len().try_into().unwrap_or(u32::MAX)
+    }
+
+    /// Who is waiting on `child_sid`'s armed completion watch, if anybody.
+    ///
+    /// A parent that took the child's answer inline (a dispatch `wait`, or an
+    /// `agent_read{sid,wait}` that returned at the boundary) already holds it,
+    /// and the notification that follows is a second copy of what it just
+    /// read. Disarming needs the watch's OWN parent, never the reader's word
+    /// for it: a third party reading someone else's child must not take that
+    /// child's notification away from the session that hired it.
+    pub fn delegation_watch_parent(&self, child_sid: &str) -> Option<String> {
+        self.delegations
+            .get(child_sid)
+            .map(|mirror| mirror.parent_sid.clone())
     }
 
     fn plan_delegation_delivery(
@@ -17679,7 +17776,11 @@ mod tests {
         gw.set_event_sink(tx);
 
         // Minted but never presented — the defect's exact shape.
-        gw.principals.reserve("s41", "sekret", "demo", "", 0);
+        gw.principals.reserve(
+            "s41",
+            "sekret",
+            crate::principals::PrincipalFacts::new("demo", "", 0),
+        );
         gw.assert_principal_reached_the_session("s41");
         let ev = sub
             .try_recv()
@@ -27820,10 +27921,10 @@ mod tests {
         );
     }
 
-    /// Narration stays ledger-only even for `all`; only the idle boundary
-    /// wakes the parent. `off` still records completion.
+    /// Mid-turn narration stays ledger-only whatever the mode; only the idle
+    /// boundary wakes the parent. `off` still records completion.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn delegation_all_and_off_modes() {
+    async fn delegation_narration_and_off_modes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path().to_path_buf();
         let gateway = delegation_gateway(&project_dir).await;
@@ -27859,7 +27960,13 @@ mod tests {
                 .await
                 .unwrap()
                 .sid;
-            gw.arm_delegation_watch(&child, &parent, ccteam_harness::NotifyMode::All, None, None);
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                None,
+                None,
+            );
             (parent, child)
         };
 
@@ -27883,7 +27990,7 @@ mod tests {
         boundary.interim_notes = 1;
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
-        assert_eq!(notes.len(), 1, "all-mode narration remains ledger-only");
+        assert_eq!(notes.len(), 1, "mid-turn narration remains ledger-only");
         assert!(notes[0]
             .user
             .starts_with(&format!("{child_sid} done · turn 2")));

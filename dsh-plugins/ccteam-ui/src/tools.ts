@@ -351,7 +351,7 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
   {
     name: 'agent',
-    description: 'Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a new session and dispatch `task` to it; with `sid` → follow up on that session. `wait` returns the answer inline; 0 (default) is async: one completion notification when the task\'s turn ends, or poll `agent_read{sid}` when the reply says notify_deliverable:false. Tell children to answer tersely, never to dump code or diffs.',
+    description: 'Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a new session and dispatch `task` to it; with `sid` → follow up on that session. `wait` returns the answer inline; 0 (default) is async: one completion notification when the task\'s turn ends, or `agent_read{sid,wait}` when the reply says notify_deliverable:false. Tell children to answer tersely, never to dump code or diffs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -370,8 +370,8 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
         title: { type: 'string', description: 'Ledger label (<=80 chars); never sent to the agent.' },
         notify: {
           type: 'string',
-          enum: ['final', 'brief', 'all', 'off'],
-          description: 'Turn-end wake: final (2000-char excerpt, default), brief (500), all, off.',
+          enum: ['final', 'brief', 'off'],
+          description: 'Turn-end wake: final (2000-char excerpt, default), brief (500), off.',
         },
         tools: {
           type: 'string',
@@ -392,15 +392,16 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
   {
     name: 'agent_read',
-    description: 'Read the team. No `sid` → roster of sessions you can reach, most recently active first; a `released` row is idle-but-real and resumes on your next `agent{sid}` call, so reuse it instead of spawning a twin. With `sid` → that session\'s transcript, newest first unless `since` pages forward; empty means no answer yet.',
+    description: 'Read the team. No `sid` → roster of sessions you can reach, most recently active first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → that session\'s transcript, newest first unless `since` pages forward; empty means no answer yet.',
     inputSchema: {
       type: 'object',
       properties: {
         sid: { type: 'string', description: 'Read this session\'s transcript instead of the roster.' },
         n: { type: 'integer', description: 'Max rows/turns (default 10, max 500).' },
-        tail: { type: 'boolean', description: 'With `sid`: newest first (default true; false + `since` pages forward).' },
+        tail: { type: 'boolean', description: 'With `sid`: newest first (default true unless `since`).' },
         since: { type: 'string', description: 'With `sid`: only turns after this turn_id cursor.' },
-        max_chars: { type: 'integer', description: 'With `sid`: char budget across returned turns (default 4000, 500-50000).' },
+        max_chars: { type: 'integer', description: 'With `sid`: char budget across returned turns (default 4000).' },
+        wait: { type: 'integer', description: 'With `sid`: seconds to wait for an in-flight turn to end, 0-240 (default 0).' },
         project: { type: 'string', description: 'Roster filter: this project slug only.' },
         activity: {
           type: 'string',

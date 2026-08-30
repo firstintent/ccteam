@@ -300,12 +300,14 @@ async fn mcp_tools_call_status_succeeds() {
     // The whole body is JSON now — no trailing prose panel to parse around.
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
     assert!(parsed.get("projects").is_some(), "{text}");
+    let note = parsed["note"].as_str().unwrap_or_default();
     assert!(
-        parsed["note"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("scoped to your"),
+        note.contains("no project named yet"),
         "a projectless caller must be told why the panel is withheld, got: {text}"
+    );
+    assert!(
+        !note.contains("could not be authenticated"),
+        "…and this credential DID authenticate: {text}"
     );
     assert!(
         parsed.get("hire").is_none(),
