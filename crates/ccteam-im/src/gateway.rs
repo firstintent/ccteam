@@ -500,6 +500,13 @@ pub struct Gateway {
     /// sids that were live at last persist. Session CONTENT lives in each
     /// session's `meta.json` (the SoT), never here. `None` ⇒ in-memory only.
     routing_path: Option<PathBuf>,
+    /// The `$CCTEAM_HOME` this daemon was given, for state that is
+    /// DAEMON-scoped rather than project- or session-scoped — today the
+    /// per-vendor account-usage catalog ([`ccteam_harness::usage_catalog`]).
+    /// Injected (never re-derived from the environment) so a test writes into
+    /// its tempdir and can never touch a real home; `None` ⇒ in-memory only,
+    /// which costs a unit-test gateway nothing but a cold cache.
+    state_root: Option<PathBuf>,
     routing_persist_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes only post-spawn capacity checks and live-map installation.
     /// Vendor startup remains concurrent while two completed spawns cannot
@@ -2088,6 +2095,7 @@ impl Gateway {
             adapter_factory,
             default_project,
             routing_path: None,
+            state_root: None,
             routing_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             capacity_admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_sid_path: None,
@@ -2285,6 +2293,7 @@ impl Gateway {
     pub fn enable_persistence(&mut self, ccteam_root: impl Into<PathBuf>) -> Result<()> {
         let root = ccteam_root.into();
         self.routing_path = Some(crate::routing_state_path_in(&root));
+        self.state_root = Some(root.clone());
         self.next_sid_path = Some(crate::next_sid_path_in(&root));
         self.next_scheduled_path = Some(
             root.join("state")
@@ -9915,6 +9924,59 @@ impl Gateway {
             .then_some((slug, meta))
     }
 
+    /// The vendor account's rate-limit windows — the ONE way any surface asks
+    /// for them, and the reason a `/status` card no longer has to care whether
+    /// its session is resident.
+    ///
+    /// Usage is ACCOUNT-scoped but only READABLE through a live session, so it
+    /// used to exist only while some process happened to be resident: the card
+    /// went scavenging through whatever sessions were alive and simply showed
+    /// nothing when none were — which is exactly when the focused session has
+    /// been idle-released (2026-08-30 IM report: the `⚡ 用量` row vanished from
+    /// a released card, and after a daemon restart from every card).
+    ///
+    /// So the fact gets a home. Any live session of `vendor` is asked (they all
+    /// report the same account, so the first answer wins) and what it says is
+    /// recorded; when none answers, the vendor's last observation is read back
+    /// from [`ccteam_harness::usage_catalog`], which drops each window at the
+    /// vendor's own declared reset so nothing stale is ever presented as
+    /// current. Callers get one `Option` and never branch on residency.
+    ///
+    /// `sessions` is the caller's ACL-scoped set (unchanged from the live-only
+    /// read this replaces); the catalog is keyed by vendor alone, which is the
+    /// same host-agnostic scope that read already had.
+    async fn account_usage_for(
+        &self,
+        vendor: AgentVendor,
+        sessions: &[&GatewaySession],
+    ) -> Option<AccountUsage> {
+        for session in sessions.iter().filter(|s| s.adapter.vendor() == vendor) {
+            if let Some(usage) = session.adapter.account_usage(&session.thread).await {
+                self.record_account_usage(vendor, "status card", &usage);
+                return Some(usage);
+            }
+        }
+        let root = self.state_root.as_deref()?;
+        ccteam_harness::usage_catalog::last_known_usage_in(
+            root,
+            vendor_str(vendor),
+            chrono::Utc::now(),
+        )
+    }
+
+    /// Persist one account-usage observation. Best-effort by construction: a
+    /// gateway with no injected state root simply keeps nothing.
+    fn record_account_usage(&self, vendor: AgentVendor, source: &str, usage: &AccountUsage) {
+        if let Some(root) = self.state_root.as_deref() {
+            ccteam_harness::usage_catalog::record_vendor_usage_best_effort(
+                root,
+                vendor_str(vendor),
+                source,
+                usage,
+            );
+        }
+    }
+
     /// The `📍` run state of a RESIDENT session. Same in-flight verdict the
     /// child rows / MCP / web get ([`Gateway::live_turn`]) — this only dresses
     /// it with durations: a turn in flight ⇒ 🔵 working; silent past the idle
@@ -9962,36 +10024,19 @@ impl Gateway {
         // Pull the harness-reported facts FROM the harness — never folded by
         // ccteam: the model/effort/ctx/goal status (live, or its persisted
         // snapshot), the running subagent/workflow list (claude's own
-        // `system:task_*` lifecycle — only a resident session has one) and the
-        // focused session's own account-usage answer.
+        // `system:task_*` lifecycle — only a resident session has one), and the
+        // account windows, which are PER VENDOR (a Codex session must never
+        // display a Claude account's) and come from the one interface that
+        // answers for a resident and a released focus alike.
         let status = self.row_thread_status(focus).await;
-        let (run_state, running, own_account) = match focus {
+        let (run_state, running) = match focus {
             SessionRowSource::Resident(s) => {
                 let running = s.adapter.running_tasks(&s.thread).await;
-                let run_state = self.status_run_state(s, &running);
-                let account = s.adapter.account_usage(&s.thread).await;
-                (run_state, running, account)
+                (self.status_run_state(s, &running), running)
             }
-            SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new(), None),
+            SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new()),
         };
-        // Account usage is account-scoped but PER VENDOR: a Codex session must
-        // never display a Claude account's windows (and vice-versa). Prefer the
-        // focused session's own answer; else borrow from another visible session
-        // OF THE SAME VENDOR whose adapter answers — which is also how a
-        // released focus (no adapter of its own) shows the account it will
-        // resume under. No same-vendor answer ⇒ omit the row.
-        let mut account = own_account;
-        if account.is_none() {
-            for o in visible {
-                if o.adapter.vendor() != vendor {
-                    continue;
-                }
-                if let Some(u) = o.adapter.account_usage(&o.thread).await {
-                    account = Some(u);
-                    break;
-                }
-            }
-        }
+        let account = self.account_usage_for(vendor, visible).await;
 
         // The ledger half — title / turn / cost / tokens and the spawn-time
         // model + effort picks — lives in `meta.json` for both residencies:
@@ -11469,6 +11514,25 @@ impl Gateway {
         let Some((slug, adapter, thread)) = fenced else {
             return Ok(false);
         };
+        // Last chance to read an ACCOUNT-scoped fact from this session: the
+        // windows belong to the vendor account, not to the process, so they are
+        // captured before the process that can report them goes away. Without
+        // this the first `/status` after a quiet period — every session
+        // released, nothing left to ask — would have no account state to show
+        // at all. Off the registry lock, like the close below, and on a short
+        // deadline: this is a nicety, and a child too wedged to answer must
+        // still be released promptly (the timeout simply means no capture).
+        if let Ok(Some(usage)) = tokio::time::timeout(
+            Self::RELEASE_USAGE_CAPTURE_TIMEOUT,
+            adapter.account_usage(&thread),
+        )
+        .await
+        {
+            gateway
+                .lock()
+                .await
+                .record_account_usage(adapter.vendor(), "session release", &usage);
+        }
         // Graceful vendor close is the slow half and never occupies the
         // registry lock. The entry is already fenced out, so new work cannot
         // race onto the retiring handle.
@@ -11483,6 +11547,11 @@ impl Gateway {
         tracing::info!(sid, %slug, reason = reason.as_str(), "ccteam-im: released session");
         Ok(true)
     }
+
+    /// How long a releasing session may take to report its account usage
+    /// before ccteam gives up and lets it go uncaptured. Releasing the process
+    /// is the job; recording the account windows on the way out is the bonus.
+    const RELEASE_USAGE_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     /// Ensure one more session can be admitted. Capacity never rejects a
     /// creation/revival: eligible sessions are gracefully released LRU-first;
@@ -16415,6 +16484,69 @@ mod tests {
                 "🧭 → alpha/s1\n📍 💤 released · turn 0\n   claude · reviewer\n   📁 {}\n   resume —\n   ⚡ 用量: 5h 0% · 周 50% (→09/03) · team\n   👥 直接子会话:\n      · s2 · claude · 🟡 working · delegated investigation\n   ↓ 本项目其他 1 个会话 → /sessions\n   ↓ 所有 1 个项目 → /projects",
                 project_dir.display()
             )]
+        );
+    }
+
+    /// The 2026-08-30 IM report, second half: with the focus released AND
+    /// nothing else resident, the `⚡ 用量` row was still missing — the card
+    /// could only learn the account windows by asking a live session, so with
+    /// no session alive there was nobody to ask. Account state is not a
+    /// property of a process: it is captured when its live source goes away
+    /// (the release path) and read back from the per-vendor catalog, so the
+    /// first `/status` after a quiet period — or after a daemon restart, where
+    /// nothing is resident by design — still reports where the account stands.
+    #[tokio::test]
+    async fn status_shows_account_usage_with_no_live_session_left_to_ask() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        // Windows the vendor says are still open, so the snapshot is current
+        // (an expired one is dropped — see `usage_catalog::last_known_usage_in`).
+        let now = chrono::Utc::now();
+        fake.set_account_usage(Some(AccountUsage {
+            subscription: Some("max".into()),
+            five_hour_pct: Some(6),
+            five_hour_resets_at: Some((now + chrono::Duration::hours(2)).to_rfc3339()),
+            weekly_pct: Some(50),
+            weekly_resets_at: Some((now + chrono::Duration::days(3)).to_rfc3339()),
+            ..Default::default()
+        }))
+        .await;
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let mut guard = gateway.lock().await;
+        // The premise: NOTHING is resident, so there is no session to borrow a
+        // live answer from — exactly the state the report was filed in.
+        assert!(guard.sessions.is_empty(), "no session may remain resident");
+        let status = guard
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        let card = &status[0];
+        assert!(
+            card.contains("📍 💤 released"),
+            "the focus is still the released session: {card}"
+        );
+        assert!(
+            card.contains("\n   ⚡ 用量: 5h 6% (→") && card.contains(" · 周 50% (→"),
+            "the account windows survive the loss of every live session: {card}"
+        );
+        assert!(
+            card.trim_end().ends_with("↓ 所有 1 个项目 → /projects"),
+            "and the card still ends with the fleet footer: {card}"
         );
     }
 

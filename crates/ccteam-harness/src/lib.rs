@@ -43,6 +43,7 @@ pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
 pub mod typed_event_tap;
+pub mod usage_catalog;
 pub mod vendor_compat;
 
 pub use adapter::{
