@@ -23,7 +23,7 @@ const DEFAULT_ROUTING_NOTES: &str = "# ccteam routing notes\n\n\
 Your division of labor, in your own words. Sessions that call `status` receive\n\
 this file verbatim; ccteam never parses, merges, or acts on it.\n\n\
 ## Harnesses ccteam can drive\n\n\
-ccteam registers these agent harnesses (spawn any of them via `session_spawn`\n\
+ccteam registers these agent harnesses (hire any of them via `agent`\n\
 or the web/IM entry points):\n\n\
 - `claude` — Claude Code (Anthropic)\n\
 - `codex` — Codex CLI (OpenAI)\n\

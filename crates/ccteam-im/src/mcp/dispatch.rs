@@ -252,7 +252,22 @@ impl McpDispatch {
                 "result": { "reloaded": ok },
             }))
         } else {
-            protocol::handle_request(&self.paths, &req).await
+            // Discovery answers a face composed for THIS caller (leaf sessions
+            // pay a fraction of an orchestrator's ambient bill); everything
+            // else falls through to the protocol core unchanged.
+            let face = match req.get("method").and_then(|m| m.as_str()) {
+                Some("initialize") | Some("tools/list") => {
+                    super::face::resolve_tool_face(
+                        &req,
+                        self.gateway.as_ref(),
+                        &caller,
+                        &self.paths,
+                    )
+                    .await
+                }
+                _ => super::face::ToolFace::full(),
+            };
+            protocol::handle_request(&self.paths, &req, &face).await
         }
     }
 }
@@ -333,7 +348,7 @@ fn admin_project_catalog_hint(paths: Option<&CcteamPaths>) -> String {
 }
 
 /// MCP-DX-2 — the sole registered project, when the catalog holds exactly
-/// one. Used as the unambiguous default for an admin `session_spawn` that
+/// one. Used as the unambiguous default for an admin `agent` that
 /// names no project (two or more candidates keep the explicit-or-error
 /// contract; zero keeps the "no projects registered" hint).
 fn sole_registered_project(paths: Option<&CcteamPaths>) -> Option<String> {
@@ -398,29 +413,26 @@ fn nearest_slug<'a>(input: &str, candidates: &'a [String]) -> Option<&'a str> {
         .map(|(_, candidate)| candidate.as_str())
 }
 
-/// v0.8.7 W1 — cap on how many child turns `session_collect` returns when the
-/// caller doesn't pass `n`. Keeps a runaway transcript from flooding the
-/// cto's context in one poll.
-const SESSION_COLLECT_DEFAULT_N: usize = 20;
-const SESSION_COLLECT_DEFAULT_MAX_CHARS: usize = 10_000;
-const SESSION_COLLECT_MIN_MAX_CHARS: usize = 500;
-const SESSION_COLLECT_MAX_MAX_CHARS: usize = 50_000;
+/// Default page size for BOTH `agent_read` branches (roster rows and
+/// transcript turns). Ten is what a caller reads; more is a `n` away.
+const AGENT_READ_DEFAULT_N: usize = 10;
+/// Default character budget across the turns one `agent_read{sid}` returns.
+const AGENT_READ_DEFAULT_MAX_CHARS: usize = 4_000;
+const AGENT_READ_MIN_MAX_CHARS: usize = 500;
+const AGENT_READ_MAX_MAX_CHARS: usize = 50_000;
 use crate::delegation::{DelegationOutcome, DelegationSummary};
 
 /// Keep inline waits below the shortest common MCP client deadline (~300s),
-/// leaving 60s for spawn/submit work around the wait itself. The wire still
-/// accepts the documented 0..=600 request range; only execution is capped.
-const EFFECTIVE_INLINE_WAIT_CEILING_SECONDS: u64 = 240;
+/// leaving 60s for spawn/submit work around the wait itself. Requests above it
+/// clamp (and still answer an honest `pending` on timeout).
+const INLINE_WAIT_CEILING_SECONDS: u64 = 240;
 
-fn requested_inline_wait_seconds(args: &serde_json::Value) -> u64 {
-    args.get("wait_seconds")
+/// The `agent{wait}` window, clamped to what the transport can survive.
+fn inline_wait_seconds(args: &serde_json::Value) -> u64 {
+    args.get("wait")
         .and_then(|value| value.as_u64())
         .unwrap_or(0)
-        .min(600)
-}
-
-fn effective_inline_wait_seconds(requested: u64) -> u64 {
-    requested.min(EFFECTIVE_INLINE_WAIT_CEILING_SECONDS)
+        .min(INLINE_WAIT_CEILING_SECONDS)
 }
 
 /// v0.8.5 D6 — how long the `interaction/ask` handler waits for the user to
@@ -509,7 +521,7 @@ async fn execute_chat_send_file(
         .unwrap_or_else(|| serde_json::json!({}));
     // v0.8.7 (FIX-1) — resolve the live session's reply target FIRST, under
     // the gateway lock, then DROP the guard before any fs read / send (lock
-    // discipline §7-1, mirroring run_session_collect). `None` here means no
+    // discipline §7-1, mirroring run_agent_read_transcript). `None` here means no
     // live (project, role) session is tracked → run_chat_send_file falls back
     // to the on-disk registry. We resolve here (async) and inject the result
     // into the sync builder so build_send_file_event stays unit-testable.
@@ -1394,13 +1406,15 @@ fn summarize_tool_input(tool_name: &str, tool_input: &serde_json::Value) -> Stri
 // guard BEFORE the (blocking) `read_all_turns` fs read.
 // =====================================================================
 
-/// True for a `tools/call` whose tool name is in the `session_` group.
+/// True for a `tools/call` naming one of the session tools (`agent`,
+/// `agent_read`, `agent_stop`). Asks the ONE membership predicate rather than
+/// matching a name shape, so a future tool joins the group by being listed.
 fn is_session_tool_call(req: &serde_json::Value) -> bool {
     req.get("method").and_then(|m| m.as_str()) == Some("tools/call")
         && req
             .pointer("/params/name")
             .and_then(|n| n.as_str())
-            .is_some_and(|n| n.starts_with("session_"))
+            .is_some_and(protocol::is_session_tool)
 }
 
 /// True for a `tools/call` whose tool name is `status` or its bare-name
@@ -1415,14 +1429,14 @@ fn is_status_call(req: &serde_json::Value) -> bool {
     )
 }
 
-/// v0.10 T1 — daemon-aware `status`: return the base status JSON with the
-/// vendor panel + routing notes appended for the caller's project's bound
-/// host. Ambient (session principal, which is every `POST /mcp` caller) is
-/// scoped to its OWN project — any self-reported `project`/`_caller_slug` is
-/// ignored (the panel would otherwise leak another project's host). Admin (the
-/// local mcp.sock admin-token tier) may name a `project`, else falls back to a
-/// supplied `_caller_slug` (like `session_spawn`; nothing ccteam ships injects
-/// one now that the stdio forwarder is gone). The vendor panel probes + reads
+/// Daemon-aware `status`: which agents the caller's project can hire and what
+/// the team spent, tiered by `detail`.
+///
+/// Ambient (session principal, which is every `POST /mcp` caller) is scoped to
+/// its OWN project — any self-reported `project`/`_caller_slug` is ignored (the
+/// body would otherwise leak another project's host). Admin (the local
+/// mcp.sock admin-token tier) may name a `project`, else falls back to a
+/// supplied `_caller_slug`, else answers fleet-wide. Gathering probes + reads
 /// fs, so it runs off the async runtime.
 async fn execute_status(
     req: &serde_json::Value,
@@ -1436,14 +1450,24 @@ async fn execute_status(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    if let Some(user_id) = caller.user_id() {
-        return execute_user_status(id, &args, paths, user_id).await;
-    }
+    // The bare-name beacon is the brief body byte-for-byte: it exists for
+    // hosts that surface tool NAMES only, and a second shape would be a second
+    // thing to keep true.
+    let is_beacon = req.pointer("/params/name").and_then(|n| n.as_str())
+        == Some(protocol::STATUS_BEACON_TOOL_NAME);
+    let detail = if is_beacon {
+        super::vendor_panel::StatusDetail::Brief
+    } else {
+        match super::vendor_panel::StatusDetail::parse(args.get("detail").and_then(|v| v.as_str()))
+        {
+            Ok(detail) => detail,
+            Err(message) => return session_tool_response(id, message, true),
+        }
+    };
 
-    // Base body (slim projects + daemon health), reused verbatim
-    // from the protocol core so the daemon-aware path never drifts from the
-    // local fallback.
-    let base = super::protocol::tool_ls(paths).unwrap_or_else(|_| "{}".to_string());
+    if let Some(user_id) = caller.user_id() {
+        return execute_user_status(id, &args, paths, user_id, detail).await;
+    }
 
     // Resolve the caller's project scope (server-side; never trust a
     // self-reported project on the Ambient path).
@@ -1470,30 +1494,31 @@ async fn execute_status(
         ctx.as_ref(),
     ) {
         Ok(p) => p,
-        Err(msg) => {
-            // Ambient caller not authenticated: base status + honest note, NO
-            // panel (we won't render another project's host).
-            return session_tool_response(id, format!("{base}\n\n{msg}"), false);
+        Err(note) => {
+            // Ambient caller not authenticated: the fleet ledger it could
+            // already read, plus an honest note — never another project's host.
+            let body = serde_json::json!({
+                "projects": protocol::status_project_rows(paths, |_| true),
+                "note": note,
+            });
+            return status_response(id, body);
         }
     };
 
-    let hub_models = crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await;
-    let paths_owned = paths.clone();
-    let slug_owned = project.clone();
-    let section = tokio::task::spawn_blocking(move || {
-        super::vendor_panel::render_section(&paths_owned, slug_owned.as_deref(), &hub_models)
+    let body = build_status_body(paths, project.clone(), detail, || {
+        protocol::status_project_rows(paths, |_| true)
     })
-    .await
-    .unwrap_or_else(|_| "vendors: panel unavailable (probe worker failed)".to_string());
-
-    session_tool_response(id, format!("{base}\n\n{section}"), false)
+    .await;
+    status_response(id, body)
 }
 
+/// Tenant `status`: the same tiers, scoped by the shared owner policy.
 async fn execute_user_status(
     id: serde_json::Value,
     args: &serde_json::Value,
     paths: &CcteamPaths,
     user_id: &str,
+    detail: super::vendor_panel::StatusDetail,
 ) -> serde_json::Value {
     let explicit = args
         .get("project")
@@ -1506,41 +1531,86 @@ async fn execute_user_status(
             return session_tool_response(id, "status: project not found".to_string(), true);
         }
     }
-
-    let base =
-        super::protocol::tool_ls_for_user(paths, user_id).unwrap_or_else(|_| "{}".to_string());
-    let projects = explicit
-        .map(|project| vec![project])
-        .unwrap_or_else(|| visible_user_projects(paths, user_id));
-    if projects.is_empty() {
-        return session_tool_response(
-            id,
-            format!(
-                "{base}\n\nvendors: no projects are visible to this user; project-scoped host, budget, and routing details are withheld"
+    let rows = || {
+        protocol::status_project_rows(paths, |state| {
+            ccteam_core::identity::can_see_owner(user_id, false, state.owner.as_deref())
+        })
+    };
+    let mut body = build_status_body(paths, explicit, detail, rows).await;
+    if body
+        .get("projects")
+        .and_then(|projects| projects.as_array())
+        .is_some_and(|projects| projects.is_empty())
+    {
+        body.insert(
+            "note".into(),
+            serde_json::json!(
+                "no projects are visible to this user; project-scoped host, budget and routing details are withheld"
             ),
-            false,
         );
     }
+    status_response(id, body)
+}
 
-    let hub_models = crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await;
+/// Build the tiered `status` body for an optional project scope. With a
+/// project it is the project shape; without one it is the fleet shape (the
+/// projects the caller can see + the local host's hire list).
+async fn build_status_body(
+    paths: &CcteamPaths,
+    project: Option<String>,
+    detail: super::vendor_panel::StatusDetail,
+    project_rows: impl Fn() -> Vec<serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    // The hub catalog is only ever read into a `models`/`full` body; a brief
+    // call must not pay for a network/disk round trip it will not print.
+    let hub = if matches!(
+        detail,
+        super::vendor_panel::StatusDetail::Models | super::vendor_panel::StatusDetail::Full
+    ) {
+        crate::hub::load_models_catalog(&crate::hub::hub_base(), paths, false).await
+    } else {
+        crate::hub::HubModelsState::Unavailable
+    };
     let paths_owned = paths.clone();
-    let sections = tokio::task::spawn_blocking(move || {
-        projects
-            .iter()
-            .map(|project| {
-                super::vendor_panel::render_section(
-                    &paths_owned,
-                    Some(project.as_str()),
-                    &hub_models,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
+    let slug_owned = project.clone();
+    let panel = tokio::task::spawn_blocking(move || {
+        super::vendor_panel::gather_status_panel(&paths_owned, slug_owned.as_deref())
     })
-    .await
-    .unwrap_or_else(|_| "vendors: panel unavailable (probe worker failed)".to_string());
+    .await;
+    let Ok(panel) = panel else {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "error".into(),
+            serde_json::json!("status: probe worker failed"),
+        );
+        return body;
+    };
+    let mut body = super::vendor_panel::status_value(&panel, &hub, detail);
+    if project.is_none() {
+        // Fleet scope: there is no single project, so the per-project facts
+        // are replaced by the ledger of the ones the caller can see.
+        body.remove("project");
+        body.remove("cost_24h_usd");
+        body.insert("projects".into(), serde_json::json!(project_rows()));
+    }
+    if detail == super::vendor_panel::StatusDetail::Full {
+        // Operator data lives ONLY here: an agent that just wants to hire
+        // should never carry daemon health in its context.
+        body.insert(
+            "daemon".into(),
+            protocol::daemon_health_json(&ccteam_core::check_daemon_health(paths)),
+        );
+        body.entry("projects")
+            .or_insert_with(|| serde_json::json!(project_rows()));
+    }
+    body
+}
 
-    session_tool_response(id, format!("{base}\n\n{sections}"), false)
+/// Serialize a `status` body compactly (no pretty-printer: indentation is
+/// 30-45% of the bytes a caller pays for).
+fn status_response(id: serde_json::Value, body: impl serde::Serialize) -> serde_json::Value {
+    let text = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+    session_tool_response(id, text, false)
 }
 
 /// Build a tools/call-shaped JSON-RPC response carrying one text block.
@@ -1652,11 +1722,9 @@ async fn execute_session_tool_with_paths(
     // a READABLE error instead of hanging the caller's whole turn on a
     // never-resolving tool call. spawn/dispatch budget for process startup +
     // any explicit inline wait; the read-only tools are short.
-    let requested_wait_secs = requested_inline_wait_seconds(&args);
-    let effective_wait_secs = effective_inline_wait_seconds(requested_wait_secs);
     let budget = std::time::Duration::from_secs(match name.as_str() {
-        "session_spawn" | "session_dispatch" => 60 + effective_wait_secs,
-        "session_stop" => 30,
+        "agent" => 60 + inline_wait_seconds(&args),
+        "agent_stop" => 30,
         _ => 15,
     });
     match tokio::time::timeout(
@@ -1672,7 +1740,7 @@ async fn execute_session_tool_with_paths(
             format!(
                 "{name}: timed out after {}s — the daemon is busy (lock contention or a slow \
                  spawn/submit); the operation may still complete in the background. Retry, and \
-                 check session_list / session_collect before assuming it failed.",
+                 check agent_read before assuming it failed.",
                 budget.as_secs()
             ),
             true,
@@ -1700,8 +1768,19 @@ async fn authorize_user_session_tool(
     paths: &CcteamPaths,
     user_id: &str,
 ) -> std::result::Result<(), String> {
-    match name {
-        "session_spawn" => {
+    // `agent` and `agent_read` each cover two shapes; which gate applies is
+    // decided by the same `sid` the tool itself branches on.
+    let addresses_a_session = args
+        .get("sid")
+        .and_then(|sid| sid.as_str())
+        .is_some_and(|sid| !sid.trim().is_empty());
+    let effective = match (name, addresses_a_session) {
+        ("agent", false) => "hire",
+        ("agent_read", false) => "roster",
+        _ => "drive",
+    };
+    match effective {
+        "hire" => {
             // The hint enumerates the caller's OWN projects only (a pure
             // function of identity, not of the probed input): actionable
             // recovery without existence disclosure.
@@ -1728,17 +1807,17 @@ async fn authorize_user_session_tool(
                     }
                     _ => {
                         return Err(format!(
-                            "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly{}",
+                            "{name}: missing `project` — tenant MCP callers must name one of their own projects explicitly{}",
                             hint()
                         ));
                     }
                 },
             };
             if !user_can_see_project(paths, user_id, &project) {
-                return Err(format!("session_spawn: project not found{}", hint()));
+                return Err(format!("{name}: project not found{}", hint()));
             }
         }
-        "session_dispatch" | "session_collect" | "session_stop" => {
+        "drive" => {
             let sid = args
                 .get("sid")
                 .and_then(|sid| sid.as_str())
@@ -1752,7 +1831,7 @@ async fn authorize_user_session_tool(
                     // An enrolled hand-started client is a ledger row without a
                     // live-map row, so the live map alone cannot answer "whose
                     // project is this sid in". This gate decides VISIBILITY only
-                    // — a tenant who can see the node in `session_list` must
+                    // — a tenant who can see the node in `agent_read` must
                     // reach the honest not-driveable refusal instead of
                     // "session not found", while a node in someone else's
                     // project stays indistinguishable from an unknown sid.
@@ -1765,7 +1844,7 @@ async fn authorize_user_session_tool(
                 return Err(format!("{name}: session not found"));
             }
         }
-        "session_list" => {
+        "roster" => {
             let visible = visible_user_projects(paths, user_id);
             if let Some(project) = args
                 .get("project")
@@ -1775,7 +1854,7 @@ async fn authorize_user_session_tool(
             {
                 if !visible.iter().any(|candidate| candidate == project) {
                     return Err(format!(
-                        "session_list: project not found{}",
+                        "{name}: project not found{}",
                         user_project_list_hint(&visible)
                     ));
                 }
@@ -1792,8 +1871,8 @@ async fn authorize_user_session_tool(
     Ok(())
 }
 
-/// Dispatch a privileged `session_*` call to the gateway. Returns `Ok(body)`
-/// (a pretty JSON string) on success, `Err(msg)` on a tool-level error.
+/// Dispatch one session tool to the gateway. Returns `Ok(body)` (a compact
+/// JSON string) on success, `Err(msg)` on a tool-level error.
 async fn run_session_tool(
     name: &str,
     args: &serde_json::Value,
@@ -1802,16 +1881,105 @@ async fn run_session_tool(
     paths: &CcteamPaths,
 ) -> std::result::Result<String, String> {
     match name {
-        "session_spawn" => run_session_spawn_at(args, gateway, caller, Some(paths)).await,
-        "session_dispatch" => run_session_dispatch(args, gateway, caller).await,
-        "session_collect" => run_session_collect(args, gateway, caller).await,
-        "session_list" => run_session_list_at(args, gateway, Some(paths)).await,
-        "session_stop" => run_session_stop(args, gateway, caller).await,
+        "agent" => run_agent(args, gateway, caller, paths).await,
+        "agent_read" => run_agent_read(args, gateway, caller, paths).await,
+        "agent_stop" => run_agent_stop(args, gateway, caller).await,
         other => Err(format!("unknown session tool: {other}")),
     }
 }
 
-/// `session_spawn` — create a session in the caller's own project and return
+/// Parameters that only make sense when HIRING. Naming one alongside `sid` is
+/// a caller that thinks it is configuring a session it is only messaging —
+/// refused rather than silently ignored, because "my model setting did
+/// nothing" is a far worse bug report than "that parameter is not for this".
+const AGENT_SPAWN_ONLY_PARAMS: &[&str] = &[
+    "vendor",
+    "model",
+    "effort",
+    "role",
+    "mode",
+    "permission_mode",
+    "tools",
+    "parent_sid",
+];
+
+/// `agent` — hire a new session (`task` alone) or task one you already have
+/// (`task` + `sid`). One tool, because the two are the same act with one
+/// parameter of difference; they share task, wait, notify, title and
+/// idempotency wholesale.
+async fn run_agent(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    caller: McpCaller,
+    paths: &CcteamPaths,
+) -> std::result::Result<String, String> {
+    if args.get("host").is_some() {
+        return Err(format!(
+            "agent: {}",
+            crate::remote_host::HOST_SPAWN_PARAM_REMOVED
+        ));
+    }
+    if args.get("protocol").is_some() {
+        return Err(PROTOCOL_SPAWN_PARAM_REMOVED.to_string());
+    }
+    if args.get("wait_seconds").is_some() {
+        return Err("agent: `wait_seconds` was renamed to `wait`".to_string());
+    }
+    if args
+        .get("task")
+        .and_then(|task| task.as_str())
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err("agent: missing `task` — say what the agent should do".to_string());
+    }
+    let addresses_a_session = args
+        .get("sid")
+        .and_then(|sid| sid.as_str())
+        .is_some_and(|sid| !sid.trim().is_empty());
+    if addresses_a_session {
+        let named: Vec<&str> = AGENT_SPAWN_ONLY_PARAMS
+            .iter()
+            .copied()
+            .filter(|param| args.get(param).is_some_and(|value| !value.is_null()))
+            .collect();
+        if !named.is_empty() {
+            return Err(format!(
+                "agent: `sid` names an existing session — drop {} or omit `sid` to hire",
+                named.join("/")
+            ));
+        }
+        run_agent_dispatch(args, gateway, caller).await
+    } else {
+        run_agent_spawn_at(args, gateway, caller, Some(paths)).await
+    }
+}
+
+/// `agent_read` — the roster (no `sid`) or one session's transcript (`sid`).
+/// Each branch ignores the other's filters rather than erroring: a caller that
+/// leaves a stale `activity` in place while reading one transcript has made no
+/// mistake worth a refusal.
+async fn run_agent_read(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    caller: McpCaller,
+    paths: &CcteamPaths,
+) -> std::result::Result<String, String> {
+    if args.get("limit").is_some() {
+        return Err("agent_read: `limit` was renamed to `n`".to_string());
+    }
+    let addresses_a_session = args
+        .get("sid")
+        .and_then(|sid| sid.as_str())
+        .is_some_and(|sid| !sid.trim().is_empty());
+    if addresses_a_session {
+        run_agent_read_transcript(args, gateway, caller).await
+    } else {
+        run_agent_read_roster_at(args, gateway, Some(paths)).await
+    }
+}
+
+/// `agent` — create a session in the caller's own project and return
 /// its `s{n}` id + vendor resume key + host. v0.9.0 W1 (F1/G1): the caller is
 /// authenticated by its `(sid, secret)` PRINCIPAL (see [`execute_session_tool`]),
 /// so `_caller_slug` here is the SERVER's view of the caller's project — an
@@ -1889,7 +2057,7 @@ async fn resolve_call_origin(
             };
             let Some(gateway) = gateway else {
                 return Err(format!(
-                    "session_spawn: parent_sid `{declared}` cannot be validated (no live gateway)"
+                    "agent: parent_sid `{declared}` cannot be validated (no live gateway)"
                 ));
             };
             let view = {
@@ -1897,14 +2065,14 @@ async fn resolve_call_origin(
                     Some(deadline) => deadline
                         .lock(gateway)
                         .await
-                        .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
+                        .map_err(|error| mcp_gateway_error("agent", &error))?,
                     None => crate::latency::gateway_lock(gateway, "mcp.spawn.resolve").await,
                 };
                 gw.session_views().into_iter().find(|v| v.sid == declared)
             };
             let Some(view) = view else {
                 return Err(format!(
-                    "session_spawn: parent_sid `{declared}` is not a live session — run session_list to find your own sid, or omit parent_sid for a root spawn"
+                    "agent: parent_sid `{declared}` is not a live session — run agent_read to find your own sid, or omit parent_sid for a root spawn"
                 ));
             };
             Ok(Some(crate::gateway::DelegationParent {
@@ -1917,19 +2085,13 @@ async fn resolve_call_origin(
     }
 }
 
-async fn run_session_spawn_at(
+async fn run_agent_spawn_at(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
     paths: Option<&CcteamPaths>,
 ) -> std::result::Result<String, String> {
     let deadline = crate::gateway::GatewayDeadline::start();
-    if args.get("host").is_some() {
-        return Err(crate::remote_host::HOST_SPAWN_PARAM_REMOVED.to_string());
-    }
-    if args.get("protocol").is_some() {
-        return Err(PROTOCOL_SPAWN_PARAM_REMOVED.to_string());
-    }
     // Roleless is a first-class form; absent or "" both mean roleless.
     let role = args
         .get("role")
@@ -1942,7 +2104,23 @@ async fn run_session_spawn_at(
     let permission_mode = ccteam_harness::PermissionMode::parse_opt(
         args.get("permission_mode").and_then(|v| v.as_str()),
     )
-    .map_err(|e| format!("session_spawn: {e}"))?;
+    .map_err(|e| format!("agent: {e}"))?;
+    // The child's own MCP tool face, persisted in its meta so every later
+    // resume serves the same one. `full` is the default and is NOT stored.
+    let tool_face = match args
+        .get("tools")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None | Some("full") => None,
+        Some(value @ ("read" | "none")) => Some(value.to_string()),
+        Some(other) => {
+            return Err(format!(
+                "agent: invalid `tools` `{other}` (expected `full` | `read` | `none`)"
+            ))
+        }
+    };
     let protocol = derive_session_protocol(vendor);
     // Optional model/effort (composer facets), forwarded to EVERY vendor
     // verbatim — the vendor owns the verdict on its own value set. Grok's
@@ -1985,9 +2163,7 @@ async fn run_session_spawn_at(
     if let Some(t) = &title {
         let n = t.chars().count();
         if n > 80 {
-            return Err(format!(
-                "session_spawn: `title` too long ({n} chars; max 80)"
-            ));
+            return Err(format!("agent: `title` too long ({n} chars; max 80)"));
         }
     }
     // Resolve only after validating the request facets: falling through to
@@ -1996,7 +2172,7 @@ async fn run_session_spawn_at(
     // v0.9.1 delegation-ergonomics — optional FIRST task: spawn+dispatch in one
     // call (the dominant flow; saves the second round-trip and closes the
     // crash window between a spawn and its first dispatch). Identical
-    // semantics to session_dispatch{sid, task}: async by default with a
+    // semantics to agent{sid, task}: async by default with a
     // completion notification; `wait_seconds` blocks inline; `notify:false`
     // opts out. Cycle checks are moot for a fresh child; the spawn guardrails
     // (depth/children/delegated/budget) below already gate the delegation.
@@ -2007,17 +2183,16 @@ async fn run_session_spawn_at(
         .filter(|s| !s.is_empty())
         .map(String::from);
     // v0.9.5 feedback fix — a title-less child renders as `title: null`
-    // everywhere (session_list, team view, notifications). When the spawn
+    // everywhere (agent_read, team view, notifications). When the spawn
     // carries a first task, derive a short label from its first line. Ledger/
     // display only (task → label, never label → prompt; the injection red line
     // is untouched).
     let title = title.or_else(|| task.as_deref().map(derive_title_from_task));
-    let requested_wait_seconds = requested_inline_wait_seconds(args);
-    let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
-    let notify = parse_notify_mode("session_spawn", args)?;
+    let wait_seconds = inline_wait_seconds(args);
+    let notify = parse_notify_mode("agent", args)?;
     // Operator/unowned projects retain the caller-derived pool. Tenant-owned
     // projects ignore this fallback in the gateway and make every
-    // session_spawn inherit the tenant principal.
+    // agent inherit the tenant principal.
     let fallback_owner_id = match &caller {
         McpCaller::User { user_id } => user_id.clone(),
         McpCaller::Ambient | McpCaller::Admin => "web-api".to_string(),
@@ -2059,7 +2234,7 @@ async fn run_session_spawn_at(
             let gw = deadline
                 .lock(gateway)
                 .await
-                .map_err(|error| mcp_gateway_error("session_spawn", &error))?;
+                .map_err(|error| mcp_gateway_error("agent", &error))?;
             let host = gw.project_bound_host(&project);
             let (local, satellite) = if host == ccteam_core::LOCAL_HOST {
                 (gw.local_vendor_availability_override(), None)
@@ -2124,7 +2299,7 @@ async fn run_session_spawn_at(
         Some(
             crate::gateway::Gateway::claim_spawn_idempotency(gateway, &project, key, deadline)
                 .await
-                .map_err(|error| mcp_gateway_error("session_spawn", &error))?,
+                .map_err(|error| mcp_gateway_error("agent", &error))?,
         )
     } else {
         None
@@ -2133,7 +2308,7 @@ async fn run_session_spawn_at(
         let mut gw = deadline
             .lock(gateway)
             .await
-            .map_err(|error| mcp_gateway_error("session_spawn", &error))?;
+            .map_err(|error| mcp_gateway_error("agent", &error))?;
         gw.spawn_idem_replay(&project, key)
     } else {
         None
@@ -2153,6 +2328,7 @@ async fn run_session_spawn_at(
         tuning,
         parent,
         title.clone(),
+        tool_face,
         deadline,
     )
     .await
@@ -2161,15 +2337,18 @@ async fn run_session_spawn_at(
             .downcast_ref::<crate::gateway::GatewayRequestError>()
             .is_some()
         {
-            mcp_gateway_error("session_spawn", &error)
+            mcp_gateway_error("agent", &error)
         } else {
             spawn_create_error(error, &project, &caller, paths)
         }
     })?;
     let sid = created.sid;
-    let mut body = serde_json::json!({"sid": sid});
+    // The sid is the one fact a hire ALWAYS answers with: without it the
+    // caller cannot follow up, and `dispatch_task` re-inserts the same value
+    // on the dispatch branch so both shapes agree.
+    let mut body = serde_json::json!({ "sid": sid });
     // v0.9.1 — dispatch the optional first task through the SAME submit path
-    // session_dispatch uses; its outcome (turn_id / status / inline result /
+    // agent uses; its outcome (turn_id / status / inline result /
     // hint) merges into the spawn body so one call returns everything. The
     // caller's parent link doubles as the dispatcher identity (empty = admin,
     // ledger-only submit without a watch).
@@ -2177,23 +2356,21 @@ async fn run_session_spawn_at(
         let dispatcher_sid = parent_sid_for_task.as_deref().unwrap_or("");
         let frag = dispatch_task(
             gateway,
-            "session_spawn",
+            "agent",
             dispatcher_sid,
             &sid,
             task,
-            requested_wait_seconds,
-            effective_wait_seconds,
+            wait_seconds,
             notify,
             title.clone(),
             deadline,
         )
         .await?;
         if let Some(obj) = body.as_object_mut() {
-            obj.remove("hint");
             obj.extend(frag);
         }
     }
-    let out = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string());
+    let out = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
     // v0.9.0 W2 (F7) — record for idempotent replay (the exact body a retry
     // returns, with a replay flag added). Keyed per-project by the client key.
     if let Some(key) = idem_key.as_deref() {
@@ -2203,14 +2380,14 @@ async fn run_session_spawn_at(
 }
 
 /// Test-only 3-arg shim (the historical signature) — production goes through
-/// [`run_session_spawn_at`] with real paths for catalog-aware errors.
+/// [`run_agent_spawn_at`] with real paths for catalog-aware errors.
 #[cfg(test)]
-async fn run_session_spawn(
+async fn run_agent_spawn(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
-    run_session_spawn_at(args, gateway, caller, None).await
+    run_agent_spawn_at(args, gateway, caller, None).await
 }
 
 struct SpawnProjectResolution {
@@ -2248,11 +2425,11 @@ fn resolve_spawn_project(
     match caller {
         McpCaller::Ambient => Ok(SpawnProjectResolution {
             slug: arg("_caller_slug")
-                .ok_or_else(|| "session_spawn: no project (caller slug unset)".to_string())?,
+                .ok_or_else(|| "agent: no project (caller slug unset)".to_string())?,
         }),
         McpCaller::User { .. } => Ok(SpawnProjectResolution {
             slug: arg("project").ok_or_else(|| {
-                "session_spawn: missing `project` — tenant MCP callers must name one of their own projects explicitly"
+                "agent: missing `project` — tenant MCP callers must name one of their own projects explicitly"
                     .to_string()
             })?,
         }),
@@ -2273,7 +2450,7 @@ fn resolve_spawn_project(
                 });
             }
             Err(format!(
-                "session_spawn: missing `project` — name the workspace to spawn into{}",
+                "agent: missing `project` — name the workspace to hire into{}",
                 admin_project_catalog_hint(paths)
             ))
         }
@@ -2291,7 +2468,7 @@ fn spawn_create_error(
     caller: &McpCaller,
     paths: Option<&CcteamPaths>,
 ) -> String {
-    let base = format!("session_spawn: {err}");
+    let base = format!("agent: {err}");
     if !err.to_string().starts_with("unknown project") || !matches!(caller, McpCaller::Admin) {
         return base;
     }
@@ -2316,14 +2493,25 @@ fn mcp_gateway_error(tool: &str, err: &anyhow::Error) -> String {
     }
 }
 
-/// Idempotent retries replay the original response byte-for-byte. Push
-/// surfaces deliberately carry no replay decoration.
+/// Idempotent retries replay the original response body plus one
+/// positive-space fact: `idempotent_replay:true`. Only the rare replay path
+/// pays the ~25 B, and the caller that just retried after a timeout is
+/// exactly the caller that needs to know nothing double-fired (an absent
+/// field is not a signal an agent can be trusted to read).
 fn mark_idempotent_replay(body: &str) -> String {
-    body.to_string()
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("idempotent_replay".into(), serde_json::json!(true));
+            }
+            serde_json::to_string(&v).unwrap_or_else(|_| body.to_string())
+        }
+        Err(_) => body.to_string(),
+    }
 }
 
-/// Stable error for the removed MCP `session_spawn.protocol` input.
-pub const PROTOCOL_SPAWN_PARAM_REMOVED: &str = "session_spawn: `protocol` was removed; the channel is derived from `vendor` (claude/codex/pi = stream-json, grok/opencode/kimi/dsh = acp) — omit `protocol`";
+/// Stable error for the removed MCP `agent.protocol` input.
+pub const PROTOCOL_SPAWN_PARAM_REMOVED: &str = "agent: `protocol` was removed; the channel is derived from `vendor` (claude/codex/pi = stream-json, grok/opencode/kimi/dsh = acp) — omit `protocol`";
 
 /// Derive the sole wire channel for an MCP-spawned vendor session:
 /// claude/codex/pi = stream-json; grok/opencode/kimi/dsh = acp. The `protocol`
@@ -2354,7 +2542,7 @@ fn session_vendor_wire(v: ccteam_harness::AgentVendor) -> &'static str {
     }
 }
 
-/// `session_dispatch` — forward a task as a user turn to a session by sid.
+/// `agent` — forward a task as a user turn to a session by sid.
 /// v0.9.0 W2 (F2/F5/F7): an Ambient (agent) dispatch (a) rejects a cycle
 /// (target == caller or an ancestor), (b) arms a durable completion watch on
 /// the child (parent = the dispatcher) so its next turn notifies the parent,
@@ -2362,7 +2550,7 @@ fn session_vendor_wire(v: ccteam_harness::AgentVendor) -> &'static str {
 /// `wait_seconds` for the child's answer inline. `idempotency_key` makes a
 /// client retry replay the original turn (never double-dispatch). `title` is
 /// ledger/notification only — NEVER concatenated into the task.
-async fn run_session_dispatch(
+async fn run_agent_dispatch(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
@@ -2372,27 +2560,18 @@ async fn run_session_dispatch(
     // Driveability before anything else: ccteam has no thread to submit into for
     // an enrolled hand-started client, and every path below would call it
     // unknown instead of saying so.
-    assert_target_is_driveable("session_dispatch", gateway, &sid, Some(deadline)).await?;
+    assert_target_is_driveable("agent", gateway, &sid, Some(deadline)).await?;
     let task = args
         .get("task")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "session_dispatch: missing `task`".to_string())?
+        .ok_or_else(|| "agent: missing `task`".to_string())?
         .to_string();
     // R-M3 — only operate sessions in the caller's own project.
-    assert_caller_owns_session(
-        "session_dispatch",
-        args,
-        gateway,
-        &sid,
-        &caller,
-        Some(deadline),
-    )
-    .await?;
+    assert_caller_owns_session("agent", args, gateway, &sid, &caller, Some(deadline)).await?;
 
-    let requested_wait_seconds = requested_inline_wait_seconds(args);
-    let effective_wait_seconds = effective_inline_wait_seconds(requested_wait_seconds);
-    let notify = parse_notify_mode("session_dispatch", args)?;
+    let wait_seconds = inline_wait_seconds(args);
+    let notify = parse_notify_mode("agent", args)?;
     let title = args
         .get("title")
         .and_then(|v| v.as_str())
@@ -2402,9 +2581,7 @@ async fn run_session_dispatch(
     if let Some(t) = &title {
         let n = t.chars().count();
         if n > 80 {
-            return Err(format!(
-                "session_dispatch: `title` too long ({n} chars; max 80)"
-            ));
+            return Err(format!("agent: `title` too long ({n} chars; max 80)"));
         }
     }
     let idem_key = args
@@ -2435,7 +2612,7 @@ async fn run_session_dispatch(
         let mut gw = deadline
             .lock(gateway)
             .await
-            .map_err(|error| mcp_gateway_error("session_dispatch", &error))?;
+            .map_err(|error| mcp_gateway_error("agent", &error))?;
         if let Some(key) = idem_key.as_deref() {
             if let Some(body) = gw.dispatch_idem_replay(&sid, key) {
                 return Ok(mark_idempotent_replay(&body));
@@ -2460,14 +2637,14 @@ async fn run_session_dispatch(
             if sid == caller_sid {
                 emit_cycle(&gw);
                 return Err(
-                    "session_dispatch: delegation denied: cannot dispatch a session to itself (cycle)"
+                    "agent: delegation denied: cannot dispatch a session to itself (cycle)"
                         .to_string(),
                 );
             }
             if gw.ancestor_chain(&caller_sid).contains(&sid) {
                 emit_cycle(&gw);
                 return Err(format!(
-                    "session_dispatch: delegation denied: target {sid} is an ancestor of the caller {caller_sid} (cycle)"
+                    "agent: delegation denied: target {sid} is an ancestor of the caller {caller_sid} (cycle)"
                 ));
             }
             // Budget gate: the CHILD's vendor accrues the cost of the task.
@@ -2485,7 +2662,7 @@ async fn run_session_dispatch(
                         Some("budget"),
                     );
                     return Err(format!(
-                        "session_dispatch: delegation denied: vendor `{}` has reached its 24h budget for project `{slug}` (adjust budgets or wait for the window to slide)",
+                        "agent: delegation denied: vendor `{}` has reached its 24h budget for project `{slug}` (adjust budgets or wait for the window to slide)",
                         crate::delegation::vendor_key(vendor)
                     ));
                 }
@@ -2496,12 +2673,11 @@ async fn run_session_dispatch(
     // ---- Scope 2 + wait: the shared submit half (also used by spawn{task}) ----
     let frag = dispatch_task(
         gateway,
-        "session_dispatch",
+        "agent",
         &caller_sid,
         &sid,
         task,
-        requested_wait_seconds,
-        effective_wait_seconds,
+        wait_seconds,
         notify,
         title,
         deadline,
@@ -2511,7 +2687,7 @@ async fn run_session_dispatch(
     if let Some(obj) = body.as_object_mut() {
         obj.extend(frag);
     }
-    let out = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string());
+    let out = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
     // v0.9.0 W2 (F7) — record for idempotent replay.
     if let Some(key) = idem_key.as_deref() {
         gateway.lock().await.dispatch_idem_record(&sid, key, &out);
@@ -2520,7 +2696,7 @@ async fn run_session_dispatch(
 }
 
 /// v0.9.1 delegation-ergonomics — the shared submit half of a dispatch, used
-/// Parse the optional `notify` arg shared by `session_spawn`/`session_dispatch`:
+/// Parse the optional `notify` arg shared by `agent`/`agent`:
 /// `"final"` (default — notify once, when the dispatched task's vendor turn
 /// completes and the child goes idle) / `"all"` (every mirrored assistant
 /// message of that task; debug firehose) / `"off"` (ledger-only). The
@@ -2633,7 +2809,7 @@ fn derive_title_from_task(task: &str) -> String {
     }
 }
 
-/// by BOTH `session_dispatch` and `session_spawn{task}` (one-call
+/// by BOTH `agent` and `agent{task}` (one-call
 /// spawn+dispatch, the dominant delegation flow). Subscribe (if waiting) →
 /// submit the task as a verbatim user turn → arm the delegation watch (agent
 /// callers only; `caller_sid` empty = admin, no watch; a target the caller
@@ -2648,8 +2824,7 @@ async fn dispatch_task(
     caller_sid: &str,
     sid: &str,
     task: String,
-    _requested_wait_seconds: u64,
-    effective_wait_seconds: u64,
+    wait_seconds: u64,
     notify: NotifyRequest,
     title: Option<String>,
     deadline: crate::gateway::GatewayDeadline,
@@ -2668,15 +2843,15 @@ async fn dispatch_task(
         let parent_is_external = is_delegation && gw.is_external_node(caller_sid);
         // Subscribe BEFORE submitting so a fast child can't answer before we
         // start listening (the wait races the child's own turn).
-        let rx = if effective_wait_seconds > 0 {
+        let rx = if wait_seconds > 0 {
             Some(gw.subscribe_events())
         } else {
             None
         };
         // v0.10.1 — is the target one of the caller's OWN sessions? A dispatch
         // to a session the caller never delegated is a HANDOFF: the target has
-        // its own parent, or is a root with its own human. `session_list` draws
-        // no edge for it (that tree is spawn lineage) and `session_stop` refuses
+        // its own parent, or is a root with its own human. `agent_read` draws
+        // no edge for it (that tree is spawn lineage) and `agent_stop` refuses
         // it, so a watch armed here is an edge nobody can see or take down. The
         // default `notify` is a default, not a request — only an explicit one
         // subscribes the caller to a session it does not own.
@@ -2758,7 +2933,7 @@ async fn dispatch_task(
             turn_id = %turn_id,
             notify = notify.mode.as_str(),
             parent_is_external,
-            "ccteam MCP completion notification unavailable: caller has no managed parent session; poll session_collect"
+            "ccteam MCP completion notification unavailable: caller has no managed parent session; poll agent_read"
         );
     } else if notification_route == CompletionNotificationRoute::PeerUnsubscribed {
         tracing::info!(
@@ -2777,73 +2952,55 @@ async fn dispatch_task(
             sid,
             &turn_id,
             InlineWaitWindow {
-                effective_seconds: effective_wait_seconds,
+                effective_seconds: wait_seconds,
             },
             rx,
             is_delegation,
-            tool,
             notification_route,
-            parent_is_external,
         )
         .await)
     } else {
         let mut m = serde_json::Map::new();
+        m.insert("sid".to_string(), serde_json::json!(sid));
         m.insert("turn_id".to_string(), serde_json::json!(turn_id));
         if turn_id.starts_with("queued-behind-body:") {
             // One sid, one body: the child's process from before a ccteam
             // restart is still finishing its turn; the task is queued behind
             // it and runs the moment that body exits (the notification then
-            // arrives as usual).
+            // arrives as usual). The only surviving `hint`: nothing else in
+            // the response says why nothing is happening yet.
             m.insert("status".to_string(), serde_json::json!("queued"));
             m.insert(
                 "hint".to_string(),
                 serde_json::json!(
-                    "queued behind the session body still finishing after restart; use \
-                     session_stop to end it now"
+                    "queued behind the session body still finishing after restart; agent_stop \
+                     ends it now"
                 ),
             );
-            if parent_is_external
-                || tool == "session_dispatch" && !notification_route.is_deliverable()
-            {
-                m.insert("notify_deliverable".into(), serde_json::json!(false));
-            }
-            return Ok(m);
+        } else {
+            m.insert("status".to_string(), serde_json::json!("pending"));
         }
-        m.insert("status".to_string(), serde_json::json!("dispatched"));
-        if parent_is_external || tool == "session_dispatch" && !notification_route.is_deliverable()
-        {
+        if !notification_route.is_deliverable() {
+            // The one fact a caller cannot infer: no notification is coming,
+            // so poll. Only ever present when it is FALSE.
             m.insert("notify_deliverable".into(), serde_json::json!(false));
-        }
-        if tool == "session_dispatch" && !notification_route.is_deliverable() {
-            m.insert(
-                "hint".into(),
-                serde_json::json!(
-                    "no completion notification will be delivered; poll session_collect"
-                ),
-            );
         }
         Ok(m)
     }
 }
 
-/// Build the existing normal pending fragment, adding cap metadata only when
-/// an over-ceiling request actually reaches its shorter effective deadline.
+/// An inline wait that ran out: the child is still working (a timeout NEVER
+/// cancels it), so the honest answer is the same `pending` an async call gets.
 fn pending_dispatch_response(
+    sid: &str,
     turn_id: &str,
-    _wait: InlineWaitWindow,
-    _hit_effective_deadline: bool,
-    tool: &str,
     notification_route: CompletionNotificationRoute,
-    parent_is_external: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut response = serde_json::Map::new();
+    response.insert("sid".to_string(), serde_json::json!(sid));
     response.insert("turn_id".to_string(), serde_json::json!(turn_id));
     response.insert("status".to_string(), serde_json::json!("pending"));
-    response.insert(
-        "hint".to_string(),
-        serde_json::json!("still running; poll session_collect with this turn_id"),
-    );
-    if parent_is_external || tool == "session_dispatch" && !notification_route.is_deliverable() {
+    if !notification_route.is_deliverable() {
         response.insert("notify_deliverable".into(), serde_json::json!(false));
     }
     response
@@ -2875,9 +3032,7 @@ async fn dispatch_wait_for_completion(
     wait: InlineWaitWindow,
     mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     is_delegation: bool,
-    tool: &str,
     notification_route: CompletionNotificationRoute,
-    parent_is_external: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     // MCP-DX-1 — elapsed telemetry: the wait starts right after the submit, so
     // submit→completion is an honest task-duration approximation for a wait
@@ -2887,7 +3042,6 @@ async fn dispatch_wait_for_completion(
     // Re-check cadence for "answer seen, is the turn still in flight?".
     const BOUNDARY_POLL: std::time::Duration = std::time::Duration::from_millis(200);
     let mut saw_answer = false;
-    let mut hit_effective_deadline = false;
     let completed = loop {
         if saw_answer {
             let in_flight = {
@@ -2900,7 +3054,6 @@ async fn dispatch_wait_for_completion(
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            hit_effective_deadline = true;
             break false;
         }
         // While mid-turn with an answer already seen, wake at least every
@@ -2930,14 +3083,7 @@ async fn dispatch_wait_for_completion(
     };
 
     if !completed {
-        return pending_dispatch_response(
-            turn_id,
-            wait,
-            hit_effective_deadline,
-            tool,
-            notification_route,
-            parent_is_external,
-        );
+        return pending_dispatch_response(child_sid, turn_id, notification_route);
     }
 
     // Resolve the child (sync) under a brief lock, then read its transcript
@@ -2954,7 +3100,7 @@ async fn dispatch_wait_for_completion(
                     .ok()
                     .and_then(|all| all.into_iter().rev().find(|t| !t.assistant.is_empty()));
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
-            // tokens, same semantics as session_list/collect (tokens present
+            // tokens, same semantics as agent_read/collect (tokens present
             // even for vendors with no USD price table).
             let (cost, turn) =
                 ccteam_harness::execution::session_meta::read_session_meta(&r.project_dir, &r.sid)
@@ -2973,7 +3119,7 @@ async fn dispatch_wait_for_completion(
     }
 
     let record = result_record.as_ref();
-    let mut m = DelegationSummary {
+    DelegationSummary {
         sid: child_sid,
         turn_id,
         turn: record
@@ -2992,14 +3138,10 @@ async fn dispatch_wait_for_completion(
             .map(|turn| turn.assistant.as_str())
             .unwrap_or_default(),
     }
-    .inline_result();
-    if parent_is_external || tool == "session_dispatch" && !notification_route.is_deliverable() {
-        m.insert("notify_deliverable".into(), serde_json::json!(false));
-    }
-    m
+    .inline_result()
 }
 
-/// v0.8.7 review-fix (R-L3) — pure paging core of [`run_session_collect`],
+/// v0.8.7 review-fix (R-L3) — pure paging core of [`run_agent_read_transcript`],
 /// extracted so the cursor/truncation contract is unit-testable without a
 /// gateway or filesystem. Given ALL mirrored turns, an optional `since`
 /// turn-id cursor, and a page size `n`, returns `(rows, next_cursor,
@@ -3062,23 +3204,23 @@ fn page_collected_turns(
 
 fn collect_max_chars(args: &serde_json::Value) -> usize {
     let Some(value) = args.get("max_chars") else {
-        return SESSION_COLLECT_DEFAULT_MAX_CHARS;
+        return AGENT_READ_DEFAULT_MAX_CHARS;
     };
     if let Some(n) = value.as_u64() {
         return n.clamp(
-            SESSION_COLLECT_MIN_MAX_CHARS as u64,
-            SESSION_COLLECT_MAX_MAX_CHARS as u64,
+            AGENT_READ_MIN_MAX_CHARS as u64,
+            AGENT_READ_MAX_MAX_CHARS as u64,
         ) as usize;
     }
     value
         .as_i64()
         .map(|n| {
             n.clamp(
-                SESSION_COLLECT_MIN_MAX_CHARS as i64,
-                SESSION_COLLECT_MAX_MAX_CHARS as i64,
+                AGENT_READ_MIN_MAX_CHARS as i64,
+                AGENT_READ_MAX_MAX_CHARS as i64,
             ) as usize
         })
-        .unwrap_or(SESSION_COLLECT_DEFAULT_MAX_CHARS)
+        .unwrap_or(AGENT_READ_DEFAULT_MAX_CHARS)
 }
 
 /// Fairly allocate a total output-character budget across turn contents:
@@ -3147,9 +3289,7 @@ fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (u
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let bounded = crate::delegation::truncate_head_tail_with_marker(content, budget, |n| {
-            format!(
-                "…[truncated {n} chars — full text stays in the session ledger; page with session_collect{{sid, since, n}}]…"
-            )
+            format!("…[+{n} chars: agent_read{{sid, since, n}}]…")
         });
         row["content"] = serde_json::json!(bounded.text);
         truncated |= bounded.truncated;
@@ -3200,10 +3340,15 @@ fn session_row_fields(row: SessionRow) -> serde_json::Map<String, serde_json::Va
         .unwrap_or_default()
 }
 
-/// `session_collect` — tail the child's `turns.jsonl` (assistant turns).
-/// Polled MVP: resolve sid → role + project_dir under the lock, drop the
-/// guard, then read the ccteam-owned mirror. `since` is a turn_id cursor.
-async fn run_session_collect(
+/// `agent_read{sid}` — tail one session's `turns.jsonl` (assistant turns).
+/// Resolve sid → role + project_dir under the lock, drop the guard, then read
+/// the ccteam-owned mirror. `since` is a turn_id cursor.
+///
+/// Default is NEWEST-first: the overwhelmingly common read is "what did it
+/// answer", and the old oldest-first default made a caller page through a
+/// transcript it had already seen to reach it. Passing `since` flips the
+/// default to forward paging, which is the shape that cursor is for.
+async fn run_agent_read_transcript(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
@@ -3212,17 +3357,20 @@ async fn run_session_collect(
     // Same gate as dispatch/stop: ccteam mirrors no transcript for a client it
     // never spawned, so the honest answer is what the session is — not an empty
     // page or an "unknown session" from the resolve below.
-    assert_target_is_driveable("session_collect", gateway, &sid, None).await?;
+    assert_target_is_driveable("agent_read", gateway, &sid, None).await?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
     let n = args
         .get("n")
         .and_then(|v| v.as_u64())
-        .map(|x| x as usize)
-        .unwrap_or(SESSION_COLLECT_DEFAULT_N);
-    let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
+        .map(|x| (x as usize).clamp(1, 500))
+        .unwrap_or(AGENT_READ_DEFAULT_N);
+    let tail = args
+        .get("tail")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(since.is_none());
     let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
-    assert_caller_owns_session("session_collect", args, gateway, &sid, &caller, None).await?;
+    assert_caller_owns_session("agent_read", args, gateway, &sid, &caller, None).await?;
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
     // a cheap in-memory peek — then DROP the guard before the fs read.
@@ -3237,7 +3385,7 @@ async fn run_session_collect(
             gw.session_residency(&sid),
         )
     };
-    let resolved = resolved.ok_or_else(|| format!("session_collect: unknown session: {sid}"))?;
+    let resolved = resolved.ok_or_else(|| format!("agent_read: unknown session {sid}"))?;
 
     // Tail the ccteam-owned transcript mirror.
     // v0.8.8 F1 — the mirror is keyed by `sid` (`.ccteam/chat/<sid>/turns.jsonl`),
@@ -3246,7 +3394,7 @@ async fn run_session_collect(
         &resolved.project_dir,
         &resolved.sid,
     )
-    .map_err(|e| format!("session_collect: read turns.jsonl for {sid}: {e}"))?;
+    .map_err(|e| format!("agent_read: read turns.jsonl for {sid}: {e}"))?;
 
     // v0.9.0 W2 (F2) — surface the vendor resume key + accrued cost from meta.
     let meta = ccteam_harness::execution::session_meta::read_session_meta(
@@ -3319,30 +3467,25 @@ async fn run_session_collect(
             );
         }
     }
-    Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
+    Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
-/// Default row cap for `session_list` (rows are already sorted most-recent
-/// first by `session_views`; pass `limit` to widen/narrow).
-const SESSION_LIST_DEFAULT_LIMIT: usize = 30;
-
-/// `session_list` — snapshot the gateway's live sessions.
+/// `agent_read` (no `sid`) — the roster of sessions the caller can reach.
 ///
-/// v0.9.5 feedback fix — a fleet of tens of live sessions dumped verbatim
-/// flooded the caller's context (most rows stale, every null field spelled
-/// out). The listing now accepts `project` / `activity` / `limit` filters,
-/// caps at [`SESSION_LIST_DEFAULT_LIMIT`] most-recently-active rows by
-/// default (explicit `truncated`/`total` fields say when a cap bit), and
-/// omits null/empty row fields.
+/// A fleet of tens of live sessions dumped verbatim floods the caller's
+/// context, so the listing accepts `project` / `activity` filters, caps at
+/// [`AGENT_READ_DEFAULT_N`] most-recently-active rows (explicit
+/// `truncated`/`total` fields say when a cap bit), and omits null/empty
+/// fields.
 #[cfg(test)]
-async fn run_session_list(
+async fn run_agent_read_roster(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
 ) -> std::result::Result<String, String> {
-    run_session_list_at(args, gateway, None).await
+    run_agent_read_roster_at(args, gateway, None).await
 }
 
-async fn run_session_list_at(
+async fn run_agent_read_roster_at(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     paths: Option<&CcteamPaths>,
@@ -3385,15 +3528,15 @@ async fn run_session_list_at(
     if let Some(a) = filter_activity.as_deref() {
         if !matches!(a, "working" | "idle" | "stale" | "stuck") {
             return Err(format!(
-                "session_list: invalid `activity` filter `{a}` (expected `working` | `idle` | `stale` | `stuck` | `all`)"
+                "agent_read: invalid `activity` filter `{a}` (expected `working` | `idle` | `stale` | `stuck` | `all`)"
             ));
         }
     }
     let limit = args
-        .get("limit")
+        .get("n")
         .and_then(|v| v.as_u64())
         .map(|n| (n as usize).clamp(1, 500))
-        .unwrap_or(SESSION_LIST_DEFAULT_LIMIT);
+        .unwrap_or(AGENT_READ_DEFAULT_N);
     let include_tree = args.get("tree").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Both halves of the activity answer come from under ONE lock hold, and
@@ -3551,17 +3694,22 @@ async fn run_session_list_at(
             serde_json::Value::Object(row)
         })
         .collect();
-    // v0.9.0 W2 (F2) — a `tree` view (roots → children by `parent_sid`) so a
-    // caller sees the delegation topology without recomputing it. Built over
-    // the FILTERED set (not the limit cut) so topology stays whole. Roots =
-    // sessions whose parent isn't in this set (a true root, or a parent in
-    // another project the caller can't see).
-    let filtered: Vec<crate::gateway::SessionView> =
-        classified.iter().map(|(v, _)| (*v).clone()).collect();
-    let sids: std::collections::HashSet<&str> = filtered.iter().map(|v| v.sid.as_str()).collect();
+    // A `tree` view (roots → children by `parent_sid`) so a caller sees the
+    // delegation topology without recomputing it. Laid over exactly the rows
+    // RETURNED: a topology that names sids the response does not carry costs
+    // context to describe sessions the caller cannot look at, and the caller
+    // widens `n` when it wants more. Roots = returned rows whose parent is not
+    // among them (a true root, a parent past the cut, or one in a project the
+    // caller cannot see).
+    let returned: Vec<crate::gateway::SessionView> = classified
+        .iter()
+        .take(limit)
+        .map(|(v, _)| (*v).clone())
+        .collect();
+    let sids: std::collections::HashSet<&str> = returned.iter().map(|v| v.sid.as_str()).collect();
     let mut body = serde_json::json!({"sessions": rows});
     if include_tree {
-        let tree: Vec<serde_json::Value> = filtered
+        let tree: Vec<serde_json::Value> = returned
             .iter()
             .filter(|v| {
                 v.parent_sid
@@ -3569,22 +3717,22 @@ async fn run_session_list_at(
                     .map(|p| !sids.contains(p))
                     .unwrap_or(true)
             })
-            .map(|v| session_tree_node(v, &filtered))
+            .map(|v| session_tree_node(v, &returned))
             .collect();
         body["tree"] = serde_json::json!(tree);
     }
     if truncated {
         body["truncated"] = serde_json::json!(true);
         body["total"] = serde_json::json!(total);
-        body["hint"] = serde_json::json!("narrow the filters or raise `limit`");
     }
-    Ok(serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()))
+    Ok(serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string()))
 }
 
-/// v0.9.0 W2 (F2) — build one node of the `session_list` delegation tree:
-/// `{sid, role, vendor, children:[...]}` recursively (children = sessions whose
-/// `parent_sid` is this sid). Depth is bounded by the live set, so the
-/// recursion terminates.
+/// Build one node of the roster's delegation tree: `{sid, vendor, role?,
+/// children:[...]}` recursively (children = sessions whose `parent_sid` is this
+/// sid). Depth is bounded by the returned set, so the recursion terminates. An
+/// empty `role` is omitted — roleless is the DEFAULT, and spelling `""` out on
+/// every node costs the caller bytes to learn nothing.
 fn session_tree_node(
     v: &crate::gateway::SessionView,
     all: &[crate::gateway::SessionView],
@@ -3594,16 +3742,18 @@ fn session_tree_node(
         .filter(|c| c.parent_sid.as_deref() == Some(v.sid.as_str()) && c.sid != v.sid)
         .map(|c| session_tree_node(c, all))
         .collect();
-    serde_json::json!({
-        "sid": v.sid,
-        "role": v.role,
-        "vendor": v.vendor,
-        "children": children,
-    })
+    let mut node = serde_json::Map::new();
+    node.insert("sid".into(), serde_json::json!(v.sid));
+    node.insert("vendor".into(), serde_json::json!(v.vendor));
+    if !v.role.is_empty() {
+        node.insert("role".into(), serde_json::json!(v.role));
+    }
+    node.insert("children".into(), serde_json::json!(children));
+    serde_json::Value::Object(node)
 }
 
-/// `session_stop` — deregister + close a session by sid (explicit command).
-async fn run_session_stop(
+/// `agent_stop` — deregister + close a session by sid (explicit command).
+async fn run_agent_stop(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
     caller: McpCaller,
@@ -3612,10 +3762,10 @@ async fn run_session_stop(
     // Ahead of both scope checks: a hand-started client's process belongs to its
     // operator, and the descendant walk below would otherwise reject it as "not
     // a descendant" — true, but not the reason.
-    assert_target_is_driveable("session_stop", gateway, &sid, None).await?;
+    assert_target_is_driveable("agent_stop", gateway, &sid, None).await?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
-    assert_caller_owns_session("session_stop", args, gateway, &sid, &caller, None).await?;
+    assert_caller_owns_session("agent_stop", args, gateway, &sid, &caller, None).await?;
     // v0.9.0 W2 (F2) — an Ambient (agent) caller may only stop its OWN
     // descendants (walk the target's parent chain; it must reach the caller).
     // Admin/human callers are unrestricted (fleet-wide).
@@ -3630,7 +3780,7 @@ async fn run_session_stop(
     let mut gw = gateway.lock().await;
     if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
         return Err(format!(
-            "session_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated)"
+            "agent_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated)"
         ));
     }
     // Capture the delegation event fields + drop the child's own watch BEFORE
@@ -3641,7 +3791,7 @@ async fn run_session_stop(
     }
     gw.stop_session(&sid)
         .await
-        .map_err(|e| format!("session_stop failed: {e}"))?;
+        .map_err(|e| format!("agent_stop failed: {e}"))?;
     if !caller_sid.is_empty() {
         if let Some((vendor, host, slug)) = stopped_meta {
             gw.emit_delegation_progress(
@@ -3658,7 +3808,7 @@ async fn run_session_stop(
         }
     }
     drop(gw);
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    Ok(serde_json::to_string(&serde_json::json!({
         "sid": sid,
         "stopped": true,
     }))
@@ -3680,7 +3830,7 @@ fn arg_session_sid(args: &serde_json::Value) -> std::result::Result<String, Stri
 /// resolution: an external node deliberately has no row in the live map (that
 /// map is the set of sessions ccteam holds a thread for), so `session_resolve`
 /// (dispatch/collect) and the descendant walk (stop) would report a session the
-/// caller can SEE in `session_list` as unknown — a correct refusal that reads as
+/// caller can SEE in `agent_read` as unknown — a correct refusal that reads as
 /// a ccteam bug. One shared message
 /// ([`crate::external_nodes::not_driveable_error`]) says what the session IS: a
 /// process its own operator drives, usable as a delegation parent.
@@ -3704,7 +3854,7 @@ async fn assert_target_is_driveable(
     Ok(())
 }
 
-/// v0.8.7 review-fix (R-M3) — project-scope a sid-addressed `session_*` call:
+/// v0.8.7 review-fix (R-M3) — project-scope a sid-addressed session call:
 /// the caller may only dispatch/collect/stop a session that runs in the
 /// caller's OWN bound project (`_caller_slug`). Resolves the sid under the
 /// gateway lock (sync `session_resolve`, no `.await` held), drops the guard,
@@ -3731,7 +3881,7 @@ async fn assert_caller_owns_session(
                 .map_err(|error| mcp_gateway_error(name, &error))?,
             None => crate::latency::gateway_lock(gateway, "mcp.session.resolve").await,
         };
-        if name == "session_collect" {
+        if name == "agent_read" {
             gw.session_resolve_any(sid)
         } else {
             gw.session_resolve(sid)
@@ -3762,7 +3912,9 @@ async fn assert_caller_owns_session(
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| format!("{name}: no project scope (ambient slug unset)"))?
                 .to_string();
-            let resolved = resolved.ok_or_else(|| format!("{name}: unknown session: {sid}"))?;
+            let Some(resolved) = resolved else {
+                return Err(missing_session_error(name, gateway, sid, &caller_slug).await);
+            };
             if resolved.project != caller_slug {
                 return Err(format!(
                     "{name}: permission denied — session {sid} runs in project `{}`, but the caller is bound to project `{caller_slug}`",
@@ -3772,6 +3924,39 @@ async fn assert_caller_owns_session(
             Ok(())
         }
     }
+}
+
+/// Why a sid the caller named is not driveable.
+///
+/// "Unknown" and "you stopped it" are the same absence from the live map but
+/// two different next moves — hire a replacement vs. read what it already
+/// said — and collapsing them into "unknown session" sent callers hunting for
+/// a bug in ccteam. The stopped answer is only ever given for a session in the
+/// CALLER'S OWN project: elsewhere, existence itself stays undisclosed.
+async fn missing_session_error(
+    tool: &str,
+    gateway: &GatewayHandle,
+    sid: &str,
+    caller_slug: &str,
+) -> String {
+    let resolved = {
+        let gw = gateway.lock().await;
+        gw.session_resolve_any(sid)
+    };
+    if let Some(resolved) = resolved.filter(|resolved| resolved.project == caller_slug) {
+        let stopped_at = ccteam_harness::execution::session_meta::read_session_meta(
+            &resolved.project_dir,
+            &resolved.sid,
+        )
+        .ok()
+        .and_then(|meta| meta.stopped_at);
+        if let Some(at) = stopped_at {
+            return format!(
+                "{tool}: {sid} was stopped at {at}; agent_read still reads it — hire a new one to continue"
+            );
+        }
+    }
+    format!("{tool}: unknown session {sid} in project {caller_slug}")
 }
 
 /// Parse the optional `vendor` arg (default `claude`), lowercasing first so a
@@ -3790,7 +3975,7 @@ fn parse_session_vendor(
             "pi" => Ok(ccteam_harness::AgentVendor::Pi),
             "dsh" => Ok(ccteam_harness::AgentVendor::Dsh),
             other => Err(format!(
-                "session_spawn: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, `opencode`, `kimi`, `pi`, or `dsh`"
+                "agent: invalid vendor `{other}`: expected `claude`, `codex`, `grok`, `opencode`, `kimi`, `pi`, or `dsh`"
             )),
         },
     }
@@ -4095,11 +4280,14 @@ mod session_tool_tests {
         gateway.set_local_vendor_availability_for_tests(stub_vendor_availability(true));
     }
 
+    /// `wait` is clamped to what the transport can survive, and the retired
+    /// `wait_seconds` spelling is a hard error rather than a silent no-op.
     #[test]
-    fn effective_inline_wait_seconds_caps_at_transport_safe_ceiling() {
+    fn inline_wait_clamps_to_the_transport_safe_ceiling() {
         for (requested, expected) in [(600, 240), (240, 240), (0, 0), (30, 30)] {
-            assert_eq!(effective_inline_wait_seconds(requested), expected);
+            assert_eq!(inline_wait_seconds(&json!({ "wait": requested })), expected);
         }
+        assert_eq!(inline_wait_seconds(&json!({})), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
@@ -4107,7 +4295,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gateway, principal) = dispatch_gateway(true, 10_000, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gateway,
                 McpCaller::Ambient,
@@ -4124,11 +4312,10 @@ mod session_tool_tests {
         let response = serde_json::Value::Object(
             dispatch_task(
                 &gateway,
-                "session_dispatch",
+                "agent",
                 &principal,
                 &child,
                 "slow task".to_string(),
-                600,
                 1,
                 NotifyRequest::defaulted(),
                 None,
@@ -4138,10 +4325,13 @@ mod session_tool_tests {
             .expect("a capped inline timeout is a normal pending response"),
         );
         assert_eq!(response["status"], "pending");
+        assert_eq!(response["sid"], child);
         assert!(response["turn_id"].as_str().is_some());
         assert!(response.get("requested_wait_seconds").is_none());
         assert!(response.get("effective_wait_seconds").is_none());
-        assert!(response.get("hint").is_some());
+        // A timeout is `pending` and nothing else: the caller already knows
+        // what to do with a sid, and a hint is bytes it did not ask for.
+        assert!(response.get("hint").is_none());
         assert!(
             gateway.lock().await.session_turn_in_flight(&child),
             "a capped pending response must not cancel the child turn"
@@ -4177,10 +4367,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_web_token(tmp.path(), "tok-abc123");
         let d = dispatch_with_root(tmp.path());
-        let req = call(
-            "session_list",
-            json!({ "_caller_admin_token": "tok-abc123" }),
-        );
+        let req = call("agent_read", json!({ "_caller_admin_token": "tok-abc123" }));
         let (req, caller) = d.promote_local_admin(req);
         assert_eq!(caller, McpCaller::Admin);
         assert!(
@@ -4197,7 +4384,7 @@ mod session_tool_tests {
         let d = dispatch_with_root(tmp.path());
 
         // Wrong token → Ambient (and still stripped).
-        let req = call("session_list", json!({ "_caller_admin_token": "wrong" }));
+        let req = call("agent_read", json!({ "_caller_admin_token": "wrong" }));
         let (req, caller) = d.promote_local_admin(req);
         assert_eq!(caller, McpCaller::Ambient);
         assert!(req
@@ -4205,7 +4392,7 @@ mod session_tool_tests {
             .is_none());
 
         // No token arg → Ambient, request untouched.
-        let req = call("session_list", json!({ "_caller_sid": "s1" }));
+        let req = call("agent_read", json!({ "_caller_sid": "s1" }));
         let (req, caller) = d.promote_local_admin(req);
         assert_eq!(caller, McpCaller::Ambient);
         assert_eq!(
@@ -4216,7 +4403,7 @@ mod session_tool_tests {
         // Token file absent on the daemon → Ambient even with an arg.
         let tmp2 = tempfile::TempDir::new().unwrap();
         let d2 = dispatch_with_root(tmp2.path());
-        let req = call("session_list", json!({ "_caller_admin_token": "anything" }));
+        let req = call("agent_read", json!({ "_caller_admin_token": "anything" }));
         let (_req, caller) = d2.promote_local_admin(req);
         assert_eq!(caller, McpCaller::Ambient);
     }
@@ -4654,7 +4841,7 @@ mod session_tool_tests {
     async fn execute_session_tool_rejects_wrong_secret() {
         let (gw, cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
-            "session_list",
+            "agent_read",
             json!({
                 "_caller_sid": cto_sid,
                 "_caller_secret": "ffffffffffffffffffffffffffffffff",
@@ -4670,12 +4857,12 @@ mod session_tool_tests {
     }
 
     /// v0.9.0 W1 (F1) — end-to-end: the CORRECT `(sid, secret)` principal passes
-    /// the gate and the call reaches the gateway (session_list returns rows).
+    /// the gate and the call reaches the gateway (agent_read returns rows).
     #[tokio::test]
     async fn execute_session_tool_allows_correct_principal() {
         let (gw, cto_sid, _beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
-            "session_list",
+            "agent_read",
             json!({
                 "_caller_sid": cto_sid,
                 "_caller_secret": cto_secret,
@@ -4693,13 +4880,13 @@ mod session_tool_tests {
     #[tokio::test]
     async fn execute_session_tool_rejects_cross_project_sid() {
         let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
-        for tool in ["session_dispatch", "session_collect", "session_stop"] {
+        for tool in ["agent", "agent_read", "agent_stop"] {
             let mut args = json!({
                 "_caller_sid": cto_sid.clone(),
                 "_caller_secret": cto_secret.clone(),
                 "sid": beta_sid.clone(),
             });
-            if tool == "session_dispatch" {
+            if tool == "agent" {
                 args["task"] = json!("do something");
             }
             let resp = execute_session_tool(&call(tool, args), Some(&gw), McpCaller::Ambient).await;
@@ -4720,7 +4907,7 @@ mod session_tool_tests {
         let (gw, cto_sid, beta_sid, cto_secret) = gateway_with_cto_and_cross_project().await;
         let resp = execute_session_tool(
             &call(
-                "session_collect",
+                "agent_read",
                 json!({
                     "_caller_sid": cto_sid,
                     "_caller_secret": cto_secret,
@@ -4751,7 +4938,7 @@ mod session_tool_tests {
         let target_sid = cto_sid.clone();
         let resp = execute_session_tool(
             &call(
-                "session_collect",
+                "agent_read",
                 json!({
                     "_caller_sid": cto_sid,
                     "_caller_secret": cto_secret,
@@ -4770,9 +4957,9 @@ mod session_tool_tests {
 
     #[test]
     fn is_session_tool_call_matches_only_session_tools_calls() {
-        assert!(is_session_tool_call(&call("session_spawn", json!({}))));
+        assert!(is_session_tool_call(&call("agent", json!({}))));
         assert!(is_session_tool_call(&call(
-            "session_collect",
+            "agent_read",
             json!({ "sid": "s1" })
         )));
         // Foreign tool name.
@@ -4783,7 +4970,7 @@ mod session_tool_tests {
         // Right name, wrong method.
         assert!(!is_session_tool_call(&json!({
             "method": "tools/list",
-            "params": { "name": "session_spawn" }
+            "params": { "name": "agent" }
         })));
     }
 
@@ -4793,7 +4980,7 @@ mod session_tool_tests {
     async fn execute_session_tool_ambient_denies_unknown_principal() {
         let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
         let req = call(
-            "session_list",
+            "agent_read",
             json!({ "_caller_sid": "s999", "_caller_secret": "deadbeefdeadbeefdeadbeefdeadbeef" }),
         );
         let resp = execute_session_tool(&req, Some(&gw), McpCaller::Ambient).await;
@@ -4811,7 +4998,7 @@ mod session_tool_tests {
     #[tokio::test]
     async fn execute_session_tool_ambient_gateway_down_fails_closed() {
         let req = call(
-            "session_list",
+            "agent_read",
             json!({ "_caller_sid": "s1", "_caller_secret": "abc" }),
         );
         let resp = execute_session_tool(&req, None, McpCaller::Ambient).await;
@@ -4829,7 +5016,7 @@ mod session_tool_tests {
     /// it denied).
     #[tokio::test]
     async fn execute_session_tool_admin_bypasses_gate_reports_gateway_down() {
-        let req = call("session_list", json!({}));
+        let req = call("agent_read", json!({}));
         let resp = execute_session_tool(&req, None, McpCaller::Admin).await;
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
@@ -4843,17 +5030,13 @@ mod session_tool_tests {
         );
     }
 
-    /// v0.9 T4 — admin `session_list` works with NO ambient args and reaches the
+    /// v0.9 T4 — admin `agent_read` works with NO ambient args and reaches the
     /// live gateway (fleet-wide semantics, same as the web admin Identity).
     #[tokio::test]
     async fn execute_session_tool_admin_lists_sessions_fleet_wide() {
         let (gw, _cto_sid, _beta_sid, _cto_secret) = gateway_with_cto_and_cross_project().await;
-        let resp = execute_session_tool(
-            &call("session_list", json!({})),
-            Some(&gw),
-            McpCaller::Admin,
-        )
-        .await;
+        let resp =
+            execute_session_tool(&call("agent_read", json!({})), Some(&gw), McpCaller::Admin).await;
         assert_eq!(
             resp["result"]["isError"], false,
             "admin bypasses the principal gate: {resp}"
@@ -4868,10 +5051,11 @@ mod session_tool_tests {
         let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
         let req = call(
-            "session_spawn",
+            "agent",
             json!({
                 "project": "alice",
                 "vendor": "claude",
+                "task": "hello",
                 "_caller_sid": "s999",
                 "_caller_slug": "bob",
                 "_caller_role": "forged",
@@ -4910,10 +5094,11 @@ mod session_tool_tests {
             gateway_with_tenant_projects(tmp.path()).await;
         let response = execute_session_tool_with_paths(
             &call(
-                "session_spawn",
+                "agent",
                 json!({
                     "project": "alice",
                     "vendor": "claude",
+                    "task": "hello",
                 }),
             ),
             Some(&gateway),
@@ -4944,10 +5129,11 @@ mod session_tool_tests {
         // validated against the ledger, never taken on faith.
         let response = execute_session_tool_with_paths(
             &call(
-                "session_spawn",
+                "agent",
                 json!({
                     "project": "alice",
                     "vendor": "claude",
+                    "task": "hello",
                     "parent_sid": sid,
                 }),
             ),
@@ -4975,10 +5161,11 @@ mod session_tool_tests {
         // An unknown sid is a LOUD error, never a silent root.
         let response = execute_session_tool_with_paths(
             &call(
-                "session_spawn",
+                "agent",
                 json!({
                     "project": "alice",
                     "vendor": "claude",
+                    "task": "hello",
                     "parent_sid": "s404",
                 }),
             ),
@@ -5002,7 +5189,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, gateway, alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
-        let response = run_session_spawn_at(
+        let response = run_agent_spawn_at(
             &ambient(
                 &alice_sid,
                 "alice",
@@ -5074,7 +5261,7 @@ mod session_tool_tests {
 
         let response = execute_session_tool_with_paths(
             &call(
-                "session_spawn",
+                "agent",
                 json!({
                     "project": "alice",
                     "vendor": "claude",
@@ -5148,7 +5335,7 @@ mod session_tool_tests {
         };
 
         let missing = execute_session_tool_with_paths(
-            &call("session_spawn", json!({"vendor": "claude"})),
+            &call("agent", json!({"vendor": "claude"})),
             Some(&gateway),
             caller.clone(),
             &paths,
@@ -5170,7 +5357,7 @@ mod session_tool_tests {
         let mut denied_texts = Vec::new();
         for project in ["bob", "admin", "unknown"] {
             let denied = execute_session_tool_with_paths(
-                &call("session_spawn", json!({"project": project})),
+                &call("agent", json!({"project": project})),
                 Some(&gateway),
                 caller.clone(),
                 &paths,
@@ -5181,10 +5368,7 @@ mod session_tool_tests {
                 .as_str()
                 .unwrap()
                 .to_string();
-            assert!(
-                text.starts_with("session_spawn: project not found"),
-                "{text}"
-            );
+            assert!(text.starts_with("agent: project not found"), "{text}");
             assert!(text.contains("your projects: alice"), "{text}");
             denied_texts.push(text);
         }
@@ -5203,7 +5387,7 @@ mod session_tool_tests {
         let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
         let response = execute_session_tool_with_paths(
-            &call("session_spawn", json!({"vendor": "claude"})),
+            &call("agent", json!({"vendor": "claude", "task": "hello"})),
             Some(&gateway),
             McpCaller::User {
                 user_id: "ualice".into(),
@@ -5255,7 +5439,7 @@ mod session_tool_tests {
         };
         seed_owned_project(&paths, "robchat", "user:web-api");
         seed_owned_project(&paths, "demo", "user:web-api");
-        let err = run_session_spawn_at(
+        let err = run_agent_spawn_at(
             &json!({"project": "mychat", "vendor": "claude"}),
             &gw,
             McpCaller::Admin,
@@ -5263,10 +5447,7 @@ mod session_tool_tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.starts_with("session_spawn: unknown project: mychat"),
-            "{err}"
-        );
+        assert!(err.starts_with("agent: unknown project: mychat"), "{err}");
         assert!(err.contains("did you mean `robchat`?"), "{err}");
         assert!(err.contains("registered projects: "), "{err}");
         assert!(err.contains("demo"), "{err}");
@@ -5294,7 +5475,7 @@ mod session_tool_tests {
         let (gw, _principal) = dispatch_gateway(false, 0, &alpha).await;
         gw.lock().await.register_project("beta", beta);
 
-        let err = run_session_spawn_at(
+        let err = run_agent_spawn_at(
             &json!({"vendor": "claude"}),
             &gw,
             McpCaller::Admin,
@@ -5329,7 +5510,7 @@ mod session_tool_tests {
         let (gw, _principal) = dispatch_gateway(false, 0, &robchat).await;
         gw.lock().await.register_project("robchat", robchat.clone());
         let body = parse(
-            &run_session_spawn_at(
+            &run_agent_spawn_at(
                 &json!({"vendor": "claude"}),
                 &gw,
                 McpCaller::Admin,
@@ -5375,7 +5556,7 @@ mod session_tool_tests {
             ),
         ] {
             let body = parse(
-                &run_session_spawn_at(&args, &gw, caller, Some(&paths))
+                &run_agent_spawn_at(&args, &gw, caller, Some(&paths))
                     .await
                     .unwrap(),
             );
@@ -5404,18 +5585,72 @@ mod session_tool_tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
         for args in [
-            json!({"vendor": "grok", "protocol": "acp"}),
-            json!({"vendor": "grok", "protocol": "stream-json"}),
-            json!({"vendor": "claude", "protocol": "terminal"}),
-            json!({"vendor": "claude", "protocol": "bogus"}),
-            json!({"vendor": "claude", "protocol": null}),
+            json!({"vendor": "grok", "task": "x", "protocol": "acp"}),
+            json!({"vendor": "grok", "task": "x", "protocol": "stream-json"}),
+            json!({"vendor": "claude", "task": "x", "protocol": "terminal"}),
+            json!({"vendor": "claude", "task": "x", "protocol": "bogus"}),
+            json!({"vendor": "claude", "task": "x", "protocol": null}),
         ] {
-            let err = run_session_spawn_at(&args, &gw, McpCaller::Admin, None)
+            let err = run_agent(&args, &gw, McpCaller::Admin, &paths)
                 .await
                 .unwrap_err();
             assert_eq!(err, PROTOCOL_SPAWN_PARAM_REMOVED);
         }
+    }
+
+    /// The retired parameter names are HARD errors that say what replaced
+    /// them: a silently-ignored `wait_seconds` is a caller that thinks it is
+    /// blocking and is not.
+    #[tokio::test]
+    async fn agent_rejects_retired_parameters_and_requires_a_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let run = |args: serde_json::Value| {
+            let gw = gw.clone();
+            let paths = paths.clone();
+            async move { run_agent(&args, &gw, McpCaller::Admin, &paths).await }
+        };
+        assert!(run(json!({"task": "x", "host": "sat"}))
+            .await
+            .unwrap_err()
+            .contains("host is bound to the project"));
+        assert_eq!(
+            run(json!({"task": "x", "wait_seconds": 30}))
+                .await
+                .unwrap_err(),
+            "agent: `wait_seconds` was renamed to `wait`"
+        );
+        assert_eq!(
+            run(json!({"vendor": "claude"})).await.unwrap_err(),
+            "agent: missing `task` — say what the agent should do"
+        );
+        assert_eq!(
+            run(json!({"task": "  "})).await.unwrap_err(),
+            "agent: missing `task` — say what the agent should do"
+        );
+        // A follow-up may not reconfigure the session it is only messaging.
+        assert_eq!(
+            run(json!({"task": "x", "sid": "s9", "vendor": "codex", "model": "o"}))
+                .await
+                .unwrap_err(),
+            "agent: `sid` names an existing session — drop vendor/model or omit `sid` to hire"
+        );
+        // `agent_read` renamed `limit` to `n` for the same reason.
+        assert_eq!(
+            run_agent_read(&json!({"limit": 5}), &gw, McpCaller::Admin, &paths)
+                .await
+                .unwrap_err(),
+            "agent_read: `limit` was renamed to `n`"
+        );
     }
 
     /// MCP-DX-2 — pure resolution rule: exactly one catalog entry → that
@@ -5446,7 +5681,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -5469,11 +5704,10 @@ mod session_tool_tests {
 
         let frag = dispatch_task(
             &gw,
-            "session_dispatch",
+            "agent",
             &principal,
             &child,
             "quick question".to_string(),
-            6,
             6,
             NotifyRequest::defaulted(),
             None,
@@ -5496,6 +5730,7 @@ mod session_tool_tests {
                 "context_pct",
                 "cost_usd",
                 "result_text",
+                "sid",
                 "status",
                 "turn",
                 "turn_id"
@@ -5515,10 +5750,10 @@ mod session_tool_tests {
             user_id: "ualice".into(),
         };
 
-        for tool in ["session_dispatch", "session_collect", "session_stop"] {
+        for tool in ["agent", "agent_read", "agent_stop"] {
             let invoke = |sid: &str| {
                 let mut args = json!({"sid": sid});
-                if tool == "session_dispatch" {
+                if tool == "agent" {
                     args["task"] = json!("do not leak");
                 }
                 call(tool, args)
@@ -5547,13 +5782,13 @@ mod session_tool_tests {
     }
 
     #[tokio::test]
-    async fn user_session_list_filters_to_owned_projects_and_overwrites_spoofed_scope() {
+    async fn user_agent_read_filters_to_owned_projects_and_overwrites_spoofed_scope() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, gateway, alice_sid, bob_sid, admin_sid) =
             gateway_with_tenant_projects(tmp.path()).await;
         let response = execute_session_tool_with_paths(
             &call(
-                "session_list",
+                "agent_read",
                 json!({"_caller_visible_projects": ["alice", "bob", "admin"]}),
             ),
             Some(&gateway),
@@ -5681,7 +5916,7 @@ mod session_tool_tests {
         assert!(!is_permission_ask_call(
             &json!({ "method": "interaction/ask" })
         ));
-        assert!(!is_permission_ask_call(&call("session_spawn", json!({}))));
+        assert!(!is_permission_ask_call(&call("agent", json!({}))));
     }
 
     #[test]
@@ -5774,9 +6009,9 @@ mod session_tool_tests {
         emit_permission_prompt_outstanding("", "cto", "Bash", "rm -rf /", 120);
     }
 
-    // ---------- v0.8.7 review-fix (R-L3) session_collect paging ----------
+    // ---------- v0.8.7 review-fix (R-L3) agent_read paging ----------
 
-    fn turn(id: &str) -> ccteam_harness::execution::turns_mirror::TurnRecord {
+    pub(super) fn turn(id: &str) -> ccteam_harness::execution::turns_mirror::TurnRecord {
         ccteam_harness::execution::turns_mirror::TurnRecord {
             turn_id: id.to_string(),
             ts: chrono::Utc::now(),
@@ -5872,7 +6107,7 @@ mod session_tool_tests {
 
     #[test]
     fn collect_max_chars_defaults_and_clamps() {
-        assert_eq!(collect_max_chars(&json!({})), 10_000);
+        assert_eq!(collect_max_chars(&json!({})), 4_000);
         assert_eq!(collect_max_chars(&json!({ "max_chars": 1 })), 500);
         assert_eq!(collect_max_chars(&json!({ "max_chars": -10 })), 500);
         assert_eq!(collect_max_chars(&json!({ "max_chars": 999_999 })), 50_000);
@@ -5898,7 +6133,7 @@ mod session_tool_tests {
         let excerpt = rows[1]["content"].as_str().unwrap();
         assert!(excerpt.starts_with("HEAD"));
         assert!(excerpt.ends_with("TAIL"));
-        assert!(excerpt.contains("page with session_collect{sid, since, n}"));
+        assert!(excerpt.contains("agent_read{sid, since, n}"), "{excerpt}");
     }
 
     // ========================================================================
@@ -5908,7 +6143,11 @@ mod session_tool_tests {
     // ========================================================================
 
     /// Inject the server-resolved caller identity `execute_session_tool` sets.
-    fn ambient(caller_sid: &str, slug: &str, mut args: serde_json::Value) -> serde_json::Value {
+    pub(super) fn ambient(
+        caller_sid: &str,
+        slug: &str,
+        mut args: serde_json::Value,
+    ) -> serde_json::Value {
         let o = args.as_object_mut().unwrap();
         o.insert("_caller_sid".into(), json!(caller_sid));
         o.insert("_caller_slug".into(), json!(slug));
@@ -5977,8 +6216,66 @@ mod session_tool_tests {
         (handle, principal)
     }
 
-    fn parse(body: &str) -> serde_json::Value {
+    pub(super) fn parse(body: &str) -> serde_json::Value {
         serde_json::from_str(body).unwrap()
+    }
+
+    /// The recorded `(sid, secret)` pairs a [`StubAdapter`] saw, so a test can
+    /// authenticate as a session the gateway actually spawned.
+    pub(super) type SpawnSecrets = std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
+
+    pub(super) async fn secret_for(secrets: &SpawnSecrets, sid: &str) -> String {
+        secrets
+            .lock()
+            .await
+            .iter()
+            .find(|(recorded, _)| recorded == sid)
+            .map(|(_, secret)| secret.clone())
+            .unwrap_or_else(|| panic!("no minted secret recorded for {sid}"))
+    }
+
+    /// A gateway whose adapters share ONE spawn ledger, so every session's
+    /// minted principal is recoverable — what the tool-face tests need to call
+    /// `initialize` as a specific child. Returns `(gateway, root sid, secrets)`.
+    pub(super) async fn face_gateway(
+        project_dir: &std::path::Path,
+    ) -> (GatewayHandle, String, SpawnSecrets) {
+        let secrets: SpawnSecrets = Default::default();
+        let shared = std::sync::Arc::clone(&secrets);
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(StubAdapter {
+                spawns: std::sync::Arc::clone(&shared),
+                ..Default::default()
+            }) as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
+        mark_stub_vendors_installed(&mut gw);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+        let root = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        (
+            std::sync::Arc::new(tokio::sync::Mutex::new(gw)),
+            root,
+            secrets,
+        )
     }
 
     fn assert_exact_keys(value: &serde_json::Value, expected: &[&str]) {
@@ -5995,19 +6292,26 @@ mod session_tool_tests {
     }
 
     #[tokio::test]
-    async fn session_spawn_rejects_removed_host_parameter() {
+    async fn agent_rejects_removed_host_parameter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
-        let args = ambient(&principal, "alpha", json!({"host": "sat-a"}));
-        let err = run_session_spawn(&args, &gw, McpCaller::Ambient)
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let args = ambient(&principal, "alpha", json!({"task": "x", "host": "sat-a"}));
+        let err = run_agent(&args, &gw, McpCaller::Ambient, &paths)
             .await
             .unwrap_err();
-        assert_eq!(err, crate::remote_host::HOST_SPAWN_PARAM_REMOVED);
+        assert_eq!(
+            err,
+            format!("agent: {}", crate::remote_host::HOST_SPAWN_PARAM_REMOVED)
+        );
         assert_eq!(gw.lock().await.session_views().len(), 1);
     }
 
     #[tokio::test]
-    async fn session_spawn_reports_vendor_not_installed_from_empty_snapshot() {
+    async fn agent_reports_vendor_not_installed_from_empty_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gateway, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         gateway
@@ -6015,7 +6319,7 @@ mod session_tool_tests {
             .await
             .set_local_vendor_availability_for_tests(stub_vendor_availability(false));
 
-        let error = run_session_spawn(
+        let error = run_agent_spawn(
             &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
             &gateway,
             McpCaller::Ambient,
@@ -6040,22 +6344,18 @@ mod session_tool_tests {
             "alpha",
             json!({ "idempotency_key": "k1", "vendor": "claude" }),
         );
-        let r1 = parse(
-            &run_session_spawn(&a, &gw, McpCaller::Ambient)
-                .await
-                .unwrap(),
-        );
-        let r2 = parse(
-            &run_session_spawn(&a, &gw, McpCaller::Ambient)
-                .await
-                .unwrap(),
-        );
+        let r1 = parse(&run_agent_spawn(&a, &gw, McpCaller::Ambient).await.unwrap());
+        let r2 = parse(&run_agent_spawn(&a, &gw, McpCaller::Ambient).await.unwrap());
         assert_exact_keys(&r1, &["sid"]);
-        assert_exact_keys(&r2, &["sid"]);
+        assert_exact_keys(&r2, &["idempotent_replay", "sid"]);
         assert_eq!(r1["sid"], r2["sid"], "replay returns the original sid");
-        assert!(r2.get("idempotent_replay").is_none());
+        assert_eq!(r2["idempotent_replay"], true, "a replay says so");
         // Exactly ONE child was created (principal + 1 child = 2 sessions).
-        let list = parse(&run_session_list(&serde_json::json!({}), &gw).await.unwrap());
+        let list = parse(
+            &run_agent_read_roster(&serde_json::json!({}), &gw)
+                .await
+                .unwrap(),
+        );
         let children = list["sessions"]
             .as_array()
             .unwrap()
@@ -6065,10 +6365,10 @@ mod session_tool_tests {
         assert_eq!(children, 1, "no double-spawn: {list}");
     }
 
-    /// Two independent MCP session_spawn calls must reach vendor startup at
+    /// Two independent MCP agent calls must reach vendor startup at
     /// the same time; only the post-spawn admission seam is serialized.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn session_spawn_fanout_reaches_two_vendor_spawns_concurrently() {
+    async fn agent_fanout_reaches_two_vendor_spawns_concurrently() {
         let tmp = tempfile::TempDir::new().unwrap();
         let barrier = std::sync::Arc::new(StubSpawnBarrier::default());
         let factory: crate::daemon::AdapterFactory = {
@@ -6091,7 +6391,7 @@ mod session_tool_tests {
         let spawn = |role: &'static str| {
             let gateway = std::sync::Arc::clone(&gateway);
             tokio::spawn(async move {
-                run_session_spawn(
+                run_agent_spawn(
                     &json!({"project": "alpha", "vendor": "claude", "role": role}),
                     &gateway,
                     McpCaller::Admin,
@@ -6113,15 +6413,15 @@ mod session_tool_tests {
         assert_ne!(parse(&first)["sid"], parse(&second)["sid"]);
     }
 
-    /// v0.9.5 feedback fix — `session_list` accepts `project`/`activity`/
+    /// v0.9.5 feedback fix — `agent_read` accepts `project`/`activity`/
     /// `limit` filters, caps rows (flagging `truncated` + `total`), slims
     /// null/empty fields out of each row, and rejects a bogus activity value.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_list_filters_limit_and_slim_rows() {
+    async fn agent_read_filters_limit_and_slim_rows() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         for _ in 0..3 {
-            run_session_spawn(
+            run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -6130,7 +6430,7 @@ mod session_tool_tests {
             .unwrap();
         }
         // Unfiltered: principal + 3 children.
-        let all = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let all = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         assert_exact_keys(&all, &["sessions"]);
         assert!(all.get("total").is_none());
         assert_eq!(all["sessions"].as_array().unwrap().len(), 4);
@@ -6141,22 +6441,24 @@ mod session_tool_tests {
         assert!(row.get("status").is_none(), "static status omitted: {row}");
 
         // limit=2 → truncated + hint, total still 4.
-        let capped = parse(&run_session_list(&json!({"limit": 2}), &gw).await.unwrap());
+        let capped = parse(&run_agent_read_roster(&json!({"n": 2}), &gw).await.unwrap());
         assert_eq!(capped["sessions"].as_array().unwrap().len(), 2);
         assert_eq!(capped["total"], json!(4));
         assert_eq!(capped["truncated"], json!(true));
-        assert!(capped["hint"].as_str().unwrap().contains("raise `limit`"));
+        // `truncated` + `total` say everything the caller needs; a prose hint
+        // repeating the schema is bytes it already paid for.
+        assert!(capped.get("hint").is_none(), "{capped}");
 
         // project filter: a non-existent slug matches nothing.
         let none = parse(
-            &run_session_list(&json!({"project": "nope"}), &gw)
+            &run_agent_read_roster(&json!({"project": "nope"}), &gw)
                 .await
                 .unwrap(),
         );
         assert_eq!(none["sessions"].as_array().unwrap().len(), 0);
 
         // bogus activity value → readable error.
-        let err = run_session_list(&json!({"activity": "busy"}), &gw)
+        let err = run_agent_read_roster(&json!({"activity": "busy"}), &gw)
             .await
             .unwrap_err();
         assert!(err.contains("invalid `activity` filter"), "{err}");
@@ -6170,13 +6472,13 @@ mod session_tool_tests {
     /// identity being used by somebody else. `is_self` follows the caller's
     /// server-resolved principal; `current` follows the fleet's routing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_list_marks_the_calling_session_not_the_current_one() {
+    async fn agent_read_marks_the_calling_session_not_the_current_one() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let mut children = Vec::new();
         for _ in 0..2 {
             let spawned = parse(
-                &run_session_spawn(
+                &run_agent_spawn(
                     &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                     &gw,
                     McpCaller::Ambient,
@@ -6199,7 +6501,7 @@ mod session_tool_tests {
 
         // The principal asks: exactly its own row is marked.
         let as_principal = parse(
-            &run_session_list(&ambient(&principal, "alpha", json!({})), &gw)
+            &run_agent_read_roster(&ambient(&principal, "alpha", json!({})), &gw)
                 .await
                 .unwrap(),
         );
@@ -6220,7 +6522,7 @@ mod session_tool_tests {
         // The marker follows the CALLER, not the fleet: same gateway, same
         // rows, a child asking sees the mark move onto its own row.
         let as_child = parse(
-            &run_session_list(&ambient(&children[0], "alpha", json!({})), &gw)
+            &run_agent_read_roster(&ambient(&children[0], "alpha", json!({})), &gw)
                 .await
                 .unwrap(),
         );
@@ -6235,10 +6537,10 @@ mod session_tool_tests {
     /// its own. Marking the nearest candidate would be a guess, and a guessed
     /// identity is exactly the failure this field exists to end.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_list_marks_nothing_when_the_caller_has_no_sid() {
+    async fn agent_read_marks_nothing_when_the_caller_has_no_sid() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
-        run_session_spawn(
+        run_agent_spawn(
             &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
             &gw,
             McpCaller::Ambient,
@@ -6247,7 +6549,7 @@ mod session_tool_tests {
         .unwrap();
 
         for args in [json!({}), json!({ "_caller_sid": "" })] {
-            let list = parse(&run_session_list(&args, &gw).await.unwrap());
+            let list = parse(&run_agent_read_roster(&args, &gw).await.unwrap());
             assert_exact_keys(&list, &["sessions"]);
             let rows = list["sessions"].as_array().unwrap();
             assert_eq!(rows.len(), 2, "both sessions listed: {list}");
@@ -6265,16 +6567,20 @@ mod session_tool_tests {
             );
         }
 
-        let with_tree = parse(&run_session_list(&json!({"tree": true}), &gw).await.unwrap());
+        let with_tree = parse(
+            &run_agent_read_roster(&json!({"tree": true}), &gw)
+                .await
+                .unwrap(),
+        );
         assert_exact_keys(&with_tree, &["sessions", "tree"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_list_surfaces_requested_model_and_omits_vendor_default() {
+    async fn agent_read_surfaces_requested_model_and_omits_vendor_default() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let spawned = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(
                     &principal,
                     "alpha",
@@ -6318,7 +6624,7 @@ mod session_tool_tests {
         )
         .unwrap();
 
-        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let list = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         let child = list["sessions"]
             .as_array()
             .unwrap()
@@ -6341,10 +6647,10 @@ mod session_tool_tests {
     /// the session is DOING. A resident row carries no `residency` at all —
     /// the agent's context is not spent on a field that says nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn session_list_shows_released_sessions_and_marks_their_residency() {
+    async fn agent_read_shows_released_sessions_and_marks_their_residency() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
-        let child = run_session_spawn(
+        let child = run_agent_spawn(
             &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
             &gw,
             McpCaller::Ambient,
@@ -6354,7 +6660,7 @@ mod session_tool_tests {
         let child = parse(&child)["sid"].as_str().unwrap().to_string();
 
         // Resident rows say nothing about residency.
-        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let list = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         let row = |list: &serde_json::Value, sid: &str| -> serde_json::Value {
             list["sessions"]
                 .as_array()
@@ -6378,7 +6684,7 @@ mod session_tool_tests {
         }
         assert_eq!(Gateway::idle_release_tick(&gw).await, vec![child.clone()]);
 
-        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let list = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         assert_eq!(row(&list, &child)["residency"], "released");
         assert!(
             row(&list, &child).get("activity").is_some(),
@@ -6387,10 +6693,10 @@ mod session_tool_tests {
         // The caller's own (still resident) row is unchanged.
         assert!(row(&list, &principal).get("residency").is_none());
 
-        // `session_collect` says the same thing, in place of the old
+        // `agent_read` says the same thing, in place of the old
         // `status:"stopped"` (which could not tell "asleep" from "over").
         let collected = parse(
-            &run_session_collect(
+            &run_agent_read_transcript(
                 &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
                 &gw,
                 McpCaller::Ambient,
@@ -6404,7 +6710,7 @@ mod session_tool_tests {
         // An explicit stop flips the word — the difference the caller acts on.
         gw.lock().await.stop_session(&child).await.unwrap();
         let collected = parse(
-            &run_session_collect(
+            &run_agent_read_transcript(
                 &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
                 &gw,
                 McpCaller::Ambient,
@@ -6413,7 +6719,7 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(collected["residency"], "stopped");
-        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let list = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         assert!(
             !list["sessions"]
                 .as_array()
@@ -6424,7 +6730,7 @@ mod session_tool_tests {
         );
     }
 
-    /// v0.9.5 feedback fix — a title-less `session_spawn{task}` derives a
+    /// v0.9.5 feedback fix — a title-less `agent{task}` derives a
     /// short display label from the task's first line (ledger only), and the
     /// `notify` arg accepts the mode strings while rejecting garbage.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6432,7 +6738,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
         let long_line = format!("Refactor the harness layer {}", "x".repeat(80));
-        run_session_spawn(
+        run_agent_spawn(
             &ambient(
                 &principal,
                 "alpha",
@@ -6443,7 +6749,7 @@ mod session_tool_tests {
         )
         .await
         .unwrap();
-        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let list = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         let title = list["sessions"]
             .as_array()
             .unwrap()
@@ -6455,7 +6761,7 @@ mod session_tool_tests {
         assert!(title.ends_with('…'));
 
         // Explicit titles are never overridden by the derivation.
-        run_session_spawn(
+        run_agent_spawn(
             &ambient(
                 &principal,
                 "alpha",
@@ -6466,7 +6772,7 @@ mod session_tool_tests {
         )
         .await
         .unwrap();
-        let list = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let list = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         assert!(
             list["sessions"]
                 .as_array()
@@ -6478,7 +6784,7 @@ mod session_tool_tests {
 
         // Garbage notify → readable error, no spawn side effect.
         let before = gw.lock().await.session_views().len();
-        let err = run_session_spawn(
+        let err = run_agent_spawn(
             &ambient(
                 &principal,
                 "alpha",
@@ -6493,16 +6799,16 @@ mod session_tool_tests {
         assert_eq!(gw.lock().await.session_views().len(), before);
     }
 
-    /// v0.9.1 — `session_spawn{task}`: one call spawns AND dispatches (the
+    /// v0.9.1 — `agent{task}`: one call spawns AND dispatches (the
     /// dominant flow). The response merges the dispatch outcome (`turn_id` +
-    /// `status:dispatched`) into the spawn body, and the delegation lineage
+    /// `status:pending`) into the spawn body, and the delegation lineage
     /// is intact (`parent_sid` = the caller).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_with_task_dispatches_in_one_call() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let r = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(
                     &principal,
                     "alpha",
@@ -6515,7 +6821,7 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_exact_keys(&r, &["sid", "status", "turn_id"]);
-        assert_eq!(r["status"], json!("dispatched"), "dispatch merged: {r}");
+        assert_eq!(r["status"], json!("pending"), "dispatch merged: {r}");
         assert!(
             r["turn_id"].as_str().is_some_and(|t| !t.is_empty()),
             "turn_id present: {r}"
@@ -6529,7 +6835,7 @@ mod session_tool_tests {
         let (gw, _principal) = dispatch_gateway(false, 0, tmp.path()).await;
 
         let spawned = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &json!({
                     "project": "alpha",
                     "vendor": "claude",
@@ -6542,14 +6848,16 @@ mod session_tool_tests {
             .unwrap(),
         );
         let spawned_sid = spawned["sid"].as_str().unwrap();
-        assert!(spawned.get("notify_deliverable").is_none());
+        // No managed parent to wake: say so on the HIRE too, not only on a
+        // follow-up. The caller's next move (poll) is the same either way.
+        assert_eq!(spawned["notify_deliverable"], false, "{spawned}");
         assert!(
             ccteam_harness::read_delegation_watch(tmp.path(), spawned_sid).is_none(),
             "an admin fallback caller has no parent watch"
         );
 
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &json!({ "project": "alpha", "vendor": "claude" }),
                 &gw,
                 McpCaller::Admin,
@@ -6561,7 +6869,7 @@ mod session_tool_tests {
             .unwrap()
             .to_string();
         let dispatched = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &json!({ "sid": child, "task": "follow-up" }),
                 &gw,
                 McpCaller::Admin,
@@ -6573,7 +6881,7 @@ mod session_tool_tests {
         assert!(ccteam_harness::read_delegation_watch(tmp.path(), &child).is_none());
 
         let off_child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &json!({ "project": "alpha", "vendor": "claude" }),
                 &gw,
                 McpCaller::Admin,
@@ -6585,7 +6893,7 @@ mod session_tool_tests {
             .unwrap()
             .to_string();
         let off = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &json!({ "sid": off_child, "task": "ledger only", "notify": "off" }),
                 &gw,
                 McpCaller::Admin,
@@ -6596,21 +6904,16 @@ mod session_tool_tests {
         assert_eq!(off["notify_deliverable"], false);
     }
 
-    /// v0.9.1 — `session_spawn{task, wait_seconds}` with an answering child
-    /// returns the answer inline (`status:completed`, `result_text`), exactly
-    /// like session_dispatch's wait path.
+    /// `agent{task, wait}` with an answering child returns the answer inline
+    /// (`status:completed`, `result_text`), exactly like the follow-up path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn spawn_with_task_and_wait_returns_inline_result() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
         let task = format!("HEAD{}TAIL", "🦀".repeat(12_000));
         let r = parse(
-            &run_session_spawn(
-                &ambient(
-                    &principal,
-                    "alpha",
-                    json!({ "task": task, "wait_seconds": 6 }),
-                ),
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "task": task, "wait": 6 })),
                 &gw,
                 McpCaller::Ambient,
             )
@@ -6634,7 +6937,7 @@ mod session_tool_tests {
         assert!(result.starts_with("echo: HEAD"));
         assert!(result.ends_with("TAIL"));
         assert!(result.contains("…[+"));
-        assert!(result.contains("session_collect{sid:"));
+        assert!(result.contains("agent_read{sid:"));
         assert!(
             r.get("status_line").is_none(),
             "spawn MCP envelope has no text status: {r}"
@@ -6659,7 +6962,7 @@ mod session_tool_tests {
         )
         .await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "codex" })),
                 &gw,
                 McpCaller::Ambient,
@@ -6672,14 +6975,14 @@ mod session_tool_tests {
             .to_string();
 
         let waited = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &ambient(
                     &principal,
                     "alpha",
                     json!({
                         "sid": child,
                         "task": "run the task",
-                        "wait_seconds": 6,
+                        "wait": 6,
                         "notify": "off"
                     }),
                 ),
@@ -6695,7 +6998,7 @@ mod session_tool_tests {
         assert_eq!(waited["result_text"], CAPACITY_ERROR);
 
         let collected = parse(
-            &run_session_collect(
+            &run_agent_read_transcript(
                 &ambient(&principal, "alpha", json!({ "sid": child, "tail": true })),
                 &gw,
                 McpCaller::Ambient,
@@ -6719,7 +7022,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(
                     &principal,
                     "alpha",
@@ -6757,7 +7060,7 @@ mod session_tool_tests {
         .unwrap();
 
         let response = parse(
-            &run_session_collect(
+            &run_agent_read_transcript(
                 &ambient(
                     &principal,
                     "alpha",
@@ -6784,7 +7087,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -6801,18 +7104,18 @@ mod session_tool_tests {
             json!({ "sid": child, "task": "go", "idempotency_key": "d1" }),
         );
         let t1 = parse(
-            &run_session_dispatch(&d, &gw, McpCaller::Ambient)
+            &run_agent_dispatch(&d, &gw, McpCaller::Ambient)
                 .await
                 .unwrap(),
         );
         let t2 = parse(
-            &run_session_dispatch(&d, &gw, McpCaller::Ambient)
+            &run_agent_dispatch(&d, &gw, McpCaller::Ambient)
                 .await
                 .unwrap(),
         );
-        assert_exact_keys(&t2, &["status", "turn_id"]);
+        assert_exact_keys(&t2, &["idempotent_replay", "sid", "status", "turn_id"]);
         assert_eq!(t1["turn_id"], t2["turn_id"], "replay returns the same turn");
-        assert!(t2.get("idempotent_replay").is_none());
+        assert_eq!(t2["idempotent_replay"], true, "a replay says so");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6820,7 +7123,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         // self-dispatch.
-        let e = run_session_dispatch(
+        let e = run_agent_dispatch(
             &ambient(
                 &principal,
                 "alpha",
@@ -6834,7 +7137,7 @@ mod session_tool_tests {
         assert!(e.contains("itself"), "self cycle: {e}");
         // child dispatching to its ancestor (principal).
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -6845,7 +7148,7 @@ mod session_tool_tests {
             .as_str()
             .unwrap()
             .to_string();
-        let e2 = run_session_dispatch(
+        let e2 = run_agent_dispatch(
             &ambient(&child, "alpha", json!({ "sid": principal, "task": "x" })),
             &gw,
             McpCaller::Ambient,
@@ -6860,7 +7163,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -6884,7 +7187,7 @@ mod session_tool_tests {
             .unwrap()
             .sid
         };
-        let e = run_session_stop(
+        let e = run_agent_stop(
             &ambient(&principal, "alpha", json!({ "sid": sibling })),
             &gw,
             McpCaller::Ambient,
@@ -6893,7 +7196,7 @@ mod session_tool_tests {
         .unwrap_err();
         assert!(e.contains("not a descendant"), "non-descendant stop: {e}");
         // The real descendant stops fine.
-        let ok = run_session_stop(
+        let ok = run_agent_stop(
             &ambient(&principal, "alpha", json!({ "sid": child })),
             &gw,
             McpCaller::Ambient,
@@ -6911,7 +7214,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 0, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -6924,11 +7227,11 @@ mod session_tool_tests {
             .to_string();
         let task = format!("HEAD{}TAIL", "界".repeat(12_000));
         let r = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &ambient(
                     &principal,
                     "alpha",
-                    json!({ "sid": child, "task": task, "wait_seconds": 6 }),
+                    json!({ "sid": child, "task": task, "wait": 6 }),
                 ),
                 &gw,
                 McpCaller::Ambient,
@@ -6953,7 +7256,7 @@ mod session_tool_tests {
         let tmp2 = tempfile::TempDir::new().unwrap();
         let (gw2, p2) = dispatch_gateway(true, 10_000, tmp2.path()).await;
         let child2 = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&p2, "alpha", json!({ "vendor": "claude" })),
                 &gw2,
                 McpCaller::Ambient,
@@ -6965,11 +7268,11 @@ mod session_tool_tests {
             .unwrap()
             .to_string();
         let r2 = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &ambient(
                     &p2,
                     "alpha",
-                    json!({ "sid": child2, "task": "go", "wait_seconds": 1 }),
+                    json!({ "sid": child2, "task": "go", "wait": 1 }),
                 ),
                 &gw2,
                 McpCaller::Ambient,
@@ -6995,7 +7298,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway_opts(true, true, 0, None, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "codex" })),
                 &gw,
                 McpCaller::Ambient,
@@ -7010,11 +7313,11 @@ mod session_tool_tests {
         // it keeps this leg's boundary from racing a notification into the
         // async leg's assertion below.
         let r = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &ambient(
                     &principal,
                     "alpha",
-                    json!({ "sid": child, "task": "do the wave", "wait_seconds": 6, "notify": "off" }),
+                    json!({ "sid": child, "task": "do the wave", "wait": 6, "notify": "off" }),
                 ),
                 &gw,
                 McpCaller::Ambient,
@@ -7026,8 +7329,8 @@ mod session_tool_tests {
             &r,
             &[
                 "context_pct",
-                "notify_deliverable",
                 "result_text",
+                "sid",
                 "status",
                 "turn",
                 "turn_id",
@@ -7050,7 +7353,7 @@ mod session_tool_tests {
         // fresh child keeps this assertion independent of the wait leg's
         // already-consumed watch.)
         let child2 = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "codex" })),
                 &gw,
                 McpCaller::Ambient,
@@ -7061,7 +7364,7 @@ mod session_tool_tests {
             .as_str()
             .unwrap()
             .to_string();
-        run_session_dispatch(
+        run_agent_dispatch(
             &ambient(
                 &principal,
                 "alpha",
@@ -7101,7 +7404,7 @@ mod session_tool_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (gw, principal) = dispatch_gateway(true, 3_000, tmp.path()).await;
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
                 &gw,
                 McpCaller::Ambient,
@@ -7117,10 +7420,10 @@ mod session_tool_tests {
         let d = ambient(
             &principal,
             "alpha",
-            json!({ "sid": child, "task": "go", "wait_seconds": 5 }),
+            json!({ "sid": child, "task": "go", "wait": 5 }),
         );
         let waiter =
-            tokio::spawn(async move { run_session_dispatch(&d, &gw_w, McpCaller::Ambient).await });
+            tokio::spawn(async move { run_agent_dispatch(&d, &gw_w, McpCaller::Ambient).await });
         // Give the wait time to submit + park.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         // The gateway lock must be acquirable NOW (the wait is off-lock).
@@ -7206,7 +7509,7 @@ mod session_tool_tests {
     /// All three driving tools refuse an external sid with the ONE shared
     /// message, and it says what the session IS. "not found" would be a claim
     /// the caller can immediately disprove — the sid is right there in
-    /// `session_list` — so it would read as a ccteam bug instead of an answer.
+    /// `agent_read` — so it would read as a ccteam bug instead of an answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn driving_tools_refuse_an_external_node_by_saying_what_it_is() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7214,31 +7517,31 @@ mod session_tool_tests {
         let node = enroll_external_node(&gw, "alpha").await;
 
         // The premise of the whole requirement: the caller can see it.
-        let listed = parse(&run_session_list(&json!({}), &gw).await.unwrap());
+        let listed = parse(&run_agent_read_roster(&json!({}), &gw).await.unwrap());
         assert!(
             listed["sessions"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|row| row["sid"] == json!(node)),
-            "the node is visible in session_list: {listed}"
+            "the node is visible in agent_read: {listed}"
         );
 
-        let dispatch = run_session_dispatch(
+        let dispatch = run_agent_dispatch(
             &ambient(&principal, "alpha", json!({ "sid": node, "task": "do it" })),
             &gw,
             McpCaller::Ambient,
         )
         .await
         .unwrap_err();
-        let collect = run_session_collect(
+        let collect = run_agent_read_transcript(
             &ambient(&principal, "alpha", json!({ "sid": node })),
             &gw,
             McpCaller::Ambient,
         )
         .await
         .unwrap_err();
-        let stop = run_session_stop(
+        let stop = run_agent_stop(
             &ambient(&principal, "alpha", json!({ "sid": node })),
             &gw,
             McpCaller::Ambient,
@@ -7246,9 +7549,9 @@ mod session_tool_tests {
         .await
         .unwrap_err();
         for (tool, message) in [
-            ("session_dispatch", &dispatch),
-            ("session_collect", &collect),
-            ("session_stop", &stop),
+            ("agent", &dispatch),
+            ("agent_read", &collect),
+            ("agent_stop", &stop),
         ] {
             assert_eq!(
                 message,
@@ -7264,7 +7567,7 @@ mod session_tool_tests {
         }
 
         // The ledger row is the reason, not the caller's auth tier.
-        let admin = run_session_dispatch(
+        let admin = run_agent_dispatch(
             &json!({ "sid": node, "task": "do it" }),
             &gw,
             McpCaller::Admin,
@@ -7273,7 +7576,7 @@ mod session_tool_tests {
         .unwrap_err();
         assert_eq!(
             admin,
-            crate::external_nodes::not_driveable_error("session_dispatch", &node)
+            crate::external_nodes::not_driveable_error("agent", &node)
         );
         // A refused stop is a no-op: the node keeps its place in the ledger.
         assert!(gw.lock().await.is_external_node(&node));
@@ -7292,7 +7595,7 @@ mod session_tool_tests {
         let node = enroll_external_node(&gw, "alpha").await;
 
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &json!({ "project": "alpha", "vendor": "claude", "parent_sid": node }),
                 &gw,
                 McpCaller::Admin,
@@ -7312,7 +7615,7 @@ mod session_tool_tests {
                 max_children: 1,
                 max_delegated: 50,
             });
-        let denied = run_session_spawn(
+        let denied = run_agent_spawn(
             &json!({ "project": "alpha", "vendor": "claude", "parent_sid": node }),
             &gw,
             McpCaller::Admin,
@@ -7323,7 +7626,7 @@ mod session_tool_tests {
         assert!(denied.contains("already has 1 active children"), "{denied}");
 
         // Acceptance comes from the ledger, never from faith in the declaration.
-        let unknown = run_session_spawn(
+        let unknown = run_agent_spawn(
             &json!({ "project": "alpha", "vendor": "claude", "parent_sid": "s999999" }),
             &gw,
             McpCaller::Admin,
@@ -7345,7 +7648,7 @@ mod session_tool_tests {
         let node = enroll_external_node(&gw, "alpha").await;
 
         let external = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &json!({
                     "project": "alpha",
                     "vendor": "claude",
@@ -7370,7 +7673,7 @@ mod session_tool_tests {
 
         // A managed parent has a transport, and keeps it.
         let managed = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(
                     &principal,
                     "alpha",
@@ -7394,7 +7697,7 @@ mod session_tool_tests {
     /// delegated is a HANDOFF, not a delegation: the target has its own parent,
     /// or is a root with its own human. The default `notify` is a default, not a
     /// request, so it must not subscribe the caller to a peer's conversation —
-    /// an edge `session_list` never draws and `session_stop` refuses to take
+    /// an edge `agent_read` never draws and `agent_stop` refuses to take
     /// down. Naming `notify` explicitly still opts in (for exactly one task, per
     /// the watch contract), and the caller's own children are untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7416,7 +7719,7 @@ mod session_tool_tests {
         };
 
         let handoff = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &ambient(
                     &principal,
                     "alpha",
@@ -7430,10 +7733,12 @@ mod session_tool_tests {
         );
         assert_exact_keys(
             &handoff,
-            &["hint", "notify_deliverable", "status", "turn_id"],
+            &["notify_deliverable", "sid", "status", "turn_id"],
         );
         assert_eq!(handoff["notify_deliverable"], false, "{handoff}");
-        assert!(handoff.get("hint").is_some(), "{handoff}");
+        // `notify_deliverable:false` IS the instruction to poll; a prose hint
+        // saying so again is the manual this surface stopped being.
+        assert!(handoff.get("hint").is_none(), "{handoff}");
         let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer)
             .expect("the handoff edge is still recorded in the ledger");
         assert_eq!(watch.parent_sid, principal);
@@ -7445,7 +7750,7 @@ mod session_tool_tests {
 
         // Explicit opt-in still arms the notification.
         let explicit = parse(
-            &run_session_dispatch(
+            &run_agent_dispatch(
                 &ambient(
                     &principal,
                     "alpha",
@@ -7463,7 +7768,7 @@ mod session_tool_tests {
 
         // The caller's OWN child keeps the default notification.
         let child = parse(
-            &run_session_spawn(
+            &run_agent_spawn(
                 &ambient(
                     &principal,
                     "alpha",
@@ -7503,10 +7808,10 @@ mod session_tool_tests {
         let caller = McpCaller::User {
             user_id: "ualice".into(),
         };
-        for tool in ["session_dispatch", "session_collect", "session_stop"] {
+        for tool in ["agent", "agent_read", "agent_stop"] {
             let invoke = |sid: &str| {
                 let mut args = json!({ "sid": sid });
-                if tool == "session_dispatch" {
+                if tool == "agent" {
                     args["task"] = json!("do not leak");
                 }
                 call(tool, args)
@@ -7543,5 +7848,506 @@ mod session_tool_tests {
                 "{tool}: another tenant's node must stay indistinguishable from an unknown sid"
             );
         }
+    }
+}
+
+// ============================================================================
+// The per-caller tool face + the byte budgets it exists to hit, end to end
+// through `dispatch_as` (the face rules themselves are unit-tested in
+// `super::face`).
+// ============================================================================
+#[cfg(test)]
+mod tool_face_tests {
+    use super::session_tool_tests::*;
+    use super::*;
+    use serde_json::json;
+
+    fn compact_len(value: &serde_json::Value) -> usize {
+        serde_json::to_string(value).unwrap().len()
+    }
+
+    fn discovery(method: &str, sid: &str, secret: &str) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": { "arguments": { "_caller_sid": sid, "_caller_secret": secret } }
+        })
+    }
+
+    fn dispatcher(paths: &CcteamPaths, gateway: &GatewayHandle) -> McpDispatch {
+        McpDispatch {
+            paths: paths.clone(),
+            sink: None,
+            pending: None,
+            gateway: Some(std::sync::Arc::clone(gateway)),
+        }
+    }
+
+    /// G1, end to end — a session AT the delegation depth cap is served the
+    /// leaf face and the leaf instructions: one read tool, the depth-cap fact,
+    /// and none of the orchestration policy it could not act on anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_depth_capped_child_is_served_the_leaf_face_and_no_orchestration_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, secrets) = face_gateway(tmp.path()).await;
+        gateway
+            .lock()
+            .await
+            .set_delegation_config(ccteam_core::DelegationConfig {
+                max_depth: 1,
+                ..Default::default()
+            });
+
+        let child = parse(
+            &run_agent(
+                &ambient(&root, "alpha", json!({ "task": "leaf work" })),
+                &gateway,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let dispatch = dispatcher(&paths, &gateway);
+        let child_secret = secret_for(&secrets, &child).await;
+        let listed = dispatch
+            .dispatch_as(
+                discovery("tools/list", &child, &child_secret),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["chat_send_file", "agent_read"],
+            "a capped child may read the team and answer its chat, nothing else"
+        );
+
+        let init = dispatch
+            .dispatch_as(
+                discovery("initialize", &child, &child_secret),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains(&format!("You are {child} in project alpha.")),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains("at the delegation depth cap and cannot hire agents"),
+            "{instructions}"
+        );
+        assert!(
+            !instructions.contains("never shell out to a vendor CLI"),
+            "a session that cannot hire must not be taught how: {instructions}"
+        );
+
+        // The ROOT, by contrast, gets the orchestrating face — and pays for it.
+        let root_secret = secret_for(&secrets, &root).await;
+        let root_list = dispatch
+            .dispatch_as(
+                discovery("tools/list", &root, &root_secret),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        let root_names: Vec<&str> = root_list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(root_names.contains(&"agent"), "{root_names:?}");
+        assert!(
+            root_names.contains(&"chat_send_file"),
+            "a root answers its own human: {root_names:?}"
+        );
+        let root_init = dispatch
+            .dispatch_as(
+                discovery("initialize", &root, &root_secret),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+
+        // G1 — the point of the whole exercise: the leaf's ambient bill is a
+        // fraction of the orchestrator's. (The absolute leaf budget is pinned
+        // in `protocol::tests::leaf_ambient_cost_stays_under_two_kilobytes`.)
+        let leaf_cost = compact_len(&listed["result"]) + instructions.len();
+        let root_cost = compact_len(&root_list["result"])
+            + root_init["result"]["instructions"].as_str().unwrap().len();
+        assert!(
+            leaf_cost * 2 < root_cost,
+            "a leaf must pay less than half an orchestrator's ambient tax \
+             (leaf {leaf_cost} B vs root {root_cost} B)"
+        );
+    }
+
+    /// `agent{tools}` is persisted, so a resume serves the SAME face — and an
+    /// unknown value is refused rather than silently widened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_tools_argument_is_persisted_and_validated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, secrets) = face_gateway(tmp.path()).await;
+
+        for (requested, stored) in [
+            ("read", Some("read")),
+            ("none", Some("none")),
+            ("full", None),
+        ] {
+            let sid = parse(
+                &run_agent(
+                    &ambient(&root, "alpha", json!({ "task": "x", "tools": requested })),
+                    &gateway,
+                    McpCaller::Ambient,
+                    &paths,
+                )
+                .await
+                .unwrap(),
+            )["sid"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let meta = ccteam_harness::execution::session_meta::read_session_meta(tmp.path(), &sid)
+                .unwrap();
+            assert_eq!(meta.tool_face.as_deref(), stored, "tools:{requested}");
+        }
+
+        let err = run_agent(
+            &ambient(&root, "alpha", json!({ "task": "x", "tools": "readonly" })),
+            &gateway,
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "agent: invalid `tools` `readonly` (expected `full` | `read` | `none`)"
+        );
+
+        // A `tools:"none"` child lists nothing, and its instructions say so.
+        let muted = parse(
+            &run_agent(
+                &ambient(&root, "alpha", json!({ "task": "x", "tools": "none" })),
+                &gateway,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dispatch = dispatcher(&paths, &gateway);
+        let muted_secret = secret_for(&secrets, &muted).await;
+        let listed = dispatch
+            .dispatch_as(
+                discovery("tools/list", &muted, &muted_secret),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"], json!({ "tools": [] }));
+        let init = dispatch
+            .dispatch_as(
+                discovery("initialize", &muted, &muted_secret),
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("(no ccteam tools)"));
+    }
+
+    /// G2 — the default `status` body, and the beacon that must be the same
+    /// bytes (it exists for hosts that see names only; a second shape would be
+    /// a second thing to keep true).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_brief_is_tiny_and_the_beacon_is_byte_identical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, secrets) = face_gateway(tmp.path()).await;
+        let secret = secret_for(&secrets, &root).await;
+        let call_status = |name: &'static str, detail: Option<&'static str>| {
+            let gateway = std::sync::Arc::clone(&gateway);
+            let paths = paths.clone();
+            let root = root.clone();
+            let secret = secret.clone();
+            async move {
+                let mut args = json!({ "_caller_sid": root, "_caller_secret": secret });
+                if let Some(detail) = detail {
+                    args["detail"] = json!(detail);
+                }
+                let req = json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": name, "arguments": args }
+                });
+                let resp = execute_status(&req, Some(&gateway), McpCaller::Ambient, &paths).await;
+                resp["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+
+        let brief = call_status("status", None).await;
+        let beacon = call_status(protocol::STATUS_BEACON_TOOL_NAME, None).await;
+        assert_eq!(beacon, brief, "the beacon IS the brief body");
+        assert!(
+            brief.len() <= 300,
+            "status brief is {} B: {brief}",
+            brief.len()
+        );
+        let body: serde_json::Value = serde_json::from_str(&brief).unwrap();
+        assert_eq!(body["project"], "alpha");
+        assert_eq!(body["host"], "local");
+        assert!(body["hire"].is_array());
+        assert!(body["cost_24h_usd"].is_number());
+        // Operator data lives only in `full`.
+        assert!(body.get("daemon").is_none(), "{brief}");
+        assert!(body.get("projects").is_none(), "{brief}");
+
+        // The beacon takes no `detail`: it is the brief body or nothing.
+        let beacon_full = call_status(protocol::STATUS_BEACON_TOOL_NAME, Some("full")).await;
+        assert_eq!(beacon_full, brief);
+
+        let full: serde_json::Value =
+            serde_json::from_str(&call_status("status", Some("full")).await).unwrap();
+        for key in ["models", "vendors", "routing", "daemon", "projects"] {
+            assert!(full.get(key).is_some(), "full must carry `{key}`: {full}");
+        }
+        let bad = call_status("status", Some("everything")).await;
+        assert!(bad.contains("invalid `detail`"), "{bad}");
+    }
+
+    /// G2 — a ten-row roster stays inside its budget, and `tree` describes
+    /// exactly the rows that were returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ten_row_roster_fits_its_budget_and_the_tree_covers_the_rows_returned() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, _secrets) = face_gateway(tmp.path()).await;
+        gateway
+            .lock()
+            .await
+            .set_delegation_config(ccteam_core::DelegationConfig {
+                max_children: 20,
+                ..Default::default()
+            });
+        // Hired straight through the spawn branch (no first task), so the
+        // rows carry no derived title — the worst case for the budget is a
+        // roster of anonymous workers.
+        for _ in 0..12 {
+            run_agent_spawn(
+                &ambient(&root, "alpha", json!({})),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        }
+
+        let roster = parse(
+            &run_agent_read(
+                &ambient(&root, "alpha", json!({ "tree": true })),
+                &gateway,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        let rows = roster["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), AGENT_READ_DEFAULT_N, "default page is 10 rows");
+        assert_eq!(roster["truncated"], json!(true));
+        assert_eq!(roster["total"], json!(13));
+        let bytes = compact_len(&roster);
+        assert!(bytes <= 1200, "10-row roster is {bytes} B: {roster}");
+
+        // Every returned row appears exactly once in the topology, and a
+        // roleless session spells no empty `role`.
+        fn count(node: &serde_json::Value) -> usize {
+            assert!(
+                node.get("role").is_none(),
+                "an empty role must be omitted: {node}"
+            );
+            1 + node["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(count)
+                .sum::<usize>()
+        }
+        let tree_nodes: usize = roster["tree"].as_array().unwrap().iter().map(count).sum();
+        assert_eq!(
+            tree_nodes,
+            rows.len(),
+            "the tree covers the returned rows and nothing else: {roster}"
+        );
+        for row in rows {
+            assert!(row.get("role").is_none(), "empty role omitted: {row}");
+            assert!(row.get("title").is_none(), "{row}");
+        }
+    }
+
+    /// `agent_read{sid}` answers NEWEST-first by default (the overwhelmingly
+    /// common read is "what did it say"), and `since` flips it to forward
+    /// paging without needing `tail:false` spelled out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transcript_reads_newest_first_unless_since_pages_forward() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, _secrets) = face_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent(
+                &ambient(&root, "alpha", json!({ "task": "x", "notify": "off" })),
+                &gateway,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for i in 0..15u32 {
+            ccteam_harness::execution::turns_mirror::append_turn(
+                tmp.path(),
+                &child,
+                &turn(&format!("t{i}")),
+            )
+            .unwrap();
+        }
+
+        let read = |args: serde_json::Value| {
+            let gateway = std::sync::Arc::clone(&gateway);
+            let paths = paths.clone();
+            let args = ambient(&root, "alpha", args);
+            async move {
+                parse(
+                    &run_agent_read(&args, &gateway, McpCaller::Ambient, &paths)
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+
+        let newest = read(json!({ "sid": child })).await;
+        let turns = newest["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), AGENT_READ_DEFAULT_N);
+        assert_eq!(
+            turns.last().unwrap()["turn_id"],
+            "t14",
+            "the default page ends at the newest turn: {newest}"
+        );
+        assert_eq!(turns[0]["turn_id"], "t5");
+
+        let forward = read(json!({ "sid": child, "since": "t1" })).await;
+        let forward_turns = forward["turns"].as_array().unwrap();
+        assert_eq!(
+            forward_turns[0]["turn_id"], "t2",
+            "`since` pages FORWARD from the cursor: {forward}"
+        );
+
+        // An explicit `tail` still wins over the `since`-derived default.
+        let tailed = read(json!({ "sid": child, "since": "t1", "tail": true })).await;
+        assert_eq!(
+            tailed["turns"].as_array().unwrap().last().unwrap()["turn_id"],
+            "t14"
+        );
+    }
+
+    /// "Never seen here" and "you stopped it" are the same absence from the
+    /// live map but two different next moves, so they must not share an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_session_is_not_reported_as_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, _secrets) = face_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent(
+                &ambient(&root, "alpha", json!({ "task": "x", "notify": "off" })),
+                &gateway,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        run_agent_stop(
+            &ambient(&root, "alpha", json!({ "sid": child })),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+
+        let stopped = run_agent(
+            &ambient(&root, "alpha", json!({ "sid": child, "task": "more" })),
+            &gateway,
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            stopped.contains(&format!("{child} was stopped at")),
+            "{stopped}"
+        );
+        assert!(
+            stopped.contains("agent_read still reads it — hire a new one to continue"),
+            "{stopped}"
+        );
+
+        let unknown = run_agent(
+            &ambient(&root, "alpha", json!({ "sid": "s999", "task": "more" })),
+            &gateway,
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown, "agent: unknown session s999 in project alpha");
     }
 }

@@ -1337,7 +1337,7 @@ pub struct VerifyMcpReport {
     pub stub_count: usize,
     /// Number of tools with a real dispatch (= total - stub_count).
     pub active_count: usize,
-    /// Sorted, full tool names (e.g. `session_spawn`) for the
+    /// Sorted, full tool names (e.g. `agent_read`) for the
     /// human-readable + JSON reports.
     pub tool_list: Vec<String>,
     /// Per-group counts (`workflow` → 15, `chat` → 8, ...). Sorted by
@@ -4971,8 +4971,8 @@ mod tests {
         // sync with `tool_definitions_count_matches_spec` (live truth).
         assert_eq!(report.total_tools, report.active_count);
         assert_eq!(
-            report.total_tools, 8,
-            "ships 8 tools (v0.9 T1 cull; 2026-07-26 screenshot cull + status beacon alias)"
+            report.total_tools, 6,
+            "ships 6 tools (status + beacon + chat_send_file + agent/agent_read/agent_stop)"
         );
     }
 

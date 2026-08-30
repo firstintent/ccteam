@@ -72,7 +72,7 @@ async fn call_tool(paths: &CcteamPaths, name: &str, args: Value) -> Value {
         "method": "tools/call",
         "params": { "name": name, "arguments": args }
     });
-    let resp = ccteam_im::mcp::handle_request(paths, &req)
+    let resp = ccteam_im::mcp::handle_request(paths, &req, &ccteam_im::mcp::ToolFace::full())
         .await
         .expect("tools/call expects a response");
     assert_eq!(

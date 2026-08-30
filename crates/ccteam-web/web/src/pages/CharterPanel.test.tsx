@@ -649,9 +649,9 @@ describe("PlaybookCards (编队起手 formations)", () => {
     // The CTA is a real link into the Home launcher.
     expect(html).toContain('href="/"');
     // Honesty line sits under the cards: prefill only, orchestration
-    // happens in-session via session_* — never a shipped prompt.
+    // happens in-session via the `agent` tool — never a shipped prompt.
     expect(html).toContain('data-testid="playbook-honesty"');
-    expect(html).toContain("session_*");
+    expect(html).toContain("agent 工具派工");
   });
 
   it("every 起手 CTA targets `/` with its own one-shot { playbook } state", () => {

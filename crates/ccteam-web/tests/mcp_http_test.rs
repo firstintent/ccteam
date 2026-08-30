@@ -1,7 +1,8 @@
 //! v0.9 T4 — in-process router tests for `POST /mcp`.
 //!
-//! Acceptance: initialize echoes protocolVersion; tools/list matches the
-//! managed Pi bridge readiness contract;
+//! Acceptance: initialize negotiates protocolVersion (and an unsupported
+//! `MCP-Protocol-Version` header is a 400); a full-face tools/list equals the
+//! set the Pi bridge knows;
 //! tools/call status succeeds; no/bad bearer → 401 (auth on AND off);
 //! GET /mcp → 405; notification → 202 empty.
 //!
@@ -12,7 +13,7 @@
 //! `mcp_tenant_bearer_test` for the refusal, and `routes::mcp`'s module doc for
 //! why a credential a static config file can carry must grant nothing).
 //!
-//! Two tests left with that family: `mcp_session_list_admin_bearer_bypasses_cto_gate`
+//! Two tests left with that family: `mcp_agent_read_admin_bearer_bypasses_cto_gate`
 //! (an owner front door that no longer exists) and
 //! `mcp_internal_bus_methods_not_exposed_over_http` (the internal-bus refusal
 //! applies to front-door callers only — every HTTP caller is now an agent
@@ -24,7 +25,7 @@ use std::net::SocketAddr;
 use axum::Router;
 use ccteam_core::enroll::{self, EnrollCredential, EnrollScope};
 use ccteam_core::CcteamPaths;
-use ccteam_harness::PI_REQUIRED_MCP_TOOL_NAMES;
+use ccteam_harness::PI_KNOWN_MCP_TOOL_NAMES;
 use ccteam_web::{router_with_state, AppState, AuthState};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -143,7 +144,94 @@ async fn mcp_initialize_defaults_protocol_version_when_omitted() {
     .await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(
+        body["result"]["protocolVersion"],
+        ccteam_im::mcp::MCP_PROTOCOL_VERSION
+    );
+}
+
+/// The transport's own version gate: a DECLARED revision this server does not
+/// speak is refused at the HTTP layer rather than answered under assumptions
+/// neither side shares. An absent header passes (`initialize` negotiates).
+#[tokio::test]
+async fn mcp_rejects_an_unsupported_protocol_version_header() {
+    let tmp = TempDir::new().unwrap();
+    let (addr, cred) = serve(&tmp, AuthState::disabled()).await;
+    let list = || serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+
+    let bad = client()
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", format!("Bearer {}", cred.bearer()))
+        .header("MCP-Protocol-Version", "1999-01-01")
+        .json(&list())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let body: serde_json::Value = bad.json().await.unwrap();
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("unsupported MCP-Protocol-Version 1999-01-01"),
+        "{message}"
+    );
+    assert!(message.contains("2025-06-18"), "{message}");
+
+    // Gate order: the version refusal beats the body parser — an unsupported
+    // header with MALFORMED JSON is still a 400, never a -32700 parse error.
+    let bad_body = client()
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", format!("Bearer {}", cred.bearer()))
+        .header("MCP-Protocol-Version", "1999-01-01")
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_body.status(),
+        400,
+        "header gate must precede body handling"
+    );
+
+    // Present-but-invalid values are refused, not treated as absent.
+    for degenerate in ["", "   "] {
+        let empty = client()
+            .post(format!("http://{addr}/mcp"))
+            .header("authorization", format!("Bearer {}", cred.bearer()))
+            .header("MCP-Protocol-Version", degenerate)
+            .json(&list())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), 400, "empty header value must refuse");
+    }
+    let non_utf8 = client()
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", format!("Bearer {}", cred.bearer()))
+        .header(
+            "MCP-Protocol-Version",
+            reqwest::header::HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        )
+        .json(&list())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(non_utf8.status(), 400, "non-UTF8 header value must refuse");
+
+    // Every supported revision passes the gate.
+    let id = initialize(addr, &cred.bearer()).await;
+    for known in ccteam_im::mcp::SUPPORTED_PROTOCOL_VERSIONS {
+        let ok = client()
+            .post(format!("http://{addr}/mcp"))
+            .header("authorization", format!("Bearer {}", cred.bearer()))
+            .header("mcp-session-id", &id)
+            .header("MCP-Protocol-Version", *known)
+            .json(&list())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200, "{known}");
+    }
 }
 
 // ── ② tools/list returns the full tool surface ─────────────────────
@@ -173,7 +261,7 @@ async fn mcp_tools_list_returns_the_full_surface() {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
-    let mut expected = PI_REQUIRED_MCP_TOOL_NAMES.to_vec();
+    let mut expected = PI_KNOWN_MCP_TOOL_NAMES.to_vec();
     actual.sort_unstable();
     expected.sort_unstable();
     assert_eq!(actual, expected, "tools={tools:?}");
@@ -209,19 +297,19 @@ async fn mcp_tools_call_status_succeeds() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["result"]["isError"], false);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    // v0.10 T1 — the daemon-aware `status` returns the base health JSON, then
-    // the vendor panel or an honest note appended as trailing plain text
-    // (separated by a blank line). The JSON is the first `\n\n`-delimited chunk.
-    let json_chunk = text.split("\n\n").next().unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(json_chunk).unwrap();
-    assert!(parsed.get("projects").is_some() || parsed.get("orchestrator").is_some());
+    // The whole body is JSON now — no trailing prose panel to parse around.
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert!(parsed.get("projects").is_some(), "{text}");
     assert!(
-        text.contains("the vendor panel is scoped to your own project"),
+        parsed["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("scoped to your"),
         "a projectless caller must be told why the panel is withheld, got: {text}"
     );
     assert!(
-        !text.contains("vendors (project="),
-        "ccteam must not render a panel for a project this caller never named, got: {text}"
+        parsed.get("hire").is_none(),
+        "ccteam must not answer with a host this caller never named, got: {text}"
     );
 }
 

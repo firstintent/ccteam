@@ -1,9 +1,9 @@
 //! Wire-name invariants for the MCP tool surface.
 //!
 //! Names are the part of the protocol an agent actually sees, so they are
-//! locked here: bare `<group>_<rest>` (never `ccteam__`-prefixed, which would
-//! render as the double `mcp__ccteam__ccteam__session_spawn`), the two
-//! prefix-less admin singletons, and no culled or pre-rename name resurrected.
+//! locked here: bare names (never `ccteam__`-prefixed, which would render as
+//! the double `mcp__ccteam__ccteam__agent`), the two prefix-less admin
+//! singletons, and no culled or pre-rename name resurrected.
 //!
 //! These used to shell out to a stdio `mcp-serve` child for `tools/list`; that
 //! transport is deleted, so the listing comes from the protocol core.
@@ -28,7 +28,7 @@ fn tmp_paths() -> (TempDir, CcteamPaths) {
 async fn list_tool_names() -> Vec<String> {
     let (_tmp, paths) = tmp_paths();
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
-    let resp = ccteam_im::mcp::handle_request(&paths, &req)
+    let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
         .await
         .expect("tools/list expects a response");
     resp["result"]["tools"]
@@ -46,7 +46,7 @@ async fn server_name_stays_ccteam_for_v05_muscle_memory() {
     // derives the model-visible namespace from it (`mcp__ccteam__<tool>`).
     let (_tmp, paths) = tmp_paths();
     let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
-    let resp = ccteam_im::mcp::handle_request(&paths, &req)
+    let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
         .await
         .expect("initialize expects a response");
     assert_eq!(resp["result"]["serverInfo"]["name"], "ccteam");
@@ -63,13 +63,14 @@ async fn every_tool_carries_group_subprefix_or_is_singleton() {
         );
         let ok = n == "status"
             || n == "grok_claude_codex_kimi"
+            || n == "agent"
             || n.starts_with("admin_")
             || n.starts_with("workflow_")
             || n.starts_with("chat_")
-            || n.starts_with("session_");
+            || n.starts_with("agent_");
         assert!(
             ok,
-            "tool {n:?} is missing a group sub-prefix (chat_/session_/status)",
+            "tool {n:?} is missing a group sub-prefix (chat_/agent_/status)",
         );
     }
 }
@@ -110,8 +111,14 @@ async fn legacy_v05_unprefixed_names_are_gone() {
         // server key, so the old form double-prefixed for the model).
         "ccteam__status",
         "ccteam__chat_send_file",
-        "ccteam__session_spawn",
-        "ccteam__session_list",
+        // 2026-08-31 merge: spawn+dispatch → `agent`, list+collect →
+        // `agent_read`. Pre-v1.0, so no alias survives.
+        "session_spawn",
+        "session_dispatch",
+        "session_collect",
+        "session_list",
+        "session_stop",
+        "ccteam__agent",
     ] {
         assert!(
             !names.contains(&legacy.to_string()),
@@ -145,7 +152,9 @@ async fn status_and_session_tools_dispatch_as_tool_results() {
     // a tools/call RESULT rather than a transport-shaped failure.
     let names = list_tool_names().await;
     assert!(names.contains(&"status".to_string()));
-    assert!(names.contains(&"session_list".to_string()));
+    assert!(names.contains(&"agent".to_string()));
+    assert!(names.contains(&"agent_read".to_string()));
+    assert!(names.contains(&"agent_stop".to_string()));
     assert!(names.contains(&"chat_send_file".to_string()));
 
     let (_tmp, paths) = tmp_paths();
@@ -154,9 +163,10 @@ async fn status_and_session_tools_dispatch_as_tool_results() {
         "method": "tools/call",
         "params": { "name": "status", "arguments": {} }
     });
-    let resp: Value = ccteam_im::mcp::handle_request(&paths, &req)
-        .await
-        .expect("tools/call expects a response");
+    let resp: Value =
+        ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .expect("tools/call expects a response");
     assert_eq!(
         resp["result"]["isError"], false,
         "status should land as result, not isError"

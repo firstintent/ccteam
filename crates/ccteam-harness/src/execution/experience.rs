@@ -557,6 +557,7 @@ mod tests {
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
             mode: None,
+            tool_face: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: "s1".into(),
@@ -630,6 +631,7 @@ mod tests {
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
             mode: None,
+            tool_face: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: "s1".into(),

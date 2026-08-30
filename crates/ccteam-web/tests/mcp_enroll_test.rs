@@ -3,7 +3,7 @@
 //!
 //! The measured defect this replaces: a `codex` the user started in a terminal
 //! authenticated with the machine-wide admin web token that ccteam had written
-//! into the vendor's global config, so its `session_spawn` children mounted as
+//! into the vendor's global config, so its `agent` children mounted as
 //! ROOTS and landed in a scratch project neither session had named. A static file
 //! is shared by every process that vendor starts, so it can only ever carry
 //! "whose config is this" — the per-process identity has to come from the server,
@@ -105,7 +105,7 @@ fn fake_paths(root: &std::path::Path) -> CcteamPaths {
 
 // ── fixture ──────────────────────────────────────────────────────────────────
 
-/// A harness double, so a `session_spawn` from an enrolled client really lands a
+/// A harness double, so a `agent` from an enrolled client really lands a
 /// session without needing a vendor binary.
 #[derive(Clone)]
 struct FakeVendor {
@@ -395,7 +395,7 @@ async fn a_call_with_the_id_spawns_under_the_node_in_its_own_project() {
         addr,
         &cred.bearer(),
         Some(&id),
-        call_body(2, "session_spawn", json!({ "vendor": "claude" })),
+        call_body(2, "agent", json!({ "vendor": "claude", "task": "hello" })),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -440,7 +440,7 @@ async fn one_credential_two_processes_get_two_nodes() {
             addr,
             &cred.bearer(),
             Some(id),
-            call_body(9, "session_spawn", json!({ "vendor": "claude" })),
+            call_body(9, "agent", json!({ "vendor": "claude", "task": "hello" })),
         )
         .await;
         let body: Value = resp.json().await.unwrap();
@@ -471,7 +471,7 @@ async fn an_id_replayed_under_another_credential_is_404_and_reveals_nothing() {
         addr,
         &other.bearer(),
         Some(&id),
-        call_body(2, "session_list", json!({})),
+        call_body(2, "agent_read", json!({})),
     )
     .await;
     assert_eq!(
@@ -487,7 +487,7 @@ async fn an_id_replayed_under_another_credential_is_404_and_reveals_nothing() {
         addr,
         &other.bearer(),
         Some("ms_0000000000000000000000000000dead"),
-        call_body(2, "session_list", json!({})),
+        call_body(2, "agent_read", json!({})),
     )
     .await;
     assert_eq!(unknown.status(), 404);
@@ -506,7 +506,7 @@ async fn an_id_replayed_under_another_credential_is_404_and_reveals_nothing() {
         addr,
         &mine.bearer(),
         Some(&id),
-        call_body(3, "session_list", json!({})),
+        call_body(3, "agent_read", json!({})),
     )
     .await;
     assert_eq!(
@@ -532,7 +532,7 @@ async fn a_call_without_the_id_is_404_pointing_at_initialize() {
         addr,
         &cred.bearer(),
         None,
-        call_body(2, "session_list", json!({})),
+        call_body(2, "agent_read", json!({})),
     )
     .await;
     assert_eq!(
@@ -548,6 +548,51 @@ async fn a_call_without_the_id_is_404_pointing_at_initialize() {
 }
 
 // ── 6. unbound + unnamed: discovery only, and no guessing ───────────────────
+
+/// An unbound binding's `initialize` must say WHICH projects it may name.
+/// Otherwise its first useful call is guaranteed to be a refusal, and the
+/// list it needs only arrives inside that refusal.
+#[tokio::test]
+#[serial]
+async fn an_unbound_binding_is_told_which_projects_it_may_name() {
+    let tmp = TempDir::new().unwrap();
+    let _env = isolate(&tmp);
+    let paths = fake_paths(tmp.path());
+    let app = state_with_project(&paths).await;
+    let addr = spawn_server(app).await;
+    let cred = mint(&paths, EnrollScope::User);
+
+    let resp = post_mcp(
+        addr,
+        &cred.bearer(),
+        None,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": CLIENT } }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let instructions = body["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("hand-started agent with no project yet"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains(&format!("reachable: {SLUG}")),
+        "the reachable projects must be named up front: {instructions}"
+    );
+    assert!(
+        instructions.contains("never guesses it from a working directory"),
+        "{instructions}"
+    );
+    // It has no ccteam chat, so the chat-envelope paragraph is not its bill.
+    assert!(
+        !instructions.contains("your reply goes back to that chat"),
+        "{instructions}"
+    );
+}
 
 #[tokio::test]
 #[serial]
@@ -587,7 +632,7 @@ async fn a_user_scoped_credential_discovers_but_cannot_act() {
     let body: Value = listed.json().await.unwrap();
     assert_eq!(
         body["result"]["tools"].as_array().unwrap().len(),
-        8,
+        6,
         "{body}"
     );
 
@@ -596,7 +641,7 @@ async fn a_user_scoped_credential_discovers_but_cannot_act() {
         addr,
         &cred.bearer(),
         Some(&id),
-        call_body(3, "session_spawn", json!({ "vendor": "claude" })),
+        call_body(3, "agent", json!({ "vendor": "claude", "task": "hello" })),
     )
     .await;
     assert_eq!(
@@ -670,8 +715,8 @@ async fn a_user_scoped_credential_binds_the_project_it_names() {
         Some(&id),
         call_body(
             2,
-            "session_spawn",
-            json!({ "vendor": "claude", "project": SLUG }),
+            "agent",
+            json!({ "vendor": "claude", "task": "hello", "project": SLUG }),
         ),
     )
     .await;
@@ -712,8 +757,8 @@ async fn a_user_scoped_credential_binds_the_project_it_names() {
         Some(&id),
         call_body(
             3,
-            "session_spawn",
-            json!({ "vendor": "claude", "project": SLUG }),
+            "agent",
+            json!({ "vendor": "claude", "task": "hello", "project": SLUG }),
         ),
     )
     .await;
@@ -748,7 +793,7 @@ async fn a_second_call_naming_another_project_is_refused_and_the_binding_holds()
         addr,
         &cred.bearer(),
         Some(&id),
-        call_body(2, "session_list", json!({ "project": SLUG })),
+        call_body(2, "agent_read", json!({ "project": SLUG })),
     )
     .await;
     let body: Value = first.json().await.unwrap();
@@ -762,11 +807,7 @@ async fn a_second_call_naming_another_project_is_refused_and_the_binding_holds()
         addr,
         &cred.bearer(),
         Some(&id),
-        call_body(
-            3,
-            "session_spawn",
-            json!({ "vendor": "claude", "project": OTHER }),
-        ),
+        call_body(3, "agent", json!({ "vendor": "claude", "project": OTHER })),
     )
     .await;
     assert_eq!(
@@ -798,7 +839,7 @@ async fn a_second_call_naming_another_project_is_refused_and_the_binding_holds()
     );
 }
 
-/// The refusal text of a `session_spawn` that named `slug`, as the AGENT reads
+/// The refusal text of a `agent` that named `slug`, as the AGENT reads
 /// it. A helper rather than a closure so the same credential can probe twice —
 /// which is the whole assertion below.
 async fn spawn_refusal(addr: SocketAddr, bearer: &str, id: &str, slug: &str) -> String {
@@ -806,11 +847,7 @@ async fn spawn_refusal(addr: SocketAddr, bearer: &str, id: &str, slug: &str) -> 
         addr,
         bearer,
         Some(id),
-        call_body(
-            2,
-            "session_spawn",
-            json!({ "vendor": "claude", "project": slug }),
-        ),
+        call_body(2, "agent", json!({ "vendor": "claude", "project": slug })),
     )
     .await;
     assert_eq!(
@@ -945,7 +982,7 @@ async fn delete_ends_the_binding_the_principal_and_the_node() {
         addr,
         &cred.bearer(),
         Some(&id),
-        call_body(2, "session_list", json!({})),
+        call_body(2, "agent_read", json!({})),
     )
     .await;
     assert_eq!(after.status(), 404);
@@ -1000,8 +1037,8 @@ async fn the_admin_web_token_is_refused_and_cannot_ride_a_binding() {
         Some(&id),
         call_body(
             2,
-            "session_spawn",
-            json!({ "vendor": "claude", "project": SLUG }),
+            "agent",
+            json!({ "vendor": "claude", "task": "hello", "project": SLUG }),
         ),
     )
     .await;
@@ -1058,8 +1095,13 @@ async fn a_bound_client_gets_the_vendor_panel_for_its_own_project() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["result"]["isError"], false, "{body}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let status: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        status["project"], SLUG,
+        "a bound client's status names its own project, got: {text}"
+    );
     assert!(
-        text.contains(&format!("vendors (project={SLUG}")),
-        "a bound client's panel names its own project, got: {text}"
+        status["hire"].is_array(),
+        "brief status lists what this host can hire: {text}"
     );
 }

@@ -16,6 +16,7 @@ use tempfile::TempDir;
 fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionMeta {
     SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid.into(),

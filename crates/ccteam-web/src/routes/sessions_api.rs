@@ -223,7 +223,7 @@ async fn gate_sid(app: &AppState, identity: &crate::auth::Identity, sid: &str) -
 /// One project's activity resolver, snapshotted once and asked per session —
 /// the SHARED path every web surface answers "what is this session doing"
 /// through (`working|idle|stale|stuck`), so the session rail, the team graph,
-/// MCP `session_list` and a phone's `/status` card can never tell the user
+/// MCP `agent_read` and a phone's `/status` card can never tell the user
 /// different things about one session.
 ///
 /// The project snapshot + its staleness baseline are computed ONCE per project
@@ -672,7 +672,7 @@ fn rename_payload(renamed: &ccteam_im::gateway::SessionRename) -> serde_json::Va
 
 /// Reconstruct a session's history from its ccteam-owned transcript mirror
 /// `<project_dir>/.ccteam/chat/<sid>/turns.jsonl` (the same file the W1
-/// `session_collect` path reads). Each [`TurnRecord`] becomes one event
+/// `agent_read` path reads). Each [`TurnRecord`] becomes one event
 /// object; any read error folds to an empty page — a best-effort history
 /// view (an absent file is the legitimate first-turn case). Split out from the
 /// handler so the disk → events mapping is unit-testable without a live

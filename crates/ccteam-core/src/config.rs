@@ -50,7 +50,7 @@ pub struct CcteamConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects_root: Option<PathBuf>,
 
-    /// Optional project slug used by admin MCP `session_spawn` after the
+    /// Optional project slug used by an admin MCP `agent` spawn after the
     /// explicit/cwd/sole-project tiers. The slug is validated against the
     /// live catalog at use time; an absent or stale value is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]

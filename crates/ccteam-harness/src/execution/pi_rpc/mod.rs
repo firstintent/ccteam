@@ -26,7 +26,7 @@ use bridge::{
 };
 pub use bridge::{
     bridge_source, PiApprovalDecision, PiDialogKind, PiDialogRequest, PiDialogResponse,
-    PiInteractionResolver, REQUIRED_MCP_TOOL_NAMES,
+    PiInteractionResolver, KNOWN_MCP_TOOL_NAMES,
 };
 use protocol::{
     response_data, PiAvailableModels, PiContextUsage, PiEvent, PiExtensionUiRequest, PiModel,

@@ -278,7 +278,7 @@ async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     let body: Value = resp.json().await.unwrap();
@@ -298,7 +298,7 @@ async fn a_spawning_principal_can_list_its_tools_but_not_call_them() {
     assert_eq!(resp.status(), 401);
 }
 
-/// The full sid-bearer round-trip: session_list + session_spawn (with the slug
+/// The full sid-bearer round-trip: agent_read + agent (with the slug
 /// derived server-side) both succeed under `ccteam-sid:<sid>:<secret>`.
 #[tokio::test]
 async fn session_bearer_round_trip_list_and_spawn() {
@@ -308,12 +308,12 @@ async fn session_bearer_round_trip_list_and_spawn() {
     let addr = spawn_server(app).await;
     let bearer = format!("ccteam-sid:{sid}:{secret}");
 
-    // session_list authenticates by principal and reaches the live gateway.
+    // agent_read authenticates by principal and reaches the live gateway.
     let resp = post_mcp(
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -322,13 +322,13 @@ async fn session_bearer_round_trip_list_and_spawn() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("\"sessions\""), "got: {text}");
 
-    // session_spawn with NO caller-supplied project — the slug is derived
+    // agent with NO caller-supplied project — the slug is derived
     // server-side from the caller's session (demo). Roleless keeps it simple.
     let resp = post_mcp(
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"session_spawn","arguments":{"vendor":"claude"}}}),
+               "params":{"name":"agent","arguments":{"vendor":"claude","task":"hello"}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -343,6 +343,38 @@ async fn session_bearer_round_trip_list_and_spawn() {
     );
     // v0.9.2 — an Ambient spawn carries the delegation-parent edge: the
     // server-verified caller sid, depth = parent + 1, and the caller label.
+}
+
+/// The per-caller face reaches the wire: a session bearer's `initialize` is
+/// answered with instructions that NAME the caller. Without the transport
+/// injecting the caller identity on non-`tools/call` methods, the daemon can
+/// only serve the anonymous full face, and a leaf pays an orchestrator's bill.
+#[tokio::test]
+async fn initialize_under_a_session_bearer_states_the_caller_identity() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
+    let addr = spawn_server(app).await;
+    let bearer = format!("ccteam-sid:{sid}:{secret}");
+
+    // No `params` at all — the shape a minimal client actually sends.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let instructions = body["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(&format!("You are {sid} in project demo.")),
+        "identity line missing: {instructions}"
+    );
+    assert!(
+        instructions.contains("Read those files before answering"),
+        "the attachment policy is unconditional: {instructions}"
+    );
 }
 
 /// THE v0.9.2 regression: with the web gate ENABLED (production default — the
@@ -382,7 +414,7 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"session_spawn","arguments":{"vendor":"claude"}}}),
+               "params":{"name":"agent","arguments":{"vendor":"claude","task":"hello"}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -400,7 +432,7 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
         addr,
         &format!("ccteam:{TOKEN_HEX}"),
         json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
-               "params":{"name":"session_spawn","arguments":{"vendor":"claude","project":"demo"}}}),
+               "params":{"name":"agent","arguments":{"vendor":"claude","task":"hello","project":"demo"}}}),
     )
     .await;
     assert_eq!(
@@ -450,8 +482,8 @@ async fn a_declared_parent_sid_never_overrides_a_verified_session_principal() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"session_spawn",
-                         "arguments":{"vendor":"claude","parent_sid":"s404"}}}),
+               "params":{"name":"agent",
+                         "arguments":{"vendor":"claude","task":"hello","parent_sid":"s404"}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -494,7 +526,7 @@ async fn codex_http_thread_config_passes_session_principal_gate() {
         addr,
         bearer,
         json!({"jsonrpc":"2.0","id":41,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -513,7 +545,7 @@ async fn codex_http_thread_config_passes_session_principal_gate() {
 /// Real-machine acceptance for the deferred Codex HTTP migration. It starts
 /// the installed `codex app-server`, gives it an HTTP global ccteam entry plus
 /// a per-thread session override, then asks Codex itself to call
-/// `session_spawn` through `/mcp`. The project is intentionally omitted: only
+/// `agent` through `/mcp`. The project is intentionally omitted: only
 /// a successfully authenticated session principal can derive `demo`
 /// server-side, so a call that rode the global entry's enrollment credential
 /// instead of the per-thread principal fails.
@@ -624,7 +656,7 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
             "params":{
                 "threadId":thread_id,
                 "server":"ccteam",
-                "tool":"session_spawn",
+                "tool":"agent",
                 "arguments":{"vendor":"claude"}
             }
         }),
@@ -639,8 +671,8 @@ async fn real_codex_http_mcp_passes_session_principal_gate() {
     let text = called
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
-        .expect("session_spawn returns MCP text content");
-    let spawned: Value = serde_json::from_str(text).expect("session_spawn result is JSON");
+        .expect("agent returns MCP text content");
+    let spawned: Value = serde_json::from_str(text).expect("agent result is JSON");
     assert!(spawned["sid"].is_string(), "real Codex MCP call: {spawned}");
 
     child.kill().await.ok();
@@ -660,7 +692,7 @@ async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
         addr,
         &format!("ccteam-sid:{sid}:ffffffffffffffffffffffffffffffff"),
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     assert_eq!(wrong.status(), 401, "wrong secret → 401");
@@ -669,7 +701,7 @@ async fn session_bearer_wrong_secret_or_unknown_sid_is_401() {
         addr,
         "ccteam-sid:s999:deadbeefdeadbeefdeadbeefdeadbeef",
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     assert_eq!(unknown.status(), 401, "unknown sid → 401");
@@ -691,7 +723,7 @@ async fn session_bearer_denied_after_stop() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     assert_eq!(ok.status(), 200);
@@ -703,7 +735,7 @@ async fn session_bearer_denied_after_stop() {
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-               "params":{"name":"session_list","arguments":{}}}),
+               "params":{"name":"agent_read","arguments":{}}}),
     )
     .await;
     assert_eq!(denied.status(), 401, "stale bearer after stop → 401");

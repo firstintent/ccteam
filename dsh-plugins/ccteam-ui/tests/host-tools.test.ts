@@ -3,17 +3,15 @@ import { SessionCredentialStore } from '../src/credentials.js'
 import { CcteamMcpClient, CcteamMcpClientPool, CCTEAM_TOOL_DEFINITIONS, registerCcteamTools } from '../src/tools.js'
 
 describe('ccteam tools', () => {
-  it('keeps the original MCP tool registration count and names', () => {
+  it('mirrors the daemon MCP tool surface: six tools, exact names', () => {
     const names = CCTEAM_TOOL_DEFINITIONS.map(tool => tool.name).sort()
-    expect(CCTEAM_TOOL_DEFINITIONS).toHaveLength(8)
+    expect(CCTEAM_TOOL_DEFINITIONS).toHaveLength(6)
     expect(names).toEqual([
+      'agent',
+      'agent_read',
+      'agent_stop',
       'chat_send_file',
       'grok_claude_codex_kimi',
-      'session_collect',
-      'session_dispatch',
-      'session_list',
-      'session_spawn',
-      'session_stop',
       'status',
     ])
   })
@@ -175,7 +173,7 @@ describe('ccteam tools', () => {
       }),
     })
 
-    const result = await client.callTool('session_spawn', { task: 'x' })
+    const result = await client.callTool('agent', { task: 'x' })
 
     expect(result.isError).toBe(true)
     expect(result.content[0]?.text).toBe('name a workspace: alpha, beta')

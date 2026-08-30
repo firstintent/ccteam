@@ -238,11 +238,14 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_sha: Option<BTreeMap<String, String>>,
     /// v0.8.24 F5 — which surface triggered session creation:
-    /// `im` | `web` | `mcp` | `session_spawn`. Legacy metas parse as `None`.
+    /// `im` | `web` | `mcp` | `session_spawn`. The last is an event-provenance
+    /// TAG whose value predates the `agent` tool rename and is deliberately
+    /// unchanged: renaming a recorded fact rewrites history. Legacy metas
+    /// parse as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
     /// v0.9.0 W2 (F2) — delegation parent: the sid of the session whose
-    /// principal spawned this one via `session_spawn`. `None` for a
+    /// principal spawned this one via `agent`. `None` for a
     /// human-created (root) session. Legacy metas parse as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_sid: Option<String>,
@@ -256,12 +259,23 @@ pub struct SessionMeta {
     /// `delegation.max_depth` guardrail caps this. Legacy metas parse as `0`.
     #[serde(default)]
     pub delegation_depth: u32,
+    /// Which ccteam MCP tool face this session is served at `initialize` /
+    /// `tools/list`: `None` = the full face, `"read"` = read-only
+    /// (`agent_read`), `"none"` = no ccteam tools at all. Chosen by the
+    /// spawner (`agent{tools}`); sessions created from REST/IM carry `None`.
+    ///
+    /// It lives here rather than in the live map because the face is
+    /// recomputed on every process start (a resume is a new process), and a
+    /// released session's next resume must serve the same face its parent
+    /// asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_face: Option<String>,
     /// Who runs the process behind this session — see [`ManagedBy`]. Legacy
     /// metas parse as [`ManagedBy::Ccteam`], which is what they all are.
     #[serde(default)]
     pub managed_by: ManagedBy,
     /// RFC3339 timestamp of the user's EXPLICIT stop (`/stop`, `POST
-    /// /sessions/{sid}/stop`, `session_stop`), or `None` for a session that is
+    /// /sessions/{sid}/stop`, `agent_stop`), or `None` for a session that is
     /// merely not resident right now.
     ///
     /// This is the one fact that separates the two ways a session can be
@@ -280,7 +294,7 @@ impl SessionMeta {
     /// message: a managed session the user has not explicitly stopped.
     ///
     /// The single predicate behind "released" everywhere — the boot
-    /// reconcile, the route scrub, the `/sessions` + `session_list` listings
+    /// reconcile, the route scrub, the `/sessions` + `agent_read` listings
     /// and the `/status` fleet count all ask it here so they cannot drift
     /// into three different ideas of which sessions still exist.
     pub fn is_resumable(&self) -> bool {
@@ -531,6 +545,7 @@ mod title_tests {
     fn blank_meta() -> SessionMeta {
         SessionMeta {
             mode: None,
+            tool_face: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: "s1".into(),

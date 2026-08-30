@@ -3063,6 +3063,7 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
     // vendor_uuid is persisted in meta.json (what apply_new_session writes).
     let meta = ccteam_harness::SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: "codex-r1".into(),

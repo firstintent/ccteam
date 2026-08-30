@@ -321,6 +321,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let sid = "s-resume";
     let meta = SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid.into(),
@@ -415,6 +416,7 @@ async fn resume_carries_mcp_servers() {
 
     let meta = SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid.into(),

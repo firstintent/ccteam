@@ -78,7 +78,10 @@ pub(crate) enum DelegationOutcome {
     },
 }
 
-pub(crate) const INLINE_RESULT_MAX_CHARS: usize = 10_000;
+/// Cap on the answer text an INLINE `agent{wait}` result carries. The caller
+/// asked to block on this answer, so it gets more than a notification does —
+/// but not a transcript: `agent_read{sid,tail:true}` is one call away.
+pub(crate) const INLINE_RESULT_MAX_CHARS: usize = 4_000;
 
 pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option<u64> {
     status
@@ -88,7 +91,12 @@ pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option
 }
 
 impl DelegationSummary<'_> {
-    pub(crate) fn notification_text(&self) -> String {
+    /// The completion turn the parent receives. `max_chars` is the excerpt cap
+    /// its watch asked for ([`NOTIFICATION_ANSWER_MAX_CHARS`] for `final`,
+    /// [`BRIEF_NOTIFICATION_ANSWER_MAX_CHARS`] for `brief`): the wake-up POINT
+    /// is a property of the task, how much rides along is the parent's context
+    /// budget, so they are separate axes.
+    pub(crate) fn notification_text(&self, max_chars: usize) -> String {
         let outcome = match &self.outcome {
             DelegationOutcome::Done => format!("{} done", self.sid),
             DelegationOutcome::Failed { kind, .. } => format!(
@@ -107,11 +115,9 @@ impl DelegationSummary<'_> {
             ),
             None => format!("{outcome} · turn {}", self.turn),
         };
-        let answer = truncate_head_tail_with_marker(
-            self.answer.trim(),
-            NOTIFICATION_ANSWER_MAX_CHARS,
-            |omitted| full_answer_marker(omitted, self.sid),
-        );
+        let answer = truncate_head_tail_with_marker(self.answer.trim(), max_chars, |omitted| {
+            full_answer_marker(omitted, self.sid)
+        });
         if answer.text.is_empty() {
             first
         } else {
@@ -121,6 +127,7 @@ impl DelegationSummary<'_> {
 
     pub(crate) fn inline_result(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut result = serde_json::Map::new();
+        result.insert("sid".into(), serde_json::json!(self.sid));
         result.insert("turn_id".into(), serde_json::json!(self.turn_id));
         result.insert("turn".into(), serde_json::json!(self.turn));
         let (kind, error) = match &self.outcome {
@@ -231,16 +238,33 @@ pub(crate) fn truncate_head_tail_with_marker(
     }
 }
 
-/// Max characters of child answer embedded in a completion notification.
-pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 4_000;
+/// Max characters of child answer embedded in a `final` completion
+/// notification — the default. A parent that wants the whole thing calls
+/// `agent_read`; a parent that wants less asks for `notify:"brief"`.
+pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 2_000;
+
+/// The `notify:"brief"` excerpt cap: enough to know what happened, cheap
+/// enough to wake a parent on many children.
+pub const BRIEF_NOTIFICATION_ANSWER_MAX_CHARS: usize = 500;
+
+/// The excerpt cap a watch's notify mode asks for.
+pub fn notification_answer_max_chars(mode: ccteam_harness::NotifyMode) -> usize {
+    match mode {
+        ccteam_harness::NotifyMode::Brief => BRIEF_NOTIFICATION_ANSWER_MAX_CHARS,
+        _ => NOTIFICATION_ANSWER_MAX_CHARS,
+    }
+}
 
 pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
-    format!("…[+{omitted} chars: session_collect{{sid:{child_sid},tail:true}}]…")
+    format!("…[+{omitted} chars: agent_read{{sid:{child_sid},tail:true}}]…")
 }
 
 /// Render the ordinary user-role completion turn sent to the parent.
-pub(crate) fn build_notification_text_with_outcome(summary: &DelegationSummary<'_>) -> String {
-    summary.notification_text()
+pub(crate) fn build_notification_text_with_outcome(
+    summary: &DelegationSummary<'_>,
+    max_chars: usize,
+) -> String {
+    summary.notification_text(max_chars)
 }
 
 /// Build the interim-note notification (an `all`-mode watch only): the child
@@ -442,7 +466,7 @@ mod tests {
             cost_usd: None,
             answer: "hello",
         }
-        .notification_text();
+        .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
         assert_eq!(t, "s444 done · turn 3 · ctx 31%\nhello");
         assert!(!t.contains("[ccteam]"));
         assert!(!t.contains("--- final answer ---"));
@@ -462,7 +486,7 @@ mod tests {
             answer: "wave done",
         };
         assert_eq!(
-            build_notification_text_with_outcome(&summary),
+            build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
             "s69 done · turn 3 · ctx 3%\nwave done"
         );
     }
@@ -491,7 +515,7 @@ mod tests {
             "HEAD{}TAIL",
             "x".repeat(NOTIFICATION_ANSWER_MAX_CHARS + 500)
         );
-        let t = DelegationSummary {
+        let summary = DelegationSummary {
             sid: "s1",
             turn_id: "s1-1",
             turn: 4,
@@ -499,14 +523,54 @@ mod tests {
             context_pct: None,
             cost_usd: None,
             answer: &long,
+        };
+        // `final` (the default) and `brief` differ only in the excerpt cap.
+        for cap in [
+            NOTIFICATION_ANSWER_MAX_CHARS,
+            BRIEF_NOTIFICATION_ANSWER_MAX_CHARS,
+        ] {
+            let t = summary.notification_text(cap);
+            assert!(t.contains("HEAD"));
+            assert!(t.contains("TAIL"));
+            assert!(t.contains("…[+"));
+            assert!(t.contains("agent_read{sid:s1,tail:true}"));
+            let embedded = t.split_once('\n').unwrap().1;
+            assert_eq!(embedded.chars().count(), cap);
         }
-        .notification_text();
-        assert!(t.contains("HEAD"));
-        assert!(t.contains("TAIL"));
-        assert!(t.contains("…[+"));
-        assert!(t.contains("session_collect{sid:s1,tail:true}"));
-        let embedded = t.split_once('\n').unwrap().1;
-        assert_eq!(embedded.chars().count(), NOTIFICATION_ANSWER_MAX_CHARS);
+    }
+
+    /// G3 — the defaults halved, and `brief` is a quarter of that.
+    #[test]
+    fn notification_caps_are_the_documented_tiers() {
+        use ccteam_harness::NotifyMode;
+        assert_eq!(NOTIFICATION_ANSWER_MAX_CHARS, 2_000);
+        assert_eq!(BRIEF_NOTIFICATION_ANSWER_MAX_CHARS, 500);
+        assert_eq!(INLINE_RESULT_MAX_CHARS, 4_000);
+        assert_eq!(notification_answer_max_chars(NotifyMode::Final), 2_000);
+        assert_eq!(notification_answer_max_chars(NotifyMode::Brief), 500);
+        assert_eq!(notification_answer_max_chars(NotifyMode::All), 2_000);
+    }
+
+    /// The inline result names the session it came from: an `agent` reply is
+    /// the only place a caller learns the sid it just hired.
+    #[test]
+    fn inline_result_carries_the_child_sid() {
+        let result = DelegationSummary {
+            sid: "s5",
+            turn_id: "s5-1",
+            turn: 1,
+            outcome: DelegationOutcome::Done,
+            context_pct: None,
+            cost_usd: None,
+            answer: "ok",
+        }
+        .inline_result();
+        assert_eq!(result["sid"], serde_json::json!("s5"));
+        assert_eq!(result["status"], serde_json::json!("completed"));
+        assert_eq!(result["result_text"], serde_json::json!("ok"));
+        // A completed answer of "ok" must stay tiny.
+        let bytes = serde_json::to_string(&result).unwrap().len();
+        assert!(bytes <= 250, "inline completion is {bytes} B: {result:?}");
     }
 
     #[test]
@@ -524,7 +588,7 @@ mod tests {
             answer: "oops",
         };
         assert_eq!(
-            build_notification_text_with_outcome(&summary),
+            build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
             "s444 FAILED (turn_timeout) · turn 3 · ctx 31%\noops"
         );
     }
@@ -540,7 +604,7 @@ mod tests {
             cost_usd: None,
             answer: "ok",
         }
-        .notification_text();
+        .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
         assert_eq!(t.lines().next(), Some("s444 done · turn 3"));
     }
 

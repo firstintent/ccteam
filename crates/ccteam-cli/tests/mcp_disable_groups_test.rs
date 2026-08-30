@@ -57,7 +57,7 @@ fn disable_unset_returns_all_visible_groups() {
         !names.contains(&"screenshot".to_string()),
         "screenshot was culled 2026-07-26; got {names:?}"
     );
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 6);
 }
 
 #[test]
@@ -70,6 +70,7 @@ fn disable_chat_hides_chat_keeps_others() {
     }
     assert!(!names.iter().any(|n| n.starts_with("chat_")));
     assert!(names.contains(&"status".to_string()));
+    assert_eq!(names.len(), 5);
 }
 
 #[test]
@@ -108,6 +109,19 @@ fn disable_unknown_token_is_silently_ignored() {
     );
 }
 
+/// Disabling the session group leaves discovery + chat: 2 admin + 1 chat = 3.
+#[test]
+fn disable_session_leaves_discovery_and_chat() {
+    let names = names_with_disable(Some("session"));
+    assert_eq!(names.len(), 3, "{names:?}");
+    for kept in ["status", "grok_claude_codex_kimi", "chat_send_file"] {
+        assert!(names.contains(&kept.to_string()), "{names:?}");
+    }
+    for gone in ["agent", "agent_read", "agent_stop"] {
+        assert!(!names.contains(&gone.to_string()), "{names:?}");
+    }
+}
+
 #[test]
 fn disable_all_groups_returns_empty_list() {
     let names = names_with_disable(Some("admin,workflow,chat,session"));
@@ -127,5 +141,5 @@ fn disable_workflow_preserves_other_groups() {
     for g in ["admin", "chat", "session"] {
         assert!(groups.contains(g), "group `{g}` should still be present");
     }
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 6);
 }

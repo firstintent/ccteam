@@ -378,7 +378,7 @@ for raw in sys.stdin:
         emit({"type": "agent_start"})
         if message == "bridge-tools":
             mcp_call("tools/call", {"name": "status", "arguments": {}}, "pi-tool-status")
-            mcp_call("tools/call", {"name": "session_list", "arguments": {}}, "pi-tool-list")
+            mcp_call("tools/call", {"name": "agent_read", "arguments": {}}, "pi-tool-list")
             assistant("stop", "bridge-tools-ok")
             emit({"type": "agent_settled"})
             continue

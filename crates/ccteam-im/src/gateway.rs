@@ -662,12 +662,12 @@ pub struct Gateway {
     /// of `delegations`; notifier drops unwatched/non-boundary signals without
     /// ever joining the gateway mutex queue.
     delegation_watch_set: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// v0.9.0 W2 (F7) — idempotency cache for `session_spawn` (per-project
+    /// v0.9.0 W2 (F7) — idempotency cache for `agent` (per-project
     /// `key → response body`). In-memory only (honest: a daemon restart forgets
     /// keys); within one lifetime a replay returns the original body + zero
     /// side effects.
     spawn_idem: crate::delegation::IdemCache,
-    /// v0.9.0 W2 (F7) — idempotency cache for `session_dispatch` (per-child
+    /// v0.9.0 W2 (F7) — idempotency cache for `agent` (per-child
     /// `key → response body`). Same honest in-memory scope as `spawn_idem`.
     dispatch_idem: crate::delegation::IdemCache,
     /// v0.9.0 W2 (F2) — sender the detached event pumps use to signal a
@@ -1340,7 +1340,7 @@ pub struct StartOutcome {
 /// `model:` for the model, vendor default for effort). Passed by value
 /// through `create_session_api_on_host` → `start_session` →
 /// `plan_new_session`, and filled by every entry point: REST
-/// (`spawn_tuning_from_form`), MCP `session_spawn`, IM `/new model= effort=`.
+/// (`spawn_tuning_from_form`), MCP `agent`, IM `/new model= effort=`.
 ///
 /// **No entry point may second-guess it.** Both facets ride to the vendor
 /// verbatim for every vendor; ccteam does not filter them against any cached
@@ -1618,7 +1618,19 @@ pub struct CallerCtx {
     pub depth: u32,
 }
 
-/// v0.9.0 W2 (F2/F5) — the resolved delegation parent for a `session_spawn`.
+/// One lock hold's worth of facts for the MCP tool-face resolver
+/// ([`Gateway::session_face_context`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFaceContext {
+    /// Project working dir holding `.ccteam/chat/<sid>/meta.json`.
+    pub project_dir: PathBuf,
+    /// `delegation.max_depth` in force right now.
+    pub max_depth: u32,
+    /// A chat is wired to this session, so `chat_send_file` can reach one.
+    pub has_reply_target: bool,
+}
+
+/// v0.9.0 W2 (F2/F5) — the resolved delegation parent for an `agent` spawn.
 /// `Some` for an Ambient (agent-initiated) spawn — the child links to it and
 /// the F5 guardrails apply; `None` for an Admin/human spawn (root, unrestricted).
 #[derive(Debug, Clone)]
@@ -1744,9 +1756,13 @@ struct NewSessionPlan {
     spawned_by_role: Option<String>,
     /// v0.9.0 W2 (F2/F5) — delegation depth (root = 0; child = parent + 1).
     delegation_depth: u32,
-    /// v0.9.0 W2 (F2) — explicit session title from `session_spawn` (ledger /
+    /// v0.9.0 W2 (F2) — explicit session title from `agent` (ledger /
     /// display). `None` → auto-titled from the first message. Never a prompt.
     title: Option<String>,
+    /// The MCP tool face this session is served (`agent{tools}`): `None` =
+    /// full, `"read"` / `"none"` narrow it. Persisted into `meta.tool_face`
+    /// so every later resume answers the same face.
+    tool_face: Option<String>,
     /// v0.9.0 W3 (F3) — the exec-bridge target when `host != local`, already
     /// resolved (+ gated) by the caller's `prepare_host_for_spawn` await
     /// BEFORE `plan_new_session` mints the sid (a fresh spawn must never
@@ -2548,7 +2564,7 @@ impl Gateway {
         self.spawn_event_pump(&sid);
         // Every resume/rebuild path funnels through here, so the "a session
         // being driven again is no longer stopped" rule is written ONCE.
-        self.clear_session_stopped(&sid);
+        self.clear_explicit_stop(&sid);
         if let Some((slug, cwd, body)) = post_mortem {
             // The previous body exited unobserved: let the watcher recover
             // what it said (vendor record) and report it — AFTER the session
@@ -2594,7 +2610,7 @@ impl Gateway {
     /// Being merely non-resident is NOT gone: a released session (and a
     /// detached body) keeps its chat's focus, because the next message resumes
     /// exactly that sid. The ownership check also scrubs routes persisted by an
-    /// older buggy session_spawn that bound a tenant project's sid to the admin
+    /// older buggy agent that bound a tenant project's sid to the admin
     /// web chat.
     fn drop_dead_session_routes(&self) {
         let mut memo = ProjectPrincipalMemo::new();
@@ -2924,7 +2940,7 @@ impl Gateway {
         outcomes
     }
 
-    /// An EXPLICIT user stop of a detached body (`/stop`, `session_stop`,
+    /// An EXPLICIT user stop of a detached body (`/stop`, `agent_stop`,
     /// project stop): SIGTERM → grace → SIGKILL, then forget it. Returns
     /// `Ok(true)` when `sid` was detached and is now stopped; `Ok(false)` when
     /// `sid` was not detached (the caller continues with its own path).
@@ -3414,7 +3430,7 @@ impl Gateway {
     }
 
     /// v0.10 T1 — the execution host bound to a project (sync, no shellout),
-    /// for the `session_spawn` availability pre-check. Any resolve miss → the
+    /// for the `agent` availability pre-check. Any resolve miss → the
     /// local host (the overwhelming common case). Read-only, holds no
     /// `.await`.
     pub(crate) fn project_bound_host(&self, slug: &str) -> String {
@@ -3442,7 +3458,7 @@ impl Gateway {
     }
 
     /// v0.10 T1 — a satellite host's last control-channel agent report for the
-    /// `session_spawn` availability discovery: `(online, heartbeat_age_secs,
+    /// `agent` availability discovery: `(online, heartbeat_age_secs,
     /// agents)`. `None` when the daemon has no home / registry, or the host is
     /// not registered (the caller then does not block — the existing
     /// offline/unknown-host gate in `prepare_host_for_spawn` owns those). Reads
@@ -4712,7 +4728,7 @@ impl Gateway {
             String::new(),
             String::new(),
             // Implicit first-message spawn stays skip — HITL is opt-in via
-            // `/new … hitl` / API / session_spawn.
+            // `/new … hitl` / API / agent.
             PermissionMode::Skip,
             // v0.8.11 E2 — defaults to the stream-json protocol (a pure chat
             // session with no terminal needs).
@@ -4993,7 +5009,7 @@ impl Gateway {
         let adapter = (self.adapter_factory)(vendor, protocol);
         // Ownership is decided HERE, the one sync core every fresh spawn funnels
         // through (IM `/new` → `start_session`, REST `POST …/sessions` →
-        // `create_session_api_tuned`, MCP `session_spawn` →
+        // `create_session_api_tuned`, MCP `agent` →
         // `create_delegated_session`), so a future entry inherits it for free
         // instead of needing its own patch. project 是归属单元, session 继承: a
         // tenant-owned project stamps its own principal even when a fleet-wide
@@ -5028,6 +5044,7 @@ impl Gateway {
             spawned_by_role: None,
             delegation_depth: 0,
             title: None,
+            tool_face: None,
             remote: None,
             ccteam_root: self.project_paths.as_ref().map(|paths| paths.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
@@ -5148,6 +5165,7 @@ impl Gateway {
             origin: SessionOrigin::Ccteam,
             title: None,
             title_source: None,
+            tool_face: plan.tool_face.clone(),
             turn_count: 0,
             cost_usd: None,
             tokens_total: None,
@@ -5205,6 +5223,7 @@ impl Gateway {
             spawned_by_role: _,
             delegation_depth,
             title: _,
+            tool_face: _,
             remote: _,
             ccteam_root: _,
             remote_proxy: _,
@@ -6007,7 +6026,7 @@ impl Gateway {
                         // gets mid-turn progress rows from its hooks; stream-json
                         // and ACP have none, so the pump used to mirror only the
                         // turn's END — and every reader that classifies activity
-                        // from the FILE (MCP `session_list`/`session_collect`,
+                        // from the FILE (MCP `agent_read`/`agent_read`,
                         // web, CLI) saw a hard-working session as `idle`, or as
                         // `stale` once the submit row aged past the 5-minute warn
                         // window. Keyed on `is_terminal()` rather than on a
@@ -6525,7 +6544,7 @@ impl Gateway {
                             }
                             // v0.8.8 F1 — 落盘这条 assistant 回复到
                             // `.ccteam/chat/<sid>/turns.jsonl`(生产唯一 live
-                            // writer)。这是 SPA / cto session_collect 历史读侧的
+                            // writer)。这是 SPA / cto agent_read 历史读侧的
                             // 数据源,缺它历史永远为空。`append_turn` 是 O_APPEND
                             // 原子单写(PIPE_BUF-atomic)、不持 gateway 锁,放热路
                             // 径安全;目录已按 sid 隔离,故 TurnRecord 不带
@@ -8086,7 +8105,7 @@ impl Gateway {
     /// (no meta). This is the deeper twin of [`resume_dead_session`]: keeping
     /// BOTH rungs in the shared submit core ([`submit_resolved`] + the directive
     /// path's [`ensure_session_live`]) means every submit-by-sid path — IM
-    /// current-session, `@handle`, MCP `session_dispatch`, the web turn — revives
+    /// current-session, `@handle`, MCP `agent`, the web turn — revives
     /// a session that left the live map identically, rather than each frontend
     /// special-casing it. ACL is the caller's concern (each frontend gates who
     /// may address a sid before reaching the submit core).
@@ -8445,17 +8464,17 @@ impl Gateway {
     /// `chat_turn_user_prompt` row for the turn just submitted.
     ///
     /// Every reader that answers "what is this session doing right now" from
-    /// OUTSIDE the daemon process — MCP `session_list` / `session_collect`, the
+    /// OUTSIDE the daemon process — MCP `agent_read` / `agent_read`, the
     /// web session list, the CLI — classifies `progress.jsonl`, not the pump's
     /// in-memory liveness. A paneless session used to mirror only the END of a
     /// turn, so from submit until completion its newest row stayed the PREVIOUS
     /// turn's `chat_turn_completed` — an idle boundary. A parent polling its
     /// child therefore read `idle` seconds after dispatching work, and a
-    /// `session_collect(tail)` on that verdict returned the previous turn's
+    /// `agent_read(tail)` on that verdict returned the previous turn's
     /// answer as if it were the new one.
     ///
     /// This is the one choke point every submission funnels through (IM text,
-    /// web chat, MCP `session_dispatch`, adapter-driven directive turns), so a
+    /// web chat, MCP `agent`, adapter-driven directive turns), so a
     /// new entry point inherits the fix instead of needing its own. Written for
     /// EVERY disposition: `Queued` means the work is outstanding behind a
     /// running turn, which is busy, not idle. Terminal sessions write this row
@@ -9778,7 +9797,7 @@ impl Gateway {
     }
 
     /// One session's in-flight turn by sid — [`Gateway::live_turns`] for callers
-    /// that classify a single session (MCP `session_collect`).
+    /// that classify a single session (MCP `agent_read`).
     pub fn live_turn_for(&self, sid: &str) -> Option<ccteam_core::stall::LiveTurn> {
         self.sessions
             .get(sid)
@@ -9788,7 +9807,7 @@ impl Gateway {
     /// Classify live sessions through the shared resolver
     /// (`ccteam_core::stall::classify_session_activity`) — projected progress
     /// truth folded with the daemon's in-flight turns, the same
-    /// `working|idle|stale|stuck` vocabulary MCP `session_list` and the web
+    /// `working|idle|stale|stuck` vocabulary MCP `agent_read` and the web
     /// session list report. Each distinct project is snapshotted once from the
     /// incremental projection; an up-to-date byte cursor makes this a stat plus
     /// an in-memory clone rather than a journal scan.
@@ -10305,7 +10324,7 @@ impl Gateway {
             .collect();
         // THE merge point for external ledger nodes: every consumer of
         // `session_views()` (web agents graph, `/status`, projects, the REST
-        // session list, MCP `session_list` + its parent validation) sees a
+        // session list, MCP `agent_read` + its parent validation) sees a
         // hand-started client because it is merged HERE and nowhere else — so a
         // new consumer inherits it instead of having to remember a second map.
         views.extend(self.external_nodes.values().map(external_node_view));
@@ -10427,7 +10446,7 @@ impl Gateway {
     /// sid, which the caller binds to the client's `Mcp-Session-Id`
     /// ([`crate::native_bindings::NativeBindings::attach_session`]).
     ///
-    /// This is what stops a hand-started agent's `session_spawn` children from
+    /// This is what stops a hand-started agent's `agent` children from
     /// mounting as ROOTS: they now have a parent that exists in the ledger.
     /// `owner` is the enrollment credential's identity (never self-reported) and
     /// `slug` must already be a registered project — execution location is a
@@ -10749,6 +10768,7 @@ impl Gateway {
             origin: SessionOrigin::Adopted,
             title: None,
             title_source: None,
+            tool_face: None,
             turn_count: 0,
             cost_usd: None,
             tokens_total: None,
@@ -10854,6 +10874,7 @@ impl Gateway {
                 origin: SessionOrigin::Adopted,
                 title: None,
                 title_source: None,
+                tool_face: None,
                 turn_count: 0,
                 cost_usd: None,
                 tokens_total: None,
@@ -10949,7 +10970,7 @@ impl Gateway {
     }
 
     /// Resolve a session id to the data a collector needs to tail its
-    /// transcript (v0.8.7 W1 — cto `session_collect`). Returns the role
+    /// transcript (v0.8.7 W1 — cto `agent_read`). Returns the role
     /// (the `<bot>` segment of `.ccteam/chat/<bot>/turns.jsonl`) and the
     /// session's project slug + absolute working dir, or `None` for an
     /// unknown sid. Read-only: clones scalar fields under no `.await`, so a
@@ -10969,7 +10990,7 @@ impl Gateway {
     /// Like [`Self::session_resolve`], but a STOPPED session answers too — from
     /// its on-disk `meta.json`, exactly the fallback [`Self::project_slug_for_sid`]
     /// already grants the ACL gate. For READ-ONLY surfaces (the history endpoint):
-    /// a transcript outlives the live map by design (`session_stop` never purges
+    /// a transcript outlives the live map by design (`agent_stop` never purges
     /// `turns.jsonl`), so "stopped" must not read as "never existed". Drive
     /// surfaces (dispatch/steer/pane) keep the live-only resolver — a thread you
     /// can write to is exactly what a stopped session does not have.
@@ -11769,6 +11790,20 @@ impl Gateway {
             .unwrap_or_default()
     }
 
+    /// Everything the MCP tool-face resolver needs about one session, in ONE
+    /// lock hold: where its `meta.json` lives, the delegation depth cap in
+    /// force, and whether a chat can still reach it. Asked here rather than
+    /// through three separate accessors so the three facts can never describe
+    /// two different moments. Read-only, holds no `.await`.
+    pub fn session_face_context(&self, sid: &str) -> Option<SessionFaceContext> {
+        let resolved = self.session_resolve_any(sid)?;
+        Some(SessionFaceContext {
+            project_dir: resolved.project_dir,
+            max_depth: self.delegation_config().max_depth,
+            has_reply_target: self.reply_target_for(sid).is_some(),
+        })
+    }
+
     /// v0.9.0 W2 (F5) — set the delegation guardrail posture programmatically
     /// (overrides `config.yaml`). Prod leaves this unset; tests use it to
     /// exercise the guardrails with tiny limits.
@@ -11932,7 +11967,7 @@ impl Gateway {
         }
     }
 
-    /// v0.9.0 W2 (F2/F5) — the delegation-aware spawn `session_spawn` routes
+    /// v0.9.0 W2 (F2/F5) — the delegation-aware spawn `agent` routes
     /// through. Mirrors [`Self::create_session_api_on_host`] but (a) links the
     /// child to its `parent` (parent_sid/depth/spawned_by_role/title +
     /// `trigger="session_spawn"`), (b) enforces the F5 guardrails on an Ambient
@@ -12102,6 +12137,7 @@ impl Gateway {
         tuning: SpawnTuning,
         parent: Option<DelegationParent>,
         title: Option<String>,
+        tool_face: Option<String>,
         deadline: GatewayDeadline,
     ) -> Result<CreateSessionOutcome> {
         let (host, wire_slug, root, proxy) = {
@@ -12224,6 +12260,7 @@ impl Gateway {
             plan.spawned_by_role = spawned_by_role;
             plan.delegation_depth = child_depth;
             plan.title = title.clone();
+            plan.tool_face = tool_face;
             if let Some(parent_sid) = plan.parent_sid.clone() {
                 guard.delegation_spawn_reservations.insert(
                     plan.id.clone(),
@@ -12543,7 +12580,7 @@ impl Gateway {
     /// v0.9.0 W2 (F2) — drop a child's completion watch (mirror + durable
     /// `delegation.json`). Used on an inline `wait` completion (suppress the
     /// redundant notification), when the dispatched task's turn boundary spends
-    /// the watch (v0.10.1), by `session_stop`, and by the reconcile when the
+    /// the watch (v0.10.1), by `agent_stop`, and by the reconcile when the
     /// parent is gone.
     pub fn disarm_delegation_watch(&mut self, child_sid: &str) {
         self.delegation_watch_set.write().unwrap().remove(child_sid);
@@ -12626,6 +12663,9 @@ impl Gateway {
         if mirror.notified_turns.iter().any(|turn| turn == &dedup_key) {
             return None;
         }
+        // The excerpt cap comes from the watch's own mode: `brief` wakes the
+        // parent at the same boundary as `final`, with a quarter of the text.
+        let excerpt_cap = crate::delegation::notification_answer_max_chars(mirror.notify);
         let notification = (mirror.notify != NotifyMode::Off).then(|| {
             crate::delegation::build_notification_text_with_outcome(
                 &crate::delegation::DelegationSummary {
@@ -12644,6 +12684,7 @@ impl Gateway {
                     cost_usd: None,
                     answer: &signal.tail,
                 },
+                excerpt_cap,
             )
         });
         Some(DelegationDeliveryPlan {
@@ -13448,7 +13489,7 @@ impl Gateway {
             .await?
         {
             // A turn's answer streams over the pump → SSE; hand back the turn id
-            // so a `session_dispatch` caller can `session_collect{since: id}`.
+            // so a `agent` caller can `agent_read{since: id}`.
             SubmitResult::Turn { id, .. } => Ok(id),
             // A directive's synchronous receipt (e.g. "已切换 model → opus") has
             // no turn id, and the POST already returned 202 — so deliver it over
@@ -13488,7 +13529,7 @@ impl Gateway {
     /// tenant's sessions. It is therefore admin-only, matching the web Status /
     /// 主机 / Settings nav (already `useMe().isAdmin`-gated). A non-admin caller
     /// falls straight through to a turn/vendor-directive (today's behaviour).
-    /// A2A `session_dispatch` keeps calling `submit_to_sid` directly, so
+    /// A2A `agent` keeps calling `submit_to_sid` directly, so
     /// agent→agent routing is deliberately never given the human control face.
     pub async fn submit_web_sid(
         &mut self,
@@ -13613,7 +13654,7 @@ impl Gateway {
         // IS this sid's body: an explicit stop ends it (the one case the daemon
         // signals such a process — on the user's word, never on its own).
         if self.stop_detached_body(sid).await? {
-            self.mark_session_stopped(sid);
+            self.record_explicit_stop(sid);
             return Ok(());
         }
         let Some(session) = self.sessions.get(sid) else {
@@ -13640,7 +13681,7 @@ impl Gateway {
             .write()
             .unwrap()
             .retain(|_, v| v != sid);
-        self.mark_session_stopped(sid);
+        self.record_explicit_stop(sid);
         self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         self.persist_routing()?;
         Ok(())
@@ -13665,7 +13706,7 @@ impl Gateway {
             .write()
             .unwrap()
             .retain(|_, v| v != sid);
-        self.mark_session_stopped(sid);
+        self.record_explicit_stop(sid);
         if !already_stopped {
             self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         }
@@ -13676,7 +13717,7 @@ impl Gateway {
     /// Record an explicit stop in `meta.json` (through the catalog, so the
     /// in-memory index stays in lockstep with disk). Best-effort and
     /// idempotent — the first stop's timestamp stands.
-    fn mark_session_stopped(&self, sid: &str) {
+    fn record_explicit_stop(&self, sid: &str) {
         let Some(entry) = self.session_catalog.find_or_load(sid, &self.projects) else {
             return;
         };
@@ -13693,7 +13734,7 @@ impl Gateway {
     /// Clear the explicit-stop marker: the user is driving this session again,
     /// so it is no longer stopped. Called from the ONE rebuild apply point
     /// every resume path funnels through.
-    fn clear_session_stopped(&self, sid: &str) {
+    fn clear_explicit_stop(&self, sid: &str) {
         let Some(entry) = self.session_catalog.find_or_load(sid, &self.projects) else {
             return;
         };
@@ -15436,7 +15477,7 @@ enum SubmitResult {
     /// a streaming turn or a sink-delivered choice).
     Directive(Vec<String>),
     /// Plain user text submitted as a new turn. `id` is the `TurnId` string
-    /// (handed to `session_dispatch` for `session_collect{since}`); `drained`
+    /// (handed to `agent` for `agent_read{since}`); `drained`
     /// is the sink-less drained answer (empty in production — answers stream).
     Turn { id: String, drained: Vec<String> },
     /// 2026-08-19 (one sid, one body) — the text was QUEUED behind the
@@ -16333,7 +16374,7 @@ mod tests {
         assert!(gateway.is_session_live("s1"));
     }
 
-    /// `session_dispatch` funnels into the same submit core, so dispatching to
+    /// `agent` funnels into the same submit core, so dispatching to
     /// a released sid resumes it rather than failing or minting a twin.
     #[tokio::test]
     async fn dispatch_to_a_released_session_resumes_it_in_place() {
@@ -16893,7 +16934,7 @@ mod tests {
     }
 
     /// The reason external nodes exist: a child spawned BY a hand-started agent
-    /// hangs under it instead of mounting as a root. `session_list`'s tree is
+    /// hangs under it instead of mounting as a root. `agent_read`'s tree is
     /// built purely from `parent_sid` over `session_views()`, and roots are rows
     /// whose parent is absent from the set — so both rows being present with the
     /// right linkage is exactly the tree property.
@@ -16907,7 +16948,7 @@ mod tests {
             .register_external_node("alpha", "user:web-api", "codex/0.144.3")
             .unwrap();
         let child = spawn_managed(&mut gateway).await;
-        // The lineage `session_spawn` records for a delegated child.
+        // The lineage `agent` records for a delegated child.
         {
             let session = gateway.sessions.get_mut(&child).unwrap();
             session.parent_sid = Some(parent.clone());
@@ -17220,7 +17261,7 @@ mod tests {
         );
     }
 
-    /// `/stop` / `session_stop` / project stop on a detached sid ENDS the body
+    /// `/stop` / `agent_stop` / project stop on a detached sid ENDS the body
     /// (the one case the daemon signals such a process — on the user's word)
     /// and forgets it; the sid is then a plain stopped session.
     #[tokio::test]
@@ -20942,7 +20983,7 @@ mod tests {
     /// THE REPORTED BUG (2026-07-30, real machine) — a tenant's IM `/status`
     /// rendered NO `👥 直接子会话` block and under-counted "本项目其他 N 个会话"
     /// while that tenant's WEB team page listed the very same children. The
-    /// children (`s22..s30`) had been spawned by an ambient `session_spawn`, so
+    /// children (`s22..s30`) had been spawned by an ambient `agent`, so
     /// they carried the admin pool's owner (`user:web-api`); the LIVE gate read
     /// that stored owner verbatim while its STOPPED twin (`chat_can_access_sid`)
     /// already inherited the project principal — same chat, same project, same
@@ -21100,7 +21141,7 @@ mod tests {
     }
 
     /// The WRITE path decides ownership once, in `plan_new_session`, so every
-    /// spawn entry (IM `/new`, REST `POST …/sessions`, MCP `session_spawn`) is
+    /// spawn entry (IM `/new`, REST `POST …/sessions`, MCP `agent`) is
     /// covered without its own patch (§五 总纲 判据②). The persisted
     /// `meta.owner` is what `ccteam-web` serves verbatim, so getting it right
     /// here is what keeps the two frontends telling one story.
@@ -21718,7 +21759,7 @@ mod tests {
 
     /// A paneless session must open its file-backed BUSY window at SUBMIT, not
     /// at completion. `progress.jsonl` is what every out-of-process reader
-    /// classifies activity from (MCP `session_list`/`session_collect`, web,
+    /// classifies activity from (MCP `agent_read`/`agent_read`, web,
     /// CLI), and mirroring only the turn's end left the newest row on the
     /// PREVIOUS turn's `chat_turn_completed` — an idle boundary — for the whole
     /// of the next turn. A parent that polled its child right after dispatching
@@ -22232,7 +22273,7 @@ mod tests {
         // v0.8.8 F1 — create_session_api no longer dedups on (project, role):
         // two creates of the same role mint two DISTINCT sids, each backed by
         // its own pane/pump. The web/cto "spawn another reviewer" flow relies
-        // on this (and the session_spawn tool description was updated to
+        // on this (and the agent tool description was updated to
         // "always mints a new sid").
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
@@ -22700,7 +22741,7 @@ mod tests {
     /// gateway sid to the role + absolute project_dir a collector tails for
     /// `.ccteam/chat/<role>/turns.jsonl`. End-to-end with the real fake: spawn
     /// a session, submit a turn, then resolve the sid and read back the child's
-    /// answer from a turns.jsonl mirror (the exact pipeline `session_collect`
+    /// answer from a turns.jsonl mirror (the exact pipeline `agent_read`
     /// runs daemon-side). Unknown sid → None (→ tool error at the edge).
     #[tokio::test]
     async fn gateway_session_resolve_then_collect_child_turns() {
@@ -22714,7 +22755,7 @@ mod tests {
         let mut gateway = Gateway::new(fake.clone(), "alpha", project_dir.clone());
 
         // cto spawns a work-role session + dispatches a task (gateway-driven
-        // half of session_spawn / session_dispatch).
+        // half of agent / agent).
         let sid = gateway
             .create_session_api(
                 "alpha".into(),
@@ -22730,7 +22771,7 @@ mod tests {
             .await
             .unwrap();
 
-        // session_collect resolves the sid → role + project_dir, then tails
+        // agent_read resolves the sid → role + project_dir, then tails
         // the ccteam-owned mirror. Unknown sid is None.
         assert!(gateway.session_resolve("s99").is_none());
         let resolved = gateway.session_resolve(&sid).expect("known sid resolves");
@@ -24310,6 +24351,7 @@ mod tests {
             origin: SessionOrigin::Ccteam,
             title: None,
             title_source: None,
+            tool_face: None,
             turn_count: 0,
             cost_usd: None,
             tokens_total: None,
@@ -24387,6 +24429,7 @@ mod tests {
             origin: SessionOrigin::Ccteam,
             title: None,
             title_source: None,
+            tool_face: None,
             turn_count: 0,
             cost_usd: None,
             tokens_total: None,
@@ -24510,7 +24553,7 @@ mod tests {
     }
 
     /// Send-resume symmetry (the architectural twin of the web-turn fix) — the
-    /// shared `submit_to_sid` core (which the web turn, MCP `session_dispatch`
+    /// shared `submit_to_sid` core (which the web turn, MCP `agent`
     /// and the `@handle` mirror all funnel through) COLD-RESUMES a session that
     /// left the live map, instead of erroring "current session missing". This is
     /// the deepest resume-by-sid rung now living in the submit core alongside the

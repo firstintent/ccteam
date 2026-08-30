@@ -7,7 +7,7 @@
 // documentation only (id, i18n key stem, icon, vendor lineup); picking one
 // merely prefills the composer and aims the vendor draft (the established
 // HomeView template mechanism), while the actual orchestration happens inside
-// the spawned session via the session_* tools.
+// the spawned session via the `agent` tool.
 
 import { Crown, Lightbulb, Pyramid, Radar, ShieldCheck, Trophy } from "lucide-react";
 import { makeT, type Lang } from "./i18n";

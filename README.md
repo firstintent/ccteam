@@ -73,7 +73,7 @@ Everything the console does is also `/api/v1` (OpenAPI at `/api/docs`).
 
 **3 · Orchestrate a team from inside a claude session**
 
-Any registered session can hire the others — say it in plain language and `session_spawn` / `dispatch` / `collect` run under the hood (with an honest `working` / `idle` signal, so nobody guesses from silence):
+Any registered session can hire the others — say it in plain language and `agent` / `agent_read` run under the hood (with an honest `working` / `idle` signal, so nobody guesses from silence):
 
 ```text
 Spawn a codex session, have it implement RFC-12 and run the tests; report back when green.
@@ -92,10 +92,10 @@ Register a satellite with a join token (Settings → Access) — it dials out to
 
 ---
 
-Under all four modes are the same **eight MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
+Under all four modes are the same **six MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
 
 ```text
-session_spawn · session_dispatch · session_collect · session_list · session_stop
+agent · agent_read · agent_stop
 status (+ its discovery alias grok_claude_codex_kimi) · chat_send_file
 ```
 
@@ -111,11 +111,11 @@ ccteam also lives natively inside [DeepSeek Harness](https://www.npmjs.com/packa
 | Face | For | What it gives you |
 |---|---|---|
 | **Workbench** | People using DSH Web | A full-page ccteam workbench opened from a button at the bottom of DSH's sidebar: the cross-harness team tree (search, per-project fold/unfold, hover ⋯ menu), a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, mid-turn model/effort switch, interrupt), and a details column — docks beside DSH's own panes or expands full-page. |
-| **Tools** | DSH agents (the LLM) | The same eight MCP tools described above, callable from inside a DSH session. |
+| **Tools** | DSH agents (the LLM) | The same six MCP tools described above, callable from inside a DSH session. |
 | **Transport** | ccteam | The channel that lets ccteam hire a DSH session the way it hires any other harness. |
 | **Engine** | You | The ccteam daemon itself, shipped with the plugin as a platform package (`@ccteam/engine-<os>-<cpu>`): installed, started and supervised from the **Engine** section of the plugin's settings card — state, version, **Start / Stop / Restart / Update engine**, a *Start the engine when the plugin loads* switch, the engine log. |
 
-Install it with `dsh plugin --profile web add @ccteam/ccteam-ui` and restart `dsh web`: the plugin brings the engine, starts the daemon, and picks up your console token from `~/.ccteam` on the same machine — nothing to paste. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `session_spawn` with `vendor:"dsh"`), the plugin and its credentials are materialized for you. Either way it is one daemon shared with the CLI and ccteam web: the plugin attaches to a running one, never starts a second one against another `~/.ccteam`, and never stops it when DSH restarts. The full setup (both install paths, coexistence rules, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
+Install it with `dsh plugin --profile web add @ccteam/ccteam-ui` and restart `dsh web`: the plugin brings the engine, starts the daemon, and picks up your console token from `~/.ccteam` on the same machine — nothing to paste. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `agent` with `vendor:"dsh"`), the plugin and its credentials are materialized for you. Either way it is one daemon shared with the CLI and ccteam web: the plugin attaches to a running one, never starts a second one against another `~/.ccteam`, and never stops it when DSH restarts. The full setup (both install paths, coexistence rules, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
 
 ## Install
 
@@ -194,12 +194,12 @@ After you reboot your computer, run `ccteam start` again to bring ccteam back.
 Delegation is explicit — an agent (or you) says who does what, and the bridge handles identity, routing, delivery, and the ledger:
 
 ```text
-session_spawn{vendor:"codex", title:"impl",  task:"implement RFC-12, run tests, report"}
-session_spawn{vendor:"grok",  title:"probe", task:"profile the hot path", wait_seconds:120}
-session_spawn{vendor:"kimi",  title:"chore", task:"apply the rename across every module"}
+agent{vendor:"codex", title:"impl",  task:"implement RFC-12, run tests, report"}
+agent{vendor:"grok",  title:"probe", task:"profile the hot path", wait:120}
+agent{vendor:"kimi",  title:"chore", task:"apply the rename across every module"}
 ```
 
-Async by default: the completion notification lands in the parent's chat like a colleague reporting back. `wait_seconds` is for sub-minute answers you need inline.
+Async by default: the completion notification lands in the parent's chat like a colleague reporting back. `wait` is for sub-minute answers you need inline.
 
 **Common workflows:**
 

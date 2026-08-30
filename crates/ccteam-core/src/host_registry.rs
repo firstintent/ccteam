@@ -62,7 +62,7 @@ pub struct HostProjectReport {
 /// - `ccteam-web::routes::{hosts,capabilities}` (wrap [`probe_bin_cached`]
 ///   for the LOCAL admin host-detail / capability matrix, plus the
 ///   tool-surface state keyed off [`Self::tool_surface`]);
-/// - the MCP `status` vendor panel + `session_spawn` availability discovery
+/// - the MCP `status` vendor panel + `agent` availability discovery
 ///   (`ccteam-im`) via [`probe_availability`].
 #[derive(Debug, Clone, Copy)]
 pub struct AgentProbeSpec {
@@ -288,7 +288,7 @@ fn path_is_executable(path: &std::path::Path) -> bool {
 }
 
 /// One vendor's availability on THIS machine — the normalized snapshot the
-/// MCP `status` panel and the `session_spawn` discovery error render from.
+/// MCP `status` panel and the `agent` discovery error render from.
 /// Deliberately carries only machine facts (`installed` + `--version`);
 /// auth / budget / host-online are layered on by the panel from other
 /// sources, never faked here.

@@ -221,7 +221,7 @@ async fn session_turn_no_gateway_is_503() {
 }
 
 #[tokio::test]
-async fn session_stop_no_gateway_is_503() {
+async fn agent_stop_no_gateway_is_503() {
     let tmp = TempDir::new().unwrap();
     let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
     let client = reqwest::Client::new();

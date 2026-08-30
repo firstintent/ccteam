@@ -201,7 +201,7 @@ impl LiveTurn {
 }
 
 /// **The one session-activity resolver.** Every live surface — IM `/status`,
-/// MCP `session_list` / `session_collect`, the web session list feeding the
+/// MCP `agent_read`, the web session list feeding the
 /// SPA rail — answers "what is this session doing" through here, so the two
 /// user-facing ends cannot disagree by construction. Surfaces with no live
 /// view (`ccteam status` and other daemonless readers) pass `live: None` and

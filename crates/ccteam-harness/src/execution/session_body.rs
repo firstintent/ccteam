@@ -28,7 +28,7 @@
 //! - Same-uid soft identity, like every other rung: a same-uid process can
 //!   forge a `body.json`. What this prevents is a *misattribution by ccteam
 //!   itself* (two bodies for one sid), not an attack.
-//! - [`terminate`] exists for EXPLICIT user stops (`/stop`, `session_stop`,
+//! - [`terminate`] exists for EXPLICIT user stops (`/stop`, `agent_stop`,
 //!   project stop). The daemon never calls it on its own initiative — a
 //!   detached body is waited for, not killed (AGENTS.md §三 "永不主动 kill").
 

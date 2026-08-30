@@ -7,17 +7,17 @@
 //! and give a clean env-driven way to disable categories (e.g.
 //! `CCTEAM_DISABLE_TOOLS=chat,session`).
 //!
-//! Group model (v0.9 T1 culled surface; `screenshot` group removed
-//! 2026-07-26 with the tmux-era pane-capture tool):
-//! - 1 admin tool (`status`, renamed from `admin_ls`)
+//! Group model:
+//! - 2 admin tools (`status` + its bare-name discovery beacon)
 //! - 0 workflow tools (variant kept so the `workflow_` prefix routing
 //!   + env toggle stay stable)
-//! - 1 chat tool (`send_file`)
-//! - 5 session tools (spawn / dispatch / collect / list / stop)
+//! - 1 chat tool (`chat_send_file`)
+//! - 3 session tools (`agent` / `agent_read` / `agent_stop`)
 //!
-//! Total: 7 tools registered. Disabling a group hides every tool in
-//! that group from `tools/list`; `tools/call` against a disabled tool
-//! falls through to the standard "unknown tool" error.
+//! Total: 6 tools registered. Disabling a group hides every tool in
+//! that group from `tools/list` — applied AFTER the per-caller face, so an
+//! operator toggle can only ever subtract. `tools/call` against a disabled
+//! tool falls through to the standard "unknown tool" error.
 
 use std::collections::HashSet;
 
@@ -44,8 +44,8 @@ pub enum ToolGroup {
     Workflow,
     /// Chat-mode bot workflow (`send_file` only after v0.9 T1).
     Chat,
-    /// cto scheduling over the gateway session map (5 tools):
-    /// spawn / dispatch / collect / list / stop.
+    /// Delegation over the gateway session map (3 tools):
+    /// `agent` / `agent_read` / `agent_stop`.
     Session,
 }
 
@@ -109,12 +109,12 @@ pub fn disabled_groups_from_env() -> HashSet<ToolGroup> {
     parse_disable_env(env.as_deref())
 }
 
-/// Map a wire tool name (e.g. `session_spawn`) to its group.
+/// Map a wire tool name (e.g. `agent_read`) to its group.
 /// Returns `None` for unknown names so unrecognised tools can't be
 /// filtered out accidentally.
 ///
 /// Wire names are BARE (no `ccteam__` prefix): MCP clients already
-/// namespace by server key (Claude Code shows `mcp__ccteam__session_spawn`),
+/// namespace by server key (Claude Code shows `mcp__ccteam__agent`),
 /// so a baked-in prefix would double up.
 pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
     let bare = name;
@@ -133,7 +133,9 @@ pub fn group_for_tool(name: &str) -> Option<ToolGroup> {
     if bare.strip_prefix("chat_").is_some() {
         return Some(ToolGroup::Chat);
     }
-    if bare.strip_prefix("session_").is_some() {
+    // The session group is `agent` plus its `agent_*` verbs. The retired
+    // `session_` prefix maps to nothing on purpose (no compat alias).
+    if bare == "agent" || bare.strip_prefix("agent_").is_some() {
         return Some(ToolGroup::Session);
     }
     None
@@ -209,16 +211,25 @@ mod tests {
         assert_eq!(group_for_tool("status"), Some(ToolGroup::Admin));
         assert_eq!(group_for_tool("workflow_show"), Some(ToolGroup::Workflow));
         assert_eq!(group_for_tool("chat_send_file"), Some(ToolGroup::Chat));
-        assert_eq!(group_for_tool("session_spawn"), Some(ToolGroup::Session));
+        assert_eq!(group_for_tool("agent"), Some(ToolGroup::Session));
+        assert_eq!(group_for_tool("agent_read"), Some(ToolGroup::Session));
+        assert_eq!(group_for_tool("agent_stop"), Some(ToolGroup::Session));
+        assert_eq!(
+            group_for_tool(super::super::protocol::STATUS_BEACON_TOOL_NAME),
+            Some(ToolGroup::Admin)
+        );
         assert_eq!(group_for_tool("bogus"), None);
         assert_eq!(group_for_tool("not-a-ccteam-tool"), None);
         // Culled tools no longer map (advise group dropped; screenshot
         // culled 2026-07-26).
         assert_eq!(group_for_tool("advise_vote"), None);
         assert_eq!(group_for_tool("screenshot"), None);
+        // The retired `session_*` names map to nothing (no compat alias).
+        assert_eq!(group_for_tool("session_spawn"), None);
+        assert_eq!(group_for_tool("session_list"), None);
         // Legacy prefixed wire names (pre-rename) no longer map either —
         // the client's server namespace made the baked-in prefix redundant.
-        assert_eq!(group_for_tool("ccteam__session_spawn"), None);
+        assert_eq!(group_for_tool("ccteam__agent"), None);
     }
 
     #[test]
@@ -226,13 +237,13 @@ mod tests {
         let tools = vec![
             json!({ "name": "status" }),
             json!({ "name": "chat_send_file" }),
-            json!({ "name": "session_list" }),
+            json!({ "name": "agent_read" }),
         ];
         let mut disabled = HashSet::new();
         disabled.insert(ToolGroup::Chat);
         let kept = filter_by_disabled(tools, &disabled);
         let names: Vec<&str> = kept.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["status", "session_list"]);
+        assert_eq!(names, vec!["status", "agent_read"]);
     }
 
     #[test]

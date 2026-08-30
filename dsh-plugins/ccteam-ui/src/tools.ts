@@ -320,120 +320,108 @@ interface McpToolDefinition {
 export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'status',
-    description: 'Discovery + health: which of claude / codex / grok / opencode / kimi / pi are installed on your project\'s host, plus per-vendor session_spawn recipes, daemon health, cost/budget, advisory models, and routing notes. Managed Pi sessions get the bridge; plain shell pi does not.',
+    description: 'Which agents this project\'s host can hire and what the team spent today. Brief by default; `detail` adds model ids + effort ladders (models), install/auth/budget per vendor (vendors), your routing notes (routing), or everything (full).',
     inputSchema: {
       type: 'object',
-      properties: {},
-      required: [],
+      properties: {
+        detail: { type: 'string', enum: ['brief', 'models', 'vendors', 'routing', 'full'], description: 'Default brief.' },
+      },
     },
   },
   {
     name: 'grok_claude_codex_kimi',
-    description: 'Alias of status (discovery beacon for hosts that surface tool names only). Which agents this machine can spawn — claude / codex / grok / kimi / opencode / pi — with install/auth state and per-vendor session_spawn recipes. Identical response to status.',
+    description: 'Alias of `status` (brief): which agents — grok, claude, codex, kimi, opencode, pi, dsh — this machine can hire.',
     inputSchema: {
       type: 'object',
       properties: {},
-      required: [],
     },
   },
   {
     name: 'chat_send_file',
-    description: 'Send a file (image or document) from disk back to YOUR own bound chat (Telegram / Lark / web) — a chat user cannot open a local path, so this is how a generated artifact (chart, report, photo) actually reaches them. Zero addressing params: the daemon resolves your home chat from your session identity. `path` must be on the daemon\'s filesystem. `kind` is inferred from the extension when omitted (png/jpg/jpeg/gif/webp → photo, else document). Delivery reuses the same outbound funnel as text replies (long-message split + durable ledger + failure echo).',
+    description: 'Send a local file (image or document) to your own bound chat — a chat user cannot open a path.',
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute path to the file on the daemon\'s filesystem.' },
-        caption: { type: 'string', description: 'Optional caption sent with the file.' },
-        kind: { type: 'string', enum: ['photo', 'document'], description: 'photo → sendPhoto (compressed image); document → sendDocument (any file). Inferred from the extension when omitted.' },
+        path: { type: 'string', description: 'Absolute path on the daemon\'s filesystem.' },
+        caption: { type: 'string', description: 'Optional caption.' },
+        kind: { type: 'string', enum: ['photo', 'document'], description: 'Default: images → photo, else document.' },
       },
       required: ['path'],
     },
   },
   {
-    name: 'session_spawn',
-    description: 'Spawn an agent session — vendor: claude (default) | codex | grok | opencode | kimi | pi — in YOUR OWN project; always mints a NEW s{n} sid. grok = fast live web/X search; claude/codex/pi = coding agents; status shows per-host availability. Pass `task` to dispatch the first task in the same call — identical semantics to session_dispatch. Async managed-parent calls get ONE completion notification when the child\'s turn ends; a hand-started (enrolled) caller has no return transport, gets `notify_deliverable:false`, and must poll `session_collect` (or use `wait_seconds`). The response adds `turn_id` + `status`, plus `result_text`/`elapsed_seconds`/ledger `cost_usd`/`tokens_total` when waited to completion. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Auth: your per-session `(sid, secret)` principal — you can only spawn into your own project; the execution host follows the project binding. Returns `{sid, vendor_session_id (vendor-native resume key, may be empty), host, ...}`. Read output later with session_collect{sid, tail:true}.',
+    name: 'agent',
+    description: 'Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a new session and dispatch `task` to it; with `sid` → follow up on that session. `wait` returns the answer inline; 0 (default) is async: one completion notification when the task\'s turn ends, or poll `agent_read{sid}` when the reply says notify_deliverable:false. Tell children to answer tersely, never to dump code or diffs.',
     inputSchema: {
       type: 'object',
       properties: {
-        role: { type: 'string', description: 'Optional work-role (must exist as `.claude/agents/<role>.md`). Omit or pass "" for a roleless session (bare vendor reads the project CLAUDE.md/AGENTS.md).' },
+        task: { type: 'string', description: 'Task text, forwarded verbatim as a user turn.' },
+        sid: { type: 'string', description: 'Existing session to task; omit to hire a new one.' },
         vendor: {
           type: 'string',
           enum: ['claude', 'codex', 'grok', 'opencode', 'kimi', 'pi', 'dsh'],
-          description: 'Harness vendor (lowercase). Default claude.',
+          description: 'Harness for a new session (default claude).',
         },
-        model: { type: 'string', description: 'Optional explicit model id, passed to the vendor verbatim; overrides the role\'s `model:` frontmatter. Omitted → vendor default. `status` lists each installed vendor\'s observed ids.' },
-        effort: { type: 'string', description: 'Optional reasoning-effort token, passed to the vendor verbatim for EVERY vendor — the value set is vendor-specific and the vendor validates it (a bad token fails the spawn with its own error, it is never silently ignored). Omitted → vendor default. `status` lists each installed vendor\'s effort ladder.' },
-        project: { type: 'string', description: 'Target project slug. A managed session always spawns into its OWN project and may omit this. A hand-started (enrolled) caller names its workspace here on its first call — that choice sticks for the session, and `status` lists the slugs it can reach. Never inferred from a working directory.' },
+        wait: { type: 'integer', description: 'Seconds to block inline, 0-240 (default 0 = async).' },
+        model: { type: 'string', description: 'Model id, passed to the vendor verbatim.' },
+        effort: { type: 'string', description: 'Reasoning-effort token, passed verbatim to the vendor.' },
+        role: { type: 'string', description: 'Work-role `.claude/agents/<role>.md`; omit for roleless.' },
+        project: { type: 'string', description: 'Workspace slug. Required on an enrolled client\'s first call.' },
+        title: { type: 'string', description: 'Ledger label (<=80 chars); never sent to the agent.' },
+        notify: {
+          type: 'string',
+          enum: ['final', 'brief', 'all', 'off'],
+          description: 'Turn-end wake: final (2000-char excerpt, default), brief (500), all, off.',
+        },
+        tools: {
+          type: 'string',
+          enum: ['full', 'read', 'none'],
+          description: 'New session\'s ccteam tool face (default full).',
+        },
+        mode: { type: 'string', description: 'Vendor session mode. DSH only: standard|ptc|minimal|creator.' },
         permission_mode: {
           type: 'string',
           enum: ['skip', 'hitl'],
-          description: 'Permission posture (default `skip`). `hitl` (human-in-the-loop) makes a non-allowlist tool call pop an approve/deny prompt to the bound IM chat; allowlist/auto-allowed tools never prompt.',
+          description: 'hitl asks your chat to approve tool calls (default skip).',
         },
-        title: { type: 'string', description: 'Optional short label (≤80 chars) for the ledger / team visualization only — NEVER sent to the agent or concatenated into any prompt.' },
-        task: { type: 'string', description: 'Optional FIRST task — dispatched to the fresh child in the same call, exactly like session_dispatch{sid, task} (verbatim user turn, no injection). Omit to spawn only.' },
-        wait_seconds: { type: 'integer', description: 'With `task`: request 0–600 seconds (default 0 = async); effective inline wait is capped at 240s. Use inline wait for health probes/short tasks; keep long/repo tasks async (managed parents get a notification; a hand-started agent polls collect). Pending/timeout never cancels the child.' },
-        notify: { type: ['string', 'boolean'], description: 'With `task`: for a managed parent, `final` (default) wakes it ONCE when the child\'s vendor turn ends; `all` wakes it on every assistant message (debug firehose); `off` = ledger-only. A hand-started (enrolled) caller has no notification return transport: the response reports `notify_deliverable:false`; poll session_collect. Booleans still parse: true→final, false→off.' },
-        idempotency_key: { type: 'string', description: 'Optional client key. A retry with the same key (per-project, within ~1h) replays the ORIGINAL spawn (same sid + same dispatch outcome, zero side effects) instead of creating a second session — safe against MCP-client timeouts. In-memory only: a daemon restart forgets keys.' },
-        parent_sid: { type: 'string', description: 'Your OWN sid, when you are a plain local session ccteam mirrors in its ledger (session_list shows you). A managed session never needs this — its parent comes from its principal — but a plain one is anonymous to the bridge, so without it the child mounts as a root and the delegation tree loses the edge. Validated: an unknown sid is an error, not a silent root.' },
+        idempotency_key: { type: 'string', description: 'Retry key: a retry replays the original call (~1h).' },
+        parent_sid: { type: 'string', description: 'Your own sid when ccteam does not manage you.' },
       },
-      required: [],
+      required: ['task'],
     },
   },
   {
-    name: 'session_dispatch',
-    description: 'Dispatch a task to a session by `sid` (from session_spawn / session_list); the target must run in YOUR OWN project. `task` is forwarded VERBATIM as a user turn (NO system-prompt injection). Async managed-parent calls get ONE completion notification at the vendor turn boundary; a hand-started (enrolled) caller has no return transport, gets `notify_deliverable:false`, and must poll `session_collect` (or use `wait_seconds`). Inline completion returns `{status:"completed"|"failed", result_text, error_kind?, error?, elapsed_seconds, cost_usd?, tokens_total?}`; timeout returns `{status:"pending"}` and never cancels the child. Instruct children to answer tersely with a structured summary and no code or diff dumps, because answers beyond the return cap are truncated. Dispatch to yourself or an ancestor is rejected (cycle). Explicit dispatch, never a proactive kill.',
+    name: 'agent_read',
+    description: 'Read the team. No `sid` → roster of sessions you can reach, most recently active first; a `released` row is idle-but-real and resumes on your next `agent{sid}` call, so reuse it instead of spawning a twin. With `sid` → that session\'s transcript, newest first unless `since` pages forward; empty means no answer yet.',
     inputSchema: {
       type: 'object',
       properties: {
-        sid: { type: 'string', description: 'Gateway session id (`s{n}`) from session_spawn / session_list.' },
-        task: { type: 'string', description: 'Task / instruction text, forwarded verbatim as a user turn.' },
-        wait_seconds: { type: 'integer', description: 'Request 0–600 seconds (default 0 = async); effective inline wait is capped at 240s. Use inline wait for health probes/short tasks; keep long/repo tasks async (managed parents get a notification; a hand-started agent polls collect). Pending/timeout never cancels the child.' },
-        notify: { type: ['string', 'boolean'], description: 'For a managed parent, `final` (default) wakes it ONCE when the child\'s vendor turn ends; `all` wakes it on every assistant message (debug firehose); `off` = ledger-only. A hand-started (enrolled) caller has no notification return transport: the response reports `notify_deliverable:false`; poll session_collect. Booleans still parse: true→final, false→off.' },
-        title: { type: 'string', description: 'Optional short label (≤80 chars) for the notification / ledger only — NEVER concatenated into the task or any prompt.' },
-        idempotency_key: { type: 'string', description: 'Optional client key. A retry with the same key (per-target-child, within ~1h) replays the ORIGINAL dispatch (same turn) instead of double-dispatching. In-memory only: a daemon restart forgets keys.' },
+        sid: { type: 'string', description: 'Read this session\'s transcript instead of the roster.' },
+        n: { type: 'integer', description: 'Max rows/turns (default 10, max 500).' },
+        tail: { type: 'boolean', description: 'With `sid`: newest first (default true; false + `since` pages forward).' },
+        since: { type: 'string', description: 'With `sid`: only turns after this turn_id cursor.' },
+        max_chars: { type: 'integer', description: 'With `sid`: char budget across returned turns (default 4000, 500-50000).' },
+        project: { type: 'string', description: 'Roster filter: this project slug only.' },
+        activity: {
+          type: 'string',
+          enum: ['working', 'idle', 'stale', 'stuck', 'all'],
+          description: 'Roster filter (default all).',
+        },
+        tree: { type: 'boolean', description: 'Roster: add delegation topology over the returned rows.' },
       },
-      required: ['sid', 'task'],
     },
   },
   {
-    name: 'session_collect',
-    description: 'Collect (poll) a session\'s transcript by `sid`. Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project collect is rejected). Tails `<project>/.ccteam/chat/<sid>/turns.jsonl` (the ccteam-owned mirror, keyed by sid so parallel sessions never bleed) and returns assistant-side turns; a terminal failure carries `outcome:"failed"`, `error_kind`, and `error`. Also returns the child\'s `vendor_session_id` (native resume key), `activity` (`working` = mid-turn / `idle` = turn done / `stale` / `stuck`), and accrued ledger (`cost_usd` when priced, `tokens_total` when reported). Pass `since` to return only turns AFTER that turn id. Default paging is OLDEST-first; pass `tail:true` for the NEWEST `n` turns. Returns an empty `turns` array when the target hasn\'t answered yet.',
+    name: 'agent_stop',
+    description: 'Stop a session you delegated. Explicit command, never a proactive kill; `agent_read{sid}` still reads its transcript.',
     inputSchema: {
       type: 'object',
       properties: {
-        sid: { type: 'string', description: 'Gateway session id (`s{n}`) to collect from.' },
-        since: { type: 'string', description: 'Optional turn_id cursor — return only assistant turns recorded AFTER this id.' },
-        n: { type: 'integer', description: 'Max turns to return (default 20). Applied after the `since` cursor filter.' },
-        tail: { type: 'boolean', description: 'When true, return the NEWEST `n` turns (after the `since` filter) instead of the oldest — use to grab the final answer of a long transcript without paging.' },
-        max_chars: { type: 'integer', description: 'Maximum total characters across returned turn contents (default 10000; clamped to 500–50000). Longer contents retain a 70% head / 30% tail excerpt with an explicit ledger pointer.' },
+        sid: { type: 'string', description: 'Session to stop.' },
       },
       required: ['sid'],
     },
-  },
-  {
-    name: 'session_list',
-    description: 'List the gateway\'s live sessions (the same `s{n}` namespace session_spawn allocates), most recently active first, capped at `limit` (default 30; `truncated`/`total` say when the cap bit). Authenticated by your `(sid, secret)` principal. Each row carries `sid`, `project`, `vendor`, `activity` (`working` = mid-turn / `idle` / `stale` / `stuck` — the honest busy signal), `last_active`, plus — when set — `role`, `is_self` (YOUR OWN row — the only way to find yourself here), `current` (that session is the active one of some chat — NOT you), `waiting_approval` (hitl blocked on a human), the delegation `parent_sid`/`delegation_depth`, non-local `host`, `cost_usd`, `tokens_total` (raw token ledger, present even for vendors with no USD price table), and `title` (null/empty fields are omitted). The response also includes a `tree` field (roots → children by `parent_sid`, over the filtered set) so you can see the delegation topology. Filter with `project` / `activity` to keep the listing small. Use this to find a `sid` to dispatch to or collect from.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project: { type: 'string', description: 'Only list sessions of this project slug.' },
-        activity: { type: 'string', enum: ['working', 'idle', 'stale', 'stuck', 'all'], description: 'Only list sessions with this activity state (default `all`).' },
-        limit: { type: 'integer', description: 'Max rows returned, most recently active first (default 30, clamped to 1–500).' },
-      },
-      required: [],
-    },
-  },
-  {
-    name: 'session_stop',
-    description: 'Stop a session by `sid` (deregister + close it). Authenticated by your `(sid, secret)` principal; the target `sid` must run in YOUR OWN project (cross-project stop is rejected). This is an EXPLICIT command, NOT a proactive kill — it never file-purges the transcript, so a later session_collect of an already-recorded `turns.jsonl` still works until cleanup. An unknown sid is an error.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        sid: { type: 'string', description: 'Gateway session id (`s{n}`) to stop.' },
-      },
-      required: ['sid'],
-    },
-  },
+  }
 ]
 
 export function registerCcteamTools(ctx: ToolRegistryContext, clientFor: McpClientForExec, notifier?: DelegationNotifier): void {
@@ -481,11 +469,12 @@ export class CcteamCompletionNotifier implements DelegationNotifier {
 
   maybeNotify(toolName: string, args: unknown, result: McpToolResult, exec: ToolRunContext, client: CcteamMcpClient): void {
     if (this.closed) return
-    if (toolName !== 'session_spawn' && toolName !== 'session_dispatch') return
-    if (toolName === 'session_spawn' && (!isRecord(args) || typeof args.task !== 'string' || args.task.trim() === '')) return
+    // `agent` always carries a task: no `sid` hires and dispatches in one call,
+    // with `sid` it is a follow-up. Either way the parent wants the answer back.
+    if (toolName !== 'agent') return
     const origin = exec.agent
     if (!isAgentWithSession(origin)) return
-    const sid = extractDelegatedSid(toolName, args, result)
+    const sid = extractDelegatedSid(args, result)
     if (sid === undefined) return
     void this.pollAndFollowup(origin, sid, result, client).catch(() => undefined)
   }
@@ -497,7 +486,7 @@ export class CcteamCompletionNotifier implements DelegationNotifier {
         if (this.closed) return
         await this.sleep(this.pollIntervalMs)
         if (this.closed) return
-        const collected = await client.callTool('session_collect', {
+        const collected = await client.callTool('agent_read', {
           sid,
           tail: true,
           n: 1,
@@ -538,8 +527,9 @@ export function createUserTextMessage(text: string): UserTextMessage {
   }) as UserTextMessage
 }
 
-function extractDelegatedSid(toolName: string, args: unknown, result: McpToolResult): string | undefined {
-  if (toolName === 'session_dispatch' && isRecord(args) && typeof args.sid === 'string') {
+function extractDelegatedSid(args: unknown, result: McpToolResult): string | undefined {
+  // A follow-up names its target; a hire learns the fresh sid from the reply.
+  if (isRecord(args) && typeof args.sid === 'string' && args.sid.trim() !== '') {
     return args.sid
   }
   const body = resultJson(result)

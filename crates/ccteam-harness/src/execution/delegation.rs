@@ -36,9 +36,14 @@ pub enum NotifyMode {
     /// ledger).
     #[default]
     Final,
+    /// Same boundary as [`Self::Final`], a SHORTER excerpt. The wake-up point
+    /// is a property of the task; how much of the answer rides along is the
+    /// parent's context budget, so the two are separate axes and only the cap
+    /// differs here.
+    Brief,
     /// Notify on EVERY mirrored assistant message (debug / firehose).
     All,
-    /// Never notify — ledger-only, the parent polls `session_collect`.
+    /// Never notify — ledger-only, the parent polls `agent_read`.
     Off,
 }
 
@@ -47,12 +52,13 @@ impl NotifyMode {
     pub fn as_str(self) -> &'static str {
         match self {
             NotifyMode::Final => "final",
+            NotifyMode::Brief => "brief",
             NotifyMode::All => "all",
             NotifyMode::Off => "off",
         }
     }
 
-    /// Parse a wire value: `"final"|"all"|"off"` — plus the pre-v0.9.5 boolean
+    /// Parse a wire value: `"final"|"brief"|"all"|"off"` — plus the boolean
     /// form (`true` → `Final`, `false` → `Off`) so existing callers and
     /// on-disk `delegation.json` watches keep working.
     pub fn parse_value(v: &serde_json::Value) -> Result<Self, String> {
@@ -61,14 +67,15 @@ impl NotifyMode {
             serde_json::Value::Bool(false) => Ok(NotifyMode::Off),
             serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
                 "final" | "true" => Ok(NotifyMode::Final),
+                "brief" => Ok(NotifyMode::Brief),
                 "all" => Ok(NotifyMode::All),
                 "off" | "false" | "none" => Ok(NotifyMode::Off),
                 other => Err(format!(
-                    "invalid notify mode `{other}` (expected `final` | `all` | `off`)"
+                    "invalid notify mode `{other}` (expected `final` | `brief` | `all` | `off`)"
                 )),
             },
             other => Err(format!(
-                "invalid notify value {other} (expected `final` | `all` | `off` or a boolean)"
+                "invalid notify value {other} (expected `final` | `brief` | `all` | `off` or a boolean)"
             )),
         }
     }
@@ -213,6 +220,7 @@ mod tests {
         // String forms round-trip; the pre-v0.9.5 boolean form still parses.
         for (raw, want) in [
             ("\"final\"", NotifyMode::Final),
+            ("\"brief\"", NotifyMode::Brief),
             ("\"all\"", NotifyMode::All),
             ("\"off\"", NotifyMode::Off),
             ("true", NotifyMode::Final),
@@ -222,6 +230,10 @@ mod tests {
             assert_eq!(got, want, "parsing {raw}");
         }
         assert_eq!(serde_json::to_string(&NotifyMode::All).unwrap(), "\"all\"");
+        assert_eq!(
+            serde_json::to_string(&NotifyMode::Brief).unwrap(),
+            "\"brief\""
+        );
         assert!(serde_json::from_str::<NotifyMode>("\"sometimes\"").is_err());
         assert!(serde_json::from_str::<NotifyMode>("3").is_err());
     }

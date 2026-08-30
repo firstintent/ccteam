@@ -10,7 +10,7 @@
 //!
 //! Operations covered (one test each):
 //!  1. `initialize` — protocol version + tools capability + server identity
-//!  2. `tools/list` — the exact 8-tool surface
+//!  2. `tools/list` — the exact 6-tool surface
 //!  3. `tools/call status` — empty project list on a fresh root
 
 use serde_json::{json, Value};
@@ -31,7 +31,7 @@ fn tmp_paths() -> (TempDir, CcteamPaths) {
 }
 
 async fn call(paths: &CcteamPaths, req: Value) -> Value {
-    ccteam_im::mcp::handle_request(paths, &req)
+    ccteam_im::mcp::handle_request(paths, &req, &ccteam_im::mcp::ToolFace::full())
         .await
         .expect("request expects a response")
 }
@@ -58,7 +58,7 @@ async fn mcp_initialize_returns_protocol_version_and_tools_cap() {
 
 #[tokio::test]
 async fn mcp_tools_list_returns_full_tool_set() {
-    // status 1 + beacon alias 1 + chat 1 + session 5 = 8.
+    // status 1 + beacon alias 1 + chat 1 + session 3 = 6.
     let (_tmp, paths) = tmp_paths();
     let resp = call(
         &paths,
@@ -68,19 +68,17 @@ async fn mcp_tools_list_returns_full_tool_set() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(
         tools.len(),
-        8,
-        "status 1 + beacon alias 1 + chat 1 + session 5 = 8"
+        6,
+        "status 1 + beacon alias 1 + chat 1 + session 3 = 6"
     );
     let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     names.sort();
     let mut expected = vec![
+        "agent",
+        "agent_read",
+        "agent_stop",
         "chat_send_file",
         "grok_claude_codex_kimi",
-        "session_collect",
-        "session_dispatch",
-        "session_list",
-        "session_spawn",
-        "session_stop",
         "status",
     ];
     expected.sort();
@@ -100,7 +98,11 @@ async fn mcp_tools_list_returns_full_tool_set() {
         "screenshot",
         "ccteam__status",
         "ccteam__chat_send_file",
-        "ccteam__session_spawn",
+        "session_spawn",
+        "session_dispatch",
+        "session_collect",
+        "session_list",
+        "session_stop",
     ] {
         assert!(!names.contains(&gone), "culled tool present: {gone}");
     }

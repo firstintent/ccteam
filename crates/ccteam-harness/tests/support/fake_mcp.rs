@@ -53,11 +53,9 @@ async fn handle(
             {"name":"status","description":"Status","inputSchema":{"type":"object","properties":{}}},
             {"name":"grok_claude_codex_kimi","description":"Discovery","inputSchema":{"type":"object","properties":{}}},
             {"name":"chat_send_file","description":"Send file","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_spawn","description":"Spawn","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_dispatch","description":"Dispatch","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_collect","description":"Collect","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_list","description":"List","inputSchema":{"type":"object","properties":{}}},
-            {"name":"session_stop","description":"Stop","inputSchema":{"type":"object","properties":{}}}
+            {"name":"agent","description":"Hire or task","inputSchema":{"type":"object","properties":{}}},
+            {"name":"agent_read","description":"Read the team","inputSchema":{"type":"object","properties":{}}},
+            {"name":"agent_stop","description":"Stop","inputSchema":{"type":"object","properties":{}}}
         ]}),
         "tools/call" => json!({"content":[{"type":"text","text":"ok"}],"isError":false}),
         _ => Value::Null,

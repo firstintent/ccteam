@@ -26,7 +26,7 @@
 //! durable credential written into it cannot say WHICH caller is speaking.
 //! Measured consequence: two `codex` runs in different repos authenticated as
 //! the same machine-wide caller, so neither could be a delegation parent and
-//! their `session_spawn` children mounted as ROOTS in a project nobody had
+//! their `agent` children mounted as ROOTS in a project nobody had
 //! named. A credential a static file can carry must therefore grant nothing by
 //! itself — which is why the tier is *deleted* rather than narrowed: an
 //! identity-free caller has no correct amount of authority. The web token still
@@ -143,6 +143,9 @@ async fn handle_post(
     let Some(auth) = require_mcp_auth(&app, &headers) else {
         return unauthorized();
     };
+    if let Some(refusal) = refuse_unsupported_protocol_header(&headers) {
+        return refusal;
+    }
 
     let mut req = match body {
         Ok(Json(v)) => v,
@@ -185,7 +188,6 @@ async fn handle_post(
             slug,
             may_invoke_tools,
         } => {
-            log_tier_call(&format!("session:{sid}"), &req);
             // A session that is still spawning is not a session yet: nothing
             // can be dispatched to it and it must not be able to spawn or stop
             // anybody. It only needs discovery (`initialize` / `tools/list`) to
@@ -211,9 +213,47 @@ async fn handle_post(
                     .into_response();
             }
             inject_session_caller(&mut req, &sid, &role, &secret, &slug);
-            dispatch_json_rpc(&app, req, ccteam_im::mcp::McpCaller::Ambient).await
+            dispatch_json_rpc(
+                &app,
+                req,
+                ccteam_im::mcp::McpCaller::Ambient,
+                &format!("session:{sid}"),
+            )
+            .await
         }
     }
+}
+
+/// The transport's own version gate: a client that DECLARES a protocol
+/// revision this server does not speak is told so at the HTTP layer, before a
+/// body is interpreted under assumptions neither side shares. An absent header
+/// passes — `initialize` negotiates instead (and a conforming client sends the
+/// header only after that handshake).
+fn refuse_unsupported_protocol_header(headers: &HeaderMap) -> Option<Response> {
+    // A PRESENT header must name a version this server speaks. Non-UTF8 and
+    // empty values are present-but-invalid → 400, not silently "absent"
+    // (absence is the one lenient case: the client then negotiates at
+    // `initialize`).
+    let declared = headers
+        .get("mcp-protocol-version")?
+        .to_str()
+        .map(str::trim)
+        .unwrap_or("");
+    if ccteam_im::mcp::SUPPORTED_PROTOCOL_VERSIONS.contains(&declared) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "unsupported MCP-Protocol-Version {declared}; supported: {}",
+                    ccteam_im::mcp::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                )
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// Run one JSON-RPC message through the dispatcher and shape the HTTP answer.
@@ -223,9 +263,15 @@ async fn dispatch_json_rpc(
     app: &AppState,
     req: Value,
     caller: ccteam_im::mcp::McpCaller,
+    tier: &str,
 ) -> Response {
     let dispatch = app.mcp_dispatch();
-    match dispatch.dispatch_as(req, caller).await {
+    // Log AFTER the dispatch: the one fact worth recording about a
+    // `tools/list` is how big the face it answered with was, and that only
+    // exists once the daemon has composed it.
+    let answer = dispatch.dispatch_as(req.clone(), caller).await;
+    log_tier_call(tier, &req, answer.as_ref());
+    match answer {
         Some(response) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -255,13 +301,26 @@ async fn dispatch_json_rpc(
 /// — an enrolled client is never logged as the identity that wrote its config
 /// file, which is the whole point of that family.
 ///
-/// Tool calls only: `initialize` / `tools/list` are discovery noise.
-fn log_tier_call(tier: &str, req: &Value) {
-    if !is_tool_call(req) {
+/// Discovery is logged too. A tool face is now composed PER CALLER, so "which
+/// tools did this session actually get" is a question with a different answer
+/// per session — and the only moment it is decided is `initialize` /
+/// `tools/list`. Unlogged, a leaf that came up with the wrong face would leave
+/// no evidence at all; `tools = N` is that evidence.
+fn log_tier_call(tier: &str, req: &Value, response: Option<&Value>) {
+    if is_tool_call(req) {
+        let tool = called_tool(req).unwrap_or("?");
+        tracing::info!(%tier, %tool, "ccteam-web: POST /mcp tool call");
         return;
     }
-    let tool = called_tool(req).unwrap_or("?");
-    tracing::info!(%tier, %tool, "ccteam-web: POST /mcp tool call");
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+    if !matches!(method, "initialize" | "tools/list") {
+        return;
+    }
+    let tools = response
+        .and_then(|response| response.pointer("/result/tools"))
+        .and_then(Value::as_array)
+        .map(Vec::len);
+    tracing::info!(%tier, %method, ?tools, "ccteam-web: POST /mcp discovery");
 }
 
 /// Who authenticated against `POST /mcp`. Two families, no admin tier — see the
@@ -393,37 +452,57 @@ fn verify_session_bearer(app: &AppState, sid: &str, secret: &str) -> Option<McpA
     })
 }
 
+/// The `params.arguments` object, created if the message has none.
+///
+/// Every method gets one now, not just `tools/call`: `initialize` and
+/// `tools/list` are where the daemon composes this caller's TOOL FACE, and it
+/// cannot do that without knowing who is asking. A message that carries no
+/// `params` at all (which `initialize` and `tools/list` legitimately may)
+/// would otherwise arrive anonymous and be served the full surface.
+fn caller_args(req: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if !req.get("params").is_some_and(Value::is_object) {
+        req.as_object_mut()?.insert("params".into(), json!({}));
+    }
+    let params = req.get_mut("params")?.as_object_mut()?;
+    if !params.get("arguments").is_some_and(Value::is_object) {
+        params.insert("arguments".into(), json!({}));
+    }
+    params.get_mut("arguments")?.as_object_mut()
+}
+
 /// Inject the FULL caller identity (`_caller_sid` / `_caller_secret` /
-/// `_caller_role` / `_caller_slug`) into a tools/call arguments object so the
-/// Ambient session_* PRINCIPAL gate sees the curated session's identity. All
-/// four are OVERWRITTEN (never trust a caller-supplied value); the daemon
-/// re-verifies `(sid, secret)` and re-derives slug/role from CallerCtx.
+/// `_caller_role` / `_caller_slug`) so the Ambient PRINCIPAL gate sees the
+/// curated session's identity. All four are OVERWRITTEN (never trust a
+/// caller-supplied value); the daemon re-verifies `(sid, secret)` and
+/// re-derives slug/role from CallerCtx.
 fn inject_session_caller(req: &mut Value, sid: &str, role: &str, secret: &str, slug: &str) {
-    let Some(params) = req.get_mut("params") else {
+    let Some(map) = caller_args(req) else {
         return;
     };
-    let args = params.as_object_mut().and_then(|m| m.get_mut("arguments"));
-    let args = match args {
-        Some(a) => a,
-        None => {
-            if let Some(obj) = params.as_object_mut() {
-                obj.insert("arguments".into(), json!({}));
-                obj.get_mut("arguments").unwrap()
-            } else {
-                return;
-            }
-        }
+    map.insert("_caller_sid".into(), json!(sid));
+    map.insert("_caller_secret".into(), json!(secret));
+    map.insert("_caller_role".into(), json!(role));
+    map.insert("_caller_slug".into(), json!(slug));
+    // The local-socket admin fallback arg must never ride in over HTTP —
+    // this transport has no admin tier at all (see the module doc); it
+    // authenticates a session principal or an enrolled client's node.
+    map.remove("_caller_admin_token");
+    map.remove("_enroll_reachable");
+}
+
+/// Tell the daemon which projects an enrolled binding with NO ledger node yet
+/// could name, so `initialize.instructions` can list them instead of leaving
+/// the agent to discover its first refusal.
+fn inject_enroll_reachable(req: &mut Value, reachable: Vec<String>) {
+    let Some(map) = caller_args(req) else {
+        return;
     };
-    if let Some(map) = args.as_object_mut() {
-        map.insert("_caller_sid".into(), json!(sid));
-        map.insert("_caller_secret".into(), json!(secret));
-        map.insert("_caller_role".into(), json!(role));
-        map.insert("_caller_slug".into(), json!(slug));
-        // The local-socket admin fallback arg must never ride in over HTTP —
-        // this transport has no admin tier at all (see the module doc); it
-        // authenticates a session principal or an enrolled client's node.
-        map.remove("_caller_admin_token");
-    }
+    map.remove("_caller_sid");
+    map.remove("_caller_secret");
+    map.remove("_caller_role");
+    map.remove("_caller_slug");
+    map.remove("_caller_admin_token");
+    map.insert("_enroll_reachable".into(), json!(reachable));
 }
 
 /// The connecting peer's address, when the serving stack was built with
@@ -544,16 +623,29 @@ async fn handle_enroll_post(
                 )
                     .into_response();
             }
-            log_tier_call(&format!("session:{sid}"), &req);
             inject_session_caller(&mut req, sid, &matched.role, secret, &matched.slug);
-            dispatch_json_rpc(app, req, ccteam_im::mcp::McpCaller::Ambient).await
+            dispatch_json_rpc(
+                app,
+                req,
+                ccteam_im::mcp::McpCaller::Ambient,
+                &format!("session:{sid}"),
+            )
+            .await
         }
         None => {
-            log_tier_call(&format!("enroll:{}", credential.id), &req);
             if let Some(refusal) = refuse_projectless_call(app, credential, &binding, &req) {
                 return refusal;
             }
-            dispatch_json_rpc(app, req, ccteam_im::mcp::McpCaller::Ambient).await
+            // No ledger node yet: the daemon still needs to know WHO is asking
+            // so `initialize` can tell this agent which projects it may name.
+            inject_enroll_reachable(&mut req, addressable_projects(app, &credential.owner));
+            dispatch_json_rpc(
+                app,
+                req,
+                ccteam_im::mcp::McpCaller::Ambient,
+                &format!("enroll:{}", credential.id),
+            )
+            .await
         }
     }
 }
@@ -567,7 +659,7 @@ async fn handle_enroll_post(
 async fn open_binding(
     app: &AppState,
     credential: &EnrollCredential,
-    req: Value,
+    mut req: Value,
     peer: Option<SocketAddr>,
 ) -> Response {
     let client = client_label(&req);
@@ -606,7 +698,34 @@ async fn open_binding(
             ),
         }
     }
-    let mut response = dispatch_json_rpc(app, req, ccteam_im::mcp::McpCaller::Ambient).await;
+    // Whichever rung the binding landed on, `initialize` answers with a face
+    // and instructions composed for it: a node speaks as its own principal, a
+    // still-unbound binding is told which projects it may name.
+    let tier = match app
+        .native_bindings
+        .resolve(&id, &credential.id)
+        .and_then(|binding| {
+            binding
+                .principal()
+                .map(|(sid, secret)| (sid.to_string(), secret.to_string(), binding.clone()))
+        }) {
+        Some((sid, secret, binding)) => {
+            let matched = app
+                .session_principals
+                .as_ref()
+                .and_then(|principals| principals.verify(&sid, &secret));
+            let (role, slug) = matched
+                .map(|matched| (matched.role, matched.slug))
+                .unwrap_or_else(|| (String::new(), binding.project.clone().unwrap_or_default()));
+            inject_session_caller(&mut req, &sid, &role, &secret, &slug);
+            format!("session:{sid}")
+        }
+        None => {
+            inject_enroll_reachable(&mut req, addressable_projects(app, &credential.owner));
+            format!("enroll:{}", credential.id)
+        }
+    };
+    let mut response = dispatch_json_rpc(app, req, ccteam_im::mcp::McpCaller::Ambient, &tier).await;
     if let Ok(value) = HeaderValue::from_str(&id) {
         response
             .headers_mut()
@@ -705,9 +824,9 @@ async fn bind_named_project(
     let Some(tool) = called_tool(req) else {
         return Ok(binding);
     };
-    // The `session_*` face is the only one that takes a workspace argument;
+    // The session face is the only one that takes a workspace argument;
     // `status`/discovery name a project nowhere and must not bind one.
-    if !tool.starts_with("session_") {
+    if !ccteam_im::mcp::is_session_tool(tool) {
         return Ok(binding);
     }
     let Some(slug) = named_project(req) else {

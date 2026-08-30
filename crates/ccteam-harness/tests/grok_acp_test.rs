@@ -459,6 +459,7 @@ async fn load_resume_filters_is_replay() {
     // Seed meta as if a prior session existed with known ACP sessionId.
     let meta = SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid.into(),
@@ -752,6 +753,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     let sid_load = "s-load-mcp";
     let meta = SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid_load.into(),

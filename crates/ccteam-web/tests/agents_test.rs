@@ -2,7 +2,7 @@
 //! `GET /api/v1/agents/graph` (snapshot + ACL) and `GET /api/v1/agents/events`
 //! (global SSE: delegation frames carry `slug`, `Last-Event-ID` replay, tenant
 //! frame filter). Drives a REAL [`ccteam_im::gateway::Gateway::create_delegated_session`]
-//! (the same call `session_spawn` routes through) against a `FakeAdapter`, so
+//! (the same call `agent` routes through) against a `FakeAdapter`, so
 //! the emitted `delegation_spawned` progress event + its
 //! `GatewayEventKind::Delegation` broadcast twin are the genuine article, not
 //! a hand-built fixture.
@@ -182,7 +182,7 @@ fn register_project(paths: &CcteamPaths, slug: &str, owner: Option<&str>) -> std
 }
 
 /// Build a gateway over "demo" + spawn ONE delegated child (mirrors what
-/// `session_spawn` does for an Ambient caller) — the real code path that
+/// `agent` does for an Ambient caller) — the real code path that
 /// emits `delegation_spawned` (progress.jsonl, when project_paths is wired)
 /// AND its [`ccteam_im::gateway::GatewayEventKind::Delegation`] broadcast
 /// twin (unconditional — see `Gateway::emit_delegation_progress`).
@@ -233,6 +233,7 @@ fn idle_meta(
 ) {
     let m = ccteam_harness::SessionMeta {
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid.to_string(),

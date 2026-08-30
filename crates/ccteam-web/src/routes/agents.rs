@@ -31,7 +31,7 @@
 //! session is DOING (`working|idle|stale|stuck`, resolved through the shared
 //! [`super::sessions_api::ProjectActivity`] — the same
 //! `ccteam_core::stall::classify_session_activity` the session rail, IM
-//! `/status` and MCP `session_list` answer through; `detached` keeps its own
+//! `/status` and MCP `agent_read` answer through; `detached` keeps its own
 //! word). `residency` says whether ccteam is HOLDING a process for it
 //! (`resident|released|stopped|detached|external`).
 //!
@@ -518,6 +518,7 @@ mod tests {
     ) {
         let mut m = ccteam_harness::SessionMeta {
             mode: None,
+            tool_face: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: sid.to_string(),
