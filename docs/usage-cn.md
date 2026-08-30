@@ -305,7 +305,9 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 /status                    当前会话的深度视图——无论什么状态都是同一张卡:idle / working /
                            stuck,或 💤 released(下条消息即恢复;卡片读的是落盘事实)。
                            含 model · 强度 · ctx、账号用量窗口(5h / 周;本会话没进程时
-                           向同 harness 的任一在线会话借)、自己的后台工作、直接子会话,
+                           向同 harness 的在线会话读,并按 harness 记住,所以一个进程都不在
+                           也照样显示;过了厂商自报的重置时间就丢弃,不显示过期数)、
+                           自己的后台工作、直接子会话,
                            以及指向其余舰队的页脚(/sessions、/projects)
                            ctx 只在**真测到**时才显示:vendor 还没报过就是「未知」而非 0%,
                            且 daemon 重启后不丢

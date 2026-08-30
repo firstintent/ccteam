@@ -315,8 +315,10 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
                            idle / working / stuck, or 💤 released (resumed by your next
                            message; the card is read from what was persisted). Shows model,
                            effort and context usage, the account's rate-limit windows
-                           (5h / weekly, borrowed from any live session of the same harness
-                           when this one holds no process), the session's own background
+                           (5h / weekly — read from any live session of the same harness,
+                           and remembered per harness so they still show when nothing is
+                           resident; each window is dropped once the vendor's own reset
+                           time passes rather than shown stale), the session's own background
                            work (subagents and background shells stay listed for as long as
                            the vendor reports them running, not just during the turn that
                            launched them), its delegates, and a footer pointing at the rest
