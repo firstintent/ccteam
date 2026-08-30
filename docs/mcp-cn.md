@@ -1,0 +1,111 @@
+# ccteam MCP server — 工具全参考
+
+> English: [mcp.md](mcp.md) · 白话委派指南: [orchestration-cn.md](orchestration-cn.md) · 人用手册: [usage-cn.md](usage-cn.md)
+
+ccteam 只暴露**一个 MCP server,名字 `ccteam`**,走 streamable HTTP:daemon 的 `POST /mcp`(默认 `http://127.0.0.1:7331/mcp`)。工具名由你的 harness 加 server 前缀 —— Claude 里显示为 `mcp__ccteam__agent`,其他 harness 用各自的前缀。这套面刻意做成**菜单而非手册**:六个工具、每参数一行说明、紧凑 JSON 返回体、默认薄 + 旋钮 —— 因为 schema 的每个字节、默认返回的每一行,都记在 agent 的上下文账上。边界与失败语义住在服务端错误体里(踩到的人才付)和本页(人读一次就够)。
+
+## 1. 接入:两种凭据家族
+
+`POST /mcp` 永远要 bearer —— 没有 cookie / web-token 路,也没有 admin 层:
+
+| Bearer | 谁 | 从哪来 |
+|---|---|---|
+| `ccteam-sid:<sid>:<secret>` | **ccteam 受管会话**为自己发声 | spawn 时写进该会话的专属 MCP 配置,无需任何操作 |
+| `ccteam-enroll:<id>:<secret>` | **手起 client**(你自己启动的 CLI 会话、SDK、脚本) | `ccteam config mcp` 往各 vendor 全局配置写一份机器级凭据;web 控制台可铸项目级凭据(项目页 → external agent) |
+
+enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `initialize` 时签发:响应头带 `Mcp-Session-Id`,之后每个请求都要回带;`DELETE /mcp`(或 ~2 小时空闲清扫)结束该 binding。enrolled client 会成为一条真实的账本会话(`managed_by: external`),它雇的人是它的子节点,不是无主根。
+
+**点名 workspace。**机器级凭据不含项目,所以 enrolled client 的第一个 `agent` / `agent_read` / `agent_stop` 调用必须带 `project:"<slug>"` —— 首次点名即终身绑定,只接受凭据 owner 可见的项目,ccteam 绝不从工作目录推断。拒绝时会列出你够得着的 slug。
+
+## 2. 服务端注入什么(以及给谁)
+
+工具列表与 server `instructions` 都在连接时**按 caller 组合**,所以会话永远不为用不到的雇人手册付费:
+
+| caller | `tools/list` |
+|---|---|
+| 还能雇人的会话(深度低于 `delegation.max_depth`,默认 2) | `status` · `grok_claude_codex_kimi` · `agent` · `agent_read` · `agent_stop` |
+| 深度封顶的子会话,或以 `tools:"read"` 雇的 | 只有 `agent_read` |
+| 以 `tools:"none"` 雇的 | *(空)* |
+| 手起 client(点名项目前后) | 全部六个 |
+| …另外,任何有 chat 可回的 caller(root 会话,或当前绑着 IM/web chat 的会话) | 追加 `chat_send_file` |
+
+`CCTEAM_DISABLE_TOOLS`(组名逗号表:`admin` / `chat` / `session`)在此之上再过滤。面在进程生命周期内固定;resume = 新进程 = 重算。**裁面只是列表决策,不是权限**:被藏起的工具硬调,仍走原有的全部鉴权门。
+
+`initialize.instructions` 保持在 ~1 KB 内,同样按面组合:一句「ccteam 是什么」;「用 `agent`,绝不 shell 出去跑 `codex exec` / `claude -p`」的政策只给能雇人的面;chat 信封说明只给 chat 可达的会话;附件规则(`<channel …>` 标签或 `[attachment …]` 行带 `image_path=` / `file_path=` → 先读那些文件再回答)永远在;最后一行陈述身份事实 —— `You are s42 in project cct.`,深度封顶时补一句事实。ccteam 只写你是谁、在哪工作,绝不写你该怎么做。
+
+## 3. 六个工具
+
+### `agent` —— 雇一个,或派下一件
+
+`{task, sid?, vendor?, wait?, model?, effort?, role?, project?, title?, notify?, tools?, mode?, permission_mode?, idempotency_key?, parent_sid?}`
+
+`task` **必填**,原文作为 user turn 转发(零注入);没有「只建不派」的形态。
+
+- **不带 `sid` = 新雇。**`vendor` 选 harness —— `claude`(默认)/ `codex` / `grok` / `opencode` / `kimi` / `pi` / `dsh` —— 响应总是带**新** sid。`model` / `effort` 原样传给 vendor(省略走默认;vendor 拒绝的值 = 雇佣失败,绝不静默忽略)。`role` 指 `.claude/agents/<role>.md`(省略 = roleless,裸 vendor 自读项目 `CLAUDE.md`/`AGENTS.md`)。`mode` 仅 DSH(`standard` | `ptc` | `minimal` | `creator`)。`permission_mode:"hitl"` 把审批弹到你绑定的 chat;默认 `skip` 不弹。`tools` 设子会话自己的面(§2)。`title`(≤80 字符)只进账本与团队视图,绝不进任何 prompt。`parent_sid` 用于 ccteam 不管理你时保住委派边。
+- **带 `sid` = 续派**;`released` 会话先按 sid 复活。此形态下雇佣类参数一律拒绝而非静默忽略。
+- `wait` —— 内联等待秒数,0–240(默认 0 = async)。超时回 `status:"pending"`,**绝不取消子任务**。
+- `idempotency_key` —— 同 key 重试重放原调用而非翻倍(新雇按项目、续派按子会话;内存态,~1 小时)。重放响应多一个 `idempotent_replay:true`。
+- **没有 `host`**(机器跟随项目绑定)、**没有 `protocol`**(信道由 vendor 推导);传了都是硬错,退役的 `wait_seconds` 同理(已改名 `wait`)。
+
+响应(紧凑 JSON):async → `{sid, turn_id, status:"pending"}`(任务排在重启前旧进程后面时是 `status:"queued"`;完成通知到不了你时带 `notify_deliverable:false` —— 那就轮询 `agent_read`)。内联 → `{sid, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`;`result_text` 保留 4000 字符头尾节选 + 指向全文的指针。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
+
+### `agent_read` —— 名册,或一份 transcript
+
+`{sid?, n?, tail?, since?, max_chars?, project?, activity?, tree?}` —— 只读;`sid` 决定你拿到什么。
+
+- **不带 `sid` = 名册**,最近活跃在前:`n` 行(默认 10,最多 500),过滤器 `project` 与 `activity`(`working` | `idle` | `stale` | `stuck` | `all`),`tree:true` **只对返回行**铺委派拓扑。行 = `{sid, vendor, model?, role?, title?, activity, residency?, context_pct?, parent_sid?, is_self?, waiting_approval?, host?, cost_usd?, tokens_total?}`,空字段省略;`is_self` 标你自己那行;`truncated:true` + `total` 只在截断时出现。`residency` 只在 ccteam 不持进程时出现:`released` 在你下次 `agent{sid}` 时复活 —— 复用它,别雇双胞胎;`stopped` 是被用户显式结束的。
+- **带 `sid` = 该会话的 transcript**,默认**最新在前**(`tail` 默认 true;给了 `since` 则从 turn_id 游标向前翻页)。`n` 默认 10 条,`max_chars` 默认 4000(500–50000;超长保留 70% 头 / 30% 尾节选 + 明确指针,全文永远在账本里)。返回体:`{activity, context_pct?, cursor?, cost_usd?, tokens_total?, residency?, truncated?, turns:[{turn_id, content, outcome?, error_kind?, error?}]}`。空 `turns` = 还没答案;`activity:"working"` = turn 进行中。
+- 退役的 `limit` 参数 = 硬错(已改名 `n`)。
+
+### `agent_stop` —— 显式结束一个会话
+
+`{sid}` → `{sid, stopped:true}`。显式命令,绝非主动 kill:transcript 留在盘上,`agent_read{sid}` 照读。agent 只能 stop 自己的后代。(ccteam 自身只有两个自动刹车:vendor 日预算触顶拒**新**活;live 容量满时优雅释放最久未活跃的空闲会话 —— 创建永不因容量失败。)
+
+### `status` —— 能雇谁、花了多少;分级
+
+`{detail?: "brief" | "models" | "vendors" | "routing" | "full"}` —— 只读,默认 `brief`(~100–200 B):`{project, host, cost_24h_usd, hire:[…]}`,`hire` = 项目绑定主机上真正装了的 vendor;卫星离线或快照陈旧时补 `host_online:false` / `stale:true`;有 vendor 触顶时补 `budget_disabled:[…]`。`detail` 要多少买多少:
+
+- `models` —— 每 vendor 观测到的模型 id + reasoning-effort 阶梯(runtime last-seen,带观测时间)+ hub `models.json` 目录,两个来源分开标注。均为参考,绝非雇佣白名单。
+- `vendors` —— 每 vendor 的 installed / version / auth(`unknown` —— 诚实:在 PATH 上不冒充已登录,也从不拦雇佣)/ 预算姿态、观测时间戳、pi/dsh 桥接说明。
+- `routing` —— 你的 routing notes 原文(`source` / `sha256` / `updated_at` / `truncated` / `text`;项目级 `<project>/.ccteam/routing.md` 完整替换全局 `~/.ccteam/routing.md`,不合并),或 `{missing:[…]}` 列出查过的两个路径。
+- `full` —— 以上全部 + daemon 健康 + 每个可见项目的 24h 成本。运维数据只住这里。
+
+### `grok_claude_codex_kimi` —— 裸名发现别名
+
+无参数;返回与 brief `status` 相同的载荷。它为只显示工具**名字**的 host 而存在 —— 面上其他地方没有 "grok" / "codex" 字样,这个名字把 vendor 关键词顶到最前面。
+
+### `chat_send_file` —— 把文件发回你自己的 chat
+
+`{path, caption?, kind?}` —— 把 daemon 文件系统上的文件发到绑定**你**的 chat(chat 用户打不开本地路径)。`kind`(`photo` | `document`)按扩展名推断。刻意零寻址参数;只列给 chat 可达的 caller(§2)。
+
+## 4. 完成通知
+
+每个 `agent` 任务都挂 watch(除非你退订),**在 vendor turn 边界只报一次** —— 话痨子会话的中途叙述只进账本。通知 = 一行头 —— `s12 done · turn 7 · ctx 19%`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选:
+
+| `notify` | 节选 | 用途 |
+|---|---|---|
+| `final`(默认) | 2000 字符头尾 + 指向 `agent_read{sid,tail:true}` 的指针 | 日常委派 |
+| `brief` | 500 字符 | 大扇出,只要 pass/fail + 坐标 |
+| `all` | 保留档 —— 目前行为等同 `final` | — |
+| `off` | 无(只记账本) | 发完不管 |
+
+布尔仍认(`true`→final,`false`→off)。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话(在线 = 直接注入;进程间隙 = 排队,resume 时送达)。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,用 `wait` 或轮询 `agent_read`。派给不是你雇的会话 = handoff:照跑照记账,但不给你订阅,除非显式传 `notify`。
+
+## 5. 协议细节
+
+- **版本**:server 谈 `2025-06-18` / `2025-03-26` / `2024-11-05`。client 要别的版本 → 回 server 最新版(按规范,绝不报错)。请求头 `MCP-Protocol-Version` 若指名不支持的版本 —— 包括「有头但空值/非 UTF-8」 —— 一律 HTTP 400;不带头则由 `initialize` 谈判。
+- **传输**:一个 `POST` 一条 JSON-RPC;notification 回 202 空体;`GET /mcp` = 405(无服务端推流);`DELETE /mcp` 关 enrolled binding。解析错误 = JSON-RPC `-32700` + HTTP 200。
+- **annotations**:`status`、别名、`agent_read` 声明 `readOnlyHint`;`agent_stop` 声明 `destructiveHint`;`agent` 与 `chat_send_file` 声明 `destructiveHint:false`。
+- **序列化**:全部紧凑 JSON(不 pretty);空/默认字段省略而非写出。
+- **可观测**:daemon 对每次工具调用**以及**每次发现请求(`initialize` / `tools/list`)各打一行 INFO 日志(带 caller tier)—— 「这个会话调了几次什么」查日志即可,不靠回忆。
+
+## 6. 护栏与信任(诚实版)
+
+委派由 daemon 带理由地执法:深度(`delegation.max_depth`,默认 2)、扇出(每 parent 10)、每项目 50 委派、环拒绝(自己/祖先)、per-vendor 24h 预算。受管会话的 `(sid, secret)` principal 把它锁在自己项目内并归因每个动作 —— 但这是**单 OS 用户下的纵深防御,不是硬边界**:同 uid 进程终究能互读环境。它买到的是:agent 不会*误*跨项目、不会*误*冒充彼此。硬隔离(per-agent OS 用户 / 沙箱)现阶段刻意不做。
+
+## 7. 接线与验证
+
+- `ccteam config mcp` 向 Claude、Codex、Grok、OpenCode、Kimi 注册(各自全局配置;ccteam 只写自己那一条)。
+- **DSH** 没有 ccteam 可写的配置:它的面是 DSH web 运行时里的 `@ccteam/ccteam-ui` 插件,加载时一次性注册同样六个工具(静态全面 —— 按 caller 出面只对直连 `POST /mcp` 的 harness 生效),且能把完成通知送回 DSH 对话。
+- **Pi** 只在 ccteam 受管会话里拿到工具(内嵌 bridge;Pi 内名字带 `ccteam_` 前缀,只读工具自动放行);你手起的 `pi` 分毫不动。
+- 随时验证:`ccteam doctor --verify-mcp` → **6 tools, 0 stubs**;`claude mcp list` 显示 `ccteam ✔`;某个会话列出的工具比别人少不是坏了 —— 那是它的面(§2)。

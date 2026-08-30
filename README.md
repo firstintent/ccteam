@@ -102,6 +102,7 @@ status (+ its discovery alias grok_claude_codex_kimi) · chat_send_file
 The daemon routes and records — at-least-once notifications across restarts, idempotency keys, a child's turn written to disk before its parent is told, guardrails that refuse runaway fan-out with a reason. When a web-driven session finishes autonomous work while nobody is watching the console, the final answer is mirrored to your IM; the IM `/status` card shows your session's working children at a glance. It never schedules; *when* to delegate lives in prompts you version.
 
 - Plain-language walkthrough → [orchestration guide](docs/orchestration.md)
+- MCP tool reference (all six tools, faces, protocol) → [mcp.md](docs/mcp.md)
 - Every command → manual ([English](docs/usage.md) · [中文](docs/usage-cn.md))
 
 ## Inside DeepSeek Harness
