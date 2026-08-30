@@ -302,7 +302,11 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 
 # 查看 / 接入
 /sessions [all]            列当前项目的会话(带 vendor · role · model · 上下文用量);`all` = 跨所有项目
-/status                    全队健康:每个会话 idle / working / stuck + model · 强度 · ctx
+/status                    当前会话的深度视图——无论什么状态都是同一张卡:idle / working /
+                           stuck,或 💤 released(下条消息即恢复;卡片读的是落盘事实)。
+                           含 model · 强度 · ctx、账号用量窗口(5h / 周;本会话没进程时
+                           向同 harness 的任一在线会话借)、自己的后台工作、直接子会话,
+                           以及指向其余舰队的页脚(/sessions、/projects)
                            ctx 只在**真测到**时才显示:vendor 还没报过就是「未知」而非 0%,
                            且 daemon 重启后不丢
 /help                      列出网关命令

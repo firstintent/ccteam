@@ -311,10 +311,16 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
 
 # Inspect / onboard
 /sessions [all]            List sessions for current project; all = across projects.
-/status                    Team health: idle / working / stuck plus model, effort and context
-                           usage, the session's own background work (subagents and background
-                           shells stay listed for as long as the vendor reports them running,
-                           not just during the turn that launched them), and its delegates.
+/status                    The current session in depth — one card whatever its state:
+                           idle / working / stuck, or 💤 released (resumed by your next
+                           message; the card is read from what was persisted). Shows model,
+                           effort and context usage, the account's rate-limit windows
+                           (5h / weekly, borrowed from any live session of the same harness
+                           when this one holds no process), the session's own background
+                           work (subagents and background shells stay listed for as long as
+                           the vendor reports them running, not just during the turn that
+                           launched them), its delegates, and a footer pointing at the rest
+                           of the fleet (/sessions, /projects).
                            Context occupancy is only shown when it was actually
                            measured — a session whose vendor has not reported yet reads as
                            unknown rather than 0%, and survives daemon restarts.

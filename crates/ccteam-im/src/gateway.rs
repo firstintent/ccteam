@@ -9822,100 +9822,22 @@ impl Gateway {
             .collect()
     }
 
-    /// v0.8.19 — PULL-only fleet-health view for `/status`. One line per
-    /// accessible session: state (🟢 idle / 🔵 working / 🔴 stuck) · sid ·
-    /// session-name (`ccteam-chat-<slug>-<sid>`) · the real vendor `--resume`
-    /// id (`resume <uuid>`, or `resume —` when none) · project · role ·
-    /// state-detail · model · effort · ctx, plus the live activity counts
-    /// (`read×N·bash×M`) while working. Same ACL + iteration as
+    /// v0.8.19 — PULL-only deep view for `/status`: the chat's CURRENT
+    /// (focused) session in depth (`/sessions` is the fleet list). Same ACL as
     /// [`render_sessions`]; pure rendering (no side effects, no push, no
     /// mutation) — it only renders when the user types `/status`.
     ///
-    /// State derivation = [`Gateway::live_turn`] — the same in-flight verdict
-    /// the child rows, MCP `session_list` and the web session list are given
-    /// (no turn ⇒ 🟢 **idle** · in flight ⇒ 🔵 **working** with `now - start` ·
-    /// in flight and silent for a full watchdog window ⇒ 🔴 **STUCK** with the
-    /// silent duration, exactly what the watchdog itself would flag). This line
-    /// adds one refinement it alone can afford: a BLOCKING subagent is an
-    /// authoritative "still working" straight from the vendor, so it upgrades
-    /// 🔴 back to 🔵 (`running_tasks` costs an adapter round-trip per session,
-    /// which a fleet listing does not pay).
-    /// `/status` for a focused sid ccteam holds no process for — the RELEASED
-    /// twin of the live header, in the SAME five-line shape so the two read
-    /// identically apart from the state word. Every fact comes from what was
-    /// persisted (`meta.json` + the session's own `status.json`); nothing that
-    /// requires a running thread (running tasks, account usage, goal) is
-    /// invented. `None` when the sid is unknown, not visible to `chat`, or is
-    /// not actually released (stopped / external / detached), so the caller can
-    /// fall through to its normal paths.
-    fn render_released_status(
-        &self,
-        chat: &ChatKey,
-        sid: &str,
-        memo: &mut ProjectPrincipalMemo,
-    ) -> Option<String> {
-        if self.sessions.contains_key(sid) || self.detached.contains_key(sid) {
-            return None;
-        }
-        let (slug, dir, meta) = self.find_meta_for_sid(sid).ok()?;
-        if !meta.is_resumable() || !self.project_owner_visible_with(chat, &slug, &meta.owner, memo)
-        {
-            return None;
-        }
-        let status = ccteam_harness::execution::session_status::read_status_file(&dir, sid);
-        let turn_status = ccteam_harness::TurnStatus {
-            model: status
-                .as_ref()
-                .and_then(|status| status.model.clone())
-                .or_else(|| meta.observed_model.clone().or_else(|| meta.model.clone())),
-            context: status.as_ref().and_then(|status| status.context),
-            turn: meta.turn_count,
-            cost_usd: meta.cost_usd,
-            tokens_total: meta.tokens_total,
-        };
-        let mut head = format!("🧭 → {slug}/{sid}");
-        if let Some(title) = meta.title.as_deref().filter(|title| !title.is_empty()) {
-            head.push_str(&format!(
-                " 「{}」",
-                ccteam_harness::truncate_status_title(title)
-            ));
-        }
-        let second = format!(
-            "💤 released · {}",
-            ccteam_harness::render_status_metrics(&turn_status)
-        );
-        let mut identity = match turn_status
-            .model
-            .as_deref()
-            .filter(|model| !model.is_empty())
-        {
-            Some(model) => format!("{} {model}", vendor_str(meta.vendor)),
-            None => vendor_str(meta.vendor).to_string(),
-        };
-        if let Some(effort) = status
-            .as_ref()
-            .and_then(|st| st.effort.as_deref())
-            .or(meta.effort.as_deref())
-            .filter(|e| !e.is_empty())
-        {
-            identity.push_str(&format!(" · {effort}"));
-        }
-        if !meta.role.is_empty() {
-            identity.push_str(&format!(" · {}", meta.role));
-        }
-        let mut out = format!(
-            "{head}\n📍 {second}\n   {identity}\n   📁 {}",
-            dir.display()
-        );
-        let resume = if meta.vendor_uuid.is_empty() {
-            "resume —".to_string()
-        } else {
-            format!("resume {}", meta.vendor_uuid)
-        };
-        out.push_str(&format!("\n   {resume}"));
-        Some(out)
-    }
-
+    /// ONE card for every residency: the focus resolves to a
+    /// [`SessionRowSource`] (resident = the live-map entry, released = the
+    /// persisted `meta.json`), [`Gateway::status_card`] gathers the facts once
+    /// and [`StatusCard::render`] lays them out once. A focus pointing at a
+    /// RELEASED session is not a missing focus: the session is real, the next
+    /// message resumes it, and the reader wants to know which one they are
+    /// pointed at — so it gets the same card with `💤 released` as its run
+    /// state. (2026-08-30 IM report: a second, hand-copied renderer for the
+    /// released case stopped after the resume line, silently dropping the
+    /// account-usage row and the `/sessions` + `/projects` footer. There is
+    /// no second renderer any more.)
     async fn render_status(&self, chat: &ChatKey) -> String {
         let mut memo = ProjectPrincipalMemo::new();
         let visible: Vec<&GatewaySession> = self
@@ -9923,9 +9845,8 @@ impl Gateway {
             .values()
             .filter(|s| self.chat_can_access_with(chat, s, &mut memo))
             .collect();
-        // /status = the chat's CURRENT (focused) session in DEPTH; /sessions is
-        // the full fleet list. Resolve the focused sid; if none is set (or it has
-        // gone), point at /use rather than guess which session is "current".
+        // Resolve the focused sid; if none is set (or it has gone), point at
+        // /use rather than guess which session is "current".
         let cur_sid = self
             .current_session
             .read()
@@ -9934,60 +9855,134 @@ impl Gateway {
         let focused_resident = cur_sid
             .as_ref()
             .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid));
-        // A focus pointing at a RELEASED session is not a missing focus: the
-        // session is real, the next message resumes it, and the reader wants to
-        // know which one they are pointed at. Render it from persisted facts.
-        if focused_resident.is_none() {
-            if let Some(sid) = cur_sid.as_deref() {
-                if let Some(rendered) = self.render_released_status(chat, sid, &mut memo) {
-                    return rendered;
-                }
-            }
-        }
-        let Some(s) = focused_resident else {
-            // No focused session — keep the user oriented by leading with the
-            // current project, then point at the right next step: a fresh project
-            // wants a first message; a project with sessions wants `/use`.
-            // Released sessions count: they are exactly what `/use` can reach.
-            let released_visible: Vec<(String, SessionMeta)> = self
-                .released_session_metas(None)
-                .into_iter()
-                .filter(|(slug, meta)| {
-                    self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
-                })
-                .collect();
-            if visible.is_empty() && released_visible.is_empty() {
-                return "no sessions — start one with /new".to_string();
-            }
-            let cur = self.current_project_label(chat);
-            let in_proj = visible.iter().filter(|s| s.project == cur).count()
-                + released_visible
-                    .iter()
-                    .filter(|(slug, _)| slug == &cur)
-                    .count();
-            return if in_proj > 0 {
-                format!(
-                    "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
-                )
-            } else {
-                format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开一个(或 /new)")
-            };
+        let focused_released = match (&focused_resident, cur_sid.as_deref()) {
+            (None, Some(sid)) => self.released_focus(chat, sid, &mut memo),
+            _ => None,
         };
+        let focus = match (focused_resident, &focused_released) {
+            (Some(s), _) => SessionRowSource::Resident(s),
+            (None, Some((slug, meta))) => SessionRowSource::Released(slug, meta),
+            (None, None) => {
+                // No focused session — keep the user oriented by leading with the
+                // current project, then point at the right next step: a fresh project
+                // wants a first message; a project with sessions wants `/use`.
+                // Released sessions count: they are exactly what `/use` can reach.
+                let released_visible: Vec<(String, SessionMeta)> = self
+                    .released_session_metas(None)
+                    .into_iter()
+                    .filter(|(slug, meta)| {
+                        self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
+                    })
+                    .collect();
+                if visible.is_empty() && released_visible.is_empty() {
+                    return "no sessions — start one with /new".to_string();
+                }
+                let cur = self.current_project_label(chat);
+                let in_proj = visible.iter().filter(|s| s.project == cur).count()
+                    + released_visible
+                        .iter()
+                        .filter(|(slug, _)| slug == &cur)
+                        .count();
+                return if in_proj > 0 {
+                    format!(
+                        "📁 当前项目: {cur}\n无当前会话 —— /use <id> 选一个驱动(本项目 {in_proj} 个;/sessions 看全部)"
+                    )
+                } else {
+                    format!("📁 当前项目: {cur}\n本项目暂无会话 —— 发条消息开一个(或 /new)")
+                };
+            }
+        };
+        self.status_card(chat, &focus, &visible).await.render()
+    }
 
-        // Pull live facts FROM the harness — never folded by ccteam: the
-        // model/effort/ctx/goal status, the running subagent/workflow list
-        // (claude's own `system:task_*` lifecycle), and account usage.
-        let status = s.adapter.thread_status(&s.thread).await.ok();
-        let running = s.adapter.running_tasks(&s.thread).await;
+    /// The `/status` focus when the chat's current sid is one ccteam holds no
+    /// process for: the session's persisted facts, provided it is real,
+    /// released (resumable — not stopped / external / detached) and visible to
+    /// `chat`. `None` lets the caller fall through to its "no current session"
+    /// wording. Pure lookup — the card itself is gathered by
+    /// [`Gateway::status_card`] exactly as for a resident session.
+    fn released_focus(
+        &self,
+        chat: &ChatKey,
+        sid: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> Option<(String, SessionMeta)> {
+        if self.sessions.contains_key(sid) || self.detached.contains_key(sid) {
+            return None;
+        }
+        let (slug, _, meta) = self.find_meta_for_sid(sid).ok()?;
+        (meta.is_resumable() && self.project_owner_visible_with(chat, &slug, &meta.owner, memo))
+            .then_some((slug, meta))
+    }
+
+    /// The `📍` run state of a RESIDENT session. Same in-flight verdict the
+    /// child rows / MCP / web get ([`Gateway::live_turn`]) — this only dresses
+    /// it with durations: a turn in flight ⇒ 🔵 working; silent past the idle
+    /// window ⇒ 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE
+    /// "still working" signal (straight from claude) that overrides the
+    /// silence heuristic, so a main session quietly awaiting one never
+    /// mis-reads idle/stuck. Turn-OUTLIVING tasks (background workflows /
+    /// shells / monitors, and async `Agent` launches the vendor reports as
+    /// background) do NOT override: they survive the spawning turn by design,
+    /// so a leftover run must not mask a genuinely stuck later turn. Same
+    /// vocabulary as the harness turn-end eviction
+    /// (`RunningTask::outlives_turn`).
+    fn status_run_state(&self, s: &GatewaySession, running: &[RunningTask]) -> StatusRunState {
+        let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
+        match self.live_turn(s, Instant::now()) {
+            None => StatusRunState::Idle,
+            Some(l) if l.is_stuck() && !turn_scoped_running => StatusRunState::Stuck {
+                silent: std::time::Duration::from_secs(l.silent_seconds),
+            },
+            Some(l) => StatusRunState::Working {
+                elapsed: std::time::Duration::from_secs(l.elapsed_seconds),
+            },
+        }
+    }
+
+    /// Gather every fact on the `/status` card for `focus` — the ONE place the
+    /// card is assembled, for a resident and a released session alike.
+    /// Residency decides only WHERE the session's own facts are read from —
+    /// the live adapter, or the persisted `meta.json` + `status.json` through
+    /// the same [`Gateway::row_thread_status`] the `/sessions` rows use — and
+    /// leaves the one fact a released session cannot have (its running tasks)
+    /// empty; nothing is invented. Everything chat-scoped — account usage
+    /// borrowed from the fleet, the delegated children, the `/sessions` +
+    /// `/projects` footer — is gathered the same way regardless of residency.
+    async fn status_card(
+        &self,
+        chat: &ChatKey,
+        focus: &SessionRowSource<'_>,
+        visible: &[&GatewaySession],
+    ) -> StatusCard {
+        let slug = focus.slug_of(&self.default_project).to_string();
+        let sid = focus.sid().to_string();
+        let vendor = focus.vendor_kind();
+
+        // Pull the harness-reported facts FROM the harness — never folded by
+        // ccteam: the model/effort/ctx/goal status (live, or its persisted
+        // snapshot), the running subagent/workflow list (claude's own
+        // `system:task_*` lifecycle — only a resident session has one) and the
+        // focused session's own account-usage answer.
+        let status = self.row_thread_status(focus).await;
+        let (run_state, running, own_account) = match focus {
+            SessionRowSource::Resident(s) => {
+                let running = s.adapter.running_tasks(&s.thread).await;
+                let run_state = self.status_run_state(s, &running);
+                let account = s.adapter.account_usage(&s.thread).await;
+                (run_state, running, account)
+            }
+            SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new(), None),
+        };
         // Account usage is account-scoped but PER VENDOR: a Codex session must
         // never display a Claude account's windows (and vice-versa). Prefer the
-        // current session; else borrow from another visible session OF THE SAME
-        // VENDOR whose adapter answers (so usage still shows when the current
-        // session is idle/released). No same-vendor answer ⇒ omit the row.
-        let mut account = s.adapter.account_usage(&s.thread).await;
+        // focused session's own answer; else borrow from another visible session
+        // OF THE SAME VENDOR whose adapter answers — which is also how a
+        // released focus (no adapter of its own) shows the account it will
+        // resume under. No same-vendor answer ⇒ omit the row.
+        let mut account = own_account;
         if account.is_none() {
-            let vendor = s.adapter.vendor();
-            for o in &visible {
+            for o in visible {
                 if o.adapter.vendor() != vendor {
                     continue;
                 }
@@ -9998,144 +9993,30 @@ impl Gateway {
             }
         }
 
-        // State: a turn in flight ⇒ 🔵 working; silent past the idle window ⇒
-        // 🔴 stuck — EXCEPT a BLOCKING subagent is an AUTHORITATIVE "still
-        // working" signal (straight from claude) that overrides the silence
-        // heuristic, so a main session quietly awaiting one never mis-reads
-        // idle/stuck. Turn-OUTLIVING tasks (background workflows / shells /
-        // monitors, and async `Agent` launches the vendor reports as
-        // background) do NOT override: they survive the spawning turn by
-        // design, so a leftover run must not mask a genuinely stuck later turn.
-        // Same vocabulary as the harness turn-end eviction
-        // (`RunningTask::outlives_turn`).
-        let turn_scoped_running = running.iter().any(|t| !t.outlives_turn());
-        // Same in-flight verdict the child rows / MCP / web get
-        // ([`Gateway::live_turn`]) — this line only dresses it with durations.
-        let live = self.live_turn(s, Instant::now());
-        let (state, detail) = match live {
-            None => ("🟢", "idle".to_string()),
-            // Running subagents ⇒ definitively working (overrides silence).
-            Some(l) if l.is_stuck() && !turn_scoped_running => (
-                "🔴",
-                format!(
-                    "STUCK {} silent",
-                    humanize_dur(std::time::Duration::from_secs(l.silent_seconds))
-                ),
-            ),
-            Some(l) => (
-                "🔵",
-                format!(
-                    "working {}",
-                    humanize_dur(std::time::Duration::from_secs(l.elapsed_seconds))
-                ),
-            ),
+        // The ledger half — title / turn / cost / tokens and the spawn-time
+        // model + effort picks — lives in `meta.json` for both residencies:
+        // the catalog entry for a resident session, the focus's own meta for a
+        // released one. Fallback chains are the same for both.
+        let meta = match focus {
+            SessionRowSource::Resident(s) => self.session_catalog.get(&s.id).map(|e| e.meta),
+            SessionRowSource::Released(_, meta) => Some((*meta).clone()),
         };
-
-        // v0.8.23 review §3.2-5 (item 2c) — "你在哪": a standalone header line
-        // giving the project slug + current session (sid/role/title) ahead of
-        // the existing deep-view body, so the two-pointer (project × session)
-        // mental model has one line that answers both at a glance. Same
-        // format as the turn-answer status line, so
-        // the two surfaces read identically.
-        let title = self.session_title(s);
-        let meta = self.session_catalog.get(&s.id).map(|entry| entry.meta);
-        let turn_status = ccteam_harness::TurnStatus {
-            model: status
-                .as_ref()
-                .and_then(|status| status.model.clone())
-                .or_else(|| {
-                    meta.as_ref()
-                        .and_then(|meta| meta.observed_model.clone().or_else(|| meta.model.clone()))
-                }),
-            context: status.as_ref().and_then(|status| status.context),
-            turn: meta.as_ref().map(|meta| meta.turn_count).unwrap_or(0),
-            cost_usd: meta.as_ref().and_then(|meta| meta.cost_usd),
-            tokens_total: meta.as_ref().and_then(|meta| meta.tokens_total),
+        let metrics = ccteam_harness::TurnStatus {
+            model: status.as_ref().and_then(|st| st.model.clone()).or_else(|| {
+                meta.as_ref()
+                    .and_then(|m| m.observed_model.clone().or_else(|| m.model.clone()))
+            }),
+            context: status.as_ref().and_then(|st| st.context),
+            turn: meta.as_ref().map(|m| m.turn_count).unwrap_or(0),
+            cost_usd: meta.as_ref().and_then(|m| m.cost_usd),
+            tokens_total: meta.as_ref().and_then(|m| m.tokens_total),
         };
-        // Line 1 = where am I (slug/sid + title), nothing else; line 2 = run
-        // state · metrics; line 3 = the harness identity — every fact once.
-        let mut head = format!("🧭 → {}/{}", s.project, s.id);
-        if let Some(title) = title.as_deref().filter(|title| !title.is_empty()) {
-            head.push_str(&format!(
-                " 「{}」",
-                ccteam_harness::truncate_status_title(title)
-            ));
-        }
-        // 📍 line = run state · metrics (ctx / turn / cost) — what the session
-        // is doing right now.
-        let second = format!(
-            "{} · {}",
-            format!("{state} {detail}").trim_end(),
-            ccteam_harness::render_status_metrics(&turn_status)
-        );
-        // Identity line = harness + model + effort + role kept TOGETHER
-        // (`claude claude-fable-5[1m] · max · cto`, owner layout 2026-08-29):
-        // the reader sees "who is answering" as one phrase instead of the
-        // model on one line and the effort two lines below. An unknown effort
-        // or a roleless session simply omits its segment (never a `—`).
-        let mut identity = match turn_status
-            .model
-            .as_deref()
-            .filter(|model| !model.is_empty())
-        {
-            Some(model) => format!("{} {model}", vendor_str(s.vendor)),
-            None => vendor_str(s.vendor).to_string(),
-        };
-        if let Some(effort) = status
+        let effort = status
             .as_ref()
-            .and_then(|st| st.effort.as_deref())
-            .filter(|e| !e.is_empty())
-        {
-            identity.push_str(&format!(" · {effort}"));
-        }
-        if !s.role.is_empty() {
-            identity.push_str(&format!(" · {}", s.role));
-        }
-        let mut out = format!("{head}\n📍 {second}\n   {identity}");
-
-        // Project working-tree PATH — disambiguates an auto-appended slug
-        // (demo2 vs demo): the real dir is unambiguous. Resolved from the loaded
-        // project map (slug → dir); omitted if the project isn't mapped.
-        if let Some(dir) = self.projects.get(&s.project) {
-            out.push_str(&format!("\n   📁 {}", dir.display()));
-        }
-
-        // The REAL `--resume` id (Anthropic session uuid), shown in full so it
-        // can be matched against `tmux ls` / `claude --resume`; `—` for a
-        // tmux/codex session that carries no stream-json uuid (never fabricated).
-        let resume = thread_vendor_uuid(&s.thread)
-            .map(|u| format!("resume {u}"))
-            .unwrap_or_else(|| "resume —".to_string());
-        out.push_str(&format!("\n   {resume}"));
-
-        // Running subagents / background workflows — straight from claude's task
-        // lifecycle (NOT a fold). Subagents only exist while a turn is working;
-        // background workflows outlive the turn, so an idle session can still
-        // show its running workflows here.
-        out.push_str(&format_running_tasks(&running));
-
-        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
-        if let Some(g) = status.as_ref().and_then(|st| st.goal.as_ref()) {
-            let cond = g.condition.trim();
-            if !cond.is_empty() {
-                let marker = if g.met { "✅" } else { "🎯" };
-                let shown: String = if cond.chars().count() > 60 {
-                    format!("{}…", cond.chars().take(59).collect::<String>())
-                } else {
-                    cond.to_string()
-                };
-                out.push_str(&format!("\n   {marker} {shown}"));
-            }
-        }
-
-        // Account usage (5h / weekly / credits) — the vendor rate-limit windows.
-        if let Some(u) = &account {
-            let usage = format_account_usage(u);
-            if !usage.is_empty() {
-                out.push_str("\n   ");
-                out.push_str(&usage);
-            }
-        }
+            .and_then(|st| st.effort.clone())
+            .or_else(|| meta.as_ref().and_then(|m| m.effort.clone()))
+            .filter(|e| !e.is_empty());
+        let goal = status.as_ref().and_then(|st| st.goal.clone());
 
         // Direct delegated children belong on the root's deep status card:
         // their work explains why an otherwise-idle parent is still waiting.
@@ -10144,67 +10025,76 @@ impl Gateway {
         let mut direct_children: Vec<&GatewaySession> = visible
             .iter()
             .copied()
-            .filter(|child| child.parent_sid.as_deref() == Some(s.id.as_str()))
+            .filter(|child| child.parent_sid.as_deref() == Some(sid.as_str()))
             .collect();
-        if !direct_children.is_empty() {
-            direct_children.sort_by_key(|child| session_index(&child.id));
-            let child_activity = self.session_activity_snapshot(&direct_children);
-            out.push_str("\n   👥 直接子会话:");
-            for child in &direct_children {
-                let activity = child_activity
+        direct_children.sort_by_key(|child| session_index(&child.id));
+        let child_activity = self.session_activity_snapshot(&direct_children);
+        let children: Vec<StatusChild> = direct_children
+            .iter()
+            .map(|child| StatusChild {
+                sid: child.id.clone(),
+                vendor: child.vendor,
+                activity: child_activity
                     .get(&child.id)
-                    .map(String::as_str)
-                    .unwrap_or("idle");
-                let title = self
+                    .cloned()
+                    .unwrap_or_else(|| "idle".to_string()),
+                title: self
                     .session_title(child)
                     .and_then(|title| truncate_title(&title))
-                    .unwrap_or_else(|| "—".to_string());
-                out.push_str(&format!(
-                    "\n      · {} · {} · {} · {title}",
-                    child.id,
-                    vendor_str(child.vendor),
-                    activity_marker(activity)
-                ));
-            }
-
-            let mut descendants: HashSet<String> = direct_children
-                .iter()
-                .map(|child| child.id.clone())
-                .collect();
-            let mut frontier: Vec<String> = descendants.iter().cloned().collect();
-            while let Some(parent) = frontier.pop() {
-                for descendant in &visible {
-                    if descendant.id != s.id
-                        && descendant.parent_sid.as_deref() == Some(parent.as_str())
-                        && descendants.insert(descendant.id.clone())
-                    {
-                        frontier.push(descendant.id.clone());
-                    }
+                    .unwrap_or_else(|| "—".to_string()),
+            })
+            .collect();
+        let mut descendants: HashSet<String> = direct_children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect();
+        let mut frontier: Vec<String> = descendants.iter().cloned().collect();
+        while let Some(parent) = frontier.pop() {
+            for descendant in visible {
+                if descendant.id != sid
+                    && descendant.parent_sid.as_deref() == Some(parent.as_str())
+                    && descendants.insert(descendant.id.clone())
+                {
+                    frontier.push(descendant.id.clone());
                 }
             }
-            let deeper = descendants.len().saturating_sub(direct_children.len());
-            if deeper > 0 {
-                out.push_str(&format!("\n      … 另有 {deeper} 个更深后代"));
-            }
         }
+        let deeper_descendants = descendants.len().saturating_sub(direct_children.len());
 
         // Footer: the rest of the fleet lives in /sessions. Split by project so
         // the counts line up with the project-scoped `/sessions` (same project)
-        // vs the full-fleet `/sessions all` (other projects).
-        let same = visible
+        // vs the full-fleet `/sessions all` (other projects). The last line
+        // points at the full project list with a live count; count only the
+        // projects THIS chat may see (same ACL as `/projects`), so the pointer
+        // never advertises another owner's projects.
+        let same_project_others = visible
             .iter()
-            .filter(|o| o.project == s.project && o.id != s.id)
+            .filter(|o| o.project == slug && o.id != sid)
             .count();
-        if same > 0 {
-            out.push_str(&format!("\n   ↓ 本项目其他 {same} 个会话 → /sessions"));
+        let visible_projects = self.visible_project_slugs(chat).len();
+
+        StatusCard {
+            title: meta.and_then(|m| m.title),
+            // Project working-tree PATH — resolved from the loaded project map
+            // (slug → dir) for both residencies; omitted if the project isn't
+            // mapped.
+            dir: self.projects.get(&slug).cloned(),
+            resume: focus.vendor_uuid(),
+            role: focus.role().to_string(),
+            slug,
+            sid,
+            run_state,
+            metrics,
+            vendor,
+            effort,
+            running,
+            goal,
+            account,
+            children,
+            deeper_descendants,
+            same_project_others,
+            visible_projects,
         }
-        // Owner req — the last line points at the full project list (with a live
-        // count), replacing the old cross-project `/sessions all` fleet pointer.
-        // Count only the projects THIS chat may see (same ACL as `/projects`), so
-        // the pointer never advertises another owner's projects.
-        let nproj = self.visible_project_slugs(chat).len();
-        out.push_str(&format!("\n   ↓ 所有 {nproj} 个项目 → /projects"));
-        out
     }
 
     fn render_projects(&self, chat: &ChatKey) -> String {
@@ -14041,6 +13931,29 @@ impl SessionRowSource<'_> {
     fn is_released(&self) -> bool {
         matches!(self, SessionRowSource::Released(..))
     }
+
+    /// The harness as an [`AgentVendor`] — for per-vendor decisions such as
+    /// which fleet session may lend its account usage to the `/status` card.
+    /// [`Self::vendor`] is the display form.
+    fn vendor_kind(&self) -> AgentVendor {
+        match self {
+            SessionRowSource::Resident(s) => s.vendor,
+            SessionRowSource::Released(_, meta) => meta.vendor,
+        }
+    }
+
+    /// The real vendor `--resume` id: off the live thread for a resident
+    /// session (the cell both the spawn and resume paths populate), off
+    /// `meta.json` for a released one. `None` — never a fabricated id — for a
+    /// tmux / Codex session that carries no stream-json uuid.
+    fn vendor_uuid(&self) -> Option<String> {
+        match self {
+            SessionRowSource::Resident(s) => thread_vendor_uuid(&s.thread),
+            SessionRowSource::Released(_, meta) => {
+                Some(meta.vendor_uuid.clone()).filter(|uuid| !uuid.is_empty())
+            }
+        }
+    }
 }
 
 /// A session's `@handle` from its durable record — the same rule
@@ -15118,10 +15031,192 @@ fn gateway_turn_timeout_duration() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Humanize a [`Duration`](std::time::Duration) for the `/status` fleet line:
-/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
-/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
-/// `0s`.
+/// Run state on the `/status` card's `📍` line — one vocabulary for every
+/// residency, so "released" is a state word next to idle / working / stuck,
+/// not a different card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StatusRunState {
+    Idle,
+    Working { elapsed: std::time::Duration },
+    Stuck { silent: std::time::Duration },
+    Released,
+}
+
+impl StatusRunState {
+    fn render(&self) -> String {
+        match self {
+            Self::Idle => "🟢 idle".to_string(),
+            Self::Working { elapsed } => format!("🔵 working {}", humanize_dur(*elapsed)),
+            Self::Stuck { silent } => format!("🔴 STUCK {} silent", humanize_dur(*silent)),
+            Self::Released => "💤 released".to_string(),
+        }
+    }
+}
+
+/// One direct delegated child on the `/status` card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusChild {
+    sid: String,
+    vendor: AgentVendor,
+    /// `working|idle|stale|stuck` from the shared activity classifier.
+    activity: String,
+    /// Already truncated for the card; `—` when the child has no title.
+    title: String,
+}
+
+/// Every fact the IM `/status` card shows — gathered ONCE by
+/// [`Gateway::status_card`] and laid out ONCE by [`StatusCard::render`], the
+/// single interface behind the reply. A resident and a released session fill
+/// the same struct; where a fact comes from is the gatherer's business, and a
+/// fact the focus cannot have is simply absent. Every optional block below is
+/// keyed on its fact being present, never on residency, so a line added here
+/// shows for every state.
+#[derive(Debug, Clone)]
+struct StatusCard {
+    slug: String,
+    sid: String,
+    title: Option<String>,
+    run_state: StatusRunState,
+    /// ctx / turn / cost-or-tokens (+ the model, which the identity line shows).
+    metrics: ccteam_harness::TurnStatus,
+    vendor: AgentVendor,
+    effort: Option<String>,
+    /// Empty for a roleless session (the segment is omitted, never `—`).
+    role: String,
+    /// The project working tree; `None` when the slug is not mapped.
+    dir: Option<PathBuf>,
+    /// The real vendor `--resume` id; `None` renders `resume —`.
+    resume: Option<String>,
+    running: Vec<RunningTask>,
+    goal: Option<ccteam_harness::GoalStatus>,
+    account: Option<AccountUsage>,
+    children: Vec<StatusChild>,
+    /// Descendants below the direct children, collapsed to a count.
+    deeper_descendants: usize,
+    /// Other visible sessions in the same project (→ `/sessions`).
+    same_project_others: usize,
+    /// Projects this chat may see (→ `/projects`).
+    visible_projects: usize,
+}
+
+impl StatusCard {
+    /// The ONLY `/status` layout. Line 1 = where am I (slug/sid + title),
+    /// nothing else; line 2 = run state · metrics; line 3 = the harness
+    /// identity — harness + model + effort + role kept TOGETHER
+    /// (`claude claude-fable-5[1m] · max · cto`, owner layout 2026-08-29) so
+    /// the reader sees "who is answering" as one phrase; an unknown effort or
+    /// a roleless session simply omits its segment (never a `—`). Then the
+    /// project path, the real `--resume` id, and the optional blocks: running
+    /// tasks, goal, account usage, direct children, the fleet footer. Every
+    /// fact once.
+    fn render(&self) -> String {
+        let mut head = format!("🧭 → {}/{}", self.slug, self.sid);
+        if let Some(title) = self.title.as_deref().filter(|title| !title.is_empty()) {
+            head.push_str(&format!(
+                " 「{}」",
+                ccteam_harness::truncate_status_title(title)
+            ));
+        }
+        // 📍 line = run state · metrics (ctx / turn / cost) — what the session
+        // is doing right now.
+        let second = format!(
+            "{} · {}",
+            self.run_state.render(),
+            ccteam_harness::render_status_metrics(&self.metrics)
+        );
+        let mut identity = match self
+            .metrics
+            .model
+            .as_deref()
+            .filter(|model| !model.is_empty())
+        {
+            Some(model) => format!("{} {model}", vendor_str(self.vendor)),
+            None => vendor_str(self.vendor).to_string(),
+        };
+        if let Some(effort) = self.effort.as_deref().filter(|e| !e.is_empty()) {
+            identity.push_str(&format!(" · {effort}"));
+        }
+        if !self.role.is_empty() {
+            identity.push_str(&format!(" · {}", self.role));
+        }
+        let mut out = format!("{head}\n📍 {second}\n   {identity}");
+
+        // Project working-tree PATH — disambiguates an auto-appended slug
+        // (demo2 vs demo): the real dir is unambiguous.
+        if let Some(dir) = &self.dir {
+            out.push_str(&format!("\n   📁 {}", dir.display()));
+        }
+
+        // The REAL `--resume` id (Anthropic session uuid), shown in full so it
+        // can be matched against `tmux ls` / `claude --resume`; `—` for a
+        // tmux/codex session that carries no stream-json uuid (never fabricated).
+        match self.resume.as_deref() {
+            Some(uuid) => out.push_str(&format!("\n   resume {uuid}")),
+            None => out.push_str("\n   resume —"),
+        }
+
+        // Running subagents / background workflows — straight from claude's task
+        // lifecycle (NOT a fold). Subagents only exist while a turn is working;
+        // background workflows outlive the turn, so an idle session can still
+        // show its running workflows here.
+        out.push_str(&format_running_tasks(&self.running));
+
+        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
+        if let Some(g) = &self.goal {
+            let cond = g.condition.trim();
+            if !cond.is_empty() {
+                let marker = if g.met { "✅" } else { "🎯" };
+                let shown: String = if cond.chars().count() > 60 {
+                    format!("{}…", cond.chars().take(59).collect::<String>())
+                } else {
+                    cond.to_string()
+                };
+                out.push_str(&format!("\n   {marker} {shown}"));
+            }
+        }
+
+        // Account usage (5h / weekly / credits) — the vendor rate-limit windows.
+        if let Some(u) = &self.account {
+            let usage = format_account_usage(u);
+            if !usage.is_empty() {
+                out.push_str("\n   ");
+                out.push_str(&usage);
+            }
+        }
+
+        if !self.children.is_empty() {
+            out.push_str("\n   👥 直接子会话:");
+            for child in &self.children {
+                out.push_str(&format!(
+                    "\n      · {} · {} · {} · {}",
+                    child.sid,
+                    vendor_str(child.vendor),
+                    activity_marker(&child.activity),
+                    child.title
+                ));
+            }
+            if self.deeper_descendants > 0 {
+                out.push_str(&format!(
+                    "\n      … 另有 {} 个更深后代",
+                    self.deeper_descendants
+                ));
+            }
+        }
+
+        if self.same_project_others > 0 {
+            out.push_str(&format!(
+                "\n   ↓ 本项目其他 {} 个会话 → /sessions",
+                self.same_project_others
+            ));
+        }
+        out.push_str(&format!(
+            "\n   ↓ 所有 {} 个项目 → /projects",
+            self.visible_projects
+        ));
+        out
+    }
+}
+
 /// Render the `/status` running-task block — claude's own task lifecycle
 /// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
 /// Empty string when nothing runs. Three buckets by `task_type`: subagents
@@ -15221,6 +15316,10 @@ fn format_account_usage(u: &AccountUsage) -> String {
     format!("⚡ 用量: {}", parts.join(" · "))
 }
 
+/// Humanize a [`Duration`](std::time::Duration) for the `/status` card:
+/// `45s`, `1m12s`, `6m`, `2h3m`. Compact (no leading-zero noise); seconds are
+/// dropped once the span is ≥ 1h to keep the line tidy. Sub-second rounds to
+/// `0s`.
 fn humanize_dur(d: std::time::Duration) -> String {
     let total = d.as_secs();
     let h = total / 3600;
@@ -16195,8 +16294,8 @@ mod tests {
     }
 
     /// `/status` on a focus that points at a released session must render the
-    /// session — same five-line shape as the live header, with `💤 released` in
-    /// place of the run state — not "无当前会话".
+    /// session — the SAME card as a resident one, with `💤 released` in place
+    /// of the run state and the same footer — not "无当前会话".
     #[tokio::test]
     async fn status_renders_a_released_focus_from_persisted_facts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -16226,9 +16325,198 @@ mod tests {
         assert_eq!(
             status,
             vec![format!(
-                "🧭 → alpha/s1\n📍 💤 released · turn 0\n   claude · reviewer\n   📁 {}\n   resume —",
+                "🧭 → alpha/s1\n📍 💤 released · turn 0\n   claude · reviewer\n   📁 {}\n   resume —\n   ↓ 所有 1 个项目 → /projects",
                 alpha.display()
             )]
+        );
+    }
+
+    /// The 2026-08-30 IM report: `/status` on a released focus stopped after
+    /// the resume line — no `⚡ 用量` row, no `↓ 所有 N 个项目 → /projects`
+    /// footer — because the released card was a second, hand-copied renderer.
+    /// One card now, so the tail a resident session gets is the tail a
+    /// released one gets: the usage row is borrowed from a visible resident
+    /// session of the SAME harness (the account the focus will resume under),
+    /// and the delegated children + the `/sessions` + `/projects` footer are
+    /// chat-scoped facts that never depended on residency.
+    #[tokio::test]
+    async fn status_released_focus_shares_the_resident_card_tail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, project_dir) = mirror_test_paths(&tmp);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", &project_dir);
+        gateway.bind_operator_allowlist("mock", ["chat-1".to_string()]);
+        gateway.enable_project_creation(paths.clone());
+        gateway.enable_persistence(&paths.root).unwrap();
+        // A TTL no just-spawned session can reach during the test; s1 is
+        // backdated well past it below, so the sweep releases s1 alone.
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 300,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        // A delegated child keeps the chat's focus on s1 (a `/new` would move
+        // it) and is the visible same-harness resident the card borrows the
+        // account usage from — and a child row of its own.
+        let child = gateway
+            .create_delegated_session(
+                "alpha".into(),
+                "researcher".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning::default(),
+                Some(DelegationParent {
+                    sid: "s1".into(),
+                    depth: 0,
+                    role: "reviewer".into(),
+                }),
+                Some("delegated investigation".into()),
+            )
+            .await
+            .unwrap()
+            .sid;
+        assert_eq!(child, "s2");
+        ccteam_core::progress::append_event(
+            &paths.progress_jsonl("alpha"),
+            &ccteam_core::progress::build_chat_turn_user_prompt_event(
+                "researcher",
+                &child,
+                "child-turn",
+                "investigate",
+            ),
+        )
+        .unwrap();
+        fake.set_account_usage(Some(AccountUsage {
+            subscription: Some("team".into()),
+            five_hour_pct: Some(0),
+            weekly_pct: Some(50),
+            weekly_resets_at: Some("2026-09-03T00:00:00Z".into()),
+            ..Default::default()
+        }))
+        .await;
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let status = gateway
+            .lock()
+            .await
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            vec![format!(
+                "🧭 → alpha/s1\n📍 💤 released · turn 0\n   claude · reviewer\n   📁 {}\n   resume —\n   ⚡ 用量: 5h 0% · 周 50% (→09/03) · team\n   👥 直接子会话:\n      · s2 · claude · 🟡 working · delegated investigation\n   ↓ 本项目其他 1 个会话 → /sessions\n   ↓ 所有 1 个项目 → /projects",
+                project_dir.display()
+            )]
+        );
+    }
+
+    /// The card layout is one function of the facts: every optional block is
+    /// keyed on its fact being present — never on residency — in this order.
+    /// Locks the shape once so no state-specific twin can drift from it.
+    #[test]
+    fn status_card_lays_out_every_block_once_in_order() {
+        let card = StatusCard {
+            slug: "alpha".into(),
+            sid: "s7".into(),
+            title: Some("fix the thing".into()),
+            run_state: StatusRunState::Released,
+            metrics: ccteam_harness::TurnStatus {
+                model: Some("claude-sonnet-5".into()),
+                context: Some(ContextUsage::known(62, 100, ContextSource::Derived)),
+                turn: 25,
+                cost_usd: None,
+                tokens_total: Some(86_100_000),
+            },
+            vendor: AgentVendor::Claude,
+            effort: Some("xhigh".into()),
+            role: String::new(),
+            dir: Some(PathBuf::from("/tmp/excore")),
+            resume: Some("03b8d60b-5dc6-45d0-a15d-be03bb713d0e".into()),
+            running: Vec::new(),
+            goal: Some(ccteam_harness::GoalStatus {
+                condition: "all green".into(),
+                met: false,
+            }),
+            account: Some(AccountUsage {
+                subscription: Some("team".into()),
+                five_hour_pct: Some(0),
+                weekly_pct: Some(50),
+                weekly_resets_at: Some("2026-09-03T00:00:00Z".into()),
+                ..Default::default()
+            }),
+            children: vec![StatusChild {
+                sid: "s8".into(),
+                vendor: AgentVendor::Codex,
+                activity: "working".into(),
+                title: "grep the tree".into(),
+            }],
+            deeper_descendants: 2,
+            same_project_others: 3,
+            visible_projects: 8,
+        };
+        assert_eq!(
+            card.render(),
+            "🧭 → alpha/s7 「fix the thing」\n\
+             📍 💤 released · ctx 62% · turn 25 · 86.1M tok\n   \
+             claude claude-sonnet-5 · xhigh\n   \
+             📁 /tmp/excore\n   \
+             resume 03b8d60b-5dc6-45d0-a15d-be03bb713d0e\n   \
+             🎯 all green\n   \
+             ⚡ 用量: 5h 0% · 周 50% (→09/03) · team\n   \
+             👥 直接子会话:\n      \
+             · s8 · codex · 🟡 working · grep the tree\n      \
+             … 另有 2 个更深后代\n   \
+             ↓ 本项目其他 3 个会话 → /sessions\n   \
+             ↓ 所有 8 个项目 → /projects"
+        );
+        // A bare card (roleless, no effort, nothing mapped, nothing running)
+        // still ends with the footer — the one line every reader gets.
+        let bare = StatusCard {
+            title: None,
+            run_state: StatusRunState::Idle,
+            metrics: ccteam_harness::TurnStatus {
+                model: None,
+                context: None,
+                turn: 0,
+                cost_usd: None,
+                tokens_total: None,
+            },
+            effort: None,
+            dir: None,
+            resume: None,
+            goal: None,
+            account: None,
+            children: Vec::new(),
+            deeper_descendants: 0,
+            same_project_others: 0,
+            visible_projects: 1,
+            ..card
+        };
+        assert_eq!(
+            bare.render(),
+            "🧭 → alpha/s7\n📍 🟢 idle · turn 0\n   claude\n   resume —\n   ↓ 所有 1 个项目 → /projects"
+        );
+        assert_eq!(
+            StatusRunState::Working {
+                elapsed: std::time::Duration::from_secs(65)
+            }
+            .render(),
+            "🔵 working 1m5s"
+        );
+        assert_eq!(
+            StatusRunState::Stuck {
+                silent: std::time::Duration::from_secs(360)
+            }
+            .render(),
+            "🔴 STUCK 6m silent"
         );
     }
 
@@ -17563,6 +17851,10 @@ mod tests {
         /// sweeper never lets go of a session whose vendor is still carrying
         /// work.
         running_tasks: Arc<Mutex<Vec<RunningTask>>>,
+        /// What `account_usage` reports (`None` = no usage channel, the
+        /// trait default). Account-scoped: every session sharing this fake
+        /// answers with the same windows, exactly like one vendor account.
+        account_usage: Arc<Mutex<Option<AccountUsage>>>,
     }
 
     impl Default for FakeAdapter {
@@ -17623,6 +17915,7 @@ mod tests {
                 live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 closes: AtomicUsize::new(0),
                 running_tasks: Arc::new(Mutex::new(Vec::new())),
+                account_usage: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -17686,6 +17979,11 @@ mod tests {
         /// Set the status this fake reports from `thread_status` (P3).
         async fn set_status(&self, status: ThreadStatus) {
             *self.status.lock().await = status;
+        }
+
+        /// Set the account usage this fake reports from `account_usage`.
+        async fn set_account_usage(&self, usage: Option<AccountUsage>) {
+            *self.account_usage.lock().await = usage;
         }
 
         fn new_with_event_delay(vendor: AgentVendor, event_delay: std::time::Duration) -> Self {
@@ -17966,6 +18264,10 @@ mod tests {
 
         async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
             self.running_tasks.lock().await.clone()
+        }
+
+        async fn account_usage(&self, _h: &ThreadHandle) -> Option<AccountUsage> {
+            self.account_usage.lock().await.clone()
         }
 
         async fn handle_directive(
