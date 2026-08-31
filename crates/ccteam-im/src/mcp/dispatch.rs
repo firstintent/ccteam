@@ -7,6 +7,7 @@
 //! `POST /mcp` resolves the caller's credential, then calls
 //! [`McpDispatch::dispatch_as`] with the tier it proved.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ccteam_core::CcteamPaths;
@@ -2086,7 +2087,8 @@ async fn run_agent(
     {
         return Err("agent: missing `task` — say what the agent should do".to_string());
     }
-    if addresses_a_session(args) {
+    let dispatching = addresses_a_session(args);
+    if dispatching {
         let named: Vec<&str> = AGENT_SPAWN_ONLY_PARAMS
             .iter()
             .copied()
@@ -2098,10 +2100,239 @@ async fn run_agent(
                 named.join("/")
             ));
         }
+    }
+    // Card H — the user's own pre-flight policy runs here, on a well-formed
+    // request and before either branch does anything.
+    pre_agent_policy_gate(args, gateway, &caller, paths).await?;
+    if dispatching {
         run_agent_dispatch(args, gateway, caller).await
     } else {
         run_agent_spawn_at(args, gateway, caller, Some(paths)).await
     }
+}
+
+/// The in-memory facts one `agent` call needs before its policy hook can run:
+/// where the target project lives (which decides WHICH hook governs) and the
+/// coordinates a refusal is filed under.
+struct PolicyGateFacts {
+    /// The target project slug — empty when the call names none resolvably.
+    slug: String,
+    /// Is the target project's working tree on THIS machine? A satellite-bound
+    /// project keeps its hooks on the satellite, and the local tree of the same
+    /// slug (if any) belongs to a different project — so its project rung is
+    /// skipped entirely rather than faked from a same-named local directory.
+    local: bool,
+    /// That working tree, as the daemon has it mapped.
+    project_dir: Option<PathBuf>,
+    /// The harness the delegation would spend (hired, or the target's).
+    vendor: ccteam_harness::AgentVendor,
+    /// The project's bound host, for the refusal event.
+    host: String,
+    /// The harness of the delegating session, for the payload.
+    caller_vendor: String,
+    /// The caller's project tree — where its `turns.jsonl` context lives.
+    caller_dir: Option<PathBuf>,
+    /// The caller's active direct children.
+    children: Option<u32>,
+    /// Active delegated sessions in the target project.
+    delegated: Option<u32>,
+    /// The project cost projection, read off-lock.
+    projection: Option<Arc<crate::progress_projection::ProgressProjection>>,
+}
+
+/// Card H — run the user-programmable `pre-agent` policy for one `agent` call.
+///
+/// WHY HERE: [`run_agent`] is the single door both delegation forms come
+/// through, and the last point at which NOTHING has happened yet — no sid
+/// minted, no idempotency claim, no spawn reservation — and, deliberately, no
+/// gateway lock held while the script runs. A policy hook is a user program,
+/// and the useful ones ask the daemon questions (`curl` its REST API, read the
+/// roster); running one under the gateway mutex would deadlock the daemon on
+/// its own hook. Every fact the hook is handed is therefore gathered in short
+/// locks BEFORE the subprocess starts, and the refusal event is filed in
+/// another one AFTER it returns (all of them bounded, like every other lock on
+/// this path, by the server-side deadline `execute_session_tool` wraps the
+/// whole call in).
+///
+/// Cost when nobody configured a policy: two `stat`s. Only after a hook file is
+/// found does this pay for the account-usage snapshot, the 24h cost projection
+/// and the caller's context reading — an unconfigured daemon behaves, and
+/// spends, exactly as it did before.
+async fn pre_agent_policy_gate(
+    args: &serde_json::Value,
+    gateway: &GatewayHandle,
+    caller: &McpCaller,
+    paths: &CcteamPaths,
+) -> std::result::Result<(), String> {
+    let dispatching = addresses_a_session(args);
+    let arg_str = |key: &str| {
+        args.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let target_sid = arg_str("sid");
+    let caller_sid = arg_str("_caller_sid");
+    // A hire names no project; the spawn's own resolver picks it. Called here
+    // (off the lock) because it is pure — it reads args + the catalog and
+    // provisions nothing — and its refusal is the spawn branch's to report.
+    let hire_slug = if dispatching {
+        None
+    } else {
+        resolve_spawn_project(args, caller, Some(paths))
+            .ok()
+            .map(|resolution| resolution.slug)
+    };
+    let requested_vendor = parse_session_vendor(args).ok();
+
+    // ---- Phase 1: in-memory facts + WHERE a hook would live (short lock) ----
+    let facts = {
+        let gw = gateway.lock().await;
+        let target = if dispatching {
+            gw.session_resolve_any(&target_sid)
+        } else {
+            None
+        };
+        let slug = target
+            .as_ref()
+            .map(|session| session.project.clone())
+            .or(hire_slug)
+            .unwrap_or_default();
+        let host = gw.project_bound_host(&slug);
+        let vendor = target
+            .as_ref()
+            .and_then(|session| {
+                ccteam_harness::AgentVendor::ALL
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.wire_name() == session.vendor)
+            })
+            .or(requested_vendor)
+            .unwrap_or(ccteam_harness::AgentVendor::Claude);
+        let caller_session = (!caller_sid.is_empty())
+            .then(|| gw.session_resolve_any(&caller_sid))
+            .flatten();
+        let local = host == ccteam_core::LOCAL_HOST && !slug.is_empty();
+        PolicyGateFacts {
+            local,
+            project_dir: local.then(|| gw.project_dir_for(&slug)).flatten(),
+            vendor,
+            host,
+            caller_vendor: caller_session
+                .as_ref()
+                .map(|session| session.vendor.clone())
+                .unwrap_or_default(),
+            caller_dir: caller_session.map(|session| session.project_dir),
+            children: (!caller_sid.is_empty()).then(|| gw.count_active_children(&caller_sid)),
+            delegated: (!slug.is_empty()).then(|| gw.count_active_delegated(&slug)),
+            projection: gw.progress_projection(),
+            slug,
+        }
+    };
+    // The catalog is the fallback for a project registered after the daemon
+    // loaded its map (`ccteam init` mid-run), so a fresh project's own hook is
+    // honoured without a restart. Never for a remote one.
+    let project_dir = facts.local.then(|| {
+        facts
+            .project_dir
+            .clone()
+            .unwrap_or_else(|| paths.project_dir(&facts.slug))
+    });
+    // `paths.root` is the home THIS daemon runs on (`--home` / `CCTEAM_HOME`
+    // already applied) — never re-derived from the environment here.
+    let Some(script) = crate::policy::resolve_hook(project_dir.as_deref(), &paths.root) else {
+        return Ok(());
+    };
+
+    // ---- Phase 2: the facts that cost something, for a real hook only ----
+    let usage = {
+        let gw = gateway.lock().await;
+        gw.account_usage_snapshot(None).await
+    };
+    let usage = (!usage.is_empty()).then(|| {
+        serde_json::Value::Object(
+            usage
+                .iter()
+                .map(|(vendor, entry)| {
+                    (vendor.clone(), crate::usage_view::vendor_usage_value(entry))
+                })
+                .collect(),
+        )
+    });
+    let payload = crate::policy::PolicyFacts {
+        kind: if dispatching { "dispatch" } else { "hire" },
+        caller: crate::policy::CallerFacts {
+            vendor: facts.caller_vendor.clone(),
+            depth: args
+                .get("_caller_depth")
+                .and_then(|value| value.as_u64())
+                .and_then(|depth| u32::try_from(depth).ok()),
+            project: arg_str("_caller_slug"),
+            // Only a resolved caller has a tree to read this from, so the
+            // `None` here is exactly "we could not measure it" — never a zero.
+            context_pct: facts
+                .caller_dir
+                .as_deref()
+                .and_then(|dir| crate::delegation::latest_context_pct(dir, &caller_sid)),
+            sid: caller_sid.clone(),
+        },
+        request: crate::policy::RequestFacts {
+            vendor: if dispatching {
+                facts.vendor.wire_name().to_string()
+            } else {
+                requested_vendor
+                    .map(|vendor| vendor.wire_name().to_string())
+                    .unwrap_or_default()
+            },
+            model: arg_str("model"),
+            role: arg_str("role"),
+            sid: target_sid.clone(),
+            wait: inline_wait_seconds(args),
+            task: args
+                .get("task")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            title: arg_str("title"),
+        },
+        usage,
+        counts: crate::policy::CountFacts {
+            children: facts.children,
+            delegated: facts.delegated,
+            cost_24h_usd: facts.projection.as_ref().and_then(|projection| {
+                (!facts.slug.is_empty())
+                    .then(|| projection.project_snapshot(&facts.slug).cost.cost_24h_usd)
+            }),
+        },
+    }
+    .payload();
+
+    let outcome = crate::policy::run_hook(&script, &payload).await;
+    let Some(refusal) = outcome.refusal_text() else {
+        return Ok(());
+    };
+    // File the refusal on the SAME journal the built-in guardrails write to,
+    // under its own event name: an operator asking "why did nothing get
+    // delegated for an hour" must find the policy's fingerprints there.
+    if let Some(reason) = outcome.deny_reason() {
+        if !facts.slug.is_empty() {
+            let title = arg_str("title");
+            let gw = gateway.lock().await;
+            gw.emit_delegation_progress(
+                &facts.slug,
+                ccteam_harness::execution::progress_bridge::DELEGATION_POLICY_DENIED,
+                &caller_sid,
+                &target_sid,
+                facts.vendor,
+                &facts.host,
+                None,
+                (!title.is_empty()).then_some(title.as_str()),
+                Some(reason.tag()),
+            );
+        }
+    }
+    Err(format!("agent: {refusal}"))
 }
 
 /// `agent_read` — the roster (no `sid`) or one session's transcript (`sid`).
@@ -8653,6 +8884,373 @@ mod session_tool_tests {
                 theirs["result"]["content"][0]["text"], unknown["result"]["content"][0]["text"],
                 "{tool}: another tenant's node must stay indistinguishable from an unknown sid"
             );
+        }
+    }
+
+    // ========================================================================
+    // Card H — the user-programmable `pre-agent` policy hook, driven through
+    // the real `agent` door (both forms) with fixture scripts. Every root is
+    // injected (tempdir home + tempdir project tree), so no test can read or
+    // write the developer's own `~/.ccteam`.
+    // ========================================================================
+    #[cfg(unix)]
+    mod policy_gate_tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        const POLICY_DENIED: &str =
+            ccteam_harness::execution::progress_bridge::DELEGATION_POLICY_DENIED;
+
+        /// A gateway plus the two roots the policy layer resolves hooks from.
+        struct Fixture {
+            paths: CcteamPaths,
+            gateway: GatewayHandle,
+            /// The root session every delegation here comes from.
+            principal: String,
+            /// `alpha`'s working tree — its hook rung is `.ccteam/hooks/`.
+            project_dir: PathBuf,
+            /// Held so delegation signals have somewhere to land.
+            _signals: tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
+        }
+
+        async fn fixture(tmp: &std::path::Path) -> Fixture {
+            let paths = CcteamPaths {
+                root: tmp.join("home"),
+                projects_root: tmp.join("projects"),
+            };
+            let project_dir = tmp.join("alpha");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let (gateway, principal, signals) =
+                build_dispatch_gateway(true, false, 0, None, &project_dir).await;
+            // Journal + catalog + cost projection, all under the tempdir home.
+            gateway.lock().await.enable_project_creation(paths.clone());
+            Fixture {
+                paths,
+                gateway,
+                principal,
+                project_dir,
+                _signals: signals,
+            }
+        }
+
+        fn write_hook(path: &std::path::Path, body: &str, mode: u32) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        fn project_hook(project_dir: &std::path::Path) -> PathBuf {
+            project_dir
+                .join(".ccteam")
+                .join("hooks")
+                .join(crate::policy::PRE_AGENT_HOOK_FILE)
+        }
+
+        fn global_hook(paths: &CcteamPaths) -> PathBuf {
+            paths
+                .root
+                .join("hooks")
+                .join(crate::policy::PRE_AGENT_HOOK_FILE)
+        }
+
+        fn deny_hook(words: &str) -> String {
+            format!("#!/bin/sh\necho '{words}' >&2\nexit 2\n")
+        }
+
+        async fn hire(fx: &Fixture, args: serde_json::Value) -> Result<String, String> {
+            run_agent(
+                &ambient(&fx.principal, "alpha", args),
+                &fx.gateway,
+                McpCaller::Ambient,
+                &fx.paths,
+            )
+            .await
+        }
+
+        /// The journal append runs off-task; poll until `want` refusals land.
+        async fn policy_events(paths: &CcteamPaths, want: usize) -> Vec<serde_json::Value> {
+            let path = paths.progress_jsonl("alpha");
+            for _ in 0..150 {
+                let rows: Vec<serde_json::Value> = ccteam_core::progress::read_all_events(&path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|row| row["event"] == POLICY_DENIED)
+                    .collect();
+                if rows.len() >= want {
+                    return rows;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!(
+                "fewer than {want} {POLICY_DENIED} rows in {}",
+                path.display()
+            );
+        }
+
+        /// The headline: one script, both delegation forms, its own words
+        /// relayed verbatim — and the refusal recorded where an operator
+        /// looking for "why did nothing get delegated" will find it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+        async fn a_project_policy_denies_both_delegation_forms_in_its_own_words() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fx = fixture(tmp.path()).await;
+            // Unconfigured: the hire behaves exactly as it always has.
+            let child = parse(&hire(&fx, json!({ "task": "warm up" })).await.unwrap())["sid"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            // A policy appears. No registration, no restart.
+            write_hook(
+                &project_hook(&fx.project_dir),
+                &deny_hook("quota low, use codex"),
+                0o755,
+            );
+
+            let denied_hire = hire(&fx, json!({ "task": "write the docs", "vendor": "codex" }))
+                .await
+                .unwrap_err();
+            assert!(
+                denied_hire.contains("quota low, use codex"),
+                "the script's own sentence reaches the caller: {denied_hire}"
+            );
+            let denied_dispatch = hire(&fx, json!({ "sid": &child, "task": "one more thing" }))
+                .await
+                .unwrap_err();
+            assert!(
+                denied_dispatch.contains("quota low, use codex"),
+                "dispatch is governed by the same hook: {denied_dispatch}"
+            );
+
+            let rows = policy_events(&fx.paths, 2).await;
+            assert!(
+                rows.iter().all(|row| row["reason"] == "policy"),
+                "a verdict is tagged as a verdict: {rows:?}"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| row["parent_sid"] == fx.principal.as_str()),
+                "the caller is named: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|row| row["child_sid"] == ""),
+                "the hire has no child to name yet: {rows:?}"
+            );
+            assert!(
+                rows.iter().any(|row| row["child_sid"] == child.as_str()),
+                "the dispatch names its target: {rows:?}"
+            );
+        }
+
+        /// The file IS the registration: rewriting it changes the next call.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+        async fn editing_the_policy_takes_effect_on_the_next_call() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fx = fixture(tmp.path()).await;
+            let hook = project_hook(&fx.project_dir);
+            write_hook(&hook, &deny_hook("not right now"), 0o755);
+            assert!(hire(&fx, json!({ "task": "first" }))
+                .await
+                .unwrap_err()
+                .contains("not right now"));
+
+            write_hook(&hook, "#!/bin/sh\nexit 0\n", 0o755);
+            let allowed = parse(&hire(&fx, json!({ "task": "second" })).await.unwrap());
+            assert!(
+                allowed["sid"].as_str().is_some_and(|sid| !sid.is_empty()),
+                "no caching: the edited policy allows the very next call: {allowed}"
+            );
+        }
+
+        /// A broken script is fail-closed like a deny, but never WORDED like
+        /// one: the refusal names the file and how it failed, so the person who
+        /// has to fix it knows there is nothing to argue with.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+        async fn a_broken_policy_is_a_script_error_never_a_verdict() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fx = fixture(tmp.path()).await;
+            let hook = project_hook(&fx.project_dir);
+            let cases = [
+                ("#!/bin/sh\nexit 3\n", 0o755, "exited 3"),
+                ("#!/bin/sh\nsleep 30\n", 0o755, "timed out"),
+                ("#!/bin/sh\nexit 0\n", 0o644, "cannot run it"),
+            ];
+            for (body, mode, expected) in cases {
+                write_hook(&hook, body, mode);
+                let error = hire(&fx, json!({ "task": "anything" })).await.unwrap_err();
+                assert!(
+                    error.contains("policy_script_error"),
+                    "{expected}: a fault is labelled a fault: {error}"
+                );
+                assert!(
+                    error.contains(&hook.display().to_string()),
+                    "{expected}: the broken file is named: {error}"
+                );
+                assert!(error.contains(expected), "{expected}: got {error}");
+                assert!(
+                    !error.contains("denied by policy"),
+                    "{expected}: a fault must not read as a verdict: {error}"
+                );
+            }
+            let rows = policy_events(&fx.paths, 3).await;
+            assert!(
+                rows.iter()
+                    .all(|row| row["reason"] == "policy_script_error"),
+                "faults are tagged apart from verdicts on the journal: {rows:?}"
+            );
+        }
+
+        /// The fallback chain: nothing anywhere allows, the global rung governs
+        /// a project that states no policy, and a project policy REPLACES it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+        async fn the_global_hook_governs_a_project_that_states_no_policy() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fx = fixture(tmp.path()).await;
+            assert!(
+                hire(&fx, json!({ "task": "no policy anywhere" }))
+                    .await
+                    .is_ok(),
+                "an unconfigured daemon delegates exactly as before"
+            );
+
+            write_hook(&global_hook(&fx.paths), &deny_hook("global says no"), 0o755);
+            assert!(hire(&fx, json!({ "task": "second" }))
+                .await
+                .unwrap_err()
+                .contains("global says no"));
+
+            write_hook(
+                &project_hook(&fx.project_dir),
+                &deny_hook("project says no"),
+                0o755,
+            );
+            let error = hire(&fx, json!({ "task": "third" })).await.unwrap_err();
+            assert!(error.contains("project says no"), "{error}");
+            assert!(
+                !error.contains("global says no"),
+                "the rungs replace, never merge: {error}"
+            );
+        }
+
+        /// A satellite-bound project's hooks live on the satellite. The local
+        /// tree that happens to carry the same slug is a DIFFERENT machine's
+        /// files, so its script must not be mistaken for the project's policy.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+        async fn a_remote_projects_hook_is_never_run_from_the_local_tree() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fx = fixture(tmp.path()).await;
+            ccteam_core::config::upsert_project(
+                &fx.paths.root,
+                ccteam_core::ProjectEntry {
+                    slug: "alpha".into(),
+                    path: fx.project_dir.clone(),
+                    host: "sat-a".into(),
+                    remote_slug: Some("alpha".into()),
+                    remote_path: None,
+                    team: "dev".into(),
+                    installed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fx.gateway.lock().await.project_bound_host("alpha"),
+                "sat-a",
+                "the fixture must really be satellite-bound"
+            );
+            write_hook(
+                &project_hook(&fx.project_dir),
+                &deny_hook("local tree says no"),
+                0o755,
+            );
+            write_hook(&global_hook(&fx.paths), &deny_hook("global says no"), 0o755);
+
+            let error = hire(&fx, json!({ "task": "remote work" }))
+                .await
+                .unwrap_err();
+            assert!(error.contains("global says no"), "{error}");
+            assert!(
+                !error.contains("local tree says no"),
+                "the local tree is not the remote project's policy: {error}"
+            );
+        }
+
+        /// The payload is the whole point: a policy gets the quota facts, the
+        /// caller's own state and the shape of the request handed to it, so it
+        /// never needs a token or a round trip back into the daemon.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+        async fn the_hook_is_handed_the_facts_a_policy_decides_on() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let fx = fixture(tmp.path()).await;
+            // The account-usage snapshot reads the daemon's own catalog; point
+            // it at the tempdir home and seed one observation.
+            fx.gateway
+                .lock()
+                .await
+                .enable_persistence(&fx.paths.root)
+                .unwrap();
+            ccteam_harness::usage_catalog::record_vendor_usage_in(
+                &fx.paths.root,
+                "claude",
+                "status card",
+                &ccteam_harness::AccountUsage {
+                    five_hour_pct: Some(8),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // One existing delegation, so the counts are not all zero.
+            hire(&fx, json!({ "task": "warm up" })).await.unwrap();
+
+            let dump = tmp.path().join("stdin.json");
+            write_hook(
+                &project_hook(&fx.project_dir),
+                &format!("#!/bin/sh\ncat > '{}'\nexit 0\n", dump.display()),
+                0o755,
+            );
+            let task = "R".repeat(900);
+            hire(
+                &fx,
+                json!({
+                    "task": task,
+                    "vendor": "codex",
+                    "model": "gpt-5.1-codex-max",
+                    "role": "reviewer",
+                    "title": "review the diff",
+                }),
+            )
+            .await
+            .unwrap();
+
+            let raw = std::fs::read_to_string(&dump).unwrap();
+            assert_eq!(raw.lines().count(), 1, "one compact line: {raw}");
+            let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(payload["kind"], "hire");
+            assert_eq!(payload["caller"]["sid"], fx.principal.as_str());
+            assert_eq!(payload["caller"]["vendor"], "claude");
+            assert_eq!(payload["caller"]["depth"], 0);
+            assert_eq!(payload["caller"]["project"], "alpha");
+            assert_eq!(payload["request"]["vendor"], "codex");
+            assert_eq!(payload["request"]["model"], "gpt-5.1-codex-max");
+            assert_eq!(payload["request"]["role"], "reviewer");
+            assert_eq!(payload["request"]["title"], "review the diff");
+            assert_eq!(payload["request"]["wait"], 0);
+            assert_eq!(payload["request"]["task_chars"], 900);
+            assert_eq!(
+                payload["request"]["task_head"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .count(),
+                crate::policy::TASK_HEAD_MAX_CHARS,
+                "the head is capped, the full prompt never leaves the daemon: {payload}"
+            );
+            assert_eq!(
+                payload["usage"]["claude"]["windows"][0],
+                json!({"w": "5h", "pct": 8}),
+                "the quota facts are handed in: {payload}"
+            );
+            assert_eq!(payload["counts"]["children"], 1, "{payload}");
+            assert_eq!(payload["counts"]["delegated"], 1, "{payload}");
         }
     }
 }

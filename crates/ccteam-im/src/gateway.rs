@@ -3490,6 +3490,14 @@ impl Gateway {
             .unwrap_or_else(|_| ccteam_core::LOCAL_HOST.to_string())
     }
 
+    /// The working tree of a project the daemon has loaded, if any. Card H
+    /// reads it to find `<project>/.ccteam/hooks/pre-agent`: the in-memory map
+    /// is the daemon's own view of where a project lives (config-synced), so a
+    /// hook is looked up in exactly the tree its sessions run in.
+    pub(crate) fn project_dir_for(&self, slug: &str) -> Option<PathBuf> {
+        self.projects.get(slug).cloned()
+    }
+
     /// Return the injected local availability snapshot, when present. The
     /// caller probes live when this is `None`.
     pub(crate) fn local_vendor_availability_override(
@@ -11994,7 +12002,7 @@ impl Gateway {
     /// guardrail caps. Honest scope: an idle-released child is also out of the
     /// map, so this can under-count — an anti-runaway ceiling, not an exact
     /// census.
-    fn count_active_children(&self, parent_sid: &str) -> u32 {
+    pub(crate) fn count_active_children(&self, parent_sid: &str) -> u32 {
         self.sessions
             .values()
             .filter(|s| s.parent_sid.as_deref() == Some(parent_sid))
@@ -12004,7 +12012,7 @@ impl Gateway {
     /// v0.9.0 W2 (F5) — count ALL active (live-map) delegated sessions in one
     /// project (any non-`None` `parent_sid`) — the `max_delegated` runaway
     /// ceiling. Same honest live-map scope as [`Self::count_active_children`].
-    fn count_active_delegated(&self, project: &str) -> u32 {
+    pub(crate) fn count_active_delegated(&self, project: &str) -> u32 {
         self.sessions
             .values()
             .filter(|s| s.project == project && s.parent_sid.is_some())

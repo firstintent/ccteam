@@ -80,6 +80,13 @@ pub const DELEGATION_NOTIFIED: &str = "delegation_notified";
 pub const DELEGATION_COLLECTED: &str = "delegation_collected";
 pub const DELEGATION_STOPPED: &str = "delegation_stopped";
 pub const DELEGATION_DENIED: &str = "delegation_denied";
+/// Card H — a delegation the user's own `pre-agent` policy hook stopped.
+/// Distinct from [`DELEGATION_DENIED`] (the engine's built-in depth / fan-out /
+/// ceiling / cycle / budget guardrails) because the two are read by different
+/// people: this one is answerable by editing a script, and its `reason` tag
+/// separates a policy VERDICT (`policy`) from a broken policy script
+/// (`policy_script_error`) so a fault is never mistaken for a rule.
+pub const DELEGATION_POLICY_DENIED: &str = "delegation_policy_denied";
 /// One-shot human-message scheduler lifecycle events.
 pub const SCHEDULED_ENQUEUED: &str = "scheduled_enqueued";
 pub const SCHEDULED_CANCELLED: &str = "scheduled_cancelled";
@@ -125,6 +132,7 @@ pub enum EventKind {
     DelegationCollected,
     DelegationStopped,
     DelegationDenied,
+    DelegationPolicyDenied,
     ScheduledEnqueued,
     ScheduledCancelled,
     ScheduledFired,
@@ -165,6 +173,7 @@ impl EventKind {
         EventKind::DelegationCollected,
         EventKind::DelegationStopped,
         EventKind::DelegationDenied,
+        EventKind::DelegationPolicyDenied,
         EventKind::ScheduledEnqueued,
         EventKind::ScheduledCancelled,
         EventKind::ScheduledFired,
@@ -205,6 +214,7 @@ impl EventKind {
             EventKind::DelegationCollected => DELEGATION_COLLECTED,
             EventKind::DelegationStopped => DELEGATION_STOPPED,
             EventKind::DelegationDenied => DELEGATION_DENIED,
+            EventKind::DelegationPolicyDenied => DELEGATION_POLICY_DENIED,
             EventKind::ScheduledEnqueued => SCHEDULED_ENQUEUED,
             EventKind::ScheduledCancelled => SCHEDULED_CANCELLED,
             EventKind::ScheduledFired => SCHEDULED_FIRED,
@@ -246,6 +256,7 @@ impl EventKind {
             DELEGATION_COLLECTED => EventKind::DelegationCollected,
             DELEGATION_STOPPED => EventKind::DelegationStopped,
             DELEGATION_DENIED => EventKind::DelegationDenied,
+            DELEGATION_POLICY_DENIED => EventKind::DelegationPolicyDenied,
             SCHEDULED_ENQUEUED => EventKind::ScheduledEnqueued,
             SCHEDULED_CANCELLED => EventKind::ScheduledCancelled,
             SCHEDULED_FIRED => EventKind::ScheduledFired,
@@ -306,6 +317,7 @@ pub const fn class(kind: EventKind) -> EventClass {
         | EventKind::DelegationCollected
         | EventKind::DelegationStopped
         | EventKind::DelegationDenied
+        | EventKind::DelegationPolicyDenied
         | EventKind::ScheduledEnqueued
         | EventKind::ScheduledCancelled
         | EventKind::ScheduledFired

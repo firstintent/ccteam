@@ -427,8 +427,9 @@ pub fn project_vendor_budget_cap(
 
 // ── guardrail denial reasons ────────────────────────────────────────────────
 
-/// Why an Ambient delegation was denied — the `reason` tag on the
-/// `delegation_denied` progress event + the human-readable error.
+/// Why a delegation was denied — the `reason` tag on the `delegation_denied`
+/// (engine guardrails) / `delegation_policy_denied` (Card H user hook) progress
+/// event + the human-readable error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
     /// Child depth would exceed `delegation.max_depth`.
@@ -441,10 +442,18 @@ pub enum DenyReason {
     Cycle,
     /// The vendor's trailing-24h project cost has reached its budget cap.
     Budget,
+    /// Card H — the user's own `pre-agent` policy hook exited 2 (deny). The
+    /// engine has no opinion here: it relays the script's verdict.
+    Policy,
+    /// Card H — the `pre-agent` hook could not deliver a verdict (timeout, an
+    /// exit code outside the dialect, not executable). Fail-closed like a deny,
+    /// but tagged apart on purpose: a rule that says no and a script that is
+    /// broken need different humans to act.
+    PolicyScriptError,
 }
 
 impl DenyReason {
-    /// The stable lowercase tag used in the `delegation_denied{reason}` event
+    /// The stable lowercase tag used in the `delegation_*denied{reason}` event
     /// + the human-readable error.
     pub fn tag(self) -> &'static str {
         match self {
@@ -453,6 +462,8 @@ impl DenyReason {
             DenyReason::Delegated => "delegated",
             DenyReason::Cycle => "cycle",
             DenyReason::Budget => "budget",
+            DenyReason::Policy => "policy",
+            DenyReason::PolicyScriptError => "policy_script_error",
         }
     }
 }
