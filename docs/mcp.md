@@ -1,6 +1,6 @@
 # The ccteam MCP server — complete tool reference
 
-> 中文版: [mcp-cn.md](mcp-cn.md) · Plain-language delegation guide: [orchestration.md](orchestration.md) · Human surfaces manual: [usage.md](usage.md)
+> 中文版: [mcp-cn.md](mcp-cn.md) · Plain-language delegation guide: [orchestration.md](orchestration.md) · Human surfaces manual: [usage.md](usage.md) · Policy hooks & workflows: [hook-dynamic-workflows.md](hook-dynamic-workflows.md)
 
 ccteam exposes **one MCP server, named `ccteam`**, over streamable HTTP at `POST /mcp` on the daemon (`http://127.0.0.1:7331/mcp` by default). Your harness namespaces the tools with the server key — Claude shows `mcp__ccteam__agent`, other harnesses use their own prefix. The surface is deliberately a **menu, not a manual**: six tools, one-line parameter descriptions, compact JSON bodies, and thin defaults with knobs — because every byte of schema and every default response line is charged to an agent's context. Edge cases and failure semantics live in the server's error messages (only the caller who trips one pays) and on this page (a human reads it once).
 
