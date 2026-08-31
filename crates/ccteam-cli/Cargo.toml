@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 ccteam-core.workspace = true
-ccteam-flow.workspace = true
 ccteam-hooks.workspace = true
 ccteam-web.workspace = true
 # V0.6.1 F130 — IM supervisor loop folded into `ccteam start` as one

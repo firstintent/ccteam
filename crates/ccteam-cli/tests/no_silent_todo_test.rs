@@ -7,8 +7,11 @@
 //! immediately adjacent comment lines), so future grep sweeps trivially
 //! distinguish "deferred-with-reason" from "forgotten WIP". F168
 //! originally delivered six `TODO(V0.7-<anchor>)` tags; V0.6.8 retired
-//! the `chat-handle` anchor (the AgentSpec / BotRegistration /
-//! build_handle_map schema landed) so the count is now five.
+//! the `chat-handle` and `listbots-cache` anchors (the AgentSpec /
+//! BotRegistration / build_handle_map schema landed) and the
+//! dynamic-workflow rebuild of `ccteam-flow` deleted
+//! `human-approval-adapter` with the old orchestrator, so the count is
+//! now three.
 //! Sister-finding sites owned by F173 / F169 / F170 cover the
 //! remaining markers — see `docs/dev-coupling-audit.md` for the index.
 //!
@@ -113,11 +116,12 @@ fn no_silent_todo_in_production_src() {
 
 /// Cross-check that the surviving `TODO(V0.7-<anchor>)` tag set
 /// matches expectations — guards against accidental tag removal or
-/// duplication. F168 originally delivered six anchors; V0.6.8
-/// retired `chat-handle` and `listbots-cache`, so the count is now
-/// four.
+/// duplication. F168 originally delivered six anchors; V0.6.8 retired
+/// `chat-handle` and `listbots-cache`, and the dynamic-workflow rebuild
+/// of `ccteam-flow` deleted `human-approval-adapter` along with the old
+/// decision-engine orchestrator, so the count is now three.
 #[test]
-fn f168_v07_deferred_tag_count_is_four() {
+fn f168_v07_deferred_tag_count_is_three() {
     let workspace_root = workspace_root();
     let mut hits: Vec<String> = Vec::new();
     for root in SCAN_ROOTS {
@@ -141,9 +145,11 @@ fn f168_v07_deferred_tag_count_is_four() {
     }
     assert_eq!(
         hits.len(),
-        4,
-        "V0.6.8 left exactly 4 V0.7-deferred TODO anchors (F168 minus \
-         chat-handle and listbots-cache, which V0.6.8 closed); found {}:\n{}",
+        3,
+        "exactly 3 V0.7-deferred TODO anchors survive (F168 minus \
+         chat-handle and listbots-cache, closed in V0.6.8, minus \
+         human-approval-adapter, deleted with the old ccteam-flow \
+         orchestrator); found {}:\n{}",
         hits.len(),
         hits.join("\n")
     );
