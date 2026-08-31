@@ -72,7 +72,7 @@ pub(crate) async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -
 /// owner, so the five writes below — and every later daemon restart — see one
 /// stable value; minting per call would rewrite five config files on every
 /// start.
-fn enroll_bearer(paths: &CcteamPaths) -> Result<String> {
+pub(crate) fn enroll_bearer(paths: &CcteamPaths) -> Result<String> {
     let owner = ccteam_core::identity::owner_tag(ccteam_core::identity::ADMIN_WEB_ID, true);
     Ok(ccteam_core::enroll::ensure_user_credential(paths, &owner)?.bearer())
 }

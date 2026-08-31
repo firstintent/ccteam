@@ -16,10 +16,12 @@
 //!                   journal.jsonl  ◄── every call, twice (dispatch, done)
 //! ```
 //!
-//! What this crate deliberately does NOT do: talk to the network, spawn a
-//! process, read `$HOME`, print anything, or call an LLM. The single door out
-//! is [`FlowClient`]; the transport that implements it, and the CLI that
-//! drives a run, live outside.
+//! What the RUNNER deliberately does NOT do: talk to the network, spawn a
+//! process, read `$HOME`, print anything, or call an LLM. Its single door out
+//! is [`FlowClient`], and the two implementations of that trait are the only
+//! places anything else happens — `FakeClient` (deterministic, for tests) and
+//! [`McpFlowClient`] (`POST /mcp` against a running daemon). The CLI that
+//! drives a run lives outside.
 //!
 //! # Contract
 //!
@@ -60,6 +62,7 @@ mod tests;
 
 pub mod client;
 pub mod error;
+pub mod mcp_client;
 pub mod meta;
 pub mod progress;
 pub mod run;
@@ -72,6 +75,7 @@ pub mod fake;
 pub use client::{AgentOutcome, ClientError, FlowClient, HireSpec, Hired};
 pub use error::FlowError;
 pub use journal::{call_key, CacheReport, JournalEntry};
+pub use mcp_client::{McpEndpoint, McpFlowClient};
 pub use meta::{assert_deterministic, extract_meta, PhaseMeta, WorkflowMeta, DETERMINISM_HINT};
 pub use progress::{ProgressCallback, ProgressEvent};
 pub use run::{run_workflow, AgentRecord, RunConfig, RunReport, RunTotals, ScriptSource};

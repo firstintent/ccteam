@@ -25,6 +25,10 @@ ccteam-im.workspace = true
 # V0.8 W5 — `backend_kind_from_env` to branch interactive attach +
 # `from_env().capture(...)` for the rmux peek path.
 ccteam-harness.workspace = true
+# `ccteam flow run` drives the dynamic-workflow runner; the CLI supplies only
+# the three things the runner refuses to resolve itself (credential, project,
+# run directory).
+ccteam-flow.workspace = true
 # V0.8 W5 — interactive `ccteam attach` against the ccteam-hosted rmux
 # daemon goes through rmux-client's public attach driver directly
 # (Path A): `connect` → `Connection::begin_attach` → `into_parts` →

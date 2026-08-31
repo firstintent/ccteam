@@ -400,6 +400,7 @@ dependencies = [
  "async-trait",
  "axum",
  "ccteam-core",
+ "ccteam-flow",
  "ccteam-harness",
  "ccteam-hooks",
  "ccteam-im",
@@ -471,6 +472,7 @@ version = "0.10.5"
 dependencies = [
  "async-trait",
  "ccteam-harness",
+ "reqwest",
  "rquickjs",
  "serde",
  "serde_json",

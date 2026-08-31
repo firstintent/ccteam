@@ -19,6 +19,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+# The real `FlowClient` (`mcp_client`) speaks ccteam's MCP face over
+# `POST /mcp`. Same HTTP client the CLI, IM and web crates already pull, so
+# this adds a module to the build graph rather than a dependency to it.
+reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -29,7 +33,7 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 # `test-util` ships the deterministic FakeClient. On by default so downstream
-# crates (and F0b's CLI) can smoke-test a wiring without a live daemon; the
-# real HTTP client lives outside this crate.
+# crates (and the `ccteam flow run` CLI) can smoke-test a wiring without a
+# live daemon.
 default = ["test-util"]
 test-util = []
