@@ -90,16 +90,26 @@ return audits.filter(Boolean)
 ```
 
 ```bash
+ccteam flow new audit-routes       # 起一个骨架,并打印脚本面
 ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <slug>)
+ccteam flow eval <run-dir>         # 用你自己的评估脚本给跑完的 run 打分
 ```
 
 进度逐行流向 stderr;stdout 是最终 **RunReport** JSON——脚本返回值、每 agent 记录(sid、成本、是否缓存)、总计与缓存诊断。干净跑完 exit 0。
 
-参数:`--args <json>`(脚本里读 `args`)· `--parallel <n>` · `--max-agents <n>` · `--max-cost <usd>` · `--budget <usd>` · `--run-dir <dir>` · `--resume <run-dir>` · `--watchdog <secs>`。
+`flow run` 参数:`--args <json>`(脚本里读 `args`)· `--parallel <n>` · `--max-agents <n>` · `--max-cost <usd>` · `--budget <usd>` · `--run-dir <dir>` · `--resume <run-dir>` · `--watchdog <secs>`。三个动词的参数一律以 `ccteam flow <verb> --help` 为准。
 
 ### 脚本住哪
 
-`ccteam flow run` 接显式路径,放哪都行。约定:共享 flow 放 **`.agents/flows/`**(与 `.agents/skills` 同族),提交进 git,全队跑同一份编排。**别放 `.ccteam/`**——ccteam 会把该目录幂等加进项目 `.gitignore`,脚本会静默丢出版本库(per-checkout 的 *hook* 住那里恰恰因为这一点)。可跑样例:[`examples/flows/`](../examples/flows/)。
+`ccteam flow run` 接显式路径,放哪都行。约定:共享 flow 放 **`.agents/flows/`**(与 `.agents/skills` 同族),提交进 git,全队跑同一份编排——这正是 `ccteam flow new` 生成到的地方,也是 `ccteam flow eval` 找 `_eval.flow.js` 的地方。**别放 `.ccteam/`**——ccteam 会把该目录幂等加进项目 `.gitignore`,脚本会静默丢出版本库(per-checkout 的 *hook* 住那里恰恰因为这一点)。可跑样例:[`examples/flows/`](../examples/flows/)。
+
+### 怎么写一个
+
+`ccteam flow new <name>` 生成 `<slug>.flow.js`——cwd 在项目里就落到该项目的 `.agents/flows/`,否则落 cwd,`--dir` 压过二者——然后把**脚本面打印到 stdout**。文件已存在则报错,绝不覆盖。
+
+这个「打印」就是整个设计,不是顺手。Claude Code 之所以能做到「你只管说,它就把工作流写出来」,是因为它把整份写作手册烤进了 `Workflow` 工具的 JSON-schema `description` 里:工具本来就在,手册就白搭进每个会话。ccteam 没有这条通道,也不会长出来——向会话注入任何东西是「无提示词注入」红线,而 MCP 工具 schema 的每个字节都在向所有会话收税,不管那个会话这辈子写不写 flow。所以手册改成**挣来的**:跑了 `flow new` 的 agent 是自己开口要的,手册就出现在它的 shell 已经在看的地方。
+
+「你只管说」的另一半是 skill,而 skill 按定义住在用户空间——提示词形态的内容一律不进本仓。约定是一个 **`flow-creator`** skill:全机一份放 `~/.ccteam/skills/flow-creator/`(会话显式 attach),项目自己的放 `.agents/skills/flow-creator/`。它负责 CLI 做不到的那一半——把一句大白话变成对的**形状**(扇出还是流水线、每个叶子配哪家 harness、哪里上 schema 才划算);`flow new` 则负责把它下笔时要对着的那张面递过去。
 
 ### 怎么触发
 
@@ -109,7 +119,29 @@ ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <
 
 ### 评估一次 run,然后改进脚本
 
-跑完的 run 把评估所需全部留在 run 目录:持久化的脚本与 args、`journal.jsonl`(逐调用内容键、sid、成本、是否缓存)、`results/`,加上你从 stdout 收的 RunReport(null、刹车、缓存诊断)。确定性指标直接从文件里出——null 率、每叶开销、缓存复用;判断则交给一个你指向该目录的 agent。[`examples/flows/flow-review.flow.js`](../examples/flows/flow-review.flow.js) 就是这条回路的 flow 表达:一叶给 run 打分(任务清晰度、vendor 匹配、浪费开销),另一叶提出具体脚本修改。改完 `--resume`——只从第一处变更起重新付费。
+跑完的 run 把评估所需全部留在 run 目录:持久化的脚本与 args、`journal.jsonl`(逐调用内容键、sid、成本、是否缓存)、`results/`,加上你从 stdout 收的 RunReport(null、刹车、缓存诊断)。确定性指标直接从文件里出——null 率、每叶开销、缓存复用;判断则交给一个你指向该目录的 agent。
+
+`ccteam flow eval <run-dir>` 就是后半段,而且「谁来判」这个问题用约定回答,不用参数。解析顺序:
+
+1. `--script <path>`——你点名了就用它
+2. `<project>/.agents/flows/_eval.flow.js`——项目自己的评估脚本,提交进 git、全队共用
+3. `~/.ccteam/flows/_eval.flow.js`——全机回落
+4. 都没有 → 报错,并点名该把什么拷到哪里
+
+与 pre-agent hook 同一条两级形状(§1),也同一条规则:项目声明了评估脚本就是声明了**全部**——项目文件**替换**全局文件,绝不合并。`<run-dir>` 收路径,也收 `~/.ccteam/runs/` 下的裸 run id。
+
+再往下它就是糖,而且一直是糖:把活原样交给 `flow run`,只把 `args.run_dir` 设成被评 run 的绝对路径。一次评估**就是**一次 flow run——白得自己的 run 目录、journal、resume 与 RunReport,要看住的 runner 只有一个而不是两个。引擎自己不做任何判断;裁决来自你写的脚本里的那些 agent。
+
+[`examples/flows/flow-review.flow.js`](../examples/flows/flow-review.flow.js) 是拿来即用的那份:一叶把 run 打成 `{scores:{clarity,vendor_fit,waste}, notes[]}`(1-10,每一维都是**越高越好**,`waste` 也一样),另一叶给出 `{edits:[{what,why}]}`。两叶都过 schema 校验,所以脚本可以拿它当闸门。
+
+```bash
+cp examples/flows/flow-review.flow.js .agents/flows/_eval.flow.js
+ccteam flow eval ~/.ccteam/runs/<run>        # 或者直接给裸 run id
+```
+
+[`examples/flows/self-review-loop.sh`](../examples/flows/self-review-loop.sh) 把整条链——写 → 跑 → 评 → 改——串成一个配方,闸门取三维里**最低**的那一维。
+
+**它是配方,不是全自动回路,而最后一跳正是诚实的地方。** 脚本空间没有文件系统、没有进程——这恰恰是 `--resume` 精确的原因——所以 flow 改不了自己。默认情况下脚本把建议的修改打到 stderr、以 exit 3 停下,并打印出应用完修改后续跑同一份 journal 的那条 `RESUME=<run-dir>` 命令:只从第一处变更起重新付费。把 `IMPROVE_CMD` 指向一条命令,它就改为把这些修改交给那个被你显式委派的 agent,并继续迭代。你不点名谁可以改,就没有任何东西会去改你的 flow。
 
 ### 脚本面
 

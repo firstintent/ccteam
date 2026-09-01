@@ -90,16 +90,26 @@ return audits.filter(Boolean)
 ```
 
 ```bash
+ccteam flow new audit-routes       # scaffold one, and print the script surface
 ccteam flow run flow.js            # inside an initialized project (--project <slug> otherwise)
+ccteam flow eval <run-dir>         # grade a finished run with an evaluator of your own
 ```
 
 Progress streams on stderr, one line per event; stdout is the final **RunReport** JSON — the script's returned value, per-agent records (sid, cost, cached), totals, and cache diagnostics. Exit 0 on a clean run.
 
-Flags: `--args <json>` (the script reads it as `args`) · `--parallel <n>` · `--max-agents <n>` · `--max-cost <usd>` · `--budget <usd>` · `--run-dir <dir>` · `--resume <run-dir>` · `--watchdog <secs>`.
+`flow run` flags: `--args <json>` (the script reads it as `args`) · `--parallel <n>` · `--max-agents <n>` · `--max-cost <usd>` · `--budget <usd>` · `--run-dir <dir>` · `--resume <run-dir>` · `--watchdog <secs>`. `ccteam flow <verb> --help` is authoritative for all three verbs.
 
 ### Where flow scripts live
 
-Anywhere `ccteam flow run` can reach — the path is explicit. Convention: keep shared flows in **`.agents/flows/`** (the same family as `.agents/skills`), committed so the whole team runs the same orchestration. **Not `.ccteam/`** — ccteam gitignores that directory, so a script there silently falls out of version control (which is exactly why per-checkout *hooks* DO live there). Runnable samples: [`examples/flows/`](../examples/flows/).
+Anywhere `ccteam flow run` can reach — the path is explicit. Convention: keep shared flows in **`.agents/flows/`** (the same family as `.agents/skills`), committed so the whole team runs the same orchestration — which is exactly where `ccteam flow new` puts them, and where `ccteam flow eval` looks for `_eval.flow.js`. **Not `.ccteam/`** — ccteam gitignores that directory, so a script there silently falls out of version control (which is exactly why per-checkout *hooks* DO live there). Runnable samples: [`examples/flows/`](../examples/flows/).
+
+### Writing one
+
+`ccteam flow new <name>` scaffolds `<slug>.flow.js` — into the project's `.agents/flows/` when the cwd is inside a project, else the cwd, with `--dir` overriding both — and then prints the script surface to stdout. It refuses to overwrite an existing file.
+
+The printing is the whole design, not a courtesy. Claude Code makes "just ask and it writes the workflow" work by baking a full authoring manual into its `Workflow` tool's JSON-schema `description`: the manual rides into every session for free, because the tool is already there. ccteam has no equivalent channel and will not grow one — injecting anything into a session is the standing no-prompt-injection red line, and every byte of MCP tool schema taxes every session whether or not that session ever writes a flow. So the manual is **earned** instead: an agent that ran `flow new` asked for it, and gets it on stdout where its shell already looks.
+
+The other half of "just ask" is a skill, and skills are user-space by construction — no prompt-shaped content ships in this repo. The convention is a **`flow-creator`** skill, at `~/.ccteam/skills/flow-creator/` for the machine-wide one (attached to a session explicitly) or `.agents/skills/flow-creator/` for a project's own. Its job is the part a CLI cannot do — turning a plain-language ask into the right *shape* (fan-out or pipeline, which harness per leaf, where a schema earns its keep) — while `flow new` supplies the surface it writes against.
 
 ### Triggering a flow
 
@@ -109,7 +119,29 @@ Anywhere `ccteam flow run` can reach — the path is explicit. Convention: keep 
 
 ### Evaluate a run, then improve the script
 
-A finished run leaves everything an evaluation needs in its run directory: the persisted script and args, `journal.jsonl` (per-call content key, sid, cost, cached), `results/`, plus the RunReport you captured from stdout (nulls, the brake, the cache diagnostic). Deterministic metrics fall straight out of those files — null rate, spend per leaf, cache reuse; judgment comes from an agent you point at the directory. [`examples/flows/flow-review.flow.js`](../examples/flows/flow-review.flow.js) is that loop expressed as a flow: one leaf grades the run (task clarity, vendor fit, wasted spend), another proposes concrete script edits. Then edit and `--resume` — you re-pay only from the first changed call.
+A finished run leaves everything an evaluation needs in its run directory: the persisted script and args, `journal.jsonl` (per-call content key, sid, cost, cached), `results/`, plus the RunReport you captured from stdout (nulls, the brake, the cache diagnostic). Deterministic metrics fall straight out of those files — null rate, spend per leaf, cache reuse; judgment comes from an agent you point at the directory.
+
+`ccteam flow eval <run-dir>` is that second half, with "which script judges it" answered by convention instead of by a flag. It resolves, in order:
+
+1. `--script <path>` — if you name one
+2. `<project>/.agents/flows/_eval.flow.js` — the project's own evaluator, committed and shared
+3. `~/.ccteam/flows/_eval.flow.js` — the machine-wide fallback
+4. none of the above → an error naming what to copy where
+
+The same two-rung shape the pre-agent hook uses (§1), and the same rule: a project that states an evaluator states **all** of it — the project file *replaces* the global one, never merges with it. `<run-dir>` takes a path or the bare run id under `~/.ccteam/runs/`.
+
+Then it is sugar, and stays sugar: it hands the job to `flow run` with `args.run_dir` set to the absolute path of the run under review. An evaluation **is** a flow run, so it gets its own run directory, journal, resume and RunReport for free, and there is one runner to keep honest rather than two. The engine judges nothing itself — the verdict comes from agents inside a script you wrote.
+
+[`examples/flows/flow-review.flow.js`](../examples/flows/flow-review.flow.js) is the evaluator to start from: one leaf grades the run into `{scores:{clarity,vendor_fit,waste}, notes[]}` (1-10, and higher is better on every dimension, `waste` included), another proposes `{edits:[{what,why}]}`. Both are schema-validated, so a loop can gate on them.
+
+```bash
+cp examples/flows/flow-review.flow.js .agents/flows/_eval.flow.js
+ccteam flow eval ~/.ccteam/runs/<run>        # or just the bare run id
+```
+
+[`examples/flows/self-review-loop.sh`](../examples/flows/self-review-loop.sh) wires the whole thing — write → run → evaluate → improve — into one recipe, gated on the **worst** of the three scores.
+
+**It is a recipe, not an automatic loop, and the last hop is the honest part.** Script space has no filesystem and no process access — that is exactly what makes `--resume` exact — so a flow cannot edit itself. By default the script stops with the proposed edits on stderr and exit 3, printing the `RESUME=<run-dir>` invocation that continues the same journal once you have applied them: you re-pay only from the first changed call. Point `IMPROVE_CMD` at a command and it hands the edits to that explicitly-delegated agent instead and keeps iterating. Nothing rewrites your flow unless you named the thing that may.
 
 ### The script surface
 
