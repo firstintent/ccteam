@@ -635,14 +635,29 @@ fn interpret(tool: &str, raw: RawResponse) -> Attempt {
     // The body is JSON inside a text block. A server that answered prose is
     // not a crash — it is a call that produced nothing usable.
     match serde_json::from_str::<Value>(text) {
-        // Every ccteam tool body is an object; a literal `null` would slip
-        // through the non-empty-text gate above and impersonate absence
-        // downstream (the forever-poll class this validation exists for).
-        Ok(Value::Null) => Attempt::Failed(ClientError::Failed(format!(
-            "{tool}: success answer carried a JSON null body"
+        // Every ccteam tool body is a JSON OBJECT. Anything else that
+        // parses — a literal null, an array, a bare scalar — would slip
+        // through as Body(...) and downstream reads (`activity`, `turns`,
+        // `sid`) silently answer "absent", the forever-poll class this
+        // validation exists for (issues #9 and #10).
+        Ok(Value::Object(map)) => Attempt::Body(Value::Object(map)),
+        Ok(other) => Attempt::Failed(ClientError::Failed(format!(
+            "{tool}: success answer carried a non-object JSON body ({})",
+            json_type_name(&other)
         ))),
-        Ok(value) => Attempt::Body(value),
         Err(_) => Attempt::Failed(ClientError::Failed(format!("{tool}: {text}"))),
+    }
+}
+
+/// Human word for a JSON value's type, for the malformation messages.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -1080,7 +1095,29 @@ mod tests {
         })
         .to_string();
         let err = error_of(interpret("agent", raw(200, &response)));
-        assert!(err.to_string().contains("JSON null body"), "{err}");
+        assert!(
+            err.to_string().contains("non-object JSON body (null)"),
+            "{err}"
+        );
+    }
+
+    /// issue #10 (confirmed candidate 1) — arrays and bare scalars parse
+    /// fine and used to become Body(...), starving await_turn of every
+    /// field it reads. Object-only now; the type is named.
+    #[test]
+    fn non_object_bodies_are_named_failures() {
+        for (text, ty) in [("[]", "array"), ("1", "number"), ("\"x\"", "string")] {
+            let response = json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "content": [{ "type": "text", "text": text }] },
+            })
+            .to_string();
+            let err = error_of(interpret("agent", raw(200, &response)));
+            assert!(
+                err.to_string().contains("non-object JSON body") && err.to_string().contains(ty),
+                "{text} -> {err}"
+            );
+        }
     }
 
     #[test]
