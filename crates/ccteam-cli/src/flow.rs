@@ -108,6 +108,22 @@ pub fn run(req: FlowRunRequest) -> Result<()> {
         .map(|raw| serde_json::from_str::<Value>(raw).context("--args must be valid JSON"))
         .transpose()?;
     let (run_dir, resuming) = resolve_run_dir(&paths, &req.script, req.run_dir, req.resume)?;
+    // A flow launched from inside a managed session hangs its leaves under that
+    // session in the delegation tree — the runner itself is only an enrolled
+    // client (the common case IS a managed session triggering runs). Resolved
+    // here, not at the `cfg` assignment below, because the ledger bridge stamps
+    // the same attribution onto the run's envelope rows.
+    let parent_sid = resolve_parent(req.parent.clone(), std::env::var("CCTEAM_CHAT_SID").ok());
+    // Second progress sink: the run-level envelope goes to the project ledger so
+    // the daemon and the web UI can see a run at all. Purely additive — it
+    // cannot fail the run, and dropping it flushes before the process exits.
+    let ledger = crate::flow_bridge::LedgerBridge::start(
+        &paths,
+        &project,
+        &run_dir,
+        &req.script,
+        parent_sid.clone(),
+    );
 
     let endpoint = McpEndpoint {
         url: ccteam_harness::execution::mcp_config::resolve_mcp_http_url(&paths.root.join("run")),
@@ -121,10 +137,7 @@ pub fn run(req: FlowRunRequest) -> Result<()> {
     cfg.args = args;
     cfg.resume = resuming;
     cfg.watchdog = req.watchdog.map(Duration::from_secs);
-    // A flow launched from inside a managed session hangs its leaves under
-    // that session in the delegation tree — the runner itself is only an
-    // enrolled client (the common case IS a managed session triggering runs).
-    cfg.parent_sid = resolve_parent(req.parent.clone(), std::env::var("CCTEAM_CHAT_SID").ok());
+    cfg.parent_sid = parent_sid;
     if let Some(parallel) = req.parallel {
         cfg.scheduler.max_parallel = parallel.max(1);
     }
@@ -133,7 +146,7 @@ pub fn run(req: FlowRunRequest) -> Result<()> {
     }
     cfg.brakes.max_cost_usd = req.max_cost;
     cfg.brakes.budget_total = req.budget;
-    cfg.progress = Some(stderr_progress());
+    cfg.progress = Some(crate::flow_bridge::tee(stderr_progress(), ledger.sink()));
 
     // A current-thread runtime is enough: every wait in a run is I/O (an HTTP
     // long poll), and the JS engine is single-threaded by construction.

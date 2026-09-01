@@ -9,6 +9,10 @@ mod daemon_cli;
 // `ccteam flow run` — the dynamic-workflow runner's CLI face. The runner core
 // lives in `ccteam-flow`; this only supplies credential, project and run dir.
 mod flow;
+// The run-level envelope of a `ccteam flow run` (which hires belonged to one
+// run, and how it ended) submitted to the project ledger. Best-effort: a
+// missing daemon costs the run nothing but its visibility in the web UI.
+mod flow_bridge;
 mod legacy_takeover;
 mod mcp_serve;
 // v0.9.7 — `ccteam update`: channel-aware self-update (standalone replays

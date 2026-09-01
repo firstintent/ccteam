@@ -261,6 +261,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_create_session
         ))
         .routes(routes!(super::evolution::handle_evolution))
+        .routes(routes!(super::flow_runs::handle_flow_runs))
         // v0.8.22 P1 — GET history + PATCH rename share `/api/v1/sessions/{sid}`.
         .routes(routes!(
             super::sessions_api::handle_session_history,

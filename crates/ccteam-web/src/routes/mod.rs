@@ -38,6 +38,9 @@ pub mod dsh;
 // auth gate as every other resource route.
 pub mod enroll;
 pub mod evolution;
+// 2026-09-01 — `GET /api/v1/projects/{slug}/flow-runs`: the run-level envelope
+// of `ccteam flow run`, folded back out of the project ledger.
+pub mod flow_runs;
 pub mod health;
 pub mod hosts;
 // v0.8.8 F4 — web IM credential configuration (Telegram + Lark; masked

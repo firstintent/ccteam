@@ -119,6 +119,7 @@ fn expected_operations() -> BTreeSet<(&'static str, &'static str)> {
         ("GET", "/api/v1/projects/{slug}/artifact_status"),
         ("GET", "/api/v1/projects/{slug}/cost_history"),
         ("GET", "/api/v1/projects/{slug}/evolution"),
+        ("GET", "/api/v1/projects/{slug}/flow-runs"),
         ("GET", "/api/v1/projects/{slug}/sessions/active"),
         ("GET", "/api/v1/projects/{slug}/jobs/{job_id}/log"),
         ("GET", "/api/v1/sessions/active"),
