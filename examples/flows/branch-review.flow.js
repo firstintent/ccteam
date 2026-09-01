@@ -86,7 +86,9 @@ const reviewLeaf = (l) => async () => {
     vendor: l.fallback,
     label: `${l.label}:fallback`,
     schema: REVIEW_SCHEMA(l.verdicts),
-    retry: { max: 1 },
+    // v3 evidence: docs-vs-cli's codex fallback exhausted a single retry
+    // still outside the enum. One more shot before giving up honestly.
+    retry: { max: 2 },
   })
 }
 const reviews = await parallel(leaves.map(reviewLeaf))

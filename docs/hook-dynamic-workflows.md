@@ -140,6 +140,7 @@ Every call is journaled (`<run-dir>/journal.jsonl`, content-keyed; large results
 - **Structured output is extraction, not enforcement**: ccteam injects nothing into a worker, so `schema` means deterministic JSON extraction + validation + a bounded same-session retry; a worker that never complies yields `null`. (Claude Code can force a schema tool onto its own subagents; a cross-harness runner cannot.)
 - **The run lives in the CLI process today**: closing it stops *driving* — workers finish their current turns, and `--resume` picks the run back up. Daemon-managed background runs are a next phase.
 - Parallel file edits share the project working tree — give agents disjoint files, or have them create their own worktrees; per-hire isolation is not provided yet.
+- **Dogfood-testing a flow against a daemon that also serves real chats shares its gateway** — every hire, every progress event, every lock goes through the one process. Point `--home <dir>` (or `CCTEAM_HOME`) at an isolated ccteam home for exploratory or load-heavy runs, exactly like the checker-script discipline elsewhere in this project: a shared daemon is for the traffic it already carries, not a free load-test target.
 
 ## 3. Bridge mode — Claude-native workflows driving ccteam
 

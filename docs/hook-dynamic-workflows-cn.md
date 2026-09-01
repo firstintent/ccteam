@@ -140,6 +140,7 @@ ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <
 - **结构化输出是提取,不是强制**:ccteam 对 worker 零注入,所以 `schema` = 确定性 JSON 提取 + 校验 + 有界的同会话重试;始终不从命的 worker 得 `null`。(Claude Code 能对自家 subagent 强推 schema 工具;跨 harness 的 runner 做不到。)
 - **run 目前住在 CLI 进程里**:关掉它停止的是*驱动*——worker 跑完当前 turn,`--resume` 接着续。daemon 托管的后台 run 是下一阶段。
 - 并行改文件的雇佣共享同一工作树——给 agent 分派不相交的文件,或让它们自建 worktree;per-hire 隔离尚未提供。
+- **拿一个同时服务真实聊天的 daemon 跑 flow 自测,等于和那些聊天共用同一个 gateway**——每次雇佣、每个进度事件、每把锁都过同一个进程。探索性或高负载的跑法请用 `--home <dir>`(或 `CCTEAM_HOME`)指向隔离的 ccteam home——与本项目别处的 checker 脚本纪律同理:共享 daemon 是给它已经在扛的流量用的,不是免费压测靶子。
 
 ## 3. 桥接模式——Claude 原生工作流驱动 ccteam 队伍
 
