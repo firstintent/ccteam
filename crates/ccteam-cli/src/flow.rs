@@ -48,6 +48,16 @@ pub struct FlowRunRequest {
     pub run_dir: Option<PathBuf>,
     pub resume: Option<PathBuf>,
     pub watchdog: Option<u64>,
+    /// Managed session to attribute hires to; `None` falls back to
+    /// `$CCTEAM_CHAT_SID` (present inside every ccteam-managed session).
+    pub parent: Option<String>,
+}
+
+/// `--parent` beats the ambient `CCTEAM_CHAT_SID`; a blank env value counts
+/// as absent. Pure so the precedence is unit-testable without touching
+/// process env (the workspace forbids env writes in lib tests).
+fn resolve_parent(flag: Option<String>, env_sid: Option<String>) -> Option<String> {
+    flag.or(env_sid).filter(|sid| !sid.trim().is_empty())
 }
 
 /// Run one workflow to completion. Returns `Err` exactly when the report is
@@ -84,6 +94,10 @@ pub fn run(req: FlowRunRequest) -> Result<()> {
     cfg.args = args;
     cfg.resume = resuming;
     cfg.watchdog = req.watchdog.map(Duration::from_secs);
+    // A flow launched from inside a managed session hangs its leaves under
+    // that session in the delegation tree — the runner itself is only an
+    // enrolled client (the common case IS a managed session triggering runs).
+    cfg.parent_sid = resolve_parent(req.parent.clone(), std::env::var("CCTEAM_CHAT_SID").ok());
     if let Some(parallel) = req.parallel {
         cfg.scheduler.max_parallel = parallel.max(1);
     }
@@ -313,6 +327,21 @@ fn report_json(report: &RunReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parent_precedence_flag_env_blank() {
+        use super::resolve_parent;
+        assert_eq!(
+            resolve_parent(Some("s9".into()), Some("s487".into())),
+            Some("s9".into())
+        );
+        assert_eq!(
+            resolve_parent(None, Some("s487".into())),
+            Some("s487".into())
+        );
+        assert_eq!(resolve_parent(None, Some("  ".into())), None);
+        assert_eq!(resolve_parent(None, None), None);
+    }
+
     use super::*;
     use ccteam_flow::AgentOutcome;
 

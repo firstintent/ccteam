@@ -119,6 +119,7 @@ async fn hire_options_reach_the_client() {
         model,
         role,
         idempotency_key,
+        parent_sid,
     } = hire
     else {
         unreachable!("filtered to a hire above");
@@ -129,6 +130,7 @@ async fn hire_options_reach_the_client() {
     assert_eq!(role, Some("checker".to_string()));
     // The key itself is run-scoped and dynamic; its shape is the contract.
     assert!(idempotency_key.starts_with("flow-"), "{idempotency_key}");
+    assert_eq!(parent_sid, None, "no attribution unless configured");
 }
 
 #[tokio::test(start_paused = true)]
@@ -430,6 +432,24 @@ async fn the_agent_brake_refuses_new_work_while_in_flight_agents_finish() {
         3,
         "a tripped brake never cancels a running worker, it just stops new ones"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hires_carry_the_configured_parent_attribution() {
+    let h = Harness::new();
+    h.client.with_default_reply(FakeReply::text("ok"));
+    let cfg = h.config().with_parent("s487");
+    h.run_with("return await agent('go')", cfg).await;
+    let parents: Vec<Option<String>> = h
+        .client
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            crate::fake::FakeCall::Hire { parent_sid, .. } => Some(parent_sid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parents, vec![Some("s487".to_string())]);
 }
 
 #[tokio::test(start_paused = true)]

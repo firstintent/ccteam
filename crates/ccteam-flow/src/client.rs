@@ -35,6 +35,11 @@ pub struct HireSpec {
     pub role: Option<String>,
     /// Display label; also what shows up in progress events.
     pub label: Option<String>,
+    /// The managed session this run acts FOR. The runner itself is an
+    /// enrolled client; naming the triggering session here keeps the
+    /// delegation tree honest (docs/mcp.md: `parent_sid` preserves the edge
+    /// when ccteam does not manage the caller).
+    pub parent_sid: Option<String>,
     pub permission_mode: Option<String>,
     /// The journal key for this call. Handed to the client so a retried
     /// dispatch after a crash is deduplicated at the daemon (the `agent`

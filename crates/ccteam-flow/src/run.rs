@@ -81,6 +81,11 @@ pub struct RunConfig {
     pub control: RunControl,
     /// Hang guard for a script that never yields (see [`EngineInput`]).
     pub watchdog: Option<Duration>,
+    /// Managed session to attribute every hire to (`HireSpec.parent_sid`).
+    /// The CLI defaults it from `CCTEAM_CHAT_SID` so a flow launched inside a
+    /// managed session hangs its leaves under that session, not under the
+    /// anonymous enrolled runner node.
+    pub parent_sid: Option<String>,
 }
 
 impl RunConfig {
@@ -95,7 +100,14 @@ impl RunConfig {
             progress: None,
             control: RunControl::new(),
             watchdog: None,
+            parent_sid: None,
         }
+    }
+
+    /// Attribute this run's hires to a managed session (the delegation edge).
+    pub fn with_parent(mut self, sid: impl Into<String>) -> Self {
+        self.parent_sid = Some(sid.into());
+        self
     }
 
     pub fn with_args(mut self, args: Value) -> Self {
@@ -202,6 +214,7 @@ pub async fn run_workflow(script: ScriptSource, cfg: RunConfig) -> Result<RunRep
 
     let runner = Arc::new(Runner {
         client: Arc::clone(&cfg.client),
+        parent_sid: cfg.parent_sid.clone(),
         scheduler: Arc::clone(&scheduler),
         journal: Arc::clone(&journal),
         progress: cfg.progress.clone(),
@@ -281,6 +294,7 @@ fn emit(cb: &Option<ProgressCallback>, event: ProgressEvent) {
 
 struct Runner {
     client: Arc<dyn FlowClient>,
+    parent_sid: Option<String>,
     scheduler: Arc<Scheduler>,
     journal: Arc<Journal>,
     progress: Option<ProgressCallback>,
@@ -814,6 +828,7 @@ impl Runner {
             effort: opts.effort.clone(),
             role: opts.role.clone(),
             label: Some(ident.label.clone()),
+            parent_sid: self.parent_sid.clone(),
             permission_mode: opts.permission_mode.clone(),
             // Unique per CALL and stable across a crash-then-resume: run
             // token (minted per run, persisted) + call seq + content key.

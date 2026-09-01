@@ -41,7 +41,7 @@ The verdict is the exit code:
 | exit | meaning |
 |---|---|
 | `0` | allow — the call proceeds |
-| `2` | **deny** — your stderr (up to 2000 bytes, verbatim, whitespace and all) is returned to the calling agent as the refusal reason |
+| `2` | **deny** — your stderr (up to 2000 bytes, verbatim, whitespace and all) is relayed to the calling agent inside the refusal (prefixed `delegation denied by policy: `; an all-whitespace reason gets a stock sentence naming the script) |
 | anything else / timeout / not executable | **script fault** — the call is still refused (a guardrail that silently opens when its script breaks is not a guardrail), but as a distinct `policy_script_error` naming the script and the failure, so "your policy said no" and "your policy is broken" never read alike |
 
 Every denial lands in the project's progress ledger (`delegation_policy_denied`) and the daemon's denial counters — a policy that stops half your delegations is visible, never silent.
@@ -101,6 +101,16 @@ Flags: `--args <json>` (the script reads it as `args`) · `--parallel <n>` · `-
 
 Anywhere `ccteam flow run` can reach — the path is explicit. Convention: keep shared flows in **`.agents/flows/`** (the same family as `.agents/skills`), committed so the whole team runs the same orchestration. **Not `.ccteam/`** — ccteam gitignores that directory, so a script there silently falls out of version control (which is exactly why per-checkout *hooks* DO live there). Runnable samples: [`examples/flows/`](../examples/flows/).
 
+### Triggering a flow
+
+- **From a shell**: `ccteam flow run <script>` — synchronous; `--resume` continues a run.
+- **From the main session**: agents have shells — any session (whatever its harness) launches the same command, in the background if it likes, and reads the RunReport JSON when it lands. That IS the main-session trigger today; dedicated MCP `flow_*` tools are deliberately deferred until real usage proves the CLI insufficient — every byte of tool schema taxes every session's context.
+- **From Claude Code natively**: bridge mode (§3) — Claude's own workflow runtime, ccteam leaves.
+
+### Evaluate a run, then improve the script
+
+A finished run leaves everything an evaluation needs in its run directory: the persisted script and args, `journal.jsonl` (per-call content key, sid, cost, cached), `results/`, plus the RunReport you captured from stdout (nulls, the brake, the cache diagnostic). Deterministic metrics fall straight out of those files — null rate, spend per leaf, cache reuse; judgment comes from an agent you point at the directory. [`examples/flows/flow-review.flow.js`](../examples/flows/flow-review.flow.js) is that loop expressed as a flow: one leaf grades the run (task clarity, vendor fit, wasted spend), another proposes concrete script edits. Then edit and `--resume` — you re-pay only from the first changed call.
+
 ### The script surface
 
 | global | contract |
@@ -113,7 +123,7 @@ Anywhere `ccteam flow run` can reach — the path is explicit. Convention: keep 
 | `budget` | `{total, spent(), remaining()}` in USD — children costs, summed live |
 | `usage()` | the same per-harness quota map as `status{detail:"usage"}` — quota-aware vendor choice in three lines |
 
-`agent` opts: `vendor` (claude default) · `model` · `effort` · `role` · `sid` (follow up on an existing session — reuse a worker's context across steps) · `keep` (don't stop the worker after its result is consumed) · `label` · `phase` · `title` · `permission_mode` · `schema` + `retry:{max,prompt}`. An unknown option is a hard error, not a silent ignore.
+`agent` opts: `vendor` (claude default) · `model` · `effort` · `role` · `sid` (follow up on an existing session — reuse a worker's context across steps) · `keep` (don't stop the worker after its result is consumed) · `label` (also the ledger title) · `phase` · `permission_mode` · `schema` + `retry:{max,prompt}`. An unknown option is a hard error, not a silent ignore.
 
 **Brakes vs failures.** A worker failing resolves that call to `null`. A **brake** — `max_agents`, `max-cost`, wall clock, budget — refuses *new* admissions: a direct `await agent()` throws an error naming the brake, `parallel`/`pipeline` slots mask to `null`, `RunReport.brake` names it either way, and in-flight workers always finish — a brake never cancels running work.
 

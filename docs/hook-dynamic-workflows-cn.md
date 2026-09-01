@@ -41,7 +41,7 @@ hook 是任意可执行文件(shell、python、编译二进制都行)。运行�
 | exit | 含义 |
 |---|---|
 | `0` | 放行 |
-| `2` | **拒绝**——你的 stderr(至多 2000 字节,逐字节原样,连空白都保留)作为拒绝理由返回给发起调用的 agent |
+| `2` | **拒绝**——你的 stderr(至多 2000 字节,逐字节原样,连空白都保留)嵌在拒绝报文里回给发起调用的 agent(带 `delegation denied by policy: ` 前缀;全空白的理由会换成点名脚本的固定句) |
 | 其他 / 超时 / 不可执行 | **脚本故障**——调用同样被拒(坏了就悄悄放行的护栏不是护栏),但以独立的 `policy_script_error` 呈现并点名脚本与故障形态,「策略说不」与「策略坏了」永远长得不一样 |
 
 每次拒绝都进项目 progress 账本(`delegation_policy_denied`)与 daemon 拒绝计数——拦掉你一半委派的策略是看得见的,绝不静默。
@@ -101,6 +101,16 @@ ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <
 
 `ccteam flow run` 接显式路径,放哪都行。约定:共享 flow 放 **`.agents/flows/`**(与 `.agents/skills` 同族),提交进 git,全队跑同一份编排。**别放 `.ccteam/`**——ccteam 会把该目录幂等加进项目 `.gitignore`,脚本会静默丢出版本库(per-checkout 的 *hook* 住那里恰恰因为这一点)。可跑样例:[`examples/flows/`](../examples/flows/)。
 
+### 怎么触发
+
+- **shell 里**:`ccteam flow run <script>`——同步;`--resume` 续跑。
+- **主会话里**:agent 有 shell——任何会话(无论哪家 harness)跑同一条命令(愿意就放后台),落地后读 RunReport JSON。这**就是**今天的主会话触发;专门的 MCP `flow_*` 工具刻意后置——工具 schema 的每个字节都在向所有会话的上下文收税,等真实用法证明 CLI 不够再加。
+- **Claude Code 原生**:桥接模式(§3)——Claude 自家工作流运行时,ccteam 叶子。
+
+### 评估一次 run,然后改进脚本
+
+跑完的 run 把评估所需全部留在 run 目录:持久化的脚本与 args、`journal.jsonl`(逐调用内容键、sid、成本、是否缓存)、`results/`,加上你从 stdout 收的 RunReport(null、刹车、缓存诊断)。确定性指标直接从文件里出——null 率、每叶开销、缓存复用;判断则交给一个你指向该目录的 agent。[`examples/flows/flow-review.flow.js`](../examples/flows/flow-review.flow.js) 就是这条回路的 flow 表达:一叶给 run 打分(任务清晰度、vendor 匹配、浪费开销),另一叶提出具体脚本修改。改完 `--resume`——只从第一处变更起重新付费。
+
 ### 脚本面
 
 | global | 契约 |
@@ -113,7 +123,7 @@ ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <
 | `budget` | `{total, spent(), remaining()}`,美元计——children 成本实时求和 |
 | `usage()` | 与 `status{detail:"usage"}` 同一张额度图——三行代码实现额度感知选 vendor |
 
-`agent` opts:`vendor`(默认 claude)· `model` · `effort` · `role` · `sid`(向既有会话追派——跨步骤复用 worker 上下文)· `keep`(结果消费后不停掉 worker)· `label` · `phase` · `title` · `permission_mode` · `schema` + `retry:{max,prompt}`。未知选项是硬错误,不是静默忽略。
+`agent` opts:`vendor`(默认 claude)· `model` · `effort` · `role` · `sid`(向既有会话追派——跨步骤复用 worker 上下文)· `keep`(结果消费后不停掉 worker)· `label`(同时是账本标题)· `phase` · `permission_mode` · `schema` + `retry:{max,prompt}`。未知选项是硬错误,不是静默忽略。
 
 **刹车与失败的区别。** worker 失败 = 该调用 resolve `null`。**刹车**——`max_agents`、`max-cost`、墙钟、budget——拒的是*新*准入:直接 `await agent()` 会抛出点名刹车的错误,`parallel`/`pipeline` 槽位掩为 `null`,两种情况 `RunReport.brake` 都会点名;在飞的 worker 永远跑完——刹车从不取消进行中的工作。
 

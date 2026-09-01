@@ -607,6 +607,11 @@ impl FlowClient for McpFlowClient {
         args.insert("wait".into(), json!(0));
         args.insert("project".into(), json!(self.endpoint.project));
         args.insert("idempotency_key".into(), json!(spec.idempotency_key));
+        if let Some(parent) = &spec.parent_sid {
+            // The delegation edge back to the managed session that launched
+            // this run (the runner itself is only an enrolled client).
+            args.insert("parent_sid".into(), json!(parent));
+        }
         if let Some(vendor) = spec.vendor {
             args.insert("vendor".into(), json!(vendor.wire_name()));
         }

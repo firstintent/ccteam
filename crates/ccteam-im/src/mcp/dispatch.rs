@@ -2382,6 +2382,16 @@ async fn run_agent_read(
 /// 1. **Verified principal** (`Ambient`) — cryptographic, server-resolved. This
 ///    is how a hand-started client gets its edge now: it enrolls, the daemon
 ///    mints it a ledger node at `initialize`, and it calls as that node.
+///    An Ambient caller may additionally REFINE the edge with `parent_sid`,
+///    but only onto a live session in its OWN project (validated, loud on
+///    miss): the flow runner is an enrolled client acting FOR the managed
+///    session that launched it, and the tree should say so. Cross-project
+///    declarations are refused — a child's completion notification lands on
+///    its parent, so pointing the edge at someone else's session would be an
+///    injection channel, not attribution. The refusal is DELIBERATELY
+///    indistinguishable from an unknown sid (same wording, no foreign slug):
+///    sids are monotonic, so a distinguishing error would be an enumeration
+///    oracle for other projects' sessions.
 /// 2. **Declared and validated** (`Admin`) — the local mcp.sock admin-token
 ///    caller holds no per-session principal and carries no process context to
 ///    infer one from, so it may NAME its own sid. Same-uid is already this
@@ -2406,6 +2416,51 @@ async fn resolve_call_origin(
                 .to_string();
             if caller_sid.is_empty() {
                 return Ok(None);
+            }
+            let declared = args
+                .get("parent_sid")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != caller_sid);
+            if let Some(declared) = declared {
+                // Attribution within the caller's own project only (see the
+                // doc comment above): owner is a project attribute, so
+                // same-project IS same-owner, and the caller stamps no
+                // authority it does not already hold there.
+                let caller_slug = args
+                    .get("_caller_slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let Some(gateway) = gateway else {
+                    return Err(format!(
+                        "agent: parent_sid `{declared}` cannot be validated (no live gateway)"
+                    ));
+                };
+                let view = {
+                    let gw = match deadline {
+                        Some(deadline) => deadline
+                            .lock(gateway)
+                            .await
+                            .map_err(|error| mcp_gateway_error("agent", &error))?,
+                        None => crate::latency::gateway_lock(gateway, "mcp.spawn.resolve").await,
+                    };
+                    // Project scoping INSIDE the predicate: a foreign live
+                    // session and a nonexistent one must be the same miss,
+                    // or monotonic sids become an enumeration oracle.
+                    gw.session_views()
+                        .into_iter()
+                        .find(|v| v.sid == declared && v.project == caller_slug)
+                };
+                let Some(view) = view else {
+                    return Err(format!(
+                        "agent: parent_sid `{declared}` is not a live session in your project — run agent_read to find it, or omit parent_sid to attribute to yourself"
+                    ));
+                };
+                return Ok(Some(crate::gateway::DelegationParent {
+                    sid: view.sid,
+                    depth: view.delegation_depth,
+                    role: view.role,
+                }));
             }
             Ok(Some(crate::gateway::DelegationParent {
                 sid: caller_sid,
@@ -6091,6 +6146,101 @@ mod session_tool_tests {
 
         assert_eq!(meta.owner, "user:ualice");
         assert_eq!(meta.parent_sid.as_deref(), Some(alice_sid.as_str()));
+    }
+
+    /// An Ambient caller (the flow runner's shape: an enrolled node acting
+    /// FOR a managed session) may attribute its hire to a live session in
+    /// its own project — the tree mounts under the declared parent.
+    #[tokio::test]
+    async fn ambient_declared_parent_in_own_project_takes_the_edge() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let response = run_agent_spawn_at(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "vendor": "claude", "parent_sid": alice_sid }),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let first = body["sid"].as_str().unwrap().to_string();
+
+        // A sibling enrolled-style caller now declares the FIRST child as
+        // parent: the edge lands on the declared session, not the caller.
+        let response = run_agent_spawn_at(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "vendor": "claude", "parent_sid": first }),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let child_meta = ccteam_harness::execution::session_meta::read_session_meta(
+            &paths.projects_root.join("alice"),
+            body["sid"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(child_meta.parent_sid.as_deref(), Some(first.as_str()));
+    }
+
+    /// Unknown declared parent: loud error, never a silent fallback.
+    #[tokio::test]
+    async fn ambient_declared_parent_unknown_is_a_loud_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let err = run_agent_spawn_at(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "vendor": "claude", "parent_sid": "s404" }),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a live session in your project"), "{err}");
+    }
+
+    /// Cross-project attribution is refused with the SAME error an unknown
+    /// sid gets: a child's completion notification lands on its parent (an
+    /// injection channel), and a distinguishing refusal would let monotonic
+    /// sids enumerate other projects' sessions.
+    #[tokio::test]
+    async fn ambient_declared_parent_cross_project_is_an_indistinguishable_miss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let err = run_agent_spawn_at(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "vendor": "claude", "parent_sid": bob_sid }),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a live session in your project"), "{err}");
+        assert!(
+            !err.contains("bob"),
+            "must not name the foreign project: {err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

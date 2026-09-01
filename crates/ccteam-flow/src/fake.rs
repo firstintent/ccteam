@@ -72,6 +72,7 @@ pub enum FakeCall {
         model: Option<String>,
         role: Option<String>,
         idempotency_key: String,
+        parent_sid: Option<String>,
     },
     FollowUp {
         sid: String,
@@ -209,6 +210,7 @@ impl FlowClient for FakeClient {
             model: spec.model.clone(),
             role: spec.role.clone(),
             idempotency_key: spec.idempotency_key.clone(),
+            parent_sid: spec.parent_sid.clone(),
         });
         let reply = self.pick(&spec.task);
         if let Some(err) = reply.hire_error {

@@ -270,6 +270,10 @@ enum FlowCommand {
         /// Abort a script that never yields after this many seconds (default: off).
         #[arg(long, value_name = "SECS")]
         watchdog: Option<u64>,
+        /// Attribute hires to this managed session in the delegation tree
+        /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions).
+        #[arg(long, value_name = "SID")]
+        parent: Option<String>,
     },
 }
 
@@ -856,6 +860,7 @@ fn main() -> Result<()> {
                 run_dir,
                 resume,
                 watchdog,
+                parent,
             } => flow::run(flow::FlowRunRequest {
                 script,
                 project,
@@ -867,6 +872,7 @@ fn main() -> Result<()> {
                 run_dir,
                 resume,
                 watchdog,
+                parent,
             }),
         },
         Command::Config { args } => run_config(args),
