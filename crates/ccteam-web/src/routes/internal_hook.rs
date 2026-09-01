@@ -173,6 +173,18 @@ async fn dispatch(
     // envelope rows to another tenant's journal).
     if kind == "flow-run" {
         if let Some(slug) = stdin.get("project").and_then(|v| v.as_str()) {
+            // Shape BEFORE ownership: `can_see_project` resolves the slug
+            // into a filesystem path (`project_state(slug)`), so a
+            // traversal-shaped "slug" must be refused before it can probe
+            // paths outside the project namespace (s523 R2). Same check the
+            // hooks-lib writer runs — one validator, two gates, same order.
+            if ccteam_hooks::flow_run::ensure_ledger_slug(slug).is_err() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("project not found: {slug}")})),
+                )
+                    .into_response();
+            }
             let caller = identity
                 .cloned()
                 .unwrap_or_else(crate::auth::Identity::admin);

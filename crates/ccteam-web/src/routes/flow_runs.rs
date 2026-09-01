@@ -98,14 +98,17 @@ pub(crate) async fn handle_flow_runs(
     // A project that has never run a flow — or never run anything — has no
     // journal, and an unreadable one is an operational fault, not this
     // endpoint's to report. Both are the same honest answer: no runs.
-    let events = match ccteam_core::collect_recent_events(&app.paths, &slug, SCAN_LIMIT) {
-        Ok(events) => events,
-        Err(err) => {
-            tracing::warn!(%slug, error = %err, "flow-runs: read progress journal failed");
-            Vec::new()
-        }
-    };
-    let truncated = events.len() >= SCAN_LIMIT;
+    // `has_more` comes from the tail reader's one-extra-row probe, so a
+    // journal of EXACTLY `SCAN_LIMIT` rows is not falsely reported as
+    // truncated (s523 R2 — inferring from `len() >= limit` was).
+    let (events, truncated) =
+        match ccteam_core::collect_recent_events_with_more(&app.paths, &slug, SCAN_LIMIT) {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(%slug, error = %err, "flow-runs: read progress journal failed");
+                (Vec::new(), false)
+            }
+        };
     (
         StatusCode::OK,
         Json(FlowRuns {

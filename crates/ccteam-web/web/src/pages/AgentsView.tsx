@@ -557,22 +557,25 @@ export function FlowRunsPanel({
     .sort(
       (a, b) => (Date.parse(b.run.started_at) || 0) - (Date.parse(a.run.started_at) || 0),
     );
+  const truncated = groups.some((group) => group.truncated === true);
   if (rows.length === 0) {
-    // An outage is not an empty project: when every visible project's fetch
-    // failed this cycle, say the endpoint is unreachable instead of passing
-    // the failure off as "no runs" (checker s523 R1).
+    // An outage is not an empty project, and neither is a full scan window:
+    // every-fetch-failed says the endpoint is unreachable; a window that
+    // truncated away every run says the list is incomplete. Plain "no runs"
+    // is reserved for a genuinely empty answer (checker s523 R1+R2).
     const allErrored = groups.length > 0 && groups.every((group) => group.error === true);
+    const testid = allErrored
+      ? "flow-runs-unavailable"
+      : truncated
+        ? "flow-runs-truncated"
+        : "flow-runs-empty";
     return (
-      <p
-        style={{ color: "var(--text-faint)", fontSize: 13 }}
-        data-testid={allErrored ? "flow-runs-unavailable" : "flow-runs-empty"}
-      >
-        {allErrored ? t("flowRunsUnavailable") : t("flowRunsEmpty")}
+      <p style={{ color: "var(--text-faint)", fontSize: 13 }} data-testid={testid}>
+        {allErrored ? t("flowRunsUnavailable") : truncated ? t("flowRunsTruncated") : t("flowRunsEmpty")}
       </p>
     );
   }
   const showProject = new Set(rows.map((row) => row.slug)).size > 1;
-  const truncated = groups.some((group) => group.truncated === true);
   return (
     <>
     <div className="flow-rows" data-testid="flow-runs-rows">

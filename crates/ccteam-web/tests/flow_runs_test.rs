@@ -193,7 +193,9 @@ async fn a_tenant_cannot_write_another_owners_journal() {
 /// A bounded scan window is fine; a silently bounded one is not. When the
 /// journal holds more rows than one request scans, the answer SAYS so — and
 /// a run whose opening row scrolled out is missing WITH the flag up, never
-/// silently (checker s523 R1).
+/// silently (checker s523 R1). The flag is also EXACT: a journal of exactly
+/// the window size is complete coverage, not truncation (s523 R2 caught the
+/// `len() >= limit` false positive this pins down).
 #[tokio::test]
 async fn a_full_scan_window_is_reported_as_truncated() {
     let tmp = TempDir::new().unwrap();
@@ -205,27 +207,58 @@ async fn a_full_scan_window_is_reported_as_truncated() {
         json!({"project": "alpha", "run_id": "recent-1", "started_at": "2026-09-01T10:15:00Z"}),
     )
     .await;
-    // Flood the journal past the scan window with unrelated rows.
-    let mut filler = String::new();
-    for i in 0..5_000 {
-        filler.push_str(&format!(
+    // Fill the journal to EXACTLY the scan window (1 envelope + 4999 filler).
+    let filler_row = |i: usize| {
+        format!(
             "{}\n",
             json!({"ts": "2026-09-01T11:00:00Z", "event": "chat_tool_call_started", "n": i})
-        ));
-    }
+        )
+    };
+    let filler: String = (0..4_999).map(filler_row).collect();
     use std::io::Write as _;
-    std::fs::OpenOptions::new()
+    let mut journal = std::fs::OpenOptions::new()
         .append(true)
         .open(paths.progress_jsonl("alpha"))
-        .unwrap()
-        .write_all(filler.as_bytes())
         .unwrap();
+    journal.write_all(filler.as_bytes()).unwrap();
 
+    // Exactly at the window: full coverage, honestly untruncated, run listed.
+    let body = flow_runs(addr, "alpha").await;
+    assert_eq!(body["truncated"], false, "{body}");
+    assert_eq!(body["runs"].as_array().unwrap().len(), 1, "{body}");
+
+    // One row past the window: the started row scrolls out, the run vanishes
+    // from the list — and the raised flag is what keeps that absence honest.
+    journal.write_all(filler_row(4_999).as_bytes()).unwrap();
     let body = flow_runs(addr, "alpha").await;
     assert_eq!(body["truncated"], true, "{body}");
-    // The started row scrolled out, so the run is absent from the list — the
-    // raised flag is what keeps that absence honest.
     assert_eq!(body["runs"].as_array().unwrap().len(), 0, "{body}");
+}
+
+/// A traversal-shaped "slug" is refused on SHAPE, before `can_see_project`
+/// can resolve it into a filesystem path (s523 R2): the ordering is the fix;
+/// this test locks the refusal itself (non-disclosing 404, journal-free).
+#[tokio::test]
+async fn a_traversal_shaped_slug_is_refused_before_path_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, addr) = serving(&tmp).await;
+
+    for bad in ["../alpha", "a/b", "a\\b", ".."] {
+        let response = client()
+            .post(format!("http://{addr}/internal/hook/flow-run/started"))
+            .header("Authorization", format!("Bearer ccteam:{ADMIN_HEX}"))
+            .json(&json!({
+                "project": bad,
+                "run_id": "probe-1",
+                "started_at": "2026-09-01T10:15:00Z",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 404, "slug {bad:?} must 404");
+    }
+    // Nothing was filed anywhere — the seeded project's journal included.
+    assert!(!paths.progress_jsonl("alpha").exists());
 }
 
 #[tokio::test]

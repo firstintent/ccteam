@@ -99,7 +99,11 @@ fn optional_str<'a>(stdin: &'a Value, field: &str) -> &'a str {
 /// daemon minted and is REFUSED rather than sanitized — quietly rewriting a
 /// caller's project name would file a run under the wrong workspace, which is
 /// worse than a visible error on an observability path.
-fn ensure_ledger_slug(slug: &str) -> Result<()> {
+///
+/// `pub` because the web route's ACL gate must run the SAME shape check
+/// BEFORE `can_see_project` resolves the slug into a filesystem path — a
+/// traversal-shaped "slug" must never reach path resolution at all (s523 R2).
+pub fn ensure_ledger_slug(slug: &str) -> Result<()> {
     let shaped = slug.len() <= 64
         && !slug.contains("..")
         && slug

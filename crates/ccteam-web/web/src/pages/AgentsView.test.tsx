@@ -701,6 +701,22 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
     expect(html).toContain('data-testid="flow-runs-truncated"');
   });
 
+  it("a truncated window with zero surviving runs reads 'incomplete', not 'no runs'", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [], truncated: true }]}
+          nodes={noNodes}
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-truncated"');
+    expect(html).not.toContain('data-testid="flow-runs-empty"');
+  });
+
   it("zero runs renders the honest empty state, bilingually", () => {
     const zh = renderToString(
       <MemoryRouter>
