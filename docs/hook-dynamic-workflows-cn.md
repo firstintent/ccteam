@@ -1,8 +1,16 @@
-# 策略 hook 与动态工作流
+# 策略 hook 与 Flow
 
 > English: [hook-dynamic-workflows.md](hook-dynamic-workflows.md) · 工具参考: [mcp-cn.md](mcp-cn.md) · 委派指南: [orchestration-cn.md](orchestration-cn.md)
 
-把确定性代码放到 agent 团队周围的两种方式:**pre-agent 策略 hook** 用你写的脚本给每一次委派把关;**动态工作流**用你写的脚本驱动大量雇佣。hook 约束 agent 做的选择;工作流自己做选择。二者可组合:工作流的每次雇佣同样要过 hook。
+把确定性代码放到 agent 团队周围的三种方式——三者可组合,因为任何模式下的每次雇佣都要过策略 hook:
+
+| 模式 | 是什么 | 什么时候用 |
+|---|---|---|
+| **1. 策略 hook** | 给每一次委派把关的脚本 | 约束:额度、vendor 白名单、内置护栏之外的项目规则 |
+| **2. ccteam Flow** | ccteam runner 执行的确定性 JS 脚本,驱动真实的跨 harness 雇佣 | 可重复、可恢复、headless、大规模的编排 |
+| **3. Claude 原生桥接** | Claude Code 自家动态工作流经 MCP 雇 ccteam agent | 你住在 Claude Code 里,想要它的工作流 UI + 跨 harness 叶子 |
+
+hook 约束 agent 做的选择;Flow 自己做选择;桥接借 Claude 的运行时做同一件事。
 
 ## 1. pre-agent 策略 hook
 
@@ -62,9 +70,11 @@ exit 0
 - 同一 OS 用户下一切都是软隔离:在项目里干活的 agent 改得了本项目的 hook。这是项目自治,不是安全边界。
 - 绑在卫星主机上的项目,其 `.ccteam/` 在那台机器上,daemon 读不到——远程项目的委派由**全局** hook 把关。
 
-## 2. 动态工作流
+## 2. ccteam Flow(流程脚本)
 
-工作流是一个 JavaScript 文件:脚本确定性地驱动大量雇佣——计划住在代码里,模型只做叶子。脚本里的每个 `agent()` 都是一次普通的 ccteam 委派:任意 harness、账本上真实的 sid、同样的深度/预算护栏、同样要过你的 pre-agent 策略 hook。
+> 原名「动态工作流」,为与 Claude Code 原生同名特性区隔而更名 **Flow**——CLI 本来就是 `ccteam flow`。
+
+**Flow** 是一个 JavaScript 文件:脚本确定性地驱动大量雇佣——计划住在代码里,模型只做叶子。脚本里的每个 `agent()` 都是一次普通的 ccteam 委派:任意 harness、账本上真实的 sid、同样的深度/预算护栏、同样要过你的 pre-agent 策略 hook。
 
 ### 快速上手
 
@@ -86,6 +96,10 @@ ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <
 进度逐行流向 stderr;stdout 是最终 **RunReport** JSON——脚本返回值、每 agent 记录(sid、成本、是否缓存)、总计与缓存诊断。干净跑完 exit 0。
 
 参数:`--args <json>`(脚本里读 `args`)· `--parallel <n>` · `--max-agents <n>` · `--max-cost <usd>` · `--budget <usd>` · `--run-dir <dir>` · `--resume <run-dir>` · `--watchdog <secs>`。
+
+### 脚本住哪
+
+`ccteam flow run` 接显式路径,放哪都行。约定:共享 flow 放 **`.agents/flows/`**(与 `.agents/skills` 同族),提交进 git,全队跑同一份编排。**别放 `.ccteam/`**——ccteam 会把该目录幂等加进项目 `.gitignore`,脚本会静默丢出版本库(per-checkout 的 *hook* 住那里恰恰因为这一点)。可跑样例:[`examples/flows/`](../examples/flows/)。
 
 ### 脚本面
 
@@ -116,3 +130,35 @@ ccteam flow run flow.js            # 在已 init 的项目里(否则 --project <
 - **结构化输出是提取,不是强制**:ccteam 对 worker 零注入,所以 `schema` = 确定性 JSON 提取 + 校验 + 有界的同会话重试;始终不从命的 worker 得 `null`。(Claude Code 能对自家 subagent 强推 schema 工具;跨 harness 的 runner 做不到。)
 - **run 目前住在 CLI 进程里**:关掉它停止的是*驱动*——worker 跑完当前 turn,`--resume` 接着续。daemon 托管的后台 run 是下一阶段。
 - 并行改文件的雇佣共享同一工作树——给 agent 分派不相交的文件,或让它们自建 worktree;per-hire 隔离尚未提供。
+
+## 3. 桥接模式——Claude 原生工作流驱动 ccteam 队伍
+
+如果 Claude Code 是你的主会话入口,它的**原生动态工作流**今天就能编排 ccteam agent:原生工作流里的每个 `agent()` 是一个 claude subagent,让它用 ToolSearch 装载 ccteam MCP 工具、雇一个真实会话。你白得 Claude Code 的 `/workflows` 进度视图与暂停/恢复——而叶子跑在 codex/kimi/grok 上、上账本、照过你的策略 hook。
+
+```js
+// .claude/workflows/ccteam-team-review.js —— 以 /ccteam-team-review 运行
+export const meta = { name: 'ccteam-team-review', description: 'Cross-harness review via ccteam' }
+
+const files = await agent('Run `git diff --name-only dev...HEAD`; one path per line, nothing else.')
+const reviews = await pipeline(
+  files.trim().split('\n').filter(Boolean),
+  (f) => agent(
+    'Load the ccteam tools with ToolSearch (select:mcp__ccteam__agent,mcp__ccteam__agent_read). ' +
+    `Hire codex: mcp__ccteam__agent{task:"Review ${'$'}{f} for correctness bugs. VERDICT first line.", vendor:"codex", wait:240}; ` +
+    'poll mcp__ccteam__agent_read{sid, wait:240} if pending. Return ONLY the worker\'s final text.',
+    { label: f },
+  ),
+)
+return await agent(`Merge into one ranked list:\n${'$'}{JSON.stringify(reviews.filter(Boolean))}`)
+```
+
+完整版见 [`examples/claude-native/`](../examples/claude-native/)。与 ccteam Flow 的诚实对照:
+
+| | ccteam Flow | Claude 原生桥接 |
+|---|---|---|
+| 胶水成本 | 零——runner 直接调 MCP 面 | 每叶一个 claude subagent 做 MCP 转发 |
+| 存活性 | 越过 CLI 进程——`--resume` 重挂;worker 是 daemon 会话 | 绑死 Claude Code 会话;退出即从头 |
+| 编排者 | 任意 harness、headless、cron | 只能是 claude 会话 |
+| 进度 | stderr 逐行 + RunReport JSON | `/workflows` 树、暂停/恢复按键 |
+
+坐在 Claude Code 里、工作流 UI 值回票价 → 用桥接;run 要活得比你久、要 headless、要驱动几百个叶子 → 用 Flow。

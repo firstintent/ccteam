@@ -1,8 +1,16 @@
-# Policy hooks & dynamic workflows
+# Policy hooks & flows
 
 > 中文版: [hook-dynamic-workflows-cn.md](hook-dynamic-workflows-cn.md) · Tool reference: [mcp.md](mcp.md) · Delegation guide: [orchestration.md](orchestration.md)
 
-Two ways to put deterministic code around your agent team: a **pre-agent policy hook** gates every delegation with a script you write, and **dynamic workflows** drive many hires from a script you write. The hook constrains choices an agent makes; a workflow makes the choices itself. They compose: workflow hires pass through the same hook.
+Three ways to put deterministic code around your agent team — and they compose, because every hire in every mode still passes the policy hook:
+
+| mode | what it is | reach for it when |
+|---|---|---|
+| **1. Policy hook** | a script that gates every delegation | constraints: quotas, vendor allowlists, project rules beyond the built-in guardrails |
+| **2. ccteam Flow** | a deterministic JS script the ccteam runner executes, driving real cross-harness hires | orchestration that must be repeatable, resumable, headless, or huge |
+| **3. Claude-native bridge** | Claude Code's own dynamic workflows hiring ccteam agents over MCP | you live in Claude Code and want its workflow UI with cross-harness leaves |
+
+The hook constrains choices an agent makes; a Flow makes the choices itself; the bridge borrows Claude's runtime to do the same.
 
 ## 1. The pre-agent policy hook
 
@@ -62,9 +70,11 @@ The denied agent gets that sentence as the tool error and decides again — the 
 - Everything under one OS user is soft isolation: an agent working in the project can edit the project's own hook. That is project self-governance, not a security boundary.
 - A project bound to a satellite host keeps its `.ccteam/` on that machine, where the daemon cannot read it — the **global** hook governs remote projects' delegations.
 
-## 2. Dynamic workflows
+## 2. ccteam Flow — deterministic orchestration
 
-A workflow is a JavaScript file whose script drives many hires deterministically — the plan lives in code, models only do the leaves. Every `agent()` inside it is an ordinary ccteam delegation: any harness, a real sid on the ledger, the same depth and budget guardrails, and your pre-agent policy hook.
+> Formerly "dynamic workflows"; renamed **Flow** so it never collides with Claude Code's native feature of that name — the CLI was already `ccteam flow`.
+
+A **flow** is a JavaScript file whose script drives many hires deterministically — the plan lives in code, models only do the leaves. Every `agent()` inside it is an ordinary ccteam delegation: any harness, a real sid on the ledger, the same depth and budget guardrails, and your pre-agent policy hook.
 
 ### Quick start
 
@@ -86,6 +96,10 @@ ccteam flow run flow.js            # inside an initialized project (--project <s
 Progress streams on stderr, one line per event; stdout is the final **RunReport** JSON — the script's returned value, per-agent records (sid, cost, cached), totals, and cache diagnostics. Exit 0 on a clean run.
 
 Flags: `--args <json>` (the script reads it as `args`) · `--parallel <n>` · `--max-agents <n>` · `--max-cost <usd>` · `--budget <usd>` · `--run-dir <dir>` · `--resume <run-dir>` · `--watchdog <secs>`.
+
+### Where flow scripts live
+
+Anywhere `ccteam flow run` can reach — the path is explicit. Convention: keep shared flows in **`.agents/flows/`** (the same family as `.agents/skills`), committed so the whole team runs the same orchestration. **Not `.ccteam/`** — ccteam gitignores that directory, so a script there silently falls out of version control (which is exactly why per-checkout *hooks* DO live there). Runnable samples: [`examples/flows/`](../examples/flows/).
 
 ### The script surface
 
@@ -116,3 +130,35 @@ Every call is journaled (`<run-dir>/journal.jsonl`, content-keyed; large results
 - **Structured output is extraction, not enforcement**: ccteam injects nothing into a worker, so `schema` means deterministic JSON extraction + validation + a bounded same-session retry; a worker that never complies yields `null`. (Claude Code can force a schema tool onto its own subagents; a cross-harness runner cannot.)
 - **The run lives in the CLI process today**: closing it stops *driving* — workers finish their current turns, and `--resume` picks the run back up. Daemon-managed background runs are a next phase.
 - Parallel file edits share the project working tree — give agents disjoint files, or have them create their own worktrees; per-hire isolation is not provided yet.
+
+## 3. Bridge mode — Claude-native workflows driving ccteam
+
+If Claude Code is your main-session entry, its **native dynamic workflows** can orchestrate ccteam agents today: each `agent()` in a native workflow is a Claude subagent, and that subagent loads the ccteam MCP tools (ToolSearch) and hires a real session. You get Claude Code's `/workflows` progress view, pause and resume — while the leaves run on codex/kimi/grok, on the ledger, through your policy hook.
+
+```js
+// .claude/workflows/ccteam-team-review.js — run as /ccteam-team-review
+export const meta = { name: 'ccteam-team-review', description: 'Cross-harness review via ccteam' }
+
+const files = await agent('Run `git diff --name-only dev...HEAD`; one path per line, nothing else.')
+const reviews = await pipeline(
+  files.trim().split('\n').filter(Boolean),
+  (f) => agent(
+    'Load the ccteam tools with ToolSearch (select:mcp__ccteam__agent,mcp__ccteam__agent_read). ' +
+    `Hire codex: mcp__ccteam__agent{task:"Review ${'$'}{f} for correctness bugs. VERDICT first line.", vendor:"codex", wait:240}; ` +
+    'poll mcp__ccteam__agent_read{sid, wait:240} if pending. Return ONLY the worker\'s final text.',
+    { label: f },
+  ),
+)
+return await agent(`Merge into one ranked list:\n${'$'}{JSON.stringify(reviews.filter(Boolean))}`)
+```
+
+Full version: [`examples/claude-native/`](../examples/claude-native/). The honest trade against a ccteam Flow:
+
+| | ccteam Flow | Claude-native bridge |
+|---|---|---|
+| glue cost | none — the runner calls the MCP face directly | one Claude subagent per leaf, forwarding over MCP |
+| survives | the CLI process — `--resume` re-attaches; workers are daemon sessions | the Claude Code session; exiting restarts the run from scratch |
+| planner | any harness, headless, cron | a Claude session only |
+| progress | stderr lines + RunReport JSON | the `/workflows` tree, pause/resume keys |
+
+Use the bridge when you are sitting in Claude Code and the workflow UI earns its keep; use a Flow when the run must outlive you, run headless, or drive hundreds of leaves.
