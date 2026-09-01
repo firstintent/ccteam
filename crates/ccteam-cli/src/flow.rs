@@ -1,4 +1,7 @@
-//! `ccteam flow run <file.js>` — drive one dynamic workflow.
+//! `ccteam flow` — author (`new`), drive (`run`) and judge (`eval`) one
+//! dynamic workflow. `new` and `eval` are both sugar over `run`: one writes a
+//! scaffold and prints the script surface, the other resolves which script
+//! evaluates a finished run and then *is* an ordinary run.
 //!
 //! The runner itself lives in `ccteam-flow` and knows nothing about `$HOME`,
 //! terminals or credentials. This module supplies the three things it cannot
@@ -35,6 +38,30 @@ use serde_json::{json, Value};
 /// Registered in `ccteam_core::canonical_home_dirs()` so `ccteam doctor`'s
 /// home-drift check does not report it as an orchestrator-era leftover.
 const RUNS_DIR: &str = "runs";
+
+/// `<ccteam home>/flows` — the machine-wide rung of evaluator lookup. Also
+/// registered in `ccteam_core::canonical_home_dirs()`, same reason as `runs`.
+const FLOWS_DIR: &str = "flows";
+
+/// The evaluator `ccteam flow eval` resolves to when it is not given one, on
+/// both rungs. Leading underscore so it sorts above a project's real flows and
+/// reads as machinery rather than as one more workflow to run.
+const EVAL_SCRIPT_FILE: &str = "_eval.flow.js";
+
+/// A project's committed flow scripts: `.agents/flows/`, the sibling of
+/// `.agents/skills`. Deliberately NOT `.ccteam/` — ccteam adds that directory
+/// to the project's `.gitignore`, so a script there falls silently out of
+/// version control (which is exactly why per-checkout *hooks* do live there).
+fn project_flows_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".agents").join("flows")
+}
+
+/// A directory is a workflow run exactly when it holds a journal. One
+/// predicate for both verbs, so `flow eval <dir>` and `flow run --resume <dir>`
+/// can never disagree about what a run directory is.
+fn is_run_dir(dir: &Path) -> bool {
+    dir.join("journal.jsonl").is_file()
+}
 
 /// Everything `ccteam flow run` was asked for, already parsed by clap.
 pub struct FlowRunRequest {
@@ -132,6 +159,233 @@ pub fn run(req: FlowRunRequest) -> Result<()> {
     ))
 }
 
+/// Everything `ccteam flow new` was asked for.
+pub struct FlowNewRequest {
+    pub name: String,
+    /// Explicit destination; `None` picks the project's `.agents/flows/`.
+    pub dir: Option<PathBuf>,
+}
+
+/// Scaffold one flow script, then print the script surface to stdout.
+///
+/// The printing is the point, not a courtesy. Claude Code can afford to bake
+/// its authoring manual into a tool's JSON-schema `description` — it rides
+/// into every session for free. ccteam cannot: injecting anything into a
+/// session is the standing no-prompt-injection red line, and MCP tool schemas
+/// tax every session's context whether or not that session writes flows. So
+/// the manual is *earned* instead — an agent that runs `flow new` asked for
+/// it, and gets it on stdout where its shell already looks.
+pub fn new_script(req: FlowNewRequest) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let slug = ccteam_core::slugify(&req.name);
+    let dir = match req.dir {
+        Some(dir) => dir,
+        None => default_new_dir(&paths)?,
+    };
+    let file = write_scaffold(&dir, &slug)?;
+
+    println!("created {}", file.display());
+    println!();
+    print!("{CHEAT_SHEET}");
+    println!();
+    println!("edit it, then: ccteam flow run {}", file.display());
+    Ok(())
+}
+
+/// Materialize `<dir>/<slug>.flow.js`, refusing to clobber. The whole value of
+/// a scaffold is that it is safe to reach for, and a scaffold that can eat a
+/// written flow is not — so an existing file is an error, never an overwrite.
+fn write_scaffold(dir: &Path, slug: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create flow directory {}", dir.display()))?;
+    let file = dir.join(format!("{slug}.flow.js"));
+    if file.exists() {
+        return Err(anyhow!(
+            "{} already exists — pick another name, or pass `--dir`",
+            file.display()
+        ));
+    }
+    std::fs::write(&file, script_template(slug))
+        .with_context(|| format!("write {}", file.display()))?;
+    Ok(file)
+}
+
+/// `--dir` beats everything. Otherwise a flow belongs with the project that
+/// runs it, and a cwd outside any project just gets the cwd — ccteam never
+/// invents a workspace for a path (same rule [`project_from_cwd`] follows,
+/// minus the hard failure: scaffolding a file needs no daemon identity).
+fn default_new_dir(paths: &CcteamPaths) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolve current directory")?;
+    match ccteam_core::session_context_from_cwd(&cwd, paths) {
+        Ok(context) => Ok(project_flows_dir(&context.project_dir)),
+        Err(_) => Ok(cwd),
+    }
+}
+
+/// The scaffold is CODE, not content: a `meta` block and one TODO call. It
+/// carries no persona, no task wording and no house style — those are the
+/// author's, and prompt-shaped content does not ship in this repo.
+fn script_template(slug: &str) -> String {
+    format!(
+        r#"export const meta = {{ name: '{slug}', description: 'TODO: one line' }}
+
+// Replace with your orchestration. Available globals: agent(task, opts?),
+// parallel([...thunks]), pipeline(items, ...stages), phase(title), log(msg),
+// args, budget, usage(). Full reference: docs/hook-dynamic-workflows.md
+const result = await agent('TODO: first task')
+return result
+"#
+    )
+}
+
+/// The script surface, verbatim from `docs/hook-dynamic-workflows.md` — short
+/// enough to read in a terminal, complete enough to write a correct flow from
+/// without opening anything else.
+const CHEAT_SHEET: &str = "\
+Script globals
+  agent(task, opts?)      the worker's final text; the validated object when
+                          opts.schema matched; null on ANY worker-side failure
+                          (vendor error, guardrail or policy refusal)
+  parallel([...thunks])   barrier; a failed slot is null, the call never rejects
+  pipeline(items, ...st)  no barrier between stages — item A can be in stage 3
+                          while B is in stage 1; a stage throw nulls that item
+                          and skips its remaining stages
+  phase(title) / log(m)   progress structure and narration
+  args                    the --args value, verbatim
+  budget                  {total, spent(), remaining()} in USD, summed live
+  usage()                 per-harness quota map, as status{detail:\"usage\"}
+
+agent opts
+  vendor (claude default) · model · effort · role · sid (follow up on an
+  existing session) · keep (don't stop the worker) · label (also the ledger
+  title) · phase · permission_mode · schema + retry:{max,prompt}.
+  An unknown option is a hard error, not a silent ignore.
+
+Brakes vs failures
+  A worker failing resolves that call to null. A brake (max_agents, max-cost,
+  wall clock, budget) refuses NEW admissions instead: a direct `await agent()`
+  throws an error naming the brake, parallel/pipeline slots mask to null,
+  RunReport.brake names it either way, and in-flight workers always finish.
+
+Determinism
+  No filesystem, network or process access; Date.now(), Math.random() and
+  argless new Date() throw — pass time and randomness in through --args.
+  That discipline is what makes --resume exact.
+";
+
+/// Everything `ccteam flow eval` was asked for.
+pub struct FlowEvalRequest {
+    /// A run directory, or the bare id of one under `<ccteam home>/runs/`.
+    pub run: String,
+    pub script: Option<PathBuf>,
+    pub project: Option<String>,
+    pub max_cost: Option<f64>,
+    pub parent: Option<String>,
+}
+
+/// Evaluate a finished run with a flow of your own.
+///
+/// This is sugar, and stays sugar: it resolves *which* script judges the run,
+/// then hands the job to [`run`] unchanged. An evaluation IS a flow run — it
+/// gets its own run directory, journal, resume and report for free, and there
+/// is exactly one runner to keep honest. The engine still judges nothing
+/// itself; the verdict comes from agents inside a script the user wrote.
+pub fn eval(req: FlowEvalRequest) -> Result<()> {
+    let paths = CcteamPaths::from_env()?;
+    let target = resolve_eval_target(&paths, &req.run)?;
+    let script = match req.script {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(anyhow!("no evaluator script at {}", path.display()));
+            }
+            path
+        }
+        None => resolve_evaluator(&paths, project_dir_for(&paths, req.project.as_deref()))?,
+    };
+    run(FlowRunRequest {
+        script,
+        project: req.project,
+        args: Some(json!({ "run_dir": target.display().to_string() }).to_string()),
+        parallel: None,
+        max_agents: None,
+        max_cost: req.max_cost,
+        budget: None,
+        run_dir: None,
+        resume: None,
+        watchdog: None,
+        parent: req.parent,
+    })
+}
+
+/// Which evaluator governs this call — the same two-rung shape the pre-agent
+/// policy hook uses (`ccteam_im::policy::resolve_hook`: the project's file
+/// first, the ccteam home second, the file itself IS the registration, a stat
+/// per rung with no caching). A project that states an evaluator states all of
+/// it: the project file *replaces* the global one, never merges with it.
+fn resolve_evaluator(paths: &CcteamPaths, project_dir: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(dir) = project_dir {
+        let project_rung = project_flows_dir(&dir).join(EVAL_SCRIPT_FILE);
+        if project_rung.is_file() {
+            return Ok(project_rung);
+        }
+    }
+    let global_rung = paths.root.join(FLOWS_DIR).join(EVAL_SCRIPT_FILE);
+    if global_rung.is_file() {
+        return Ok(global_rung);
+    }
+    Err(anyhow!(
+        "no evaluator script — copy examples/flows/flow-review.flow.js to \
+         `.agents/flows/{EVAL_SCRIPT_FILE}` (or `{}`) and adjust, \
+         then rerun `ccteam flow eval`",
+        global_rung.display()
+    ))
+}
+
+/// The project whose `.agents/flows/` is the first rung: the named slug, else
+/// whichever project the cwd sits in. `None` when neither answers — the global
+/// rung then has to carry the call, exactly as it does for remote projects
+/// whose `.ccteam/` lives on another machine.
+fn project_dir_for(paths: &CcteamPaths, slug: Option<&str>) -> Option<PathBuf> {
+    if let Some(slug) = slug {
+        return Some(paths.project_dir(slug));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    ccteam_core::session_context_from_cwd(&cwd, paths)
+        .ok()
+        .map(|context| context.project_dir)
+}
+
+/// The run under review: a path when it looks like one, a bare run id
+/// otherwise. The id is what `flow run` already named the directory under
+/// `<ccteam home>/runs/`, and retyping the whole path to review the run you
+/// just made is pure friction. Always resolved to an absolute path — the
+/// evaluating agent reads it from its own cwd, not from this shell's.
+fn resolve_eval_target(paths: &CcteamPaths, run: &str) -> Result<PathBuf> {
+    let as_given = PathBuf::from(run);
+    if is_run_dir(&as_given) {
+        return std::fs::canonicalize(&as_given)
+            .with_context(|| format!("resolve run directory {}", as_given.display()));
+    }
+    // A bare id has no separators; joining anything else onto `runs/` would
+    // only produce a second, more confusing path in the error below.
+    let bare = !run.is_empty() && !run.contains('/') && !run.contains('\\');
+    if bare {
+        let under_runs = paths.root.join(RUNS_DIR).join(run);
+        if is_run_dir(&under_runs) {
+            return Ok(under_runs);
+        }
+        return Err(anyhow!(
+            "no workflow run at {} or {} (a run directory is one that holds journal.jsonl)",
+            as_given.display(),
+            under_runs.display()
+        ));
+    }
+    Err(anyhow!(
+        "{} is not a workflow run directory (no journal.jsonl)",
+        as_given.display()
+    ))
+}
+
 /// The workspace the cwd belongs to, read from the `.ccteam/state.json` that
 /// `ccteam init` wrote. Never guessed from the path itself.
 fn project_from_cwd(paths: &CcteamPaths) -> Result<String> {
@@ -156,7 +410,7 @@ fn resolve_run_dir(
     resume: Option<PathBuf>,
 ) -> Result<(PathBuf, bool)> {
     if let Some(dir) = resume {
-        if !dir.join("journal.jsonl").is_file() {
+        if !is_run_dir(&dir) {
             return Err(anyhow!(
                 "{} is not a workflow run directory (no journal.jsonl)",
                 dir.display()
@@ -170,7 +424,7 @@ fn resolve_run_dir(
         // An explicit --run-dir that already holds a journal is a continuation
         // by intent: re-running the same directory must not silently re-hire
         // everything the journal already paid for.
-        let resuming = dir.join("journal.jsonl").is_file();
+        let resuming = is_run_dir(&dir);
         return Ok((dir, resuming));
     }
     let root = paths.root.join(RUNS_DIR);
@@ -461,5 +715,160 @@ mod tests {
     fn a_stem_with_shell_metacharacters_cannot_escape_the_runs_dir() {
         assert_eq!(sanitize_stem("../../etc/passwd"), "etc-passwd");
         assert_eq!(sanitize_stem("re view;rm -rf"), "re-view-rm--rf");
+    }
+
+    /// The user-global evaluator rung has to be part of the home manifest or
+    /// `ccteam doctor` reports it as an orchestrator-era leftover to delete.
+    #[test]
+    fn the_flows_home_is_canonical() {
+        assert!(
+            ccteam_core::canonical_home_dirs().contains(&FLOWS_DIR),
+            "the flows home must be canonical or `ccteam doctor` reports drift",
+        );
+    }
+
+    #[test]
+    fn the_scaffold_names_the_flow_and_never_clobbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".agents").join("flows");
+        let file = write_scaffold(&dir, "audit-routes").unwrap();
+        assert_eq!(file.file_name().unwrap(), "audit-routes.flow.js");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("name: 'audit-routes'"), "{body}");
+        assert!(body.contains("await agent("), "{body}");
+
+        std::fs::write(&file, "// mine, hand-written").unwrap();
+        let err = write_scaffold(&dir, "audit-routes").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "// mine, hand-written",
+            "a refused scaffold must not have touched the file",
+        );
+    }
+
+    /// The scaffold is code, not content: `meta` plus a TODO. If a persona or
+    /// a task prompt ever creeps in, this repo's zero-prompt-content rule is
+    /// broken — and the template is the one place it could creep in unnoticed.
+    #[test]
+    fn the_scaffold_carries_no_prompt_content() {
+        let body = script_template("x");
+        assert!(body.contains("TODO"), "{body}");
+        for line in body.lines() {
+            assert!(line.len() < 90, "template line too long to be code: {line}");
+        }
+        assert_eq!(
+            body.matches("await agent(").count(),
+            1,
+            "one placeholder call, not a worked example: {body}"
+        );
+    }
+
+    /// The cheat sheet IS the authoring manual — an agent that ran `flow new`
+    /// should not have to open the docs to write a correct first flow.
+    #[test]
+    fn the_cheat_sheet_covers_the_whole_script_surface() {
+        for global in [
+            "agent(task, opts?)",
+            "parallel(",
+            "pipeline(",
+            "phase(title)",
+            "log(m)",
+            "args",
+            "budget",
+            "usage()",
+        ] {
+            assert!(CHEAT_SHEET.contains(global), "cheat sheet lost {global}");
+        }
+        // The two distinctions a first-time author gets wrong.
+        assert!(CHEAT_SHEET.contains("null"), "null-vs-throw must be stated");
+        assert!(
+            CHEAT_SHEET.contains("throws"),
+            "null-vs-throw must be stated"
+        );
+        assert!(CHEAT_SHEET.contains("retry:{max,prompt}"));
+    }
+
+    fn seed_run(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("journal.jsonl"), "").unwrap();
+    }
+
+    #[test]
+    fn eval_takes_a_bare_run_id_under_the_runs_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let run = paths.root.join(RUNS_DIR).join("review-20260901-101010");
+        seed_run(&run);
+        assert_eq!(
+            resolve_eval_target(&paths, "review-20260901-101010").unwrap(),
+            run
+        );
+    }
+
+    #[test]
+    fn eval_takes_a_path_and_absolutizes_it_for_the_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let run = tmp.path().join("elsewhere");
+        seed_run(&run);
+        let resolved = resolve_eval_target(&paths, run.to_str().unwrap()).unwrap();
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(is_run_dir(&resolved));
+    }
+
+    /// A directory without a journal is not a run — and the error has to name
+    /// both places that were tried, or a typo'd id reads as "no such run".
+    #[test]
+    fn eval_refuses_a_directory_that_is_not_a_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("empty")).unwrap();
+        let err = resolve_eval_target(&paths, "no-such-run").unwrap_err();
+        assert!(err.to_string().contains("no-such-run"), "{err}");
+        assert!(err.to_string().contains(RUNS_DIR), "{err}");
+
+        let err =
+            resolve_eval_target(&paths, tmp.path().join("empty").to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("journal.jsonl"), "{err}");
+    }
+
+    /// Same two-rung shape as the pre-agent policy hook: the project's file
+    /// REPLACES the global one, and neither existing is a named error that
+    /// tells the operator what to copy where.
+    #[test]
+    fn the_evaluator_resolves_project_first_then_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = tmp.path().join("myapp");
+        let global = paths.root.join(FLOWS_DIR).join(EVAL_SCRIPT_FILE);
+
+        let err = resolve_evaluator(&paths, Some(project.clone())).unwrap_err();
+        assert!(err.to_string().contains("flow-review.flow.js"), "{err}");
+        assert!(err.to_string().contains(EVAL_SCRIPT_FILE), "{err}");
+
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "").unwrap();
+        assert_eq!(
+            resolve_evaluator(&paths, Some(project.clone())).unwrap(),
+            global
+        );
+
+        let project_rung = project_flows_dir(&project).join(EVAL_SCRIPT_FILE);
+        std::fs::create_dir_all(project_rung.parent().unwrap()).unwrap();
+        std::fs::write(&project_rung, "").unwrap();
+        assert_eq!(
+            resolve_evaluator(&paths, Some(project)).unwrap(),
+            project_rung,
+            "the project's evaluator replaces the global one, never merges",
+        );
+    }
+
+    /// `.agents/flows/` — not `.ccteam/`, which ccteam gitignores.
+    #[test]
+    fn project_flows_live_where_git_can_see_them() {
+        let dir = project_flows_dir(Path::new("/w/myapp"));
+        assert!(dir.ends_with(".agents/flows"), "{dir:?}");
+        assert!(!dir.to_str().unwrap().contains(".ccteam"), "{dir:?}");
     }
 }

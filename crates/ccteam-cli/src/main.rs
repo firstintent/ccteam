@@ -220,7 +220,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Run a dynamic workflow script: `ccteam flow run <file.js>`.
+    /// Author, run and evaluate dynamic workflow scripts: `ccteam flow new|run|eval`.
     Flow {
         #[command(subcommand)]
         cmd: FlowCommand,
@@ -233,11 +233,21 @@ enum Command {
     },
 }
 
-/// `ccteam flow` group. One verb today (`run`); the group exists because a
-/// workflow has a lifecycle (list / show / resume) that will want verbs of its
-/// own, and a flat `ccteam flow-run` would have to be renamed to get them.
+/// `ccteam flow` group: `new` writes one, `run` drives it, `eval` judges a
+/// finished run. The group exists because a workflow has a lifecycle (list /
+/// show / resume) that will want more verbs still, and a flat `ccteam flow-run`
+/// would have to be renamed to get them.
 #[derive(Subcommand)]
 enum FlowCommand {
+    /// Scaffold a flow script and print the script surface: `ccteam flow new <name>`.
+    New {
+        /// Name of the flow; slugified into `<slug>.flow.js`.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Where to write it (default: the project's `.agents/flows/`, else the cwd).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
     /// Run a workflow script against the daemon: progress on stderr, one JSON report on stdout.
     Run {
         /// Workflow script (a `.js` file exporting `meta` + a default async function).
@@ -273,6 +283,26 @@ enum FlowCommand {
         /// Attribute hires to this managed session in the delegation tree
         /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions;
         /// pass an empty string to disable the ambient default).
+        #[arg(long, value_name = "SID")]
+        parent: Option<String>,
+    },
+    /// Evaluate a finished run with a flow of your own: `ccteam flow eval <run-dir>`.
+    Eval {
+        /// A run directory, or the bare run id of one under `~/.ccteam/runs/`.
+        #[arg(value_name = "RUN")]
+        run: String,
+        /// Evaluator script (default: `.agents/flows/_eval.flow.js`, else
+        /// `~/.ccteam/flows/_eval.flow.js`).
+        #[arg(long, value_name = "SCRIPT")]
+        script: Option<PathBuf>,
+        /// Workspace slug (default: the project the cwd belongs to).
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+        /// Stop admitting new agents past this spend.
+        #[arg(long, value_name = "USD")]
+        max_cost: Option<f64>,
+        /// Attribute hires to this managed session in the delegation tree
+        /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions).
         #[arg(long, value_name = "SID")]
         parent: Option<String>,
     },
@@ -873,6 +903,20 @@ fn main() -> Result<()> {
                 run_dir,
                 resume,
                 watchdog,
+                parent,
+            }),
+            FlowCommand::New { name, dir } => flow::new_script(flow::FlowNewRequest { name, dir }),
+            FlowCommand::Eval {
+                run,
+                script,
+                project,
+                max_cost,
+                parent,
+            } => flow::eval(flow::FlowEvalRequest {
+                run,
+                script,
+                project,
+                max_cost,
                 parent,
             }),
         },
