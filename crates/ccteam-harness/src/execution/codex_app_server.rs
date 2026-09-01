@@ -2045,6 +2045,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                                 translate_notification(&notif, &wanted)
                                             {
                                                 let ctx = bridge.bridge_for(&wanted).await;
+                                                if matches!(
+                                                    evt,
+                                                    ThreadEvent::TurnCompleted { .. }
+                                                ) {
+                                                    enrich_codex_turn_completed(
+                                                        &mut evt, turn_usage,
+                                                    );
+                                                }
                                                 if matches!(evt, ThreadEvent::TurnFailed { .. }) {
                                                     let fallback_model = match ctx
                                                         .as_ref()
@@ -3834,6 +3842,23 @@ fn codex_turn_usage_from_notification(notif: &Notification) -> Option<UnifiedTok
     serde_json::from_value(last).ok()
 }
 
+/// LEDGER-1 — the real `turn/completed` wire carries NO usage field; the
+/// per-turn accounting lives in the tracker's `last` bucket from
+/// `thread/tokenUsage/updated`. Fill it into the completed event so the
+/// ledger folds real tokens (probes showed `tokens_total` stuck at 0).
+/// Inline values win, exactly like the failed-arm twin below, so synthetic
+/// fixtures that inline `usage` stay authoritative.
+fn enrich_codex_turn_completed(evt: &mut ThreadEvent, fallback_usage: Option<UnifiedTokenUsage>) {
+    let ThreadEvent::TurnCompleted { usage, .. } = evt else {
+        return;
+    };
+    if usage.total() == 0 && usage.reported_cost_usd.is_none() {
+        if let Some(value) = fallback_usage {
+            *usage = value;
+        }
+    }
+}
+
 /// Fill accounting omitted by Codex's terminal `error` wire shape from the
 /// latest usage notification and the thread's resolved model. Inline values
 /// win for synthetic fixtures and future protocol additions.
@@ -4476,6 +4501,46 @@ mod tests {
             }
             other => panic!("expected TurnFailed, got {other:?}"),
         }
+    }
+
+    /// LEDGER-1 — a completed turn with the wire's (always-empty) usage is
+    /// filled from the tracker's last bucket; an inlined fixture usage wins.
+    #[test]
+    fn enrich_codex_turn_completed_fills_missing_usage_only() {
+        let tracker_last = UnifiedTokenUsage {
+            input_tokens: 20_717,
+            output_tokens: 1_234,
+            ..Default::default()
+        };
+        let mut event = ThreadEvent::TurnCompleted {
+            turn_id: "u-1".into(),
+            usage: UnifiedTokenUsage::default(),
+            model: None,
+        };
+        enrich_codex_turn_completed(&mut event, Some(tracker_last));
+        let ThreadEvent::TurnCompleted { usage, .. } = &event else {
+            panic!("variant preserved");
+        };
+        assert_eq!(usage.input_tokens, 20_717);
+        assert_eq!(usage.output_tokens, 1_234);
+
+        let mut inlined = ThreadEvent::TurnCompleted {
+            turn_id: "u-2".into(),
+            usage: UnifiedTokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            model: None,
+        };
+        enrich_codex_turn_completed(&mut inlined, Some(tracker_last));
+        let ThreadEvent::TurnCompleted { usage, .. } = &inlined else {
+            panic!("variant preserved");
+        };
+        assert_eq!(
+            usage.input_tokens, 100,
+            "inline fixtures stay authoritative"
+        );
     }
 
     #[test]
