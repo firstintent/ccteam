@@ -2988,18 +2988,21 @@ async fn run_agent_dispatch(
 ) -> std::result::Result<String, String> {
     let deadline = crate::gateway::GatewayDeadline::start();
     let sid = arg_session_sid(args)?;
-    // Driveability before anything else: ccteam has no thread to submit into for
-    // an enrolled hand-started client, and every path below would call it
-    // unknown instead of saying so.
-    assert_target_is_driveable("agent", gateway, &sid, Some(deadline)).await?;
     let task = args
         .get("task")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "agent: missing `task`".to_string())?
         .to_string();
-    // R-M3 — only operate sessions in the caller's own project.
+    // R-M3 FIRST — only operate sessions in the caller's own project, and the
+    // scope miss is the one non-disclosing error. State refusals below may
+    // speak plainly because they only ever fire for the caller's own sids.
     assert_caller_owns_session("agent", args, gateway, &sid, &caller, Some(deadline)).await?;
+    // No thread to submit into: a hand-started (external) node, live or from
+    // before a restart. Then the explicit-stop contract: stopped means "hire
+    // a new one", while a merely-released session cold-resumes below.
+    assert_target_not_external("agent", gateway, &sid, Some(deadline)).await?;
+    assert_target_not_stopped("agent", gateway, &sid).await?;
 
     let wait_seconds = inline_wait_seconds(args);
     let notify = parse_notify_mode("agent", args)?;
@@ -3883,7 +3886,6 @@ async fn run_agent_read_transcript(
     // Same gate as dispatch/stop: ccteam mirrors no transcript for a client it
     // never spawned, so the honest answer is what the session is — not an empty
     // page or an "unknown session" from the resolve below.
-    assert_target_is_driveable("agent_read", gateway, &sid, None).await?;
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
     let n = args
         .get("n")
@@ -3897,6 +3899,9 @@ async fn run_agent_read_transcript(
     let max_chars = collect_max_chars(args);
     // R-M3 — only collect from sessions in the caller's own project.
     assert_caller_owns_session("agent_read", args, gateway, &sid, &caller, None).await?;
+    // External nodes have no ccteam-held thread OR transcript mirror to read;
+    // after the scope gate so the wording cannot probe foreign sids.
+    assert_target_not_external("agent_read", gateway, &sid, None).await?;
     // ---- the long poll (off the gateway lock, after every gate) ----
     //
     // The missing primitive was "wait for the turn that is in flight". Without
@@ -4309,13 +4314,15 @@ async fn run_agent_stop(
     caller: McpCaller,
 ) -> std::result::Result<String, String> {
     let sid = arg_session_sid(args)?;
-    // Ahead of both scope checks: a hand-started client's process belongs to its
-    // operator, and the descendant walk below would otherwise reject it as "not
-    // a descendant" — true, but not the reason.
-    assert_target_is_driveable("agent_stop", gateway, &sid, None).await?;
     // R-M3 — only stop sessions in the caller's own project (explicit command,
     // never a proactive kill; the scope check just prevents cross-project stop).
     assert_caller_owns_session("agent_stop", args, gateway, &sid, &caller, None).await?;
+    // Before the descendant walk: a hand-started client's process belongs to
+    // its operator, and the walk would otherwise reject it as "not a
+    // descendant" — true, but not the reason. Stopped-again is the same
+    // refusal it always was.
+    assert_target_not_external("agent_stop", gateway, &sid, None).await?;
+    assert_target_not_stopped("agent_stop", gateway, &sid).await?;
     // v0.9.0 W2 (F2) — an Ambient (agent) caller may only stop its OWN
     // descendants (walk the target's parent chain; it must reach the caller).
     // Admin/human callers are unrestricted (fleet-wide).
@@ -4388,22 +4395,71 @@ fn arg_session_sid(args: &serde_json::Value) -> std::result::Result<String, Stri
 /// a ccteam bug. One shared message
 /// ([`crate::external_nodes::not_driveable_error`]) says what the session IS: a
 /// process its own operator drives, usable as a delegation parent.
-async fn assert_target_is_driveable(
+/// Refuse a hand-started (external) target. The live index answers for
+/// current bindings; the on-disk meta answers for nodes from before a daemon
+/// restart — an external node must stay refusable across restarts, or the
+/// engine would try to drive a process it never held. Runs AFTER the
+/// ownership gate so the (state-revealing) wording never leaks a foreign
+/// sid's existence.
+async fn assert_target_not_external(
     tool: &str,
     gateway: &GatewayHandle,
     sid: &str,
     deadline: Option<crate::gateway::GatewayDeadline>,
 ) -> std::result::Result<(), String> {
-    let is_external = match deadline {
-        Some(deadline) => deadline
-            .lock(gateway)
-            .await
-            .map_err(|error| mcp_gateway_error(tool, &error))?
-            .is_external_node(sid),
-        None => gateway.lock().await.is_external_node(sid),
+    let (is_external, resolved) = match deadline {
+        Some(deadline) => {
+            let gw = deadline
+                .lock(gateway)
+                .await
+                .map_err(|error| mcp_gateway_error(tool, &error))?;
+            (gw.is_external_node(sid), gw.session_resolve_any(sid))
+        }
+        None => {
+            let gw = gateway.lock().await;
+            (gw.is_external_node(sid), gw.session_resolve_any(sid))
+        }
     };
     if is_external {
         return Err(crate::external_nodes::not_driveable_error(tool, sid));
+    }
+    if let Some(resolved) = resolved {
+        let external_on_disk = ccteam_harness::execution::session_meta::read_session_meta(
+            &resolved.project_dir,
+            &resolved.sid,
+        )
+        .is_ok_and(|meta| !meta.managed_by.is_driveable());
+        if external_on_disk {
+            return Err(crate::external_nodes::not_driveable_error(tool, sid));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse dispatch/stop of an explicitly STOPPED session (the MCP contract:
+/// "hire a new one"; the transcript stays readable). Read-only surfaces skip
+/// this — a stopped session's history is exactly what they exist for.
+async fn assert_target_not_stopped(
+    tool: &str,
+    gateway: &GatewayHandle,
+    sid: &str,
+) -> std::result::Result<(), String> {
+    let resolved = {
+        let gw = gateway.lock().await;
+        gw.session_resolve_any(sid)
+    };
+    if let Some(resolved) = resolved {
+        let stopped_at = ccteam_harness::execution::session_meta::read_session_meta(
+            &resolved.project_dir,
+            &resolved.sid,
+        )
+        .ok()
+        .and_then(|meta| meta.stopped_at);
+        if let Some(at) = stopped_at {
+            return Err(format!(
+                "{tool}: {sid} was stopped at {at}; agent_read still reads it — hire a new one to continue"
+            ));
+        }
     }
     Ok(())
 }
@@ -4435,11 +4491,13 @@ async fn assert_caller_owns_session(
                 .map_err(|error| mcp_gateway_error(name, &error))?,
             None => crate::latency::gateway_lock(gateway, "mcp.session.resolve").await,
         };
-        if name == "agent_read" {
-            gw.session_resolve_any(sid)
-        } else {
-            gw.session_resolve(sid)
-        }
+        // ONE resolver for every tool: live map first, on-disk meta second.
+        // The old live-only branch for agent/agent_stop conflated "stopped"
+        // with "not in the live map", so after a daemon restart every
+        // pre-restart released session answered "unknown" — breaking
+        // resume-by-sid (issue #8). Stopped/external refusals are separate,
+        // meta-driven gates that run AFTER this scope check.
+        gw.session_resolve_any(sid)
     };
     match caller {
         McpCaller::Admin => Ok(()),
@@ -6241,6 +6299,142 @@ mod session_tool_tests {
             !err.contains("bob"),
             "must not name the foreign project: {err}"
         );
+    }
+
+    /// issue #8 — the red line "resume-by-sid survives restarts": a released
+    /// session must stay dispatchable after the daemon process is rebuilt
+    /// over the same state (the old live-only gate answered "unknown").
+    #[tokio::test]
+    async fn released_sessions_stay_dispatchable_across_daemon_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, _bob, _admin) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let spawned = run_agent_spawn_at(
+            &ambient(&alice_sid, "alice", json!({ "vendor": "claude" })),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap();
+        let child: serde_json::Value = serde_json::from_str(&spawned).unwrap();
+        let child_sid = child["sid"].as_str().unwrap().to_string();
+        drop(gateway);
+
+        let gateway2 = rebuilt_gateway_over(tmp.path());
+        let response = run_agent_dispatch(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "sid": child_sid, "task": "carry on" }),
+            ),
+            &gateway2,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(body["sid"], json!(child_sid), "{body}");
+    }
+
+    /// Explicitly STOPPED stays refused across a restart — with its own
+    /// words, never "unknown".
+    #[tokio::test]
+    async fn stopped_targets_refuse_after_restart_with_their_own_words() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, _bob, _admin) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let spawned = run_agent_spawn_at(
+            &ambient(&alice_sid, "alice", json!({ "vendor": "claude" })),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap();
+        let child: serde_json::Value = serde_json::from_str(&spawned).unwrap();
+        let child_sid = child["sid"].as_str().unwrap().to_string();
+        {
+            let mut gw = gateway.lock().await;
+            gw.stop_session(&child_sid).await.unwrap();
+        }
+        drop(gateway);
+
+        let gateway2 = rebuilt_gateway_over(tmp.path());
+        let err = run_agent_dispatch(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "sid": child_sid, "task": "carry on" }),
+            ),
+            &gateway2,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("was stopped at"), "{err}");
+    }
+
+    /// A hand-started (external) node stays refused across a restart, from
+    /// its persisted meta — the live index is empty then.
+    #[tokio::test]
+    async fn external_targets_refuse_after_restart_from_their_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, alice_sid, _bob, _admin) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let spawned = run_agent_spawn_at(
+            &ambient(&alice_sid, "alice", json!({ "vendor": "claude" })),
+            &gateway,
+            McpCaller::Ambient,
+            Some(&paths),
+        )
+        .await
+        .unwrap();
+        let child: serde_json::Value = serde_json::from_str(&spawned).unwrap();
+        let child_sid = child["sid"].as_str().unwrap().to_string();
+        let project_dir = paths.projects_root.join("alice");
+        let mut meta =
+            ccteam_harness::execution::session_meta::read_session_meta(&project_dir, &child_sid)
+                .unwrap();
+        meta.managed_by = ccteam_harness::execution::session_meta::ManagedBy::External;
+        ccteam_harness::execution::session_meta::write_session_meta(&project_dir, &meta).unwrap();
+        drop(gateway);
+
+        let gateway2 = rebuilt_gateway_over(tmp.path());
+        let err = run_agent_dispatch(
+            &ambient(
+                &alice_sid,
+                "alice",
+                json!({ "sid": child_sid, "task": "carry on" }),
+            ),
+            &gateway2,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("hand-started"), "{err}");
+    }
+
+    /// Restart double: a fresh Gateway over the same on-disk state, exactly
+    /// what a daemon restart is (processes are not respawned; state is).
+    fn rebuilt_gateway_over(tmp: &std::path::Path) -> GatewayHandle {
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(StubAdapter::default())
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gateway = Gateway::new_with_factory(factory, "alice", tmp.join("projects/alice"));
+        mark_stub_vendors_installed(&mut gateway);
+        gateway.register_project("bob", tmp.join("projects/bob"));
+        gateway.register_project("admin", tmp.join("projects/admin"));
+        std::sync::Arc::new(tokio::sync::Mutex::new(gateway))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
