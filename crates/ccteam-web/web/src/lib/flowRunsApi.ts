@@ -38,6 +38,8 @@ export interface FlowRun {
 
 export interface FlowRunsResponse {
   runs: FlowRun[];
+  /** Backend scan window hit its limit — older runs are missing, honestly. */
+  truncated?: boolean;
 }
 
 /** One project's runs — the team view is cross-project, so the tab fetches
@@ -45,6 +47,12 @@ export interface FlowRunsResponse {
 export interface ProjectFlowRuns {
   slug: string;
   runs: FlowRun[];
+  /** Mirrors the response's `truncated` (older runs scrolled out of scan). */
+  truncated?: boolean;
+  /** The fetch itself failed this cycle (endpoint missing / auth / outage) —
+   *  distinct from "answered with zero runs", so the UI can say so instead of
+   *  passing an outage off as an empty project (checker s523 R1). */
+  error?: boolean;
 }
 
 export function flowRunsUrl(slug: string): string {
@@ -67,9 +75,10 @@ export function fetchFlowRuns(slug: string, signal?: AbortSignal): Promise<FlowR
 }
 
 /** Fetch every visible project's runs as ONE logical poll attempt.
- *  Per-project fail-SOFT: one slug 403ing (or the endpoint not deployed yet)
- *  must not blank the others — that slug just contributes zero runs this
- *  cycle. The empty state stays honest either way: "no runs visible". */
+ *  Per-project fail-SOFT: one slug 404ing (ACL denial IS a 404 here) must not
+ *  blank the others — but a failed fetch is MARKED (`error: true`), never
+ *  silently identical to "zero runs": when every project errors, the panel
+ *  says the endpoint is unreachable instead of faking an empty state. */
 export function fetchProjectsFlowRuns(
   slugs: readonly string[],
   signal?: AbortSignal,
@@ -77,8 +86,8 @@ export function fetchProjectsFlowRuns(
   return Promise.all(
     slugs.map((slug) =>
       fetchFlowRuns(slug, signal).then(
-        (res) => ({ slug, runs: res.runs ?? [] }),
-        () => ({ slug, runs: [] }),
+        (res) => ({ slug, runs: res.runs ?? [], truncated: res.truncated === true }),
+        () => ({ slug, runs: [], error: true }),
       ),
     ),
   );

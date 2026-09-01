@@ -68,19 +68,39 @@ pub fn router() -> Router<AppState> {
 async fn handle_no_action(
     State(app): State<AppState>,
     Path(kind): Path<String>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    dispatch(&app, &kind, None, &headers, body.map(|Json(v)| v)).await
+    let identity = identity.map(|axum::Extension(id)| id);
+    dispatch(
+        &app,
+        &kind,
+        None,
+        identity.as_ref(),
+        &headers,
+        body.map(|Json(v)| v),
+    )
+    .await
 }
 
 async fn handle_with_action(
     State(app): State<AppState>,
     Path((kind, action)): Path<(String, String)>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    dispatch(&app, &kind, Some(&action), &headers, body.map(|Json(v)| v)).await
+    let identity = identity.map(|axum::Extension(id)| id);
+    dispatch(
+        &app,
+        &kind,
+        Some(&action),
+        identity.as_ref(),
+        &headers,
+        body.map(|Json(v)| v),
+    )
+    .await
 }
 
 /// F186 — inject `X-Ccteam-Role` / `X-Ccteam-Slug` request headers into
@@ -138,11 +158,35 @@ async fn dispatch(
     app: &AppState,
     kind: &str,
     action: Option<&str>,
+    identity: Option<&crate::auth::Identity>,
     headers: &HeaderMap,
     body: Option<Value>,
 ) -> Response {
     let t0 = std::time::Instant::now();
     let stdin = inject_headers(body.unwrap_or(Value::Null), headers);
+    // `flow-run` names its target project IN THE BODY, so the URL-shaped ACL
+    // choke point (`auth::project_acl_layer`) cannot see it — gate it here
+    // with the same ownership policy and the same non-disclosing 404. Missing
+    // `Identity` extension mirrors `project_acl_layer`: a loopback / open-mode
+    // daemon runs without auth and that posture IS the single-user admin
+    // (checker s523 R1: without this, any authenticated tenant could append
+    // envelope rows to another tenant's journal).
+    if kind == "flow-run" {
+        if let Some(slug) = stdin.get("project").and_then(|v| v.as_str()) {
+            let caller = identity
+                .cloned()
+                .unwrap_or_else(crate::auth::Identity::admin);
+            if !crate::routes::api_v1::can_see_project(app, &caller, slug) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("project not found: {slug}")})),
+                )
+                    .into_response();
+            }
+        }
+        // A body without `project` falls through: the hooks-library validator
+        // rejects it with its own "missing `project`" error.
+    }
     // Try to pull session id / role from the Claude Code hook stdin
     // payload — useful for joining hook latency rows to other stages.
     // Best-effort: any field missing → empty string. Owned (not borrowed from

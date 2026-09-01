@@ -544,34 +544,52 @@ export function FlowRunsPanel({
   const lang = langProp ?? "zh";
   const t = makeT(lang);
   const rows = groups
-    .flatMap((group) => group.runs.map((run) => ({ slug: group.slug, run })))
+    .flatMap((group) =>
+      group.runs.map((run) => ({
+        slug: group.slug,
+        run,
+        // Ledger identity is only the run-dir basename, and two projects can
+        // hold same-named runs — React keys and the expansion set scope by
+        // slug so twins never share state (checker s523 R1).
+        rowKey: `${group.slug}:${run.run_id}`,
+      })),
+    )
     .sort(
       (a, b) => (Date.parse(b.run.started_at) || 0) - (Date.parse(a.run.started_at) || 0),
     );
   if (rows.length === 0) {
+    // An outage is not an empty project: when every visible project's fetch
+    // failed this cycle, say the endpoint is unreachable instead of passing
+    // the failure off as "no runs" (checker s523 R1).
+    const allErrored = groups.length > 0 && groups.every((group) => group.error === true);
     return (
-      <p style={{ color: "var(--text-faint)", fontSize: 13 }} data-testid="flow-runs-empty">
-        {t("flowRunsEmpty")}
+      <p
+        style={{ color: "var(--text-faint)", fontSize: 13 }}
+        data-testid={allErrored ? "flow-runs-unavailable" : "flow-runs-empty"}
+      >
+        {allErrored ? t("flowRunsUnavailable") : t("flowRunsEmpty")}
       </p>
     );
   }
   const showProject = new Set(rows.map((row) => row.slug)).size > 1;
+  const truncated = groups.some((group) => group.truncated === true);
   return (
+    <>
     <div className="flow-rows" data-testid="flow-runs-rows">
-      {rows.map(({ slug, run }) => {
-        const isOpen = expanded.has(run.run_id);
+      {rows.map(({ slug, run, rowKey }) => {
+        const isOpen = expanded.has(rowKey);
         const leaves = isOpen ? flowRunLeaves(nodes, run) : [];
         return (
-          <div key={run.run_id}>
+          <div key={rowKey}>
             <div
               className="flow-row flow-run"
               role="button"
               tabIndex={0}
               aria-expanded={isOpen}
               data-testid={`flow-run-${run.run_id}`}
-              onClick={() => onToggle(run.run_id)}
+              onClick={() => onToggle(rowKey)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") onToggle(run.run_id);
+                if (event.key === "Enter") onToggle(rowKey);
               }}
             >
               <span className="n">
@@ -643,6 +661,15 @@ export function FlowRunsPanel({
         );
       })}
     </div>
+    {truncated ? (
+      <p
+        style={{ color: "var(--text-faint)", fontSize: 12.5, margin: "8px 0 0" }}
+        data-testid="flow-runs-truncated"
+      >
+        {t("flowRunsTruncated")}
+      </p>
+    ) : null}
+    </>
   );
 }
 
@@ -668,11 +695,11 @@ export function FlowRunsTab({ nodes, lang: langProp }: { nodes: AgentNode[]; lan
     [slugsKey],
   );
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
-  const toggle = (runId: string) => {
+  const toggle = (rowKey: string) => {
     setExpanded((previous) => {
       const next = new Set(previous);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
+      if (next.has(rowKey)) next.delete(rowKey);
+      else next.add(rowKey);
       return next;
     });
   };

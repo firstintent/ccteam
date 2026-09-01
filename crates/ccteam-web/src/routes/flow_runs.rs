@@ -69,6 +69,11 @@ pub struct FlowRun {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowRuns {
     pub runs: Vec<FlowRun>,
+    /// True when the scan hit [`SCAN_LIMIT`] — older runs (and any run whose
+    /// opening row already scrolled out of the window) are NOT listed. A
+    /// bounded window is fine; a silently bounded one is not: the reader must
+    /// be able to tell "no runs" from "no runs *in the window*".
+    pub truncated: bool,
 }
 
 /// `GET /api/v1/projects/{slug}/flow-runs`
@@ -100,10 +105,12 @@ pub(crate) async fn handle_flow_runs(
             Vec::new()
         }
     };
+    let truncated = events.len() >= SCAN_LIMIT;
     (
         StatusCode::OK,
         Json(FlowRuns {
             runs: fold_runs(&events),
+            truncated,
         }),
     )
         .into_response()

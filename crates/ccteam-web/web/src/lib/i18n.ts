@@ -300,6 +300,9 @@ export const I18N: Record<Lang, Record<string, string>> = {
     flowRunsParent: "触发会话",
     flowRunsNoLeaves:
       "委派图里没有这个 run 的会话 —— 可能超出时间窗,或该 run 由 CLI 直接驱动、没有触发会话。",
+    flowRunsTruncated: "扫描窗口已满 —— 更早的 run 已滚出范围,此列表不完整。",
+    flowRunsUnavailable:
+      "flow-runs 端点无法访问(daemon 未部署此版本,或本轮请求全部失败)—— 显示的空列表不代表没有 run。",
     charterTitle: "分工宪章",
     charterRoster: "厂商阵容",
     charterEdit: "编辑",
@@ -617,6 +620,9 @@ export const I18N: Record<Lang, Record<string, string>> = {
     flowRunsParent: "trigger session",
     flowRunsNoLeaves:
       "No sessions from this run in the delegation graph — outside the time window, or a CLI-driven run with no trigger session.",
+    flowRunsTruncated: "Scan window full — older runs scrolled out of range; this list is incomplete.",
+    flowRunsUnavailable:
+      "The flow-runs endpoint is unreachable (daemon predates this build, or every request failed this cycle) — an empty list here does not mean no runs.",
     charterTitle: "Division-of-labor charter",
     charterRoster: "Harness roster",
     charterEdit: "Edit",

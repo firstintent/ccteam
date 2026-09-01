@@ -610,7 +610,7 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
         <FlowRunsPanel
           groups={[{ slug: "demo", runs: [fixtureRun()] }]}
           nodes={nodes}
-          expanded={new Set(["r1"])}
+          expanded={new Set(["demo:r1"])}
           nowMs={NOW}
           onToggle={() => {}}
         />
@@ -636,7 +636,7 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
         <FlowRunsPanel
           groups={[{ slug: "demo", runs: [fixtureRun({ run_id: "r2", parent_sid: null })] }]}
           nodes={noNodes}
-          expanded={new Set(["r2"])}
+          expanded={new Set(["demo:r2"])}
           nowMs={NOW}
           onToggle={() => {}}
         />
@@ -646,6 +646,59 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
     expect(html).toContain("没有这个 run 的会话");
     // No trigger-session link row and no leaf links — nothing to link to.
     expect(html).not.toContain('href="/chat/s/');
+  });
+
+  it("cross-project twin run_ids keep independent keys and expansion state", () => {
+    const groups = [
+      { slug: "alpha", runs: [fixtureRun()] },
+      { slug: "beta", runs: [fixtureRun()] },
+    ];
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={groups}
+          nodes={noNodes}
+          expanded={new Set(["alpha:r1"])}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    // Only alpha's row opens — beta's same-named twin stays collapsed.
+    expect(html.match(/data-testid="flow-run-leaves-r1"/g)).toHaveLength(1);
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain('aria-expanded="false"');
+  });
+
+  it("an all-projects-errored cycle says the endpoint is unreachable, not 'no runs'", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [], error: true }]}
+          nodes={noNodes}
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-unavailable"');
+    expect(html).not.toContain('data-testid="flow-runs-empty"');
+  });
+
+  it("a truncated scan window is announced under the list", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [fixtureRun()], truncated: true }]}
+          nodes={noNodes}
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-truncated"');
   });
 
   it("zero runs renders the honest empty state, bilingually", () => {
@@ -684,6 +737,7 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
     );
     expect(clicks).toHaveLength(1); // collapsed ⇒ only the row toggle
     clicks[0]!();
-    expect(onToggle).toHaveBeenCalledWith("r1");
+    // Slug-scoped key: cross-project twin run_ids must not share state.
+    expect(onToggle).toHaveBeenCalledWith("demo:r1");
   });
 });

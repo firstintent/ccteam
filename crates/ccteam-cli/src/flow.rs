@@ -209,16 +209,29 @@ pub fn new_script(req: FlowNewRequest) -> Result<()> {
 /// a scaffold is that it is safe to reach for, and a scaffold that can eat a
 /// written flow is not — so an existing file is an error, never an overwrite.
 fn write_scaffold(dir: &Path, slug: &str) -> Result<PathBuf> {
+    use std::io::Write as _;
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create flow directory {}", dir.display()))?;
     let file = dir.join(format!("{slug}.flow.js"));
-    if file.exists() {
-        return Err(anyhow!(
-            "{} already exists — pick another name, or pass `--dir`",
-            file.display()
-        ));
-    }
-    std::fs::write(&file, script_template(slug))
+    // `create_new` makes the existence check and the create one atomic O_EXCL
+    // open — no windowed check-then-write to race, and a dangling symlink at
+    // the target is refused rather than followed (checker s523 R1).
+    let mut handle = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file)
+    {
+        Ok(handle) => handle,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(anyhow!(
+                "{} already exists — pick another name, or pass `--dir`",
+                file.display()
+            ));
+        }
+        Err(err) => return Err(err).with_context(|| format!("write {}", file.display())),
+    };
+    handle
+        .write_all(script_template(slug).as_bytes())
         .with_context(|| format!("write {}", file.display()))?;
     Ok(file)
 }
@@ -235,9 +248,11 @@ fn default_new_dir(paths: &CcteamPaths) -> Result<PathBuf> {
     }
 }
 
-/// The scaffold is CODE, not content: a `meta` block and one TODO call. It
-/// carries no persona, no task wording and no house style — those are the
-/// author's, and prompt-shaped content does not ship in this repo.
+/// The scaffold is CODE, not content: a `meta` block and comments. Even a
+/// placeholder `agent('TODO: …')` line is a prompt string an unedited run
+/// would send to a model, so the template ships NO agent call at all — the
+/// first task's wording is the author's, and prompt-shaped content does not
+/// ship in this repo (checker s523 R1).
 fn script_template(slug: &str) -> String {
     format!(
         r#"export const meta = {{ name: '{slug}', description: 'TODO: one line' }}
@@ -245,8 +260,7 @@ fn script_template(slug: &str) -> String {
 // Replace with your orchestration. Available globals: agent(task, opts?),
 // parallel([...thunks]), pipeline(items, ...stages), phase(title), log(msg),
 // args, budget, usage(). Full reference: docs/hook-dynamic-workflows.md
-const result = await agent('TODO: first task')
-return result
+return null
 "#
     )
 }
@@ -374,23 +388,29 @@ fn project_dir_for(paths: &CcteamPaths, slug: Option<&str>) -> Option<PathBuf> {
 /// just made is pure friction. Always resolved to an absolute path — the
 /// evaluating agent reads it from its own cwd, not from this shell's.
 fn resolve_eval_target(paths: &CcteamPaths, run: &str) -> Result<PathBuf> {
+    // A bare id has no separators. It means "the run `flow run` named under
+    // `runs/`" and is resolved THERE FIRST: a same-named directory in the cwd
+    // must not shadow the id the user was handed (checker s523 R1). A cwd
+    // directory that happens to be a run is still reachable — `./name` says
+    // "path" unambiguously.
+    let bare = !run.is_empty() && !run.contains('/') && !run.contains('\\');
+    if bare {
+        let under_runs = paths.root.join(RUNS_DIR).join(run);
+        if is_run_dir(&under_runs) {
+            return std::fs::canonicalize(&under_runs)
+                .with_context(|| format!("resolve run directory {}", under_runs.display()));
+        }
+    }
     let as_given = PathBuf::from(run);
     if is_run_dir(&as_given) {
         return std::fs::canonicalize(&as_given)
             .with_context(|| format!("resolve run directory {}", as_given.display()));
     }
-    // A bare id has no separators; joining anything else onto `runs/` would
-    // only produce a second, more confusing path in the error below.
-    let bare = !run.is_empty() && !run.contains('/') && !run.contains('\\');
     if bare {
-        let under_runs = paths.root.join(RUNS_DIR).join(run);
-        if is_run_dir(&under_runs) {
-            return Ok(under_runs);
-        }
         return Err(anyhow!(
             "no workflow run at {} or {} (a run directory is one that holds journal.jsonl)",
+            paths.root.join(RUNS_DIR).join(run).display(),
             as_given.display(),
-            under_runs.display()
         ));
     }
     Err(anyhow!(
@@ -748,7 +768,7 @@ mod tests {
         assert_eq!(file.file_name().unwrap(), "audit-routes.flow.js");
         let body = std::fs::read_to_string(&file).unwrap();
         assert!(body.contains("name: 'audit-routes'"), "{body}");
-        assert!(body.contains("await agent("), "{body}");
+        assert!(body.contains("return null"), "{body}");
 
         std::fs::write(&file, "// mine, hand-written").unwrap();
         let err = write_scaffold(&dir, "audit-routes").unwrap_err();
@@ -760,9 +780,11 @@ mod tests {
         );
     }
 
-    /// The scaffold is code, not content: `meta` plus a TODO. If a persona or
-    /// a task prompt ever creeps in, this repo's zero-prompt-content rule is
-    /// broken — and the template is the one place it could creep in unnoticed.
+    /// The scaffold is code, not content: `meta` plus comments. Even a
+    /// placeholder `agent('TODO: …')` is a prompt string an unedited run would
+    /// send to a model (checker s523 R1), so the template must carry NO agent
+    /// call at all — the template is the one place prompt content could creep
+    /// into this repo unnoticed.
     #[test]
     fn the_scaffold_carries_no_prompt_content() {
         let body = script_template("x");
@@ -771,9 +793,17 @@ mod tests {
             assert!(line.len() < 90, "template line too long to be code: {line}");
         }
         assert_eq!(
-            body.matches("await agent(").count(),
+            body.matches("agent(").count(),
             1,
-            "one placeholder call, not a worked example: {body}"
+            "agent() may appear once, in the globals comment only: {body}"
+        );
+        let comments_only: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            !comments_only.contains("agent("),
+            "no agent call outside comments: {body}"
         );
     }
 

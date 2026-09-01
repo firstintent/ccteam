@@ -286,7 +286,7 @@ fn submit_loop(endpoint: &Endpoint, rx: mpsc::Receiver<Submission>) {
         }
     };
 
-    for submission in rx {
+    for submission in rx.iter() {
         let url = format!(
             "{}/internal/hook/flow-run/{}",
             endpoint.base_url, submission.action
@@ -297,6 +297,9 @@ fn submit_loop(endpoint: &Endpoint, rx: mpsc::Receiver<Submission>) {
         }
         match runtime.block_on(request.send()) {
             Ok(response) if response.status().is_success() => {}
+            // The daemon answered but said no — it is alive, keep trying the
+            // remaining rows (a later row may be acceptable where this one
+            // was not).
             Ok(response) => {
                 tracing::warn!(
                     action = submission.action,
@@ -304,12 +307,20 @@ fn submit_loop(endpoint: &Endpoint, rx: mpsc::Receiver<Submission>) {
                     "flow ledger bridge: daemon refused a run envelope row"
                 );
             }
+            // Transport failure: the daemon is down or wedged, and every
+            // remaining row would eat its own SUBMIT_TIMEOUT — serially, in
+            // `Drop`, on the way OUT of the CLI. One timeout is the price of
+            // finding out; the rest of the queue is drained without HTTP so
+            // process exit is bounded by ONE timeout, not one per row
+            // (checker s523 R1).
             Err(err) => {
                 tracing::warn!(
                     action = submission.action,
                     error = %err,
-                    "flow ledger bridge: run envelope row not delivered"
+                    "flow ledger bridge: daemon unreachable; remaining envelope rows dropped"
                 );
+                for _ in rx.iter() {}
+                return;
             }
         }
     }

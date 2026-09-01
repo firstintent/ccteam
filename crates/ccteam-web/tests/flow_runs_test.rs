@@ -142,6 +142,90 @@ async fn a_submitted_run_envelope_comes_back_as_one_finished_run() {
     assert_eq!(run["cost_usd"], 1.25);
     assert_eq!(run["started_at"], "2026-09-01T10:15:00Z");
     assert_eq!(run["finished_at"], "2026-09-01T10:20:00Z");
+    assert_eq!(body["truncated"], false, "{body}");
+}
+
+/// The URL-shaped ACL choke point (`auth::project_acl_layer`) cannot see a
+/// slug that travels in a POST body, so `flow-run` carries its own ownership
+/// gate (checker s523 R1): a tenant must not append envelope rows to a
+/// project it cannot see — and must not learn whether that project exists.
+#[tokio::test]
+async fn a_tenant_cannot_write_another_owners_journal() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    std::fs::create_dir_all(paths.users_dir()).unwrap();
+    // Owned by `user:web-api` — NOT the tenant minted below.
+    seed_project(&paths, "alpha");
+
+    let mut reg = ccteam_core::tenants::TenantRegistry::default();
+    let tenant = reg.add("mallory");
+    reg.save(&paths.users_dir()).unwrap();
+
+    let state = AppState::with_auth(paths.clone(), AuthState::enabled(ADMIN_HEX.into()));
+    let addr = spawn(state).await;
+
+    let response = client()
+        .post(format!("http://{addr}/internal/hook/flow-run/started"))
+        .header(
+            "Authorization",
+            format!("Bearer ccteam:{}", tenant.web_token),
+        )
+        .json(&json!({
+            "project": "alpha",
+            "run_id": "intruder-1",
+            "started_at": "2026-09-01T10:15:00Z",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "a foreign project must read as not-found, disclosing nothing"
+    );
+    assert!(
+        !paths.progress_jsonl("alpha").exists(),
+        "the refused row must not have touched the journal"
+    );
+}
+
+/// A bounded scan window is fine; a silently bounded one is not. When the
+/// journal holds more rows than one request scans, the answer SAYS so — and
+/// a run whose opening row scrolled out is missing WITH the flag up, never
+/// silently (checker s523 R1).
+#[tokio::test]
+async fn a_full_scan_window_is_reported_as_truncated() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, addr) = serving(&tmp).await;
+
+    submit(
+        addr,
+        "started",
+        json!({"project": "alpha", "run_id": "recent-1", "started_at": "2026-09-01T10:15:00Z"}),
+    )
+    .await;
+    // Flood the journal past the scan window with unrelated rows.
+    let mut filler = String::new();
+    for i in 0..5_000 {
+        filler.push_str(&format!(
+            "{}\n",
+            json!({"ts": "2026-09-01T11:00:00Z", "event": "chat_tool_call_started", "n": i})
+        ));
+    }
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(paths.progress_jsonl("alpha"))
+        .unwrap()
+        .write_all(filler.as_bytes())
+        .unwrap();
+
+    let body = flow_runs(addr, "alpha").await;
+    assert_eq!(body["truncated"], true, "{body}");
+    // The started row scrolled out, so the run is absent from the list — the
+    // raised flag is what keeps that absence honest.
+    assert_eq!(body["runs"].as_array().unwrap().len(), 0, "{body}");
 }
 
 #[tokio::test]

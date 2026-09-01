@@ -88,8 +88,9 @@ describe("flowRunsApi fetch surface", () => {
     });
     const got = await fetchProjectsFlowRuns(["alpha", "beta"]);
     expect(got).toEqual([
-      { slug: "alpha", runs: [] },
-      { slug: "beta", runs: [expect.objectContaining({ run_id: "r1" })] },
+      // A failed fetch is MARKED, never silently identical to zero runs.
+      { slug: "alpha", runs: [], error: true },
+      { slug: "beta", runs: [expect.objectContaining({ run_id: "r1" })], truncated: false },
     ]);
   });
 });
