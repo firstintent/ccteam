@@ -92,6 +92,18 @@ pub const SCHEDULED_ENQUEUED: &str = "scheduled_enqueued";
 pub const SCHEDULED_CANCELLED: &str = "scheduled_cancelled";
 pub const SCHEDULED_FIRED: &str = "scheduled_fired";
 pub const SCHEDULED_FAILED: &str = "scheduled_failed";
+// 2026-09-01 — `ccteam flow run` RUN-LEVEL envelope. Deliberately three kinds
+// and no per-agent row: every hire a flow makes is already an ordinary
+// delegation on the ledger (`delegation_*`, joined to its run through
+// `parent_sid`), so duplicating leaf detail here would put the same fact in two
+// places. What lives NOWHERE outside the run directory is the envelope — which
+// hires belonged to one run, what that run was called, and how it ended — and
+// that is exactly what these three carry. The runner is a CLI process, not the
+// daemon, so it submits them through the `flow-run` hook; the schema still
+// belongs here, with every other kind.
+pub const FLOW_RUN_STARTED: &str = "flow_run_started";
+pub const FLOW_RUN_FINISHED: &str = "flow_run_finished";
+pub const FLOW_BRAKE_TRIPPED: &str = "flow_brake_tripped";
 
 pub const CODEX_PLAN_UPDATED: &str = "codex_plan_updated";
 pub const CODEX_TOKEN_USAGE: &str = "codex_token_usage";
@@ -137,6 +149,9 @@ pub enum EventKind {
     ScheduledCancelled,
     ScheduledFired,
     ScheduledFailed,
+    FlowRunStarted,
+    FlowRunFinished,
+    FlowBrakeTripped,
     CodexPlanUpdated,
     CodexTokenUsage,
     CodexThreadStatus,
@@ -178,6 +193,9 @@ impl EventKind {
         EventKind::ScheduledCancelled,
         EventKind::ScheduledFired,
         EventKind::ScheduledFailed,
+        EventKind::FlowRunStarted,
+        EventKind::FlowRunFinished,
+        EventKind::FlowBrakeTripped,
         EventKind::CodexPlanUpdated,
         EventKind::CodexTokenUsage,
         EventKind::CodexThreadStatus,
@@ -219,6 +237,9 @@ impl EventKind {
             EventKind::ScheduledCancelled => SCHEDULED_CANCELLED,
             EventKind::ScheduledFired => SCHEDULED_FIRED,
             EventKind::ScheduledFailed => SCHEDULED_FAILED,
+            EventKind::FlowRunStarted => FLOW_RUN_STARTED,
+            EventKind::FlowRunFinished => FLOW_RUN_FINISHED,
+            EventKind::FlowBrakeTripped => FLOW_BRAKE_TRIPPED,
             EventKind::CodexPlanUpdated => CODEX_PLAN_UPDATED,
             EventKind::CodexTokenUsage => CODEX_TOKEN_USAGE,
             EventKind::CodexThreadStatus => CODEX_THREAD_STATUS,
@@ -261,6 +282,9 @@ impl EventKind {
             SCHEDULED_CANCELLED => EventKind::ScheduledCancelled,
             SCHEDULED_FIRED => EventKind::ScheduledFired,
             SCHEDULED_FAILED => EventKind::ScheduledFailed,
+            FLOW_RUN_STARTED => EventKind::FlowRunStarted,
+            FLOW_RUN_FINISHED => EventKind::FlowRunFinished,
+            FLOW_BRAKE_TRIPPED => EventKind::FlowBrakeTripped,
             CODEX_PLAN_UPDATED => EventKind::CodexPlanUpdated,
             CODEX_TOKEN_USAGE => EventKind::CodexTokenUsage,
             CODEX_THREAD_STATUS => EventKind::CodexThreadStatus,
@@ -322,6 +346,16 @@ pub const fn class(kind: EventKind) -> EventClass {
         | EventKind::ScheduledCancelled
         | EventKind::ScheduledFired
         | EventKind::ScheduledFailed
+        // Flow-run envelope rows are one-off lifecycle facts, exactly like the
+        // `delegation_*` family: each says a thing HAPPENED at a point in time
+        // (a run opened, a brake tripped, a run ended) rather than restating a
+        // value that keeps changing. Collapsing them under `LatestState` would
+        // be wrong twice over — two concurrent runs of the same project would
+        // suppress each other, and losing the `started` row would leave a
+        // `finished` row that no reader can attribute to a run.
+        | EventKind::FlowRunStarted
+        | EventKind::FlowRunFinished
+        | EventKind::FlowBrakeTripped
         | EventKind::CodexPlanUpdated
         | EventKind::TypedEvent
         | EventKind::MergerLossyPartial => EventClass::Fact,
@@ -1706,6 +1740,92 @@ pub fn build_scheduled_event(
     ev
 }
 
+/// Cap one free-text field a flow script chose the contents of. The ledger is
+/// an append-only file every reader tails; a script's `meta.description` (or a
+/// brake reason built from a template) must not be able to make one row
+/// kilobytes wide. Truncation is by CHARACTER so the row stays valid UTF-8.
+fn capped(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+/// A flow run opened. `run_id` is the run directory's basename — stable for
+/// the life of the run (a `--resume` continues the SAME id) and therefore the
+/// join key between this row, its `flow_run_finished` partner, and the
+/// on-disk journal an evaluation reads.
+///
+/// `started_at` is the RUN's clock, not the daemon's: the row is submitted by
+/// a CLI process over HTTP, so `ts` (when the ledger accepted it) and
+/// `started_at` (when the run actually began) are different facts and both are
+/// kept. `parent_sid` is the managed session that launched the run — the same
+/// attribution its hires carry — and is omitted when a flow was started from a
+/// plain shell that belongs to no session.
+pub fn build_flow_run_started_event(
+    run_id: &str,
+    project: &str,
+    parent_sid: Option<&str>,
+    name: &str,
+    description: &str,
+    script_path: &str,
+    started_at: &str,
+) -> Value {
+    let mut event = json!({
+        "event": FLOW_RUN_STARTED,
+        "run_id": run_id,
+        "project": project,
+        "name": capped(name, 120),
+        "description": capped(description, 400),
+        "script_path": capped(script_path, 512),
+        "started_at": started_at,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(parent_sid) = parent_sid.filter(|sid| !sid.is_empty()) {
+        event["parent_sid"] = Value::String(parent_sid.to_string());
+    }
+    event
+}
+
+/// A flow run ended. `ok` is the runner's own verdict (false when the script
+/// threw or a brake ended the run early); `brake` names the brake when one
+/// tripped, so a reader can tell "the plan refused to admit more work" from
+/// "the plan broke" without replaying the run directory.
+pub fn build_flow_run_finished_event(
+    run_id: &str,
+    project: &str,
+    agents: usize,
+    cost_usd: f64,
+    ok: bool,
+    brake: Option<&str>,
+    finished_at: &str,
+) -> Value {
+    let mut event = json!({
+        "event": FLOW_RUN_FINISHED,
+        "run_id": run_id,
+        "project": project,
+        "agents": agents,
+        "cost_usd": cost_usd,
+        "ok": ok,
+        "finished_at": finished_at,
+        "ts": Utc::now().to_rfc3339(),
+    });
+    if let Some(brake) = brake.filter(|reason| !reason.is_empty()) {
+        event["brake"] = Value::String(capped(brake, 256));
+    }
+    event
+}
+
+/// A brake refused a flow run new admissions. Emitted once, at the moment
+/// admission first refuses — in-flight workers keep running, so this row is
+/// NOT the end of the run and never replaces `flow_run_finished`.
+pub fn build_flow_brake_tripped_event(run_id: &str, project: &str, reason: &str) -> Value {
+    json!({
+        "event": FLOW_BRAKE_TRIPPED,
+        "run_id": run_id,
+        "project": project,
+        "reason": capped(reason, 256),
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
 pub fn build_codex_plan_updated_event(
     thread_id: &str,
     turn_id: &str,
@@ -1848,6 +1968,99 @@ mod tests {
             "connection failed",
         );
         assert!(without_turn.get("turn_id").is_none());
+    }
+
+    #[test]
+    fn flow_run_kinds_round_trip_their_wire_names_and_persist_as_facts() {
+        for kind in [
+            EventKind::FlowRunStarted,
+            EventKind::FlowRunFinished,
+            EventKind::FlowBrakeTripped,
+        ] {
+            assert_eq!(EventKind::from_wire_name(kind.wire_name()), Some(kind));
+            assert!(EventKind::ALL.contains(&kind), "{kind:?} missing from ALL");
+            // A run envelope must never be collapsed: two concurrent runs would
+            // suppress each other under LatestState.
+            assert_eq!(class(kind), EventClass::Fact, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn flow_run_started_keeps_both_clocks_and_omits_an_absent_parent() {
+        let attributed = build_flow_run_started_event(
+            "audit-20260901-101500",
+            "alpha",
+            Some("s42"),
+            "audit-routes",
+            "Audit route handlers",
+            "/w/flow.js",
+            "2026-09-01T10:15:00Z",
+        );
+        assert_eq!(attributed["event"], FLOW_RUN_STARTED);
+        assert_eq!(attributed["run_id"], "audit-20260901-101500");
+        assert_eq!(attributed["parent_sid"], "s42");
+        // `started_at` is the run's clock; `ts` is when the ledger took the row.
+        assert_eq!(attributed["started_at"], "2026-09-01T10:15:00Z");
+        assert!(attributed["ts"].is_string());
+
+        let from_a_plain_shell = build_flow_run_started_event(
+            "audit-20260901-101500",
+            "alpha",
+            None,
+            "audit-routes",
+            "",
+            "/w/flow.js",
+            "2026-09-01T10:15:00Z",
+        );
+        assert!(from_a_plain_shell.get("parent_sid").is_none());
+    }
+
+    #[test]
+    fn flow_run_finished_names_a_brake_only_when_one_tripped() {
+        let clean = build_flow_run_finished_event(
+            "r1",
+            "alpha",
+            5,
+            1.25,
+            true,
+            None,
+            "2026-09-01T10:20:00Z",
+        );
+        assert_eq!(clean["agents"], 5);
+        assert_eq!(clean["cost_usd"], 1.25);
+        assert_eq!(clean["ok"], true);
+        assert!(clean.get("brake").is_none());
+
+        let braked = build_flow_run_finished_event(
+            "r1",
+            "alpha",
+            5,
+            1.25,
+            false,
+            Some("max_agents"),
+            "2026-09-01T10:20:00Z",
+        );
+        assert_eq!(braked["ok"], false);
+        assert_eq!(braked["brake"], "max_agents");
+    }
+
+    #[test]
+    fn flow_free_text_cannot_widen_a_ledger_row_without_bound() {
+        let event = build_flow_run_started_event(
+            "r1",
+            "alpha",
+            None,
+            &"n".repeat(500),
+            &"d".repeat(5_000),
+            &"p".repeat(2_000),
+            "2026-09-01T10:15:00Z",
+        );
+        assert_eq!(event["name"].as_str().unwrap().chars().count(), 120);
+        assert_eq!(event["description"].as_str().unwrap().chars().count(), 400);
+        assert_eq!(event["script_path"].as_str().unwrap().chars().count(), 512);
+
+        let brake = build_flow_brake_tripped_event("r1", "alpha", &"why ".repeat(500));
+        assert_eq!(brake["reason"].as_str().unwrap().chars().count(), 256);
     }
 
     #[test]
