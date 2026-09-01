@@ -144,12 +144,12 @@ const reviews = await pipeline(
   files.trim().split('\n').filter(Boolean),
   (f) => agent(
     'Load the ccteam tools with ToolSearch (select:mcp__ccteam__agent,mcp__ccteam__agent_read). ' +
-    `Hire codex: mcp__ccteam__agent{task:"Review ${'$'}{f} for correctness bugs. VERDICT first line.", vendor:"codex", wait:240}; ` +
+    `Hire codex: mcp__ccteam__agent{task:"Review ${f} for correctness bugs. VERDICT first line.", vendor:"codex", wait:240}; ` +
     'poll mcp__ccteam__agent_read{sid, wait:240} if pending. Return ONLY the worker\'s final text.',
     { label: f },
   ),
 )
-return await agent(`Merge into one ranked list:\n${'$'}{JSON.stringify(reviews.filter(Boolean))}`)
+return await agent(`Merge into one ranked list:\n${JSON.stringify(reviews.filter(Boolean))}`)
 ```
 
 完整版见 [`examples/claude-native/`](../examples/claude-native/)。与 ccteam Flow 的诚实对照:
