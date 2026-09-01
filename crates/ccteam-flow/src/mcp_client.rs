@@ -76,6 +76,13 @@ pub struct McpFlowClient {
     endpoint: McpEndpoint,
     next_id: AtomicU64,
     state: Mutex<ClientState>,
+    /// Single-flight gate around `initialize`. Two concurrent FIRST calls both
+    /// find `session: None`, and without a gate each opens its own binding —
+    /// the daemon then mints a SECOND enrolled ledger node and one run shows up
+    /// as several unrelated parents (measured live: leaves under s494/s495/s496
+    /// for a single flow). Async rather than [`Mutex`] because the critical
+    /// section awaits an HTTP round trip.
+    opening: tokio::sync::Mutex<()>,
     /// Give up on one turn after this long. `None` (the default) waits as long
     /// as the worker takes — a workflow's stop conditions are its brakes, not
     /// an arbitrary clock on somebody else's thinking.
@@ -129,6 +136,39 @@ enum Retry {
     Once,
 }
 
+/// What one [`McpFlowClient::await_turn`] wait produced.
+///
+/// The flag is what keeps a cursor alive. Only a real turn boundary retires the
+/// dispatch this client is waiting for; a timeout consumed nothing, so the next
+/// attempt has to resume from the SAME `since` — re-attaching with no anchor
+/// hands back the session's PREVIOUS answer as this task's result.
+struct Awaited {
+    outcome: AgentOutcome,
+    boundary: bool,
+}
+
+impl Awaited {
+    /// The turn ended (or is provably never coming): the cursor is spent.
+    fn boundary(outcome: AgentOutcome) -> Self {
+        Self {
+            outcome,
+            boundary: true,
+        }
+    }
+
+    /// The deadline hit while the worker was still mid-turn.
+    fn timed_out() -> Self {
+        Self {
+            outcome: AgentOutcome {
+                failed: true,
+                error_kind: Some("timeout".into()),
+                ..AgentOutcome::default()
+            },
+            boundary: false,
+        }
+    }
+}
+
 /// What one attempt at a `tools/call` produced.
 enum Attempt {
     /// The tool's own body (already unwrapped from `content[0].text`).
@@ -154,6 +194,7 @@ impl McpFlowClient {
             endpoint,
             next_id: AtomicU64::new(1),
             state: Mutex::new(ClientState::default()),
+            opening: tokio::sync::Mutex::new(()),
             turn_timeout: None,
         })
     }
@@ -216,7 +257,18 @@ impl McpFlowClient {
     }
 
     /// The current binding, opening one if there is none.
+    ///
+    /// Single-flight: the cache check is repeated UNDER `opening`, so of N
+    /// racing callers exactly one initializes and the rest reuse its binding.
+    /// The `-32001` re-initialize path arrives here the same way (the stale
+    /// entry is cleared first), so it is serialized by the same gate.
     async fn session(&self) -> Result<Session, ClientError> {
+        if let Some(session) = self.lock().session.clone() {
+            return Ok(session);
+        }
+        let _opening = self.opening.lock().await;
+        // Whoever held the gate may have just opened one, and a second
+        // `initialize` here is exactly the duplicate enrolled ledger node.
         if let Some(session) = self.lock().session.clone() {
             return Ok(session);
         }
@@ -252,14 +304,42 @@ impl McpFlowClient {
                 raw.body.trim()
             ))
         })?;
-        let protocol = serde_json::from_str::<Value>(&raw.body)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/result/protocolVersion")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|p| !p.is_empty());
+        // The envelope is CHECKED, not sniffed. A body that carries no `result`
+        // object is not an `initialize` answer at all (a proxy's error page, a
+        // JSON-RPC error, a truncated read); binding to it would leave the
+        // client holding a session the server never confirmed, and every later
+        // call would fail with a message about the wrong thing.
+        let parsed = serde_json::from_str::<Value>(&raw.body).map_err(|err| {
+            ClientError::Failed(format!(
+                "MCP initialize answered unreadable JSON ({err}): {}",
+                raw.body.trim()
+            ))
+        })?;
+        // A result object alone is not a JSON-RPC answer: without the
+        // envelope fields this could be any JSON that happens to nest one.
+        if parsed.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(ClientError::Failed(format!(
+                "MCP initialize answered without jsonrpc 2.0: {}",
+                raw.body.trim()
+            )));
+        }
+        if parsed.get("id").is_none() {
+            return Err(ClientError::Failed(format!(
+                "MCP initialize answered without an id: {}",
+                raw.body.trim()
+            )));
+        }
+        let Some(result) = parsed.get("result").filter(|value| value.is_object()) else {
+            return Err(ClientError::Failed(format!(
+                "MCP initialize answered without a result object: {}",
+                raw.body.trim()
+            )));
+        };
+        let protocol = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
         let session = Session { id, protocol };
         // Spec handshake completion. The daemon does not track it (a
         // notification answers 202 and nothing else), so a failure here is not
@@ -401,14 +481,28 @@ impl McpFlowClient {
         sid: &str,
         since: Option<String>,
         require_new: bool,
-    ) -> Result<AgentOutcome, ClientError> {
+    ) -> Result<Awaited, ClientError> {
         let deadline = self
             .turn_timeout
             .map(|limit| tokio::time::Instant::now() + limit);
         loop {
+            // The configured timeout is the caller's brake, so it has to bound
+            // the REQUEST and not merely the gap between requests: a 240s long
+            // poll consulted only after it returns turns a 2s budget into a
+            // four-minute wait. Ask for exactly what is left.
+            let wait = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    match poll_wait_secs(remaining) {
+                        Some(wait) => wait,
+                        None => return Ok(Awaited::timed_out()),
+                    }
+                }
+                None => READ_WAIT_SECS,
+            };
             let mut args = Map::new();
             args.insert("sid".into(), json!(sid));
-            args.insert("wait".into(), json!(READ_WAIT_SECS));
+            args.insert("wait".into(), json!(wait));
             args.insert("n".into(), json!(READ_PAGE));
             args.insert("tail".into(), json!(true));
             args.insert("project".into(), json!(self.endpoint.project));
@@ -419,7 +513,19 @@ impl McpFlowClient {
                 .call_tool("agent_read", Value::Object(args), Retry::Idempotent)
                 .await?;
 
-            let working = body.get("activity").and_then(Value::as_str) == Some("working");
+            // `stuck` is the SAME in-flight turn, only silent past the watchdog
+            // window (`ccteam_core::stall::classify_session_activity` promotes
+            // a quiet live turn to it). A worker that stopped narrating has not
+            // answered, so treating `stuck` as "turn over" returns whatever
+            // interim row was mirrored last as the final result — which is what
+            // a timed-out long poll on a thinking worker looks like. `stale`
+            // stays OUT: it is a file-age verdict with no live turn, and the
+            // same resolver already promotes a stale session that HAS one back
+            // to `working`.
+            let in_flight = matches!(
+                body.get("activity").and_then(Value::as_str),
+                Some("working") | Some("stuck")
+            );
             let rows = body
                 .get("turns")
                 .and_then(Value::as_array)
@@ -428,30 +534,49 @@ impl McpFlowClient {
             if let Some(cursor) = body.get("cursor").and_then(Value::as_str) {
                 self.remember_cursor(sid, cursor);
             }
-            if !working {
+            if !in_flight {
                 if let Some(row) = rows.last() {
-                    return Ok(self.charge(sid, outcome_from_read(&body, row)));
+                    return Ok(Awaited::boundary(
+                        self.charge(sid, outcome_from_read(&body, row)),
+                    ));
                 }
                 if !require_new {
                     // Re-attach to a session that is idle and has said nothing:
                     // the answer this run is waiting for will never come.
-                    return Ok(AgentOutcome {
+                    return Ok(Awaited::boundary(AgentOutcome {
                         failed: true,
                         error_kind: Some("no_answer".into()),
                         ..AgentOutcome::default()
-                    });
+                    }));
                 }
             }
-            if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
-                return Ok(AgentOutcome {
-                    failed: true,
-                    error_kind: Some("timeout".into()),
-                    ..AgentOutcome::default()
-                });
-            }
-            tokio::time::sleep(POLL_GAP).await;
+            // Checked BEFORE the spin guard costs another round trip, and the
+            // guard itself never sleeps past the deadline.
+            let gap = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(Awaited::timed_out());
+                    }
+                    POLL_GAP.min(remaining)
+                }
+                None => POLL_GAP,
+            };
+            tokio::time::sleep(gap).await;
         }
     }
+}
+
+/// How long the next `agent_read` may block, given what is left of the turn
+/// deadline. `None` once the deadline is spent. Rounded DOWN so the daemon is
+/// never asked to block past the deadline (a sub-second remainder becomes a
+/// `wait:0` snapshot and the expiry check right after it fires the timeout);
+/// capped at the daemon's own long-poll ceiling.
+fn poll_wait_secs(remaining: Duration) -> Option<u64> {
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.as_secs().min(READ_WAIT_SECS))
 }
 
 // ── pure response handling (unit-tested against canned JSON) ────────────────
@@ -491,18 +616,32 @@ fn interpret(tool: &str, raw: RawResponse) -> Attempt {
             raw.body.trim()
         )));
     };
-    let text = result
-        .pointer("/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let text = result.pointer("/content/0/text").and_then(Value::as_str);
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Attempt::Failed(classify_refusal(tool, text));
+        // A refusal's text is optional — `classify_refusal` already words the
+        // textless case — so the structural check below must not run first.
+        return Attempt::Failed(classify_refusal(tool, text.unwrap_or_default()));
     }
+    // A SUCCESS envelope, on the other hand, promises a body. Missing or empty
+    // `content[0].text` used to become `Body(Null)`, which reads downstream as
+    // "no sid", "no activity", "no usage" — a malformed answer silently
+    // impersonating an empty one, and an `await_turn` that polls forever.
+    let Some(text) = text.filter(|text| !text.is_empty()) else {
+        return Attempt::Failed(ClientError::Failed(format!(
+            "{tool}: success answer carried no content[0].text: {}",
+            raw.body.trim()
+        )));
+    };
     // The body is JSON inside a text block. A server that answered prose is
     // not a crash — it is a call that produced nothing usable.
     match serde_json::from_str::<Value>(text) {
+        // Every ccteam tool body is an object; a literal `null` would slip
+        // through the non-empty-text gate above and impersonate absence
+        // downstream (the forever-poll class this validation exists for).
+        Ok(Value::Null) => Attempt::Failed(ClientError::Failed(format!(
+            "{tool}: success answer carried a JSON null body"
+        ))),
         Ok(value) => Attempt::Body(value),
-        Err(_) if text.is_empty() => Attempt::Body(Value::Null),
         Err(_) => Attempt::Failed(ClientError::Failed(format!("{tool}: {text}"))),
     }
 }
@@ -664,22 +803,41 @@ impl FlowClient for McpFlowClient {
         if let Some(outcome) = inline_outcome(&body) {
             return Ok(self.charge(sid, outcome));
         }
-        self.await_turn(sid, since, true).await
+        // The dispatch landed, so record what anchors ITS answer — exactly what
+        // `hire` does. Without this, a wait killed by a transport blip leaves no
+        // trace of the cursor, and the next `await_outcome` on this sid
+        // re-attaches with no anchor and returns the PREVIOUS answer.
+        self.lock().awaiting.insert(sid.to_string(), since.clone());
+        let awaited = self.await_turn(sid, since, true).await?;
+        if awaited.boundary {
+            self.lock().awaiting.remove(sid);
+        }
+        Ok(awaited.outcome)
     }
 
     async fn await_outcome(&self, sid: &str) -> Result<AgentOutcome, ClientError> {
+        // The cursor is READ, not taken. A wait that ends in a transport error
+        // or a timeout has NOT reached a turn boundary; a second `await_outcome`
+        // that found the entry already gone would take the re-attach branch
+        // (no anchor, newest-turn-wins) and answer with the session's previous
+        // reply. Only a boundary retires it.
         let (dispatched, inline) = {
             let mut state = self.lock();
-            (state.awaiting.remove(sid), state.inline.remove(sid))
+            (state.awaiting.get(sid).cloned(), state.inline.remove(sid))
         };
         if let Some(outcome) = inline {
+            self.lock().awaiting.remove(sid);
             return Ok(self.charge(sid, outcome));
         }
-        match dispatched {
-            Some(since) => self.await_turn(sid, since, true).await,
+        let awaited = match dispatched {
+            Some(since) => self.await_turn(sid, since, true).await?,
             // Re-attach: the journal says a previous run dispatched here.
-            None => self.await_turn(sid, None, false).await,
+            None => self.await_turn(sid, None, false).await?,
+        };
+        if awaited.boundary {
+            self.lock().awaiting.remove(sid);
         }
+        Ok(awaited.outcome)
     }
 
     async fn stop(&self, sid: &str) -> Result<(), ClientError> {
@@ -894,6 +1052,97 @@ mod tests {
         ));
         assert!(matches!(err, ClientError::Failed(_)), "{err}");
         assert!(err.to_string().contains("auth required"), "{err}");
+    }
+
+    /// A SUCCESS envelope promises a body. Answering one without
+    /// `content[0].text` used to yield `Body(Null)`, i.e. a malformed answer
+    /// impersonating an empty one — "agent: answer carried no sid" for a
+    /// server that is simply broken.
+    #[test]
+    fn a_success_answer_without_content_text_is_named_not_nulled() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "isError": false },
+        })
+        .to_string();
+        let err = error_of(interpret("agent", raw(200, &response)));
+        assert!(matches!(err, ClientError::Failed(_)), "{err}");
+        assert!(err.to_string().contains("content[0].text"), "{err}");
+    }
+
+    /// Same for a `result` that is not the object the protocol promises: the
+    /// pointer simply cannot land, and the client says so instead of guessing.
+    #[test]
+    fn a_json_null_body_is_a_named_failure_not_an_empty_answer() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "content": [{ "type": "text", "text": "null" }] },
+        })
+        .to_string();
+        let err = error_of(interpret("agent", raw(200, &response)));
+        assert!(err.to_string().contains("JSON null body"), "{err}");
+    }
+
+    #[test]
+    fn a_result_that_is_not_an_object_is_a_readable_failure() {
+        let err = error_of(interpret(
+            "status",
+            raw(200, r#"{"jsonrpc":"2.0","id":1,"result":"ok"}"#),
+        ));
+        assert!(err.to_string().contains("content[0].text"), "{err}");
+        assert!(err.to_string().contains("\"result\":\"ok\""), "{err}");
+    }
+
+    /// An empty text is the same malformation wearing a different hat — and the
+    /// one that hurts most, because `await_turn` would poll a `Null` body
+    /// forever rather than fail.
+    #[test]
+    fn an_empty_content_text_is_a_failure_not_a_silent_null() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "content": [{ "type": "text", "text": "" }], "isError": false },
+        })
+        .to_string();
+        let err = error_of(interpret("agent_read", raw(200, &response)));
+        assert!(err.to_string().contains("content[0].text"), "{err}");
+    }
+
+    /// Refusal semantics are untouched by that check: a textless `isError` is
+    /// still a refusal (a verdict), never a malformation report.
+    #[test]
+    fn a_refusal_without_text_is_still_a_refusal() {
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "isError": true },
+        })
+        .to_string();
+        let err = error_of(interpret("agent", raw(200, &response)));
+        assert!(matches!(err, ClientError::Refused(_)), "{err}");
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    /// A configured turn timeout must bound the REQUEST, not just the gap
+    /// between requests, or a 2s budget waits out a 240s long poll.
+    #[test]
+    fn a_poll_never_asks_to_block_past_the_deadline() {
+        use std::time::Duration;
+        assert_eq!(poll_wait_secs(Duration::ZERO), None);
+        // Sub-second remainder: a wait:0 snapshot, never a 1s overshoot.
+        assert_eq!(poll_wait_secs(Duration::from_millis(1)), Some(0));
+        assert_eq!(poll_wait_secs(Duration::from_millis(999)), Some(0));
+        assert_eq!(poll_wait_secs(Duration::from_millis(1500)), Some(1));
+        assert_eq!(poll_wait_secs(Duration::from_secs(500)), Some(240));
+    }
+
+    /// A timeout is not a turn boundary: nothing was consumed, so the cursor
+    /// the next attempt needs must survive it.
+    #[test]
+    fn only_a_boundary_retires_the_cursor() {
+        assert!(Awaited::boundary(AgentOutcome::text("done")).boundary);
+        let timed_out = Awaited::timed_out();
+        assert!(!timed_out.boundary);
+        assert!(timed_out.outcome.failed);
+        assert_eq!(timed_out.outcome.error_kind.as_deref(), Some("timeout"));
     }
 
     #[test]

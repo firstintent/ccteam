@@ -14,7 +14,9 @@
 //! No `$HOME`, no daemon, no vendor: a raw HTTP/1.1 stub on loopback.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ccteam_flow::{FlowClient, HireSpec, McpEndpoint, McpFlowClient};
 use serde_json::{json, Value};
@@ -47,11 +49,46 @@ impl Stub {
             })
             .collect()
     }
+
+    /// Just the `agent_read` arguments, in order.
+    fn reads(&self) -> Vec<Value> {
+        self.tool_calls()
+            .into_iter()
+            .filter(|(name, _)| name == "agent_read")
+            .map(|(_, args)| args)
+            .collect()
+    }
+
+    /// How many bindings the client opened. One per client is the contract:
+    /// every extra `initialize` is another enrolled ledger node at the daemon.
+    fn initializes(&self) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|req| req["method"] == "initialize")
+            .count()
+    }
 }
 
-async fn spawn_stub<F>(reply: F) -> Stub
+/// What the stub does with one request.
+enum Reply {
+    /// 200 carrying this JSON-RPC envelope.
+    Json(Value),
+    /// The same, after a delay — the stub honouring a long poll's `wait`.
+    Slow(Duration, Value),
+    /// 202 with no body: how the daemon answers a notification.
+    Accepted,
+    /// Close the socket without answering — a transport blip.
+    Hangup,
+}
+
+/// Full control over the JSON-RPC envelope, for the malformed-answer and
+/// transport-failure cases. [`spawn_stub`] is this with the well-formed
+/// envelope filled in.
+async fn spawn_raw_stub<F>(reply: F) -> Stub
 where
-    F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
+    F: Fn(&Value) -> Reply + Send + Sync + 'static,
 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -70,35 +107,60 @@ where
                     return;
                 };
                 seen.lock().unwrap().push(req.clone());
-                let response = match req["method"].as_str().unwrap_or("") {
-                    "initialize" => Some(json!({
-                        "jsonrpc": "2.0", "id": req["id"],
-                        "result": {
-                            "protocolVersion": "2025-06-18",
-                            "capabilities": { "tools": {} },
-                            "serverInfo": { "name": "ccteam", "version": "test" },
-                        },
-                    })),
-                    // Notifications answer 202 with no body, exactly like the
-                    // daemon; a client that mis-handles that hangs here.
-                    "notifications/initialized" => None,
-                    _ => {
-                        let name = req["params"]["name"].as_str().unwrap_or("");
-                        let body = reply(name, &req["params"]["arguments"]);
-                        Some(json!({
-                            "jsonrpc": "2.0", "id": req["id"],
-                            "result": {
-                                "content": [{ "type": "text", "text": body.to_string() }],
-                                "isError": false,
-                            },
-                        }))
+                let body = match reply(&req) {
+                    Reply::Json(body) => Some(body),
+                    Reply::Slow(delay, body) => {
+                        tokio::time::sleep(delay).await;
+                        Some(body)
                     }
+                    Reply::Accepted => None,
+                    Reply::Hangup => return,
                 };
-                let _ = write_response(&mut socket, response).await;
+                let _ = write_response(&mut socket, body).await;
             });
         }
     });
     Stub { addr, requests }
+}
+
+async fn spawn_stub<F>(reply: F) -> Stub
+where
+    F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
+{
+    spawn_raw_stub(move |req| match req["method"].as_str().unwrap_or("") {
+        "initialize" => Reply::Json(initialize_ok(&req["id"])),
+        // Notifications answer 202 with no body, exactly like the daemon; a
+        // client that mis-handles that hangs here.
+        "notifications/initialized" => Reply::Accepted,
+        _ => {
+            let name = req["params"]["name"].as_str().unwrap_or("");
+            let body = reply(name, &req["params"]["arguments"]);
+            Reply::Json(tool_ok(&req["id"], &body))
+        }
+    })
+    .await
+}
+
+fn initialize_ok(id: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": id,
+        "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "ccteam", "version": "test" },
+        },
+    })
+}
+
+/// The daemon's shape: the tool body is JSON inside `content[0].text`.
+fn tool_ok(id: &Value, body: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0", "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": body.to_string() }],
+            "isError": false,
+        },
+    })
 }
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<Value> {
@@ -321,6 +383,238 @@ async fn a_failed_turn_and_a_stop_round_trip() {
     );
     client.stop("s9").await.expect("stop");
     assert_eq!(stub.tool_calls().last().unwrap().0, "agent_stop");
+}
+
+/// A wait killed by transport is NOT a turn boundary. The dispatch is still
+/// unanswered, so the retry must resume from the SAME anchor; a client that
+/// dropped the cursor re-attaches blind and hands back the session's PREVIOUS
+/// answer as this task's result — every call returns text, just the wrong text.
+#[tokio::test]
+async fn a_wait_killed_by_transport_resumes_from_the_same_cursor() {
+    let anchored = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::clone(&anchored);
+    let stub = spawn_raw_stub(move |req| {
+        match req["method"].as_str().unwrap_or("") {
+            "initialize" => return Reply::Json(initialize_ok(&req["id"])),
+            "notifications/initialized" => return Reply::Accepted,
+            _ => {}
+        }
+        let id = &req["id"];
+        let args = &req["params"]["arguments"];
+        if req["params"]["name"] == "agent" {
+            return Reply::Json(tool_ok(
+                id,
+                &json!({ "sid": "s9", "turn_id": "s9-2", "status": "pending" }),
+            ));
+        }
+        match args.get("since").and_then(Value::as_str) {
+            // The pre-dispatch cursor probe — and anything else that forgot to
+            // anchor, which is the bug: it takes the session's first answer.
+            None => Reply::Json(tool_ok(
+                id,
+                &json!({
+                    "activity": "idle",
+                    "cursor": "t1",
+                    "turns": [{ "turn_id": "t1", "content": "the STALE first answer" }],
+                }),
+            )),
+            // Anchored reads: the first FOUR die on transport — two waits, each
+            // spending the one retry `call_tool` allows — and the rest answer
+            // honestly. Two in a row on purpose: the anchor has to survive
+            // every failed wait, not just the first.
+            Some("t1") if attempts.fetch_add(1, Ordering::SeqCst) < 4 => Reply::Hangup,
+            Some("t1") => Reply::Json(tool_ok(
+                id,
+                &json!({
+                    "activity": "idle",
+                    "cursor": "t2",
+                    "turns": [{ "turn_id": "t2", "content": "the answer to the follow-up" }],
+                }),
+            )),
+            Some(_) => Reply::Hangup,
+        }
+    })
+    .await;
+    let client = client(&stub);
+
+    let died = client.follow_up("s9", "and now the second thing").await;
+    assert!(died.is_err(), "the follow-up's wait died: {died:?}");
+    let died_again = client.await_outcome("s9").await;
+    assert!(died_again.is_err(), "the retry died too: {died_again:?}");
+
+    let outcome = client.await_outcome("s9").await.expect("resumed wait");
+    assert_eq!(
+        outcome.text, "the answer to the follow-up",
+        "a dead wait must not retire the cursor",
+    );
+
+    let reads = stub.reads();
+    assert!(
+        reads.len() >= 6,
+        "probe + four dead reads + a live one: {reads:?}",
+    );
+    assert!(
+        reads[1..].iter().all(|args| args["since"] == "t1"),
+        "every read after the probe resumes from the SAME cursor: {reads:?}",
+    );
+}
+
+/// `stuck` is the daemon's word for a LIVE turn gone silent past the watchdog
+/// window, not for a finished one. Accepting it as "turn over" returns the last
+/// interim narration row as the final answer.
+#[tokio::test]
+async fn a_stuck_session_is_still_mid_turn() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&polls);
+    let stub = spawn_stub(move |name, _args| match name {
+        "agent" => json!({ "sid": "s9", "turn_id": "s9-1", "status": "pending" }),
+        _ if seen.fetch_add(1, Ordering::SeqCst) == 0 => json!({
+            "activity": "stuck",
+            "cursor": "t1",
+            "turns": [{ "turn_id": "t1", "content": "still thinking out loud" }],
+        }),
+        _ => json!({
+            "activity": "idle",
+            "cursor": "t2",
+            "turns": [{ "turn_id": "t2", "content": "the answer" }],
+        }),
+    })
+    .await;
+    let client = client(&stub);
+
+    client.hire(spec("go")).await.expect("hire");
+    let outcome = client.await_outcome("s9").await.expect("await");
+    assert_eq!(
+        outcome.text, "the answer",
+        "a silent worker has not answered — `stuck` is the same turn, still in flight",
+    );
+    assert!(
+        polls.load(Ordering::SeqCst) >= 2,
+        "the client kept polling past the stuck snapshot",
+    );
+}
+
+/// The turn timeout is the caller's brake, so it has to bound the REQUEST: a
+/// 240s long poll consulted only after it returns makes a 2s budget wait four
+/// minutes. The stub honours whatever `wait` it is asked for, so a client that
+/// still asks for 240 blows the wall-clock assertion.
+#[tokio::test]
+async fn a_short_turn_timeout_bounds_the_long_poll_it_asks_for() {
+    let stub = spawn_raw_stub(|req| {
+        match req["method"].as_str().unwrap_or("") {
+            "initialize" => return Reply::Json(initialize_ok(&req["id"])),
+            "notifications/initialized" => return Reply::Accepted,
+            _ => {}
+        }
+        if req["params"]["name"] == "agent" {
+            return Reply::Json(tool_ok(
+                &req["id"],
+                &json!({ "sid": "s9", "turn_id": "s9-1", "status": "pending" }),
+            ));
+        }
+        // Block for what was asked, bounded so a regression fails the test
+        // instead of hanging it.
+        let wait = req["params"]["arguments"]["wait"].as_u64().unwrap_or(0);
+        Reply::Slow(
+            Duration::from_secs(wait.min(20)),
+            tool_ok(&req["id"], &json!({ "activity": "working", "turns": [] })),
+        )
+    })
+    .await;
+    let client = client(&stub).with_turn_timeout(Duration::from_secs(2));
+
+    client.hire(spec("go")).await.expect("hire");
+    let started = std::time::Instant::now();
+    let outcome = client.await_outcome("s9").await.expect("await");
+    let elapsed = started.elapsed();
+
+    assert!(outcome.failed, "a spent deadline is a failure: {outcome:?}");
+    assert_eq!(outcome.error_kind.as_deref(), Some("timeout"));
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline is honoured promptly, not after a full long poll: {elapsed:?}",
+    );
+    let reads = stub.reads();
+    assert!(!reads.is_empty(), "it did poll at least once");
+    assert!(
+        reads.iter().all(|args| args["wait"].as_u64() <= Some(2)),
+        "each poll asks for at most what is left of the deadline: {reads:?}",
+    );
+}
+
+/// `initialize` is the one call whose answer becomes long-lived state. An
+/// envelope with no `result` object is a proxy page or a JSON-RPC error, not a
+/// binding — accepting it leaves the client holding a session the server never
+/// confirmed and misattributes every later failure.
+#[tokio::test]
+async fn a_malformed_initialize_is_a_readable_failure() {
+    let stub = spawn_raw_stub(|req| match req["method"].as_str().unwrap_or("") {
+        "initialize" => Reply::Json(json!({ "jsonrpc": "2.0", "id": req["id"] })),
+        _ => Reply::Accepted,
+    })
+    .await;
+
+    let err = client(&stub)
+        .usage()
+        .await
+        .expect_err("no binding, no call");
+    assert!(err.to_string().contains("initialize"), "{err}");
+    assert!(err.to_string().contains("result object"), "{err}");
+    assert_eq!(stub.initializes(), 1, "it did not retry a malformation");
+}
+
+/// A `tools/call` success envelope with no `content[0].text` used to become
+/// `Body(Null)` and then "answer carried no sid" — the malformation blamed on
+/// the tool. Name it instead.
+#[tokio::test]
+async fn a_success_envelope_without_a_body_names_the_malformation() {
+    let stub = spawn_raw_stub(|req| match req["method"].as_str().unwrap_or("") {
+        "initialize" => Reply::Json(initialize_ok(&req["id"])),
+        "notifications/initialized" => Reply::Accepted,
+        _ => Reply::Json(json!({
+            "jsonrpc": "2.0", "id": req["id"],
+            "result": { "content": [], "isError": false },
+        })),
+    })
+    .await;
+
+    let err = client(&stub).hire(spec("go")).await.expect_err("malformed");
+    assert!(err.to_string().contains("content[0].text"), "{err}");
+    assert!(!err.to_string().contains("no sid"), "{err}");
+}
+
+/// One client is ONE binding. Concurrent first hires all find `session: None`;
+/// without single-flight each opens its own, and the daemon mints an enrolled
+/// ledger node per binding — one flow run appearing as several unrelated
+/// parents (measured live: leaves under s494/s495/s496).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_hires_open_exactly_one_binding() {
+    let stub = spawn_stub(|name, args| match name {
+        "agent" => json!({
+            "sid": format!("s-{}", args["task"].as_str().unwrap_or("?")),
+            "status": "pending",
+        }),
+        _ => json!({ "activity": "idle", "turns": [] }),
+    })
+    .await;
+    let client = Arc::new(client(&stub));
+
+    let racing: Vec<_> = (0..6)
+        .map(|i| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.hire(spec(&format!("task{i}"))).await })
+        })
+        .collect();
+    for hire in racing {
+        hire.await.expect("join").expect("hire");
+    }
+
+    assert_eq!(
+        stub.initializes(),
+        1,
+        "six racing hires share one binding: {:?}",
+        stub.tool_calls(),
+    );
 }
 
 /// `usage()` hands the account snapshot through untouched — the runner takes no

@@ -3627,7 +3627,19 @@ fn page_collected_turns(
     };
     let mut rows: Vec<serde_json::Value> = after
         .iter()
-        .filter(|t| !t.assistant.is_empty())
+        // Assistant-side turns — plus every row that carries a terminal
+        // `outcome`, whose text is routinely empty. TWO writers produce such
+        // rows: a vendor turn that failed before it said anything
+        // (`outcome:"failed"`), and the boot reconcile's `"unobserved"` row
+        // for a turn the restarted daemon never watched end — both are facts
+        // a poller must see instead of the PREVIOUS successful answer.
+        // Dropping those pages the FAILURE out: the session then reads "not
+        // working, here is the last row", and the newest row left is the
+        // PREVIOUS successful answer, which a polling caller returns as the
+        // result of the task that just failed. An empty `content` is the
+        // documented "no answer yet" shape and costs nothing to carry; the
+        // failure it comes with is the whole point of the row.
+        .filter(|t| !t.assistant.is_empty() || t.outcome.is_some())
         .map(|t| {
             let mut row = serde_json::json!({"turn_id": t.turn_id, "content": t.assistant});
             if let Some(outcome) = t.outcome.as_deref() {
@@ -7449,6 +7461,104 @@ mod session_tool_tests {
         assert_eq!(rows2.len(), 2, "only t23/t24 exist after t22");
         assert!(!trunc2);
         assert_eq!(rows2[0]["turn_id"], "t23");
+    }
+
+    /// A vendor turn that failed before it said anything writes kind/error and
+    /// no text. Paging that row out is not a cosmetic loss: the session then
+    /// reads "not working, newest row = the PREVIOUS successful answer", and a
+    /// caller polling for the failed task's result gets that answer instead.
+    /// The row stays, with `content` as the documented empty string.
+    #[test]
+    fn page_collected_turns_keeps_a_failed_turn_that_said_nothing() {
+        let mut failed = turn("t2");
+        failed.assistant = String::new();
+        failed.outcome = Some("failed".into());
+        failed.error_kind = Some("server_overloaded".into());
+        failed.error = Some("Selected model is at capacity.".into());
+        let all = vec![turn("t1"), failed];
+
+        let (rows, cursor, _truncated) = page_collected_turns(&all, None, 10, true);
+        assert_eq!(rows.len(), 2, "the failure is a row, not a gap: {rows:?}");
+        assert_eq!(rows[1]["turn_id"], "t2");
+        assert_eq!(rows[1]["content"], "", "empty text, not a dropped row");
+        assert_eq!(rows[1]["outcome"], "failed");
+        assert_eq!(rows[1]["error_kind"], "server_overloaded");
+        assert_eq!(rows[1]["error"], "Selected model is at capacity.");
+        assert_eq!(
+            cursor.as_deref(),
+            Some("t2"),
+            "and it is the cursor, so the next poll pages past it",
+        );
+
+        // A turn with neither text nor an outcome is still not a row: the
+        // user-side half of an exchange has no business in an answer page.
+        let mut silent = turn("t3");
+        silent.assistant = String::new();
+        let (quiet, _c, _t) = page_collected_turns(&[silent], None, 10, true);
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// The same fact through the tool itself: `agent_read` shows the failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_read_shows_a_failed_turn_that_carried_no_text() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for (turn_id, assistant, failure) in [
+            ("answer-1", "the previous answer", None),
+            ("answer-2", "", Some(("transport", "connection reset"))),
+        ] {
+            ccteam_harness::execution::turns_mirror::append_turn(
+                tmp.path(),
+                &child,
+                &ccteam_harness::execution::turns_mirror::TurnRecord {
+                    turn_id: turn_id.into(),
+                    ts: chrono::Utc::now(),
+                    vendor: "claude".into(),
+                    role: String::new(),
+                    user: "question".into(),
+                    assistant: assistant.into(),
+                    usage: serde_json::Value::Null,
+                    status: None,
+                    tool_calls: Vec::new(),
+                    attachments: Vec::new(),
+                    outcome: failure.map(|_| "failed".to_string()),
+                    error_kind: failure.map(|(kind, _)| kind.to_string()),
+                    error: failure.map(|(_, error)| error.to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        let response = parse(
+            &run_agent_read_transcript(
+                &ambient(&principal, "alpha", json!({ "sid": child, "tail": true })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        let last = response["turns"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            last["turn_id"], "answer-2",
+            "the newest row is the failure, not the answer before it: {response}",
+        );
+        assert_eq!(last["outcome"], "failed");
+        assert_eq!(last["error_kind"], "transport");
+        assert_eq!(last["error"], "connection reset");
     }
 
     #[test]
