@@ -271,7 +271,8 @@ enum FlowCommand {
         #[arg(long, value_name = "SECS")]
         watchdog: Option<u64>,
         /// Attribute hires to this managed session in the delegation tree
-        /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions).
+        /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions;
+        /// pass an empty string to disable the ambient default).
         #[arg(long, value_name = "SID")]
         parent: Option<String>,
     },

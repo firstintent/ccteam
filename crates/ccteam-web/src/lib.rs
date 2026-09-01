@@ -357,6 +357,18 @@ where
         ) {
             tracing::warn!(error = %err, "could not publish the daemon endpoint");
         }
+        // Same truth, second consumer: `run/mcp-url` was recorded by the
+        // launcher from the REQUESTED bind, so a `:0` request (any free
+        // port) — or any gap between asked-for and bound — left MCP
+        // clients dialing a port nobody listens on (issue #7). The process
+        // that owns the port re-records it, under the same daemon-only
+        // gate, so a standalone web never clobbers the daemon's record.
+        if let Err(err) = ccteam_harness::execution::mcp_config::record_daemon_mcp_url(
+            &paths.root.join("run"),
+            &local.to_string(),
+        ) {
+            tracing::warn!(error = %err, "could not re-record the daemon MCP URL from the bound address");
+        }
     }
     let state = build_state(paths, auth_state)
         .with_dsh_web(std::sync::Arc::clone(&supervisor))

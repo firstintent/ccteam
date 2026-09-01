@@ -194,6 +194,19 @@ impl Sandbox {
             .env("FAKE_SJ_ARGV_LOG", &self.spawn_log)
             .env("CCTEAM_STREAM_JSON_INIT_TIMEOUT_MS", "15000")
             .env("RUST_LOG", "warn");
+        // The sandbox must not inherit an ambient managed-session identity:
+        // `ccteam flow run` auto-attributes hires to `$CCTEAM_CHAT_SID`, and
+        // a sid from the DEVELOPER'S live daemon does not exist in this
+        // sandbox daemon — every hire would be (correctly) refused. The same
+        // lesson as pinning HOME, one env family later.
+        for var in [
+            "CCTEAM_CHAT_SID",
+            "CCTEAM_CHAT_SLUG",
+            "CCTEAM_CHAT_SECRET",
+            "CCTEAM_CHAT_ROLE",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd
     }
 
@@ -249,6 +262,15 @@ impl Sandbox {
         assert!(
             started["status"] == "started" || started["status"] == "alreadyRunning",
             "daemon did not start: {started}",
+        );
+        // issue #7 regression: the daemon must re-record run/mcp-url from
+        // the address it BOUND, not the requested bind — MCP clients
+        // (including `ccteam flow run`) resolve the endpoint from this file.
+        let recorded = std::fs::read_to_string(self.ccteam_home.join("run/mcp-url"))
+            .expect("daemon publishes run/mcp-url");
+        assert!(
+            recorded.contains(&format!(":{}/mcp", self.port)),
+            "mcp-url must carry the bound port: {recorded}"
         );
     }
 
