@@ -7248,8 +7248,12 @@ impl Gateway {
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .map(|raw| raw.trim().parse::<u64>());
             let (floor, unreadable) = self.observed_generation_floor();
-            let (next, recovered) =
-                recovered_generation_counter(file.clone(), floor, unix_seconds_now());
+            let (next, recovered) = recovered_generation_counter(
+                file.clone(),
+                floor,
+                unix_seconds_now(),
+                unreadable == 0,
+            );
             if recovered {
                 // A pristine first boot recovers too (there is no file yet) and
                 // is not worth a warning; anything with prior state on disk, or
@@ -7346,33 +7350,31 @@ impl Gateway {
     /// `meta.json` now carries `stopped_at`, so a session the owner explicitly
     /// stopped is skipped here instead of being resurrected — the one-off
     /// "stray `/stop` afterwards" cost this used to accept is gone.
-    /// The highest thread generation any DURABLE record already claims: every
-    /// session's persisted `status.json` stamp and every
-    /// `meta.model_pinned_generation`.
+    /// The highest thread generation any DURABLE record already claims — every
+    /// `meta.model_pinned_generation` and every persisted `status.json` stamp —
+    /// together with how many records the scan could NOT read.
     ///
     /// `docs-local/issues/#14②` — these are the two places a generation
     /// outlives the counter, so they are exactly what the counter must not fall
     /// behind. One boot-time scan over the same `list_session_metas` walk
-    /// `recover_routing_from_meta` already makes; `0` when there is nothing on
-    /// disk yet (a first boot).
+    /// `recover_routing_from_meta` already makes; `(0, 0)` when there is nothing
+    /// on disk yet (a first boot).
+    ///
+    /// The second element is load-bearing: a floor is only a floor if the scan
+    /// saw everything, so any unreadable record makes the whole floor
+    /// uncertifiable and forces a clock recovery (see
+    /// [`recovered_generation_counter`]).
     fn observed_generation_floor(&self) -> (u64, usize) {
+        self.observed_generation_floor_with(&DiskSessionRecords)
+    }
+
+    /// [`Self::observed_generation_floor`] over an injected reader, so the
+    /// "could not read" paths are exercised on ANY uid — a `chmod 000` fixture
+    /// silently does nothing as root, which is exactly when CI runs.
+    fn observed_generation_floor_with(&self, records: &dyn SessionRecordReader) -> (u64, usize) {
         let mut floor = 0u64;
         let mut unreadable = 0usize;
         for (slug, dir) in &self.projects {
-            let (metas, failures) = ccteam_harness::list_session_metas_reporting(dir);
-            for meta in metas {
-                floor = floor.max(meta.model_pinned_generation.unwrap_or(0));
-                if let Some(stamp) =
-                    ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
-                        .and_then(|status| status.generation)
-                {
-                    floor = floor.max(stamp);
-                }
-            }
-            if failures.is_empty() {
-                continue;
-            }
-            unreadable += 1;
             // A satellite project's `.ccteam/` lives on the other host by
             // design, so its absence here is expected, not a fault. Either way
             // the clock floor covers what we could not read.
@@ -7380,19 +7382,48 @@ impl Gateway {
                 self.project_host_binding(slug),
                 Ok((ref host, _)) if host == ccteam_core::LOCAL_HOST
             );
-            for (path, error) in failures {
+            let report = |path: PathBuf, error: std::io::Error| {
                 if remote {
                     tracing::debug!(
                         %slug, path = %path.display(), %error,
-                        "ccteam-im: session metadata unreadable for a non-local project"
+                        "ccteam-im: session record unreadable for a non-local project"
                     );
                 } else {
                     tracing::warn!(
                         %slug, path = %path.display(), %error,
-                        "ccteam-im: session metadata unreadable; thread generations from these \
+                        "ccteam-im: session record unreadable; thread generations from these \
                          sessions cannot be seen and the counter recovers from the clock instead"
                     );
                 }
+            };
+            let (metas, failures) = records.metas(dir);
+            let mut project_unreadable = failures.len();
+            for (path, error) in failures {
+                report(path, error);
+            }
+            for meta in metas {
+                floor = floor.max(meta.model_pinned_generation.unwrap_or(0));
+                match records.status(dir, &meta.sid) {
+                    Ok(Some(status)) => {
+                        if let Some(stamp) = status.generation {
+                            floor = floor.max(stamp);
+                        }
+                    }
+                    // No snapshot yet — that session has simply never reported.
+                    Ok(None) => {}
+                    Err(error) => {
+                        project_unreadable += 1;
+                        report(
+                            ccteam_harness::execution::session_status::status_json_path(
+                                dir, &meta.sid,
+                            ),
+                            error,
+                        );
+                    }
+                }
+            }
+            if project_unreadable > 0 {
+                unreadable += 1;
             }
         }
         (floor, unreadable)
@@ -15134,6 +15165,38 @@ fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDe
 /// `None` = the file is missing, `Some(Err(..))` = present but unparseable.
 /// `floor` is the highest generation any record already claims.
 ///
+/// The two on-disk reads the thread-generation floor is computed from.
+///
+/// A trait only so the FAILURE paths are testable: a `chmod 000` fixture is a
+/// no-op for root, which is precisely the uid CI runs as, so the logic would go
+/// unexercised exactly where it is checked. Production is
+/// [`DiskSessionRecords`]; a test supplies a reader that fails on demand.
+trait SessionRecordReader {
+    fn metas(&self, project_dir: &Path) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>);
+    fn status(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+    ) -> Result<Option<ccteam_harness::ThreadStatus>, std::io::Error>;
+}
+
+/// The real thing: `meta.json` + `status.json` off disk, failures reported.
+struct DiskSessionRecords;
+
+impl SessionRecordReader for DiskSessionRecords {
+    fn metas(&self, project_dir: &Path) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>) {
+        ccteam_harness::list_session_metas_reporting(project_dir)
+    }
+
+    fn status(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+    ) -> Result<Option<ccteam_harness::ThreadStatus>, std::io::Error> {
+        ccteam_harness::execution::session_status::read_status_file_reporting(project_dir, sid)
+    }
+}
+
 /// A healthy file (at or above the floor) is taken verbatim — normal operation
 /// never consults the clock, so a backwards clock step can never lower a
 /// generation. Only the RECOVERY branches bring `now_secs` (unix seconds) in,
@@ -15151,18 +15214,33 @@ fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDe
 /// price is that generations stop being dense after the first recovery; they
 /// are opaque `u64` and nothing depends on their size.
 ///
+/// `saw_everything` is the third input and it is not a detail: a floor is only
+/// a floor if the scan could read every record. When ANY meta or `status.json`
+/// was unreadable, the floor is a lower bound on something we cannot bound, so
+/// even a healthy counter file is not trusted and the clock recovery applies.
+/// The honest posture is that we never certify a floor we could not fully see.
+///
+/// Consequence, stated plainly: an install that always has an unreadable
+/// project — a satellite whose `.ccteam/` lives on another host by design — is
+/// effectively clock-floored on every boot. Its generations jump to
+/// ~unix-seconds once and stay monotonic from there. They are opaque `u64`,
+/// nothing reads them as a count, and no generation is ever reused.
+///
 /// Returns `(next, recovered)`; `recovered` is true whenever the file did not by
 /// itself justify the answer, and the caller persists + reports it.
 fn recovered_generation_counter(
     file: Option<Result<u64, std::num::ParseIntError>>,
     floor: u64,
     now_secs: u64,
+    saw_everything: bool,
 ) -> (u64, bool) {
     match file {
-        Some(Ok(value)) if value >= floor => (value, false),
-        // Present but BEHIND the record: something rolled it back.
-        Some(Ok(_)) => (floor.max(now_secs), true),
-        // Missing or corrupt: no evidence at all.
+        // The only clock-free branch: a healthy counter over a floor we could
+        // certify end to end.
+        Some(Ok(value)) if value >= floor && saw_everything => (value, false),
+        // Rolled back, or resting on a floor we could not certify.
+        Some(Ok(value)) => (value.max(floor).max(now_secs), true),
+        // Missing or corrupt: no evidence the floor value was not already used.
         _ => (floor.max(now_secs).saturating_add(1), true),
     }
 }
@@ -18819,46 +18897,188 @@ mod tests {
     #[test]
     fn the_generation_counter_only_moves_forward() {
         const NOW: u64 = 1_800_000_000;
-        // Trustworthy file: taken as-is, no warning — and the CLOCK IS NOT
-        // CONSULTED, so a backwards clock step can never lower a generation.
+        const SEEN: bool = true;
+        const BLIND: bool = false;
+
+        // The ONE clock-free branch: a healthy file over a floor the scan
+        // certified end to end. A backwards clock step cannot lower it.
         assert_eq!(
-            recovered_generation_counter(Some(Ok(9)), 7, NOW),
+            recovered_generation_counter(Some(Ok(9)), 7, NOW, SEEN),
             (9, false)
         );
         assert_eq!(
-            recovered_generation_counter(Some(Ok(7)), 7, NOW),
+            recovered_generation_counter(Some(Ok(7)), 7, NOW, SEEN),
             (7, false)
         );
-        assert_eq!(recovered_generation_counter(Some(Ok(9)), 7, 0), (9, false));
-
-        // Recovery clears the wall clock too, not just the floor the scan could
-        // SEE: a project it could not read still carries stamps, and every
-        // generation ever issued before a recovery is far below unix-seconds.
         assert_eq!(
-            recovered_generation_counter(Some(Ok(3)), 7, NOW),
+            recovered_generation_counter(Some(Ok(9)), 7, 0, SEEN),
+            (9, false)
+        );
+
+        // A floor we could not certify is not a floor: even a healthy file
+        // resting above it recovers, because the stamp we could not read may
+        // be anywhere.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(9)), 7, NOW, BLIND),
             (NOW, true)
         );
-        assert_eq!(recovered_generation_counter(None, 7, NOW), (NOW + 1, true));
+
+        // Recovery clears the wall clock, not just the floor the scan could
+        // SEE: every generation issued before a recovery is far below
+        // unix-seconds.
         assert_eq!(
-            recovered_generation_counter(Some("bogus".parse::<u64>()), 7, NOW),
+            recovered_generation_counter(Some(Ok(3)), 7, NOW, SEEN),
+            (NOW, true)
+        );
+        assert_eq!(
+            recovered_generation_counter(None, 7, NOW, SEEN),
+            (NOW + 1, true)
+        );
+        assert_eq!(
+            recovered_generation_counter(Some("bogus".parse::<u64>()), 7, NOW, SEEN),
             (NOW + 1, true)
         );
 
         // …and when the data floor is somehow ABOVE the clock, the data wins:
         // `max` only ever raises.
         assert_eq!(
-            recovered_generation_counter(Some(Ok(3)), NOW + 50, NOW),
+            recovered_generation_counter(Some(Ok(3)), NOW + 50, NOW, SEEN),
             (NOW + 50, true)
         );
         assert_eq!(
-            recovered_generation_counter(None, NOW + 50, NOW),
+            recovered_generation_counter(None, NOW + 50, NOW, SEEN),
             (NOW + 51, true)
         );
 
         // A clock stuck at the epoch degrades to the old floor-only rule
         // rather than to something lower.
-        assert_eq!(recovered_generation_counter(None, 7, 0), (8, true));
-        assert_eq!(recovered_generation_counter(None, 0, 0), (1, true));
+        assert_eq!(recovered_generation_counter(None, 7, 0, SEEN), (8, true));
+        assert_eq!(recovered_generation_counter(None, 0, 0, SEEN), (1, true));
+    }
+
+    /// A reader that fails on demand, so the "could not read" paths are
+    /// exercised on ANY uid — `chmod 000` is a no-op for root, which is exactly
+    /// the uid CI runs as.
+    struct FailingRecords {
+        /// A real on-disk meta, cloned per requested sid (so the fixture never
+        /// hand-lists `SessionMeta`'s fields and cannot drift from it).
+        template: SessionMeta,
+        pins: Vec<(String, Option<u64>)>,
+        stamps: BTreeMap<String, u64>,
+        meta_fails: bool,
+        status_fails_for: Option<String>,
+    }
+
+    impl SessionRecordReader for FailingRecords {
+        fn metas(&self, project_dir: &Path) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>) {
+            if self.meta_fails {
+                return (
+                    vec![],
+                    vec![(
+                        project_dir.join(".ccteam/chat"),
+                        std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    )],
+                );
+            }
+            let metas = self
+                .pins
+                .iter()
+                .map(|(sid, pin)| {
+                    let mut meta = self.template.clone();
+                    meta.sid = sid.clone();
+                    meta.model_pinned_generation = *pin;
+                    meta
+                })
+                .collect();
+            (metas, vec![])
+        }
+
+        fn status(
+            &self,
+            _project_dir: &Path,
+            sid: &str,
+        ) -> Result<Option<ccteam_harness::ThreadStatus>, std::io::Error> {
+            if self.status_fails_for.as_deref() == Some(sid) {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(self.stamps.get(sid).map(|g| ccteam_harness::ThreadStatus {
+                generation: Some(*g),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// A record the scan could not READ is not a record that does not exist.
+    /// Whichever of the two files is unreadable — the meta or the
+    /// `status.json` — the floor stops being certifiable, so even a healthy
+    /// counter file recovers above the wall clock rather than resting on a
+    /// number that could sit below a stamp we never saw.
+    #[tokio::test]
+    async fn an_unreadable_record_forces_a_clock_recovery_whichever_file_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let template = read_session_meta(tmp.path(), "s1").expect("meta written");
+
+        // (i) the META is unreadable, hiding a stamp of 7.
+        let hidden_meta = FailingRecords {
+            template: template.clone(),
+            stamps: BTreeMap::new(),
+            pins: vec![],
+            meta_fails: true,
+            status_fails_for: None,
+        };
+        let (floor, unreadable) = gateway.observed_generation_floor_with(&hidden_meta);
+        assert_eq!((floor, unreadable), (0, 1), "the omission is reported");
+        let (next, recovered) =
+            recovered_generation_counter(Some(Ok(3)), floor, unix_seconds_now(), unreadable == 0);
+        assert!(recovered && next >= unix_seconds_now());
+        assert!(next > 7, "a stamp of 7 can never be re-issued, got {next}");
+
+        // (ii) the meta reads fine; its `status.json` does not.
+        let hidden_status = FailingRecords {
+            template: template.clone(),
+            stamps: BTreeMap::new(),
+            pins: vec![("s1".into(), None)],
+            meta_fails: false,
+            status_fails_for: Some("s1".into()),
+        };
+        let (floor, unreadable) = gateway.observed_generation_floor_with(&hidden_status);
+        assert_eq!(
+            (floor, unreadable),
+            (0, 1),
+            "an unreadable status.json counts exactly like an unreadable meta"
+        );
+        let (next, recovered) =
+            recovered_generation_counter(Some(Ok(3)), floor, unix_seconds_now(), unreadable == 0);
+        assert!(recovered && next >= unix_seconds_now());
+        assert!(next > 7, "a stamp of 7 can never be re-issued, got {next}");
+
+        // (iii) everything readable: the floor is certified, and a healthy
+        // counter file above it is taken verbatim — the clock is not consulted.
+        let all_readable = FailingRecords {
+            template,
+            stamps: BTreeMap::from([("s1".to_string(), 5u64)]),
+            pins: vec![("s1".into(), Some(4))],
+            meta_fails: false,
+            status_fails_for: None,
+        };
+        let (floor, unreadable) = gateway.observed_generation_floor_with(&all_readable);
+        assert_eq!(
+            (floor, unreadable),
+            (5, 0),
+            "the floor is the highest of the pin and the stamp"
+        );
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(9)), floor, unix_seconds_now(), unreadable == 0),
+            (9, false),
+            "a certified floor under a healthy counter never touches the clock"
+        );
     }
 
     /// End to end for the same rule: the counter file is destroyed, but a
@@ -18921,10 +19141,21 @@ mod tests {
     /// sessions": its pins and stamps still exist, so the counter must recover
     /// above the wall clock rather than trusting a floor it could not compute —
     /// and the omission has to be reported, not swallowed.
+    ///
+    /// This is the BELT: it proves the real `chmod`-denied path end to end, but
+    /// it can only do so as a non-root uid. The rule itself is carried on every
+    /// uid by `an_unreadable_record_forces_a_clock_recovery_whichever_file_it_is`,
+    /// which injects the failure instead — so skipping here leaves no gap, and
+    /// the skip is announced rather than silently green.
     #[tokio::test]
     async fn an_unreadable_project_is_reported_and_cannot_lower_the_floor() {
         // `chmod 000` does not stop root, so there is nothing to observe there.
         if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipped as root: chmod cannot deny root; the injected-failure test \
+                 `an_unreadable_record_forces_a_clock_recovery_whichever_file_it_is` \
+                 carries this rule on every uid"
+            );
             return;
         }
         /// Restore the mode whatever the test does, so the tempdir can clean up.

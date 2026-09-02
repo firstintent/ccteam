@@ -48,9 +48,32 @@ pub fn write_status_file(project_dir: &Path, sid: &str, status: &ThreadStatus) {
 }
 
 /// Read the persisted snapshot, or `None` if absent / unreadable / stale-shaped.
+///
+/// A caller that must not confuse "no snapshot" with "could not look" wants
+/// [`read_status_file_reporting`] instead.
 pub fn read_status_file(project_dir: &Path, sid: &str) -> Option<ThreadStatus> {
-    let body = std::fs::read_to_string(status_json_path(project_dir, sid)).ok()?;
-    serde_json::from_str(&body).ok()
+    read_status_file_reporting(project_dir, sid).ok().flatten()
+}
+
+/// [`read_status_file`] with the failure it otherwise collapses into `None`.
+///
+/// `docs-local/issues/#14` — the thread-generation floor is computed from these
+/// snapshots, so a session whose `status.json` could not be READ is not a
+/// session with no stamp: its generation is still on disk, and treating it as
+/// absent would let a recovered counter re-issue it. `Ok(None)` = genuinely no
+/// snapshot yet; `Err` = a read/permission failure, or [`std::io::ErrorKind::
+/// InvalidData`] for a file that exists but does not parse.
+pub fn read_status_file_reporting(
+    project_dir: &Path,
+    sid: &str,
+) -> Result<Option<ThreadStatus>, std::io::Error> {
+    match std::fs::read_to_string(status_json_path(project_dir, sid)) {
+        Ok(body) => serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
