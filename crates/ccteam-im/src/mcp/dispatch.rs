@@ -3576,8 +3576,13 @@ async fn dispatch_wait_for_completion(
     }
 
     let record = result_record.as_ref();
+    // The child's harness rides the mirrored turn (`TurnRecord.vendor`), the
+    // same source the gateway's completion header uses; an unmirrored result
+    // simply omits the field rather than guessing.
+    let vendor = record.map(|turn| turn.vendor.clone()).unwrap_or_default();
     DelegationSummary {
         sid: child_sid,
+        vendor: &vendor,
         turn_id,
         turn: record
             .and_then(|turn| turn.status.as_ref().map(|status| status.turn))
@@ -8876,7 +8881,7 @@ mod session_tool_tests {
                 ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &principal)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|t| t.user.contains(" done · turn "))
+                    .filter(|t| t.user.contains(" done · "))
                     .collect();
             if !notes.is_empty() {
                 break;
@@ -8884,7 +8889,7 @@ mod session_tool_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(notes.len(), 1, "one boundary notification, no flood");
-        assert!(notes[0].user.contains(" done · turn "), "{}", notes[0].user);
+        assert!(notes[0].user.contains(" done · "), "{}", notes[0].user);
         assert!(notes[0].user.contains("echo: second wave"));
     }
 

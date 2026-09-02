@@ -110,7 +110,7 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 
 ## 4. 完成通知
 
-每个 `agent` 任务都挂 watch(除非你退订),**在 vendor turn 边界只报一次** —— 话痨子会话的中途叙述只进账本。通知 = 一行头 —— `s12 done · turn 7 · ctx 19%`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选:
+每个 `agent` 任务都挂 watch(除非你退订),**在 vendor turn 边界只报一次** —— 话痨子会话的中途叙述只进账本。通知 = 一行头 —— `s12 done · codex · turn 7 · ctx 19%`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选:
 
 | `notify` | 节选 | 用途 |
 |---|---|---|

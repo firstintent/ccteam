@@ -62,8 +62,9 @@ export function formatStatusLine(status: SessionStatus): string | null {
 
 export function formatTurnStatus(status?: TurnStatus): { text: string; warn: boolean } | null {
   if (!status) return null;
-  // Bubble footer = `turn N · ctx N%` only: the model sits in the bubble header
-  // and the ledger lives on the session pages — every fact once.
+  // The metrics half of the bubble footer (`turn N · ctx N%`); SessionView
+  // prefixes `vendor · sid · model` — every fact once, the ledger stays on the
+  // session pages.
   const parts: string[] = [`turn ${status.turn}`];
   const pct = contextPct(status.context);
   const roundedPct = typeof pct === "number" && Number.isFinite(pct) ? Math.round(pct) : null;
@@ -76,4 +77,16 @@ export function formatTurnStatus(status?: TurnStatus): { text: string; warn: boo
 export function contextPct(context?: TurnStatus["context"]): number | null {
   if (!context || context.used_tokens == null || context.window_tokens <= 0) return null;
   return (context.used_tokens / context.window_tokens) * 100;
+}
+
+/** `m:ss` (or `h:mm:ss` past an hour) for the busy heartbeat — how long the
+ *  current turn has been running (GitHub #186 B). Negative or
+ *  non-finite input renders as `0:00`. */
+export function formatElapsed(ms: number): string {
+  const total = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+  return `${h > 0 ? `${h}:` : ""}${mm}:${String(s).padStart(2, "0")}`;
 }

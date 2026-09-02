@@ -61,6 +61,9 @@ pub struct DelegationSignal {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DelegationSummary<'a> {
     pub sid: &'a str,
+    /// The child's harness (`claude` / `codex` / …): the parent reads it off
+    /// the one-line header, so it never has to ask which vendor answered.
+    pub vendor: &'a str,
     pub turn_id: &'a str,
     pub turn: u64,
     pub outcome: DelegationOutcome,
@@ -136,13 +139,20 @@ impl DelegationSummary<'_> {
                     .unwrap_or("vendor error")
             ),
         };
+        // `s12 done · codex · turn 7 · ctx 19%` — the same field order as the
+        // web bubble footer and the IM status line (vendor before the metrics).
+        let vendor = if self.vendor.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", self.vendor)
+        };
         let first = match self.context_pct {
             Some(pct) => format!(
-                "{outcome} · turn {} · ctx {pct}%{}",
+                "{outcome}{vendor} · turn {} · ctx {pct}%{}",
                 self.turn,
                 if pct >= 85 { "⚠" } else { "" }
             ),
-            None => format!("{outcome} · turn {}", self.turn),
+            None => format!("{outcome}{vendor} · turn {}", self.turn),
         };
         let answer = truncate_head_tail_with_marker(self.answer.trim(), max_chars, |omitted| {
             full_answer_marker(omitted, self.sid)
@@ -476,6 +486,7 @@ mod tests {
     fn notification_text_uses_minimal_done_header() {
         let t = DelegationSummary {
             sid: "s444",
+            vendor: "codex",
             turn_id: "codex-uuid",
             turn: 3,
             outcome: DelegationOutcome::Done,
@@ -484,7 +495,7 @@ mod tests {
             answer: "hello",
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
-        assert_eq!(t, "s444 done · turn 3 · ctx 31%\nhello");
+        assert_eq!(t, "s444 done · codex · turn 3 · ctx 31%\nhello");
         assert!(!t.contains("[ccteam]"));
         assert!(!t.contains("--- final answer ---"));
         assert!(!t.contains("child is idle"));
@@ -495,6 +506,7 @@ mod tests {
     fn notification_text_folds_interim_notes() {
         let summary = DelegationSummary {
             sid: "s69",
+            vendor: "claude",
             turn_id: "s69-54",
             turn: 3,
             outcome: DelegationOutcome::Done,
@@ -504,7 +516,7 @@ mod tests {
         };
         assert_eq!(
             build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
-            "s69 done · turn 3 · ctx 3%\nwave done"
+            "s69 done · claude · turn 3 · ctx 3%\nwave done"
         );
     }
 
@@ -522,6 +534,7 @@ mod tests {
         );
         let summary = DelegationSummary {
             sid: "s1",
+            vendor: "codex",
             turn_id: "s1-1",
             turn: 4,
             outcome: DelegationOutcome::Done,
@@ -562,6 +575,7 @@ mod tests {
     fn inline_result_carries_the_child_sid() {
         let result = DelegationSummary {
             sid: "s5",
+            vendor: "codex",
             turn_id: "s5-1",
             turn: 1,
             outcome: DelegationOutcome::Done,
@@ -582,6 +596,7 @@ mod tests {
     fn notification_text_failed_header_and_context_warning() {
         let summary = DelegationSummary {
             sid: "s444",
+            vendor: "codex",
             turn_id: "codex-uuid",
             turn: 3,
             outcome: DelegationOutcome::Failed {
@@ -594,7 +609,7 @@ mod tests {
         };
         assert_eq!(
             build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
-            "s444 FAILED (turn_timeout) · turn 3 · ctx 31%\noops"
+            "s444 FAILED (turn_timeout) · codex · turn 3 · ctx 31%\noops"
         );
     }
 
@@ -602,6 +617,7 @@ mod tests {
     fn notification_text_omits_unknown_context() {
         let t = DelegationSummary {
             sid: "s444",
+            vendor: "codex",
             turn_id: "s1-1",
             turn: 3,
             outcome: DelegationOutcome::Done,
@@ -610,7 +626,7 @@ mod tests {
             answer: "ok",
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
-        assert_eq!(t.lines().next(), Some("s444 done · turn 3"));
+        assert_eq!(t.lines().next(), Some("s444 done · codex · turn 3"));
     }
 
     #[test]

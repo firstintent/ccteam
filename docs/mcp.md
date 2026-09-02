@@ -110,7 +110,7 @@ No parameters; returns the same brief `status` body. It exists for hosts that su
 
 ## 4. Completion notifications
 
-Every `agent` task is watched (unless you opt out) and reports **once, at the vendor turn boundary** — a chatty child's mid-turn narration stays in the ledger. The notification is one header line — `s12 done · turn 7 · ctx 19%` (`⚠` from 85 %; `s12 FAILED (<kind>) …` on failure) — followed by an excerpt of the answer:
+Every `agent` task is watched (unless you opt out) and reports **once, at the vendor turn boundary** — a chatty child's mid-turn narration stays in the ledger. The notification is one header line — `s12 done · codex · turn 7 · ctx 19%` (`⚠` from 85 %; `s12 FAILED (<kind>) …` on failure) — followed by an excerpt of the answer:
 
 | `notify` | Excerpt | Use |
 |---|---|---|
