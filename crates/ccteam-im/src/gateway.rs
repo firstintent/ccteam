@@ -3692,6 +3692,14 @@ impl Gateway {
             .unwrap_or_else(|_| ccteam_core::LOCAL_HOST.to_string())
     }
 
+    /// The working tree of a project the daemon has loaded, if any. Card H
+    /// reads it to find `<project>/.ccteam/hooks/pre-agent`: the in-memory map
+    /// is the daemon's own view of where a project lives (config-synced), so a
+    /// hook is looked up in exactly the tree its sessions run in.
+    pub(crate) fn project_dir_for(&self, slug: &str) -> Option<PathBuf> {
+        self.projects.get(slug).cloned()
+    }
+
     /// Return the injected local availability snapshot, when present. The
     /// caller probes live when this is `None`.
     pub(crate) fn local_vendor_availability_override(
@@ -12282,7 +12290,7 @@ impl Gateway {
     /// guardrail caps. Honest scope: an idle-released child is also out of the
     /// map, so this can under-count — an anti-runaway ceiling, not an exact
     /// census.
-    fn count_active_children(&self, parent_sid: &str) -> u32 {
+    pub(crate) fn count_active_children(&self, parent_sid: &str) -> u32 {
         self.sessions
             .values()
             .filter(|s| s.parent_sid.as_deref() == Some(parent_sid))
@@ -12292,7 +12300,7 @@ impl Gateway {
     /// v0.9.0 W2 (F5) — count ALL active (live-map) delegated sessions in one
     /// project (any non-`None` `parent_sid`) — the `max_delegated` runaway
     /// ceiling. Same honest live-map scope as [`Self::count_active_children`].
-    fn count_active_delegated(&self, project: &str) -> u32 {
+    pub(crate) fn count_active_delegated(&self, project: &str) -> u32 {
         self.sessions
             .values()
             .filter(|s| s.project == project && s.parent_sid.is_some())
@@ -13124,6 +13132,7 @@ impl Gateway {
             crate::delegation::build_notification_text_with_outcome(
                 &crate::delegation::DelegationSummary {
                     sid: &signal.child_sid,
+                    vendor: vendor_str(signal.vendor),
                     turn_id: &signal.turn_id,
                     outcome: if signal.vendor_error {
                         crate::delegation::DelegationOutcome::Failed {
@@ -21999,7 +22008,7 @@ mod tests {
         );
         assert!(
             echo.starts_with(
-                "→ alpha/s1 (reviewer) · claude claude-sonnet-4-6 · ctx 19% · turn 1 · $"
+                "→ alpha/s1 (reviewer) · claude · claude-sonnet-4-6 · turn 1 · ctx 19% · $"
             ),
             "status line carries post-turn ctx, model, turn, and current cost: {echo:?}"
         );
@@ -22357,7 +22366,8 @@ mod tests {
                 let ev = sink.recv().await.expect("sink open");
                 if matches!(ev.kind, GatewayEventKind::Answer)
                     && ev.sid.as_deref() == Some("s1")
-                    && ev.content.contains("done · turn")
+                    && ev.content.contains(" done · ")
+                    && ev.content.contains(" · turn 1")
                 {
                     return ev;
                 }
@@ -29252,7 +29262,7 @@ mod tests {
             let turns = read_all_turns(&project_dir, &parent_sid).unwrap_or_default();
             if turns
                 .iter()
-                .any(|turn| turn.user.starts_with(&format!("{child_sid} done · turn ")))
+                .any(|turn| turn.user.starts_with(&format!("{child_sid} done · ")))
             {
                 notified = true;
                 break;
@@ -29289,7 +29299,7 @@ mod tests {
         ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
             .unwrap_or_default()
             .into_iter()
-            .filter(|turn| turn.user.contains(" done · turn ") || turn.user.contains(" FAILED ("))
+            .filter(|turn| turn.user.contains(" done · ") || turn.user.contains(" FAILED ("))
             .collect()
     }
 
@@ -29365,7 +29375,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let notification = notification.expect("parent receives vendor-fatal notification");
-        assert!(notification.user.contains(" FAILED (turn_failed) · turn "));
+        assert!(notification.user.contains(" FAILED (turn_failed) · "));
         assert!(notification.user.contains(CAPACITY_ERROR));
 
         let child_failure =
@@ -29473,9 +29483,8 @@ mod tests {
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "exactly ONE notification per vendor turn");
-        assert!(notes[0]
-            .user
-            .starts_with(&format!("{child_sid} done · turn 4")));
+        assert!(notes[0].user.starts_with(&format!("{child_sid} done · ")));
+        assert!(notes[0].user.contains(" · turn 4"), "{}", notes[0].user);
         assert!(notes[0].user.contains("wave finished: 3 cards done"));
 
         // Replay (at-least-once upstream) → deduped, still one notification.
@@ -29674,9 +29683,8 @@ mod tests {
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
         assert_eq!(notes.len(), 1, "mid-turn narration remains ledger-only");
-        assert!(notes[0]
-            .user
-            .starts_with(&format!("{child_sid} done · turn 2")));
+        assert!(notes[0].user.starts_with(&format!("{child_sid} done · ")));
+        assert!(notes[0].user.contains(" · turn 2"), "{}", notes[0].user);
 
         // `off` mode: nothing notifies, but the boundary still lands
         // delegation_completed in progress.jsonl.
@@ -29987,7 +29995,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|turn| turn.user.contains(" done · turn "))
+                .filter(|turn| turn.user.contains(" done · "))
                 .count()
         };
         let mut delivered = 0;
@@ -30076,7 +30084,7 @@ mod tests {
             read_all_turns(dir, psid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|turn| turn.user.contains(" done · turn "))
+                .filter(|turn| turn.user.contains(" done · "))
                 .collect::<Vec<_>>()
         };
         let mut got: Vec<TurnRecord> = vec![];
@@ -30093,9 +30101,7 @@ mod tests {
             "the folded notification carries the LATEST text: {}",
             got[0].user
         );
-        assert!(got[0]
-            .user
-            .starts_with(&format!("{child_sid} done · turn ")));
+        assert!(got[0].user.starts_with(&format!("{child_sid} done · ")));
 
         Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;

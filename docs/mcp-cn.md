@@ -1,6 +1,6 @@
 # ccteam MCP server — 工具全参考
 
-> English: [mcp.md](mcp.md) · 白话委派指南: [orchestration-cn.md](orchestration-cn.md) · 人用手册: [usage-cn.md](usage-cn.md)
+> English: [mcp.md](mcp.md) · 白话委派指南: [orchestration-cn.md](orchestration-cn.md) · 人用手册: [usage-cn.md](usage-cn.md) · 策略 hook 与工作流: [hook-dynamic-workflows-cn.md](hook-dynamic-workflows-cn.md)
 
 ccteam 只暴露**一个 MCP server,名字 `ccteam`**,走 streamable HTTP:daemon 的 `POST /mcp`(默认 `http://127.0.0.1:7331/mcp`)。工具名由你的 harness 加 server 前缀 —— Claude 里显示为 `mcp__ccteam__agent`,其他 harness 用各自的前缀。这套面刻意做成**菜单而非手册**:六个工具、每参数一行说明、紧凑 JSON 返回体、默认薄 + 旋钮 —— 因为 schema 的每个字节、默认返回的每一行,都记在 agent 的上下文账上。边界与失败语义住在服务端错误体里(踩到的人才付)和本页(人读一次就够)。
 
@@ -110,7 +110,7 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 
 ## 4. 完成通知
 
-每个 `agent` 任务都挂 watch(除非你退订),**在 vendor turn 边界只报一次** —— 话痨子会话的中途叙述只进账本。通知 = 一行头 —— `s12 done · turn 7 · ctx 19%`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选:
+每个 `agent` 任务都挂 watch(除非你退订),**在 vendor turn 边界只报一次** —— 话痨子会话的中途叙述只进账本。通知 = 一行头 —— `s12 done · codex · turn 7 · ctx 19%`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选:
 
 | `notify` | 节选 | 用途 |
 |---|---|---|

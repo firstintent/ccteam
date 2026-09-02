@@ -904,19 +904,6 @@ fn render_sessions_table(
 }
 
 pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
-    // V0.5.0 F93b: agent-team mode dispatches to the lead session.
-    if let Some(lead_id) = read_agent_team_lead_session_id(paths, slug)? {
-        eprintln!("→ claude attach {lead_id}");
-        let status = Command::new("claude")
-            .args(["attach", &lead_id])
-            .status()
-            .context("spawn claude attach")?;
-        if !status.success() {
-            bail!("claude attach exited with {status}");
-        }
-        return Ok(());
-    }
-
     // V0.8 W5 — backend-aware interactive attach. Branch on the
     // configured mux backend BEFORE the tmux exists-check: under the
     // rmux backend the tmux session never exists, so falling through to
@@ -974,55 +961,6 @@ pub fn run_attach(paths: &CcteamPaths, slug: &str) -> Result<()> {
         "no live session for `{slug}`: tmux session `{}` not running, no `claude --bg` job recorded in progress.jsonl. Spawn one with `ccteam spawn {slug} <role>`.",
         tmux_session.name()
     )
-}
-
-/// Probe whether a project is in agent-team mode and return its lead
-/// session id from `.ccteam/team-snapshot.json`.
-///
-/// Returns:
-///   - `Ok(Some(id))` — project is agent-team mode AND has been started
-///     (snapshot exists, `lead_session_id` populated).
-///   - `Ok(None)` — project is artifact-driven OR no project exists at
-///     `<slug>` (let the caller fall through to tmux / bg paths).
-///   - `Err(_)` — project is agent-team mode but snapshot is missing /
-///     `lead_session_id` not yet written (lead hasn't been started yet).
-fn read_agent_team_lead_session_id(paths: &CcteamPaths, slug: &str) -> Result<Option<String>> {
-    let project_dir = paths.project_dir(slug);
-    if !project_dir.exists() {
-        return Ok(None);
-    }
-    let spec = match ccteam_flow::WorkflowSpec::load_for_project(&project_dir) {
-        Ok(spec) => spec,
-        Err(_) => return Ok(None),
-    };
-    if !matches!(spec.mode, ccteam_flow::WorkflowMode::AgentTeam) {
-        return Ok(None);
-    }
-    let snapshot_path = project_dir.join(".ccteam").join("team-snapshot.json");
-    if !snapshot_path.exists() {
-        bail!(
-            "project `{slug}` is in agent-team mode but has no team-snapshot.json yet.\n  \
-             Start the lead session first:  ccteam start {slug}\n  \
-             (snapshot is written by `ccteam start` after spawning the __lead session.)",
-        );
-    }
-    let body = std::fs::read_to_string(&snapshot_path)
-        .with_context(|| format!("read {}", snapshot_path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parse {}", snapshot_path.display()))?;
-    let lead_id = v
-        .get("lead_session_id")
-        .and_then(|s| s.as_str())
-        .map(String::from);
-    match lead_id {
-        Some(id) if !id.is_empty() => Ok(Some(id)),
-        _ => bail!(
-            "project `{slug}` team-snapshot.json has no `lead_session_id` yet.\n  \
-             The lead session may have failed to spawn. Check `ccteam show {slug}` and\n  \
-             `cat {}` for diagnostics.",
-            snapshot_path.display(),
-        ),
-    }
 }
 
 /// Walk `progress.jsonl` newest-first, find the most recent
@@ -4581,121 +4519,6 @@ mod tests {
             !settings_body.contains("TeammateIdle"),
             "default settings.local.json must NOT include team_* hooks",
         );
-    }
-
-    /// `ccteam attach <slug>` against an agent-team project without a
-    /// written snapshot returns a friendly error telling the user to run
-    /// `ccteam start <slug>` first.
-    #[test]
-    fn run_attach_agent_team_missing_snapshot_errors_with_hint() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "no-snapshot";
-        let target = paths.projects_root.join(slug);
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target.clone()),
-                slug: Some(slug.into()),
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        // `run_attach`'s agent-team branch keys off `mode: agent-team` in
-        // workflow.yaml; `ccteam init` scaffolds artifact-driven, so
-        // overwrite with a minimal agent-team spec for this teardown test.
-        std::fs::write(
-            target.join(".ccteam").join("workflow.yaml"),
-            format!(
-                "name: {slug}\nmode: agent-team\nagent_team:\n  team_name: {slug}\n  \
-                 lead_seed: |\n    test mission\n  cleanup_on_stop: force-kill\nagents: {{}}\n"
-            ),
-        )
-        .unwrap();
-        let err = run_attach(&paths, slug).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("team-snapshot") || msg.contains("ccteam start"),
-            "error must mention snapshot / hint at `ccteam start`; got: {msg}",
-        );
-    }
-
-    /// `ccteam attach <slug>` against an agent-team project WITH a
-    /// snapshot containing `lead_session_id` reads the lead id and would
-    /// exec `claude attach <id>`. We can't actually exec here, but
-    /// `read_agent_team_lead_session_id` is testable directly.
-    #[test]
-    fn read_agent_team_lead_session_id_resolves_from_snapshot() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "with-snapshot";
-        let target = paths.projects_root.join(slug);
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target.clone()),
-                slug: Some(slug.into()),
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        // `read_agent_team_lead_session_id` keys off `mode: agent-team` in
-        // workflow.yaml; `ccteam init` scaffolds artifact-driven, so
-        // overwrite with a minimal agent-team spec.
-        std::fs::write(
-            target.join(".ccteam").join("workflow.yaml"),
-            format!(
-                "name: {slug}\nmode: agent-team\nagent_team:\n  team_name: {slug}\n  \
-                 lead_seed: |\n    test mission\n  cleanup_on_stop: force-kill\nagents: {{}}\n"
-            ),
-        )
-        .unwrap();
-        // Fake snapshot writeup.
-        let snapshot_path = target.join(".ccteam").join("team-snapshot.json");
-        std::fs::write(
-            &snapshot_path,
-            serde_json::json!({
-                "slug": slug,
-                "lead_session_id": "deadbeef123",
-                "team_name": "with-snapshot",
-                "teammate_mode": "in-process",
-                "cleanup_on_stop": "force-kill",
-                "auto_spawn_teammates": false,
-                "suggested_teammates": [],
-                "spawned_at": "2026-05-17T12:00:00Z",
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let lead_id = read_agent_team_lead_session_id(&paths, slug)
-            .unwrap()
-            .unwrap();
-        assert_eq!(lead_id, "deadbeef123");
-    }
-
-    /// For artifact-driven projects, `read_agent_team_lead_session_id`
-    /// returns Ok(None) so the caller falls through to the tmux / bg
-    /// path.
-    #[test]
-    fn read_agent_team_lead_session_id_returns_none_for_artifact_driven() {
-        ensure_isolation();
-        let tmp = TempDir::new().unwrap();
-        let paths = fresh_paths(&tmp);
-        let slug = "art-fall";
-        let target = paths.projects_root.join(slug);
-        run_init(
-            &paths,
-            InitOptions {
-                install_in: Some(target),
-                slug: Some(slug.into()),
-                ..InitOptions::default()
-            },
-        )
-        .unwrap();
-        let res = read_agent_team_lead_session_id(&paths, slug).unwrap();
-        assert!(res.is_none(), "artifact-driven must return None");
     }
 
     /// Re-running on an existing ccteam project preserves user-edited

@@ -60,6 +60,10 @@ pub mod onboarding;
 pub mod outbound_format;
 pub mod pending;
 pub mod pending_turns;
+// Card H — the user-programmable `pre-agent` policy hook every `agent` call
+// passes through. The engine owns the guardrails nobody can express
+// differently; everything past that is a script the team's owner writes.
+pub mod policy;
 pub mod principals;
 pub mod progress;
 pub mod progress_projection;

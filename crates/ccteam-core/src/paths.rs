@@ -351,8 +351,20 @@ pub struct ProjectSessionContext {
 /// (deletable — `hub/`), and `skills/` (the user-level global skill library).
 /// Subdirectories are created lazily by their writers (`create_dir_all`);
 /// this is the top-level manifest the doctor tolerates.
+///
+/// `runs/` holds one directory per `ccteam flow run` (journal + script +
+/// spilled results). It is listed here rather than tucked under `state/`
+/// because it is the thing `--resume` is pointed at by hand: an operator has
+/// to be able to find, keep and delete a run without knowing daemon internals.
+///
+/// `flows/` is the user-global rung of flow-script lookup — the fallback under
+/// a project's own `.agents/flows/`, exactly as `hooks/` is the fallback under
+/// a project's `.ccteam/hooks/`. It sits beside `skills/` because it is the
+/// same kind of thing: user-authored content the engine only ever reads.
 pub fn canonical_home_dirs() -> &'static [&'static str] {
-    &["hooks", "run", "state", "secrets", "cache", "skills"]
+    &[
+        "hooks", "run", "state", "secrets", "cache", "skills", "runs", "flows",
+    ]
 }
 
 /// Idempotently materialize the global `~/.ccteam/` home so any

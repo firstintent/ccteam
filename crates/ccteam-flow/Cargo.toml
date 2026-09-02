@@ -4,32 +4,36 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ccteam workflow orchestration engine and filesystem watchers."
+description = "ccteam dynamic-workflow runner: a deterministic JS script orchestrating A2A agent hires."
 
 [dependencies]
-ccteam-core.workspace = true
-ccteam-cost.workspace = true
+# `AgentVendor` is the workspace-wide harness identity; the runner must not
+# mint a parallel vendor enum (it would drift the moment a vendor is added).
 ccteam-harness.workspace = true
 
+rquickjs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
-chrono.workspace = true
-croner.workspace = true
-dirs.workspace = true
-notify.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-anyhow.workspace = true
-futures.workspace = true
-indexmap = { version = "2", features = ["serde"] }
-thiserror.workspace = true
+async-trait.workspace = true
+# The real `FlowClient` (`mcp_client`) speaks ccteam's MCP face over
+# `POST /mcp`. Same HTTP client the CLI, IM and web crates already pull, so
+# this adds a module to the build graph rather than a dependency to it.
+reqwest = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
-serial_test = "3"
-async-trait.workspace = true
+# `tokio/test-util` gives the tests a virtual clock. Spawn ramps, pool
+# backoff and the wall-clock brake are then asserted exactly and in
+# microseconds, instead of being slept through for real.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
+# `test-util` ships the deterministic FakeClient. On by default so downstream
+# crates (and the `ccteam flow run` CLI) can smoke-test a wiring without a
+# live daemon.
 default = ["test-util"]
 test-util = []

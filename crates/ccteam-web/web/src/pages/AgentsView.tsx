@@ -1,8 +1,8 @@
 // 团队/Team view — topology-first (v0.9.11 TEAM-1) + 分工 charter tab
-// (TEAM-2). The legacy roster/timeline tabs are gone; a two-tab seg picks
-// between the live topology canvas and the division-of-labor charter
-// (`pages/CharterPanel.tsx`), while the KPI strip / vendor chips / ticker
-// stay global above the seg:
+// (TEAM-2) + 编排 flow-runs tab. The legacy roster/timeline tabs are gone; a
+// three-tab seg picks between the live topology canvas, the division-of-labor
+// charter (`pages/CharterPanel.tsx`) and the ccteam Flow run list, while the
+// KPI strip / vendor chips / ticker stay global above the seg:
 //
 // - 拓扑 topology: a compact, collapsible delegation tree grouped by project,
 //   designed to stay readable with 100+ sessions. Every row carries what its
@@ -13,6 +13,16 @@
 // - 分工 charter: per-project routing.md editor + vendor roster (CharterPanel
 //   reuses this view's graph nodes for its aggregation — no refetch; picking
 //   a roster card lands back on the topology filtered to that vendor).
+// - 编排 runs: `ccteam flow run` executions across visible projects, newest
+//   first (`lib/flowRunsApi.ts`; polled only while the tab is mounted). The
+//   label is deliberately NOT 「工作流/Flow」 — `/flow` (`WorkflowView.tsx`)
+//   is the unrelated content-management page, and this repo renamed the
+//   orchestration feature "Flow" precisely to dodge Claude Code's native
+//   "workflows". A run row expands into leaf sub-rows: the run's real hired
+//   sessions, DERIVED from this view's already-fetched delegation graph
+//   (descendants of the run's trigger sid, time-window bounded — zero new
+//   per-agent fetch). Project badge on run rows ONLY when runs span more
+//   than one project (same rule as the host badge below).
 // - KPI strip (live / working / active dispatches / total cost) + per-vendor
 //   chips (live count + Σcost per vendor; clicking a chip filters the
 //   topology to that vendor, clicking it again clears the filter).
@@ -35,13 +45,21 @@ import {
   type TimestampedAgentsEvent,
 } from "../lib/agentsReducer";
 import { groupDelegationTrees } from "../lib/agentsTree";
+import {
+  fetchProjectsFlowRuns,
+  flowRunLeaves,
+  runDurationLabel,
+  runStatusBadgeClass,
+  type ProjectFlowRuns,
+} from "../lib/flowRunsApi";
 import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { usePolledSnapshot } from "../hooks/usePolledSnapshot";
+import { useProjectsStore } from "../hooks/useProjectsStore";
 import { VendorChip } from "../components/VendorChip";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
 import { vendorDotClass } from "../lib/vendors";
-import { makeT, type Lang } from "../lib/i18n";
+import { makeT, tr, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
 import { toastBus } from "../lib/toastBus";
 import CharterPanel from "./CharterPanel";
@@ -53,6 +71,11 @@ const PULSE_WINDOW_MS = 60_000;
 const GRAPH_REFRESH_MS = 15_000;
 /** Stable empty snapshot so the poller's initial value never changes identity. */
 const EMPTY_GRAPH: AgentsGraphResponse = { nodes: [], edges: [], hosts: [] };
+/** Same quiet-gap cadence as the graph for the flow-runs tab (only polled
+ *  while that tab is mounted). Live-via-SSE is a documented fast-follow. */
+const RUNS_REFRESH_MS = 15_000;
+/** Stable empty snapshot for the flow-runs poller. */
+const EMPTY_RUNS: ProjectFlowRuns[] = [];
 const EVENT_LOG_CAP = 500;
 const TICKER_SIZE = 5;
 
@@ -438,16 +461,19 @@ export function AgentsPanel({
   );
 }
 
-/** Team tab seg (拓扑 | 分工) — hook-free presentational (exported for
+/** The team view's tab axis: live canvas | charter | orchestrated runs. */
+export type TeamTab = "topology" | "charter" | "runs";
+
+/** Team tab seg (拓扑 | 分工 | 编排) — hook-free presentational (exported for
  *  node-env tests). Sits below the global KPI/chips/ticker strip. */
 export function TeamTabSeg({
   tab,
   lang: langProp,
   onSwitch,
 }: {
-  tab: "topology" | "charter";
+  tab: TeamTab;
   lang?: Lang;
-  onSwitch: (tab: "topology" | "charter") => void;
+  onSwitch: (tab: TeamTab) => void;
 }) {
   const t = makeT(langProp ?? "zh");
   return (
@@ -468,6 +494,242 @@ export function TeamTabSeg({
       >
         {t("teamTabCharter")}
       </button>
+      <button
+        type="button"
+        className={tab === "runs" ? "active" : ""}
+        data-testid="agents-seg-runs"
+        onClick={() => onSwitch("runs")}
+      >
+        {t("teamTabRuns")}
+      </button>
+    </div>
+  );
+}
+
+/** One run's status label: the four known verdicts translate, anything else
+ *  renders verbatim (honest fallback — never blank, never a guessed word). */
+function runStatusLabel(t: (key: string) => string, status: string): string {
+  if (status === "running") return t("flowRunsStatusRunning");
+  if (status === "ok") return t("flowRunsStatusOk");
+  if (status === "error") return t("flowRunsStatusError");
+  if (status === "brake") return t("flowRunsStatusBrake");
+  return status;
+}
+
+/** 编排 run list — hook-free presentational (exported for node-env tests).
+ *  Flat, newest-first across projects (runs are sparse enough that a single
+ *  timeline reads better than per-project sections); the project badge
+ *  appears ONLY when runs span more than one project, mirroring the topology
+ *  host-badge rule. A row expands (`expanded` set, owned by the caller) into
+ *  leaf sub-rows: the run's hired sessions derived from the delegation graph
+ *  ([flowRunLeaves]) — each a real link to its chat route, exactly like
+ *  topology rows. */
+export function FlowRunsPanel({
+  groups,
+  nodes,
+  lang: langProp,
+  expanded,
+  nowMs,
+  onToggle,
+}: {
+  groups: ProjectFlowRuns[];
+  nodes: AgentNode[];
+  lang?: Lang;
+  expanded: ReadonlySet<string>;
+  /** Clock injected by the caller (render purity + deterministic tests) —
+   *  running runs measure their elapsed duration against it. */
+  nowMs: number;
+  onToggle: (runId: string) => void;
+}) {
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
+  const rows = groups
+    .flatMap((group) =>
+      group.runs.map((run) => ({
+        slug: group.slug,
+        run,
+        // Ledger identity is only the run-dir basename, and two projects can
+        // hold same-named runs — React keys and the expansion set scope by
+        // slug so twins never share state (checker s523 R1).
+        rowKey: `${group.slug}:${run.run_id}`,
+      })),
+    )
+    .sort(
+      (a, b) => (Date.parse(b.run.started_at) || 0) - (Date.parse(a.run.started_at) || 0),
+    );
+  const truncated = groups.some((group) => group.truncated === true);
+  if (rows.length === 0) {
+    // An outage is not an empty project, and neither is a full scan window:
+    // every-fetch-failed says the endpoint is unreachable; a window that
+    // truncated away every run says the list is incomplete. Plain "no runs"
+    // is reserved for a genuinely empty answer (checker s523 R1+R2).
+    const allErrored = groups.length > 0 && groups.every((group) => group.error === true);
+    const testid = allErrored
+      ? "flow-runs-unavailable"
+      : truncated
+        ? "flow-runs-truncated"
+        : "flow-runs-empty";
+    return (
+      <p style={{ color: "var(--text-faint)", fontSize: 13 }} data-testid={testid}>
+        {allErrored ? t("flowRunsUnavailable") : truncated ? t("flowRunsTruncated") : t("flowRunsEmpty")}
+      </p>
+    );
+  }
+  const showProject = new Set(rows.map((row) => row.slug)).size > 1;
+  return (
+    <>
+    <div className="flow-rows" data-testid="flow-runs-rows">
+      {rows.map(({ slug, run, rowKey }) => {
+        const isOpen = expanded.has(rowKey);
+        const leaves = isOpen ? flowRunLeaves(nodes, run) : [];
+        return (
+          <div key={rowKey}>
+            <div
+              className="flow-row flow-run"
+              role="button"
+              tabIndex={0}
+              aria-expanded={isOpen}
+              data-testid={`flow-run-${run.run_id}`}
+              onClick={() => onToggle(rowKey)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") onToggle(rowKey);
+              }}
+            >
+              <span className="n">
+                <span className="chev" aria-hidden="true">
+                  {isOpen ? "⌄" : "›"}
+                </span>
+                {run.status === "running" ? <span className="dot busy" aria-hidden="true" /> : null}
+                <span>{run.name}</span>
+                {showProject ? <span className="badge mono">{slug}</span> : null}
+              </span>
+              <span className="d">{run.description}</span>
+              <span className="end">
+                <span className="mono" title={t("flowRunsColAgents")}>
+                  {tr(lang, `${run.agents} 个 agent`, `${run.agents} agent${run.agents === 1 ? "" : "s"}`)}
+                </span>
+                <span className="mono">{costCell(run)}</span>
+                <span>{relativeTime(lang, run.started_at)}</span>
+                <span className="mono" title={t("flowRunsColDuration")}>
+                  {runDurationLabel(run.started_at, run.finished_at, nowMs)}
+                </span>
+                <span className={runStatusBadgeClass(run.status)}>
+                  {runStatusLabel(t, run.status)}
+                </span>
+              </span>
+            </div>
+            {isOpen ? (
+              <div className="flow-run-leaves" data-testid={`flow-run-leaves-${run.run_id}`}>
+                {run.parent_sid ? (
+                  <div className="flow-run-hint">
+                    {t("flowRunsParent")}:{" "}
+                    <Link
+                      className="mono"
+                      to={chatPath(run.parent_sid)}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      {run.parent_sid}
+                    </Link>
+                  </div>
+                ) : null}
+                {leaves.length === 0 ? (
+                  <div className="flow-run-hint">{t("flowRunsNoLeaves")}</div>
+                ) : (
+                  leaves.map((leaf) => (
+                    <div
+                      className="flow-run-leaf"
+                      key={leaf.sid}
+                      data-testid={`flow-run-leaf-${leaf.sid}`}
+                    >
+                      <VendorChip vendor={leaf.vendor} />
+                      <span className="mono">{leaf.sid}</span>
+                      <span className="t">{leaf.title || leaf.role || "—"}</span>
+                      <span className="end">
+                        <span className="mono">{costCell(leaf)}</span>
+                        <span>{relativeTime(lang, leaf.last_active)}</span>
+                        <Link
+                          className="btn ghost mini"
+                          to={chatPath(leaf.sid)}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          {t("teamOpenLink")}
+                        </Link>
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+    {truncated ? (
+      <p
+        style={{ color: "var(--text-faint)", fontSize: 12.5, margin: "8px 0 0" }}
+        data-testid="flow-runs-truncated"
+      >
+        {t("flowRunsTruncated")}
+      </p>
+    ) : null}
+    </>
+  );
+}
+
+/** 编排 tab wiring: enumerate visible projects (shared store — the same list
+ *  every other view uses), poll their flow-runs endpoints as one logical
+ *  snapshot (per-project fail-soft, see `fetchProjectsFlowRuns`), own the
+ *  expanded-run set. Mounted only while its tab is active, so the extra
+ *  polling costs nothing on the default topology view. */
+export function FlowRunsTab({ nodes, lang: langProp }: { nodes: AgentNode[]; lang?: Lang }) {
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
+  const { projects: projectRows } = useProjectsStore();
+  const slugs = useMemo(
+    () => (projectRows ?? []).map((project) => project.slug).filter(Boolean),
+    [projectRows],
+  );
+  const slugsKey = slugs.join(",");
+  const { data: groups, loading } = usePolledSnapshot<ProjectFlowRuns[]>(
+    (signal) => fetchProjectsFlowRuns(slugs, signal),
+    EMPTY_RUNS,
+    { intervalMs: RUNS_REFRESH_MS },
+    // Restart the poll chain when the visible project set changes.
+    [slugsKey],
+  );
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const toggle = (rowKey: string) => {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(rowKey)) next.delete(rowKey);
+      else next.add(rowKey);
+      return next;
+    });
+  };
+  // Tick the injected clock so a running run's elapsed duration advances
+  // between polls (same pattern as the parent view's pulse-window tick).
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 5000);
+    return () => window.clearInterval(id);
+  }, []);
+  return (
+    <div data-testid="flow-runs-tab">
+      <p style={{ color: "var(--text-muted)", fontSize: 12.5, margin: "0 0 10px" }}>
+        {t("flowRunsDesc")}
+      </p>
+      {loading && groups.every((group) => group.runs.length === 0) ? (
+        <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p>
+      ) : (
+        <FlowRunsPanel
+          groups={groups}
+          nodes={nodes}
+          lang={lang}
+          expanded={expanded}
+          nowMs={nowMs}
+          onToggle={toggle}
+        />
+      )}
     </div>
   );
 }
@@ -475,11 +737,11 @@ export function TeamTabSeg({
 export default function AgentsView({
   lang: langProp,
   initialTab,
-}: { lang?: Lang; initialTab?: "topology" | "charter" } = {}) {
+}: { lang?: Lang; initialTab?: TeamTab } = {}) {
   const lang = langProp ?? "zh";
   const t = makeT(lang);
 
-  const [tab, setTab] = useState<"topology" | "charter">(initialTab ?? "topology");
+  const [tab, setTab] = useState<TeamTab>(initialTab ?? "topology");
   const [selected, setSelected] = useState<string | null>(null);
   const [vendorFilter, setVendorFilter] = useState<string | null>(null);
   const [historyBySid, setHistoryBySid] = useState<Record<string, SessionHistoryEvent[]>>({});
@@ -605,7 +867,9 @@ export default function AgentsView({
       <AgentsTicker events={timestamped} lang={lang} onSelect={setSelected} />
       <TeamTabSeg tab={tab} lang={lang} onSwitch={setTab} />
 
-      {tab === "charter" ? (
+      {tab === "runs" ? (
+        <FlowRunsTab nodes={graph.nodes} lang={lang} />
+      ) : tab === "charter" ? (
         <CharterPanel
           nodes={graph.nodes}
           lang={lang}

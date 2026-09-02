@@ -280,12 +280,21 @@ fn last_progress_event_ts(paths: &CcteamPaths, slug: &str) -> Option<DateTime<Ut
 ///
 /// Reads the flat `~/.ccteam/progress/<slug>.jsonl` file.
 pub fn collect_recent_events(paths: &CcteamPaths, slug: &str, n: usize) -> Result<Vec<Value>> {
-    let path = paths.progress_jsonl(slug);
-    read_tail_events(&path, n)
+    Ok(collect_recent_events_with_more(paths, slug, n)?.0)
 }
 
-fn read_tail_events(path: &std::path::Path, n: usize) -> Result<Vec<Value>> {
-    Ok(crate::journal::tail_valid(path, n)?.events)
+/// [`collect_recent_events`] plus the tail reader's `has_more` verdict — true
+/// exactly when at least one older row exists BEYOND the returned window. The
+/// journal probes one extra row to know this precisely; a caller that instead
+/// infers truncation from `len() >= n` reports a false positive on a journal
+/// of exactly `n` rows (s523 R2).
+pub fn collect_recent_events_with_more(
+    paths: &CcteamPaths,
+    slug: &str,
+    n: usize,
+) -> Result<(Vec<Value>, bool)> {
+    let tail = crate::journal::tail_valid(&paths.progress_jsonl(slug), n)?;
+    Ok((tail.events, tail.has_more))
 }
 
 // ---------------- V0.4.0 F67 WorkflowSummary ----------------

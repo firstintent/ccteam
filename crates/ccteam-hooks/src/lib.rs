@@ -19,12 +19,14 @@ use ccteam_core::CcteamPaths;
 use serde_json::Value;
 
 pub mod chat_progress;
+pub mod flow_run;
 pub mod intercept_ask;
 pub mod load_context;
 pub mod permission_request;
 pub mod progress;
 
 pub use chat_progress::handle_chat_progress;
+pub use flow_run::flow_run;
 pub use intercept_ask::{intercept_ask_chat, intercept_ask_decision};
 pub use load_context::load_context;
 pub use permission_request::{decision as permission_request_decision, permission_request_decide};
@@ -86,6 +88,17 @@ pub fn dispatch(
             let event =
                 action.ok_or_else(|| anyhow!("hook `chat-progress` requires an event argument"))?;
             handle_chat_progress(paths, event, stdin)?;
+            Ok(None)
+        }
+        // 2026-09-01 — `ccteam flow run` submits its RUN-LEVEL envelope
+        // (`started` / `finished` / `brake`) here. Not a Claude Code hook: the
+        // door is shared because the question is the same one — an outside
+        // process has a fact for this daemon's ledger. See `flow_run` for why
+        // this is a kind of its own rather than `progress-append`.
+        "flow-run" => {
+            let action =
+                action.ok_or_else(|| anyhow!("hook `flow-run` requires an action argument"))?;
+            flow_run(paths, action, stdin)?;
             Ok(None)
         }
         other => Err(anyhow!("unknown hook kind: {other}")),

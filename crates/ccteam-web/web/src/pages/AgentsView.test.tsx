@@ -23,12 +23,14 @@ import AgentsView, {
   AgentsPanel,
   AgentsTicker,
   AgentsTree,
+  FlowRunsPanel,
   TeamTabSeg,
   VendorKpiChips,
 } from "./AgentsView";
 import { emptyFold } from "./chatTranscript";
 import type { AgentNode } from "../lib/agentsApi";
 import type { TimestampedAgentsEvent } from "../lib/agentsReducer";
+import type { FlowRun } from "../lib/flowRunsApi";
 
 function fixtureNode(over: Partial<AgentNode> = {}): AgentNode {
   return {
@@ -125,25 +127,47 @@ describe("AgentsView (shell smoke)", () => {
     // The KPI strip stays global above the seg on both tabs.
     expect(charter).toContain('data-testid="agents-kpis"');
   });
+
+  // 编排 tab — ccteam Flow runs (flow-runs endpoint polled only while mounted).
+  it("initialTab='runs' swaps in the flow-runs tab; KPI strip stays global", () => {
+    globalThis.fetch = vi.fn().mockReturnValue(new Promise(() => {}));
+    const html = renderToString(
+      <MemoryRouter>
+        <AgentsView initialTab="runs" />
+      </MemoryRouter>,
+    );
+    expect(html).toContain('data-testid="flow-runs-tab"');
+    expect(html).not.toContain('data-testid="agents-canvas"');
+    expect(html).not.toContain('data-testid="charter-panel"');
+    expect(html).toContain('data-testid="agents-kpis"');
+    // Intro line ties the tab to `ccteam flow run` without reading as the
+    // unrelated 工作流 page.
+    expect(html).toContain("ccteam Flow");
+  });
 });
 
-describe("TeamTabSeg (拓扑 | 分工)", () => {
-  it("renders both tabs, active one highlighted", () => {
+describe("TeamTabSeg (拓扑 | 分工 | 编排)", () => {
+  it("renders all three tabs, active one highlighted", () => {
     const html = renderToString(<TeamTabSeg tab="topology" onSwitch={() => {}} />);
     expect(html).toContain('data-testid="agents-seg"');
     expect(html).toContain("拓扑");
     expect(html).toContain("分工");
+    expect(html).toContain("编排");
     expect(html).toMatch(/class="active"[^>]*data-testid="agents-seg-topology"/);
     const charterActive = renderToString(<TeamTabSeg tab="charter" onSwitch={() => {}} />);
     expect(charterActive).toMatch(/class="active"[^>]*data-testid="agents-seg-charter"/);
+    const runsActive = renderToString(<TeamTabSeg tab="runs" onSwitch={() => {}} />);
+    expect(runsActive).toMatch(/class="active"[^>]*data-testid="agents-seg-runs"/);
   });
 
   it("clicking a tab switches to it", () => {
     const onSwitch = vi.fn();
     const clicks = collectOnClicks(TeamTabSeg({ tab: "topology", onSwitch }));
-    expect(clicks).toHaveLength(2); // [拓扑, 分工]
+    expect(clicks).toHaveLength(3); // [拓扑, 分工, 编排]
     clicks[1]!();
     expect(onSwitch).toHaveBeenCalledWith("charter");
+    clicks[2]!();
+    expect(onSwitch).toHaveBeenCalledWith("runs");
     clicks[0]!();
     expect(onSwitch).toHaveBeenCalledWith("topology");
   });
@@ -481,5 +505,255 @@ describe("roster vendor pick → filtered topology (TEAM-7)", () => {
     // …and it IS the chips' filter, so that chip shows active (click = clear).
     const chips = renderToString(<VendorKpiChips nodes={nodes} active={picked} onToggle={() => {}} />);
     expect(chips).toMatch(/agents-vendor-chip active"[^>]*data-testid="agents-vendor-chip-codex"/);
+  });
+});
+
+// 编排 tab — FlowRunsPanel (hook-free, fixture-driven). Leaves come from the
+// SAME AgentNode fixtures the topology suite uses: a run's hires are ordinary
+// delegations, so no run-specific node shape exists to invent.
+describe("FlowRunsPanel (ccteam Flow runs)", () => {
+  function fixtureRun(over: Partial<FlowRun> = {}): FlowRun {
+    return {
+      run_id: "r1",
+      name: "audit-routes",
+      description: "Audit route handlers for missing auth",
+      parent_sid: "s1",
+      status: "ok",
+      agents: 3,
+      cost_usd: 1.23,
+      started_at: "2026-09-01T10:00:00Z",
+      finished_at: "2026-09-01T10:04:00Z",
+      ...over,
+    };
+  }
+  const noNodes: AgentNode[] = [];
+  const NOW = Date.parse("2026-09-01T12:00:00Z");
+
+  it("renders a flat newest-first list with status badges; brake ≠ error in text", () => {
+    const groups = [
+      {
+        slug: "demo",
+        runs: [
+          fixtureRun({ run_id: "r-old", name: "old-run", started_at: "2026-09-01T09:00:00Z" }),
+          fixtureRun({ run_id: "r-err", name: "err-run", status: "error" }),
+          fixtureRun({ run_id: "r-brake", name: "brake-run", status: "brake" }),
+          fixtureRun({
+            run_id: "r-live",
+            name: "live-run",
+            status: "running",
+            started_at: "2026-09-01T11:00:00Z",
+            finished_at: null,
+          }),
+        ],
+      },
+    ];
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel groups={groups} nodes={noNodes} expanded={new Set()} nowMs={NOW} onToggle={() => {}} />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-rows"');
+    // Newest first: the running run (11:00) sorts above the 09:00 one.
+    expect(html.indexOf("live-run")).toBeLessThan(html.indexOf("old-run"));
+    // Status → badge class + label; brake shares warn but keeps its own word.
+    expect(html).toMatch(/badge ok"[^>]*>完成/);
+    expect(html).toMatch(/badge warn"[^>]*>出错/);
+    expect(html).toMatch(/badge warn"[^>]*>刹车/);
+    expect(html).toMatch(/badge brand"[^>]*>运行中/);
+    // Only the running row pulses.
+    expect(html.match(/dot busy/g)).toHaveLength(1);
+    // Metrics reuse the team-view conventions: 4-decimal cost, agent count.
+    expect(html).toContain("$1.2300");
+    expect(html).toContain("3 个 agent");
+    // Collapsed rows advertise expandability.
+    expect(html).toContain('aria-expanded="false"');
+    // Single project ⇒ no project badge (host-badge rule).
+    expect(html).not.toMatch(/badge mono"[^>]*>demo/);
+  });
+
+  it("shows the project badge only when runs span more than one project", () => {
+    const groups = [
+      { slug: "alpha", runs: [fixtureRun({ run_id: "ra" })] },
+      { slug: "beta", runs: [fixtureRun({ run_id: "rb", name: "beta-run" })] },
+    ];
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel groups={groups} nodes={noNodes} expanded={new Set()} nowMs={NOW} onToggle={() => {}} />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toMatch(/badge mono"[^>]*>alpha/);
+    expect(html).toMatch(/badge mono"[^>]*>beta/);
+  });
+
+  it("an expanded run lists its derived leaves as real chat links + the trigger session", () => {
+    const nodes = [
+      fixtureNode({ sid: "s1", last_active: "2026-09-01T10:03:00Z" }),
+      fixtureNode({
+        sid: "s2",
+        vendor: "codex",
+        parent_sid: "s1",
+        title: "Audit src/routes/a.rs",
+        cost_usd: 0.4,
+        last_active: "2026-09-01T10:02:00Z",
+      }),
+      fixtureNode({
+        sid: "s3",
+        vendor: "grok",
+        parent_sid: "s1",
+        last_active: "2026-09-01T10:03:30Z",
+      }),
+      // Outside the run window: the trigger session's later, unrelated hire.
+      fixtureNode({ sid: "s4", parent_sid: "s1", last_active: "2026-09-01T12:00:00Z" }),
+    ];
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [fixtureRun()] }]}
+          nodes={nodes}
+          expanded={new Set(["demo:r1"])}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-run-leaves-r1"');
+    expect(html).toContain('data-testid="flow-run-leaf-s2"');
+    expect(html).toContain('data-testid="flow-run-leaf-s3"');
+    expect(html).not.toContain('data-testid="flow-run-leaf-s4"');
+    expect(html).toContain('href="/chat/s/s2"');
+    expect(html).toContain("chip codex");
+    expect(html).toContain("Audit src/routes/a.rs");
+    expect(html).toContain("$0.4000");
+    // Trigger session link.
+    expect(html).toContain("触发会话");
+    expect(html).toContain('href="/chat/s/s1"');
+    expect(html).toContain('aria-expanded="true"');
+  });
+
+  it("a CLI-driven run (no trigger sid) expands to an honest no-leaves hint", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [fixtureRun({ run_id: "r2", parent_sid: null })] }]}
+          nodes={noNodes}
+          expanded={new Set(["demo:r2"])}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-run-leaves-r2"');
+    expect(html).toContain("没有这个 run 的会话");
+    // No trigger-session link row and no leaf links — nothing to link to.
+    expect(html).not.toContain('href="/chat/s/');
+  });
+
+  it("cross-project twin run_ids keep independent keys and expansion state", () => {
+    const groups = [
+      { slug: "alpha", runs: [fixtureRun()] },
+      { slug: "beta", runs: [fixtureRun()] },
+    ];
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={groups}
+          nodes={noNodes}
+          expanded={new Set(["alpha:r1"])}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    // Only alpha's row opens — beta's same-named twin stays collapsed.
+    expect(html.match(/data-testid="flow-run-leaves-r1"/g)).toHaveLength(1);
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain('aria-expanded="false"');
+  });
+
+  it("an all-projects-errored cycle says the endpoint is unreachable, not 'no runs'", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [], error: true }]}
+          nodes={noNodes}
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-unavailable"');
+    expect(html).not.toContain('data-testid="flow-runs-empty"');
+  });
+
+  it("a truncated scan window is announced under the list", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [fixtureRun()], truncated: true }]}
+          nodes={noNodes}
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-truncated"');
+  });
+
+  it("a truncated window with zero surviving runs reads 'incomplete', not 'no runs'", () => {
+    const html = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [], truncated: true }]}
+          nodes={noNodes}
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(html).toContain('data-testid="flow-runs-truncated"');
+    expect(html).not.toContain('data-testid="flow-runs-empty"');
+  });
+
+  it("zero runs renders the honest empty state, bilingually", () => {
+    const zh = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel groups={[]} nodes={noNodes} expanded={new Set()} nowMs={NOW} onToggle={() => {}} />
+      </MemoryRouter>,
+    );
+    expect(zh).toContain('data-testid="flow-runs-empty"');
+    expect(zh).toContain("尚无 flow 运行");
+    const en = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [] }]}
+          nodes={noNodes}
+          lang="en"
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    );
+    expect(en).toContain("No flow runs yet");
+  });
+
+  it("clicking a run row toggles its expansion", () => {
+    const onToggle = vi.fn();
+    const clicks = collectOnClicks(
+      FlowRunsPanel({
+        groups: [{ slug: "demo", runs: [fixtureRun()] }],
+        nodes: noNodes,
+        expanded: new Set<string>(),
+        nowMs: NOW,
+        onToggle,
+      }),
+    );
+    expect(clicks).toHaveLength(1); // collapsed ⇒ only the row toggle
+    clicks[0]!();
+    // Slug-scoped key: cross-project twin run_ids must not share state.
+    expect(onToggle).toHaveBeenCalledWith("demo:r1");
   });
 });

@@ -3195,3 +3195,219 @@ async fn start_thread_rejects_remote_ctx_readable() {
     assert!(matches!(err, HarnessError::NotImplemented { .. }));
     assert!(err.to_string().contains("not yet supported for codex"));
 }
+
+// ---------------------------------------------------------------------------
+// GitHub #189 — app-server lifecycle over the stdio transport,
+// against the hermetic fake (`fixtures/codex_app_server/fake_codex_app_server.py`).
+//
+// A real app-server holds every loaded thread's writer lock (an flock that
+// dies with the process) and owns a `codex-code-mode-host` helper child that
+// only a GRACEFUL shutdown cleans up. These tests pin the two facts the
+// incident report asked for: the old process is ended with SIGTERM and reaped
+// BEFORE a replacement is dialed, and a dropped adapter still ends its child
+// gracefully.
+// ---------------------------------------------------------------------------
+
+fn fake_app_server_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex_app_server/fake_codex_app_server.py")
+}
+
+/// Pin every home-derived path into `tmp` (the adapter's progress bridge,
+/// config-mtime probe and writer-lock lookup all derive from HOME /
+/// CCTEAM_HOME / CODEX_HOME), point the stdio program at the fake, and
+/// restore everything on drop (also on a panic).
+struct FakeAppServerEnv {
+    prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl FakeAppServerEnv {
+    fn install(tmp: &std::path::Path) -> Self {
+        let keys = [
+            "HOME",
+            "CCTEAM_HOME",
+            "CODEX_HOME",
+            "CCTEAM_CODEX_BIN",
+            "CCTEAM_FAKE_CODEX_STATE",
+            APP_SERVER_SOCKET_ENV,
+        ];
+        let prior = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var("HOME", tmp);
+        std::env::set_var("CCTEAM_HOME", tmp.join("ccteam"));
+        std::env::set_var("CODEX_HOME", tmp.join("codex"));
+        std::env::set_var("CCTEAM_CODEX_BIN", fake_app_server_bin());
+        std::env::set_var("CCTEAM_FAKE_CODEX_STATE", tmp.join("state"));
+        std::env::remove_var(APP_SERVER_SOCKET_ENV);
+        Self { prior }
+    }
+}
+
+impl Drop for FakeAppServerEnv {
+    fn drop(&mut self) {
+        for (key, prior) in self.prior.drain(..) {
+            restore_env(key, prior);
+        }
+    }
+}
+
+fn fake_spawn_ctx(tmp: &std::path::Path, sid: &str) -> SpawnCtx {
+    SpawnCtx {
+        generation: 0,
+        mode: None,
+        slug: "fake-codex".to_string(),
+        sid: sid.to_string(),
+        owner: "user:web-api".into(),
+        cwd: tmp.to_path_buf(),
+        project_dir: tmp.to_path_buf(),
+        extra_args: vec![],
+        model_id: None,
+        effort: None,
+        permission_mode: ccteam_harness::PermissionMode::Skip,
+        secret: String::new(),
+        remote: None,
+    }
+}
+
+/// The fake writes its pid at startup; wait for it (the handshake already
+/// completed, so it is there — the poll only covers fs latency).
+async fn fake_pid(state: &std::path::Path) -> u32 {
+    for _ in 0..100 {
+        if let Ok(raw) = std::fs::read_to_string(state.join("pid")) {
+            if let Ok(pid) = raw.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "fake app-server never wrote its pid under {}",
+        state.display()
+    );
+}
+
+/// `kill(pid, 0)` — true while the pid exists (a reaped process is gone; a
+/// zombie still answers, which is exactly the distinction the reap test
+/// needs).
+fn pid_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 only probes; FFI-safe for any pid.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..100 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+#[tokio::test]
+#[serial]
+async fn stdio_respawn_terminates_old_app_server_gracefully_before_redialing() {
+    let tmp = TempDir::new().unwrap();
+    let _env = FakeAppServerEnv::install(tmp.path());
+    let state = tmp.path().join("state");
+    let adapter = CodexAppServerAdapter::new();
+    let handle = tokio::time::timeout(
+        Duration::from_secs(15),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: "fake".to_string(),
+            },
+            &fake_spawn_ctx(tmp.path(), "s-fake-1"),
+        ),
+    )
+    .await
+    .expect("thread/start against the fake timed out")
+    .expect("thread/start against the fake should succeed");
+    assert_eq!(handle.identity, "fake-thread-1");
+    let old_pid = fake_pid(&state).await;
+    assert!(
+        pid_exists(old_pid),
+        "fake app-server must be running after start_thread"
+    );
+
+    // The respawn path: config change and transport death both come through
+    // here. By the time it returns the old process must be gone AND reaped —
+    // a re-dial can no longer race it for any thread's writer lock.
+    adapter.forget_client().await;
+    assert!(
+        !pid_exists(old_pid),
+        "old app-server pid {old_pid} must be reaped before forget_client returns"
+    );
+    assert!(
+        state.join("term").exists(),
+        "old app-server must be ended with SIGTERM (graceful), not SIGKILL"
+    );
+
+    // The next thread/start dials a NEW child.
+    std::fs::remove_file(state.join("pid")).unwrap();
+    std::fs::remove_file(state.join("term")).unwrap();
+    let handle2 = tokio::time::timeout(
+        Duration::from_secs(15),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: "fake".to_string(),
+            },
+            &fake_spawn_ctx(tmp.path(), "s-fake-2"),
+        ),
+    )
+    .await
+    .expect("second thread/start timed out")
+    .expect("second thread/start should succeed");
+    assert_eq!(handle2.identity, "fake-thread-1");
+    let new_pid = fake_pid(&state).await;
+    assert_ne!(
+        new_pid, old_pid,
+        "the re-dial must spawn a fresh app-server"
+    );
+    assert!(pid_exists(new_pid));
+    adapter.forget_client().await;
+    assert!(!pid_exists(new_pid));
+}
+
+#[test]
+#[serial]
+fn dropping_the_adapter_ends_the_app_server_with_sigterm() {
+    let tmp = TempDir::new().unwrap();
+    let _env = FakeAppServerEnv::install(tmp.path());
+    let state = tmp.path().join("state");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pid = runtime.block_on(async {
+        let adapter = CodexAppServerAdapter::new();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            adapter.start_thread(
+                &AgentSpecBrief {
+                    role: "fake".to_string(),
+                },
+                &fake_spawn_ctx(tmp.path(), "s-fake-drop"),
+            ),
+        )
+        .await
+        .expect("thread/start against the fake timed out")
+        .expect("thread/start against the fake should succeed");
+        let pid = fake_pid(&state).await;
+        assert!(pid_exists(pid));
+        // No explicit stop: the adapter (and its cached client) is simply
+        // dropped, as at daemon shutdown. The child must still get SIGTERM
+        // and be reaped by the detached waiter.
+        drop(adapter);
+        wait_for("dropped adapter's app-server to be reaped", || {
+            !pid_exists(pid)
+        })
+        .await;
+        pid
+    });
+    drop(runtime);
+    assert!(!pid_exists(pid));
+    assert!(
+        state.join("term").exists(),
+        "a dropped client must end its app-server with SIGTERM, not SIGKILL"
+    );
+}

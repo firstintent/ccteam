@@ -938,6 +938,23 @@ html.dark .dot.off { background: #4b4e57; }
 .flow-row .d { flex: 1; color: var(--text-muted); font-size: 12.5px; min-width: 160px; }
 .flow-row .end { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 
+/* 团队 → 编排 (ccteam Flow runs): a run row toggles open into leaf sub-rows —
+   the run's real hired sessions off the delegation graph. The running dot
+   borrows the topology's busy pulse (same keyframes, same reduced-motion
+   opt-out). */
+.flow-row.flow-run { cursor: pointer; }
+.flow-row.flow-run .chev { color: var(--text-faint); font-size: 15px; line-height: 1; width: 12px; flex: none; }
+.flow-row .dot.busy { animation: agent-active-pulse 1.8s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .flow-row .dot.busy { animation: none; }
+}
+.flow-run-leaves { background: var(--bg-soft); border-bottom: 1px solid var(--border-soft); padding: 4px 0; }
+.flow-run-leaves:last-child { border-bottom: none; }
+.flow-run-leaf { display: flex; align-items: center; gap: 10px; padding: 6px 16px 6px 40px; font-size: 12.5px; }
+.flow-run-leaf .t { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-run-leaf .end { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: none; }
+.flow-run-hint { padding: 6px 16px 6px 40px; font-size: 12px; color: var(--text-faint); }
+
 .form { display: flex; flex-direction: column; gap: 16px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field label { font-size: 13px; font-weight: 500; }

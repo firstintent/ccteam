@@ -61,3 +61,31 @@ output_per_1m = 10.0
 input_per_1m = 0.15
 cached_input_per_1m = 0.075
 output_per_1m = 0.6
+
+# gpt-5.6 family (standard tier) — verified 2026-09-01 against
+# developers.openai.com/api/docs/pricing (301 target of the platform
+# pricing URL). Reasoning models: reasoning_per_1m == output_per_1m.
+# OWNER-VERIFY before ship (LEDGER-1: prices are owner-checked).
+[models."gpt-5.6-sol"]
+input_per_1m = 4.0
+cached_input_per_1m = 0.4
+output_per_1m = 20.0
+reasoning_per_1m = 20.0
+
+[models."gpt-5.6-terra"]
+input_per_1m = 2.0
+cached_input_per_1m = 0.2
+output_per_1m = 12.0
+reasoning_per_1m = 12.0
+
+[models."gpt-5.6-luna"]
+input_per_1m = 0.2
+cached_input_per_1m = 0.02
+output_per_1m = 1.2
+reasoning_per_1m = 1.2
+
+[models."gpt-5.6-cyber"]
+input_per_1m = 12.5
+cached_input_per_1m = 1.25
+output_per_1m = 75.0
+reasoning_per_1m = 75.0
