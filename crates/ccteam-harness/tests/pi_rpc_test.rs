@@ -85,6 +85,7 @@ impl PiTestEnv {
 
     fn ctx(&self, sid: &str) -> SpawnCtx {
         SpawnCtx {
+            generation: 0,
             mode: None,
             slug: "pi-test".to_string(),
             sid: sid.to_string(),
@@ -588,4 +589,32 @@ async fn explicit_spawn_clamp_and_missing_native_session_fail_hard() {
         .unwrap_err()
         .to_string()
         .contains("Pi native session missing"));
+}
+
+/// `docs-local/issues/#14②` — pi writer family: its event task persists a
+/// clone of the spawn-seeded `cached_status` at every terminal event, so the
+/// seed has to carry this thread's generation. A sid outlives its threads and
+/// a re-spawn reads this file back to choose a model; an unstamped observation
+/// cannot say which thread it came from.
+#[tokio::test]
+#[serial]
+async fn a_persisted_pi_observation_carries_the_spawn_generation() {
+    let env = PiTestEnv::new().await;
+    let adapter = PiRpcAdapter::new(role_reader());
+    let spec = AgentSpecBrief {
+        role: String::new(),
+    };
+    let mut ctx = env.ctx("s9");
+    ctx.generation = 11;
+    let handle = adapter.start_thread(&spec, &ctx).await.unwrap();
+    let _ = submit_and_terminal(&adapter, &handle, "hello").await;
+    let persisted =
+        ccteam_harness::execution::session_status::read_status_file(env.project.path(), "s9")
+            .expect("a terminal event persisted a status");
+    assert_eq!(
+        persisted.generation,
+        Some(11),
+        "the observation names the thread that made it"
+    );
+    adapter.close_thread(&handle).await.unwrap();
 }

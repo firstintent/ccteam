@@ -207,6 +207,7 @@ fn setup(tmp: &Path) -> PathBuf {
 
 fn ctx(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        generation: 0,
         mode: None,
         slug: slug.to_string(),
         sid: sid.to_string(),
@@ -521,6 +522,7 @@ async fn child_death_then_restart_recovers() {
 
 fn ctx_hitl(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        generation: 0,
         permission_mode: PermissionMode::Hitl,
         ..ctx(tmp, slug, sid)
     }
@@ -779,6 +781,50 @@ async fn stream_json_status_survives_release_via_persisted_file() {
         .expect("persisted context survives session release");
     assert_eq!(c.used_tokens, Some(12_345));
     assert_eq!(c.window_tokens, 1_000_000);
+}
+
+/// `docs-local/issues/#14②` — claude writer family: the status tap persists a
+/// clone of the spawn-seeded shared `ThreadStatus`, so that seed carries this
+/// thread's generation and every write inherits it. A sid outlives its threads
+/// and a re-spawn reads this file back to choose a model; an unstamped
+/// observation cannot say which thread produced it.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_persisted_claude_observation_carries_the_spawn_generation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let mut spawn = ctx(tmp.path(), "demo", "s1");
+    spawn.generation = 5;
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &spawn,
+        )
+        .await
+        .expect("start_thread");
+
+    let stream_handle = handle.clone();
+    let submit = adapter.submit_turn(&handle, TurnInput::UserText("hi".into()));
+    let _ = tokio::join!(collect_answer(&adapter, &stream_handle), submit);
+
+    let status_file = tmp.path().join(".ccteam/chat/s1/status.json");
+    for _ in 0..40 {
+        if status_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let persisted = ccteam_harness::execution::session_status::read_status_file(tmp.path(), "s1")
+        .expect("tap persisted status.json");
+    assert_eq!(
+        persisted.generation,
+        Some(5),
+        "the observation names the thread that made it"
+    );
+    adapter.close_thread(&handle).await.unwrap();
 }
 
 /// Task 2 — `/model <id>` is driveable in stream-json: it issues a

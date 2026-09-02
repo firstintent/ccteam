@@ -66,6 +66,7 @@ fn clear_fake() {
 
 fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "demo".into(),
         sid: sid.into(),
@@ -458,6 +459,7 @@ async fn load_resume_filters_is_replay() {
     let sid = "s-resume";
     // Seed meta as if a prior session existed with known ACP sessionId.
     let meta = SessionMeta {
+        model_pinned_generation: None,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),
@@ -722,6 +724,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     }
 
     let ctx_with_secret = |sid: &str| SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "demo".into(),
         sid: sid.into(),
@@ -752,6 +755,7 @@ async fn session_new_and_load_carry_mcp_servers() {
     // Phase B — cold resume via session/load (meta carries the vendor_uuid).
     let sid_load = "s-load-mcp";
     let meta = SessionMeta {
+        model_pinned_generation: None,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),
@@ -851,6 +855,7 @@ async fn session_new_offers_this_sessions_principal_verbatim() {
                 role: String::new(),
             },
             &SpawnCtx {
+                generation: 0,
                 mode: None,
                 slug: "demo".into(),
                 sid: "s77".into(),
@@ -1154,6 +1159,63 @@ async fn context_survives_release_via_the_turn_boundary_snapshot() {
     );
     assert_eq!(ctx.window_tokens, live_ctx.window_tokens);
     assert_eq!(after.model, live.model);
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// `docs-local/issues/#14②` — ACP writer family, end to end: a real turn goes
+/// through `AcpTurnRunner`, which persists `st.thread_status()` at the
+/// boundary. That snapshot must carry the generation of the thread that made
+/// it, because a sid outlives its threads and a re-spawn reads this file back
+/// to decide which model to come up on. Without the stamp the reader cannot
+/// tell a retired thread's observation from the current one's.
+#[tokio::test]
+#[serial]
+async fn a_persisted_acp_observation_carries_the_spawn_generation() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let mut ctx = spawn_ctx(&tmp, "s1");
+    ctx.generation = 7;
+    let handle = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &ctx,
+        ),
+    )
+    .await
+    .expect("start timeout")
+    .expect("start ok");
+
+    let mut stream = adapter.events(&handle);
+    let collector = tokio::spawn(async move {
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, ThreadEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("hello".into()))
+        .await
+        .expect("submit");
+    tokio::time::timeout(Duration::from_secs(10), collector)
+        .await
+        .expect("collector timeout")
+        .expect("collector join");
+
+    let persisted = ccteam_harness::execution::session_status::read_status_file(tmp.path(), "s1")
+        .expect("the turn boundary persisted a status");
+    assert_eq!(
+        persisted.generation,
+        Some(7),
+        "the observation names the thread that made it"
+    );
 
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();

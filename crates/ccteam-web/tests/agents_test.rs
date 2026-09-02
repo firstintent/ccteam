@@ -232,6 +232,7 @@ fn idle_meta(
     observed_model: Option<&str>,
 ) {
     let m = ccteam_harness::SessionMeta {
+        model_pinned_generation: None,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),

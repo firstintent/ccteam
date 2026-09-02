@@ -123,6 +123,12 @@ impl Drop for AcpInjectionReservation {
 /// Shared live state for one ACP session.
 #[derive(Debug, Default)]
 pub struct SessionTranslateState {
+    /// Which thread generation this ACP session is ([`crate::SpawnCtx::generation`]).
+    /// Stamped onto every [`ThreadStatus`] this state produces, so an
+    /// observation persisted to `status.json` says which thread made it
+    /// (`docs-local/issues/#14②`). Set once at spawn; `None` outside the
+    /// gateway.
+    pub generation: Option<u64>,
     /// Client-started `session/prompt` turn, owned/finalized by the runner.
     pub buffer: Option<TurnBuffer>,
     /// Opt-in for vendors such as Grok that can admit an interjection while
@@ -213,6 +219,7 @@ impl SessionTranslateState {
             context: self.context_usage(),
             effort: self.effort.clone(),
             goal: None,
+            generation: self.generation,
         }
     }
 
