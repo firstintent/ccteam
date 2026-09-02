@@ -598,6 +598,9 @@ impl PiRpcAdapter {
             effort: effective_effort,
             context: None,
             goal: None,
+            // Seeded once at spawn; the event task clones this cached status,
+            // so every persisted observation carries the stamp.
+            generation: ctx.generation_stamp(),
         };
         let (event_tx, _) = broadcast::channel(256);
         let live = Arc::new(LiveSession {
@@ -1556,6 +1559,9 @@ impl HarnessAdapter for PiRpcAdapter {
             effort: Some(state.thinking_level),
             context: stats.context_usage.map(context_from_pi),
             goal: None,
+            // Carry the spawn-seeded stamp: this refresh describes the SAME
+            // thread (`docs-local/issues/#14②`).
+            generation: live.cached_status.lock().unwrap().generation,
         };
         *live.cached_status.lock().unwrap() = status.clone();
         write_status_file(&live.project_dir, &live.sid, &status);

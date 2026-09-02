@@ -989,6 +989,19 @@ pub fn format_tokens(n: u64) -> String {
 pub struct ThreadStatus {
     pub model: Option<String>,
     pub context: Option<ContextUsage>,
+    /// Which thread generation observed this ([`SpawnCtx::generation`]).
+    ///
+    /// `docs-local/issues/#14②` — `status.json` is keyed by SID, but a sid
+    /// outlives its threads, so an unstamped observation cannot say whether it
+    /// describes the thread running now or the one a `/role` switch retired.
+    /// Every writer stamps its own generation; readers compare. A late write
+    /// from a retired thread is then simply not selected, with no gating, no
+    /// abort ordering and no check/write race to lose.
+    ///
+    /// `None` = a file written before the stamp existed, or a spawn with no
+    /// generation. Treated as satisfying no pin — see `respawn_tuning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     /// Reasoning-effort level the model will actually run at (Claude Opus
     /// 4.6+ / Codex), e.g. `low` / `medium` / `high` / `xhigh` / `max`.
     /// `None` for builds/models without an effort axis. Default-skipped so
@@ -1223,6 +1236,20 @@ pub struct ThreadErrorEvent {
 pub struct SpawnCtx {
     pub slug: String,
     pub sid: String,
+    /// Which THREAD of this sid is starting. A sid outlives any one thread —
+    /// a `/role` switch, a resume, a rebuild all re-spawn under the same sid —
+    /// and the gateway mints a fresh, monotonic generation for each.
+    ///
+    /// `docs-local/issues/#14②` — the adapter stamps it onto every
+    /// [`ThreadStatus`] it persists, so an observation says WHICH thread made
+    /// it. That is what lets a reader ignore a write from a retired thread
+    /// without having to stop it first: a late write is harmless by
+    /// construction rather than by winning a race against a shutdown.
+    ///
+    /// `0` = "no generation" (a spawn outside the gateway: tests, the flow
+    /// orchestrator). Such a stamp never satisfies a pin.
+    pub generation: u64,
+    // (see `generation_stamp` for the `0 → None` normalization every writer uses)
     /// Canonical owner tag for this session (`user:web-api`, `user:<id>`, or
     /// the IM owner tag). Adapters that need identity-scoped local resources
     /// consume this; other vendors ignore it.
@@ -1288,6 +1315,15 @@ pub struct SpawnCtx {
     /// location is a transport parameter, not an adapter branch). `None`
     /// (the overwhelming majority) = local spawn, unchanged.
     pub remote: Option<crate::execution::remote_exec::RemoteExecTarget>,
+}
+
+impl SpawnCtx {
+    /// This thread's generation as a [`ThreadStatus::generation`] stamp:
+    /// `None` for the `0` sentinel, so a spawn with no generation never
+    /// produces an observation that could satisfy a pin.
+    pub fn generation_stamp(&self) -> Option<u64> {
+        (self.generation != 0).then_some(self.generation)
+    }
 }
 
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`
@@ -2069,6 +2105,7 @@ mod tests {
     #[test]
     fn thread_status_suffix_combines_model_and_ctx() {
         let full = ThreadStatus {
+            generation: None,
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage::known(
                 188_000,
@@ -2120,6 +2157,7 @@ mod tests {
             context: None,
             effort: None,
             goal: None,
+            generation: None,
         };
         assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));
         // Default (statusless) → nothing to append.

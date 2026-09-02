@@ -321,6 +321,7 @@ impl GrokAcpAdapter {
         project_dir: PathBuf,
         cwd: PathBuf,
         info: ModelInfo,
+        generation: Option<u64>,
     ) -> Arc<LiveSession> {
         crate::model_catalog::record_vendor_models_best_effort(
             "grok",
@@ -340,6 +341,9 @@ impl GrokAcpAdapter {
             window_tokens: info.window,
             effort: info.effort,
             capture_vendor_started_turns: true,
+            // Stamp this THREAD so every observation the turn runner
+            // persists says which one made it (`docs-local/issues/#14②`).
+            generation,
             ..Default::default()
         }));
         // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
@@ -410,6 +414,7 @@ impl GrokAcpAdapter {
             context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
+            generation: st.generation,
         }
     }
 
@@ -774,6 +779,7 @@ impl HarnessAdapter for GrokAcpAdapter {
             ctx.project_dir.clone(),
             cwd,
             info,
+            ctx.generation_stamp(),
         );
         let mut handle = Self::make_handle(&live);
         if let Ok(st) = live.state.lock() {

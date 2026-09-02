@@ -237,11 +237,15 @@ impl DshAcpAdapter {
         info: ModelInfo,
         permission_mode: PermissionMode,
         requested_model: Option<String>,
+        generation: Option<u64>,
     ) -> Arc<LiveSession> {
         let state = Arc::new(StdMutex::new(SessionTranslateState {
             model: info.model.or(requested_model),
             window_tokens: info.window,
             effort: info.effort,
+            // Stamp this THREAD so every observation the turn runner
+            // persists says which one made it (`docs-local/issues/#14②`).
+            generation,
             ..Default::default()
         }));
         if let Some(snapshot) = read_status_file(&project_dir, &sid) {
@@ -535,6 +539,7 @@ impl HarnessAdapter for DshAcpAdapter {
             info,
             ctx.permission_mode,
             agent_options.requested_model_display(),
+            ctx.generation_stamp(),
         );
         let mut handle = Self::make_handle(&live);
         if let Ok(st) = live.state.lock() {

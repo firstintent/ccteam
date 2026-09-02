@@ -15,6 +15,7 @@ use tempfile::TempDir;
 
 fn sample_meta(sid: &str, slug: &str, last_active: &str, uuid: &str) -> SessionMeta {
     SessionMeta {
+        model_pinned_generation: None,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),

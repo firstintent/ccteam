@@ -170,6 +170,7 @@ fn write_hook_logger(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 
 fn make_ctx(cwd: &Path) -> SpawnCtx {
     SpawnCtx {
+        generation: 0,
         mode: None,
         slug: SLUG.to_string(),
         sid: "s-agent-smoke".to_string(),
@@ -495,6 +496,7 @@ fn seed_hitl_persona(project_dir: &Path, victim: &Path) {
 
 fn make_ctx_hitl(cwd: &Path) -> SpawnCtx {
     SpawnCtx {
+        generation: 0,
         mode: None,
         slug: HITL_SLUG.to_string(),
         sid: "s-agent-hitl".to_string(),
@@ -633,6 +635,7 @@ async fn run_hitl_decision_turn(allow: bool, tag: &str) -> (bool, bool) {
 
     let adapter = ClaudeTuiAdapter::new();
     let ctx = SpawnCtx {
+        generation: 0,
         mode: None,
         slug: slug.clone(),
         sid: format!("s-agent-hitl-{tag}"),

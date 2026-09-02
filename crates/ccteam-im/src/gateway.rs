@@ -23,8 +23,8 @@ use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
     DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
-    TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, ThreadStatus,
+    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
@@ -93,6 +93,161 @@ impl ChatKey {
     fn from_identity(s: &str) -> Option<Self> {
         let (channel, chat_id) = s.split_once(':')?;
         Some(Self::new(channel, chat_id, chat_id))
+    }
+
+    /// The key the per-chat FOCUS tables ([`FocusRoutes`]) are addressed by:
+    /// the CHAT, exactly as [`Self::identity`] defines it, with `user_id`
+    /// normalized away.
+    ///
+    /// `docs-local/issues/#14①` — the focus maps used to be keyed by the full
+    /// `(channel, chat_id, user_id)` triple, so ONE Telegram chat could hold
+    /// TWO routes at once: an inbound message writes `user_id = <sender
+    /// username>`, while everything that reconstructs a chat from a session's
+    /// persisted `meta.owner` goes through [`Self::from_identity`] — whose
+    /// input deliberately carries no `user_id` — and so reads/writes `user_id
+    /// = chat_id`. A focused session that answered an INTERNAL turn (a
+    /// delegation completion notification, whose `plan_unlocked_turn` resets
+    /// `reply_to` to the owner-shaped key) therefore looked up the OTHER key,
+    /// read as out-of-focus, and had its IM leg dropped — the human saw the
+    /// answer on the web console and nothing on Telegram.
+    ///
+    /// Focus follows ownership: the chat is the unit, not one member of it.
+    fn focus_key(&self) -> ChatKey {
+        ChatKey::new(&self.channel, &self.chat_id, &self.chat_id)
+    }
+}
+
+/// A per-chat FOCUS table — `current_project` (chat → the project it is
+/// working in) and `current_session` (chat → the session it is talking to).
+///
+/// A type rather than a bare `BTreeMap` so [`ChatKey::focus_key`] normalization
+/// has exactly ONE home: the inner map is private and every accessor takes a
+/// plain `&ChatKey` and normalizes it here, so a reader or writer added later
+/// is covered by construction rather than by remembering. Both tables use it —
+/// they share the key shape, so they shared the split.
+///
+/// Cheap to clone (`Arc`): each detached event pump keeps its own handle to the
+/// session table to answer "is this session still its chat's focus?".
+#[derive(Debug, Clone, Default)]
+struct FocusRoutes {
+    inner: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
+}
+
+impl FocusRoutes {
+    /// Read the table, RECOVERING a poisoned lock.
+    ///
+    /// A panic under the lock leaves a `BTreeMap` that is still structurally
+    /// sound — these critical sections are a single map operation — so the
+    /// honest response is to carry on, not to drop the caller's work. Dropping
+    /// it would be the very bug this type exists to prevent: a lost route reads
+    /// back as "this chat has no session", which spawns a phantom one or routes
+    /// the next message to the wrong sid.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<ChatKey, String>> {
+        self.inner.read().unwrap_or_else(|poisoned| {
+            tracing::error!("ccteam-im: focus route table lock was poisoned; reading through it");
+            poisoned.into_inner()
+        })
+    }
+
+    /// [`Self::read`]'s write twin — same recovery, same reason.
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<ChatKey, String>> {
+        self.inner.write().unwrap_or_else(|poisoned| {
+            tracing::error!("ccteam-im: focus route table lock was poisoned; writing through it");
+            poisoned.into_inner()
+        })
+    }
+
+    /// What this chat is currently pointed at, if anything.
+    fn get(&self, chat: &ChatKey) -> Option<String> {
+        self.read().get(&chat.focus_key()).cloned()
+    }
+
+    fn contains(&self, chat: &ChatKey) -> bool {
+        self.get(chat).is_some()
+    }
+
+    /// Point this chat at `value`, replacing whatever it pointed at before.
+    fn set(&self, chat: &ChatKey, value: impl Into<String>) {
+        self.write().insert(chat.focus_key(), value.into());
+    }
+
+    fn remove(&self, chat: &ChatKey) {
+        self.write().remove(&chat.focus_key());
+    }
+
+    /// Is `sid` the session this chat is talking to right now?
+    fn is_focused(&self, chat: &ChatKey, value: &str) -> bool {
+        self.read()
+            .get(&chat.focus_key())
+            .is_some_and(|v| v == value)
+    }
+
+    /// Drop every route whose VALUE fails `keep`.
+    fn retain_values(&self, mut keep: impl FnMut(&str) -> bool) {
+        self.write().retain(|_, v| keep(v));
+    }
+
+    /// [`Self::retain_values`]' two-argument twin, for a predicate that also
+    /// needs the chat (an ACL re-check). The key handed to `keep` is already
+    /// normalized, so it names the chat and never a single member.
+    fn retain(&self, mut keep: impl FnMut(&ChatKey, &str) -> bool) {
+        self.write().retain(|chat, v| keep(chat, v));
+    }
+
+    fn values(&self) -> Vec<String> {
+        self.read().values().cloned().collect()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// The whole table, for persistence.
+    fn saved_routes(&self) -> Vec<SavedGatewayRoute> {
+        self.read()
+            .iter()
+            .map(|(chat, value)| SavedGatewayRoute {
+                chat: chat.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// Replace the whole table from a persisted snapshot.
+    ///
+    /// `routing.json` written before the key was chat-scoped can hold two rows
+    /// for one chat (see [`ChatKey::focus_key`]); they collapse onto the same
+    /// key here and `rank` decides the survivor — the HIGHEST rank wins, and
+    /// `None` disqualifies a row outright (a route the caller would only
+    /// delete a moment later is not a candidate at all). Ranks compare only
+    /// within one chat, so a caller may rank on whatever it knows.
+    ///
+    /// Order in the file is the serialized BTreeMap's key order, NOT time, so
+    /// the caller must rank on the value itself: a stale route must never
+    /// shadow the live one, whichever way the rows happened to be written.
+    fn load_saved<R: Ord>(
+        &self,
+        saved: Vec<SavedGatewayRoute>,
+        mut rank: impl FnMut(&ChatKey, &str) -> Option<R>,
+    ) {
+        let mut collapsed: BTreeMap<ChatKey, (R, String)> = BTreeMap::new();
+        for route in saved {
+            let key = route.chat.focus_key();
+            let Some(candidate) = rank(&key, &route.value) else {
+                continue;
+            };
+            match collapsed.get(&key) {
+                Some((incumbent, _)) if *incumbent >= candidate => {}
+                _ => {
+                    collapsed.insert(key, (candidate, route.value));
+                }
+            }
+        }
+        *self.write() = collapsed
+            .into_iter()
+            .map(|(chat, (_, value))| (chat, value))
+            .collect();
     }
 }
 
@@ -517,6 +672,10 @@ pub struct Gateway {
     /// (`~/.ccteam/state/sessions/next-sid`). Its own file so "sid never
     /// reused" survives a wiped routing table / purged meta.json set.
     next_sid_path: Option<PathBuf>,
+    /// Persisted THREAD-generation counter (`state/sessions/next-generation`).
+    /// Its own file for the same reason `next_sid_path` is — see
+    /// [`Gateway::next_live_generation`]. `None` ⇒ in-memory only.
+    next_generation_path: Option<PathBuf>,
     /// Daemon-wide monotonic scheduled-message counter (`d{n}`).
     next_scheduled_path: Option<PathBuf>,
     /// v0.8.21 Wave-2 — sids that were live at last persist, stashed by
@@ -548,13 +707,13 @@ pub struct Gateway {
     /// [`Principal::Guest`] instead: it owns only what it creates and sees no
     /// project, so it cannot reach anything of the owner's or a tenant's.
     operator_chats: BTreeMap<String, OperatorBinding>,
-    current_project: BTreeMap<ChatKey, String>,
-    /// chat → its current/focused session id. Shared (`Arc<RwLock>`) so the
-    /// detached event pumps can read it to label *out-of-band* answers/errors
-    /// — i.e. async events from a session that is no longer the chat's focus,
-    /// which otherwise masquerade as the current session in the single IM
-    /// stream (v0.8.10 routing-isolation fix).
-    current_session: Arc<std::sync::RwLock<BTreeMap<ChatKey, String>>>,
+    current_project: FocusRoutes,
+    /// chat → its current/focused session id. Shared (`Arc<RwLock>` inside
+    /// [`FocusRoutes`]) so the detached event pumps can read it to label
+    /// *out-of-band* answers/errors — i.e. async events from a session that is
+    /// no longer the chat's focus, which otherwise masquerade as the current
+    /// session in the single IM stream (v0.8.10 routing-isolation fix).
+    current_session: FocusRoutes,
     sessions: BTreeMap<String, GatewaySession>,
     /// Process-wide allocator for [`GatewaySession::generation`]. It is not a
     /// persisted identity; it only fences races within this daemon lifetime.
@@ -1843,6 +2002,16 @@ struct ResumeDeadPlan {
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// Live-entry epoch captured during planning. Apply aborts if the entry was
     /// replaced or removed while the vendor spawn was in flight.
+    fenced_generation: u64,
+    /// The generation of the thread this resume is about to START — minted
+    /// ONCE here, stamped into its `SpawnCtx` (so its observations carry it)
+    /// and installed on the live entry by apply.
+    ///
+    /// `docs-local/issues/#14②` — these were two different values before: the
+    /// plan passed the OLD entry's epoch to the adapter while apply minted a
+    /// second one for the live map, so a resumed thread's `status.json` stamp
+    /// disagreed with `GatewaySession.generation` and a pin could be judged
+    /// against a generation no thread ever wrote.
     generation: u64,
     /// v0.9.0 W3 (G10) — see `MetaRebuildPlan::ccteam_root` / `remote_proxy`;
     /// same re-gate contract, performed by `spawn_for_resume_plan`.
@@ -2111,8 +2280,21 @@ fn append_next_hint(reply: &mut String, hint: &str) {
 }
 
 impl Gateway {
+    /// Mint the next THREAD generation and make it durable before it is used.
+    ///
+    /// Two jobs, one counter: it fences apply-phase races within this daemon
+    /// (a rebuild must not install over a newer replacement), and it stamps
+    /// which thread of a sid produced an observation
+    /// (`docs-local/issues/#14②`, [`ccteam_harness::ThreadStatus::generation`]).
+    /// The second job is why it is PERSISTED, exactly like the sid counter: a
+    /// restart that rolled it back would let a fresh thread stamp below a pin
+    /// written before the restart, and `model_pinned_generation` would then
+    /// never be satisfied again. A failed persist only leaves a harmless gap.
     fn next_live_generation(&mut self) -> u64 {
         self.next_session_generation = self.next_session_generation.wrapping_add(1).max(1);
+        if let Err(error) = self.persist_next_generation() {
+            tracing::warn!(%error, "ccteam-im: persisting the thread-generation counter failed");
+        }
         self.next_session_generation
     }
 
@@ -2157,6 +2339,7 @@ impl Gateway {
             routing_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             capacity_admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_sid_path: None,
+            next_generation_path: None,
             next_scheduled_path: None,
             restore_pending: Vec::new(),
             detached: BTreeMap::new(),
@@ -2164,8 +2347,8 @@ impl Gateway {
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
             projects,
             operator_chats: BTreeMap::new(),
-            current_project: BTreeMap::new(),
-            current_session: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            current_project: FocusRoutes::default(),
+            current_session: FocusRoutes::default(),
             sessions: BTreeMap::new(),
             next_session_generation: 0,
             rebuild_reservations: BTreeMap::new(),
@@ -2353,6 +2536,7 @@ impl Gateway {
         self.routing_path = Some(crate::routing_state_path_in(&root));
         self.state_root = Some(root.clone());
         self.next_sid_path = Some(crate::next_sid_path_in(&root));
+        self.next_generation_path = Some(crate::next_generation_path_in(&root));
         self.next_scheduled_path = Some(
             root.join("state")
                 .join("scheduled")
@@ -2400,10 +2584,15 @@ impl Gateway {
         };
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
-        let model_id = meta
-            .model
-            .clone()
-            .or_else(|| role_model_id(role_detail.as_ref()));
+        // Both tuning axes, one precedence — see `respawn_tuning`.
+        let (model_id, effort) = respawn_tuning(
+            &cwd,
+            &meta.sid,
+            RespawnModel::Replay {
+                role_detail: role_detail.as_ref(),
+            },
+            &RespawnMetaTuning::from_meta(meta),
+        );
         let owner = self
             .tenant_project_owner(slug)
             .or_else(|| ChatKey::from_identity(&meta.owner))
@@ -2452,7 +2641,7 @@ impl Gateway {
             owner,
             handle,
             model_id,
-            effort: meta.effort.clone(),
+            effort,
             mode: meta.mode.clone(),
             secret: rebuild_secret,
             cwd,
@@ -2518,6 +2707,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    generation: plan.generation,
                     slug: plan.slug.clone(),
                     sid: plan.sid.clone(),
                     owner: plan.owner.identity(),
@@ -2663,27 +2853,42 @@ impl Gateway {
     /// web chat.
     fn drop_dead_session_routes(&self) {
         let mut memo = ProjectPrincipalMemo::new();
-        self.current_session.write().unwrap().retain(|chat, sid| {
-            // A detached body is still this chat's session — it comes back
-            // (rebuilt by sid) the moment the body exits; keep the focus.
-            if self.detached.contains_key(sid) {
-                return true;
-            }
-            if let Some(session) = self.sessions.get(sid) {
-                return self.chat_can_access_with(chat, session, &mut memo);
-            }
-            // RELEASED (not resident, not stopped): the session is real, its
-            // transcript is on disk, and the next message resumes THAT sid.
-            // Dropping the focus here is what made an idle release — or a
-            // restart — silently mint a brand-new session on the chat's next
-            // plain message.
-            self.find_meta_for_sid(sid)
-                .map(|(slug, _dir, meta)| {
-                    meta.is_resumable()
-                        && self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo)
-                })
-                .unwrap_or(false)
-        });
+        self.current_session
+            .retain(|chat, sid| self.focus_route_is_addressable(chat, sid, &mut memo));
+    }
+
+    /// Can `chat` still address `sid` — i.e. is this focus route worth keeping?
+    ///
+    /// The single definition of a route's validity, shared by
+    /// [`Self::drop_dead_session_routes`] (which prunes) and `load_state`
+    /// (which, when a pre-fix `routing.json` collapses two rows onto one chat,
+    /// must not pick a route the very next prune would delete while a valid
+    /// alternative sat beside it).
+    fn focus_route_is_addressable(
+        &self,
+        chat: &ChatKey,
+        sid: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> bool {
+        // A detached body is still this chat's session — it comes back
+        // (rebuilt by sid) the moment the body exits; keep the focus.
+        if self.detached.contains_key(sid) {
+            return true;
+        }
+        if let Some(session) = self.sessions.get(sid) {
+            return self.chat_can_access_with(chat, session, memo);
+        }
+        // RELEASED (not resident, not stopped): the session is real, its
+        // transcript is on disk, and the next message resumes THAT sid.
+        // Dropping the focus here is what made an idle release — or a
+        // restart — silently mint a brand-new session on the chat's next
+        // plain message.
+        self.find_meta_for_sid(sid)
+            .map(|(slug, _dir, meta)| {
+                meta.is_resumable()
+                    && self.project_owner_visible_with(chat, &slug, &meta.owner, memo)
+            })
+            .unwrap_or(false)
     }
 
     /// Cold-start RECONCILE of the sessions that were resident at last persist
@@ -3019,10 +3224,7 @@ impl Gateway {
             ),
         );
         self.emit_session_lifecycle(sid, &detached.slug, "stopped", "user");
-        self.current_session
-            .write()
-            .unwrap()
-            .retain(|_, v| v != sid);
+        self.current_session.retain_values(|v| v != sid);
         self.persist_routing()?;
         tracing::info!(session = %sid, pid = detached.body.pid, stopped, "ccteam-im: detached body stopped by user");
         Ok(true)
@@ -3583,12 +3785,12 @@ impl Gateway {
         }
     }
 
-    /// True when this chat/user already has a current gateway session.
+    /// True when this chat already has a current gateway session. `user_id` is
+    /// the caller's sender, not part of the focus identity (see
+    /// [`ChatKey::focus_key`]) — the chat's session is the chat's, whoever spoke.
     pub fn has_current_session(&self, channel: &str, chat_id: &str, user_id: &str) -> bool {
         self.current_session
-            .read()
-            .unwrap()
-            .contains_key(&ChatKey::new(channel, chat_id, user_id))
+            .contains(&ChatKey::new(channel, chat_id, user_id))
     }
 
     /// Route one inbound text message and return outbound replies. Thin
@@ -3682,10 +3884,7 @@ impl Gateway {
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
-                self.current_session
-                    .write()
-                    .unwrap()
-                    .insert(chat.clone(), session_id);
+                self.current_session.set(&chat, session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -3695,10 +3894,7 @@ impl Gateway {
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
-                self.current_session
-                    .write()
-                    .unwrap()
-                    .insert(chat.clone(), session_id);
+                self.current_session.set(&chat, session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -3722,7 +3918,7 @@ impl Gateway {
         // Claude keeps its native in-thread `/clear` (the passthrough below) — only
         // a codex current session + an exact `/clear` is intercepted here.
         if text.trim() == "/clear" {
-            let current = self.current_session.read().unwrap().get(&chat).cloned();
+            let current = self.current_session.get(&chat);
             if let Some(sid) = current {
                 let is_codex = self
                     .sessions
@@ -3950,18 +4146,12 @@ impl Gateway {
                 let (sid, raw_title) = match split_leading_sid(rest) {
                     Some((sid, title)) => (sid.to_string(), title),
                     None => {
-                        let sid = self
-                            .current_session
-                            .read()
-                            .unwrap()
-                            .get(chat)
-                            .cloned()
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "/rename 需要一个活动会话:先 /new 或发条消息,\
-                                     也可以 /rename <sid> <新标题> 指名重命名。"
-                                )
-                            })?;
+                        let sid = self.current_session.get(chat).ok_or_else(|| {
+                            anyhow!(
+                                "/rename 需要一个活动会话:先 /new 或发条消息,\
+                                 也可以 /rename <sid> <新标题> 指名重命名。"
+                            )
+                        })?;
                         (sid, rest)
                     }
                 };
@@ -4050,15 +4240,9 @@ impl Gateway {
                 // so fat-fingering it just stops the live turn.
                 let sid = match parts.next() {
                     Some(id) => id.to_string(),
-                    None => self
-                        .current_session
-                        .read()
-                        .unwrap()
-                        .get(chat)
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow!("/interrupt 需要一个活动会话(或 /interrupt <sid>)")
-                        })?,
+                    None => self.current_session.get(chat).ok_or_else(|| {
+                        anyhow!("/interrupt 需要一个活动会话(或 /interrupt <sid>)")
+                    })?,
                 };
                 // Own-only ACL — identical to /stop (a chat can interrupt only
                 // its own / the shared web-pool session).
@@ -4225,15 +4409,9 @@ impl Gateway {
 
         let (when, text) = parse_inbox_create_args(rest)?;
         let send_at = crate::scheduled::parse_send_time(&when)?;
-        let sid = self
-            .current_session
-            .read()
-            .unwrap()
-            .get(chat)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!("/inbox needs a current session; use /sessions then /use <sid>")
-            })?;
+        let sid = self.current_session.get(chat).ok_or_else(|| {
+            anyhow!("/inbox needs a current session; use /sessions then /use <sid>")
+        })?;
         let visible_pending = self
             .scheduled_items
             .values()
@@ -4292,8 +4470,7 @@ impl Gateway {
         if !self.can_see_project(chat, project) {
             return Err(anyhow!("unknown project: {project}"));
         }
-        self.current_project
-            .insert(chat.clone(), project.to_string());
+        self.current_project.set(chat, project);
         let adopted = self.adopt_session_in_project(chat, project);
         self.persist_routing()?;
         Ok(match adopted {
@@ -4338,24 +4515,21 @@ impl Gateway {
             {
                 Ok(resumed_sid) => {
                     // Move current project to this session's project, and bind
-                    // BOTH the focus and the reply target to THIS chat key.
+                    // the reply target to THIS chat key.
                     // `resume_stopped_session` can only route by the caller's
                     // canonical IDENTITY (`ChatKey::from_identity` forces
-                    // `user_id = chat_id`), which is not the real key this chat
-                    // is addressed by — leaving the focus keyed to a chat that
-                    // never speaks, so the next plain message still went to the
-                    // OLD session.
+                    // `user_id = chat_id`); the FOCUS tables no longer care
+                    // (they key by the chat — see `ChatKey::focus_key`), but
+                    // `reply_to` is a concrete delivery route, so it is still
+                    // repointed at the chat that actually spoke.
                     if let Some(s) = self.sessions.get(&resumed_sid) {
                         let proj = s.project.clone();
                         if let Ok(mut target) = s.reply_to.lock() {
                             *target = chat.clone();
                         }
-                        self.current_project.insert(chat.clone(), proj);
+                        self.current_project.set(chat, proj);
                     }
-                    self.current_session
-                        .write()
-                        .unwrap()
-                        .insert(chat.clone(), resumed_sid.clone());
+                    self.current_session.set(chat, resumed_sid.clone());
                     self.persist_routing()?;
                     return Ok(format!("resumed session {resumed_sid}"));
                 }
@@ -4371,11 +4545,8 @@ impl Gateway {
         // Switching INTO a session moves the chat's "current project" to that
         // session's project, so a following /new (and /cd's default) lands in
         // the same project you just switched into — not the stale prior one.
-        self.current_project.insert(chat.clone(), project);
-        self.current_session
-            .write()
-            .unwrap()
-            .insert(chat.clone(), sid.clone());
+        self.current_project.set(chat, project);
+        self.current_session.set(chat, sid.clone());
         self.persist_routing()?;
         Ok(format!("using session {sid}"))
     }
@@ -4541,7 +4712,7 @@ impl Gateway {
                     && self.project_owner_visible_with(chat, slug, &meta.owner, &mut memo)
             })
             .collect();
-        let current_sid = self.current_session.read().unwrap().get(chat).cloned();
+        let current_sid = self.current_session.get(chat);
         let rows: Vec<SessionRowSource<'_>> = visible
             .iter()
             .map(|s| SessionRowSource::Resident(s))
@@ -4682,7 +4853,7 @@ impl Gateway {
         // brand-new project owns none, so `adopt_session_in_project` returns
         // `None` and removes the stale pointer, making the next message spawn a
         // `cto` session HERE rather than in the chat's previous project.
-        self.current_project.insert(chat.clone(), slug.clone());
+        self.current_project.set(chat, slug.clone());
         self.adopt_session_in_project(chat, &slug);
         if let Err(err) = self.persist_routing() {
             tracing::warn!(error = %err, "ccteam-im: persist after /newproject failed");
@@ -4722,7 +4893,7 @@ impl Gateway {
     /// slow await so [`Gateway::handle_message_shared`] can drop the gateway
     /// lock before running it.
     fn plan_ensure_current_session(&mut self, chat: &ChatKey) -> Result<EnsureSessionOutcome> {
-        if self.current_session.read().unwrap().contains_key(chat) {
+        if self.current_session.contains(chat) {
             return Ok(EnsureSessionOutcome::AlreadyHasSession);
         }
         let templates = self.templates_for_chat(chat);
@@ -4738,13 +4909,12 @@ impl Gateway {
             let cd_elsewhere = self
                 .current_project
                 .get(chat)
-                .is_some_and(|p| *p != template.project);
+                .is_some_and(|p| p != template.project);
             if !cd_elsewhere {
                 // Mirrors `start_template_session`'s pre-spawn mutation: switching
                 // INTO the bot's project happens regardless of whether the spawn
                 // itself later runs inline or with the lock dropped.
-                self.current_project
-                    .insert(chat.clone(), template.project.clone());
+                self.current_project.set(chat, template.project.clone());
                 let plan = self.plan_new_session(
                     chat.clone(),
                     template.project,
@@ -4879,8 +5049,7 @@ impl Gateway {
         owner: ChatKey,
         template: GatewayRouteTemplate,
     ) -> Result<String> {
-        self.current_project
-            .insert(owner.clone(), template.project.clone());
+        self.current_project.set(&owner, template.project.clone());
         self.start_session(
             owner,
             template.project,
@@ -5179,6 +5348,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.id.clone(),
                     owner: plan.owner.identity(),
@@ -5220,6 +5390,7 @@ impl Gateway {
             }
         });
         let mut meta = SessionMeta {
+            model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: plan.id.clone(),
@@ -5374,10 +5545,7 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        self.current_session
-            .write()
-            .unwrap()
-            .insert(reply_to, id.clone());
+        self.current_session.set(&reply_to, id.clone());
         if !capacity_checked {
             self.persist_routing()?;
         }
@@ -5415,10 +5583,7 @@ impl Gateway {
     async fn switch_current_role(&mut self, chat: &ChatKey, role: String) -> Result<String> {
         let sid = self
             .current_session
-            .read()
-            .unwrap()
             .get(chat)
-            .cloned()
             .ok_or_else(|| anyhow!("/role 需要一个活动会话:先 /new 或发条消息再切换。"))?;
         let old = self
             .sessions
@@ -5475,8 +5640,6 @@ impl Gateway {
                 ));
             }
         };
-        let model_id = role_model_id(Some(&role_detail));
-
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
         // the retired transcript.
@@ -5495,13 +5658,27 @@ impl Gateway {
         // Wave-2: a restart rebuilds from meta, so the role change must persist).
         let meta_dir = cwd.clone();
         let meta_role = role.clone();
-        // `/role` re-derives the MODEL from the new role's frontmatter, but the
-        // effort belongs to the session, not the role — replay it so a switch
-        // doesn't silently drop the level the session was spawned with.
-        let (effort, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
-            Some(entry) => (entry.meta.effort, entry.meta.mode),
-            None => (None, None),
+        // Same helper, same precedence as every other re-spawn — only the
+        // MODEL axis differs, and it says so in the type: `/role` re-derives
+        // it from the new role's frontmatter (the point of the command) while
+        // the effort belongs to the SESSION, not the role, and carries across.
+        let (meta_tuning, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
+            Some(entry) => (
+                RespawnMetaTuning::from_meta(&entry.meta),
+                entry.meta.mode.clone(),
+            ),
+            None => (RespawnMetaTuning::default(), None),
         };
+        let (model_id, effort) = respawn_tuning(
+            &cwd,
+            &sid,
+            RespawnModel::FromRole(role_model_id(Some(&role_detail))),
+            &meta_tuning,
+        );
+        // Mint the new THREAD's generation BEFORE the spawn: the adapter stamps
+        // it onto every observation this thread persists, and the meta pin
+        // below records it (`docs-local/issues/#14②`).
+        let generation = self.next_live_generation();
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -5517,12 +5694,12 @@ impl Gateway {
                 permission_mode,
                 secret.clone(),
                 &host,
+                generation,
             )
             .await?;
         // Replace the record in place: same sid, new role/handle/thread, fresh
         // pane counters; replies route back to the owner (the chat that drives
         // it), matching `start_session`.
-        let generation = self.next_live_generation();
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -5555,10 +5732,7 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        self.current_session
-            .write()
-            .unwrap()
-            .insert(chat.clone(), sid.clone());
+        self.current_session.set(chat, sid.clone());
         self.persist_routing()?;
         // v0.8.21 Wave-2 — keep meta.json (the session SoT) in sync: `/role`
         // changed the role, so a daemon restart must rebuild at the NEW role.
@@ -5574,6 +5748,15 @@ impl Gateway {
             meta.model = model_id;
             meta.effort = effort;
             meta.mode = mode;
+            // `/role` chose the model from a REQUEST (the new role's
+            // frontmatter), so the observation in `status.json` — the model
+            // this command just overrode — must not outrank it until the NEW
+            // thread reports one of its own. Record which generation that is,
+            // here in the file the gateway owns. Nothing is written to
+            // `status.json` from this side and nothing has to be stopped: an
+            // observation simply does not count for the model until it is
+            // stamped with this generation or later (issue #14②).
+            meta.model_pinned_generation = Some(generation);
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
@@ -5704,7 +5887,7 @@ impl Gateway {
         // v0.8.10 routing-isolation — read handle to the chat→focus map so the
         // detached pump can label out-of-band answers/errors (events from a
         // session that is no longer the chat's current focus).
-        let current_session = Arc::clone(&self.current_session);
+        let current_session = self.current_session.clone();
         // v0.9.0 W2 (F2) — signal completed child turns to the delegation
         // notifier (the pump is detached + holds no gateway lock, so it can't
         // deliver the notification itself). `None` when no notifier is wired.
@@ -6773,10 +6956,7 @@ impl Gateway {
                             // one; the focused session's own replies stay unlabeled.
                             // turns.jsonl already captured the RAW `text` above — only
                             // the IM `content` is prefixed.
-                            let is_focused = current_session
-                                .read()
-                                .map(|m| m.get(&chat_key).map(|s| s == &session_id).unwrap_or(false))
-                                .unwrap_or(true);
+                            let is_focused = current_session.is_focused(&chat_key, &session_id);
                             // v0.8.23 review §3.2-5 (item 2a) — a FOCUSED answer
                             // otherwise carries NO context at all, so the "which
                             // session just answered" question only had an answer for
@@ -7053,6 +7233,51 @@ impl Gateway {
     /// step to cold-start rebuild from each session's `meta.json` (the SoT).
     /// No session content is read here (spawning is async; load_state is not).
     fn load_state(&mut self) -> Result<()> {
+        // Monotonic THREAD-generation counter. Unlike the sid counter it is NOT
+        // trusted on its own: the values it hands out are already written into
+        // durable records (`status.json` stamps, `meta.model_pinned_generation`),
+        // so a wiped or rolled-back file would let a NEW thread reuse a
+        // generation an old observation or pin already used — a stale
+        // observation would satisfy a pin (silent retune), or a pin above the
+        // reset counter would never be satisfiable again. Recover the floor
+        // from those records and never move backwards.
+        if self.next_generation_path.is_some() {
+            let file = self
+                .next_generation_path
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|raw| raw.trim().parse::<u64>());
+            let (floor, unreadable) = self.observed_generation_floor();
+            let (next, recovered) = recovered_generation_counter(
+                file.clone(),
+                floor,
+                unix_seconds_now(),
+                unreadable == 0,
+            );
+            if recovered {
+                // A pristine first boot recovers too (there is no file yet) and
+                // is not worth a warning; anything with prior state on disk, or
+                // a project we could not read, is.
+                if floor > 0 || unreadable > 0 || matches!(file, Some(Err(_))) {
+                    tracing::warn!(
+                        file = ?file,
+                        floor,
+                        unreadable,
+                        next,
+                        "ccteam-im: next-generation counter was missing, corrupt or behind the \
+                         durable record; recovering above the wall clock so no thread generation \
+                         is reused"
+                    );
+                } else {
+                    tracing::debug!(next, "ccteam-im: seeding the thread-generation counter");
+                }
+                // Durable BEFORE it is used, exactly like a minted generation.
+                if let Err(error) = self.persist_next_generation_at(next) {
+                    tracing::warn!(%error, "ccteam-im: persisting the recovered counter failed");
+                }
+            }
+            self.next_session_generation = next;
+        }
         // Monotonic sid counter — its own file, read independently of routing so
         // a wiped routing table never resets it (red line: sid never reused).
         if let Some(path) = self.next_sid_path.as_ref() {
@@ -7072,16 +7297,33 @@ impl Gateway {
         let raw = std::fs::read_to_string(path)?;
         let saved: RoutingState = serde_json::from_str(&raw)?;
         self.default_project = saved.default_project;
-        self.current_project = saved
-            .current_project
-            .into_iter()
-            .map(|route| (route.chat, route.value))
-            .collect();
-        *self.current_session.write().unwrap() = saved
-            .current_session
-            .into_iter()
-            .map(|route| (route.chat, route.value))
-            .collect();
+        // A chat's two axes collapse onto one key each (see
+        // `ChatKey::focus_key`). The PROJECT tie-break is arbitrary — both
+        // values are a project this chat really used, and a wrong pick
+        // self-heals on the next `/cd` or `/use` — so take the later row.
+        self.current_project
+            .load_saved(saved.current_project, |_, _| Some(()));
+        // The SESSION choice is not arbitrary: a stale route must never shadow
+        // the live one. Disqualify anything this chat cannot address — the
+        // SAME predicate `drop_dead_session_routes` prunes by, so a collapse
+        // can never pick a row that is deleted moments later while a valid
+        // alternative sat beside it. Among the survivors prefer a sid that was
+        // resident at last persist (`live_sids`), then the higher sid ordinal:
+        // sids are monotonic and never reused, so that is the later-created
+        // session. `None` (an unparseable sid) ranks below every real one.
+        let live: std::collections::BTreeSet<&str> =
+            saved.live_sids.iter().map(String::as_str).collect();
+        let routes = self.current_session.clone();
+        let mut memo = ProjectPrincipalMemo::new();
+        routes.load_saved(saved.current_session, |chat, sid| {
+            self.focus_route_is_addressable(chat, sid, &mut memo)
+                .then(|| {
+                    (
+                        live.contains(sid),
+                        sid.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()),
+                    )
+                })
+        });
         // Live map stays empty; rebuild happens async from meta.json. Dead-route
         // cleanup is deferred to AFTER rebuild (a route to a sid that fails to
         // rebuild is dropped there), since nothing is live yet at this point.
@@ -7108,6 +7350,85 @@ impl Gateway {
     /// `meta.json` now carries `stopped_at`, so a session the owner explicitly
     /// stopped is skipped here instead of being resurrected — the one-off
     /// "stray `/stop` afterwards" cost this used to accept is gone.
+    /// The highest thread generation any DURABLE record already claims — every
+    /// `meta.model_pinned_generation` and every persisted `status.json` stamp —
+    /// together with how many records the scan could NOT read.
+    ///
+    /// `docs-local/issues/#14②` — these are the two places a generation
+    /// outlives the counter, so they are exactly what the counter must not fall
+    /// behind. One boot-time scan over the same `list_session_metas` walk
+    /// `recover_routing_from_meta` already makes; `(0, 0)` when there is nothing
+    /// on disk yet (a first boot).
+    ///
+    /// The second element is load-bearing: a floor is only a floor if the scan
+    /// saw everything, so any unreadable record makes the whole floor
+    /// uncertifiable and forces a clock recovery (see
+    /// [`recovered_generation_counter`]).
+    fn observed_generation_floor(&self) -> (u64, usize) {
+        self.observed_generation_floor_with(&DiskSessionRecords)
+    }
+
+    /// [`Self::observed_generation_floor`] over an injected reader, so the
+    /// "could not read" paths are exercised on ANY uid — a `chmod 000` fixture
+    /// silently does nothing as root, which is exactly when CI runs.
+    fn observed_generation_floor_with(&self, records: &dyn SessionRecordReader) -> (u64, usize) {
+        let mut floor = 0u64;
+        let mut unreadable = 0usize;
+        for (slug, dir) in &self.projects {
+            // A satellite project's `.ccteam/` lives on the other host by
+            // design, so its absence here is expected, not a fault. Either way
+            // the clock floor covers what we could not read.
+            let remote = !matches!(
+                self.project_host_binding(slug),
+                Ok((ref host, _)) if host == ccteam_core::LOCAL_HOST
+            );
+            let report = |path: PathBuf, error: std::io::Error| {
+                if remote {
+                    tracing::debug!(
+                        %slug, path = %path.display(), %error,
+                        "ccteam-im: session record unreadable for a non-local project"
+                    );
+                } else {
+                    tracing::warn!(
+                        %slug, path = %path.display(), %error,
+                        "ccteam-im: session record unreadable; thread generations from these \
+                         sessions cannot be seen and the counter recovers from the clock instead"
+                    );
+                }
+            };
+            let (metas, failures) = records.metas(dir);
+            let mut project_unreadable = failures.len();
+            for (path, error) in failures {
+                report(path, error);
+            }
+            for meta in metas {
+                floor = floor.max(meta.model_pinned_generation.unwrap_or(0));
+                match records.status(dir, &meta.sid) {
+                    Ok(Some(status)) => {
+                        if let Some(stamp) = status.generation {
+                            floor = floor.max(stamp);
+                        }
+                    }
+                    // No snapshot yet — that session has simply never reported.
+                    Ok(None) => {}
+                    Err(error) => {
+                        project_unreadable += 1;
+                        report(
+                            ccteam_harness::execution::session_status::status_json_path(
+                                dir, &meta.sid,
+                            ),
+                            error,
+                        );
+                    }
+                }
+            }
+            if project_unreadable > 0 {
+                unreadable += 1;
+            }
+        }
+        (floor, unreadable)
+    }
+
     fn recover_routing_from_meta(&mut self) {
         let mut pending = Vec::new();
         for dir in self.projects.values() {
@@ -7142,24 +7463,8 @@ impl Gateway {
         }
         let saved = RoutingState {
             default_project: self.default_project.clone(),
-            current_project: self
-                .current_project
-                .iter()
-                .map(|(chat, value)| SavedGatewayRoute {
-                    chat: chat.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-            current_session: self
-                .current_session
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(chat, value)| SavedGatewayRoute {
-                    chat: chat.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
+            current_project: self.current_project.saved_routes(),
+            current_session: self.current_session.saved_routes(),
             live_sids: self.sessions.keys().cloned().collect(),
         };
         atomic_write_durable(path, &serde_json::to_vec_pretty(&saved)?)
@@ -7175,24 +7480,8 @@ impl Gateway {
             };
             let saved = RoutingState {
                 default_project: guard.default_project.clone(),
-                current_project: guard
-                    .current_project
-                    .iter()
-                    .map(|(chat, value)| SavedGatewayRoute {
-                        chat: chat.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
-                current_session: guard
-                    .current_session
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .map(|(chat, value)| SavedGatewayRoute {
-                        chat: chat.clone(),
-                        value: value.clone(),
-                    })
-                    .collect(),
+                current_project: guard.current_project.saved_routes(),
+                current_session: guard.current_session.saved_routes(),
                 live_sids: guard.sessions.keys().cloned().collect(),
             };
             (path, serde_json::to_vec_pretty(&saved)?)
@@ -7241,6 +7530,22 @@ impl Gateway {
             std::fs::create_dir_all(parent)?;
         }
         atomic_write_durable(path, self.next_session.to_string().as_bytes())
+    }
+
+    /// [`Self::persist_next_sid`]'s twin for the thread-generation counter.
+    /// See [`Self::next_live_generation`] for why it has to survive a restart.
+    fn persist_next_generation(&self) -> Result<()> {
+        self.persist_next_generation_at(self.next_session_generation)
+    }
+
+    fn persist_next_generation_at(&self, value: u64) -> Result<()> {
+        let Some(path) = self.next_generation_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write_durable(path, value.to_string().as_bytes())
     }
 
     fn load_scheduled_state(&mut self) {
@@ -7765,11 +8070,8 @@ impl Gateway {
     ) -> Result<Vec<String>> {
         let session_id = self
             .current_session
-            .read()
-            .unwrap()
             .get(chat)
-            .ok_or_else(|| anyhow!("no current session for chat"))?
-            .clone();
+            .ok_or_else(|| anyhow!("no current session for chat"))?;
         // Both user-entry legs (this IM path and the web `submit_to_sid`) drive
         // a session through the SAME `submit_resolved` core, so directive
         // handling can never drift between them — the bug this unification
@@ -7900,7 +8202,7 @@ impl Gateway {
         let host = s.host.clone();
         let permission_mode = s.permission_mode;
         let secret = s.secret.clone();
-        let generation = s.generation;
+        let fenced_generation = s.generation;
         // Sync a possibly-registered-after-start project from the config.yaml
         // SoT before the lookup (mirrors start_session / `/role`).
         self.ensure_project_loaded(&project);
@@ -7910,26 +8212,33 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
         let role_detail = ensure_role_exists(&cwd, &role)?;
-        // One read for both axes: `model` falls back to the role's frontmatter
-        // (a role may pin a model), `effort` has no such fallback — the vendor
-        // default is the honest answer when the session never named one.
+        // Both tuning axes, one precedence — see `respawn_tuning`. `mode` has
+        // no observed counterpart, so it replays from `meta` verbatim.
         let meta = self
             .session_catalog
             .find_or_load(session_id, &self.projects)
             .map(|entry| entry.meta);
-        let model_id = meta
-            .as_ref()
-            .and_then(|m| m.model.clone())
-            .or_else(|| role_model_id(role_detail.as_ref()));
-        let (effort, mode) = match meta {
-            Some(m) => (m.effort, m.mode),
-            None => (None, None),
-        };
+        let mode = meta.as_ref().and_then(|m| m.mode.clone());
+        let (model_id, effort) = respawn_tuning(
+            &cwd,
+            session_id,
+            RespawnModel::Replay {
+                role_detail: role_detail.as_ref(),
+            },
+            &meta
+                .as_ref()
+                .map(RespawnMetaTuning::from_meta)
+                .unwrap_or_default(),
+        );
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
         // no stored-secret update).
         let adapter = (self.adapter_factory)(vendor, protocol);
+        // Mint the resumed THREAD's generation HERE, once: it rides the
+        // `SpawnCtx` so every observation this thread persists carries it, and
+        // apply installs this same value on the live entry (issue #14②).
+        let generation = self.next_live_generation();
         Ok(Some(ResumeDeadPlan {
             session_id: session_id.to_string(),
             project,
@@ -7946,6 +8255,7 @@ impl Gateway {
             effort,
             mode,
             adapter,
+            fenced_generation,
             generation,
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
@@ -7974,6 +8284,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.session_id.clone(),
                     owner: plan.owner.identity(),
@@ -8017,6 +8328,7 @@ impl Gateway {
             effort: _,
             mode: _,
             adapter,
+            fenced_generation,
             generation,
             ccteam_root: _,
             remote_proxy: _,
@@ -8024,7 +8336,7 @@ impl Gateway {
         let still_matches = self
             .sessions
             .get(&session_id)
-            .is_some_and(|s| s.generation == generation);
+            .is_some_and(|s| s.generation == fenced_generation);
         if !still_matches {
             // Session was stopped or its thread was replaced while we spawned —
             // do NOT insert a zombie; close the fresh thread gracefully.
@@ -8047,12 +8359,13 @@ impl Gateway {
         // submit flow + the pump, so resume leaves it ALONE: the turn path
         // re-stamps turn_started_at itself, and clearing it here would race the
         // in-flight reactive retry (a turn IS running when that path resumes).
+        // Install the generation the PLAN minted — the same one the resumed
+        // thread was spawned with, so `GatewaySession.generation` and the
+        // stamps in this session's `status.json` agree (issue #14②). Minting a
+        // second one here is what made them disagree.
         if let Some(s) = self.sessions.get_mut(&session_id) {
             s.thread = thread;
             s.adapter = adapter;
-        }
-        let generation = self.next_live_generation();
-        if let Some(s) = self.sessions.get_mut(&session_id) {
             s.generation = generation;
         }
         // Drop the stale pump (its task is already ending — it was bound to the
@@ -8102,6 +8415,9 @@ impl Gateway {
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
+        // The THREAD generation this spawn is (`docs-local/issues/#14②`);
+        // stamped onto every observation the new thread persists.
+        generation: u64,
     ) -> Result<(Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle), HarnessError> {
         let (bound_host, wire_slug) = self
             .ensure_session_host_binding(slug, host)
@@ -8127,6 +8443,7 @@ impl Gateway {
                     role: role.to_string(),
                 },
                 &SpawnCtx {
+                    generation,
                     slug: slug.to_string(),
                     sid: sid.to_string(),
                     owner: owner.identity(),
@@ -8871,7 +9188,7 @@ impl Gateway {
     /// what WOULD restore the face — normally `/new` — instead of pretending to
     /// have done it. See [`ccteam_harness::ToolSurfaceRebuild`].
     async fn rebuild_tool_surface(&self, chat: &ChatKey) -> Result<String> {
-        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+        let Some(session_id) = self.current_session.get(chat) else {
             return Ok("当前没有会话可重连;先 /new 或 /use <sid>".to_string());
         };
         let Some(session) = self.sessions.get(&session_id) else {
@@ -8892,7 +9209,7 @@ impl Gateway {
     /// Resolve a numeric short-reply (1-based) against the current session's
     /// pending choice (v0.8.5 D3).
     async fn resolve_numeric(&self, chat: &ChatKey, n: usize) -> Result<Vec<String>> {
-        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+        let Some(session_id) = self.current_session.get(chat) else {
             return Ok(vec!["no choice to answer".to_string()]);
         };
         let key = pending_key(chat, &session_id);
@@ -8923,7 +9240,7 @@ impl Gateway {
     }
 
     async fn resolve_free_text(&self, chat: &ChatKey, text: &str) -> Result<Option<Vec<String>>> {
-        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+        let Some(session_id) = self.current_session.get(chat) else {
             return Ok(None);
         };
         let pending = {
@@ -8969,7 +9286,7 @@ impl Gateway {
 
     /// True when the current session has an outstanding pending choice.
     async fn has_pending_for_current(&self, chat: &ChatKey) -> bool {
-        let Some(session_id) = self.current_session.read().unwrap().get(chat).cloned() else {
+        let Some(session_id) = self.current_session.get(chat) else {
             return false;
         };
         let key = pending_key(chat, &session_id);
@@ -8998,8 +9315,8 @@ impl Gateway {
         let visible = self.visible_project_slugs(chat);
         let visible_has = |slug: &str| visible.iter().any(|v| v == slug);
         if let Some(cur) = self.current_project.get(chat) {
-            if visible_has(cur) {
-                return Some(cur.clone());
+            if visible_has(&cur) {
+                return Some(cur);
             }
         }
         if visible_has(&self.default_project) {
@@ -9334,13 +9651,10 @@ impl Gateway {
             });
         match &adopted {
             Some(id) => {
-                self.current_session
-                    .write()
-                    .unwrap()
-                    .insert(chat.clone(), id.clone());
+                self.current_session.set(chat, id.clone());
             }
             None => {
-                self.current_session.write().unwrap().remove(chat);
+                self.current_session.remove(chat);
             }
         }
         adopted
@@ -9952,11 +10266,7 @@ impl Gateway {
             .collect();
         // Resolve the focused sid; if none is set (or it has gone), point at
         // /use rather than guess which session is "current".
-        let cur_sid = self
-            .current_session
-            .read()
-            .ok()
-            .and_then(|m| m.get(chat).cloned());
+        let cur_sid = self.current_session.get(chat);
         let focused_resident = cur_sid
             .as_ref()
             .and_then(|sid| visible.iter().copied().find(|s| &s.id == sid));
@@ -10378,13 +10688,8 @@ impl Gateway {
     /// creation-order (`session_index` ascending) sort so the REST session
     /// list reads recency-first like the IM `/sessions` view.
     pub fn session_views(&self) -> Vec<SessionView> {
-        let current: std::collections::HashSet<String> = self
-            .current_session
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+        let current: std::collections::HashSet<String> =
+            self.current_session.values().into_iter().collect();
         let mut views: Vec<SessionView> = self
             .sessions
             .values()
@@ -10512,13 +10817,8 @@ impl Gateway {
         &self,
         slugs: Option<&std::collections::HashSet<String>>,
     ) -> Vec<SessionView> {
-        let current: std::collections::HashSet<String> = self
-            .current_session
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+        let current: std::collections::HashSet<String> =
+            self.current_session.values().into_iter().collect();
         self.released_session_metas(slugs)
             .iter()
             .map(|(slug, meta)| released_session_view(meta, slug, &current))
@@ -10750,10 +11050,7 @@ impl Gateway {
         // mints a fresh secret, inserts into the live map, starts the pump.
         self.rebuild_session_from_meta(&slug, cwd, &meta, caller.clone())
             .await?;
-        self.current_session
-            .write()
-            .unwrap()
-            .insert(caller, sid.to_string());
+        self.current_session.set(&caller, sid);
         self.persist_routing()?;
         Ok(sid.to_string())
     }
@@ -10822,11 +11119,7 @@ impl Gateway {
             guard
                 .apply_rebuilt_session(plan, thread, caller.clone(), true)
                 .await?;
-            guard
-                .current_session
-                .write()
-                .unwrap()
-                .insert(caller, sid.to_string());
+            guard.current_session.set(&caller, sid);
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid.to_string())
@@ -10881,6 +11174,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
+            model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: sid.clone(),
@@ -10929,10 +11223,7 @@ impl Gateway {
         self.rebuild_session_from_meta(slug, cwd.clone(), &meta, caller.clone())
             .await?;
         self.persist_session_meta(&cwd, &meta)?;
-        self.current_session
-            .write()
-            .unwrap()
-            .insert(caller, sid.clone());
+        self.current_session.set(&caller, sid.clone());
         self.persist_routing()?;
         Ok(sid)
     }
@@ -10987,6 +11278,7 @@ impl Gateway {
             let sid = format!("s{}", guard.next_session);
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
+                model_pinned_generation: None,
                 managed_by: Default::default(),
                 stopped_at: None,
                 sid: sid.clone(),
@@ -11060,11 +11352,7 @@ impl Gateway {
         catalog.write(&cwd, &meta)?;
         {
             let guard = gateway.lock().await;
-            guard
-                .current_session
-                .write()
-                .unwrap()
-                .insert(caller, sid.clone());
+            guard.current_session.set(&caller, sid.clone());
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid)
@@ -13710,10 +13998,8 @@ impl Gateway {
             // so `/status`/`/sessions` render THIS session in depth, matching
             // the IM current-session semantics.
             if let Some(project) = self.sessions.get(sid).map(|s| s.project.clone()) {
-                self.current_project.insert(chat.clone(), project);
-                if let Ok(mut cur) = self.current_session.write() {
-                    cur.insert(chat.clone(), sid.to_string());
-                }
+                self.current_project.set(&chat, project);
+                self.current_session.set(&chat, sid);
             }
             if let Some(reply) = self.handle_command(&chat, &text).await? {
                 self.emit_sid_answer(sid, 0, reply);
@@ -13843,10 +14129,7 @@ impl Gateway {
         // chat doesn't keep addressing a dead session. (Only an EXPLICIT stop
         // does this — an idle release / capacity eviction keeps the focus so
         // the next message resumes the SAME sid.)
-        self.current_session
-            .write()
-            .unwrap()
-            .retain(|_, v| v != sid);
+        self.current_session.retain_values(|v| v != sid);
         self.record_explicit_stop(sid);
         self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         self.persist_routing()?;
@@ -13868,10 +14151,7 @@ impl Gateway {
         }
         let already_stopped = meta.stopped_at.is_some();
         self.principals.forget(sid);
-        self.current_session
-            .write()
-            .unwrap()
-            .retain(|_, v| v != sid);
+        self.current_session.retain_values(|v| v != sid);
         self.record_explicit_stop(sid);
         if !already_stopped {
             self.emit_session_lifecycle(sid, &slug, "stopped", "user");
@@ -14877,6 +15157,103 @@ fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDe
     }
 }
 
+/// Where the thread-generation counter must resume from.
+///
+/// `docs-local/issues/#14②` — the counter hands out values that get written
+/// into durable records (`status.json` stamps, `meta.model_pinned_generation`),
+/// so it may only ever move FORWARD. `file` is the persisted counter:
+/// `None` = the file is missing, `Some(Err(..))` = present but unparseable.
+/// `floor` is the highest generation any record already claims.
+///
+/// The two on-disk reads the thread-generation floor is computed from.
+///
+/// A trait only so the FAILURE paths are testable: a `chmod 000` fixture is a
+/// no-op for root, which is precisely the uid CI runs as, so the logic would go
+/// unexercised exactly where it is checked. Production is
+/// [`DiskSessionRecords`]; a test supplies a reader that fails on demand.
+trait SessionRecordReader {
+    fn metas(&self, project_dir: &Path) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>);
+    fn status(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+    ) -> Result<Option<ccteam_harness::ThreadStatus>, std::io::Error>;
+}
+
+/// The real thing: `meta.json` + `status.json` off disk, failures reported.
+struct DiskSessionRecords;
+
+impl SessionRecordReader for DiskSessionRecords {
+    fn metas(&self, project_dir: &Path) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>) {
+        ccteam_harness::list_session_metas_reporting(project_dir)
+    }
+
+    fn status(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+    ) -> Result<Option<ccteam_harness::ThreadStatus>, std::io::Error> {
+        ccteam_harness::execution::session_status::read_status_file_reporting(project_dir, sid)
+    }
+}
+
+/// A healthy file (at or above the floor) is taken verbatim — normal operation
+/// never consults the clock, so a backwards clock step can never lower a
+/// generation. Only the RECOVERY branches bring `now_secs` (unix seconds) in,
+/// and only through `max`, which can only raise:
+///
+/// - file behind the floor → `max(floor, now_secs)`
+/// - file missing or corrupt → `max(floor, now_secs) + 1`, since nothing then
+///   says the floor value itself was not already handed out.
+///
+/// The clock is what makes a recovery safe for records we could NOT read — a
+/// permission-denied or satellite project whose sessions still carry stamps and
+/// pins. Every generation issued before a recovery is a small dense counter
+/// value, orders of magnitude below unix-seconds, so a recovered counter is
+/// provably above every stamp on disk whether or not the scan could see it. The
+/// price is that generations stop being dense after the first recovery; they
+/// are opaque `u64` and nothing depends on their size.
+///
+/// `saw_everything` is the third input and it is not a detail: a floor is only
+/// a floor if the scan could read every record. When ANY meta or `status.json`
+/// was unreadable, the floor is a lower bound on something we cannot bound, so
+/// even a healthy counter file is not trusted and the clock recovery applies.
+/// The honest posture is that we never certify a floor we could not fully see.
+///
+/// Consequence, stated plainly: an install that always has an unreadable
+/// project — a satellite whose `.ccteam/` lives on another host by design — is
+/// effectively clock-floored on every boot. Its generations jump to
+/// ~unix-seconds once and stay monotonic from there. They are opaque `u64`,
+/// nothing reads them as a count, and no generation is ever reused.
+///
+/// Returns `(next, recovered)`; `recovered` is true whenever the file did not by
+/// itself justify the answer, and the caller persists + reports it.
+fn recovered_generation_counter(
+    file: Option<Result<u64, std::num::ParseIntError>>,
+    floor: u64,
+    now_secs: u64,
+    saw_everything: bool,
+) -> (u64, bool) {
+    match file {
+        // The only clock-free branch: a healthy counter over a floor we could
+        // certify end to end.
+        Some(Ok(value)) if value >= floor && saw_everything => (value, false),
+        // Rolled back, or resting on a floor we could not certify.
+        Some(Ok(value)) => (value.max(floor).max(now_secs), true),
+        // Missing or corrupt: no evidence the floor value was not already used.
+        _ => (floor.max(now_secs).saturating_add(1), true),
+    }
+}
+
+/// Unix seconds, or `0` if the clock is before the epoch. Only ever used to
+/// RAISE a recovered generation counter (see `recovered_generation_counter`).
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
     detail
         .and_then(|d| d.frontmatter.get("model"))
@@ -14884,6 +15261,137 @@ fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// The reasoning effort a re-spawn of `sid` must come back on, from the
+/// session's `status.json` — what the VENDOR last reported applying, written
+/// by the harness status tap at every turn boundary ("observe, don't echo").
+///
+/// `None` when the session never ran a turn, or when the vendor has no effort
+/// axis; the caller then falls back to `meta.effort` (what the spawn asked
+/// for). See [`respawn_tuning`] for why the observation outranks the request.
+///
+/// Deliberately generation-BLIND, unlike the model: the reasoning level belongs
+/// to the session rather than to any one of its threads, and `/role` carries it
+/// across by design (daef69b0). A retired thread's effort is still this
+/// session's effort.
+fn observed_effort(status: Option<&ThreadStatus>) -> Option<String> {
+    status
+        .and_then(|s| s.effort.as_deref())
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+}
+
+/// The `(model_id, effort)` a re-spawn must come back on, in ONE precedence
+/// shared by every re-spawn path: what the vendor last REPORTED (`status.json`)
+/// → what the spawn REQUESTED (`meta.json`) → the role's frontmatter (model
+/// only; effort has no role default, and the vendor default is the honest
+/// answer when the session never named one).
+///
+/// `docs-local/issues/#14②` — the observation has to outrank the request,
+/// because only the request is frozen at spawn time. `meta.model` /
+/// `meta.effort` are written once, at spawn (and on `/role`); a mid-session
+/// `/model claude-fable-5-1[1m]` or an effort the vendor resolved for itself
+/// never reaches them, so an idle release + cold resume silently came back on
+/// a different model and effort than the session had been running — with a
+/// live sid and no signal that anything had changed. `status.json` only ever
+/// holds what the vendor itself said, so it is never a wish, and it is the
+/// only persisted home of the `[1m]` tag (the translator carries the bare API
+/// id into `meta.observed_model`). `persisted_session_model` filters claude's
+/// own unresolved `"default"` picker label and legacy `<synthetic>` markers,
+/// so a placeholder can never reach `--model`.
+///
+/// The status.json rung is not new: it was read by the pre-Wave-2 restore path
+/// and was dropped as collateral when `084d17d6` retired
+/// `gateway-state.json`'s sessions vec, which re-sourced the model from the
+/// new `meta.json` SoT and never re-added it.
+///
+/// A sid outlives its threads, so an observation is only trusted for the MODEL
+/// when it is stamped with at least `meta.model_pinned_generation` — the
+/// generation of the thread whose model came from a request instead
+/// ([`SessionMeta::model_pinned_generation`]). A late write by the retired
+/// generation N can never satisfy `>= N+1`, and the new thread's first report
+/// satisfies it forever, so the pin resolves itself and nothing has to clear
+/// it — no gating, no abort ordering, no check/write race to lose.
+///
+/// An UNSTAMPED observation (`generation: None`: a file written before the
+/// stamp existed, or by a spawn with no generation) satisfies no pin. With no
+/// pin set it is trusted as before, which is what an idle release + resume
+/// needs; with a pin set it is skipped, because it cannot prove it came from
+/// the thread the pin is waiting for.
+fn respawn_tuning(
+    project_dir: &Path,
+    sid: &str,
+    model: RespawnModel<'_>,
+    meta: &RespawnMetaTuning,
+) -> (Option<String>, Option<String>) {
+    let status = ccteam_harness::execution::session_status::read_status_file(project_dir, sid);
+    let model_id = match model {
+        RespawnModel::Replay { role_detail } => meta
+            .observed_model_within_pin(project_dir, sid, status.as_ref())
+            .or_else(|| meta.model.clone())
+            .or_else(|| role_model_id(role_detail)),
+        RespawnModel::FromRole(role_model) => role_model,
+    };
+    (
+        model_id,
+        observed_effort(status.as_ref()).or_else(|| meta.effort.clone()),
+    )
+}
+
+/// The `meta.json` half of [`respawn_tuning`]'s inputs — what the last spawn
+/// REQUESTED, plus the generation from which an observed model counts.
+#[derive(Debug, Default)]
+struct RespawnMetaTuning {
+    model: Option<String>,
+    effort: Option<String>,
+    model_pinned_generation: Option<u64>,
+}
+
+impl RespawnMetaTuning {
+    fn from_meta(meta: &SessionMeta) -> Self {
+        Self {
+            model: meta.model.clone(),
+            effort: meta.effort.clone(),
+            model_pinned_generation: meta.model_pinned_generation,
+        }
+    }
+
+    /// The observed model, if the observation is recent enough to count.
+    fn observed_model_within_pin(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+        status: Option<&ThreadStatus>,
+    ) -> Option<String> {
+        let satisfies_pin = match self.model_pinned_generation {
+            None => true,
+            Some(pinned) => status
+                .and_then(|s| s.generation)
+                .is_some_and(|g| g >= pinned),
+        };
+        // `persisted_session_model` owns the placeholder filter (claude's
+        // unresolved `"default"` picker label, legacy `<synthetic>` markers),
+        // so it stays the one reader that decides what is a usable model id.
+        satisfies_pin
+            .then(|| ccteam_harness::persisted_session_model(project_dir, sid))
+            .flatten()
+    }
+}
+
+/// Where a re-spawn's MODEL comes from. The effort axis has no such split —
+/// it belongs to the session, never to the role.
+enum RespawnModel<'a> {
+    /// Replay the session's own model: what the vendor last reported, else
+    /// what the spawn asked for, else the role's frontmatter.
+    Replay { role_detail: Option<&'a RoleDetail> },
+    /// `/role` — the NEW role's frontmatter decides, and `None` (an unpinned
+    /// role) genuinely means the vendor default. That is the point of the
+    /// command, so no other rung may override it. The caller also records the
+    /// new thread's generation in `meta.model_pinned_generation`, so the
+    /// retired thread's observation stops counting for the model until the new
+    /// one reports.
+    FromRole(Option<String>),
 }
 
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
@@ -16375,7 +16883,7 @@ mod tests {
             assert_eq!(g.session_residency("s1"), Some("released"));
             // The FOCUS survives — only an explicit stop drops routes.
             assert_eq!(
-                g.current_session.read().unwrap().values().next().cloned(),
+                g.current_session.values().first().cloned(),
                 Some("s1".to_string())
             );
         }
@@ -16529,10 +17037,7 @@ mod tests {
         assert_eq!(
             gateway
                 .current_session
-                .read()
-                .unwrap()
-                .get(&ChatKey::new("mock", "chat-1", "alice"))
-                .cloned(),
+                .get(&ChatKey::new("mock", "chat-1", "alice")),
             Some("s1".to_string()),
             "capacity eviction must not drop the chat's focus"
         );
@@ -16907,7 +17412,7 @@ mod tests {
             "the stop is recorded in meta.json, not just in memory"
         );
         assert!(
-            guard.current_session.read().unwrap().is_empty(),
+            guard.current_session.is_empty(),
             "an EXPLICIT stop drops the chat focus (unlike a release)"
         );
         assert!(guard.released_session_views(None).is_empty());
@@ -17335,11 +17840,7 @@ mod tests {
             let mut gateway = Gateway::new(fake, "alpha", &project_dir);
             gateway.enable_persistence(tmp.path()).unwrap();
             sid = spawn_managed(&mut gateway).await;
-            gateway
-                .current_session
-                .write()
-                .unwrap()
-                .insert(chat.clone(), sid.clone());
+            gateway.current_session.set(&chat, sid.clone());
             gateway.persist_routing().unwrap();
         }
         // The previous daemon is gone; its body is not.
@@ -17355,8 +17856,8 @@ mod tests {
         assert!(restarted.is_session_detached(&sid));
         assert_eq!(fake.starts.load(Ordering::SeqCst), 0, "zero start_thread");
         assert_eq!(
-            restarted.current_session.read().unwrap().get(&chat),
-            Some(&sid),
+            restarted.current_session.get(&chat),
+            Some(sid.clone()),
             "the chat keeps its focus on the detached sid"
         );
         let views = restarted.session_views();
@@ -18010,6 +18511,739 @@ mod tests {
         );
     }
 
+    /// Write `status.json` exactly as a harness status tap does at a turn
+    /// boundary: the model the VENDOR reported (with its `[1m]` tag), the
+    /// effort it actually applied, and the generation of the thread that
+    /// observed them. `generation: None` is a file written before the stamp
+    /// existed.
+    fn tap_status(
+        project_dir: &Path,
+        sid: &str,
+        model: &str,
+        effort: &str,
+        generation: Option<u64>,
+    ) {
+        ccteam_harness::execution::session_status::write_status_file(
+            project_dir,
+            sid,
+            &ThreadStatus {
+                model: Some(model.to_string()),
+                context: None,
+                effort: Some(effort.to_string()),
+                goal: None,
+                generation,
+            },
+        );
+    }
+
+    /// The generation the gateway stamped on `sid`'s CURRENT thread — what a
+    /// live tap would write with.
+    fn live_generation(gateway: &Gateway, sid: &str) -> Option<u64> {
+        gateway.sessions.get(sid).map(|s| s.generation)
+    }
+
+    /// `docs-local/issues/#14②` — "released" must not mean "quietly retuned".
+    /// A session the owner had put on `claude-fable-5-1[1m] · max` came back
+    /// from an idle release running `claude-sonnet-5 · xhigh`: every re-spawn
+    /// path sourced both axes from `meta.json` (frozen at spawn) and never
+    /// looked at `status.json`, where the tap records what the vendor itself
+    /// reported for every turn — the only persisted home of the live `/model`
+    /// switch, and the only one that carries the `[1m]` tag.
+    ///
+    /// Covers both rebuild planners: the dead-child resume
+    /// (`plan_resume_dead_session`) and the rebuild-from-meta core
+    /// (`plan_session_rebuild`, shared by the daemon-restart restore, `/use`
+    /// cold resume and external adopt).
+    #[tokio::test]
+    async fn a_respawn_comes_back_on_the_model_and_effort_the_vendor_reported() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        // Spawned on one tuning…
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: Some("claude-sonnet-5".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+        // …and then moved off it live, in the session (`/model` + an effort the
+        // vendor resolved for itself). Neither reaches meta.json.
+        tap_status(
+            tmp.path(),
+            "s1",
+            "claude-fable-5-1[1m]",
+            "max",
+            live_generation(&gateway, "s1"),
+        );
+        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
+        assert_eq!(meta.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(meta.effort.as_deref(), Some("xhigh"));
+
+        // Rung 1 — the child died (crash / OOM / a released stream-json body).
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "a dead-child resume comes back on the model and effort the session was RUNNING"
+        );
+
+        // Rung 2 — the rebuild-from-meta core (daemon restart / `/use` cold
+        // resume / external adopt all funnel through it).
+        gateway.stop_session("s1").await.ok();
+        gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await
+            .expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "…and so does the rebuild-from-meta path"
+        );
+    }
+
+    /// The other half of the precedence: with no observation to honour, a
+    /// re-spawn replays what the spawn ASKED for. A session that never ran a
+    /// turn has no `status.json` at all, and one whose vendor has no effort
+    /// axis has no `effort` in it — neither may erase the request.
+    ///
+    /// Deliberately green both before and after the `status.json` rung existed:
+    /// it guards the FALLBACK, so it is the test that would catch an
+    /// over-correction rather than the missing rung.
+    #[tokio::test]
+    async fn a_respawn_without_an_observation_replays_the_spawn_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: Some("opus".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // No status.json — the session never completed a turn.
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("opus".into()), Some("xhigh".into()))),
+            "with nothing observed, the spawn-time request stands"
+        );
+
+        // A status.json that names neither axis is equally not an observation
+        // (an empty effort string is what a vendor with no effort axis leaves).
+        ccteam_harness::execution::session_status::write_status_file(
+            tmp.path(),
+            "s1",
+            &ThreadStatus {
+                generation: None,
+                model: None,
+                context: None,
+                effort: Some("   ".into()),
+                goal: None,
+            },
+        );
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("opus".into()), Some("xhigh".into()))),
+            "a blank observation does not erase the request either"
+        );
+    }
+
+    /// The daemon-restart leg end to end: `status.json` is on disk, so the
+    /// session's live tuning survives the process that observed it. This is
+    /// the shape the owner actually hit — the daemon restarts, the next
+    /// message cold-resumes the session, and it must not come back retuned.
+    #[tokio::test]
+    async fn a_restart_rebuild_comes_back_on_the_reported_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            tap_status(
+                &alpha,
+                "s1",
+                "claude-fable-5-1[1m]",
+                "max",
+                live_generation(&gateway, "s1"),
+            );
+        }
+
+        let mut restarted = Gateway::new(fake.clone(), "alpha", alpha);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.reconcile_restored_sessions().await;
+        // The next message revives s1 through the rebuild core.
+        restarted
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "a restart must not silently retune the session"
+        );
+    }
+
+    // ── issue #14② — which THREAD's observation counts ──────────────────────
+    //
+    // A sid outlives its threads, so `status.json` alone cannot say whether an
+    // observation describes the thread running now or the one a `/role` switch
+    // retired. Every writer stamps its generation; `model_pinned_generation`
+    // records the generation from which an observed MODEL counts. These four
+    // tests pin the whole rule at the data level — no races to simulate,
+    // because the mechanism does not depend on winning one.
+
+    /// Set up `/role`-switched s1 and hand back the gateway plus the retired
+    /// and current generations. `cto` pins no model; `reviewer` pins one.
+    async fn role_switched_session(
+        tmp: &tempfile::TempDir,
+    ) -> (Gateway, Arc<FakeAdapter>, u64, u64) {
+        seed_role(tmp.path(), "cto");
+        seed_role_with_model(tmp.path(), "reviewer", Some("claude-opus-5"));
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        let retired = live_generation(&gateway, "s1").expect("s1 is live");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/role reviewer")
+            .await
+            .unwrap();
+        let current = live_generation(&gateway, "s1").expect("s1 is live");
+        assert!(current > retired, "a re-spawn mints a fresh generation");
+        assert_eq!(
+            read_session_meta(tmp.path(), "s1")
+                .expect("meta written")
+                .model_pinned_generation,
+            Some(current),
+            "`/role` pins the NEW thread's generation"
+        );
+        (gateway, fake, retired, current)
+    }
+
+    /// The BLOCK's case, at the data level: the retired thread's status tap
+    /// wakes from an awaited probe AFTER the switch and writes. Its stamp is
+    /// the OLD generation, so it cannot satisfy the pin — the re-spawn comes
+    /// back on the new role's model. Nothing had to stop that write, which is
+    /// the point: the previous design tried to erase it and lost the race.
+    #[tokio::test]
+    async fn an_observation_from_the_retired_generation_cannot_retune_a_role_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut gateway, fake, retired, _current) = role_switched_session(&tmp).await;
+
+        tap_status(
+            tmp.path(),
+            "s1",
+            "claude-fable-5-1[1m]",
+            "max",
+            Some(retired),
+        );
+
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-opus-5".into()), Some("max".into()))),
+            "the retired generation's model is ignored; its EFFORT still carries"
+        );
+    }
+
+    /// …and the moment the NEW thread reports, the pin is satisfied by the
+    /// stamp itself. Nothing clears it — a pin is a floor, not a flag.
+    #[tokio::test]
+    async fn an_observation_from_the_new_generation_satisfies_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut gateway, fake, _retired, current) = role_switched_session(&tmp).await;
+
+        tap_status(
+            tmp.path(),
+            "s1",
+            "claude-fable-5-1[1m]",
+            "max",
+            Some(current),
+        );
+
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "this thread's own observation outranks the role's model again"
+        );
+    }
+
+    /// The owner's actual requirement: with NO pin, an idle release and resume
+    /// replay the last observation whatever generation made it. This is the
+    /// common path — the pin only ever exists between a `/role` switch and the
+    /// new thread's first report.
+    #[tokio::test]
+    async fn with_no_pin_a_resume_replays_the_last_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: Some("claude-sonnet-5".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_session_meta(tmp.path(), "s1")
+                .expect("meta written")
+                .model_pinned_generation,
+            None,
+            "an ordinary spawn takes its model from the request; nothing to pin"
+        );
+
+        // An observation from some ANCIENT generation still counts.
+        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max", Some(1));
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "no pin ⇒ replay what the session was RUNNING"
+        );
+    }
+
+    /// A `status.json` written before the stamp existed carries no generation.
+    /// It cannot prove which thread made it, so it satisfies no pin — but with
+    /// no pin set there is nothing to prove, and it is trusted as before.
+    #[tokio::test]
+    async fn an_unstamped_observation_is_trusted_only_without_a_pin() {
+        // With a pin: unusable for the model, still usable for the effort.
+        let pinned = tempfile::tempdir().unwrap();
+        let (mut gateway, fake, _retired, _current) = role_switched_session(&pinned).await;
+        tap_status(pinned.path(), "s1", "claude-fable-5-1[1m]", "max", None);
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-opus-5".into()), Some("max".into()))),
+            "an unstamped observation cannot satisfy a pin"
+        );
+
+        // Without a pin: unchanged from before the stamp existed.
+        let plain = tempfile::tempdir().unwrap();
+        seed_role_with_model(plain.path(), "cto", None);
+        let fake2 = Arc::new(FakeAdapter::default());
+        let mut gateway2 = Gateway::new(fake2.clone(), "alpha", plain.path());
+        gateway2
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        tap_status(plain.path(), "s1", "claude-fable-5-1[1m]", "max", None);
+        fake2.live.store(false, Ordering::SeqCst);
+        gateway2.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake2.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "a legacy file is still an observation when nothing is pinned"
+        );
+    }
+
+    /// The generation counter hands out values that end up in DURABLE records —
+    /// `status.json` stamps and `meta.model_pinned_generation` — so losing the
+    /// counter file must never let a new thread reuse one. Reusing a generation
+    /// would let a stale observation satisfy a pin (a silent retune), or strand
+    /// a pin above a reset counter forever.
+    #[test]
+    fn the_generation_counter_only_moves_forward() {
+        const NOW: u64 = 1_800_000_000;
+        const SEEN: bool = true;
+        const BLIND: bool = false;
+
+        // The ONE clock-free branch: a healthy file over a floor the scan
+        // certified end to end. A backwards clock step cannot lower it.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(9)), 7, NOW, SEEN),
+            (9, false)
+        );
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(7)), 7, NOW, SEEN),
+            (7, false)
+        );
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(9)), 7, 0, SEEN),
+            (9, false)
+        );
+
+        // A floor we could not certify is not a floor: even a healthy file
+        // resting above it recovers, because the stamp we could not read may
+        // be anywhere.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(9)), 7, NOW, BLIND),
+            (NOW, true)
+        );
+
+        // Recovery clears the wall clock, not just the floor the scan could
+        // SEE: every generation issued before a recovery is far below
+        // unix-seconds.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(3)), 7, NOW, SEEN),
+            (NOW, true)
+        );
+        assert_eq!(
+            recovered_generation_counter(None, 7, NOW, SEEN),
+            (NOW + 1, true)
+        );
+        assert_eq!(
+            recovered_generation_counter(Some("bogus".parse::<u64>()), 7, NOW, SEEN),
+            (NOW + 1, true)
+        );
+
+        // …and when the data floor is somehow ABOVE the clock, the data wins:
+        // `max` only ever raises.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(3)), NOW + 50, NOW, SEEN),
+            (NOW + 50, true)
+        );
+        assert_eq!(
+            recovered_generation_counter(None, NOW + 50, NOW, SEEN),
+            (NOW + 51, true)
+        );
+
+        // A clock stuck at the epoch degrades to the old floor-only rule
+        // rather than to something lower.
+        assert_eq!(recovered_generation_counter(None, 7, 0, SEEN), (8, true));
+        assert_eq!(recovered_generation_counter(None, 0, 0, SEEN), (1, true));
+    }
+
+    /// A reader that fails on demand, so the "could not read" paths are
+    /// exercised on ANY uid — `chmod 000` is a no-op for root, which is exactly
+    /// the uid CI runs as.
+    struct FailingRecords {
+        /// A real on-disk meta, cloned per requested sid (so the fixture never
+        /// hand-lists `SessionMeta`'s fields and cannot drift from it).
+        template: SessionMeta,
+        pins: Vec<(String, Option<u64>)>,
+        stamps: BTreeMap<String, u64>,
+        meta_fails: bool,
+        status_fails_for: Option<String>,
+    }
+
+    impl SessionRecordReader for FailingRecords {
+        fn metas(&self, project_dir: &Path) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>) {
+            if self.meta_fails {
+                return (
+                    vec![],
+                    vec![(
+                        project_dir.join(".ccteam/chat"),
+                        std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                    )],
+                );
+            }
+            let metas = self
+                .pins
+                .iter()
+                .map(|(sid, pin)| {
+                    let mut meta = self.template.clone();
+                    meta.sid = sid.clone();
+                    meta.model_pinned_generation = *pin;
+                    meta
+                })
+                .collect();
+            (metas, vec![])
+        }
+
+        fn status(
+            &self,
+            _project_dir: &Path,
+            sid: &str,
+        ) -> Result<Option<ccteam_harness::ThreadStatus>, std::io::Error> {
+            if self.status_fails_for.as_deref() == Some(sid) {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(self.stamps.get(sid).map(|g| ccteam_harness::ThreadStatus {
+                generation: Some(*g),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// A record the scan could not READ is not a record that does not exist.
+    /// Whichever of the two files is unreadable — the meta or the
+    /// `status.json` — the floor stops being certifiable, so even a healthy
+    /// counter file recovers above the wall clock rather than resting on a
+    /// number that could sit below a stamp we never saw.
+    #[tokio::test]
+    async fn an_unreadable_record_forces_a_clock_recovery_whichever_file_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", tmp.path());
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude")
+            .await
+            .unwrap();
+        let template = read_session_meta(tmp.path(), "s1").expect("meta written");
+
+        // (i) the META is unreadable, hiding a stamp of 7.
+        let hidden_meta = FailingRecords {
+            template: template.clone(),
+            stamps: BTreeMap::new(),
+            pins: vec![],
+            meta_fails: true,
+            status_fails_for: None,
+        };
+        let (floor, unreadable) = gateway.observed_generation_floor_with(&hidden_meta);
+        assert_eq!((floor, unreadable), (0, 1), "the omission is reported");
+        let (next, recovered) =
+            recovered_generation_counter(Some(Ok(3)), floor, unix_seconds_now(), unreadable == 0);
+        assert!(recovered && next >= unix_seconds_now());
+        assert!(next > 7, "a stamp of 7 can never be re-issued, got {next}");
+
+        // (ii) the meta reads fine; its `status.json` does not.
+        let hidden_status = FailingRecords {
+            template: template.clone(),
+            stamps: BTreeMap::new(),
+            pins: vec![("s1".into(), None)],
+            meta_fails: false,
+            status_fails_for: Some("s1".into()),
+        };
+        let (floor, unreadable) = gateway.observed_generation_floor_with(&hidden_status);
+        assert_eq!(
+            (floor, unreadable),
+            (0, 1),
+            "an unreadable status.json counts exactly like an unreadable meta"
+        );
+        let (next, recovered) =
+            recovered_generation_counter(Some(Ok(3)), floor, unix_seconds_now(), unreadable == 0);
+        assert!(recovered && next >= unix_seconds_now());
+        assert!(next > 7, "a stamp of 7 can never be re-issued, got {next}");
+
+        // (iii) everything readable: the floor is certified, and a healthy
+        // counter file above it is taken verbatim — the clock is not consulted.
+        let all_readable = FailingRecords {
+            template,
+            stamps: BTreeMap::from([("s1".to_string(), 5u64)]),
+            pins: vec![("s1".into(), Some(4))],
+            meta_fails: false,
+            status_fails_for: None,
+        };
+        let (floor, unreadable) = gateway.observed_generation_floor_with(&all_readable);
+        assert_eq!(
+            (floor, unreadable),
+            (5, 0),
+            "the floor is the highest of the pin and the stamp"
+        );
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(9)), floor, unix_seconds_now(), unreadable == 0),
+            (9, false),
+            "a certified floor under a healthy counter never touches the clock"
+        );
+    }
+
+    /// End to end for the same rule: the counter file is destroyed, but a
+    /// session's `meta` pin and `status.json` stamp still claim generation 7.
+    /// The next spawn must stamp ABOVE that, or the pin would be satisfied by
+    /// the retired thread's observation.
+    #[tokio::test]
+    async fn a_wiped_generation_counter_recovers_from_the_durable_record() {
+        for (label, planted) in [("missing", None), ("rolled back", Some("3"))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let alpha = tmp.path().join("alpha");
+            std::fs::create_dir_all(&alpha).unwrap();
+            seed_role_with_model(&alpha, "cto", None);
+            {
+                let fake = Arc::new(FakeAdapter::default());
+                let mut gateway = Gateway::new(fake, "alpha", alpha.clone());
+                gateway.enable_persistence(tmp.path()).unwrap();
+                gateway
+                    .handle_text("mock", "chat-1", "alice", "/new claude cto")
+                    .await
+                    .unwrap();
+                // The durable record claims generation 7 on both axes.
+                let mut meta = read_session_meta(&alpha, "s1").expect("meta written");
+                meta.model_pinned_generation = Some(7);
+                ccteam_harness::write_session_meta(&alpha, &meta).unwrap();
+                tap_status(&alpha, "s1", "claude-fable-5-1[1m]", "max", Some(7));
+            }
+            // ...and the counter file is lost or rolled back under it.
+            let counter = crate::next_generation_path_in(tmp.path());
+            match planted {
+                None => std::fs::remove_file(&counter).unwrap(),
+                Some(v) => std::fs::write(&counter, v).unwrap(),
+            }
+
+            let fake = Arc::new(FakeAdapter::default());
+            let mut restarted = Gateway::new(fake, "alpha", alpha.clone());
+            restarted.enable_persistence(tmp.path()).unwrap();
+            let minted = restarted.next_live_generation();
+            assert!(
+                minted >= 8,
+                "{label}: the next generation must clear everything on disk, got {minted}"
+            );
+            // Above the WALL CLOCK too, so it also clears records the scan
+            // could not read (a permission-denied or satellite project).
+            assert!(
+                minted >= unix_seconds_now(),
+                "{label}: a recovered generation must clear unseen records too, got {minted}"
+            );
+            // The recovery is durable immediately, like any minted generation.
+            let persisted: u64 = std::fs::read_to_string(&counter)
+                .expect("recovered counter persisted")
+                .trim()
+                .parse()
+                .expect("counter is a number");
+            assert!(persisted >= 8, "{label}: recovery persisted {persisted}");
+        }
+    }
+
+    /// A project whose sessions cannot be read is NOT "a project with no
+    /// sessions": its pins and stamps still exist, so the counter must recover
+    /// above the wall clock rather than trusting a floor it could not compute —
+    /// and the omission has to be reported, not swallowed.
+    ///
+    /// This is the BELT: it proves the real `chmod`-denied path end to end, but
+    /// it can only do so as a non-root uid. The rule itself is carried on every
+    /// uid by `an_unreadable_record_forces_a_clock_recovery_whichever_file_it_is`,
+    /// which injects the failure instead — so skipping here leaves no gap, and
+    /// the skip is announced rather than silently green.
+    #[tokio::test]
+    async fn an_unreadable_project_is_reported_and_cannot_lower_the_floor() {
+        // `chmod 000` does not stop root, so there is nothing to observe there.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "skipped as root: chmod cannot deny root; the injected-failure test \
+                 `an_unreadable_record_forces_a_clock_recovery_whichever_file_it_is` \
+                 carries this rule on every uid"
+            );
+            return;
+        }
+        /// Restore the mode whatever the test does, so the tempdir can clean up.
+        struct RestoreMode(std::path::PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        seed_role_with_model(&alpha, "cto", None);
+        {
+            let fake = Arc::new(FakeAdapter::default());
+            let mut gateway = Gateway::new(fake, "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude cto")
+                .await
+                .unwrap();
+            tap_status(&alpha, "s1", "claude-fable-5-1[1m]", "max", Some(7));
+        }
+
+        // The scan can no longer see that session's stamp…
+        let chat = alpha.join(".ccteam").join("chat");
+        let _restore = RestoreMode(chat.clone());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&chat, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // …and the counter file is gone.
+        std::fs::remove_file(crate::next_generation_path_in(tmp.path())).unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut restarted = Gateway::new(fake, "alpha", alpha.clone());
+        restarted.enable_persistence(tmp.path()).unwrap();
+
+        // The omission is surfaced, not swallowed.
+        let (floor, unreadable) = restarted.observed_generation_floor();
+        assert_eq!(floor, 0, "the stamp is genuinely invisible to the scan");
+        assert_eq!(unreadable, 1, "…and the project is REPORTED as unreadable");
+
+        // Reuse is impossible anyway: the recovery cleared the wall clock.
+        let minted = restarted.next_live_generation();
+        assert!(
+            minted > 7,
+            "an unreadable project must not let generation 7 be re-issued, got {minted}"
+        );
+        assert!(minted >= unix_seconds_now(), "recovered above the clock");
+    }
+
+    /// A resume spawns a NEW thread, so its generation must be minted ONCE and
+    /// be the same value in two places: the `SpawnCtx` the adapter stamps its
+    /// observations with, and `GatewaySession.generation` in the live map.
+    /// They used to disagree — the plan passed the OLD entry's epoch to the
+    /// adapter while apply minted a second one for the live map — so a pin
+    /// could be judged against a generation no thread had ever written.
+    #[tokio::test]
+    async fn a_resumed_thread_stamps_the_generation_the_live_map_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role_with_model(tmp.path(), "cto", None);
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+
+        let installed = live_generation(&gateway, "s1").expect("s1 is live");
+        let stamped = fake
+            .spawn_generations
+            .lock()
+            .await
+            .last()
+            .copied()
+            .expect("the resume spawned a thread");
+        assert_eq!(
+            stamped, installed,
+            "the resumed thread stamps the generation the live map holds"
+        );
+    }
+
     // ----- P2a wrap_inbound (turn-text + attachment paths) ----------
 
     use crate::transport::AttachmentKind;
@@ -18161,6 +19395,9 @@ mod tests {
         /// v0.8.24 A-U3 — `(model_id, effort)` captured per start_thread so a
         /// test can assert an explicit composer choice reached the SpawnCtx.
         spawn_tunings: Arc<Mutex<Vec<CapturedTuning>>>,
+        /// `SpawnCtx::generation` captured per start_thread, so a test can assert
+        /// the thread was stamped with the generation the live map installs.
+        spawn_generations: Arc<Mutex<Vec<u64>>>,
         /// v0.8.11 E4 — when set, `submit_turn` ALSO enqueues a `TurnCompleted`
         /// after the `AgentMessage` (mirrors a real adapter's turn boundary).
         /// Off by default so the sync-drain tests (which only take the first
@@ -18254,6 +19491,7 @@ mod tests {
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
+                spawn_generations: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
                 assistant_messages: 1,
                 emit_turn_started: false,
@@ -18406,6 +19644,7 @@ mod tests {
                 .lock()
                 .await
                 .push((ctx.model_id.clone(), ctx.effort.clone()));
+            self.spawn_generations.lock().await.push(ctx.generation);
             // A fresh/resumed child is alive.
             self.live.store(true, Ordering::SeqCst);
             Ok(ThreadHandle {
@@ -20946,6 +22185,375 @@ mod tests {
         );
     }
 
+    /// `docs-local/issues/#14①` — the INVERSE of the case above, and the one
+    /// that silently ate 18 of the owner's replies over two days: the session
+    /// IS the chat's focus, so v0.10.1's "second speaker" guard must NOT fire.
+    ///
+    /// The production sequence, verbatim. A chat's focus is written from its
+    /// INBOUND key (`user_id = <sender>`), but a restart rebuilds the session
+    /// from `meta.owner` — deliberately `"channel:chat_id"` with no `user_id`
+    /// (see [`ChatKey::identity`]) — so the session's owner comes back
+    /// chat-id-shaped. A human turn still lands, because `submit_resolved`
+    /// points `reply_to` at the chat that actually spoke; the next INTERNAL
+    /// turn (a delegation completion notification) instead goes through
+    /// `plan_unlocked_turn`, which resets `reply_to` to the OWNER-shaped key.
+    /// While the focus map was keyed by the whole `(channel, chat_id,
+    /// user_id)` triple that key matched no route, so the focused session's
+    /// answer read as out-of-focus + internal and only its IM leg was dropped
+    /// — the owner saw the reply on the web console and nothing on Telegram.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn focused_answer_to_an_internal_turn_survives_a_restart_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_boundary());
+
+        // Day one: the owner opens a session from IM. The focus is written
+        // under the SENDER's key; `meta.owner` records only the chat.
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            assert_eq!(
+                gateway
+                    .current_session
+                    .get(&ChatKey::new("mock", "chat-1", "alice")),
+                Some("s1".to_string())
+            );
+        }
+
+        // Day two: the daemon restarted. Routing survives; the session does
+        // not (a restart re-spawns nothing) — it is rebuilt on demand.
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+        gateway.reconcile_restored_sessions().await;
+        let (tx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        // The owner speaks: this cold-resumes s1 (rebuilding its owner from
+        // `meta.owner`, i.e. chat-id-shaped) and is answered normally.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert!(gateway.is_session_live("s1"), "the human's turn revived s1");
+
+        // A child finishes. The completion notification is an INTERNAL turn on
+        // the very session this chat is talking to — its answer belongs in the
+        // thread.
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        Gateway::submit_to_sid_shared(
+            Arc::clone(&gateway),
+            "s1",
+            "s9 done · turn 1\nanswer".into(),
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer) && ev.content.contains("s9 done") {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the FOCUSED session's answer to an internal turn reaches the IM thread");
+        assert_eq!(delivered.sid.as_deref(), Some("s1"));
+        assert_eq!(delivered.channel, "mock");
+        assert!(
+            !delivered.content.starts_with("[s1 "),
+            "the chat's own focused session is not labelled a second speaker: {}",
+            delivered.content
+        );
+    }
+
+    /// `docs-local/issues/#14①` through the REAL notifier, not a hand-written
+    /// submit standing in for one: a `DelegationSignal` goes onto the channel
+    /// the event pumps publish to, `run_delegation_notifier` gates it on the
+    /// armed watch and the turn boundary, and `deliver_delegation_signal_shared`
+    /// plans, submits and commits the notification. Same restart-rebuilt parent
+    /// as the test above, because that is what makes its `reply_to` owner-shaped
+    /// — and this is the path that actually lost the owner's replies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn the_real_notifier_delivers_a_childs_completion_to_the_im_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+
+        // The owner's session, created from IM before the restart.
+        {
+            let mut gw = Gateway::new_with_factory(Arc::clone(&factory), "alpha", alpha.clone());
+            gw.enable_persistence(tmp.path()).unwrap();
+            gw.handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+
+        let mut gw = Gateway::new_with_factory(factory, "alpha", alpha.clone());
+        gw.register_project("alpha", alpha);
+        gw.enable_persistence(tmp.path()).unwrap();
+        gw.reconcile_restored_sessions().await;
+        // Daemon startup order: the notifier sender BEFORE the event sink, so
+        // every pump `set_event_sink` spawns captures it.
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
+        gw.set_delegation_notifier_tx(dtx.clone());
+        let (etx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        // The owner speaks: cold-resumes the parent, rebuilding its owner from
+        // `meta.owner` (chat-id-shaped, no `user_id`).
+        gw.handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        let child = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gw.arm_delegation_watch(
+            &child,
+            "s1",
+            ccteam_harness::NotifyMode::Final,
+            Some("the wave".into()),
+            None,
+        );
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+        tokio::spawn(Gateway::run_delegation_notifier(Arc::clone(&gateway), drx));
+
+        // The child's vendor turn ends — the signal a pump publishes.
+        dtx.send(crate::delegation::DelegationSignal {
+            child_sid: child.clone(),
+            turn_id: format!("{child}-1"),
+            tail: "wave finished".into(),
+            vendor: AgentVendor::Claude,
+            host: "local".into(),
+            boundary: true,
+            vendor_error: false,
+            interim_notes: 0,
+            covered_turns: vec![format!("{child}-1")],
+            context_pct: None,
+            turn: 1,
+            error_kind: None,
+        })
+        .unwrap();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer)
+                    && ev.sid.as_deref() == Some("s1")
+                    && ev.content.contains("done · turn")
+                {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the notifier's completion answer reaches the parent's IM thread");
+        assert_eq!(delivered.channel, "mock");
+        assert!(
+            delivered.content.contains(&child),
+            "the notification names the child that finished: {}",
+            delivered.content
+        );
+    }
+
+    /// `docs-local/issues/#14①` — a `routing.json` written while the focus key
+    /// was the full triple can hold TWO rows for one chat (the live shape:
+    /// `{user_id: "339498819"}` beside `{user_id: "cryptorobsu"}`, pointing at
+    /// different sessions). They collapse onto one route on load, and the
+    /// survivor is the sid that was RESIDENT at last persist — a stale route
+    /// must never shadow the session the chat is actually talking to, even
+    /// when the stale one is the newer session and sorts later in the file.
+    #[tokio::test]
+    async fn routing_load_collapses_a_chats_member_keyed_routes_onto_the_live_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let chat_shaped = ChatKey::new("telegram", "339498819", "339498819");
+        let member_shaped = ChatKey::new("telegram", "339498819", "cryptorobsu");
+
+        // Two real, resumable sessions of that one Telegram chat.
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            for _ in 0..2 {
+                gateway
+                    .handle_text("telegram", "339498819", "cryptorobsu", "/new claude")
+                    .await
+                    .unwrap();
+            }
+        }
+        let routing = crate::routing_state_path_in(tmp.path());
+        let saved: RoutingState =
+            serde_json::from_str(&std::fs::read_to_string(&routing).unwrap()).unwrap();
+        std::fs::write(
+            &routing,
+            serde_json::to_vec(&RoutingState {
+                current_project: vec![
+                    SavedGatewayRoute {
+                        chat: chat_shaped.clone(),
+                        value: "alpha".into(),
+                    },
+                    SavedGatewayRoute {
+                        chat: member_shaped.clone(),
+                        value: "alpha".into(),
+                    },
+                ],
+                current_session: vec![
+                    // The chat's live session — the LOWER ordinal, so ranking
+                    // by recency alone would lose it.
+                    SavedGatewayRoute {
+                        chat: member_shaped.clone(),
+                        value: "s1".into(),
+                    },
+                    SavedGatewayRoute {
+                        chat: chat_shaped.clone(),
+                        value: "s2".into(),
+                    },
+                ],
+                live_sids: vec!["s1".into()],
+                ..saved
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut gateway = Gateway::new(fake, "alpha", alpha);
+        gateway.enable_persistence(tmp.path()).unwrap();
+
+        assert_eq!(
+            gateway.current_session.values(),
+            vec!["s1".to_string()],
+            "one chat keeps exactly one session route, and it is the live one"
+        );
+        assert_eq!(
+            gateway.current_project.values(),
+            vec!["alpha".to_string()],
+            "…and exactly one project route"
+        );
+        // Whoever speaks in that chat now resolves to the same session.
+        for who in ["339498819", "cryptorobsu", "a-new-member"] {
+            assert_eq!(
+                gateway
+                    .current_session
+                    .get(&ChatKey::new("telegram", "339498819", who)),
+                Some("s1".to_string()),
+                "the focus belongs to the chat, not to {who}"
+            );
+        }
+    }
+
+    /// The collapse must not pick a route the very next prune would delete.
+    /// Ranking by "live at last persist, then newest sid" alone would take the
+    /// STOPPED `s9` here — it is both in `live_sids` and the higher ordinal —
+    /// leaving `drop_dead_session_routes` to drop it moments later and the
+    /// chat with no focus at all, though a perfectly good route sat beside it.
+    /// So candidates are filtered by the same predicate that prunes, first.
+    #[tokio::test]
+    async fn routing_load_never_collapses_onto_a_route_it_would_immediately_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+
+        // Two real sessions in the chat's project; the higher-numbered one is
+        // explicitly stopped, so no chat may still address it.
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            gateway.stop_session("s2").await.unwrap();
+        }
+        let routing = crate::routing_state_path_in(tmp.path());
+        let saved: RoutingState =
+            serde_json::from_str(&std::fs::read_to_string(&routing).unwrap()).unwrap();
+        std::fs::write(
+            &routing,
+            serde_json::to_vec(&RoutingState {
+                current_session: vec![
+                    SavedGatewayRoute {
+                        chat: ChatKey::new("mock", "chat-1", "alice"),
+                        value: "s1".into(),
+                    },
+                    SavedGatewayRoute {
+                        chat: ChatKey::new("mock", "chat-1", "chat-1"),
+                        value: "s2".into(),
+                    },
+                ],
+                // `s2` looks like the better pick on both ranking axes.
+                live_sids: vec!["s2".into()],
+                ..saved
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = Gateway::new(fake, "alpha", alpha);
+        restored.enable_persistence(tmp.path()).unwrap();
+        assert_eq!(
+            restored.current_session.values(),
+            vec!["s1".to_string()],
+            "a stopped sid is not a candidate, however it ranks"
+        );
+    }
+
+    /// A poisoned focus-route lock must not swallow a write. Dropping one
+    /// makes `contains`/`get` answer "this chat has no session", which spawns a
+    /// phantom session or routes the next message to the wrong sid — the exact
+    /// bug class this table exists to prevent. The map is a `BTreeMap` mutated
+    /// one operation at a time, so it is still consistent after a panic:
+    /// recover through the poison rather than degrade.
+    #[tokio::test]
+    async fn a_poisoned_focus_lock_still_records_the_chats_session() {
+        let routes = FocusRoutes::default();
+        let chat = ChatKey::new("telegram", "339498819", "cryptorobsu");
+
+        // Poison the lock the way a panic under it would.
+        let poisoner = routes.clone();
+        std::thread::spawn(move || {
+            let _guard = poisoner.inner.write().unwrap();
+            panic!("panic while holding the focus lock");
+        })
+        .join()
+        .expect_err("the spawned thread panics");
+        assert!(routes.inner.write().is_err(), "the lock is poisoned");
+
+        routes.set(&chat, "s487");
+        assert_eq!(
+            routes.get(&chat),
+            Some("s487".to_string()),
+            "a poisoned lock must not lose the chat's focus"
+        );
+        assert!(routes.contains(&chat));
+        assert!(routes.is_focused(&chat, "s487"));
+        routes.remove(&chat);
+        assert!(routes.get(&chat).is_none(), "…nor swallow its removal");
+    }
+
     /// v0.8.23 review §3.2-5 (item 2a) — a WEB-owned session's answer gets NO
     /// echo at all (the web console already shows its session context in its
     /// own chrome). Own `FakeAdapter`/gateway, see the sibling roleless test
@@ -21255,10 +22863,7 @@ mod tests {
             let focused = |chat: &ChatKey| {
                 gateway
                     .current_session
-                    .read()
-                    .unwrap()
                     .get(chat)
-                    .cloned()
                     .expect("/new focuses the chat")
             };
             let (mine, theirs) = (focused(&rob), focused(&eve));
@@ -23287,10 +24892,7 @@ mod tests {
             .unwrap();
         assert_eq!(replies, vec!["using session s1\n↓ 查看状态 → /status"]);
         assert_eq!(gateway.current_project_for(&chat).as_deref(), Some("alpha"));
-        assert_eq!(
-            gateway.current_session.read().unwrap().get(&chat).cloned(),
-            Some("s1".to_string())
-        );
+        assert_eq!(gateway.current_session.get(&chat), Some("s1".to_string()));
 
         // A malformed nav payload is benign (never panics / switches).
         let replies = gateway
@@ -23367,6 +24969,7 @@ mod tests {
         // TOTAL window (absolute, via `format_tokens`) + percent — no project
         // slug, no absolute USED count.
         fake.set_status(ThreadStatus {
+            generation: None,
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage::known(
                 188_000,
@@ -23388,6 +24991,7 @@ mod tests {
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
+            generation: None,
             model: Some("claude-sonnet-4-5".into()),
             effort: None,
             context: Some(ContextUsage::known(
@@ -23550,6 +25154,7 @@ mod tests {
             .unwrap();
         // A model + effort + context so the model·effort·ctx tail is exercised.
         fake.set_status(ThreadStatus {
+            generation: None,
             model: Some("claude-opus-4-8".into()),
             context: Some(ContextUsage::known(
                 410_000,
@@ -24510,6 +26115,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -24588,6 +26194,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -25774,10 +27381,8 @@ mod tests {
         assert_eq!(
             restored
                 .current_session
-                .read()
-                .unwrap()
                 .values()
-                .next()
+                .first()
                 .map(String::as_str),
             Some("s2")
         );

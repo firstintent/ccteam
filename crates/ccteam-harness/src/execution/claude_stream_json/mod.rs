@@ -221,7 +221,7 @@ fn spawn_status_tap(
     active_turn: Arc<AtomicBool>,
     project_dir: PathBuf,
     sid: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
         // v0.8.20 — throttle the mid-turn context refresh so `/sessions` tracks
@@ -409,7 +409,7 @@ fn spawn_status_tap(
                 }
             }
         }
-    });
+    })
 }
 
 /// True for a task that legitimately OUTLIVES the turn that spawned it, so the
@@ -1464,6 +1464,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             effort: None,
             // Goal is read from the transcript on `thread_status`, not the tap.
             goal: None,
+            // Stamp this THREAD, so every observation the tap persists says
+            // which one made it (`docs-local/issues/#14②`). Seeded once here:
+            // the tap and the `/model` handler both clone this shared status,
+            // so no writer has to remember.
+            generation: ctx.generation_stamp(),
         }));
         // v0.8.20 `/status` — the live running-subagent/workflow list, kept
         // current by the SAME status tap from claude's `system:task_*` events.
@@ -1475,14 +1480,17 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // `message.model`) into `status`, so /sessions + the web statusline
         // show model + context% as the session burns context; ALSO reflect the
         // `system:task_*` lifecycle into `running_tasks` for `/status`.
-        spawn_status_tap(
+        // The transport owns the tap's handle so closing one stops the other —
+        // a tap outliving its transport would write the NEXT thread's
+        // `status.json` (see `StreamJsonTransport::status_task`).
+        transport.attach_status_task(spawn_status_tap(
             Arc::clone(&transport),
             Arc::clone(&status),
             Arc::clone(&running_tasks),
             Arc::clone(&active_turn),
             ctx.project_dir.clone(),
             ctx.sid.clone(),
-        );
+        ));
         // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
         // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that
         // resolves each via the wired resolver (→ IM approve/deny) and
@@ -2130,6 +2138,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     context: p.context,
                     effort: l.effort.or(p.effort),
                     goal: None,
+                    // The LIVE thread is the one being described here.
+                    generation: l.generation.or(p.generation),
                 },
                 (Some(l), None) => l,
                 (None, Some(p)) => p,
@@ -2417,6 +2427,7 @@ mod effort_tests {
             dir.path(),
             "s1",
             &ThreadStatus {
+                generation: None,
                 model: Some("default".to_string()),
                 context: None,
                 effort: None,
@@ -2430,6 +2441,7 @@ mod effort_tests {
             dir.path(),
             "s2",
             &ThreadStatus {
+                generation: None,
                 model: Some("claude-opus-4-8[1m]".to_string()),
                 context: None,
                 effort: None,

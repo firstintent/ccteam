@@ -121,6 +121,7 @@ async fn claude_bg_start_thread_parses_backgrounded_marker() {
         role: "tester".into(),
     };
     let ctx = SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "demo".into(),
         sid: "claude-1".into(),
@@ -157,6 +158,7 @@ async fn claude_bg_start_thread_rejects_empty_role() {
         role: String::new(),
     };
     let ctx = SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "demo".into(),
         sid: "claude-1".into(),
@@ -279,6 +281,7 @@ async fn claude_bg_via_mux_spawns_ephemeral_session_and_close_reaps_it() {
         role: "tester".into(),
     };
     let ctx = SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "muxbg".into(),
         sid: "claude-9".into(),
@@ -465,6 +468,7 @@ mod codex_tmux {
             role: String::new(),
         };
         let ctx = SpawnCtx {
+            generation: 0,
             slug: "codextest".into(),
             sid: "codex-1".into(),
             owner: "user:web-api".into(),
