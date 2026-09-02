@@ -1511,7 +1511,8 @@ async fn recover_unobserved_turn_reads_the_vendor_transcript() {
         })
         .await
         .expect("the unobserved end_turn is recovered");
-    assert_eq!(recovered.assistant, "DONE after restart");
+    // issue #192 — the mid-turn text block is part of the turn's answer.
+    assert_eq!(recovered.assistant, "working on it\n\nDONE after restart");
     assert_eq!(recovered.usage["input_tokens"], 15);
     assert_eq!(recovered.usage["output_tokens"], 26);
 
