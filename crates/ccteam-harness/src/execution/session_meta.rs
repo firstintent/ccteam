@@ -360,21 +360,64 @@ pub fn touch_last_active(project_dir: &Path, sid: &str) {
 
 /// Scan `<project_dir>/.ccteam/chat/*/meta.json` and return all parseable
 /// metas, sorted by `last_active` descending.
+///
+/// Unreadable entries are SKIPPED. A caller that must not confuse "no sessions"
+/// with "could not look" wants [`list_session_metas_reporting`] instead.
 pub fn list_session_metas(project_dir: &Path) -> Vec<SessionMeta> {
+    list_session_metas_reporting(project_dir).0
+}
+
+/// [`list_session_metas`] plus the read failures it otherwise swallows, as
+/// `(path, error)` pairs.
+///
+/// `docs-local/issues/#14` — the thread-generation floor is computed from these
+/// metas, so a project it could not read is not "a project with no sessions":
+/// its sessions' pins and stamps still exist, and silently treating them as
+/// absent would let a recovered counter re-issue a generation they already
+/// carry. A permission-denied directory and a satellite project whose
+/// `.ccteam/` lives on another host both land here.
+///
+/// A MISSING `.ccteam/chat` is not a failure — that is a project which has
+/// simply never had a session. A corrupt `meta.json` is reported as
+/// [`std::io::ErrorKind::InvalidData`]: unreadable for this purpose either way.
+pub fn list_session_metas_reporting(
+    project_dir: &Path,
+) -> (Vec<SessionMeta>, Vec<(PathBuf, std::io::Error)>) {
     let chat_base = project_dir.join(".ccteam").join("chat");
-    let Ok(entries) = std::fs::read_dir(&chat_base) else {
-        return vec![];
+    let mut failures: Vec<(PathBuf, std::io::Error)> = Vec::new();
+    let entries = match std::fs::read_dir(&chat_base) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (vec![], failures),
+        Err(err) => {
+            failures.push((chat_base, err));
+            return (vec![], failures);
+        }
     };
-    let mut out: Vec<SessionMeta> = entries
-        .flatten()
-        .filter_map(|e| {
-            let meta_path = e.path().join("meta.json");
-            let raw = std::fs::read_to_string(&meta_path).ok()?;
-            serde_json::from_str(&raw).ok()
-        })
-        .collect();
+    let mut out: Vec<SessionMeta> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                failures.push((chat_base.clone(), err));
+                continue;
+            }
+        };
+        let meta_path = entry.path().join("meta.json");
+        match std::fs::read_to_string(&meta_path) {
+            Ok(raw) => match serde_json::from_str::<SessionMeta>(&raw) {
+                Ok(meta) => out.push(meta),
+                Err(err) => failures.push((
+                    meta_path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+                )),
+            },
+            // A chat dir with no `meta.json` is not a session at all.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failures.push((meta_path, err)),
+        }
+    }
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-    out
+    (out, failures)
 }
 
 // ── external vendor discovery ─────────────────────────────────────────────────

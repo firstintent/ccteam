@@ -7247,16 +7247,30 @@ impl Gateway {
                 .as_ref()
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .map(|raw| raw.trim().parse::<u64>());
-            let floor = self.observed_generation_floor();
-            let (next, recovered) = recovered_generation_counter(file.clone(), floor);
+            let (floor, unreadable) = self.observed_generation_floor();
+            let (next, recovered) =
+                recovered_generation_counter(file.clone(), floor, unix_seconds_now());
             if recovered {
-                tracing::warn!(
-                    file = ?file,
-                    floor,
-                    next,
-                    "ccteam-im: next-generation counter was missing, corrupt or behind the \
-                     durable record; recovering forward so no thread generation is reused"
-                );
+                // A pristine first boot recovers too (there is no file yet) and
+                // is not worth a warning; anything with prior state on disk, or
+                // a project we could not read, is.
+                if floor > 0 || unreadable > 0 || matches!(file, Some(Err(_))) {
+                    tracing::warn!(
+                        file = ?file,
+                        floor,
+                        unreadable,
+                        next,
+                        "ccteam-im: next-generation counter was missing, corrupt or behind the \
+                         durable record; recovering above the wall clock so no thread generation \
+                         is reused"
+                    );
+                } else {
+                    tracing::debug!(next, "ccteam-im: seeding the thread-generation counter");
+                }
+                // Durable BEFORE it is used, exactly like a minted generation.
+                if let Err(error) = self.persist_next_generation_at(next) {
+                    tracing::warn!(%error, "ccteam-im: persisting the recovered counter failed");
+                }
             }
             self.next_session_generation = next;
         }
@@ -7341,10 +7355,12 @@ impl Gateway {
     /// behind. One boot-time scan over the same `list_session_metas` walk
     /// `recover_routing_from_meta` already makes; `0` when there is nothing on
     /// disk yet (a first boot).
-    fn observed_generation_floor(&self) -> u64 {
+    fn observed_generation_floor(&self) -> (u64, usize) {
         let mut floor = 0u64;
-        for dir in self.projects.values() {
-            for meta in list_session_metas(dir) {
+        let mut unreadable = 0usize;
+        for (slug, dir) in &self.projects {
+            let (metas, failures) = ccteam_harness::list_session_metas_reporting(dir);
+            for meta in metas {
                 floor = floor.max(meta.model_pinned_generation.unwrap_or(0));
                 if let Some(stamp) =
                     ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
@@ -7353,8 +7369,33 @@ impl Gateway {
                     floor = floor.max(stamp);
                 }
             }
+            if failures.is_empty() {
+                continue;
+            }
+            unreadable += 1;
+            // A satellite project's `.ccteam/` lives on the other host by
+            // design, so its absence here is expected, not a fault. Either way
+            // the clock floor covers what we could not read.
+            let remote = !matches!(
+                self.project_host_binding(slug),
+                Ok((ref host, _)) if host == ccteam_core::LOCAL_HOST
+            );
+            for (path, error) in failures {
+                if remote {
+                    tracing::debug!(
+                        %slug, path = %path.display(), %error,
+                        "ccteam-im: session metadata unreadable for a non-local project"
+                    );
+                } else {
+                    tracing::warn!(
+                        %slug, path = %path.display(), %error,
+                        "ccteam-im: session metadata unreadable; thread generations from these \
+                         sessions cannot be seen and the counter recovers from the clock instead"
+                    );
+                }
+            }
         }
-        floor
+        (floor, unreadable)
     }
 
     fn recover_routing_from_meta(&mut self) {
@@ -7463,13 +7504,17 @@ impl Gateway {
     /// [`Self::persist_next_sid`]'s twin for the thread-generation counter.
     /// See [`Self::next_live_generation`] for why it has to survive a restart.
     fn persist_next_generation(&self) -> Result<()> {
+        self.persist_next_generation_at(self.next_session_generation)
+    }
+
+    fn persist_next_generation_at(&self, value: u64) -> Result<()> {
         let Some(path) = self.next_generation_path.as_ref() else {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        atomic_write_durable(path, self.next_session_generation.to_string().as_bytes())
+        atomic_write_durable(path, value.to_string().as_bytes())
     }
 
     fn load_scheduled_state(&mut self) {
@@ -15089,22 +15134,46 @@ fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDe
 /// `None` = the file is missing, `Some(Err(..))` = present but unparseable.
 /// `floor` is the highest generation any record already claims.
 ///
-/// The counter resumes at `max(file, floor)`, plus one when the file could not
-/// be read at all — a missing or corrupt file gives no evidence that its last
-/// value was consumed, so stepping past the floor keeps the next mint strictly
-/// above everything on disk. Returns `(next, recovered)`; `recovered` is true
-/// whenever the file did not by itself justify the answer, and the caller warns.
+/// A healthy file (at or above the floor) is taken verbatim — normal operation
+/// never consults the clock, so a backwards clock step can never lower a
+/// generation. Only the RECOVERY branches bring `now_secs` (unix seconds) in,
+/// and only through `max`, which can only raise:
+///
+/// - file behind the floor → `max(floor, now_secs)`
+/// - file missing or corrupt → `max(floor, now_secs) + 1`, since nothing then
+///   says the floor value itself was not already handed out.
+///
+/// The clock is what makes a recovery safe for records we could NOT read — a
+/// permission-denied or satellite project whose sessions still carry stamps and
+/// pins. Every generation issued before a recovery is a small dense counter
+/// value, orders of magnitude below unix-seconds, so a recovered counter is
+/// provably above every stamp on disk whether or not the scan could see it. The
+/// price is that generations stop being dense after the first recovery; they
+/// are opaque `u64` and nothing depends on their size.
+///
+/// Returns `(next, recovered)`; `recovered` is true whenever the file did not by
+/// itself justify the answer, and the caller persists + reports it.
 fn recovered_generation_counter(
     file: Option<Result<u64, std::num::ParseIntError>>,
     floor: u64,
+    now_secs: u64,
 ) -> (u64, bool) {
     match file {
         Some(Ok(value)) if value >= floor => (value, false),
         // Present but BEHIND the record: something rolled it back.
-        Some(Ok(_)) => (floor, true),
+        Some(Ok(_)) => (floor.max(now_secs), true),
         // Missing or corrupt: no evidence at all.
-        _ => (floor.saturating_add(1), true),
+        _ => (floor.max(now_secs).saturating_add(1), true),
     }
+}
+
+/// Unix seconds, or `0` if the clock is before the epoch. Only ever used to
+/// RAISE a recovered generation counter (see `recovered_generation_counter`).
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
@@ -18749,20 +18818,47 @@ mod tests {
     /// a pin above a reset counter forever.
     #[test]
     fn the_generation_counter_only_moves_forward() {
-        // Trustworthy file: taken as-is, no warning.
-        assert_eq!(recovered_generation_counter(Some(Ok(9)), 7), (9, false));
-        assert_eq!(recovered_generation_counter(Some(Ok(7)), 7), (7, false));
-        // Behind the record -> recover to the floor and warn.
-        assert_eq!(recovered_generation_counter(Some(Ok(3)), 7), (7, true));
-        // Missing or corrupt -> step PAST the floor: nothing says the floor
-        // value itself was not already handed out.
-        assert_eq!(recovered_generation_counter(None, 7), (8, true));
+        const NOW: u64 = 1_800_000_000;
+        // Trustworthy file: taken as-is, no warning — and the CLOCK IS NOT
+        // CONSULTED, so a backwards clock step can never lower a generation.
         assert_eq!(
-            recovered_generation_counter(Some("bogus".parse::<u64>()), 7),
-            (8, true)
+            recovered_generation_counter(Some(Ok(9)), 7, NOW),
+            (9, false)
         );
-        // First boot, nothing on disk.
-        assert_eq!(recovered_generation_counter(None, 0), (1, true));
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(7)), 7, NOW),
+            (7, false)
+        );
+        assert_eq!(recovered_generation_counter(Some(Ok(9)), 7, 0), (9, false));
+
+        // Recovery clears the wall clock too, not just the floor the scan could
+        // SEE: a project it could not read still carries stamps, and every
+        // generation ever issued before a recovery is far below unix-seconds.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(3)), 7, NOW),
+            (NOW, true)
+        );
+        assert_eq!(recovered_generation_counter(None, 7, NOW), (NOW + 1, true));
+        assert_eq!(
+            recovered_generation_counter(Some("bogus".parse::<u64>()), 7, NOW),
+            (NOW + 1, true)
+        );
+
+        // …and when the data floor is somehow ABOVE the clock, the data wins:
+        // `max` only ever raises.
+        assert_eq!(
+            recovered_generation_counter(Some(Ok(3)), NOW + 50, NOW),
+            (NOW + 50, true)
+        );
+        assert_eq!(
+            recovered_generation_counter(None, NOW + 50, NOW),
+            (NOW + 51, true)
+        );
+
+        // A clock stuck at the epoch degrades to the old floor-only rule
+        // rather than to something lower.
+        assert_eq!(recovered_generation_counter(None, 7, 0), (8, true));
+        assert_eq!(recovered_generation_counter(None, 0, 0), (1, true));
     }
 
     /// End to end for the same rule: the counter file is destroyed, but a
@@ -18805,7 +18901,82 @@ mod tests {
                 minted >= 8,
                 "{label}: the next generation must clear everything on disk, got {minted}"
             );
+            // Above the WALL CLOCK too, so it also clears records the scan
+            // could not read (a permission-denied or satellite project).
+            assert!(
+                minted >= unix_seconds_now(),
+                "{label}: a recovered generation must clear unseen records too, got {minted}"
+            );
+            // The recovery is durable immediately, like any minted generation.
+            let persisted: u64 = std::fs::read_to_string(&counter)
+                .expect("recovered counter persisted")
+                .trim()
+                .parse()
+                .expect("counter is a number");
+            assert!(persisted >= 8, "{label}: recovery persisted {persisted}");
         }
+    }
+
+    /// A project whose sessions cannot be read is NOT "a project with no
+    /// sessions": its pins and stamps still exist, so the counter must recover
+    /// above the wall clock rather than trusting a floor it could not compute —
+    /// and the omission has to be reported, not swallowed.
+    #[tokio::test]
+    async fn an_unreadable_project_is_reported_and_cannot_lower_the_floor() {
+        // `chmod 000` does not stop root, so there is nothing to observe there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        /// Restore the mode whatever the test does, so the tempdir can clean up.
+        struct RestoreMode(std::path::PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        seed_role_with_model(&alpha, "cto", None);
+        {
+            let fake = Arc::new(FakeAdapter::default());
+            let mut gateway = Gateway::new(fake, "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude cto")
+                .await
+                .unwrap();
+            tap_status(&alpha, "s1", "claude-fable-5-1[1m]", "max", Some(7));
+        }
+
+        // The scan can no longer see that session's stamp…
+        let chat = alpha.join(".ccteam").join("chat");
+        let _restore = RestoreMode(chat.clone());
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&chat, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        // …and the counter file is gone.
+        std::fs::remove_file(crate::next_generation_path_in(tmp.path())).unwrap();
+
+        let fake = Arc::new(FakeAdapter::default());
+        let mut restarted = Gateway::new(fake, "alpha", alpha.clone());
+        restarted.enable_persistence(tmp.path()).unwrap();
+
+        // The omission is surfaced, not swallowed.
+        let (floor, unreadable) = restarted.observed_generation_floor();
+        assert_eq!(floor, 0, "the stamp is genuinely invisible to the scan");
+        assert_eq!(unreadable, 1, "…and the project is REPORTED as unreadable");
+
+        // Reuse is impossible anyway: the recovery cleared the wall clock.
+        let minted = restarted.next_live_generation();
+        assert!(
+            minted > 7,
+            "an unreadable project must not let generation 7 be re-issued, got {minted}"
+        );
+        assert!(minted >= unix_seconds_now(), "recovered above the clock");
     }
 
     /// A resume spawns a NEW thread, so its generation must be minted ONCE and
