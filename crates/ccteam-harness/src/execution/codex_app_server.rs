@@ -2331,6 +2331,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
             // Codex has a native `/goal` (thread/goal/*); surfacing it in the
             // statusline is a follow-up — None for now.
             goal: None,
+            // Codex persists no `status.json` (its status is a pure in-memory
+            // tracker read), so there is no observation to stamp.
+            generation: None,
         })
     }
 

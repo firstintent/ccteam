@@ -191,24 +191,26 @@ pub struct SessionMeta {
     /// switch never silently resets the axis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// True from a re-spawn that chose the model from a REQUEST rather than
-    /// from an observation, until the new thread completes its first turn.
+    /// The thread generation from which an observed model may be trusted.
     ///
     /// `docs-local/issues/#14②` — a re-spawn sources the model from
     /// `status.json` first, because that is where the vendor's own reports
     /// land. But that file describes whichever thread last ran under this sid,
     /// and after a `/role` switch the retired thread's model is precisely the
-    /// answer the command overrode: a release before the new thread's first
-    /// turn would otherwise rebuild at the model the user just left.
+    /// answer the command overrode: a release before the new thread reported
+    /// would otherwise rebuild at the model the user just left.
     ///
-    /// So the gateway pins "no observation from THIS thread yet" here instead
-    /// of trying to erase the old one. This flag is written under the gateway
-    /// lock and cleared by the same per-turn meta write that refreshes
-    /// `turn_count`; the retired thread cannot reach it, which is the point —
-    /// a competing write to `status.json` would race that thread's status tap,
-    /// which may still be inside an awaited vendor probe.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub awaiting_observation: bool,
+    /// So a re-spawn whose model came from a REQUEST rather than an
+    /// observation records the NEW thread's generation here, under the gateway
+    /// lock. An observation counts only if it is stamped with at least this
+    /// generation ([`crate::ThreadStatus::generation`]), so a late write by the
+    /// retired thread can never satisfy it, and the new thread's first report
+    /// satisfies it forever — the pin resolves itself, nothing clears it.
+    ///
+    /// `None` = no pin: replay the last observation whatever its generation,
+    /// which is what an idle release + resume must do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pinned_generation: Option<u64>,
     pub host: String,
     pub created_at: String,
     /// Updated only on turn completion — not on every event.
@@ -562,7 +564,7 @@ mod title_tests {
 
     fn blank_meta() -> SessionMeta {
         SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             mode: None,
             tool_face: None,
             managed_by: Default::default(),

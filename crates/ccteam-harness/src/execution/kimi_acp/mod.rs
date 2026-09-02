@@ -275,6 +275,7 @@ impl KimiAcpAdapter {
         cwd: PathBuf,
         info: ModelInfo,
         permission_mode: PermissionMode,
+        generation: Option<u64>,
     ) -> Arc<LiveSession> {
         crate::model_catalog::record_vendor_models_best_effort(
             "kimi",
@@ -293,6 +294,9 @@ impl KimiAcpAdapter {
             model: info.model,
             window_tokens: info.window,
             effort: info.effort,
+            // Stamp this THREAD so every observation the turn runner
+            // persists says which one made it (`docs-local/issues/#14②`).
+            generation,
             ..Default::default()
         }));
         // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
@@ -367,6 +371,7 @@ impl KimiAcpAdapter {
             context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
+            generation: st.generation,
         }
     }
 
@@ -641,6 +646,7 @@ impl HarnessAdapter for KimiAcpAdapter {
             cwd,
             info,
             ctx.permission_mode,
+            ctx.generation_stamp(),
         );
         // Spawn-time model + effort through the SAME vendor-native seams the
         // `/model` directive uses: `session/set_model` for the model (kimi's

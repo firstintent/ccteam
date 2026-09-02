@@ -181,6 +181,22 @@ pub fn next_sid_path_in(ccteam_root: &Path) -> PathBuf {
     ccteam_root.join("state").join("sessions").join("next-sid")
 }
 
+/// The monotonic THREAD-generation counter
+/// (`~/.ccteam/state/sessions/next-generation`).
+///
+/// `docs-local/issues/#14②` — a generation identifies which thread of a sid
+/// made an observation, and `SessionMeta::model_pinned_generation` compares
+/// against it with `>=`. That comparison is only sound if generations never go
+/// backwards, so the counter is persisted for the same reason `next-sid` is:
+/// a restart that reset it would let a new thread's stamp fall below a pin
+/// written before the restart, and the pin would then never resolve.
+pub fn next_generation_path_in(ccteam_root: &Path) -> PathBuf {
+    ccteam_root
+        .join("state")
+        .join("sessions")
+        .join("next-generation")
+}
+
 /// Resolve the session-id counter for the current user
 /// (`~/.ccteam/state/sessions/next-sid`).
 pub fn default_next_sid_path() -> PathBuf {

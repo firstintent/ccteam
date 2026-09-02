@@ -517,7 +517,7 @@ mod tests {
         depth: u32,
     ) {
         let mut m = ccteam_harness::SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             mode: None,
             tool_face: None,
             managed_by: Default::default(),

@@ -62,6 +62,7 @@ mod tests {
     fn roundtrips_a_status_with_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let status = ThreadStatus {
+            generation: None,
             model: Some("grok-4.5".into()),
             context: Some(ContextUsage::known(17_580, 500_000, ContextSource::Derived)),
             effort: Some("high".into()),
@@ -93,5 +94,30 @@ mod tests {
         let ctx = got.context.expect("context survives");
         assert_eq!(ctx.used_tokens, Some(188_000));
         assert_eq!(ctx.source, ContextSource::Unknown);
+        assert_eq!(
+            got.generation, None,
+            "a file written before the stamp existed claims no thread"
+        );
+    }
+
+    /// `docs-local/issues/#14②` — the file layer every writer family goes
+    /// through. A sid outlives its threads, so the reader decides which
+    /// observation to trust by its generation; the stamp has to survive the
+    /// round trip or the whole rule is inert.
+    #[test]
+    fn a_persisted_status_keeps_its_generation_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = ThreadStatus {
+            generation: Some(42),
+            model: Some("claude-fable-5-1[1m]".into()),
+            context: None,
+            effort: Some("max".into()),
+            goal: None,
+        };
+        write_status_file(dir.path(), "s9", &status);
+        assert_eq!(
+            read_status_file(dir.path(), "s9").and_then(|s| s.generation),
+            Some(42)
+        );
     }
 }

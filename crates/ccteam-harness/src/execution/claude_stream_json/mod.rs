@@ -214,27 +214,6 @@ fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
 /// `get_context_usage` (totalTokens / maxTokens) — never a heuristic estimate,
 /// and clears the context (statusline shows none) when the vendor can't answer.
 /// Runs for the session's whole life (ends when the transport closes).
-/// Persist a status snapshot only while the thread that observed it is still
-/// this session's.
-///
-/// `docs-local/issues/#14②` — `status.json` is keyed by SID, but a sid outlives
-/// any one thread: a `/role` switch or a resume closes the old transport and
-/// spawns a new one under the same sid. Since a re-spawn now sources the model
-/// from this file, a write by a retired thread is not merely stale, it retunes
-/// the next thread. Returns whether the snapshot was written (for tests).
-fn persist_status_while_open(
-    transport: &StreamJsonTransport,
-    project_dir: &Path,
-    sid: &str,
-    snapshot: &ThreadStatus,
-) -> bool {
-    if transport.is_session_closed() {
-        return false;
-    }
-    write_status_file(project_dir, sid, snapshot);
-    true
-}
-
 fn spawn_status_tap(
     transport: Arc<StreamJsonTransport>,
     status: Arc<StdMutex<ThreadStatus>>,
@@ -340,7 +319,7 @@ fn spawn_status_tap(
                                 None
                             };
                             if let Some(snap) = snapshot {
-                                persist_status_while_open(&transport, &project_dir, &sid, &snap);
+                                write_status_file(&project_dir, &sid, &snap);
                             }
                         }
                     }
@@ -385,7 +364,7 @@ fn spawn_status_tap(
                             None
                         };
                         if let Some(snap) = snapshot {
-                            persist_status_while_open(&transport, &project_dir, &sid, &snap);
+                            write_status_file(&project_dir, &sid, &snap);
                         }
                     }
                     // v0.8.20 `/status` — reflect claude's subagent/workflow task
@@ -1096,9 +1075,7 @@ async fn refresh_context_after_turn(
         None
     };
     if let Some(snapshot) = snapshot {
-        // Same rule as the tap: a retired thread must not write this sid's
-        // status file (`persist_status_while_open`).
-        persist_status_while_open(transport, project_dir, sid, &snapshot);
+        write_status_file(project_dir, sid, &snapshot);
     }
 }
 
@@ -1487,6 +1464,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             effort: None,
             // Goal is read from the transcript on `thread_status`, not the tap.
             goal: None,
+            // Stamp this THREAD, so every observation the tap persists says
+            // which one made it (`docs-local/issues/#14②`). Seeded once here:
+            // the tap and the `/model` handler both clone this shared status,
+            // so no writer has to remember.
+            generation: ctx.generation_stamp(),
         }));
         // v0.8.20 `/status` — the live running-subagent/workflow list, kept
         // current by the SAME status tap from claude's `system:task_*` events.
@@ -2156,6 +2138,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     context: p.context,
                     effort: l.effort.or(p.effort),
                     goal: None,
+                    // The LIVE thread is the one being described here.
+                    generation: l.generation.or(p.generation),
                 },
                 (Some(l), None) => l,
                 (None, Some(p)) => p,
@@ -2443,6 +2427,7 @@ mod effort_tests {
             dir.path(),
             "s1",
             &ThreadStatus {
+                generation: None,
                 model: Some("default".to_string()),
                 context: None,
                 effort: None,
@@ -2456,6 +2441,7 @@ mod effort_tests {
             dir.path(),
             "s2",
             &ThreadStatus {
+                generation: None,
                 model: Some("claude-opus-4-8[1m]".to_string()),
                 context: None,
                 effort: None,
@@ -2465,51 +2451,6 @@ mod effort_tests {
         assert_eq!(
             persisted_session_model(dir.path(), "s2"),
             Some("claude-opus-4-8[1m]".to_string())
-        );
-    }
-
-    /// `docs-local/issues/#14②` — a sid outlives any one thread (a `/role`
-    /// switch or a resume re-spawns under the same sid), and a re-spawn now
-    /// sources its model from `status.json`. So a RETIRED thread writing that
-    /// file does not merely record something stale — it retunes the thread
-    /// that replaced it. Every write the status tap makes is gated on its own
-    /// transport still being open, and `shutdown` aborts the tap outright, so
-    /// a probe that resolves after the close has nowhere to land.
-    #[tokio::test]
-    async fn a_retired_thread_does_not_write_the_sessions_status_file() {
-        use super::{read_status_file, StreamJsonTransport};
-
-        let dir = tempfile::tempdir().unwrap();
-        let (client_rw, _peer_rw) = tokio::io::duplex(8192);
-        let (cr, cw) = tokio::io::split(client_rw);
-        let transport = StreamJsonTransport::spawn_from_io(cr, cw, None);
-
-        let live = ThreadStatus {
-            model: Some("claude-fable-5-1[1m]".into()),
-            context: None,
-            effort: Some("max".into()),
-            goal: None,
-        };
-        assert!(
-            super::persist_status_while_open(&transport, dir.path(), "s1", &live),
-            "an open thread records what it observed"
-        );
-
-        transport.shutdown().await;
-        let retired = ThreadStatus {
-            model: Some("claude-sonnet-5".into()),
-            context: None,
-            effort: Some("xhigh".into()),
-            goal: None,
-        };
-        assert!(
-            !super::persist_status_while_open(&transport, dir.path(), "s1", &retired),
-            "a closed thread's trailing write is dropped"
-        );
-        assert_eq!(
-            read_status_file(dir.path(), "s1").and_then(|s| s.model),
-            Some("claude-fable-5-1[1m]".to_string()),
-            "the retired thread must not overwrite the sid's status file"
         );
     }
 

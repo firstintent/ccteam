@@ -23,8 +23,8 @@ use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ChoicePrompt, ChoiceSelection, DetachOutcome, Directive,
     DirectiveOutcome, EventAttachment, ExternalClaudeSession, HarnessAdapter, HarnessError,
     PermissionMode, ProcessBackend, RunningTask, SessionMeta, SessionOrigin, SessionProtocol,
-    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, TitleSource,
-    TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
+    SessionTitleTarget, SpawnCtx, ThreadEvent, ThreadHandle, ThreadItemDetails, ThreadStatus,
+    TitleSource, TitleSync, TurnDisposition, TurnInput, TurnRouting, UnobservedTurnCtx,
 };
 #[cfg(test)]
 use ccteam_harness::{read_session_meta, write_session_meta};
@@ -672,6 +672,10 @@ pub struct Gateway {
     /// (`~/.ccteam/state/sessions/next-sid`). Its own file so "sid never
     /// reused" survives a wiped routing table / purged meta.json set.
     next_sid_path: Option<PathBuf>,
+    /// Persisted THREAD-generation counter (`state/sessions/next-generation`).
+    /// Its own file for the same reason `next_sid_path` is — see
+    /// [`Gateway::next_live_generation`]. `None` ⇒ in-memory only.
+    next_generation_path: Option<PathBuf>,
     /// Daemon-wide monotonic scheduled-message counter (`d{n}`).
     next_scheduled_path: Option<PathBuf>,
     /// v0.8.21 Wave-2 — sids that were live at last persist, stashed by
@@ -2266,8 +2270,21 @@ fn append_next_hint(reply: &mut String, hint: &str) {
 }
 
 impl Gateway {
+    /// Mint the next THREAD generation and make it durable before it is used.
+    ///
+    /// Two jobs, one counter: it fences apply-phase races within this daemon
+    /// (a rebuild must not install over a newer replacement), and it stamps
+    /// which thread of a sid produced an observation
+    /// (`docs-local/issues/#14②`, [`ccteam_harness::ThreadStatus::generation`]).
+    /// The second job is why it is PERSISTED, exactly like the sid counter: a
+    /// restart that rolled it back would let a fresh thread stamp below a pin
+    /// written before the restart, and `model_pinned_generation` would then
+    /// never be satisfied again. A failed persist only leaves a harmless gap.
     fn next_live_generation(&mut self) -> u64 {
         self.next_session_generation = self.next_session_generation.wrapping_add(1).max(1);
+        if let Err(error) = self.persist_next_generation() {
+            tracing::warn!(%error, "ccteam-im: persisting the thread-generation counter failed");
+        }
         self.next_session_generation
     }
 
@@ -2312,6 +2329,7 @@ impl Gateway {
             routing_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             capacity_admission_lock: Arc::new(tokio::sync::Mutex::new(())),
             next_sid_path: None,
+            next_generation_path: None,
             next_scheduled_path: None,
             restore_pending: Vec::new(),
             detached: BTreeMap::new(),
@@ -2508,6 +2526,7 @@ impl Gateway {
         self.routing_path = Some(crate::routing_state_path_in(&root));
         self.state_root = Some(root.clone());
         self.next_sid_path = Some(crate::next_sid_path_in(&root));
+        self.next_generation_path = Some(crate::next_generation_path_in(&root));
         self.next_scheduled_path = Some(
             root.join("state")
                 .join("scheduled")
@@ -2678,6 +2697,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    generation: plan.generation,
                     slug: plan.slug.clone(),
                     sid: plan.sid.clone(),
                     owner: plan.owner.identity(),
@@ -5318,6 +5338,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.id.clone(),
                     owner: plan.owner.identity(),
@@ -5359,7 +5380,7 @@ impl Gateway {
             }
         });
         let mut meta = SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: plan.id.clone(),
@@ -5644,6 +5665,10 @@ impl Gateway {
             RespawnModel::FromRole(role_model_id(Some(&role_detail))),
             &meta_tuning,
         );
+        // Mint the new THREAD's generation BEFORE the spawn: the adapter stamps
+        // it onto every observation this thread persists, and the meta pin
+        // below records it (`docs-local/issues/#14②`).
+        let generation = self.next_live_generation();
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -5659,12 +5684,12 @@ impl Gateway {
                 permission_mode,
                 secret.clone(),
                 &host,
+                generation,
             )
             .await?;
         // Replace the record in place: same sid, new role/handle/thread, fresh
         // pane counters; replies route back to the owner (the chat that drives
         // it), matching `start_session`.
-        let generation = self.next_live_generation();
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -5715,12 +5740,13 @@ impl Gateway {
             meta.mode = mode;
             // `/role` chose the model from a REQUEST (the new role's
             // frontmatter), so the observation in `status.json` — the model
-            // this command just overrode — must not outrank it until the new
-            // thread has reported one of its own. Pin that here, in the file
-            // the gateway owns; writing `status.json` from this side would
-            // race the retired thread's status tap, which can still be inside
-            // an awaited vendor probe (issue #14②).
-            meta.awaiting_observation = true;
+            // this command just overrode — must not outrank it until the NEW
+            // thread reports one of its own. Record which generation that is,
+            // here in the file the gateway owns. Nothing is written to
+            // `status.json` from this side and nothing has to be stopped: an
+            // observation simply does not count for the model until it is
+            // stamped with this generation or later (issue #14②).
+            meta.model_pinned_generation = Some(generation);
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
@@ -7199,6 +7225,15 @@ impl Gateway {
     fn load_state(&mut self) -> Result<()> {
         // Monotonic sid counter — its own file, read independently of routing so
         // a wiped routing table never resets it (red line: sid never reused).
+        // Monotonic THREAD-generation counter, same contract, same reason it
+        // is a separate file (see `next_live_generation`).
+        if let Some(path) = self.next_generation_path.as_ref() {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(n) = raw.trim().parse::<u64>() {
+                    self.next_session_generation = n;
+                }
+            }
+        }
         if let Some(path) = self.next_sid_path.as_ref() {
             if let Ok(raw) = std::fs::read_to_string(path) {
                 if let Ok(n) = raw.trim().parse::<u64>() {
@@ -7370,6 +7405,18 @@ impl Gateway {
             std::fs::create_dir_all(parent)?;
         }
         atomic_write_durable(path, self.next_session.to_string().as_bytes())
+    }
+
+    /// [`Self::persist_next_sid`]'s twin for the thread-generation counter.
+    /// See [`Self::next_live_generation`] for why it has to survive a restart.
+    fn persist_next_generation(&self) -> Result<()> {
+        let Some(path) = self.next_generation_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        atomic_write_durable(path, self.next_session_generation.to_string().as_bytes())
     }
 
     fn load_scheduled_state(&mut self) {
@@ -8103,6 +8150,7 @@ impl Gateway {
                     role: plan.role.clone(),
                 },
                 &SpawnCtx {
+                    generation: plan.generation,
                     slug: plan.project.clone(),
                     sid: plan.session_id.clone(),
                     owner: plan.owner.identity(),
@@ -8231,6 +8279,9 @@ impl Gateway {
         permission_mode: PermissionMode,
         secret: String,
         host: &str,
+        // The THREAD generation this spawn is (`docs-local/issues/#14②`);
+        // stamped onto every observation the new thread persists.
+        generation: u64,
     ) -> Result<(Arc<dyn HarnessAdapter + Send + Sync>, ThreadHandle), HarnessError> {
         let (bound_host, wire_slug) = self
             .ensure_session_host_binding(slug, host)
@@ -8256,6 +8307,7 @@ impl Gateway {
                     role: role.to_string(),
                 },
                 &SpawnCtx {
+                    generation,
                     slug: slug.to_string(),
                     sid: sid.to_string(),
                     owner: owner.identity(),
@@ -10986,7 +11038,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: sid.clone(),
@@ -11090,7 +11142,7 @@ impl Gateway {
             let sid = format!("s{}", guard.next_session);
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
-                awaiting_observation: false,
+                model_pinned_generation: None,
                 managed_by: Default::default(),
                 stopped_at: None,
                 sid: sid.clone(),
@@ -14545,12 +14597,6 @@ fn refresh_session_activity_meta(
     let Some(mut meta) = catalog.get(sid).map(|entry| entry.meta) else {
         return;
     };
-    // A turn completed, so the CURRENT thread has now reported for itself and
-    // `status.json` describes it: lift the re-spawn pin a `/role` switch set
-    // (issue #14②, `SessionMeta::awaiting_observation`). Cleared here rather
-    // than by the harness so it stays gateway-owned — the retired thread can
-    // never unset it.
-    meta.awaiting_observation = false;
     meta.last_active = chrono::Utc::now().to_rfc3339();
     meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
         .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
@@ -14991,9 +15037,14 @@ fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
 /// `None` when the session never ran a turn, or when the vendor has no effort
 /// axis; the caller then falls back to `meta.effort` (what the spawn asked
 /// for). See [`respawn_tuning`] for why the observation outranks the request.
-fn observed_effort(project_dir: &Path, sid: &str) -> Option<String> {
-    ccteam_harness::execution::session_status::read_status_file(project_dir, sid)
-        .and_then(|s| s.effort)
+///
+/// Deliberately generation-BLIND, unlike the model: the reasoning level belongs
+/// to the session rather than to any one of its threads, and `/role` carries it
+/// across by design (daef69b0). A retired thread's effort is still this
+/// session's effort.
+fn observed_effort(status: Option<&ThreadStatus>) -> Option<String> {
+    status
+        .and_then(|s| s.effort.as_deref())
         .map(|e| e.trim().to_string())
         .filter(|e| !e.is_empty())
 }
@@ -15022,39 +15073,46 @@ fn observed_effort(project_dir: &Path, sid: &str) -> Option<String> {
 /// `gateway-state.json`'s sessions vec, which re-sourced the model from the
 /// new `meta.json` SoT and never re-added it.
 ///
-/// `meta.awaiting_observation` suspends the observation rung entirely: it says
-/// the last re-spawn picked the model from a request the observation predates,
-/// so `status.json` still describes the RETIRED thread.
+/// A sid outlives its threads, so an observation is only trusted for the MODEL
+/// when it is stamped with at least `meta.model_pinned_generation` — the
+/// generation of the thread whose model came from a request instead
+/// ([`SessionMeta::model_pinned_generation`]). A late write by the retired
+/// generation N can never satisfy `>= N+1`, and the new thread's first report
+/// satisfies it forever, so the pin resolves itself and nothing has to clear
+/// it — no gating, no abort ordering, no check/write race to lose.
+///
+/// An UNSTAMPED observation (`generation: None`: a file written before the
+/// stamp existed, or by a spawn with no generation) satisfies no pin. With no
+/// pin set it is trusted as before, which is what an idle release + resume
+/// needs; with a pin set it is skipped, because it cannot prove it came from
+/// the thread the pin is waiting for.
 fn respawn_tuning(
     project_dir: &Path,
     sid: &str,
     model: RespawnModel<'_>,
     meta: &RespawnMetaTuning,
 ) -> (Option<String>, Option<String>) {
-    let observed = |f: fn(&Path, &str) -> Option<String>| {
-        (!meta.awaiting_observation)
-            .then(|| f(project_dir, sid))
-            .flatten()
-    };
+    let status = ccteam_harness::execution::session_status::read_status_file(project_dir, sid);
     let model_id = match model {
-        RespawnModel::Replay { role_detail } => observed(ccteam_harness::persisted_session_model)
+        RespawnModel::Replay { role_detail } => meta
+            .observed_model_within_pin(project_dir, sid, status.as_ref())
             .or_else(|| meta.model.clone())
             .or_else(|| role_model_id(role_detail)),
         RespawnModel::FromRole(role_model) => role_model,
     };
     (
         model_id,
-        observed(observed_effort).or_else(|| meta.effort.clone()),
+        observed_effort(status.as_ref()).or_else(|| meta.effort.clone()),
     )
 }
 
 /// The `meta.json` half of [`respawn_tuning`]'s inputs — what the last spawn
-/// REQUESTED, plus whether an observation of it exists yet.
+/// REQUESTED, plus the generation from which an observed model counts.
 #[derive(Debug, Default)]
 struct RespawnMetaTuning {
     model: Option<String>,
     effort: Option<String>,
-    awaiting_observation: bool,
+    model_pinned_generation: Option<u64>,
 }
 
 impl RespawnMetaTuning {
@@ -15062,8 +15120,29 @@ impl RespawnMetaTuning {
         Self {
             model: meta.model.clone(),
             effort: meta.effort.clone(),
-            awaiting_observation: meta.awaiting_observation,
+            model_pinned_generation: meta.model_pinned_generation,
         }
+    }
+
+    /// The observed model, if the observation is recent enough to count.
+    fn observed_model_within_pin(
+        &self,
+        project_dir: &Path,
+        sid: &str,
+        status: Option<&ThreadStatus>,
+    ) -> Option<String> {
+        let satisfies_pin = match self.model_pinned_generation {
+            None => true,
+            Some(pinned) => status
+                .and_then(|s| s.generation)
+                .is_some_and(|g| g >= pinned),
+        };
+        // `persisted_session_model` owns the placeholder filter (claude's
+        // unresolved `"default"` picker label, legacy `<synthetic>` markers),
+        // so it stays the one reader that decides what is a usable model id.
+        satisfies_pin
+            .then(|| ccteam_harness::persisted_session_model(project_dir, sid))
+            .flatten()
     }
 }
 
@@ -15075,9 +15154,10 @@ enum RespawnModel<'a> {
     Replay { role_detail: Option<&'a RoleDetail> },
     /// `/role` — the NEW role's frontmatter decides, and `None` (an unpinned
     /// role) genuinely means the vendor default. That is the point of the
-    /// command, so no other rung may override it; the retired thread's
-    /// observation is suspended by `meta.awaiting_observation` until the new
-    /// thread reports one of its own.
+    /// command, so no other rung may override it. The caller also records the
+    /// new thread's generation in `meta.model_pinned_generation`, so the
+    /// retired thread's observation stops counting for the model until the new
+    /// one reports.
     FromRole(Option<String>),
 }
 
@@ -18198,10 +18278,18 @@ mod tests {
         );
     }
 
-    /// Write `status.json` exactly as the harness status tap does at a turn
-    /// boundary: the model the VENDOR reported (with its `[1m]` tag) and the
-    /// effort it actually applied.
-    fn tap_status(project_dir: &Path, sid: &str, model: &str, effort: &str) {
+    /// Write `status.json` exactly as a harness status tap does at a turn
+    /// boundary: the model the VENDOR reported (with its `[1m]` tag), the
+    /// effort it actually applied, and the generation of the thread that
+    /// observed them. `generation: None` is a file written before the stamp
+    /// existed.
+    fn tap_status(
+        project_dir: &Path,
+        sid: &str,
+        model: &str,
+        effort: &str,
+        generation: Option<u64>,
+    ) {
         ccteam_harness::execution::session_status::write_status_file(
             project_dir,
             sid,
@@ -18210,8 +18298,15 @@ mod tests {
                 context: None,
                 effort: Some(effort.to_string()),
                 goal: None,
+                generation,
             },
         );
+    }
+
+    /// The generation the gateway stamped on `sid`'s CURRENT thread — what a
+    /// live tap would write with.
+    fn live_generation(gateway: &Gateway, sid: &str) -> Option<u64> {
+        gateway.sessions.get(sid).map(|s| s.generation)
     }
 
     /// `docs-local/issues/#14②` — "released" must not mean "quietly retuned".
@@ -18252,7 +18347,13 @@ mod tests {
             .unwrap();
         // …and then moved off it live, in the session (`/model` + an effort the
         // vendor resolved for itself). Neither reaches meta.json.
-        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
+        tap_status(
+            tmp.path(),
+            "s1",
+            "claude-fable-5-1[1m]",
+            "max",
+            live_generation(&gateway, "s1"),
+        );
         let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
         assert_eq!(meta.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(meta.effort.as_deref(), Some("xhigh"));
@@ -18327,6 +18428,7 @@ mod tests {
             tmp.path(),
             "s1",
             &ThreadStatus {
+                generation: None,
                 model: None,
                 context: None,
                 effort: Some("   ".into()),
@@ -18359,7 +18461,13 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude")
                 .await
                 .unwrap();
-            tap_status(&alpha, "s1", "claude-fable-5-1[1m]", "max");
+            tap_status(
+                &alpha,
+                "s1",
+                "claude-fable-5-1[1m]",
+                "max",
+                live_generation(&gateway, "s1"),
+            );
         }
 
         let mut restarted = Gateway::new(fake.clone(), "alpha", alpha);
@@ -18377,15 +18485,20 @@ mod tests {
         );
     }
 
-    /// `/role` keeps daef69b0's rule — the MODEL re-derives from the NEW role,
-    /// that is what the command is for — while the effort, which belongs to the
-    /// session and not the role, carries across on the same precedence as every
-    /// other re-spawn. The old thread's observed model is dropped with it, so a
-    /// release before the new thread's first turn rebuilds at the new role's
-    /// model rather than the retired one.
-    #[tokio::test]
-    async fn role_switch_rederives_the_model_and_carries_the_observed_effort() {
-        let tmp = tempfile::tempdir().unwrap();
+    // ── issue #14② — which THREAD's observation counts ──────────────────────
+    //
+    // A sid outlives its threads, so `status.json` alone cannot say whether an
+    // observation describes the thread running now or the one a `/role` switch
+    // retired. Every writer stamps its generation; `model_pinned_generation`
+    // records the generation from which an observed MODEL counts. These four
+    // tests pin the whole rule at the data level — no races to simulate,
+    // because the mechanism does not depend on winning one.
+
+    /// Set up `/role`-switched s1 and hand back the gateway plus the retired
+    /// and current generations. `cto` pins no model; `reviewer` pins one.
+    async fn role_switched_session(
+        tmp: &tempfile::TempDir,
+    ) -> (Gateway, Arc<FakeAdapter>, u64, u64) {
         seed_role(tmp.path(), "cto");
         seed_role_with_model(tmp.path(), "reviewer", Some("claude-opus-5"));
         let fake = Arc::new(FakeAdapter::default());
@@ -18394,98 +18507,152 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude cto")
             .await
             .unwrap();
-        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
-
+        let retired = live_generation(&gateway, "s1").expect("s1 is live");
         gateway
             .handle_text("mock", "chat-1", "alice", "/role reviewer")
             .await
             .unwrap();
+        let current = live_generation(&gateway, "s1").expect("s1 is live");
+        assert!(current > retired, "a re-spawn mints a fresh generation");
         assert_eq!(
-            fake.spawn_tunings.lock().await.last().cloned(),
-            Some((Some("claude-opus-5".into()), Some("max".into()))),
-            "/role re-derives the model, carries the applied effort"
+            read_session_meta(tmp.path(), "s1")
+                .expect("meta written")
+                .model_pinned_generation,
+            Some(current),
+            "`/role` pins the NEW thread's generation"
         );
-        // The retired thread's observation is SUSPENDED, not erased: the
-        // gateway pins the fact in the file it owns, and never writes
-        // `status.json` — that would race the retired thread's status tap.
-        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
-        assert!(
-            meta.awaiting_observation,
-            "the new thread has not reported yet"
-        );
-        assert_eq!(
-            ccteam_harness::persisted_session_model(tmp.path(), "s1").as_deref(),
-            Some("claude-fable-5-1[1m]"),
-            "status.json is left exactly as the vendor last wrote it"
-        );
-        assert_eq!(
-            observed_effort(tmp.path(), "s1").as_deref(),
-            Some("max"),
-            "the effort is the SAME session's applied level and stays"
-        );
+        (gateway, fake, retired, current)
     }
 
-    /// The BLOCK this pin replaces: `/role` used to CLEAR `status.json`'s
-    /// model, a read-modify-write racing the retired thread's status tap —
-    /// which can still be parked inside an awaited vendor probe and land its
-    /// write afterwards, restoring exactly the model the switch overrode.
-    ///
-    /// Now nothing competes for that file. A late write from the old thread is
-    /// simply not consulted: `meta.awaiting_observation` suspends the
-    /// observation rung until the NEW thread completes a turn, and only the
-    /// gateway — under its own lock — can lift it.
+    /// The BLOCK's case, at the data level: the retired thread's status tap
+    /// wakes from an awaited probe AFTER the switch and writes. Its stamp is
+    /// the OLD generation, so it cannot satisfy the pin — the re-spawn comes
+    /// back on the new role's model. Nothing had to stop that write, which is
+    /// the point: the previous design tried to erase it and lost the race.
     #[tokio::test]
-    async fn a_late_write_by_the_retired_thread_cannot_retune_a_role_switch() {
+    async fn an_observation_from_the_retired_generation_cannot_retune_a_role_switch() {
         let tmp = tempfile::tempdir().unwrap();
-        seed_role(tmp.path(), "cto");
-        seed_role_with_model(tmp.path(), "reviewer", Some("claude-opus-5"));
-        let fake = Arc::new(FakeAdapter::default());
-        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/new claude cto")
-            .await
-            .unwrap();
-        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/role reviewer")
-            .await
-            .unwrap();
+        let (mut gateway, fake, retired, _current) = role_switched_session(&tmp).await;
 
-        // The retired thread's tap wakes from its probe and writes anyway —
-        // the race the old clear could not win.
-        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
+        tap_status(
+            tmp.path(),
+            "s1",
+            "claude-fable-5-1[1m]",
+            "max",
+            Some(retired),
+        );
 
-        // Released before the new thread ever ran a turn, then resumed.
         fake.live.store(false, Ordering::SeqCst);
         gateway.resume_dead_session("s1").await.expect("resume");
         assert_eq!(
             fake.spawn_tunings.lock().await.last().cloned(),
             Some((Some("claude-opus-5".into()), Some("max".into()))),
-            "the re-spawn comes back on the NEW role's model, not the retired thread's"
+            "the retired generation's model is ignored; its EFFORT still carries"
+        );
+    }
+
+    /// …and the moment the NEW thread reports, the pin is satisfied by the
+    /// stamp itself. Nothing clears it — a pin is a floor, not a flag.
+    #[tokio::test]
+    async fn an_observation_from_the_new_generation_satisfies_the_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut gateway, fake, _retired, current) = role_switched_session(&tmp).await;
+
+        tap_status(
+            tmp.path(),
+            "s1",
+            "claude-fable-5-1[1m]",
+            "max",
+            Some(current),
         );
 
-        // The pin lifts on the new thread's first completed turn. Drive the
-        // exact call the pump makes there (`ThreadEvent::TurnCompleted` →
-        // `refresh_session_activity_meta`) rather than racing the scheduler.
-        assert!(
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "this thread's own observation outranks the role's model again"
+        );
+    }
+
+    /// The owner's actual requirement: with NO pin, an idle release and resume
+    /// replay the last observation whatever generation made it. This is the
+    /// common path — the pin only ever exists between a `/role` switch and the
+    /// new thread's first report.
+    #[tokio::test]
+    async fn with_no_pin_a_resume_replays_the_last_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: Some("claude-sonnet-5".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
             read_session_meta(tmp.path(), "s1")
                 .expect("meta written")
-                .awaiting_observation,
-            "still pinned until a turn completes"
-        );
-        refresh_session_activity_meta(
-            tmp.path(),
-            "alpha",
-            "s1",
-            AgentVendor::Claude,
+                .model_pinned_generation,
             None,
-            &gateway.session_catalog,
+            "an ordinary spawn takes its model from the request; nothing to pin"
         );
-        assert!(
-            !read_session_meta(tmp.path(), "s1")
-                .expect("meta written")
-                .awaiting_observation,
-            "a completed turn means this thread has now reported for itself"
+
+        // An observation from some ANCIENT generation still counts.
+        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max", Some(1));
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "no pin ⇒ replay what the session was RUNNING"
+        );
+    }
+
+    /// A `status.json` written before the stamp existed carries no generation.
+    /// It cannot prove which thread made it, so it satisfies no pin — but with
+    /// no pin set there is nothing to prove, and it is trusted as before.
+    #[tokio::test]
+    async fn an_unstamped_observation_is_trusted_only_without_a_pin() {
+        // With a pin: unusable for the model, still usable for the effort.
+        let pinned = tempfile::tempdir().unwrap();
+        let (mut gateway, fake, _retired, _current) = role_switched_session(&pinned).await;
+        tap_status(pinned.path(), "s1", "claude-fable-5-1[1m]", "max", None);
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-opus-5".into()), Some("max".into()))),
+            "an unstamped observation cannot satisfy a pin"
+        );
+
+        // Without a pin: unchanged from before the stamp existed.
+        let plain = tempfile::tempdir().unwrap();
+        seed_role_with_model(plain.path(), "cto", None);
+        let fake2 = Arc::new(FakeAdapter::default());
+        let mut gateway2 = Gateway::new(fake2.clone(), "alpha", plain.path());
+        gateway2
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        tap_status(plain.path(), "s1", "claude-fable-5-1[1m]", "max", None);
+        fake2.live.store(false, Ordering::SeqCst);
+        gateway2.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake2.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "a legacy file is still an observation when nothing is pinned"
         );
     }
 
@@ -24209,6 +24376,7 @@ mod tests {
         // TOTAL window (absolute, via `format_tokens`) + percent — no project
         // slug, no absolute USED count.
         fake.set_status(ThreadStatus {
+            generation: None,
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage::known(
                 188_000,
@@ -24230,6 +24398,7 @@ mod tests {
 
         // A non-[1m] model, no effort, renders against the 200k baseline.
         fake.set_status(ThreadStatus {
+            generation: None,
             model: Some("claude-sonnet-4-5".into()),
             effort: None,
             context: Some(ContextUsage::known(
@@ -24392,6 +24561,7 @@ mod tests {
             .unwrap();
         // A model + effort + context so the model·effort·ctx tail is exercised.
         fake.set_status(ThreadStatus {
+            generation: None,
             model: Some("claude-opus-4-8".into()),
             context: Some(ContextUsage::known(
                 410_000,
@@ -25352,7 +25522,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -25431,7 +25601,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             mode: None,
             managed_by: Default::default(),
             stopped_at: None,

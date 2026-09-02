@@ -556,7 +556,7 @@ mod tests {
         let project = tmp.path();
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             mode: None,
             tool_face: None,
             managed_by: Default::default(),
@@ -631,7 +631,7 @@ mod tests {
         // Seed meta + turns for s1.
         let now = Utc::now();
         let meta = super::super::session_meta::SessionMeta {
-            awaiting_observation: false,
+            model_pinned_generation: None,
             mode: None,
             tool_face: None,
             managed_by: Default::default(),
