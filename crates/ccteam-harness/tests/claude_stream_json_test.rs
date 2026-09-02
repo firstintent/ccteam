@@ -114,6 +114,15 @@ while True:
                   "request_id":rid,"response":{}}})
         continue
     n += 1
+    user_log = os.environ.get("FAKE_SJ_USER_LOG")
+    if user_log:
+        try:
+            blocks = json.loads(line)["message"]["content"]
+            text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+        except Exception:
+            text = line.strip()
+        with open(user_log, "a") as f:
+            f.write(text + "\n")
     # Real claude emits `system:init` on the FIRST user turn (not at spawn),
     # and that line is where it reports each MCP server's connection status.
     # `FAKE_SJ_INIT_MCP_FAILED=1` reproduces a child that came up while the
@@ -163,6 +172,12 @@ while True:
         continue
     emit({"type":"assistant","session_id":sid,
           "message":{"role":"assistant","content":[{"type":"text","text":reply}]}})
+    # A long FIRST turn: the assistant step is out, the result comes later —
+    # the window in which a slash line would be read as a steer, not a command.
+    slow = os.environ.get("FAKE_SJ_SLOW_FIRST_RESULT_SECS")
+    if slow and n == 1:
+        import time
+        time.sleep(float(slow))
     emit({"type":"result","subtype":"success","result":reply,"is_error":False,
           "total_cost_usd":0.001,"usage":{"input_tokens":7,"output_tokens":4},
           "session_id":sid})
@@ -193,6 +208,8 @@ fn setup(tmp: &Path) -> PathBuf {
     std::env::set_var("FAKE_SJ_ARGV_LOG", tmp.join("argv.log"));
     std::env::remove_var("FAKE_SJ_DIE_AFTER_INIT");
     std::env::remove_var("FAKE_SJ_NO_RESULT");
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
     // Clear the fault switch here, not only at the end of the test that sets
     // it: a panicking test never reaches its own cleanup, and the leaked
     // `FAKE_SJ_DIE_ON_RESUME=1` then killed the NEXT serial test's resume spawn
@@ -528,6 +545,81 @@ fn ctx_hitl(tmp: &Path, slug: &str, sid: &str) -> SpawnCtx {
     }
 }
 
+/// issue #193 — a vendor slash command sent while a turn is in flight is
+/// parked and delivered right after the turn's `result` (Claude executes a
+/// slash line only when idle; mid-turn it becomes a steer the model reads as
+/// prose). The user gets a receipt saying so instead of silence.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn slash_during_turn_is_deferred_until_the_turn_ends() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "1.5");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+
+    // Turn 1 in flight (assistant step out, result 1.5s away).
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("long task".into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let goal = adapter
+        .handle_directive(
+            &handle,
+            Directive {
+                name: "goal".into(),
+                args: "ship it".into(),
+                choice: None,
+            },
+        )
+        .await
+        .unwrap();
+    match &goal {
+        DirectiveOutcome::Done { receipt } => {
+            assert!(
+                receipt.contains("/goal ship it"),
+                "names the command: {receipt}"
+            );
+            assert!(receipt.contains("排队"), "says it is queued: {receipt}");
+        }
+        other => panic!("mid-turn slash must be parked with a receipt, got {other:?}"),
+    }
+    // Not written yet: the CLI would read it as a steer.
+    let logged = std::fs::read_to_string(&user_log).unwrap_or_default();
+    assert_eq!(logged.lines().collect::<Vec<_>>(), vec!["long task"]);
+
+    // Two vendor turns complete: the long task, then the deferred /goal.
+    let mut completed = 0;
+    while completed < 2 {
+        match tokio::time::timeout(Duration::from_secs(10), events.next()).await {
+            Ok(Some(ThreadEvent::TurnCompleted { .. })) => completed += 1,
+            Ok(Some(_)) => {}
+            other => panic!("expected two completed turns, got {other:?} after {completed}"),
+        }
+    }
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec!["long task", "/goal ship it"],
+        "the slash line reaches the CLI verbatim, after the turn"
+    );
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn slash_bridge_passes_through_safe_rejects_dialog() {
@@ -560,6 +652,17 @@ async fn slash_bridge_passes_through_safe_rejects_dialog() {
         matches!(compact, DirectiveOutcome::Turn(_)),
         "/compact must pass through as a turn, got {compact:?}"
     );
+    // Let the /compact turn finish: a slash sent while it is still in flight
+    // is parked (issue #193), which is not what this test is about.
+    let mut events = adapter.events(&handle);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(Some(ThreadEvent::TurnCompleted { .. })) => break,
+            Ok(Some(_)) => {}
+            other => panic!("expected the /compact turn to complete, got {other:?}"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Bare /model (no arg, no choice) → a NeedsChoice picker built strictly
     // from the REAL captured model list (the `initialize` `response.models[]`;

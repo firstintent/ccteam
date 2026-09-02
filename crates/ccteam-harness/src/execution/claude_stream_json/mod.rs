@@ -34,7 +34,7 @@ pub mod spawn_spec;
 pub mod translate;
 pub mod transport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -108,6 +108,14 @@ struct LiveSession {
     /// Adapter-local vendor-turn occupancy for truthful Started vs Injected
     /// submission receipts. Set before writing input; cleared on TurnResult.
     active_turn: Arc<AtomicBool>,
+    /// Vendor slash commands (`/goal`, `/compact`, …) that arrived while a turn
+    /// was in flight, verbatim, FIFO. Claude parses a slash line only when
+    /// idle — a line written mid-turn is a steer the MODEL reads as prose
+    /// (issue #193: `/goal …` typed while the planner was working surfaced as
+    /// "the user sent a new message"). The status tap writes the next one the
+    /// moment a `result` closes the turn, so the command lands where the CLI
+    /// actually executes it.
+    deferred_slash: Arc<StdMutex<VecDeque<String>>>,
 }
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -219,6 +227,7 @@ fn spawn_status_tap(
     status: Arc<StdMutex<ThreadStatus>>,
     running_tasks: Arc<StdMutex<TaskTracker>>,
     active_turn: Arc<AtomicBool>,
+    deferred_slash: Arc<StdMutex<VecDeque<String>>>,
     project_dir: PathBuf,
     sid: String,
 ) -> tokio::task::JoinHandle<()> {
@@ -324,7 +333,41 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
-                        active_turn.store(false, Ordering::Release);
+                        // Clear occupancy and claim the next deferred slash
+                        // command (issue #193) under ONE lock, so a directive
+                        // racing this `result` either sees the turn still open
+                        // (→ parked, popped right here) or already closed (→
+                        // submitted directly) — never parked behind a turn
+                        // that has already ended.
+                        let next = match deferred_slash.lock() {
+                            Ok(mut q) => {
+                                active_turn.store(false, Ordering::Release);
+                                let next = q.pop_front();
+                                if next.is_some() {
+                                    active_turn.store(true, Ordering::Release);
+                                }
+                                next
+                            }
+                            Err(_) => {
+                                active_turn.store(false, Ordering::Release);
+                                None
+                            }
+                        };
+                        if let Some(line) = next {
+                            // Each deferred command starts its own turn; the
+                            // rest of the queue waits for the next `result`.
+                            if let Err(error) =
+                                transport.send_line(protocol::user_text_line(&line)).await
+                            {
+                                active_turn.store(false, Ordering::Release);
+                                tracing::warn!(
+                                    session = %sid,
+                                    %error,
+                                    line = %line,
+                                    "stream-json: deferred slash command was not delivered"
+                                );
+                            }
+                        }
                         effort_probed_this_turn = false;
                         // The turn ended — BLOCKING tasks cannot still be running,
                         // so drop them as a safety net in case a terminal task
@@ -410,6 +453,20 @@ fn spawn_status_tap(
             }
         }
     })
+}
+
+/// Receipt for a vendor slash command parked behind the in-flight turn
+/// (issue #193). Says WHEN it runs so the user does not mistake the wait
+/// for a silent drop; `position` > 1 means others are queued ahead of it.
+fn deferred_slash_receipt(line: &str, position: usize) -> String {
+    let ahead = if position > 1 {
+        format!("（前面还有 {} 条排队）", position - 1)
+    } else {
+        String::new()
+    };
+    format!(
+        "⏳ `{line}` 已排队{ahead}：会话正在执行当前 turn，Claude 只在空闲时解析斜杠命令（turn 中发出会被当作普通文本交给模型），当前 turn 结束后自动执行。"
+    )
 }
 
 /// True for a task that legitimately OUTLIVES the turn that spawned it, so the
@@ -1475,6 +1532,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let running_tasks: Arc<StdMutex<TaskTracker>> =
             Arc::new(StdMutex::new(TaskTracker::default()));
         let active_turn = Arc::new(AtomicBool::new(false));
+        let deferred_slash: Arc<StdMutex<VecDeque<String>>> =
+            Arc::new(StdMutex::new(VecDeque::new()));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
@@ -1488,6 +1547,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             Arc::clone(&status),
             Arc::clone(&running_tasks),
             Arc::clone(&active_turn),
+            Arc::clone(&deferred_slash),
             ctx.project_dir.clone(),
             ctx.sid.clone(),
         ));
@@ -1557,6 +1617,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             status,
             running_tasks,
             active_turn,
+            deferred_slash,
         };
         // Body record lifecycle: the record written at spawn is cleared the
         // moment THIS daemon observes the child's exit (stdout EOF). A
@@ -2094,6 +2155,24 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 } else {
                     format!("/{name} {}", d.args.trim())
                 };
+                // Mid-turn, the CLI would hand this line to the model as a
+                // steer instead of executing it (issue #193) — park it until
+                // the turn's `result` and say so, rather than letting the
+                // command silently degrade into prose.
+                // Check-and-park under the queue lock: the status tap clears
+                // `active_turn` and pops under the same lock, so this can never
+                // park behind a turn that has already ended.
+                if let Some(live) = self.lookup(&h.identity) {
+                    if let Ok(mut q) = live.deferred_slash.lock() {
+                        if live.active_turn.load(Ordering::Acquire) {
+                            q.push_back(line.clone());
+                            let position = q.len();
+                            return Ok(DirectiveOutcome::Done {
+                                receipt: deferred_slash_receipt(&line, position),
+                            });
+                        }
+                    }
+                }
                 let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
                 Ok(DirectiveOutcome::Turn(turn))
             }

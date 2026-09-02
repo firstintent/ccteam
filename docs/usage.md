@@ -361,7 +361,7 @@ List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows 
 ### Direct Chat and File Exchange
 
 - **Messages without a prefix** go to the current session.
-- **Non-gateway slash commands** (`/compact`, `/clear`, `/model`, etc.) pass through to the current agent. Picker commands such as `/model` become option buttons.
+- **Non-gateway slash commands** (`/compact`, `/clear`, `/goal`, `/model`, etc.) pass through to the current agent. Picker commands such as `/model` become option buttons. Claude executes a slash command only when idle, so one sent while a turn is running is queued and delivered right after that turn ends (you get a receipt); plain text sent mid-turn is still steered into the running turn.
 - **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files back to chat.
 - **During an in-flight turn,** ccteam keeps a live progress message such as `working... · bash x3`. The final answer arrives separately and long answers are chunked. If the agent asks a question, it appears as option buttons; tap one and the agent continues.
 
