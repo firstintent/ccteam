@@ -2002,6 +2002,16 @@ struct ResumeDeadPlan {
     adapter: Arc<dyn HarnessAdapter + Send + Sync>,
     /// Live-entry epoch captured during planning. Apply aborts if the entry was
     /// replaced or removed while the vendor spawn was in flight.
+    fenced_generation: u64,
+    /// The generation of the thread this resume is about to START — minted
+    /// ONCE here, stamped into its `SpawnCtx` (so its observations carry it)
+    /// and installed on the live entry by apply.
+    ///
+    /// `docs-local/issues/#14②` — these were two different values before: the
+    /// plan passed the OLD entry's epoch to the adapter while apply minted a
+    /// second one for the live map, so a resumed thread's `status.json` stamp
+    /// disagreed with `GatewaySession.generation` and a pin could be judged
+    /// against a generation no thread ever wrote.
     generation: u64,
     /// v0.9.0 W3 (G10) — see `MetaRebuildPlan::ccteam_root` / `remote_proxy`;
     /// same re-gate contract, performed by `spawn_for_resume_plan`.
@@ -7223,17 +7233,35 @@ impl Gateway {
     /// step to cold-start rebuild from each session's `meta.json` (the SoT).
     /// No session content is read here (spawning is async; load_state is not).
     fn load_state(&mut self) -> Result<()> {
+        // Monotonic THREAD-generation counter. Unlike the sid counter it is NOT
+        // trusted on its own: the values it hands out are already written into
+        // durable records (`status.json` stamps, `meta.model_pinned_generation`),
+        // so a wiped or rolled-back file would let a NEW thread reuse a
+        // generation an old observation or pin already used — a stale
+        // observation would satisfy a pin (silent retune), or a pin above the
+        // reset counter would never be satisfiable again. Recover the floor
+        // from those records and never move backwards.
+        if self.next_generation_path.is_some() {
+            let file = self
+                .next_generation_path
+                .as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|raw| raw.trim().parse::<u64>());
+            let floor = self.observed_generation_floor();
+            let (next, recovered) = recovered_generation_counter(file.clone(), floor);
+            if recovered {
+                tracing::warn!(
+                    file = ?file,
+                    floor,
+                    next,
+                    "ccteam-im: next-generation counter was missing, corrupt or behind the \
+                     durable record; recovering forward so no thread generation is reused"
+                );
+            }
+            self.next_session_generation = next;
+        }
         // Monotonic sid counter — its own file, read independently of routing so
         // a wiped routing table never resets it (red line: sid never reused).
-        // Monotonic THREAD-generation counter, same contract, same reason it
-        // is a separate file (see `next_live_generation`).
-        if let Some(path) = self.next_generation_path.as_ref() {
-            if let Ok(raw) = std::fs::read_to_string(path) {
-                if let Ok(n) = raw.trim().parse::<u64>() {
-                    self.next_session_generation = n;
-                }
-            }
-        }
         if let Some(path) = self.next_sid_path.as_ref() {
             if let Ok(raw) = std::fs::read_to_string(path) {
                 if let Ok(n) = raw.trim().parse::<u64>() {
@@ -7304,6 +7332,31 @@ impl Gateway {
     /// `meta.json` now carries `stopped_at`, so a session the owner explicitly
     /// stopped is skipped here instead of being resurrected — the one-off
     /// "stray `/stop` afterwards" cost this used to accept is gone.
+    /// The highest thread generation any DURABLE record already claims: every
+    /// session's persisted `status.json` stamp and every
+    /// `meta.model_pinned_generation`.
+    ///
+    /// `docs-local/issues/#14②` — these are the two places a generation
+    /// outlives the counter, so they are exactly what the counter must not fall
+    /// behind. One boot-time scan over the same `list_session_metas` walk
+    /// `recover_routing_from_meta` already makes; `0` when there is nothing on
+    /// disk yet (a first boot).
+    fn observed_generation_floor(&self) -> u64 {
+        let mut floor = 0u64;
+        for dir in self.projects.values() {
+            for meta in list_session_metas(dir) {
+                floor = floor.max(meta.model_pinned_generation.unwrap_or(0));
+                if let Some(stamp) =
+                    ccteam_harness::execution::session_status::read_status_file(dir, &meta.sid)
+                        .and_then(|status| status.generation)
+                {
+                    floor = floor.max(stamp);
+                }
+            }
+        }
+        floor
+    }
+
     fn recover_routing_from_meta(&mut self) {
         let mut pending = Vec::new();
         for dir in self.projects.values() {
@@ -8073,7 +8126,7 @@ impl Gateway {
         let host = s.host.clone();
         let permission_mode = s.permission_mode;
         let secret = s.secret.clone();
-        let generation = s.generation;
+        let fenced_generation = s.generation;
         // Sync a possibly-registered-after-start project from the config.yaml
         // SoT before the lookup (mirrors start_session / `/role`).
         self.ensure_project_loaded(&project);
@@ -8106,6 +8159,10 @@ impl Gateway {
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
         // no stored-secret update).
         let adapter = (self.adapter_factory)(vendor, protocol);
+        // Mint the resumed THREAD's generation HERE, once: it rides the
+        // `SpawnCtx` so every observation this thread persists carries it, and
+        // apply installs this same value on the live entry (issue #14②).
+        let generation = self.next_live_generation();
         Ok(Some(ResumeDeadPlan {
             session_id: session_id.to_string(),
             project,
@@ -8122,6 +8179,7 @@ impl Gateway {
             effort,
             mode,
             adapter,
+            fenced_generation,
             generation,
             ccteam_root: self.project_paths.as_ref().map(|p| p.root.clone()),
             remote_proxy: self.remote_host_proxy.clone(),
@@ -8194,6 +8252,7 @@ impl Gateway {
             effort: _,
             mode: _,
             adapter,
+            fenced_generation,
             generation,
             ccteam_root: _,
             remote_proxy: _,
@@ -8201,7 +8260,7 @@ impl Gateway {
         let still_matches = self
             .sessions
             .get(&session_id)
-            .is_some_and(|s| s.generation == generation);
+            .is_some_and(|s| s.generation == fenced_generation);
         if !still_matches {
             // Session was stopped or its thread was replaced while we spawned —
             // do NOT insert a zombie; close the fresh thread gracefully.
@@ -8224,12 +8283,13 @@ impl Gateway {
         // submit flow + the pump, so resume leaves it ALONE: the turn path
         // re-stamps turn_started_at itself, and clearing it here would race the
         // in-flight reactive retry (a turn IS running when that path resumes).
+        // Install the generation the PLAN minted — the same one the resumed
+        // thread was spawned with, so `GatewaySession.generation` and the
+        // stamps in this session's `status.json` agree (issue #14②). Minting a
+        // second one here is what made them disagree.
         if let Some(s) = self.sessions.get_mut(&session_id) {
             s.thread = thread;
             s.adapter = adapter;
-        }
-        let generation = self.next_live_generation();
-        if let Some(s) = self.sessions.get_mut(&session_id) {
             s.generation = generation;
         }
         // Drop the stale pump (its task is already ending — it was bound to the
@@ -15021,6 +15081,32 @@ fn ensure_role_exists(cwd: &std::path::Path, role: &str) -> Result<Option<RoleDe
     }
 }
 
+/// Where the thread-generation counter must resume from.
+///
+/// `docs-local/issues/#14②` — the counter hands out values that get written
+/// into durable records (`status.json` stamps, `meta.model_pinned_generation`),
+/// so it may only ever move FORWARD. `file` is the persisted counter:
+/// `None` = the file is missing, `Some(Err(..))` = present but unparseable.
+/// `floor` is the highest generation any record already claims.
+///
+/// The counter resumes at `max(file, floor)`, plus one when the file could not
+/// be read at all — a missing or corrupt file gives no evidence that its last
+/// value was consumed, so stepping past the floor keeps the next mint strictly
+/// above everything on disk. Returns `(next, recovered)`; `recovered` is true
+/// whenever the file did not by itself justify the answer, and the caller warns.
+fn recovered_generation_counter(
+    file: Option<Result<u64, std::num::ParseIntError>>,
+    floor: u64,
+) -> (u64, bool) {
+    match file {
+        Some(Ok(value)) if value >= floor => (value, false),
+        // Present but BEHIND the record: something rolled it back.
+        Some(Ok(_)) => (floor, true),
+        // Missing or corrupt: no evidence at all.
+        _ => (floor.saturating_add(1), true),
+    }
+}
+
 fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
     detail
         .and_then(|d| d.frontmatter.get("model"))
@@ -18656,6 +18742,106 @@ mod tests {
         );
     }
 
+    /// The generation counter hands out values that end up in DURABLE records —
+    /// `status.json` stamps and `meta.model_pinned_generation` — so losing the
+    /// counter file must never let a new thread reuse one. Reusing a generation
+    /// would let a stale observation satisfy a pin (a silent retune), or strand
+    /// a pin above a reset counter forever.
+    #[test]
+    fn the_generation_counter_only_moves_forward() {
+        // Trustworthy file: taken as-is, no warning.
+        assert_eq!(recovered_generation_counter(Some(Ok(9)), 7), (9, false));
+        assert_eq!(recovered_generation_counter(Some(Ok(7)), 7), (7, false));
+        // Behind the record -> recover to the floor and warn.
+        assert_eq!(recovered_generation_counter(Some(Ok(3)), 7), (7, true));
+        // Missing or corrupt -> step PAST the floor: nothing says the floor
+        // value itself was not already handed out.
+        assert_eq!(recovered_generation_counter(None, 7), (8, true));
+        assert_eq!(
+            recovered_generation_counter(Some("bogus".parse::<u64>()), 7),
+            (8, true)
+        );
+        // First boot, nothing on disk.
+        assert_eq!(recovered_generation_counter(None, 0), (1, true));
+    }
+
+    /// End to end for the same rule: the counter file is destroyed, but a
+    /// session's `meta` pin and `status.json` stamp still claim generation 7.
+    /// The next spawn must stamp ABOVE that, or the pin would be satisfied by
+    /// the retired thread's observation.
+    #[tokio::test]
+    async fn a_wiped_generation_counter_recovers_from_the_durable_record() {
+        for (label, planted) in [("missing", None), ("rolled back", Some("3"))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let alpha = tmp.path().join("alpha");
+            std::fs::create_dir_all(&alpha).unwrap();
+            seed_role_with_model(&alpha, "cto", None);
+            {
+                let fake = Arc::new(FakeAdapter::default());
+                let mut gateway = Gateway::new(fake, "alpha", alpha.clone());
+                gateway.enable_persistence(tmp.path()).unwrap();
+                gateway
+                    .handle_text("mock", "chat-1", "alice", "/new claude cto")
+                    .await
+                    .unwrap();
+                // The durable record claims generation 7 on both axes.
+                let mut meta = read_session_meta(&alpha, "s1").expect("meta written");
+                meta.model_pinned_generation = Some(7);
+                ccteam_harness::write_session_meta(&alpha, &meta).unwrap();
+                tap_status(&alpha, "s1", "claude-fable-5-1[1m]", "max", Some(7));
+            }
+            // ...and the counter file is lost or rolled back under it.
+            let counter = crate::next_generation_path_in(tmp.path());
+            match planted {
+                None => std::fs::remove_file(&counter).unwrap(),
+                Some(v) => std::fs::write(&counter, v).unwrap(),
+            }
+
+            let fake = Arc::new(FakeAdapter::default());
+            let mut restarted = Gateway::new(fake, "alpha", alpha.clone());
+            restarted.enable_persistence(tmp.path()).unwrap();
+            let minted = restarted.next_live_generation();
+            assert!(
+                minted >= 8,
+                "{label}: the next generation must clear everything on disk, got {minted}"
+            );
+        }
+    }
+
+    /// A resume spawns a NEW thread, so its generation must be minted ONCE and
+    /// be the same value in two places: the `SpawnCtx` the adapter stamps its
+    /// observations with, and `GatewaySession.generation` in the live map.
+    /// They used to disagree — the plan passed the OLD entry's epoch to the
+    /// adapter while apply minted a second one for the live map — so a pin
+    /// could be judged against a generation no thread had ever written.
+    #[tokio::test]
+    async fn a_resumed_thread_stamps_the_generation_the_live_map_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role_with_model(tmp.path(), "cto", None);
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+
+        let installed = live_generation(&gateway, "s1").expect("s1 is live");
+        let stamped = fake
+            .spawn_generations
+            .lock()
+            .await
+            .last()
+            .copied()
+            .expect("the resume spawned a thread");
+        assert_eq!(
+            stamped, installed,
+            "the resumed thread stamps the generation the live map holds"
+        );
+    }
+
     // ----- P2a wrap_inbound (turn-text + attachment paths) ----------
 
     use crate::transport::AttachmentKind;
@@ -18807,6 +18993,9 @@ mod tests {
         /// v0.8.24 A-U3 — `(model_id, effort)` captured per start_thread so a
         /// test can assert an explicit composer choice reached the SpawnCtx.
         spawn_tunings: Arc<Mutex<Vec<CapturedTuning>>>,
+        /// `SpawnCtx::generation` captured per start_thread, so a test can assert
+        /// the thread was stamped with the generation the live map installs.
+        spawn_generations: Arc<Mutex<Vec<u64>>>,
         /// v0.8.11 E4 — when set, `submit_turn` ALSO enqueues a `TurnCompleted`
         /// after the `AgentMessage` (mirrors a real adapter's turn boundary).
         /// Off by default so the sync-drain tests (which only take the first
@@ -18900,6 +19089,7 @@ mod tests {
                 spawn_modes: Arc::new(Mutex::new(Vec::new())),
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
+                spawn_generations: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
                 assistant_messages: 1,
                 emit_turn_started: false,
@@ -19052,6 +19242,7 @@ mod tests {
                 .lock()
                 .await
                 .push((ctx.model_id.clone(), ctx.effort.clone()));
+            self.spawn_generations.lock().await.push(ctx.generation);
             // A fresh/resumed child is alive.
             self.live.store(true, Ordering::SeqCst);
             Ok(ThreadHandle {
