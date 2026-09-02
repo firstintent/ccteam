@@ -78,6 +78,7 @@ fn ephemeral_home(slug: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String) {
                       mode: ccteam_harness::PermissionMode| {
         let now = "2026-01-01T00:00:00Z".to_string();
         let meta = ccteam_harness::SessionMeta {
+            awaiting_observation: false,
             mode: None,
             tool_face: None,
             managed_by: Default::default(),

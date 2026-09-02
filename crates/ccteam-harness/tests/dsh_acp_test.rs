@@ -268,6 +268,7 @@ fn spawn_ctx_with_model(tmp: &TempDir, sid: &str) -> SpawnCtx {
 
 fn write_meta(project: &Path, sid: &str, vendor_uuid: &str) {
     let meta = SessionMeta {
+        awaiting_observation: false,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),

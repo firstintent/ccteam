@@ -191,6 +191,24 @@ pub struct SessionMeta {
     /// switch never silently resets the axis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// True from a re-spawn that chose the model from a REQUEST rather than
+    /// from an observation, until the new thread completes its first turn.
+    ///
+    /// `docs-local/issues/#14②` — a re-spawn sources the model from
+    /// `status.json` first, because that is where the vendor's own reports
+    /// land. But that file describes whichever thread last ran under this sid,
+    /// and after a `/role` switch the retired thread's model is precisely the
+    /// answer the command overrode: a release before the new thread's first
+    /// turn would otherwise rebuild at the model the user just left.
+    ///
+    /// So the gateway pins "no observation from THIS thread yet" here instead
+    /// of trying to erase the old one. This flag is written under the gateway
+    /// lock and cleared by the same per-turn meta write that refreshes
+    /// `turn_count`; the retired thread cannot reach it, which is the point —
+    /// a competing write to `status.json` would race that thread's status tap,
+    /// which may still be inside an awaited vendor probe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting_observation: bool,
     pub host: String,
     pub created_at: String,
     /// Updated only on turn completion — not on every event.
@@ -544,6 +562,7 @@ mod title_tests {
 
     fn blank_meta() -> SessionMeta {
         SessionMeta {
+            awaiting_observation: false,
             mode: None,
             tool_face: None,
             managed_by: Default::default(),

@@ -320,6 +320,7 @@ async fn resume_prefers_session_resume_no_replay() {
     let project = tmp.path();
     let sid = "s-resume";
     let meta = SessionMeta {
+        awaiting_observation: false,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),
@@ -415,6 +416,7 @@ async fn resume_carries_mcp_servers() {
     }
 
     let meta = SessionMeta {
+        awaiting_observation: false,
         mode: None,
         tool_face: None,
         managed_by: Default::default(),

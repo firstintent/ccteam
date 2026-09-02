@@ -73,6 +73,15 @@ pub struct StreamJsonTransport {
     writer_task: StdMutex<Option<JoinHandle<()>>>,
     reader_task: StdMutex<Option<JoinHandle<()>>>,
     stderr_task: StdMutex<Option<JoinHandle<()>>>,
+    /// The per-session status tap ([`super::spawn_status_tap`]), so closing
+    /// the transport also STOPS it. The tap persists `status.json`, and a sid
+    /// outlives its thread — a `/role` switch or a resume re-spawns a new
+    /// thread under the same sid — so a tap left running past its own
+    /// transport would write the NEXT thread's status file with the retired
+    /// thread's observations. Selecting on `wait_closed()` is not enough by
+    /// itself: the loop can be parked inside an awaited vendor probe when the
+    /// close lands, and would still write on the way out.
+    status_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for StreamJsonTransport {
@@ -158,6 +167,23 @@ impl StreamJsonTransport {
             writer_task: StdMutex::new(Some(writer_task)),
             reader_task: StdMutex::new(Some(reader_task)),
             stderr_task: StdMutex::new(None),
+            status_task: StdMutex::new(None),
+        }
+    }
+
+    /// Hand the per-session status tap to the transport so `shutdown`/`detach`
+    /// can stop it. See [`Self::status_task`].
+    pub fn attach_status_task(&self, handle: JoinHandle<()>) {
+        if let Some(previous) = self.status_task.lock().unwrap().replace(handle) {
+            previous.abort();
+        }
+    }
+
+    /// Stop the status tap. Called from both close paths, before anything
+    /// else: a tap that is still runnable can persist one more snapshot.
+    fn abort_status_task(&self) {
+        if let Some(h) = self.status_task.lock().unwrap().take() {
+            h.abort();
         }
     }
 
@@ -291,6 +317,7 @@ impl StreamJsonTransport {
     pub async fn detach(&self) -> Option<u32> {
         self.detached.store(true, Ordering::Release);
         let pid = self.pid();
+        self.abort_status_task();
         self.close.closed.store(true, Ordering::Release);
         self.close.notify.notify_waiters();
         if let Some(h) = self.writer_task.lock().unwrap().take() {
@@ -309,6 +336,10 @@ impl StreamJsonTransport {
     }
 
     pub async fn shutdown(&self) {
+        // Stop the status tap BEFORE the close is announced: this transport's
+        // thread is retiring, and the sid it was writing `status.json` for
+        // will belong to its replacement.
+        self.abort_status_task();
         // Mark closed first so any `events()` task ends promptly even if
         // the child lingers past the stdin-EOF window.
         self.close.closed.store(true, Ordering::Release);

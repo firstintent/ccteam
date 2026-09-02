@@ -134,9 +134,32 @@ struct FocusRoutes {
 }
 
 impl FocusRoutes {
+    /// Read the table, RECOVERING a poisoned lock.
+    ///
+    /// A panic under the lock leaves a `BTreeMap` that is still structurally
+    /// sound — these critical sections are a single map operation — so the
+    /// honest response is to carry on, not to drop the caller's work. Dropping
+    /// it would be the very bug this type exists to prevent: a lost route reads
+    /// back as "this chat has no session", which spawns a phantom one or routes
+    /// the next message to the wrong sid.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<ChatKey, String>> {
+        self.inner.read().unwrap_or_else(|poisoned| {
+            tracing::error!("ccteam-im: focus route table lock was poisoned; reading through it");
+            poisoned.into_inner()
+        })
+    }
+
+    /// [`Self::read`]'s write twin — same recovery, same reason.
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<ChatKey, String>> {
+        self.inner.write().unwrap_or_else(|poisoned| {
+            tracing::error!("ccteam-im: focus route table lock was poisoned; writing through it");
+            poisoned.into_inner()
+        })
+    }
+
     /// What this chat is currently pointed at, if anything.
     fn get(&self, chat: &ChatKey) -> Option<String> {
-        self.inner.read().ok()?.get(&chat.focus_key()).cloned()
+        self.read().get(&chat.focus_key()).cloned()
     }
 
     fn contains(&self, chat: &ChatKey) -> bool {
@@ -145,98 +168,86 @@ impl FocusRoutes {
 
     /// Point this chat at `value`, replacing whatever it pointed at before.
     fn set(&self, chat: &ChatKey, value: impl Into<String>) {
-        if let Ok(mut map) = self.inner.write() {
-            map.insert(chat.focus_key(), value.into());
-        }
+        self.write().insert(chat.focus_key(), value.into());
     }
 
     fn remove(&self, chat: &ChatKey) {
-        if let Ok(mut map) = self.inner.write() {
-            map.remove(&chat.focus_key());
-        }
+        self.write().remove(&chat.focus_key());
     }
 
     /// Is `sid` the session this chat is talking to right now?
-    ///
-    /// A poisoned lock reads as FOCUSED: the fallback belongs to the IM egress
-    /// (`has_addressee`), where guessing "focused" delivers a possibly
-    /// unlabelled answer and guessing "not focused" silently swallows it.
     fn is_focused(&self, chat: &ChatKey, value: &str) -> bool {
-        self.inner
-            .read()
-            .map(|m| m.get(&chat.focus_key()).is_some_and(|v| v == value))
-            .unwrap_or(true)
+        self.read()
+            .get(&chat.focus_key())
+            .is_some_and(|v| v == value)
     }
 
     /// Drop every route whose VALUE fails `keep`.
     fn retain_values(&self, mut keep: impl FnMut(&str) -> bool) {
-        if let Ok(mut map) = self.inner.write() {
-            map.retain(|_, v| keep(v));
-        }
+        self.write().retain(|_, v| keep(v));
     }
 
     /// [`Self::retain_values`]' two-argument twin, for a predicate that also
     /// needs the chat (an ACL re-check). The key handed to `keep` is already
     /// normalized, so it names the chat and never a single member.
     fn retain(&self, mut keep: impl FnMut(&ChatKey, &str) -> bool) {
-        if let Ok(mut map) = self.inner.write() {
-            map.retain(|chat, v| keep(chat, v));
-        }
+        self.write().retain(|chat, v| keep(chat, v));
     }
 
     fn values(&self) -> Vec<String> {
-        self.inner
-            .read()
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+        self.read().values().cloned().collect()
     }
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.inner.read().map(|m| m.is_empty()).unwrap_or(true)
+        self.read().is_empty()
     }
 
     /// The whole table, for persistence.
     fn saved_routes(&self) -> Vec<SavedGatewayRoute> {
-        self.inner
-            .read()
-            .map(|m| {
-                m.iter()
-                    .map(|(chat, value)| SavedGatewayRoute {
-                        chat: chat.clone(),
-                        value: value.clone(),
-                    })
-                    .collect()
+        self.read()
+            .iter()
+            .map(|(chat, value)| SavedGatewayRoute {
+                chat: chat.clone(),
+                value: value.clone(),
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// Replace the whole table from a persisted snapshot.
     ///
     /// `routing.json` written before the key was chat-scoped can hold two rows
     /// for one chat (see [`ChatKey::focus_key`]); they collapse onto the same
-    /// key here, and `prefer` picks the survivor — `prefer(candidate,
-    /// incumbent) == true` keeps the candidate. Order in the file is the
-    /// serialized BTreeMap's key order, NOT time, so a caller that cares must
-    /// rank on the value itself; a stale route must never shadow the live one.
-    fn load_saved(
+    /// key here and `rank` decides the survivor — the HIGHEST rank wins, and
+    /// `None` disqualifies a row outright (a route the caller would only
+    /// delete a moment later is not a candidate at all). Ranks compare only
+    /// within one chat, so a caller may rank on whatever it knows.
+    ///
+    /// Order in the file is the serialized BTreeMap's key order, NOT time, so
+    /// the caller must rank on the value itself: a stale route must never
+    /// shadow the live one, whichever way the rows happened to be written.
+    fn load_saved<R: Ord>(
         &self,
         saved: Vec<SavedGatewayRoute>,
-        mut prefer: impl FnMut(&str, &str) -> bool,
+        mut rank: impl FnMut(&ChatKey, &str) -> Option<R>,
     ) {
-        let mut collapsed: BTreeMap<ChatKey, String> = BTreeMap::new();
+        let mut collapsed: BTreeMap<ChatKey, (R, String)> = BTreeMap::new();
         for route in saved {
             let key = route.chat.focus_key();
+            let Some(candidate) = rank(&key, &route.value) else {
+                continue;
+            };
             match collapsed.get(&key) {
-                Some(incumbent) if !prefer(&route.value, incumbent) => {}
+                Some((incumbent, _)) if *incumbent >= candidate => {}
                 _ => {
-                    collapsed.insert(key, route.value);
+                    collapsed.insert(key, (candidate, route.value));
                 }
             }
         }
-        if let Ok(mut map) = self.inner.write() {
-            *map = collapsed;
-        }
+        *self.write() = collapsed
+            .into_iter()
+            .map(|(chat, (_, value))| (chat, value))
+            .collect();
     }
 }
 
@@ -2548,9 +2559,10 @@ impl Gateway {
         let (model_id, effort) = respawn_tuning(
             &cwd,
             &meta.sid,
-            meta.model.clone(),
-            meta.effort.clone(),
-            role_detail.as_ref(),
+            RespawnModel::Replay {
+                role_detail: role_detail.as_ref(),
+            },
+            &RespawnMetaTuning::from_meta(meta),
         );
         let owner = self
             .tenant_project_owner(slug)
@@ -2811,27 +2823,42 @@ impl Gateway {
     /// web chat.
     fn drop_dead_session_routes(&self) {
         let mut memo = ProjectPrincipalMemo::new();
-        self.current_session.retain(|chat, sid| {
-            // A detached body is still this chat's session — it comes back
-            // (rebuilt by sid) the moment the body exits; keep the focus.
-            if self.detached.contains_key(sid) {
-                return true;
-            }
-            if let Some(session) = self.sessions.get(sid) {
-                return self.chat_can_access_with(chat, session, &mut memo);
-            }
-            // RELEASED (not resident, not stopped): the session is real, its
-            // transcript is on disk, and the next message resumes THAT sid.
-            // Dropping the focus here is what made an idle release — or a
-            // restart — silently mint a brand-new session on the chat's next
-            // plain message.
-            self.find_meta_for_sid(sid)
-                .map(|(slug, _dir, meta)| {
-                    meta.is_resumable()
-                        && self.project_owner_visible_with(chat, &slug, &meta.owner, &mut memo)
-                })
-                .unwrap_or(false)
-        });
+        self.current_session
+            .retain(|chat, sid| self.focus_route_is_addressable(chat, sid, &mut memo));
+    }
+
+    /// Can `chat` still address `sid` — i.e. is this focus route worth keeping?
+    ///
+    /// The single definition of a route's validity, shared by
+    /// [`Self::drop_dead_session_routes`] (which prunes) and `load_state`
+    /// (which, when a pre-fix `routing.json` collapses two rows onto one chat,
+    /// must not pick a route the very next prune would delete while a valid
+    /// alternative sat beside it).
+    fn focus_route_is_addressable(
+        &self,
+        chat: &ChatKey,
+        sid: &str,
+        memo: &mut ProjectPrincipalMemo,
+    ) -> bool {
+        // A detached body is still this chat's session — it comes back
+        // (rebuilt by sid) the moment the body exits; keep the focus.
+        if self.detached.contains_key(sid) {
+            return true;
+        }
+        if let Some(session) = self.sessions.get(sid) {
+            return self.chat_can_access_with(chat, session, memo);
+        }
+        // RELEASED (not resident, not stopped): the session is real, its
+        // transcript is on disk, and the next message resumes THAT sid.
+        // Dropping the focus here is what made an idle release — or a
+        // restart — silently mint a brand-new session on the chat's next
+        // plain message.
+        self.find_meta_for_sid(sid)
+            .map(|(slug, _dir, meta)| {
+                meta.is_resumable()
+                    && self.project_owner_visible_with(chat, &slug, &meta.owner, memo)
+            })
+            .unwrap_or(false)
     }
 
     /// Cold-start RECONCILE of the sessions that were resident at last persist
@@ -5332,6 +5359,7 @@ impl Gateway {
             }
         });
         let mut meta = SessionMeta {
+            awaiting_observation: false,
             managed_by: Default::default(),
             stopped_at: None,
             sid: plan.id.clone(),
@@ -5581,8 +5609,6 @@ impl Gateway {
                 ));
             }
         };
-        let model_id = role_model_id(Some(&role_detail));
-
         // Tear down the old pane + its event pump before re-spawning so the
         // same-sid pane is recreated cleanly and no stale pump keeps draining
         // the retired transcript.
@@ -5601,16 +5627,23 @@ impl Gateway {
         // Wave-2: a restart rebuilds from meta, so the role change must persist).
         let meta_dir = cwd.clone();
         let meta_role = role.clone();
-        // `/role` re-derives the MODEL from the new role's frontmatter — that
-        // is what the command is for — but the effort belongs to the SESSION,
-        // not the role, so it carries across on the same precedence every
-        // other re-spawn uses (issue #14②: the vendor's applied level, then
-        // the level the spawn asked for).
-        let (meta_effort, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
-            Some(entry) => (entry.meta.effort, entry.meta.mode),
-            None => (None, None),
+        // Same helper, same precedence as every other re-spawn — only the
+        // MODEL axis differs, and it says so in the type: `/role` re-derives
+        // it from the new role's frontmatter (the point of the command) while
+        // the effort belongs to the SESSION, not the role, and carries across.
+        let (meta_tuning, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
+            Some(entry) => (
+                RespawnMetaTuning::from_meta(&entry.meta),
+                entry.meta.mode.clone(),
+            ),
+            None => (RespawnMetaTuning::default(), None),
         };
-        let effort = observed_effort(&cwd, &sid).or(meta_effort);
+        let (model_id, effort) = respawn_tuning(
+            &cwd,
+            &sid,
+            RespawnModel::FromRole(role_model_id(Some(&role_detail))),
+            &meta_tuning,
+        );
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -5680,28 +5713,19 @@ impl Gateway {
             meta.model = model_id;
             meta.effort = effort;
             meta.mode = mode;
+            // `/role` chose the model from a REQUEST (the new role's
+            // frontmatter), so the observation in `status.json` — the model
+            // this command just overrode — must not outrank it until the new
+            // thread has reported one of its own. Pin that here, in the file
+            // the gateway owns; writing `status.json` from this side would
+            // race the retired thread's status tap, which can still be inside
+            // an awaited vendor probe (issue #14②).
+            meta.awaiting_observation = true;
             meta.role_sha =
                 ccteam_harness::execution::experience::role_fingerprint(&meta_dir, &meta_role);
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
             meta.last_active = chrono::Utc::now().to_rfc3339();
             let _ = self.persist_session_meta(&meta_dir, &meta);
-        }
-        // `/role` closed the old thread, so `status.json`'s model describes a
-        // process that no longer exists — and a re-spawn now sources the model
-        // from there FIRST (issue #14②). Drop that one axis so a release or
-        // restart before the new thread's first turn rebuilds at the NEW
-        // role's model instead of the retired one. Clearing is honest ("no
-        // observation yet"); writing the REQUESTED model here would be an echo
-        // into a file that only ever holds what the vendor itself reported.
-        // The effort axis is the same session's applied level and stays.
-        if let Some(mut status) =
-            ccteam_harness::execution::session_status::read_status_file(&meta_dir, &sid)
-        {
-            if status.model.take().is_some() {
-                ccteam_harness::execution::session_status::write_status_file(
-                    &meta_dir, &sid, &status,
-                );
-            }
         }
         self.spawn_event_pump(&sid);
         Ok(sid)
@@ -7197,25 +7221,28 @@ impl Gateway {
         // values are a project this chat really used, and a wrong pick
         // self-heals on the next `/cd` or `/use` — so take the later row.
         self.current_project
-            .load_saved(saved.current_project, |_, _| true);
-        // The SESSION tie-break is not arbitrary: a stale route must never
-        // shadow the live one. `live_sids` is the persisted "was resident at
-        // last persist" set, so prefer a live sid; among equals prefer the
-        // higher sid ordinal, which is the later-created session (sids are
-        // monotonic and never reused).
+            .load_saved(saved.current_project, |_, _| Some(()));
+        // The SESSION choice is not arbitrary: a stale route must never shadow
+        // the live one. Disqualify anything this chat cannot address — the
+        // SAME predicate `drop_dead_session_routes` prunes by, so a collapse
+        // can never pick a row that is deleted moments later while a valid
+        // alternative sat beside it. Among the survivors prefer a sid that was
+        // resident at last persist (`live_sids`), then the higher sid ordinal:
+        // sids are monotonic and never reused, so that is the later-created
+        // session. `None` (an unparseable sid) ranks below every real one.
         let live: std::collections::BTreeSet<&str> =
             saved.live_sids.iter().map(String::as_str).collect();
-        // `None` (an unparseable sid) ranks below every real one.
-        let rank = |sid: &str| {
-            (
-                live.contains(sid),
-                sid.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()),
-            )
-        };
-        self.current_session
-            .load_saved(saved.current_session, |candidate, incumbent| {
-                rank(candidate) > rank(incumbent)
-            });
+        let routes = self.current_session.clone();
+        let mut memo = ProjectPrincipalMemo::new();
+        routes.load_saved(saved.current_session, |chat, sid| {
+            self.focus_route_is_addressable(chat, sid, &mut memo)
+                .then(|| {
+                    (
+                        live.contains(sid),
+                        sid.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()),
+                    )
+                })
+        });
         // Live map stays empty; rebuild happens async from meta.json. Dead-route
         // cleanup is deferred to AFTER rebuild (a route to a sid that fails to
         // rebuild is dropped there), since nothing is live yet at this point.
@@ -8019,9 +8046,13 @@ impl Gateway {
         let (model_id, effort) = respawn_tuning(
             &cwd,
             session_id,
-            meta.as_ref().and_then(|m| m.model.clone()),
-            meta.and_then(|m| m.effort),
-            role_detail.as_ref(),
+            RespawnModel::Replay {
+                role_detail: role_detail.as_ref(),
+            },
+            &meta
+                .as_ref()
+                .map(RespawnMetaTuning::from_meta)
+                .unwrap_or_default(),
         );
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
@@ -10955,6 +10986,7 @@ impl Gateway {
         let now = chrono::Utc::now().to_rfc3339();
         let owner_tag = canonical_owner(&caller).identity();
         let mut meta = SessionMeta {
+            awaiting_observation: false,
             managed_by: Default::default(),
             stopped_at: None,
             sid: sid.clone(),
@@ -11058,6 +11090,7 @@ impl Gateway {
             let sid = format!("s{}", guard.next_session);
             let now = chrono::Utc::now().to_rfc3339();
             let mut meta = SessionMeta {
+                awaiting_observation: false,
                 managed_by: Default::default(),
                 stopped_at: None,
                 sid: sid.clone(),
@@ -14512,6 +14545,12 @@ fn refresh_session_activity_meta(
     let Some(mut meta) = catalog.get(sid).map(|entry| entry.meta) else {
         return;
     };
+    // A turn completed, so the CURRENT thread has now reported for itself and
+    // `status.json` describes it: lift the re-spawn pin a `/role` switch set
+    // (issue #14②, `SessionMeta::awaiting_observation`). Cleared here rather
+    // than by the harness so it stays gateway-owned — the retired thread can
+    // never unset it.
+    meta.awaiting_observation = false;
     meta.last_active = chrono::Utc::now().to_rfc3339();
     meta.turn_count = ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, sid)
         .map(|turns| turns.iter().filter(|turn| !turn.user.is_empty()).count() as u64)
@@ -14982,19 +15021,64 @@ fn observed_effort(project_dir: &Path, sid: &str) -> Option<String> {
 /// and was dropped as collateral when `084d17d6` retired
 /// `gateway-state.json`'s sessions vec, which re-sourced the model from the
 /// new `meta.json` SoT and never re-added it.
+///
+/// `meta.awaiting_observation` suspends the observation rung entirely: it says
+/// the last re-spawn picked the model from a request the observation predates,
+/// so `status.json` still describes the RETIRED thread.
 fn respawn_tuning(
     project_dir: &Path,
     sid: &str,
-    meta_model: Option<String>,
-    meta_effort: Option<String>,
-    role_detail: Option<&RoleDetail>,
+    model: RespawnModel<'_>,
+    meta: &RespawnMetaTuning,
 ) -> (Option<String>, Option<String>) {
-    (
-        ccteam_harness::persisted_session_model(project_dir, sid)
-            .or(meta_model)
+    let observed = |f: fn(&Path, &str) -> Option<String>| {
+        (!meta.awaiting_observation)
+            .then(|| f(project_dir, sid))
+            .flatten()
+    };
+    let model_id = match model {
+        RespawnModel::Replay { role_detail } => observed(ccteam_harness::persisted_session_model)
+            .or_else(|| meta.model.clone())
             .or_else(|| role_model_id(role_detail)),
-        observed_effort(project_dir, sid).or(meta_effort),
+        RespawnModel::FromRole(role_model) => role_model,
+    };
+    (
+        model_id,
+        observed(observed_effort).or_else(|| meta.effort.clone()),
     )
+}
+
+/// The `meta.json` half of [`respawn_tuning`]'s inputs — what the last spawn
+/// REQUESTED, plus whether an observation of it exists yet.
+#[derive(Debug, Default)]
+struct RespawnMetaTuning {
+    model: Option<String>,
+    effort: Option<String>,
+    awaiting_observation: bool,
+}
+
+impl RespawnMetaTuning {
+    fn from_meta(meta: &SessionMeta) -> Self {
+        Self {
+            model: meta.model.clone(),
+            effort: meta.effort.clone(),
+            awaiting_observation: meta.awaiting_observation,
+        }
+    }
+}
+
+/// Where a re-spawn's MODEL comes from. The effort axis has no such split —
+/// it belongs to the session, never to the role.
+enum RespawnModel<'a> {
+    /// Replay the session's own model: what the vendor last reported, else
+    /// what the spawn asked for, else the role's frontmatter.
+    Replay { role_detail: Option<&'a RoleDetail> },
+    /// `/role` — the NEW role's frontmatter decides, and `None` (an unpinned
+    /// role) genuinely means the vendor default. That is the point of the
+    /// command, so no other rung may override it; the retired thread's
+    /// observation is suspended by `meta.awaiting_observation` until the new
+    /// thread reports one of its own.
+    FromRole(Option<String>),
 }
 
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
@@ -18200,6 +18284,10 @@ mod tests {
     /// re-spawn replays what the spawn ASKED for. A session that never ran a
     /// turn has no `status.json` at all, and one whose vendor has no effort
     /// axis has no `effort` in it — neither may erase the request.
+    ///
+    /// Deliberately green both before and after the `status.json` rung existed:
+    /// it guards the FALLBACK, so it is the test that would catch an
+    /// over-correction rather than the missing rung.
     #[tokio::test]
     async fn a_respawn_without_an_observation_replays_the_spawn_request() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -18317,15 +18405,87 @@ mod tests {
             Some((Some("claude-opus-5".into()), Some("max".into()))),
             "/role re-derives the model, carries the applied effort"
         );
+        // The retired thread's observation is SUSPENDED, not erased: the
+        // gateway pins the fact in the file it owns, and never writes
+        // `status.json` — that would race the retired thread's status tap.
+        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
+        assert!(
+            meta.awaiting_observation,
+            "the new thread has not reported yet"
+        );
         assert_eq!(
-            ccteam_harness::persisted_session_model(tmp.path(), "s1"),
-            None,
-            "the retired thread's model is no longer an observation"
+            ccteam_harness::persisted_session_model(tmp.path(), "s1").as_deref(),
+            Some("claude-fable-5-1[1m]"),
+            "status.json is left exactly as the vendor last wrote it"
         );
         assert_eq!(
             observed_effort(tmp.path(), "s1").as_deref(),
             Some("max"),
             "the effort is the SAME session's applied level and stays"
+        );
+    }
+
+    /// The BLOCK this pin replaces: `/role` used to CLEAR `status.json`'s
+    /// model, a read-modify-write racing the retired thread's status tap —
+    /// which can still be parked inside an awaited vendor probe and land its
+    /// write afterwards, restoring exactly the model the switch overrode.
+    ///
+    /// Now nothing competes for that file. A late write from the old thread is
+    /// simply not consulted: `meta.awaiting_observation` suspends the
+    /// observation rung until the NEW thread completes a turn, and only the
+    /// gateway — under its own lock — can lift it.
+    #[tokio::test]
+    async fn a_late_write_by_the_retired_thread_cannot_retune_a_role_switch() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        seed_role_with_model(tmp.path(), "reviewer", Some("claude-opus-5"));
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/role reviewer")
+            .await
+            .unwrap();
+
+        // The retired thread's tap wakes from its probe and writes anyway —
+        // the race the old clear could not win.
+        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
+
+        // Released before the new thread ever ran a turn, then resumed.
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-opus-5".into()), Some("max".into()))),
+            "the re-spawn comes back on the NEW role's model, not the retired thread's"
+        );
+
+        // The pin lifts on the new thread's first completed turn. Drive the
+        // exact call the pump makes there (`ThreadEvent::TurnCompleted` →
+        // `refresh_session_activity_meta`) rather than racing the scheduler.
+        assert!(
+            read_session_meta(tmp.path(), "s1")
+                .expect("meta written")
+                .awaiting_observation,
+            "still pinned until a turn completes"
+        );
+        refresh_session_activity_meta(
+            tmp.path(),
+            "alpha",
+            "s1",
+            AgentVendor::Claude,
+            None,
+            &gateway.session_catalog,
+        );
+        assert!(
+            !read_session_meta(tmp.path(), "s1")
+                .expect("meta written")
+                .awaiting_observation,
+            "a completed turn means this thread has now reported for itself"
         );
     }
 
@@ -21353,12 +21513,113 @@ mod tests {
         );
     }
 
+    /// `docs-local/issues/#14①` through the REAL notifier, not a hand-written
+    /// submit standing in for one: a `DelegationSignal` goes onto the channel
+    /// the event pumps publish to, `run_delegation_notifier` gates it on the
+    /// armed watch and the turn boundary, and `deliver_delegation_signal_shared`
+    /// plans, submits and commits the notification. Same restart-rebuilt parent
+    /// as the test above, because that is what makes its `reply_to` owner-shaped
+    /// — and this is the path that actually lost the owner's replies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn the_real_notifier_delivers_a_childs_completion_to_the_im_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(FakeAdapter::new(vendor).with_turn_boundary())
+                as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+
+        // The owner's session, created from IM before the restart.
+        {
+            let mut gw = Gateway::new_with_factory(Arc::clone(&factory), "alpha", alpha.clone());
+            gw.enable_persistence(tmp.path()).unwrap();
+            gw.handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+        }
+
+        let mut gw = Gateway::new_with_factory(factory, "alpha", alpha.clone());
+        gw.register_project("alpha", alpha);
+        gw.enable_persistence(tmp.path()).unwrap();
+        gw.reconcile_restored_sessions().await;
+        // Daemon startup order: the notifier sender BEFORE the event sink, so
+        // every pump `set_event_sink` spawns captures it.
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
+        gw.set_delegation_notifier_tx(dtx.clone());
+        let (etx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        // The owner speaks: cold-resumes the parent, rebuilding its owner from
+        // `meta.owner` (chat-id-shaped, no `user_id`).
+        gw.handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        let child = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gw.arm_delegation_watch(
+            &child,
+            "s1",
+            ccteam_harness::NotifyMode::Final,
+            Some("the wave".into()),
+            None,
+        );
+
+        let gateway = Arc::new(tokio::sync::Mutex::new(gw));
+        tokio::spawn(Gateway::run_delegation_notifier(Arc::clone(&gateway), drx));
+
+        // The child's vendor turn ends — the signal a pump publishes.
+        dtx.send(crate::delegation::DelegationSignal {
+            child_sid: child.clone(),
+            turn_id: format!("{child}-1"),
+            tail: "wave finished".into(),
+            vendor: AgentVendor::Claude,
+            host: "local".into(),
+            boundary: true,
+            vendor_error: false,
+            interim_notes: 0,
+            covered_turns: vec![format!("{child}-1")],
+            context_pct: None,
+            turn: 1,
+            error_kind: None,
+        })
+        .unwrap();
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let ev = sink.recv().await.expect("sink open");
+                if matches!(ev.kind, GatewayEventKind::Answer)
+                    && ev.sid.as_deref() == Some("s1")
+                    && ev.content.contains("done · turn")
+                {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the notifier's completion answer reaches the parent's IM thread");
+        assert_eq!(delivered.channel, "mock");
+        assert!(
+            delivered.content.contains(&child),
+            "the notification names the child that finished: {}",
+            delivered.content
+        );
+    }
+
     /// `docs-local/issues/#14①` — a `routing.json` written while the focus key
     /// was the full triple can hold TWO rows for one chat (the live shape:
-    /// `{user_id: "339498819"} → s408` beside `{user_id: "cryptorobsu"} →
-    /// s487`). They collapse onto one route on load, and the survivor is the
-    /// LIVE sid — a stale route must never shadow the session the chat is
-    /// actually talking to, whichever way the file happened to be ordered.
+    /// `{user_id: "339498819"}` beside `{user_id: "cryptorobsu"}`, pointing at
+    /// different sessions). They collapse onto one route on load, and the
+    /// survivor is the sid that was RESIDENT at last persist — a stale route
+    /// must never shadow the session the chat is actually talking to, even
+    /// when the stale one is the newer session and sorts later in the file.
     #[tokio::test]
     async fn routing_load_collapses_a_chats_member_keyed_routes_onto_the_live_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -21366,12 +21627,25 @@ mod tests {
         std::fs::create_dir_all(&alpha).unwrap();
         let chat_shaped = ChatKey::new("telegram", "339498819", "339498819");
         let member_shaped = ChatKey::new("telegram", "339498819", "cryptorobsu");
+
+        // Two real, resumable sessions of that one Telegram chat.
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            for _ in 0..2 {
+                gateway
+                    .handle_text("telegram", "339498819", "cryptorobsu", "/new claude")
+                    .await
+                    .unwrap();
+            }
+        }
         let routing = crate::routing_state_path_in(tmp.path());
-        std::fs::create_dir_all(routing.parent().unwrap()).unwrap();
+        let saved: RoutingState =
+            serde_json::from_str(&std::fs::read_to_string(&routing).unwrap()).unwrap();
         std::fs::write(
             &routing,
             serde_json::to_vec(&RoutingState {
-                default_project: "alpha".into(),
                 current_project: vec![
                     SavedGatewayRoute {
                         chat: chat_shaped.clone(),
@@ -21383,29 +21657,31 @@ mod tests {
                     },
                 ],
                 current_session: vec![
-                    SavedGatewayRoute {
-                        chat: chat_shaped.clone(),
-                        value: "s408".into(),
-                    },
+                    // The chat's live session — the LOWER ordinal, so ranking
+                    // by recency alone would lose it.
                     SavedGatewayRoute {
                         chat: member_shaped.clone(),
-                        value: "s487".into(),
+                        value: "s1".into(),
+                    },
+                    SavedGatewayRoute {
+                        chat: chat_shaped.clone(),
+                        value: "s2".into(),
                     },
                 ],
-                live_sids: vec!["s487".into()],
+                live_sids: vec!["s1".into()],
+                ..saved
             })
             .unwrap(),
         )
         .unwrap();
 
-        let fake = Arc::new(FakeAdapter::default());
         let mut gateway = Gateway::new(fake, "alpha", alpha);
         gateway.enable_persistence(tmp.path()).unwrap();
 
         assert_eq!(
             gateway.current_session.values(),
-            vec!["s487".to_string()],
-            "one chat keeps exactly one session route"
+            vec!["s1".to_string()],
+            "one chat keeps exactly one session route, and it is the live one"
         );
         assert_eq!(
             gateway.current_project.values(),
@@ -21418,10 +21694,104 @@ mod tests {
                 gateway
                     .current_session
                     .get(&ChatKey::new("telegram", "339498819", who)),
-                Some("s487".to_string()),
+                Some("s1".to_string()),
                 "the focus belongs to the chat, not to {who}"
             );
         }
+    }
+
+    /// The collapse must not pick a route the very next prune would delete.
+    /// Ranking by "live at last persist, then newest sid" alone would take the
+    /// STOPPED `s9` here — it is both in `live_sids` and the higher ordinal —
+    /// leaving `drop_dead_session_routes` to drop it moments later and the
+    /// chat with no focus at all, though a perfectly good route sat beside it.
+    /// So candidates are filtered by the same predicate that prunes, first.
+    #[tokio::test]
+    async fn routing_load_never_collapses_onto_a_route_it_would_immediately_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+
+        // Two real sessions in the chat's project; the higher-numbered one is
+        // explicitly stopped, so no chat may still address it.
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            gateway.stop_session("s2").await.unwrap();
+        }
+        let routing = crate::routing_state_path_in(tmp.path());
+        let saved: RoutingState =
+            serde_json::from_str(&std::fs::read_to_string(&routing).unwrap()).unwrap();
+        std::fs::write(
+            &routing,
+            serde_json::to_vec(&RoutingState {
+                current_session: vec![
+                    SavedGatewayRoute {
+                        chat: ChatKey::new("mock", "chat-1", "alice"),
+                        value: "s1".into(),
+                    },
+                    SavedGatewayRoute {
+                        chat: ChatKey::new("mock", "chat-1", "chat-1"),
+                        value: "s2".into(),
+                    },
+                ],
+                // `s2` looks like the better pick on both ranking axes.
+                live_sids: vec!["s2".into()],
+                ..saved
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut restored = Gateway::new(fake, "alpha", alpha);
+        restored.enable_persistence(tmp.path()).unwrap();
+        assert_eq!(
+            restored.current_session.values(),
+            vec!["s1".to_string()],
+            "a stopped sid is not a candidate, however it ranks"
+        );
+    }
+
+    /// A poisoned focus-route lock must not swallow a write. Dropping one
+    /// makes `contains`/`get` answer "this chat has no session", which spawns a
+    /// phantom session or routes the next message to the wrong sid — the exact
+    /// bug class this table exists to prevent. The map is a `BTreeMap` mutated
+    /// one operation at a time, so it is still consistent after a panic:
+    /// recover through the poison rather than degrade.
+    #[tokio::test]
+    async fn a_poisoned_focus_lock_still_records_the_chats_session() {
+        let routes = FocusRoutes::default();
+        let chat = ChatKey::new("telegram", "339498819", "cryptorobsu");
+
+        // Poison the lock the way a panic under it would.
+        let poisoner = routes.clone();
+        std::thread::spawn(move || {
+            let _guard = poisoner.inner.write().unwrap();
+            panic!("panic while holding the focus lock");
+        })
+        .join()
+        .expect_err("the spawned thread panics");
+        assert!(routes.inner.write().is_err(), "the lock is poisoned");
+
+        routes.set(&chat, "s487");
+        assert_eq!(
+            routes.get(&chat),
+            Some("s487".to_string()),
+            "a poisoned lock must not lose the chat's focus"
+        );
+        assert!(routes.contains(&chat));
+        assert!(routes.is_focused(&chat, "s487"));
+        routes.remove(&chat);
+        assert!(routes.get(&chat).is_none(), "…nor swallow its removal");
     }
 
     /// v0.8.23 review §3.2-5 (item 2a) — a WEB-owned session's answer gets NO
@@ -24982,6 +25352,7 @@ mod tests {
 
         // A stopped session s1 belongs to project alpha (meta.json on disk).
         let meta = SessionMeta {
+            awaiting_observation: false,
             mode: None,
             managed_by: Default::default(),
             stopped_at: None,
@@ -25060,6 +25431,7 @@ mod tests {
 
         // A stopped session s1 (meta.json on disk, never spawned → not live).
         let meta = SessionMeta {
+            awaiting_observation: false,
             mode: None,
             managed_by: Default::default(),
             stopped_at: None,
