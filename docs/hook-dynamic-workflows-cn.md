@@ -116,6 +116,7 @@ ccteam flow eval <run-dir>         # 用你自己的评估脚本给跑完的 run
 - **shell 里**:`ccteam flow run <script>`——同步;`--resume` 续跑。
 - **主会话里**:agent 有 shell——任何会话(无论哪家 harness)跑同一条命令(愿意就放后台),落地后读 RunReport JSON。这**就是**今天的主会话触发;专门的 MCP `flow_*` 工具刻意后置——工具 schema 的每个字节都在向所有会话的上下文收税,等真实用法证明 CLI 不够再加。
 - **Claude Code 原生**:桥接模式(§3)——Claude 自家工作流运行时,ccteam 叶子。
+- **看进度**:web 控制台 **团队 → 编排** tab 列出 daemon 记到账本上的每一次 run——名字、状态、雇佣数、成本、耗时;展开一行看它雇的会话。runner 向 daemon 上报信封是 best-effort:daemon 没在跑时(或用早于这个 tab 的构建)驱动的 run 不在账本上,也就不会出现。
 
 ### 评估一次 run,然后改进脚本
 

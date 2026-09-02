@@ -116,6 +116,7 @@ The other half of "just ask" is a skill, and skills are user-space by constructi
 - **From a shell**: `ccteam flow run <script>` — synchronous; `--resume` continues a run.
 - **From the main session**: agents have shells — any session (whatever its harness) launches the same command, in the background if it likes, and reads the RunReport JSON when it lands. That IS the main-session trigger today; dedicated MCP `flow_*` tools are deliberately deferred until real usage proves the CLI insufficient — every byte of tool schema taxes every session's context.
 - **From Claude Code natively**: bridge mode (§3) — Claude's own workflow runtime, ccteam leaves.
+- **Watching it**: the web console's **Team → Runs** tab lists every run the daemon recorded — name, status, hires, cost, duration; expand a row for the hired sessions. The runner reports its envelope to the daemon best-effort, so a run driven while the daemon was down (or by a build older than this tab) is not on the ledger and does not appear.
 
 ### Evaluate a run, then improve the script
 

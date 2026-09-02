@@ -280,20 +280,27 @@ fn last_progress_event_ts(paths: &CcteamPaths, slug: &str) -> Option<DateTime<Ut
 ///
 /// Reads the flat `~/.ccteam/progress/<slug>.jsonl` file.
 pub fn collect_recent_events(paths: &CcteamPaths, slug: &str, n: usize) -> Result<Vec<Value>> {
-    Ok(collect_recent_events_with_more(paths, slug, n)?.0)
+    Ok(crate::journal::tail_valid(&paths.progress_jsonl(slug), n)?.events)
 }
 
-/// [`collect_recent_events`] plus the tail reader's `has_more` verdict — true
-/// exactly when at least one older row exists BEYOND the returned window. The
-/// journal probes one extra row to know this precisely; a caller that instead
-/// infers truncation from `len() >= n` reports a false positive on a journal
-/// of exactly `n` rows (s523 R2).
-pub fn collect_recent_events_with_more(
+/// Tail the newest `n` progress rows the caller KEEPS, reading at most
+/// `max_bytes` of the journal — the read for sparse row kinds (a handful of
+/// flow envelopes among thousands of chat and tool rows), where a window
+/// measured in file rows fills with noise and answers nothing about the rows
+/// asked for. Returns the kept rows oldest first, plus `has_more`: true when
+/// an (n+1)th kept row exists or the byte budget ran out before the file
+/// start — never inferred from `len() >= n` (s523 R2).
+pub fn collect_recent_events_where<F>(
     paths: &CcteamPaths,
     slug: &str,
     n: usize,
-) -> Result<(Vec<Value>, bool)> {
-    let tail = crate::journal::tail_valid(&paths.progress_jsonl(slug), n)?;
+    max_bytes: u64,
+    pick: F,
+) -> Result<(Vec<Value>, bool)>
+where
+    F: FnMut(&[u8]) -> crate::journal::Pick<Value>,
+{
+    let tail = crate::journal::tail_select(&paths.progress_jsonl(slug), n, None, max_bytes, pick)?;
     Ok((tail.events, tail.has_more))
 }
 

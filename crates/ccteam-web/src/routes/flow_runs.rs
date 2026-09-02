@@ -12,6 +12,14 @@
 //! `flow-run` hook, and this handler folds them back into runs. Nothing is read
 //! from a run directory — those live on whichever machine drove the run, which
 //! is not necessarily this one.
+//!
+//! The journal is read for ENVELOPE rows, not for rows: a run is three rows
+//! among thousands of chat and tool rows, so the walk is bounded in envelopes
+//! kept (plus a byte budget), never in journal rows. The first cut of this
+//! endpoint tailed a fixed 5000-row window and reported the window overflowing
+//! as "older runs scrolled out" — on any project that had chatted more than
+//! 5000 rows that read as a warning about runs that never existed, and a run
+//! older than 5000 rows of chat silently vanished (docs-local/issues/#16).
 
 use std::collections::HashMap;
 
@@ -21,6 +29,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use ccteam_core::journal::Pick;
 use ccteam_core::progress::{FLOW_BRAKE_TRIPPED, FLOW_RUN_FINISHED, FLOW_RUN_STARTED};
 use serde::Serialize;
 use serde_json::Value;
@@ -31,14 +40,29 @@ use crate::state::AppState;
 
 use super::sessions_api::project_not_visible;
 
-/// How far back down the ledger one request looks.
+/// How many runs one request lists, at least.
 ///
-/// The journal is tailed BACKWARDS, so this bounds the work per request rather
-/// than scaling with the file: a project with a 64 MiB journal costs the same
-/// as a fresh one. Envelope rows are rare (three per run) but share the file
-/// with high-volume chat and tool rows, so the window is generous — this is a
-/// cold endpoint behind a tab, not one of the hot status paths.
-const SCAN_LIMIT: usize = 5_000;
+/// The bound is in envelope ROWS kept while walking the journal backwards:
+/// a run contributes a `started` row, a `finished` row and at most a few
+/// `brake` rows, so three rows per run is the floor and the list holds at
+/// least [`RUN_LIMIT`] complete runs whenever that many exist. Any run whose
+/// rows fall past the window is not listed and `truncated` says so.
+const RUN_LIMIT: usize = 50;
+const ENVELOPE_ROW_LIMIT: usize = RUN_LIMIT * 3;
+
+/// How much journal one request may read.
+///
+/// Envelope rows are rare, so a project that never ran a flow is walked to
+/// its first byte — the budget is what keeps that walk finite on a very large
+/// journal (this is a cold endpoint behind a tab, polled only while the tab
+/// is open, not one of the hot status paths). Hitting it reports `truncated`,
+/// because a walk that stopped early cannot promise the rest holds no run.
+const SCAN_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// The envelope kinds, as the bytes a row of that kind must contain. A byte
+/// scan for these gates the JSON parse, so the thousands of chat rows between
+/// two runs cost a substring search each, not a parse.
+const ENVELOPE_KINDS: [&str; 3] = [FLOW_RUN_STARTED, FLOW_RUN_FINISHED, FLOW_BRAKE_TRIPPED];
 
 /// One flow run, folded from its envelope rows.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -69,10 +93,13 @@ pub struct FlowRun {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FlowRuns {
     pub runs: Vec<FlowRun>,
-    /// True when the scan hit [`SCAN_LIMIT`] — older runs (and any run whose
-    /// opening row already scrolled out of the window) are NOT listed. A
-    /// bounded window is fine; a silently bounded one is not: the reader must
-    /// be able to tell "no runs" from "no runs *in the window*".
+    /// True when at least one run exists that is NOT listed: the journal holds
+    /// more envelope rows than the window keeps (only the newest runs are
+    /// shown), or the read budget ran out before the journal's first byte.
+    /// False means the list is complete — including an empty list on a busy
+    /// project that simply never ran a flow. A bounded window is fine; a
+    /// silently bounded one is not: the reader must be able to tell "no runs"
+    /// from "no runs *shown*".
     pub truncated: bool,
 }
 
@@ -98,17 +125,21 @@ pub(crate) async fn handle_flow_runs(
     // A project that has never run a flow — or never run anything — has no
     // journal, and an unreadable one is an operational fault, not this
     // endpoint's to report. Both are the same honest answer: no runs.
-    // `has_more` comes from the tail reader's one-extra-row probe, so a
-    // journal of EXACTLY `SCAN_LIMIT` rows is not falsely reported as
-    // truncated (s523 R2 — inferring from `len() >= limit` was).
-    let (events, truncated) =
-        match ccteam_core::collect_recent_events_with_more(&app.paths, &slug, SCAN_LIMIT) {
-            Ok(pair) => pair,
-            Err(err) => {
-                tracing::warn!(%slug, error = %err, "flow-runs: read progress journal failed");
-                (Vec::new(), false)
-            }
-        };
+    // `has_more` comes from the tail reader's one-extra-row probe on KEPT
+    // rows (or its byte budget), never from `len() >= limit` (s523 R2).
+    let (events, truncated) = match ccteam_core::collect_recent_events_where(
+        &app.paths,
+        &slug,
+        ENVELOPE_ROW_LIMIT,
+        SCAN_BYTE_BUDGET,
+        pick_envelope_row,
+    ) {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::warn!(%slug, error = %err, "flow-runs: read progress journal failed");
+            (Vec::new(), false)
+        }
+    };
     (
         StatusCode::OK,
         Json(FlowRuns {
@@ -117,6 +148,40 @@ pub(crate) async fn handle_flow_runs(
         }),
     )
         .into_response()
+}
+
+/// Keep a journal row only when it is a flow envelope.
+///
+/// Bytes first: a row that does not even contain an envelope kind's name is
+/// skipped without parsing. A row that does (a chat row quoting the name, say)
+/// is parsed and judged on its `event` field like any other. Rows that are not
+/// JSON at all are corrupt — the same verdict every other reader gives them.
+fn pick_envelope_row(line: &[u8]) -> Pick<Value> {
+    if !ENVELOPE_KINDS
+        .iter()
+        .any(|kind| contains_bytes(line, kind.as_bytes()))
+    {
+        return Pick::Skip;
+    }
+    match serde_json::from_slice::<Value>(line) {
+        Ok(event) if is_envelope(&event) => Pick::Keep(event),
+        Ok(_) => Pick::Skip,
+        Err(_) => Pick::Corrupt,
+    }
+}
+
+fn is_envelope(event: &Value) -> bool {
+    event
+        .get("event")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| ENVELOPE_KINDS.contains(&kind))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// What the envelope rows seen so far say about one run.
@@ -344,6 +409,38 @@ mod tests {
         ]);
         let order: Vec<&str> = runs.iter().map(|run| run.run_id.as_str()).collect();
         assert_eq!(order, ["newer", "middle", "older"]);
+    }
+
+    #[test]
+    fn the_row_picker_keeps_envelopes_and_skips_everything_else_unparsed() {
+        let started = json!({"event": FLOW_RUN_STARTED, "run_id": "r1"}).to_string();
+        assert!(matches!(
+            pick_envelope_row(started.as_bytes()),
+            Pick::Keep(_)
+        ));
+
+        // A chat row merely QUOTING an envelope kind is parsed and then
+        // skipped on its real `event` — never kept, never corrupt.
+        let quoting =
+            json!({"event": "chat_turn_completed", "text": "see flow_run_started"}).to_string();
+        assert_eq!(pick_envelope_row(quoting.as_bytes()), Pick::Skip);
+
+        // A row without any kind name is skipped before parsing — so even a
+        // torn one is not this reader's corruption to count.
+        assert_eq!(
+            pick_envelope_row(br#"{"event":"chat_tool_call_started""#),
+            Pick::Skip
+        );
+        assert_eq!(
+            pick_envelope_row(br#"{"event":"chat_tool_call_started"}"#),
+            Pick::Skip
+        );
+
+        // A torn envelope row IS corrupt: it was meant for us and is unreadable.
+        assert_eq!(
+            pick_envelope_row(br#"{"event":"flow_run_finished","run_id":"#),
+            Pick::Corrupt
+        );
     }
 
     #[test]

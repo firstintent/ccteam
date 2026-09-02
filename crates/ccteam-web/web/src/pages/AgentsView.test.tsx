@@ -701,7 +701,7 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
     expect(html).toContain('data-testid="flow-runs-truncated"');
   });
 
-  it("a truncated window with zero surviving runs reads 'incomplete', not 'no runs'", () => {
+  it("truncated with zero listed runs says runs exist unlisted, and never shows the on-ramp", () => {
     const html = renderToString(
       <MemoryRouter>
         <FlowRunsPanel
@@ -714,7 +714,49 @@ describe("FlowRunsPanel (ccteam Flow runs)", () => {
       </MemoryRouter>,
     ).replace(/<!-- -->/g, "");
     expect(html).toContain('data-testid="flow-runs-truncated"');
+    expect(html).toContain("更早的 run 存在但未列出");
     expect(html).not.toContain('data-testid="flow-runs-empty"');
+    expect(html).not.toContain("ccteam flow new");
+  });
+
+  it("the empty state is an on-ramp: both commands, the examples pointer, the guide link (#16)", () => {
+    const zh = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel groups={[]} nodes={noNodes} expanded={new Set()} nowMs={NOW} onToggle={() => {}} />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(zh).toContain('data-testid="flow-runs-empty"');
+    // The real CLI surface, in order: scaffold, then run what it wrote.
+    expect(zh.indexOf("ccteam flow new &lt;name&gt;")).toBeGreaterThan(-1);
+    expect(zh.indexOf("ccteam flow run .agents/flows/&lt;name&gt;.flow.js")).toBeGreaterThan(
+      zh.indexOf("ccteam flow new &lt;name&gt;"),
+    );
+    // Each command has its own copy button; the middle step has none.
+    expect(zh.match(/data-testid="flow-start-copy"/g)).toHaveLength(2);
+    expect(zh).toContain("examples/flows/");
+    expect(zh).toContain(
+      'href="https://github.com/firstintent/ccteam/blob/main/docs/hook-dynamic-workflows-cn.md"',
+    );
+    // Never the old dead-end warning about a scan window.
+    expect(zh).not.toContain("扫描窗口");
+
+    const en = renderToString(
+      <MemoryRouter>
+        <FlowRunsPanel
+          groups={[{ slug: "demo", runs: [] }]}
+          nodes={noNodes}
+          lang="en"
+          expanded={new Set()}
+          nowMs={NOW}
+          onToggle={() => {}}
+        />
+      </MemoryRouter>,
+    ).replace(/<!-- -->/g, "");
+    expect(en).toContain("No flow runs yet");
+    expect(en).toContain("Scaffold a script");
+    expect(en).toContain(
+      'href="https://github.com/firstintent/ccteam/blob/main/docs/hook-dynamic-workflows.md"',
+    );
   });
 
   it("zero runs renders the honest empty state, bilingually", () => {

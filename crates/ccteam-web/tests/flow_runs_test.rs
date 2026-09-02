@@ -190,49 +190,104 @@ async fn a_tenant_cannot_write_another_owners_journal() {
     );
 }
 
-/// A bounded scan window is fine; a silently bounded one is not. When the
-/// journal holds more rows than one request scans, the answer SAYS so — and
-/// a run whose opening row scrolled out is missing WITH the flag up, never
-/// silently (checker s523 R1). The flag is also EXACT: a journal of exactly
-/// the window size is complete coverage, not truncation (s523 R2 caught the
-/// `len() >= limit` false positive this pins down).
+/// Append `n` non-envelope rows to a project's journal, the way a day of chat
+/// and tool calls does — the noise every flow envelope is buried under.
+fn bury_under_chat(paths: &CcteamPaths, slug: &str, n: usize) {
+    use std::io::Write as _;
+    let filler: String = (0..n)
+        .map(|i| {
+            format!(
+                "{}\n",
+                json!({"ts": "2026-09-01T11:00:00Z", "event": "chat_tool_call_started", "n": i})
+            )
+        })
+        .collect();
+    let mut journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(paths.progress_jsonl(slug))
+        .unwrap();
+    journal.write_all(filler.as_bytes()).unwrap();
+}
+
+/// The bug behind docs-local/issues/#16: the list is bounded in RUNS, not in
+/// journal rows. A run buried under any amount of later chat is still listed,
+/// and the list is reported complete — the first cut's 5000-row window lost
+/// the run AND raised its "older runs scrolled out" flag on every busy
+/// project, including ones that had never run a flow.
 #[tokio::test]
-async fn a_full_scan_window_is_reported_as_truncated() {
+async fn a_run_buried_under_a_busy_journal_is_still_listed_and_not_disclaimed() {
     let tmp = TempDir::new().unwrap();
     let (paths, addr) = serving(&tmp).await;
 
     submit(
         addr,
         "started",
-        json!({"project": "alpha", "run_id": "recent-1", "started_at": "2026-09-01T10:15:00Z"}),
+        json!({"project": "alpha", "run_id": "buried-1", "started_at": "2026-09-01T10:15:00Z"}),
     )
     .await;
-    // Fill the journal to EXACTLY the scan window (1 envelope + 4999 filler).
-    let filler_row = |i: usize| {
-        format!(
-            "{}\n",
-            json!({"ts": "2026-09-01T11:00:00Z", "event": "chat_tool_call_started", "n": i})
-        )
-    };
-    let filler: String = (0..4_999).map(filler_row).collect();
-    use std::io::Write as _;
-    let mut journal = std::fs::OpenOptions::new()
-        .append(true)
-        .open(paths.progress_jsonl("alpha"))
-        .unwrap();
-    journal.write_all(filler.as_bytes()).unwrap();
+    submit(
+        addr,
+        "finished",
+        json!({"project": "alpha", "run_id": "buried-1", "agents": 2, "cost_usd": 0.5, "ok": true,
+               "finished_at": "2026-09-01T10:20:00Z"}),
+    )
+    .await;
+    // Well past what any row-counted window would cover.
+    bury_under_chat(&paths, "alpha", 12_000);
 
-    // Exactly at the window: full coverage, honestly untruncated, run listed.
     let body = flow_runs(addr, "alpha").await;
     assert_eq!(body["truncated"], false, "{body}");
-    assert_eq!(body["runs"].as_array().unwrap().len(), 1, "{body}");
+    let runs = body["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{body}");
+    assert_eq!(runs[0]["run_id"], "buried-1");
+    assert_eq!(runs[0]["status"], "ok");
+}
 
-    // One row past the window: the started row scrolls out, the run vanishes
-    // from the list — and the raised flag is what keeps that absence honest.
-    journal.write_all(filler_row(4_999).as_bytes()).unwrap();
+/// `truncated` means exactly "a run exists that is not listed": more runs than
+/// the window keeps. The newest survive, the flag is up, and one run under the
+/// bound reads complete — the flag is never inferred from a full page.
+#[tokio::test]
+async fn more_runs_than_the_window_keeps_lists_the_newest_and_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let (_paths, addr) = serving(&tmp).await;
+
+    // The window is 150 envelope rows; two rows per run here, so 75 runs fill
+    // it exactly and the 76th (oldest, submitted first) falls off.
+    for i in 0..76 {
+        let run_id = format!("run-{i:03}");
+        let minute = i % 60;
+        let hour = 10 + i / 60;
+        submit(
+            addr,
+            "started",
+            json!({"project": "alpha", "run_id": run_id,
+                   "started_at": format!("2026-09-01T{hour:02}:{minute:02}:00Z")}),
+        )
+        .await;
+        submit(
+            addr,
+            "finished",
+            json!({"project": "alpha", "run_id": run_id, "agents": 1, "cost_usd": 0.1, "ok": true,
+                   "finished_at": format!("2026-09-01T{hour:02}:{minute:02}:30Z")}),
+        )
+        .await;
+    }
+
     let body = flow_runs(addr, "alpha").await;
     assert_eq!(body["truncated"], true, "{body}");
-    assert_eq!(body["runs"].as_array().unwrap().len(), 0, "{body}");
+    let ids: Vec<&str> = body["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["run_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 75, "{body}");
+    assert_eq!(ids[0], "run-075", "newest first");
+    assert_eq!(ids[74], "run-001", "the oldest listed is the second run");
+    assert!(
+        !ids.contains(&"run-000"),
+        "the run past the window is not listed"
+    );
 }
 
 /// A traversal-shaped "slug" is refused on SHAPE, before `can_see_project`
@@ -371,13 +426,24 @@ async fn several_runs_come_back_newest_first() {
     assert_eq!(order, ["newer", "middle", "older"]);
 }
 
+/// "No runs" and "complete" together, whether the project is fresh or has
+/// chatted for weeks — a busy journal is not evidence of runs.
 #[tokio::test]
 async fn a_project_that_never_ran_a_flow_answers_honestly_empty() {
     let tmp = TempDir::new().unwrap();
-    let (_paths, addr) = serving(&tmp).await;
+    let (paths, addr) = serving(&tmp).await;
 
     let body = flow_runs(addr, "alpha").await;
     assert_eq!(body["runs"].as_array().unwrap().len(), 0);
+    assert_eq!(body["truncated"], false, "{body}");
+
+    // The journal exists now, and is long; still no runs, still complete.
+    std::fs::create_dir_all(paths.progress_jsonl("alpha").parent().unwrap()).unwrap();
+    std::fs::write(paths.progress_jsonl("alpha"), "").unwrap();
+    bury_under_chat(&paths, "alpha", 12_000);
+    let body = flow_runs(addr, "alpha").await;
+    assert_eq!(body["runs"].as_array().unwrap().len(), 0);
+    assert_eq!(body["truncated"], false, "{body}");
 }
 
 #[tokio::test]

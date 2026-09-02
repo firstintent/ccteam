@@ -67,6 +67,19 @@ impl<T> Default for Tail<T> {
     }
 }
 
+/// What a [`tail_select`] closure says about one raw row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick<T> {
+    /// Keep this row; it counts toward the requested `n`.
+    Keep(T),
+    /// A well-formed row the caller does not want. Passed over silently: it
+    /// counts as neither kept nor corrupt, so a sparse selection over a busy
+    /// journal does not inflate the corruption counters.
+    Skip,
+    /// Not a row of the caller's schema; counted in `corrupt_count`.
+    Corrupt,
+}
+
 /// Result metadata from a streaming forward scan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanSummary {
@@ -98,8 +111,8 @@ pub struct Delta {
 
 /// Return the final parseable JSON row, skipping corrupt trailing rows.
 pub fn last_valid(path: &Path) -> Result<Option<Value>> {
-    Ok(tail_filter_map_inner(path, 1, None, false, |line| {
-        serde_json::from_slice::<Value>(line).ok()
+    Ok(tail_pick_inner(path, 1, None, false, u64::MAX, |line| {
+        parse_or_corrupt(serde_json::from_slice::<Value>(line).ok())
     })?
     .events
     .pop())
@@ -128,23 +141,61 @@ pub fn tail_filter_map<T, F>(
     path: &Path,
     n: usize,
     before: Option<u64>,
-    parse: F,
-) -> Result<Tail<T>>
-where
-    F: FnMut(&[u8]) -> Option<T>,
-{
-    tail_filter_map_inner(path, n, before, true, parse)
-}
-
-fn tail_filter_map_inner<T, F>(
-    path: &Path,
-    n: usize,
-    before: Option<u64>,
-    probe_older: bool,
     mut parse: F,
 ) -> Result<Tail<T>>
 where
     F: FnMut(&[u8]) -> Option<T>,
+{
+    tail_pick_inner(path, n, before, true, u64::MAX, |line| {
+        parse_or_corrupt(parse(line))
+    })
+}
+
+/// Return the newest `n` rows the caller keeps, walking backwards from
+/// `before` (exclusive) or EOF and reading at most `max_bytes` from disk.
+///
+/// This is the tail for SPARSE rows. [`tail_filter_map`] bounds its walk in
+/// rows of the file, which is the wrong unit when the rows of interest are a
+/// handful among thousands of unrelated ones: the window fills with noise and
+/// tells the caller nothing about the rows it asked for. Here `n` counts kept
+/// rows only — the bound is in the caller's unit — and the byte budget is what
+/// keeps one request's cost finite on a large journal.
+///
+/// `has_more` is true when an (n+1)th kept row exists, OR when the byte budget
+/// ran out first: a walk that stopped early cannot promise the rest of the
+/// file holds nothing the caller wanted, so it must not read as complete.
+pub fn tail_select<T, F>(
+    path: &Path,
+    n: usize,
+    before: Option<u64>,
+    max_bytes: u64,
+    pick: F,
+) -> Result<Tail<T>>
+where
+    F: FnMut(&[u8]) -> Pick<T>,
+{
+    tail_pick_inner(path, n, before, true, max_bytes, pick)
+}
+
+/// The two-way parse contract of [`tail_filter_map`] / [`last_valid`], spelled
+/// in [`Pick`]: those callers never skip, so `None` is corruption.
+fn parse_or_corrupt<T>(parsed: Option<T>) -> Pick<T> {
+    match parsed {
+        Some(value) => Pick::Keep(value),
+        None => Pick::Corrupt,
+    }
+}
+
+fn tail_pick_inner<T, F>(
+    path: &Path,
+    n: usize,
+    before: Option<u64>,
+    probe_older: bool,
+    max_bytes: u64,
+    mut pick: F,
+) -> Result<Tail<T>>
+where
+    F: FnMut(&[u8]) -> Pick<T>,
 {
     if n == 0 {
         return Ok(Tail::default());
@@ -157,8 +208,15 @@ where
     let target = if probe_older { n.saturating_add(1) } else { n };
     let mut rows = Vec::with_capacity(target.min(1024));
     let mut corrupt_count = 0;
+    let mut budget_exhausted = false;
 
     while rows.len() < target {
+        // Lines already buffered are free; the budget gates the next disk
+        // block only, so an exhausted budget never drops a row it has read.
+        if reader.bytes_read >= max_bytes && reader.needs_read() {
+            budget_exhausted = true;
+            break;
+        }
         let Some((offset, raw)) = reader.next_line()? else {
             break;
         };
@@ -166,14 +224,15 @@ where
         if line.is_empty() {
             continue;
         }
-        match parse(line) {
-            Some(value) => rows.push((offset, value)),
-            None => corrupt_count += 1,
+        match pick(line) {
+            Pick::Keep(value) => rows.push((offset, value)),
+            Pick::Skip => {}
+            Pick::Corrupt => corrupt_count += 1,
         }
     }
 
     let records_parsed = rows.len();
-    let has_more = probe_older && records_parsed > n;
+    let has_more = (probe_older && records_parsed > n) || budget_exhausted;
     if has_more {
         rows.truncate(n);
     }
@@ -355,6 +414,12 @@ impl ReverseLines {
         }))
     }
 
+    /// True when the next [`next_line`] would have to read another block:
+    /// nothing complete is buffered and the file start has not been reached.
+    fn needs_read(&self) -> bool {
+        !self.reached_bof && !self.buffer.contains(&b'\n')
+    }
+
     fn next_line(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         loop {
             if let Some(newline) = self.buffer.iter().rposition(|byte| *byte == b'\n') {
@@ -465,6 +530,88 @@ mod tests {
         assert_eq!(older.events.len(), 1);
         assert_eq!(older.events[0]["n"], 1);
         assert!(!older.has_more);
+    }
+
+    /// A row selector: keep `{"k":"want",...}`, skip every other valid row.
+    fn want_only(line: &[u8]) -> Pick<Value> {
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) if value["k"] == "want" => Pick::Keep(value),
+            Ok(_) => Pick::Skip,
+            Err(_) => Pick::Corrupt,
+        }
+    }
+
+    #[test]
+    fn tail_select_bounds_by_kept_rows_and_never_counts_skips_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        // Three wanted rows, each buried under a hundred rows of noise — the
+        // shape of a run envelope on a busy project journal.
+        let mut raw = String::new();
+        for wanted in 1..=3 {
+            for noise in 0..100 {
+                raw.push_str(&format!("{{\"k\":\"noise\",\"n\":{noise}}}\n"));
+            }
+            raw.push_str(&format!("{{\"k\":\"want\",\"n\":{wanted}}}\n"));
+        }
+        raw.push_str("{not-json\n");
+        std::fs::write(&path, raw).unwrap();
+
+        // Two kept rows asked for: the newest two, in file order, with the
+        // third's existence reported — and the 300 skipped rows nowhere.
+        let two = tail_select(&path, 2, None, u64::MAX, want_only).unwrap();
+        let ns = |tail: &Tail| {
+            tail.events
+                .iter()
+                .map(|event| event["n"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ns(&two), vec![2, 3]);
+        assert!(two.has_more);
+        assert_eq!(two.corrupt_count, 1, "only the torn row is corrupt");
+
+        // Room for all of them: complete, and honestly so.
+        let all = tail_select(&path, 3, None, u64::MAX, want_only).unwrap();
+        assert_eq!(ns(&all), vec![1, 2, 3]);
+        assert!(!all.has_more);
+
+        // The row-bounded tail over the same file sees only the newest wanted
+        // row — the other two are buried past its window, unreported.
+        let by_rows = tail_valid(&path, 50).unwrap();
+        let wanted_by_rows: Vec<u64> = by_rows
+            .events
+            .iter()
+            .filter(|event| event["k"] == "want")
+            .map(|event| event["n"].as_u64().unwrap())
+            .collect();
+        assert_eq!(wanted_by_rows, vec![3]);
+    }
+
+    #[test]
+    fn tail_select_reports_has_more_when_the_byte_budget_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.jsonl");
+        // One wanted row at the very top, then well over a budget's worth of
+        // noise below it.
+        let mut raw = String::from("{\"k\":\"want\",\"n\":1}\n");
+        for noise in 0..2_000 {
+            raw.push_str(&format!("{{\"k\":\"noise\",\"n\":{noise}}}\n"));
+        }
+        std::fs::write(&path, raw).unwrap();
+
+        // Budget smaller than the file: the walk stops short of the wanted
+        // row, and says so — an empty answer here is "unknown", not "none".
+        let short = tail_select(&path, 10, None, READ_BLOCK_SIZE, want_only).unwrap();
+        assert!(short.events.is_empty());
+        assert!(
+            short.has_more,
+            "an exhausted budget must not read as complete"
+        );
+
+        // Budget covering the file: the row is found and nothing is pending.
+        let full = tail_select(&path, 10, None, u64::MAX, want_only).unwrap();
+        assert_eq!(full.events.len(), 1);
+        assert!(!full.has_more);
     }
 
     #[test]

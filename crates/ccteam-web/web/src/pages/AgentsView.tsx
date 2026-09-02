@@ -56,6 +56,7 @@ import { useAgentsEvents } from "../hooks/useAgentsEvents";
 import { usePolledSnapshot } from "../hooks/usePolledSnapshot";
 import { useProjectsStore } from "../hooks/useProjectsStore";
 import { VendorChip } from "../components/VendorChip";
+import { copyText } from "../lib/clipboard";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
 import { emptyFold, foldActivity, renderFold, type ActivityFold } from "./chatTranscript";
 import { vendorDotClass } from "../lib/vendors";
@@ -506,6 +507,78 @@ export function TeamTabSeg({
   );
 }
 
+/** The Flow guide, per language. The SPA bundles no manual, and this tab is
+ *  the one place a first-time reader lands without having read one. */
+function flowDocsUrl(lang: Lang): string {
+  return lang === "en"
+    ? "https://github.com/firstintent/ccteam/blob/main/docs/hook-dynamic-workflows.md"
+    : "https://github.com/firstintent/ccteam/blob/main/docs/hook-dynamic-workflows-cn.md";
+}
+
+/** The three steps of a first run. The commands are the real CLI surface —
+ *  the web cannot launch a run itself (the runner is a CLI process; a
+ *  daemon-managed run is a later card), so the entry point here is the exact
+ *  command, copyable, next to what it does and where its output lands. */
+const FLOW_START_STEPS = [
+  { key: "flowRunsStep1", note: "flowRunsStep1Note", command: "ccteam flow new <name>" },
+  { key: "flowRunsStep2", note: "flowRunsStep2Note", command: null },
+  {
+    key: "flowRunsStep3",
+    note: "flowRunsStep3Note",
+    command: "ccteam flow run .agents/flows/<name>.flow.js",
+  },
+] as const;
+
+/** One copyable shell command. Each keeps its own copied/failed flash so two
+ *  buttons never share state; failure is shown, never silent (a dead button
+ *  is the one thing worse than no button). */
+function CommandLine({ command, lang }: { command: string; lang: Lang }) {
+  const t = makeT(lang);
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+  const onCopy = async () => {
+    if (await copyText(command)) {
+      setState("copied");
+      window.setTimeout(() => setState("idle"), 1500);
+    } else {
+      setState("failed");
+    }
+  };
+  return (
+    <div className="flow-start-cmd">
+      <code className="mono">{command}</code>
+      <button type="button" className="btn ghost mini" onClick={onCopy} data-testid="flow-start-copy">
+        {state === "copied" ? t("flowRunsCopied") : t("flowRunsCopy")}
+      </button>
+      {state === "failed" ? <span className="flow-start-copy-failed">{t("flowRunsCopyFailed")}</span> : null}
+    </div>
+  );
+}
+
+/** The empty state is an on-ramp, not a shrug: what to type, where the script
+ *  lands, where the examples and the guide are. Exported for node-env tests. */
+export function FlowStartGuide({ lang: langProp }: { lang?: Lang }) {
+  const lang = langProp ?? "zh";
+  const t = makeT(lang);
+  return (
+    <div className="flow-start" data-testid="flow-runs-empty">
+      <p className="flow-start-title">{t("flowRunsEmpty")}</p>
+      <p className="flow-start-lead">{t("flowRunsEmptyLead")}</p>
+      <ol className="flow-start-steps">
+        {FLOW_START_STEPS.map((step) => (
+          <li key={step.key}>
+            <div className="flow-start-step-title">{t(step.key)}</div>
+            {step.command ? <CommandLine command={step.command} lang={lang} /> : null}
+            <div className="flow-start-step-note">{t(step.note)}</div>
+          </li>
+        ))}
+      </ol>
+      <a className="flow-start-docs" href={flowDocsUrl(lang)} target="_blank" rel="noreferrer">
+        {t("flowRunsDocs")} ↗
+      </a>
+    </div>
+  );
+}
+
 /** One run's status label: the four known verdicts translate, anything else
  *  renders verbatim (honest fallback — never blank, never a guessed word). */
 function runStatusLabel(t: (key: string) => string, status: string): string {
@@ -559,21 +632,28 @@ export function FlowRunsPanel({
     );
   const truncated = groups.some((group) => group.truncated === true);
   if (rows.length === 0) {
-    // An outage is not an empty project, and neither is a full scan window:
-    // every-fetch-failed says the endpoint is unreachable; a window that
-    // truncated away every run says the list is incomplete. Plain "no runs"
-    // is reserved for a genuinely empty answer (checker s523 R1+R2).
+    // An outage is not an empty project, and neither is an unlisted run:
+    // every-fetch-failed says the endpoint is unreachable; `truncated` with
+    // nothing listed (a read budget exhausted before any complete run) says
+    // runs exist that are not shown. The on-ramp is reserved for a genuinely
+    // empty answer — the backend reports a busy project that never ran a
+    // flow as exactly that, complete and empty (checker s523 R1+R2; #16).
     const allErrored = groups.length > 0 && groups.every((group) => group.error === true);
-    const testid = allErrored
-      ? "flow-runs-unavailable"
-      : truncated
-        ? "flow-runs-truncated"
-        : "flow-runs-empty";
-    return (
-      <p style={{ color: "var(--text-faint)", fontSize: 13 }} data-testid={testid}>
-        {allErrored ? t("flowRunsUnavailable") : truncated ? t("flowRunsTruncated") : t("flowRunsEmpty")}
-      </p>
-    );
+    if (allErrored) {
+      return (
+        <p style={{ color: "var(--text-faint)", fontSize: 13 }} data-testid="flow-runs-unavailable">
+          {t("flowRunsUnavailable")}
+        </p>
+      );
+    }
+    if (truncated) {
+      return (
+        <p style={{ color: "var(--text-faint)", fontSize: 13 }} data-testid="flow-runs-truncated">
+          {t("flowRunsTruncated")}
+        </p>
+      );
+    }
+    return <FlowStartGuide lang={lang} />;
   }
   const showProject = new Set(rows.map((row) => row.slug)).size > 1;
   return (
@@ -716,7 +796,10 @@ export function FlowRunsTab({ nodes, lang: langProp }: { nodes: AgentNode[]; lan
   return (
     <div data-testid="flow-runs-tab">
       <p style={{ color: "var(--text-muted)", fontSize: 12.5, margin: "0 0 10px" }}>
-        {t("flowRunsDesc")}
+        {t("flowRunsDesc")}{" "}
+        <a href={flowDocsUrl(lang)} target="_blank" rel="noreferrer">
+          {t("flowRunsDocs")} ↗
+        </a>
       </p>
       {loading && groups.every((group) => group.runs.length === 0) ? (
         <p style={{ color: "var(--text-faint)", fontSize: 13 }}>{t("loading")}</p>
