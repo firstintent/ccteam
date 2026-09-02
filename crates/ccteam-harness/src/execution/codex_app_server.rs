@@ -535,7 +535,10 @@ impl CodexAppServerAdapter {
         self.call_or_drop_dead(&conn.client, "thread/resume", json!({ "threadId": tid }))
             .await
             .map_err(|e| {
-                HarnessError::SubmitFailed(format!("thread/resume (ensure-loaded): {e:#}"))
+                HarnessError::SubmitFailed(format!(
+                    "thread/resume (ensure-loaded): {e:#}{}",
+                    writer_held_hint(tid, &e)
+                ))
             })?;
         loaded.insert(tid.to_string());
         drop(loaded);
@@ -772,10 +775,21 @@ impl CodexAppServerAdapter {
         Ok(())
     }
 
-    /// One-shot helper: drop the cached client (e.g. after detecting a
-    /// dead reader task). Next call to `client()` will re-dial.
+    /// One-shot helper: drop the cached client (after a transport death, or
+    /// to re-spawn on a config change). Next call to `client()` re-dials.
+    ///
+    /// The stdio child is terminated and REAPED here, under the connection
+    /// lock, before the slot is cleared — so the next `conn()` (which waits
+    /// on the same lock) can only spawn once the old app-server is gone.
+    /// Leaving that to drop timing put the writer lock of every thread the
+    /// old process had loaded in a race with the new process's
+    /// `thread/resume` (GitHub #189). A UDS connection has no
+    /// child to end; that error is expected and ignored.
     pub async fn forget_client(&self) {
-        *self.inner.lock().await = None;
+        let mut guard = self.inner.lock().await;
+        if let Some(conn) = guard.take() {
+            let _ = conn.client.terminate_stdio_child().await;
+        }
     }
 
     /// V0.6.1 F122 — register a progress bridge for `thread_id`. Called
@@ -1711,7 +1725,8 @@ impl HarnessAdapter for CodexAppServerAdapter {
                             sid = %ctx.sid,
                             slug = %ctx.slug,
                             error = %resume_err,
-                            "codex thread/resume failed; falling back to fresh thread/start"
+                            "codex thread/resume failed; falling back to fresh thread/start{}",
+                            writer_held_hint(&uuid, &resume_err)
                         );
                         if let Some(progress_path) = progress_jsonl_from_env(&ctx.slug) {
                             let ev = build_chat_session_reset_event_with_reason(
@@ -2406,14 +2421,108 @@ impl HarnessAdapter for CodexAppServerAdapter {
 /// codex's `fail_pending` connection-loss path sets `code: None`, and any
 /// non-RPC failure (writer channel closed, request send error) is not a
 /// `JsonRpcError` at all — both mean the transport is gone.
-/// Resolve `$CODEX_HOME/config.toml`, falling back to `~/.codex/config.toml`
-/// — the same file `codex app-server` reads. ccteam inherits `CODEX_HOME` into
-/// the child, so both resolve identically.
-fn codex_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("CODEX_HOME")
+/// `$CODEX_HOME`, falling back to `~/.codex` — the directory `codex app-server`
+/// itself resolves. ccteam inherits `CODEX_HOME` into the child, so both agree.
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
-    Some(home.join("config.toml"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))
+}
+
+/// Resolve `$CODEX_HOME/config.toml` — the same file `codex app-server` reads.
+fn codex_config_path() -> Option<PathBuf> {
+    Some(codex_home_dir()?.join("config.toml"))
+}
+
+/// The substring codex's `thread/resume` / `thread/archive` rejection carries
+/// when another app-server PROCESS holds the thread's writer lock. Shared with
+/// the web layer, which maps it to a 409 conflict instead of a generic
+/// upstream 502 (GitHub #189).
+pub const THREAD_WRITER_HELD_MARKER: &str = "already has an active writer";
+
+/// If `err` is codex's "already has an active writer" rejection, name the
+/// process holding `$CODEX_HOME/thread-writer-locks/<tid>.lock` and say what
+/// to do; empty for any other error. The lock is an flock, so a holder is
+/// always a LIVE process (a dead one released it), and because
+/// `forget_client` reaps ccteam's own previous app-server before re-dialing,
+/// the holder can only be a process ccteam did not spawn (a Codex desktop
+/// remote app-server, a `codex` TUI with the thread open). ccteam never kills
+/// those — it points at them.
+fn writer_held_hint(tid: &str, err: &anyhow::Error) -> String {
+    if !format!("{err:#}").contains(THREAD_WRITER_HELD_MARKER) {
+        return String::new();
+    }
+    let holder = codex_home_dir()
+        .map(|home| home.join("thread-writer-locks").join(format!("{tid}.lock")))
+        .and_then(|lock| writer_lock_holder(&lock));
+    match holder {
+        Some(holder) => format!(
+            " — the thread is open in another codex app-server ({holder}); ccteam never \
+             kills a process it did not spawn: close the thread there (or stop that \
+             process) and resend"
+        ),
+        None => " — the thread is open in another codex app-server ccteam could not \
+                 identify; close it there and resend"
+            .to_string(),
+    }
+}
+
+/// Best-effort: which live process has `lock` open. codex opens a thread's
+/// writer-lock file only to flock it, so an open fd IS the holder. Linux only
+/// (walks `/proc/<pid>/fd` for this uid's processes, skipping ourselves);
+/// `None` elsewhere or when nothing holds it. Reports pid + command line, and
+/// flags an orphan (`ppid 1`) — the shape the incident report showed.
+#[cfg(target_os = "linux")]
+fn writer_lock_holder(lock: &std::path::Path) -> Option<String> {
+    let lock = std::fs::canonicalize(lock).ok()?;
+    let me = std::process::id();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .map(|t| t == lock)
+                .unwrap_or(false)
+        });
+        if !holds {
+            continue;
+        }
+        let cmdline = std::fs::read(entry.path().join("cmdline"))
+            .ok()
+            .map(|raw| {
+                String::from_utf8_lossy(&raw)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "?".to_string());
+        // `/proc/<pid>/stat` = `pid (comm) state ppid …`; split after the
+        // last `)` so a comm containing spaces/parens can't shift fields.
+        let orphan = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.split_whitespace().nth(1).map(str::to_string))
+            })
+            .is_some_and(|ppid| ppid == "1");
+        let orphan_note = if orphan { ", orphaned: ppid 1" } else { "" };
+        return Some(format!("pid {pid}{orphan_note}: {cmdline}"));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn writer_lock_holder(_lock: &std::path::Path) -> Option<String> {
+    None
 }
 
 /// Last-modified time of codex's `config.toml`, or `None` if it can't be
@@ -3953,6 +4062,45 @@ mod tests {
         // JsonRpcError at all → also transport death.
         let io = anyhow::anyhow!("send jsonrpc request turn/start: channel closed");
         assert!(is_transport_death(&io));
+    }
+
+    /// GitHub #189 — the writer-lock holder lookup names the
+    /// process that has the lock file open (never ourselves) and stays
+    /// silent when nobody holds it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_lock_holder_names_the_process_holding_the_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("t1.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(
+            writer_lock_holder(&lock).is_none(),
+            "unheld lock must report no holder"
+        );
+        // Hold it from a child (`sleep` with the file as its stdin): a
+        // different pid, exactly like production where the holder is never
+        // the daemon itself.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::fs::File::open(&lock).unwrap())
+            .spawn()
+            .expect("spawn sleep");
+        let holder = writer_lock_holder(&lock).expect("child holds the lock file open");
+        assert!(holder.contains(&format!("pid {}", child.id())), "{holder}");
+        assert!(holder.contains("sleep"), "{holder}");
+        assert!(!holder.contains("orphaned"), "{holder}");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn writer_held_hint_only_decorates_the_active_writer_rejection() {
+        let other = anyhow::anyhow!("jsonrpc error -32600: thread not found");
+        assert_eq!(writer_held_hint("t1", &other), "");
+        let held = anyhow::anyhow!("jsonrpc error -32600: thread t1 already has an active writer");
+        let hint = writer_held_hint("t1", &held);
+        assert!(hint.contains("another codex app-server"), "{hint}");
+        assert!(hint.contains("resend"), "{hint}");
     }
 
     #[test]

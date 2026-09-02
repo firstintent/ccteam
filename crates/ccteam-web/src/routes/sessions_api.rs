@@ -1182,6 +1182,13 @@ pub(crate) async fn handle_session_turn(
         Ok(_turn_id) => (StatusCode::ACCEPTED, Json(json!({"accepted": true}))).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "submit_to_sid failed");
+            if is_thread_writer_held(&err) {
+                // Another codex app-server process owns the thread's writer
+                // lock: a state conflict the message already explains (holder
+                // pid + the next step), not an upstream failure — never a
+                // "please retry" 502 (GitHub #189).
+                return conflict_error(format_submit_error(&err), "CODEX_THREAD_WRITER_HELD", mode);
+            }
             create_gateway_error(
                 StatusCode::BAD_GATEWAY,
                 format_submit_error(&err),
@@ -2255,12 +2262,54 @@ fn format_create_session_error(err: &anyhow::Error) -> String {
 fn format_submit_error(err: &anyhow::Error) -> String {
     let raw = err.to_string();
     let detail = raw.strip_prefix("submit failed: ").unwrap_or(&raw);
+    if is_thread_writer_held(err) {
+        // The adapter's message already names the holder and the next step;
+        // "please retry" would be wrong advice for a lock a live foreign
+        // process holds.
+        return format!("发送失败: {detail}");
+    }
     format!("发送失败: {detail}。下一步: 请重试；如果仍失败，刷新会话列表或重新 /new。")
+}
+
+/// True when the submit was rejected because another codex app-server holds
+/// the thread's writer lock (the adapter keeps codex's marker verbatim).
+fn is_thread_writer_held(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .contains(ccteam_harness::execution::codex_app_server::THREAD_WRITER_HELD_MARKER)
+}
+
+/// 409 with a stable `error_code` (JSON) — the state-conflict shape
+/// [`gateway_json_error`] already uses for a detached body.
+fn conflict_error(msg: String, error_code: &str, mode: InputMode) -> Response {
+    match mode {
+        InputMode::Json => (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": msg, "error_code": error_code})),
+        )
+            .into_response(),
+        _ => create_error(StatusCode::CONFLICT, msg, mode),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub #189 — the codex writer-lock rejection is recognised
+    /// anywhere in the submit error chain and stops the generic retry advice.
+    #[test]
+    fn thread_writer_held_is_recognised_from_the_submit_error_chain() {
+        let held = anyhow::anyhow!(
+            "submit failed: thread/resume (ensure-loaded): jsonrpc error -32600: thread \
+             01a0 already has an active writer — the thread is open in another codex \
+             app-server (pid 42: codex app-server --listen unix://)"
+        );
+        assert!(is_thread_writer_held(&held));
+        assert!(!format_submit_error(&held).contains("请重试"));
+        let other = anyhow::anyhow!("submit failed: thread not found");
+        assert!(!is_thread_writer_held(&other));
+        assert!(format_submit_error(&other).contains("请重试"));
+    }
 
     #[test]
     fn parse_vendor_accepts_both_case_insensitive() {
