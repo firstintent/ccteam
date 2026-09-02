@@ -2544,10 +2544,14 @@ impl Gateway {
         };
         let (host, wire_slug) = self.ensure_session_host_binding(slug, &meta.host)?;
         let role_detail = ensure_role_exists(&cwd, &meta.role).ok().flatten();
-        let model_id = meta
-            .model
-            .clone()
-            .or_else(|| role_model_id(role_detail.as_ref()));
+        // Both tuning axes, one precedence — see `respawn_tuning`.
+        let (model_id, effort) = respawn_tuning(
+            &cwd,
+            &meta.sid,
+            meta.model.clone(),
+            meta.effort.clone(),
+            role_detail.as_ref(),
+        );
         let owner = self
             .tenant_project_owner(slug)
             .or_else(|| ChatKey::from_identity(&meta.owner))
@@ -2596,7 +2600,7 @@ impl Gateway {
             owner,
             handle,
             model_id,
-            effort: meta.effort.clone(),
+            effort,
             mode: meta.mode.clone(),
             secret: rebuild_secret,
             cwd,
@@ -5597,13 +5601,16 @@ impl Gateway {
         // Wave-2: a restart rebuilds from meta, so the role change must persist).
         let meta_dir = cwd.clone();
         let meta_role = role.clone();
-        // `/role` re-derives the MODEL from the new role's frontmatter, but the
-        // effort belongs to the session, not the role — replay it so a switch
-        // doesn't silently drop the level the session was spawned with.
-        let (effort, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
+        // `/role` re-derives the MODEL from the new role's frontmatter — that
+        // is what the command is for — but the effort belongs to the SESSION,
+        // not the role, so it carries across on the same precedence every
+        // other re-spawn uses (issue #14②: the vendor's applied level, then
+        // the level the spawn asked for).
+        let (meta_effort, mode) = match self.session_catalog.find_or_load(&sid, &self.projects) {
             Some(entry) => (entry.meta.effort, entry.meta.mode),
             None => (None, None),
         };
+        let effort = observed_effort(&cwd, &sid).or(meta_effort);
         let (adapter, thread) = self
             .spawn_session_thread(
                 vendor,
@@ -5678,6 +5685,23 @@ impl Gateway {
             meta.skills_sha = ccteam_harness::execution::experience::skills_fingerprint(&meta_dir);
             meta.last_active = chrono::Utc::now().to_rfc3339();
             let _ = self.persist_session_meta(&meta_dir, &meta);
+        }
+        // `/role` closed the old thread, so `status.json`'s model describes a
+        // process that no longer exists — and a re-spawn now sources the model
+        // from there FIRST (issue #14②). Drop that one axis so a release or
+        // restart before the new thread's first turn rebuilds at the NEW
+        // role's model instead of the retired one. Clearing is honest ("no
+        // observation yet"); writing the REQUESTED model here would be an echo
+        // into a file that only ever holds what the vendor itself reported.
+        // The effort axis is the same session's applied level and stays.
+        if let Some(mut status) =
+            ccteam_harness::execution::session_status::read_status_file(&meta_dir, &sid)
+        {
+            if status.model.take().is_some() {
+                ccteam_harness::execution::session_status::write_status_file(
+                    &meta_dir, &sid, &status,
+                );
+            }
         }
         self.spawn_event_pump(&sid);
         Ok(sid)
@@ -7985,21 +8009,20 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| anyhow!("unknown project: {project}"))?;
         let role_detail = ensure_role_exists(&cwd, &role)?;
-        // One read for both axes: `model` falls back to the role's frontmatter
-        // (a role may pin a model), `effort` has no such fallback — the vendor
-        // default is the honest answer when the session never named one.
+        // Both tuning axes, one precedence — see `respawn_tuning`. `mode` has
+        // no observed counterpart, so it replays from `meta` verbatim.
         let meta = self
             .session_catalog
             .find_or_load(session_id, &self.projects)
             .map(|entry| entry.meta);
-        let model_id = meta
-            .as_ref()
-            .and_then(|m| m.model.clone())
-            .or_else(|| role_model_id(role_detail.as_ref()));
-        let (effort, mode) = match meta {
-            Some(m) => (m.effort, m.mode),
-            None => (None, None),
-        };
+        let mode = meta.as_ref().and_then(|m| m.mode.clone());
+        let (model_id, effort) = respawn_tuning(
+            &cwd,
+            session_id,
+            meta.as_ref().and_then(|m| m.model.clone()),
+            meta.and_then(|m| m.effort),
+            role_detail.as_ref(),
+        );
         let (host, wire_slug) = self.ensure_session_host_binding(&project, &host)?;
         // Reuse the existing secret: the resumed child's env is re-stamped with
         // it, so pane-env and the cto-gate map stay in lockstep (no fresh mint →
@@ -14922,6 +14945,58 @@ fn role_model_id(detail: Option<&RoleDetail>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The reasoning effort a re-spawn of `sid` must come back on, from the
+/// session's `status.json` — what the VENDOR last reported applying, written
+/// by the harness status tap at every turn boundary ("observe, don't echo").
+///
+/// `None` when the session never ran a turn, or when the vendor has no effort
+/// axis; the caller then falls back to `meta.effort` (what the spawn asked
+/// for). See [`respawn_tuning`] for why the observation outranks the request.
+fn observed_effort(project_dir: &Path, sid: &str) -> Option<String> {
+    ccteam_harness::execution::session_status::read_status_file(project_dir, sid)
+        .and_then(|s| s.effort)
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+}
+
+/// The `(model_id, effort)` a re-spawn must come back on, in ONE precedence
+/// shared by every re-spawn path: what the vendor last REPORTED (`status.json`)
+/// → what the spawn REQUESTED (`meta.json`) → the role's frontmatter (model
+/// only; effort has no role default, and the vendor default is the honest
+/// answer when the session never named one).
+///
+/// `docs-local/issues/#14②` — the observation has to outrank the request,
+/// because only the request is frozen at spawn time. `meta.model` /
+/// `meta.effort` are written once, at spawn (and on `/role`); a mid-session
+/// `/model claude-fable-5-1[1m]` or an effort the vendor resolved for itself
+/// never reaches them, so an idle release + cold resume silently came back on
+/// a different model and effort than the session had been running — with a
+/// live sid and no signal that anything had changed. `status.json` only ever
+/// holds what the vendor itself said, so it is never a wish, and it is the
+/// only persisted home of the `[1m]` tag (the translator carries the bare API
+/// id into `meta.observed_model`). `persisted_session_model` filters claude's
+/// own unresolved `"default"` picker label and legacy `<synthetic>` markers,
+/// so a placeholder can never reach `--model`.
+///
+/// The status.json rung is not new: it was read by the pre-Wave-2 restore path
+/// and was dropped as collateral when `084d17d6` retired
+/// `gateway-state.json`'s sessions vec, which re-sourced the model from the
+/// new `meta.json` SoT and never re-added it.
+fn respawn_tuning(
+    project_dir: &Path,
+    sid: &str,
+    meta_model: Option<String>,
+    meta_effort: Option<String>,
+    role_detail: Option<&RoleDetail>,
+) -> (Option<String>, Option<String>) {
+    (
+        ccteam_harness::persisted_session_model(project_dir, sid)
+            .or(meta_model)
+            .or_else(|| role_model_id(role_detail)),
+        observed_effort(project_dir, sid).or(meta_effort),
+    )
+}
+
 /// Resolve a session pump's live reply target `(channel, chat_id)`,
 /// honoring a `/cd`-updated `reply_to` and falling back to the owner.
 fn pump_target(session: &GatewaySession) -> (String, String) {
@@ -18036,6 +18111,221 @@ mod tests {
             last,
             Some((Some("opus".into()), Some("xhigh".into()))),
             "a resumed session re-spawns with the effort it was created with"
+        );
+    }
+
+    /// Write `status.json` exactly as the harness status tap does at a turn
+    /// boundary: the model the VENDOR reported (with its `[1m]` tag) and the
+    /// effort it actually applied.
+    fn tap_status(project_dir: &Path, sid: &str, model: &str, effort: &str) {
+        ccteam_harness::execution::session_status::write_status_file(
+            project_dir,
+            sid,
+            &ThreadStatus {
+                model: Some(model.to_string()),
+                context: None,
+                effort: Some(effort.to_string()),
+                goal: None,
+            },
+        );
+    }
+
+    /// `docs-local/issues/#14②` — "released" must not mean "quietly retuned".
+    /// A session the owner had put on `claude-fable-5-1[1m] · max` came back
+    /// from an idle release running `claude-sonnet-5 · xhigh`: every re-spawn
+    /// path sourced both axes from `meta.json` (frozen at spawn) and never
+    /// looked at `status.json`, where the tap records what the vendor itself
+    /// reported for every turn — the only persisted home of the live `/model`
+    /// switch, and the only one that carries the `[1m]` tag.
+    ///
+    /// Covers both rebuild planners: the dead-child resume
+    /// (`plan_resume_dead_session`) and the rebuild-from-meta core
+    /// (`plan_session_rebuild`, shared by the daemon-restart restore, `/use`
+    /// cold resume and external adopt).
+    #[tokio::test]
+    async fn a_respawn_comes_back_on_the_model_and_effort_the_vendor_reported() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        // Spawned on one tuning…
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: Some("claude-sonnet-5".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+        // …and then moved off it live, in the session (`/model` + an effort the
+        // vendor resolved for itself). Neither reaches meta.json.
+        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
+        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
+        assert_eq!(meta.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(meta.effort.as_deref(), Some("xhigh"));
+
+        // Rung 1 — the child died (crash / OOM / a released stream-json body).
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "a dead-child resume comes back on the model and effort the session was RUNNING"
+        );
+
+        // Rung 2 — the rebuild-from-meta core (daemon restart / `/use` cold
+        // resume / external adopt all funnel through it).
+        gateway.stop_session("s1").await.ok();
+        gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await
+            .expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "…and so does the rebuild-from-meta path"
+        );
+    }
+
+    /// The other half of the precedence: with no observation to honour, a
+    /// re-spawn replays what the spawn ASKED for. A session that never ran a
+    /// turn has no `status.json` at all, and one whose vendor has no effort
+    /// axis has no `effort` in it — neither may erase the request.
+    #[tokio::test]
+    async fn a_respawn_without_an_observation_replays_the_spawn_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: Some("opus".into()),
+                    effort: Some("xhigh".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // No status.json — the session never completed a turn.
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("opus".into()), Some("xhigh".into()))),
+            "with nothing observed, the spawn-time request stands"
+        );
+
+        // A status.json that names neither axis is equally not an observation
+        // (an empty effort string is what a vendor with no effort axis leaves).
+        ccteam_harness::execution::session_status::write_status_file(
+            tmp.path(),
+            "s1",
+            &ThreadStatus {
+                model: None,
+                context: None,
+                effort: Some("   ".into()),
+                goal: None,
+            },
+        );
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("opus".into()), Some("xhigh".into()))),
+            "a blank observation does not erase the request either"
+        );
+    }
+
+    /// The daemon-restart leg end to end: `status.json` is on disk, so the
+    /// session's live tuning survives the process that observed it. This is
+    /// the shape the owner actually hit — the daemon restarts, the next
+    /// message cold-resumes the session, and it must not come back retuned.
+    #[tokio::test]
+    async fn a_restart_rebuild_comes_back_on_the_reported_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let alpha = tmp.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        {
+            let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.clone());
+            gateway.enable_persistence(tmp.path()).unwrap();
+            gateway
+                .handle_text("mock", "chat-1", "alice", "/new claude")
+                .await
+                .unwrap();
+            tap_status(&alpha, "s1", "claude-fable-5-1[1m]", "max");
+        }
+
+        let mut restarted = Gateway::new(fake.clone(), "alpha", alpha);
+        restarted.enable_persistence(tmp.path()).unwrap();
+        restarted.reconcile_restored_sessions().await;
+        // The next message revives s1 through the rebuild core.
+        restarted
+            .handle_text("mock", "chat-1", "alice", "still here?")
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-fable-5-1[1m]".into()), Some("max".into()))),
+            "a restart must not silently retune the session"
+        );
+    }
+
+    /// `/role` keeps daef69b0's rule — the MODEL re-derives from the NEW role,
+    /// that is what the command is for — while the effort, which belongs to the
+    /// session and not the role, carries across on the same precedence as every
+    /// other re-spawn. The old thread's observed model is dropped with it, so a
+    /// release before the new thread's first turn rebuilds at the new role's
+    /// model rather than the retired one.
+    #[tokio::test]
+    async fn role_switch_rederives_the_model_and_carries_the_observed_effort() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_role(tmp.path(), "cto");
+        seed_role_with_model(tmp.path(), "reviewer", Some("claude-opus-5"));
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        tap_status(tmp.path(), "s1", "claude-fable-5-1[1m]", "max");
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/role reviewer")
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.spawn_tunings.lock().await.last().cloned(),
+            Some((Some("claude-opus-5".into()), Some("max".into()))),
+            "/role re-derives the model, carries the applied effort"
+        );
+        assert_eq!(
+            ccteam_harness::persisted_session_model(tmp.path(), "s1"),
+            None,
+            "the retired thread's model is no longer an observation"
+        );
+        assert_eq!(
+            observed_effort(tmp.path(), "s1").as_deref(),
+            Some("max"),
+            "the effort is the SAME session's applied level and stays"
         );
     }
 
