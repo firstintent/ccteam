@@ -490,42 +490,84 @@ async fn auth_enabled_session_bearer_reaches_mcp_and_spawn_links_parent() {
     assert_eq!(resp.status(), 401, "bad session bearer → 401");
 }
 
-/// The `parent_sid` declaration survives the family cull — and stays a
-/// declaration.
+/// A verified session principal may REFINE its edge with `parent_sid`, but
+/// only onto a live session in its own project — and a miss is loud.
 ///
-/// It exists for a caller that holds no per-session principal (the local
-/// `mcp.sock` fallback, where same-uid file access is already the trust
-/// boundary): it may NAME its own sid so the ledger keeps an edge that really
-/// exists, and the daemon validates that name against the live set. Kept per
-/// owner decision. What it must never become is a second identity source — a
-/// caller that DOES hold a principal is answered by the principal, so a declared
-/// parent from a session bearer is ignored rather than honoured. Otherwise any
-/// managed session could mount its children anywhere in somebody else's tree by
-/// asking.
+/// The declaration is not a second identity source: it never lets a caller
+/// mount children in somebody else's tree. What it does buy is the flow
+/// runner, which connects as an enrolled client acting FOR the managed session
+/// that launched it; without a refinement its hires would mount as roots and
+/// the topology would lose an edge that really exists. So the daemon validates
+/// the name against the live set SCOPED TO THE CALLER'S PROJECT — same project
+/// is same owner, so the caller stamps no authority it does not already hold —
+/// and refuses an unknown sid rather than silently rooting the spawn. The
+/// refusal is deliberately worded identically for "no such sid" and "someone
+/// else's sid": sids are monotonic, so a distinguishing error would be an
+/// enumeration oracle.
 #[tokio::test]
-async fn a_declared_parent_sid_never_overrides_a_verified_session_principal() {
+async fn a_verified_principal_refines_its_edge_only_onto_a_live_session_it_can_see() {
     let tmp = TempDir::new().unwrap();
     let paths = fake_paths(tmp.path());
     let (app, sid, secret) = state_with_one_session(paths, AuthState::disabled()).await;
     let addr = spawn_server(app).await;
     let bearer = format!("ccteam-sid:{sid}:{secret}");
 
+    // Declaring your OWN sid is inert — the principal already answers it.
     let resp = post_mcp(
         addr,
         &bearer,
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+               "params":{"name":"agent",
+                         "arguments":{"vendor":"claude","task":"hello","parent_sid":sid}}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false, "self-declaration: {body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let spawned: Value = serde_json::from_str(text).unwrap();
+    let child = spawned["sid"]
+        .as_str()
+        .expect("spawn returns a sid")
+        .to_string();
+
+    // A sid nobody can see is refused, not silently ignored: a runner that
+    // names the wrong parent must hear about it, not quietly become a root.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
                "params":{"name":"agent",
                          "arguments":{"vendor":"claude","task":"hello","parent_sid":"s404"}}}),
     )
     .await;
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    // Not an error: the declaration is inert on this path, not rejected — the
-    // caller's verified identity simply answers the question first.
-    assert_eq!(body["result"]["isError"], false, "spawn: {body}");
+    assert_eq!(
+        body["result"]["isError"], true,
+        "unknown parent_sid: {body}"
+    );
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    let spawned: Value = serde_json::from_str(text).unwrap();
-    assert!(spawned["sid"].is_string(), "spawn: {text}");
+    assert!(
+        text.contains("is not a live session in your project"),
+        "unknown parent_sid must say so: {text}"
+    );
+
+    // A live session in the caller's OWN project is a legitimate refinement.
+    let resp = post_mcp(
+        addr,
+        &bearer,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+               "params":{"name":"agent",
+                         "arguments":{"vendor":"claude","task":"hello","parent_sid":child}}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"]["isError"], false,
+        "sibling refinement: {body}"
+    );
 }
 
 /// Deterministic fake-Codex acceptance: build the exact
