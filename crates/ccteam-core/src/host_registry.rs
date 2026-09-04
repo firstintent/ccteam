@@ -75,7 +75,7 @@ pub struct AgentProbeSpec {
     pub bin_env: &'static str,
     /// Default binary name resolved on `PATH` when the env override is unset.
     pub default_bin: &'static str,
-    /// How ccteam exposes its eight tools to this vendor.
+    /// How ccteam exposes its tools to this vendor.
     pub tool_surface: ToolSurfaceMode,
     /// Admin one-click install/update recipe (VENDOR-INSTALL-1): the exact
     /// argv the daemon runs via `std::process::Command::new(argv[0])

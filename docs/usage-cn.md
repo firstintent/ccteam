@@ -455,6 +455,23 @@ ccteam skill migrate-project        # 旧 .claude/skills 实体搬进 .agents/sk
 
 全局库与项目**不相灌**:库里的技能只在会话里按条消息引用(web ＋ 菜单),要进 git 的项目技能自己放 `.agents/skills/`。
 
+### `flow`(确定性编排)
+
+flow 是一段 JS 脚本,由 ccteam runner 对着 daemon 执行:`agent()` / `parallel()` / `pipeline()` / `phase()` 调度的是真实的跨 harness 雇佣,每个叶子都是账本上一个独立会话。进度走 stderr,最终一份 JSON 报告走 stdout。
+
+```bash
+ccteam flow new branch-review              # 在 .agents/flows/ 生成 <slug>.flow.js 并打印脚本 API
+ccteam flow run branch-review.flow.js      # 按 cwd 所属项目跑(--project <slug> 显式点名)
+ccteam flow run f.js --args '{"base":"main"}'   # JSON 作为 `args` 交给脚本
+ccteam flow run f.js --parallel 16 --max-agents 100 --max-cost 5 --budget 5
+ccteam flow run f.js --resume ~/.ccteam/runs/<id>   # 重放 journal,把这次 run 接着跑
+ccteam flow eval <run-id>                  # 用评审 flow 给已完成的 run 打分(.agents/flows/_eval.flow.js)
+```
+
+每次 run 都在 `~/.ccteam/runs/<id>` 落 journal(`--run-dir` 可自己指定),daemon 或机器重启都不丢:雇来的是真会话,活得比 runner 久,`--resume` 会重新挂上还在飞的那些而不是重雇。刹车是显式的 —— `--parallel`(同时在飞,默认 32)、`--max-agents`(单次 run 硬顶,默认 100)、`--max-cost` / `--budget`(超过这个花费就不再放新雇佣进来;`--budget` 同时是脚本看到的 `budget.total`)、`--watchdog <秒>`(脚本一直不让出就中止)。在受管会话里跑会自动按 `$CCTEAM_CHAT_SID` 归到那个会话名下;`--parent <sid>` 覆盖,`--parent ''` 关掉。
+
+flow 雇人和任何一次委派一样,照样过 `pre-agent` 策略 hook 与同一套护栏。脚本 API、hook 契约与评审闭环见 [hook-dynamic-workflows-cn.md](hook-dynamic-workflows-cn.md)。
+
 ### 运维
 
 ```bash

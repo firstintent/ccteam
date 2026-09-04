@@ -90,9 +90,23 @@ Register a satellite with a join token (Settings → Access) — it dials out to
 
 > Satellite execution currently runs Claude sessions; the other vendors run on the daemon's machine.
 
+**5 · Orchestrate in code, not in a prompt**
+
+When the shape of the work is known, write it down instead of asking for it. A **flow** is a plain JS script the ccteam runner executes — `agent()` / `parallel()` / `pipeline()` / `phase()` over real cross-harness hires, every leaf its own session on the ledger:
+
+```sh
+ccteam flow new branch-review          # scaffold a script + the API it can call
+ccteam flow run branch-review.flow.js --args '{"base":"main"}' --budget 5
+ccteam flow eval <run-id>              # grade a finished run with a flow of your own
+```
+
+Runs are journaled, so a run survives a daemon restart and `--resume` picks it back up — the workers outlive the runner. `--parallel` / `--max-agents` / `--max-cost` are the brakes, and the Team page's **Runs** tab shows every run with the sessions it hired.
+
+Independently, a **policy hook** — `<project>/.ccteam/hooks/pre-agent`, any executable, re-read on every call — gates *every* delegation, whether a human, an agent or a flow made it. It is handed the caller, the request and the live per-harness quota map on stdin; exit `0` allows, exit `2` denies with your stderr relayed verbatim to the calling agent, and a broken script refuses distinguishably rather than silently opening.
+
 ---
 
-Under all four modes are the same **six MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
+Under all five modes are the same **six MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
 
 ```text
 agent · agent_read · agent_stop
@@ -103,6 +117,7 @@ The daemon routes and records — at-least-once notifications across restarts, i
 
 - Plain-language walkthrough → [orchestration guide](docs/orchestration.md)
 - MCP tool reference (all six tools, faces, protocol) → [mcp.md](docs/mcp.md)
+- Policy hooks & flows (the script API, run journal, evaluation loop) → [hook-dynamic-workflows.md](docs/hook-dynamic-workflows.md) ([中文](docs/hook-dynamic-workflows-cn.md))
 - Every command → manual ([English](docs/usage.md) · [中文](docs/usage-cn.md))
 
 ## Inside DeepSeek Harness

@@ -473,6 +473,23 @@ ccteam skill migrate-project        # Move legacy .claude/skills entities into .
 
 The global library and project skills never mix: nothing links or copies from the library into a project — sessions reference library skills per message (composer attach), while project-own skills live in the project as normal git-visible files.
 
+### `flow` (Deterministic Orchestration)
+
+A flow is a JS script the ccteam runner executes against the daemon — `agent()` / `parallel()` / `pipeline()` / `phase()` over real cross-harness hires, each leaf its own session on the ledger. Progress goes to stderr, one JSON report to stdout.
+
+```bash
+ccteam flow new branch-review              # Scaffold <slug>.flow.js into .agents/flows/ and print the script API.
+ccteam flow run branch-review.flow.js      # Run it against the project the cwd belongs to (--project <slug> to name one).
+ccteam flow run f.js --args '{"base":"main"}'   # JSON handed to the script as `args`.
+ccteam flow run f.js --parallel 16 --max-agents 100 --max-cost 5 --budget 5
+ccteam flow run f.js --resume ~/.ccteam/runs/<id>   # Replay the journal and pick the run back up.
+ccteam flow eval <run-id>                  # Grade a finished run with an evaluator flow (.agents/flows/_eval.flow.js).
+```
+
+Every run is journaled under `~/.ccteam/runs/<id>` (`--run-dir` to place it yourself), so a daemon or machine restart does not lose it: the hires are real sessions that outlive the runner, and `--resume` re-attaches to the ones still in flight instead of re-hiring. The brakes are explicit — `--parallel` (in flight at once, default 32), `--max-agents` (hard cap per run, default 100), `--max-cost` / `--budget` (stop admitting new hires past a spend; `--budget` is also what the script sees as `budget.total`), `--watchdog <secs>` (abort a script that never yields). Inside a managed session the run is attributed to it automatically via `$CCTEAM_CHAT_SID`; `--parent <sid>` overrides, `--parent ''` disables.
+
+Hires made by a flow pass the same `pre-agent` policy hook and the same guardrails as any other delegation. The script API, the hook contract and the evaluation loop are in [hook-dynamic-workflows.md](hook-dynamic-workflows.md).
+
 ### Operations
 
 ```bash
