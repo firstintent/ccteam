@@ -81,11 +81,13 @@ pub(crate) enum DelegationOutcome {
     },
 }
 
-/// Cap on the answer text an INLINE `agent{wait}` result carries. The caller
-/// asked to block on this answer, so it gets more than a notification does —
-/// but not a transcript: the excerpt's marker names the exact `agent_read`
-/// call for the rest.
-pub(crate) const INLINE_RESULT_MAX_CHARS: usize = 4_000;
+/// Cap on the answer text an INLINE `agent{wait}` result carries: the `final`
+/// tier. The caller blocked for this answer, so it gets the widest excerpt any
+/// wake-up carries — but not a transcript, and not its own private tier four
+/// times that (issue #195: `notify` went frugal by default while the inline
+/// path, the one a correct orchestrator actually takes, kept 4000). The
+/// excerpt's marker names the exact `agent_read` call for the rest.
+pub(crate) const INLINE_RESULT_MAX_CHARS: usize = NOTIFICATION_ANSWER_MAX_CHARS;
 
 pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option<u64> {
     status
@@ -601,7 +603,7 @@ mod tests {
         use ccteam_harness::NotifyMode;
         assert_eq!(NOTIFICATION_ANSWER_MAX_CHARS, 2_000);
         assert_eq!(BRIEF_NOTIFICATION_ANSWER_MAX_CHARS, 500);
-        assert_eq!(INLINE_RESULT_MAX_CHARS, 4_000);
+        assert_eq!(INLINE_RESULT_MAX_CHARS, 2_000);
         assert_eq!(notification_answer_max_chars(NotifyMode::Final), 2_000);
         assert_eq!(notification_answer_max_chars(NotifyMode::Brief), 500);
         assert_eq!(notification_answer_max_chars(NotifyMode::Off), 2_000);

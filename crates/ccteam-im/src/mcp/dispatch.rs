@@ -417,6 +417,16 @@ fn nearest_slug<'a>(input: &str, candidates: &'a [String]) -> Option<&'a str> {
 /// Default page size for BOTH `agent_read` branches (roster rows and
 /// transcript turns). Ten is what a caller reads; more is a `n` away.
 const AGENT_READ_DEFAULT_N: usize = 10;
+/// Default turns a transcript read returns. ONE, not the roster's ten: the
+/// overwhelmingly common question a `sid` read asks is "what did it answer",
+/// and that is the newest turn. Ten turns is transcript replay — a rarer need,
+/// and one the caller says out loud. Ten of them sharing one character budget
+/// was measured at 73% pointer / 27% content (issue #195); `remaining` and
+/// `latest` say when there is more.
+const AGENT_READ_TRANSCRIPT_DEFAULT_N: usize = 1;
+/// Below this a returned turn carries more pointer than prose, so the page
+/// drops whole rows (counted in `remaining`) instead of shredding every one.
+const MIN_USEFUL_ROW_CHARS: usize = 200;
 use crate::delegation::{DelegationOutcome, DelegationSummary};
 /// Default character budget across the turns one `agent_read{sid}` returns.
 use crate::delegation::{
@@ -3321,6 +3331,13 @@ async fn dispatch_task(
         )
         .await
         .map_err(|error| mcp_gateway_error(tool, &error))?;
+        // Before the task is even submitted: this caller will block on the
+        // boundary, so the completion is its to take inline and the notifier
+        // must not ALSO push it (issue #195 — the parent paid a whole extra
+        // turn for the second copy).
+        if wait_seconds > 0 {
+            gateway.lock().await.claim_inline_wait(sid, wait_seconds);
+        }
     }
     let turn_id = match crate::gateway::Gateway::submit_to_sid_shared(
         Arc::clone(gateway),
@@ -3516,10 +3533,12 @@ async fn await_turn_boundary(
 /// reads the child's freshly-appended turn (clean text) + cost from meta and,
 /// for a delegation, disarms the watch (the caller already has the result
 /// inline — suppress the redundant notification). On timeout it returns
-/// `pending` and leaves the watch armed (the child is not cancelled). When a
-/// request above the effective inline ceiling reaches that ceiling, the
-/// pending response also reports the requested/effective waits and an honest
-/// collect-or-notification hint.
+/// `pending` and leaves the watch armed (the child is not cancelled). The
+/// caller placed an inline claim before the submit, so the notifier hands this
+/// boundary over instead of pushing a second copy of the answer; the claim is
+/// released here either way. When a request above the effective inline ceiling
+/// reaches that ceiling, the pending response also reports the
+/// requested/effective waits and an honest collect-or-notification hint.
 ///
 /// v0.9.5 feedback fix — an `Answer` frame alone is NOT completion; see
 /// [`await_turn_boundary`], which owns that rule for every long poll.
@@ -3538,9 +3557,17 @@ async fn dispatch_wait_for_completion(
     // that covers the whole task.
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(wait.effective_seconds);
-    let completed = await_turn_boundary(gateway, child_sid, deadline, rx, false).await;
-
-    if !completed {
+    let observed = await_turn_boundary(gateway, child_sid, deadline, rx, false).await;
+    // Release the claim placed before the submit, and pick up a boundary the
+    // notifier suppressed in our favour: that happens when the child finished
+    // in the same instant our deadline expired, and the answer is then ours to
+    // report rather than nobody's (the notification was already skipped).
+    let suppressed = if is_delegation {
+        gateway.lock().await.release_inline_wait(child_sid)
+    } else {
+        false
+    };
+    if !observed && !suppressed {
         return pending_dispatch_response(child_sid, turn_id, notification_route);
     }
 
@@ -3569,8 +3596,10 @@ async fn dispatch_wait_for_completion(
         })
         .unwrap_or((None, None, 0));
 
-    // Inline completion: the caller already holds the result → disarm the watch
-    // so a delegation doesn't ALSO wake the parent with a redundant turn.
+    // The task is done and its answer rides back in THIS response, so the watch
+    // is spent. The notification was already suppressed at the boundary by the
+    // claim above; this clears the bookkeeping and covers the case where we
+    // reached the boundary before the notifier planned at all.
     if is_delegation {
         crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), child_sid)
             .await;
@@ -3721,11 +3750,22 @@ fn previous_turn_id<'a>(
 }
 
 /// The exact one-call read of a whole turn — what a truncated transcript row
-/// points at instead of a vague "read more". `previous` is the row before it
-/// (see [`previous_turn_id`]); the first row of a transcript is reached as the
-/// oldest turn instead.
-fn whole_turn_recipe(sid: &str, previous: Option<&str>, total_chars: usize) -> String {
+/// points at instead of a vague "read more". The cheapest form that lands on
+/// THAT turn: the newest one needs no cursor at all (a default read is already
+/// `tail:true, n:1`), which is 32 characters the caller does not pay on the
+/// commonest row of all. Otherwise `previous` (see [`previous_turn_id`]) is the
+/// cursor to page from; the first row of a transcript is reached as the oldest
+/// turn instead.
+fn whole_turn_recipe(
+    sid: &str,
+    previous: Option<&str>,
+    total_chars: usize,
+    is_newest: bool,
+) -> String {
     let budget = crate::delegation::read_budget_for(total_chars);
+    if is_newest {
+        return format!("agent_read{{sid:{sid},n:1,max_chars:{budget}}}");
+    }
     match previous {
         Some(previous) => {
             format!("agent_read{{sid:{sid},since:{previous},n:1,max_chars:{budget}}}")
@@ -3793,6 +3833,40 @@ fn collected_turn_budgets(lengths: &[usize], max_chars: usize) -> Vec<usize> {
     budgets
 }
 
+/// Shed rows from a page that cannot afford them. A row is unaffordable when
+/// the page overflows `max_chars` AND the equal share left per row has fallen
+/// under [`MIN_USEFUL_ROW_CHARS`] — at that point every row would come back as
+/// mostly pointer, and a caller is better served by fewer whole turns plus an
+/// honest `remaining`. Returns how many rows were dropped; a page that fits is
+/// never touched, and one row always survives.
+///
+/// WHICH END matters. A `tail` page is "the latest answers", so the oldest go
+/// and the newest turn always survives. A FORWARD page is a caller walking a
+/// cursor, so the newest go instead: dropping from the front there would move
+/// the cursor past turns the caller never saw, and a short page is far better
+/// than one that silently skips.
+fn drop_unaffordable_rows(
+    rows: &mut Vec<serde_json::Value>,
+    max_chars: usize,
+    tail: bool,
+) -> usize {
+    let row_chars = |row: &serde_json::Value| {
+        row.get("content")
+            .and_then(|value| value.as_str())
+            .map(|text| text.chars().count())
+            .unwrap_or(0)
+    };
+    let mut total: usize = rows.iter().map(row_chars).sum();
+    let mut dropped = 0;
+    while rows.len() > 1 && total > max_chars && max_chars / rows.len() < MIN_USEFUL_ROW_CHARS {
+        let victim = if tail { 0 } else { rows.len() - 1 };
+        total -= row_chars(&rows[victim]);
+        rows.remove(victim);
+        dropped += 1;
+    }
+    dropped
+}
+
 /// Apply the collect character budget to the already-selected turn page.
 /// `recipe(turn_id, total_chars)` names the exact read of one whole turn, and
 /// rides on every excerpt's marker. Returns `(original_total_chars,
@@ -3830,9 +3904,16 @@ fn bound_collected_turns(
             .get("turn_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let bounded = crate::delegation::truncate_head_tail_with_marker(content, budget, |n| {
-            format!("…[+{n} chars: {}]…", recipe(turn_id, original_chars))
-        });
+        let mark =
+            |omitted: usize| format!("…[+{omitted} chars: {}]…", recipe(turn_id, original_chars));
+        // A pointer that costs more than the text it withholds makes the answer
+        // both bigger and worse — return the turn whole instead. The overspend
+        // is bounded by one marker per row (issue #195: turns of 131-197 chars
+        // were cut to save 40-94 while paying 86 to say where the rest was).
+        if original_chars <= budget + mark(original_chars - budget).chars().count() {
+            continue;
+        }
+        let bounded = crate::delegation::truncate_head_tail_with_marker(content, budget, mark);
         row["content"] = serde_json::json!(bounded.text);
         truncated |= bounded.truncated;
     }
@@ -3982,7 +4063,7 @@ async fn run_agent_read_transcript(
         .get("n")
         .and_then(|v| v.as_u64())
         .map(|x| (x as usize).min(500))
-        .unwrap_or(AGENT_READ_DEFAULT_N);
+        .unwrap_or(AGENT_READ_TRANSCRIPT_DEFAULT_N);
     let tail = args
         .get("tail")
         .and_then(|v| v.as_bool())
@@ -4003,24 +4084,28 @@ async fn run_agent_read_transcript(
     // read that follows is the ordinary one: every filter still applies, the
     // body carries no new field, and a timeout just answers
     // `activity:"working"`.
-    if read_wait_for_turn_boundary(gateway, &sid, args).await {
-        // D4 — the caller now HOLDS the answer, so the completion notification
-        // would be a second copy. Disarmed exactly where an inline dispatch
-        // wait disarms it, and only for the parent the watch names: a third
-        // party reading someone else's child must never take that child's
-        // notification away from the session that hired it.
-        let caller_sid = args
-            .get("_caller_sid")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let is_watching_parent = !caller_sid.is_empty()
-            && gateway
-                .lock()
-                .await
-                .delegation_watch_parent(&sid)
-                .as_deref()
-                == Some(caller_sid);
-        if is_watching_parent {
+    //
+    // D4 — a boundary this read returns is one the caller now HOLDS, so the
+    // completion notification would be a second copy. The claim goes in BEFORE
+    // the poll (the notifier reaches the boundary first otherwise, issue #195),
+    // and only for the parent the watch names: a third party reading someone
+    // else's child must never take that child's notification away from the
+    // session that hired it.
+    let read_wait = read_wait_seconds(args);
+    let caller_sid = args
+        .get("_caller_sid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let claimed = read_wait > 0 && !caller_sid.is_empty() && {
+        let mut gw = gateway.lock().await;
+        gw.delegation_watch_parent(&sid).as_deref() == Some(caller_sid.as_str())
+            && gw.claim_inline_wait(&sid, read_wait)
+    };
+    let reached = read_wait_for_turn_boundary(gateway, &sid, args).await;
+    if claimed {
+        let suppressed = gateway.lock().await.release_inline_wait(&sid);
+        if reached || suppressed {
             crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), &sid)
                 .await;
         }
@@ -4065,12 +4150,31 @@ async fn run_agent_read_transcript(
     let page = page_collected_turns(&all, since.as_deref(), n, tail);
     let TranscriptPage {
         mut rows,
-        cursor,
-        remaining,
+        mut cursor,
+        mut remaining,
         latest,
     } = page;
+    // Fewer whole turns beat a page of stubs: while the page cannot fit and a
+    // row's share has fallen under what a turn needs to say anything, drop the
+    // OLDEST row and count it as unread rather than shredding every row down to
+    // its pointer (issue #195).
+    let dropped = drop_unaffordable_rows(&mut rows, max_chars, tail);
+    if dropped > 0 {
+        remaining += dropped;
+        cursor = rows
+            .last()
+            .and_then(|row| row.get("turn_id"))
+            .and_then(|value| value.as_str())
+            .map(String::from);
+    }
+    let newest = latest.clone();
     let recipe = |turn_id: &str, total_chars: usize| {
-        whole_turn_recipe(&resolved.sid, previous_turn_id(&all, turn_id), total_chars)
+        whole_turn_recipe(
+            &resolved.sid,
+            previous_turn_id(&all, turn_id),
+            total_chars,
+            newest.as_deref() == Some(turn_id),
+        )
     };
     let (_total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars, &recipe);
 
@@ -7751,13 +7855,83 @@ mod session_tool_tests {
         assert_eq!(previous_turn_id(&all, "t0"), None);
         assert_eq!(previous_turn_id(&all, "ghost"), None);
         assert_eq!(
-            whole_turn_recipe("s5", Some("t1"), 908),
+            whole_turn_recipe("s5", Some("t1"), 908, false),
             "agent_read{sid:s5,since:t1,n:1,max_chars:908}"
         );
         assert_eq!(
-            whole_turn_recipe("s5", None, 7),
+            whole_turn_recipe("s5", None, 7, false),
             "agent_read{sid:s5,tail:false,n:1,max_chars:100}"
         );
+        // The newest turn is what a default read already returns, so its
+        // recipe carries no cursor — 32 characters saved on the commonest row.
+        assert_eq!(
+            whole_turn_recipe("s5", Some("t1"), 908, true),
+            "agent_read{sid:s5,n:1,max_chars:908}"
+        );
+    }
+
+    /// issue #195 — a pointer that costs more than the text it withholds makes
+    /// the answer bigger AND worse, so the turn comes back whole.
+    #[test]
+    fn a_pointer_that_costs_more_than_it_saves_is_not_emitted() {
+        // 131 chars whole, 103 of budget: the pointer would withhold 28 chars
+        // and cost 51 to say so — the exact shape measured in the field.
+        let recipe = |_: &str, _: usize| "agent_read{sid:s5,n:1,max_chars:131}".to_string();
+        let mut rows = vec![json!({ "turn_id": "t1", "content": "x".repeat(131) })];
+        let (_total, truncated) = bound_collected_turns(&mut rows, 103, &recipe);
+        assert!(
+            !truncated,
+            "131 chars whole beats 103 chars of mostly marker"
+        );
+        assert_eq!(rows[0]["content"].as_str().unwrap().chars().count(), 131);
+
+        // Far past the marker's own cost, truncation is the smaller answer again.
+        let mut long = vec![json!({ "turn_id": "t1", "content": "x".repeat(4_000) })];
+        let (_total, truncated) = bound_collected_turns(&mut long, 500, &recipe);
+        assert!(truncated);
+        assert_eq!(long[0]["content"].as_str().unwrap().chars().count(), 500);
+    }
+
+    /// issue #195 — a tight budget spread over many rows returns fewer WHOLE
+    /// turns (the newest ones) and counts the rest as unread, instead of ten
+    /// stubs that are mostly pointer. A page that fits is never touched.
+    #[test]
+    fn a_tight_budget_drops_whole_rows_instead_of_shredding_every_one() {
+        let mut rows: Vec<serde_json::Value> = (0..10)
+            .map(|i| json!({ "turn_id": format!("t{i}"), "content": "x".repeat(700) }))
+            .collect();
+        let dropped = drop_unaffordable_rows(&mut rows, 1_000, true);
+        assert_eq!(dropped, 5, "1000/5 = 200 chars a row is the useful floor");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0]["turn_id"], "t5",
+            "the OLDEST rows are the ones shed"
+        );
+        assert_eq!(rows[4]["turn_id"], "t9", "the newest row always survives");
+
+        // A FORWARD page sheds from the other end: dropping the oldest would
+        // walk the caller's cursor past turns it never saw.
+        let mut forward: Vec<serde_json::Value> = (0..10)
+            .map(|i| json!({ "turn_id": format!("t{i}"), "content": "x".repeat(700) }))
+            .collect();
+        assert_eq!(drop_unaffordable_rows(&mut forward, 1_000, false), 5);
+        assert_eq!(forward[0]["turn_id"], "t0", "the cursor keeps its place");
+        assert_eq!(forward[4]["turn_id"], "t4");
+
+        // Ten short turns fit inside the budget: nothing is dropped.
+        let mut short: Vec<serde_json::Value> = (0..10)
+            .map(|i| json!({ "turn_id": format!("t{i}"), "content": "ok" }))
+            .collect();
+        assert_eq!(drop_unaffordable_rows(&mut short, 1_000, true), 0);
+        assert_eq!(short.len(), 10);
+    }
+
+    /// The transcript branch answers "what did it say" with ONE turn; the
+    /// roster keeps its ten one-line rows.
+    #[test]
+    fn transcript_and_roster_defaults_are_not_the_same_number() {
+        assert_eq!(AGENT_READ_TRANSCRIPT_DEFAULT_N, 1);
+        assert_eq!(AGENT_READ_DEFAULT_N, 10);
     }
 
     // ========================================================================
@@ -10694,14 +10868,25 @@ mod tool_face_tests {
             }
         };
 
+        // A bare read answers "what did it say": the newest turn, alone.
         let newest = read(json!({ "sid": child })).await;
         let turns = newest["turns"].as_array().unwrap();
-        assert_eq!(turns.len(), AGENT_READ_DEFAULT_N);
+        assert_eq!(turns.len(), AGENT_READ_TRANSCRIPT_DEFAULT_N);
         assert_eq!(
             turns.last().unwrap()["turn_id"],
             "t14",
             "the default page ends at the newest turn: {newest}"
         );
+        assert_eq!(
+            newest["remaining"],
+            json!(14),
+            "the rest is counted, not shown"
+        );
+
+        // Asking for ten still pages ten, newest last.
+        let ten = read(json!({ "sid": child, "n": 10 })).await;
+        let turns = ten["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), AGENT_READ_DEFAULT_N);
         assert_eq!(turns[0]["turn_id"], "t5");
 
         let forward = read(json!({ "sid": child, "since": "t1" })).await;

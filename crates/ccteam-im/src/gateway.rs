@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use ccteam_core::config::{upsert_project, CcteamConfig, ProjectEntry};
@@ -837,6 +837,13 @@ pub struct Gateway {
     /// of `delegations`; notifier drops unwatched/non-boundary signals without
     /// ever joining the gateway mutex queue.
     delegation_watch_set: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Children whose completion the notifier SUPPRESSED because a parent was
+    /// blocking on it inline ([`Self::claim_inline_wait`]). The waiter clears
+    /// its own entry ([`Self::release_inline_wait`]); the entry is what tells a
+    /// waiter whose deadline expired in the same instant that the boundary did
+    /// happen and is already its own to report — without it, that razor-thin
+    /// race would drop the completion entirely.
+    inline_boundaries: HashSet<String>,
     /// v0.9.0 W2 (F7) — idempotency cache for `agent` (per-project
     /// `key → response body`). In-memory only (honest: a daemon restart forgets
     /// keys); within one lifetime a replay returns the original body + zero
@@ -891,6 +898,13 @@ struct DelegationMirror {
     /// Child turns already notified — the at-least-once dedup set (mirrors the
     /// durable `DelegationWatch.notified_turns`).
     notified_turns: Vec<String>,
+    /// Deadline of a parent that is BLOCKING on this child's next boundary
+    /// (`agent{wait}` / `agent_read{sid,wait}`) — see
+    /// [`Gateway::claim_inline_wait`]. While it is live the notifier hands the
+    /// completion to that waiter instead of pushing a notification turn.
+    /// In-memory only: a daemon restart drops the waiter with it, and the
+    /// reloaded watch notifies normally.
+    inline_wait_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -2393,6 +2407,7 @@ impl Gateway {
             local_vendor_availability_override: None,
             delegations: std::collections::HashMap::new(),
             delegation_watch_set: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            inline_boundaries: HashSet::new(),
             spawn_idem: crate::delegation::IdemCache::default(),
             dispatch_idem: crate::delegation::IdemCache::default(),
             delegation_tx: None,
@@ -12901,13 +12916,53 @@ impl Gateway {
                 slug,
                 project_dir,
                 notified_turns,
+                inline_wait_until: None,
             },
         );
+        // A new task starts with nobody blocking on it, and any suppressed
+        // boundary from the PREVIOUS task belongs to a waiter that is gone.
+        self.inline_boundaries.remove(child_sid);
         self.delegation_watch_set
             .write()
             .unwrap()
             .insert(child_sid.to_string());
         true
+    }
+
+    /// Declare that the caller is BLOCKING on `child_sid`'s next turn boundary
+    /// for `seconds`, so the completion is delivered to it inline instead of
+    /// being pushed to it a second time as a notification turn.
+    ///
+    /// The decision belongs here, at arm time, not to a disarm after the fact:
+    /// the notifier runs straight off the pump at the boundary while a waiter
+    /// reaches the same boundary through an event broadcast plus two file
+    /// reads, so a post-hoc disarm loses that race essentially always
+    /// (measured 2026-09-04: `delegation_notified` 1 ms after
+    /// `delegation_completed`, while the parent already held the answer — the
+    /// parent then paid a whole extra turn to say it had already reported it).
+    ///
+    /// Returns false when there is no watch to claim (nothing to suppress).
+    pub fn claim_inline_wait(&mut self, child_sid: &str, seconds: u64) -> bool {
+        let Some(mirror) = self.delegations.get_mut(child_sid) else {
+            return false;
+        };
+        mirror.inline_wait_until = Some(Instant::now() + Duration::from_secs(seconds));
+        self.inline_boundaries.remove(child_sid);
+        true
+    }
+
+    /// Release the claim [`Self::claim_inline_wait`] took, and answer whether a
+    /// boundary was suppressed in the waiter's favour while it held it — i.e.
+    /// whether the completion the waiter was blocking for has already happened
+    /// and is the waiter's to report. Both sides touch this under the gateway
+    /// lock, so a waiter that times out in the same instant as the boundary
+    /// either sees the suppressed boundary here (and reports the answer) or
+    /// releases first (and the notifier delivers). Exactly one of the two.
+    pub fn release_inline_wait(&mut self, child_sid: &str) -> bool {
+        if let Some(mirror) = self.delegations.get_mut(child_sid) {
+            mirror.inline_wait_until = None;
+        }
+        self.inline_boundaries.remove(child_sid)
     }
 
     /// Lock-narrowed durable watch registration for MCP dispatch. Per-child
@@ -13009,6 +13064,9 @@ impl Gateway {
                         slug,
                         project_dir: project_dir.clone(),
                         notified_turns: watch.notified_turns.clone(),
+                        // A shared arm starts with nobody blocking on it; the
+                        // dispatch claims the wait right after (issue #195).
+                        inline_wait_until: None,
                     },
                 );
                 guard
@@ -13075,6 +13133,7 @@ impl Gateway {
                 .write()
                 .unwrap()
                 .remove(child_sid);
+            guard.inline_boundaries.remove(child_sid);
             guard
                 .delegations
                 .remove(child_sid)
@@ -13128,7 +13187,7 @@ impl Gateway {
     }
 
     fn plan_delegation_delivery(
-        &self,
+        &mut self,
         signal: crate::delegation::DelegationSignal,
     ) -> Option<DelegationDeliveryPlan> {
         use ccteam_harness::NotifyMode;
@@ -13140,10 +13199,23 @@ impl Gateway {
         if mirror.notified_turns.iter().any(|turn| turn == &dedup_key) {
             return None;
         }
+        // A parent BLOCKING on this boundary (`agent{wait}` /
+        // `agent_read{sid,wait}`) is about to hold the answer, so pushing it a
+        // notification turn as well is the same report twice — and the second
+        // copy costs the parent a whole turn of its own context. Hand this one
+        // to the waiter: the ledger row is still written and the watch is still
+        // spent, only the wake-up is dropped. The mark is what lets a waiter
+        // whose deadline expired in this same instant still report it.
+        let claimed_inline = mirror
+            .inline_wait_until
+            .is_some_and(|until| Instant::now() <= until);
+        if claimed_inline {
+            self.inline_boundaries.insert(signal.child_sid.clone());
+        }
         // The excerpt cap comes from the watch's own mode: `brief` wakes the
         // parent at the same boundary as `final`, with a quarter of the text.
         let excerpt_cap = crate::delegation::notification_answer_max_chars(mirror.notify);
-        let notification = (mirror.notify != NotifyMode::Off).then(|| {
+        let notification = (mirror.notify != NotifyMode::Off && !claimed_inline).then(|| {
             crate::delegation::build_notification_text_with_outcome(
                 &crate::delegation::DelegationSummary {
                     sid: &signal.child_sid,
@@ -13189,10 +13261,10 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
     ) {
-        let Some(plan) = crate::latency::gateway_lock(&gateway, "notifier.plan")
+        let plan = crate::latency::gateway_lock(&gateway, "notifier.plan")
             .await
-            .plan_delegation_delivery(signal)
-        else {
+            .plan_delegation_delivery(signal);
+        let Some(plan) = plan else {
             return;
         };
         let child = plan.signal.child_sid.clone();
@@ -13357,6 +13429,10 @@ impl Gateway {
                         slug: slug.clone(),
                         project_dir: dir.clone(),
                         notified_turns: watch.notified_turns.clone(),
+                        // The waiter that may have been blocking on this child
+                        // died with the previous daemon; the reloaded watch
+                        // notifies normally.
+                        inline_wait_until: None,
                     },
                 ));
                 // v0.9.5 feedback fix — a restart reconcile folds ALL missed
@@ -29376,6 +29452,135 @@ mod tests {
                 .any(|t| t.assistant.contains("echo: do the research")),
             "child turn is durably appended BEFORE the notification (read-your-writes)"
         );
+    }
+
+    /// issue #195 — a parent BLOCKING on a child (`agent{wait}` /
+    /// `agent_read{sid,wait}`) is about to hold the answer, so the notifier
+    /// must hand this boundary over rather than push the same report a second
+    /// time. Measured before the fix: the notifier delivered 1 ms after the
+    /// boundary while the waiter's post-hoc disarm was still reading files, and
+    /// the parent paid a whole extra turn to answer "I already reported that".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_inline_waiter_takes_the_completion_and_the_notifier_stands_down() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+
+        {
+            let mut gw = gateway.lock().await;
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                None,
+                None,
+            );
+            // The claim goes in BEFORE the task is submitted — the whole point
+            // is that it cannot lose a race with the boundary.
+            assert!(gw.claim_inline_wait(&child, 60));
+            gw.submit_to_sid(&child, "do the work".into())
+                .await
+                .unwrap();
+        }
+
+        // Wait until the notifier has PROCESSED the boundary — it spends the
+        // watch either way, so a spent watch is the non-destructive proof that
+        // the delivery decision has already been made.
+        let mut delivered = false;
+        for _ in 0..400 {
+            if gateway
+                .lock()
+                .await
+                .delegation_watch_parent(&child)
+                .is_none()
+            {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(delivered, "the notifier must consume the boundary");
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "the parent already holds this answer; a notification turn is a second copy"
+        );
+        // …and the waiter is told the completion is its to report, which is
+        // what saves a wait that lapsed in the same instant as the boundary.
+        assert!(
+            gateway.lock().await.release_inline_wait(&child),
+            "a suppressed boundary belongs to the waiter that claimed it"
+        );
+    }
+
+    /// The mirror image, and the reason the claim is released rather than
+    /// simply cleared: a wait that lapsed before the child finished is owed its
+    /// notification, and the at-least-once contract does not bend for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_lapsed_inline_claim_lets_the_notification_through() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+
+        {
+            let mut gw = gateway.lock().await;
+            gw.arm_delegation_watch(
+                &child,
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                None,
+                None,
+            );
+            assert!(gw.claim_inline_wait(&child, 60));
+            // The waiter gives up before the child ever answers.
+            assert!(
+                !gw.release_inline_wait(&child),
+                "nothing was suppressed yet, so the waiter reports pending"
+            );
+            gw.submit_to_sid(&child, "do the work".into())
+                .await
+                .unwrap();
+        }
+
+        let mut notified = false;
+        for _ in 0..400 {
+            if !ccteam_notification_turns(&project_dir, &parent).is_empty() {
+                notified = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            notified,
+            "a released claim owes the parent its completion notification"
+        );
+    }
+
+    /// A parent and an unrelated child session in the same project.
+    async fn delegation_pair(gateway: &Arc<tokio::sync::Mutex<Gateway>>) -> (String, String) {
+        let mut gw = gateway.lock().await;
+        let parent = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let child = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        (parent, child)
     }
 
     /// Count minimal completion notification turns delivered to `sid`.

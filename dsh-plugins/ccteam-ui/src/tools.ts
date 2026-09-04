@@ -397,7 +397,7 @@ export const CCTEAM_TOOL_DEFINITIONS: McpToolDefinition[] = [
       type: 'object',
       properties: {
         sid: { type: 'string', description: 'Read this session\'s transcript instead of the roster.' },
-        n: { type: 'integer', description: 'Max rows/turns (default 10, max 500).' },
+        n: { type: 'integer', description: 'Max rows: roster 10, transcript 1 (max 500).' },
         tail: { type: 'boolean', description: 'With `sid`: newest first (default true unless `since`).' },
         since: { type: 'string', description: 'With `sid`: only turns after this turn_id cursor.' },
         max_chars: { type: 'integer', description: 'With `sid`: char budget across returned turns (default 1000).' },
