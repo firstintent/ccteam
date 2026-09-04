@@ -279,10 +279,10 @@ pub use projects::{
 // v0.8.6 W5b ResDisk — read-side role reader for the resource API.
 pub use queries::{
     active_sessions, artifact_queue, artifact_status, collect_projects, collect_recent_events,
-    compute_cost_summary, cost_history_buckets, cost_summary, cost_summary_from_events,
-    count_agent_spawns_within, job_log_tail, workflow_summary, workflow_summary_from_events,
-    ActiveSessionInfo, AgentStatus, ArtifactQueueEntry, ArtifactStatusGroup, CostHistoryBucket,
-    CostSummary, ProjectSummary, WorkflowSummary,
+    collect_recent_events_where, compute_cost_summary, cost_history_buckets, cost_summary,
+    cost_summary_from_events, count_agent_spawns_within, job_log_tail, workflow_summary,
+    workflow_summary_from_events, ActiveSessionInfo, AgentStatus, ArtifactQueueEntry,
+    ArtifactStatusGroup, CostHistoryBucket, CostSummary, ProjectSummary, WorkflowSummary,
 };
 pub use roles::{
     agents_dir, list_default_library_skills, list_default_library_skills_in, list_library_skills,

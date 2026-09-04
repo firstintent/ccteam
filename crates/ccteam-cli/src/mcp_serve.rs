@@ -72,7 +72,7 @@ pub(crate) async fn forward_to_socket(_socket: &std::path::Path, _req: &Value) -
 /// owner, so the five writes below — and every later daemon restart — see one
 /// stable value; minting per call would rewrite five config files on every
 /// start.
-fn enroll_bearer(paths: &CcteamPaths) -> Result<String> {
+pub(crate) fn enroll_bearer(paths: &CcteamPaths) -> Result<String> {
     let owner = ccteam_core::identity::owner_tag(ccteam_core::identity::ADMIN_WEB_ID, true);
     Ok(ccteam_core::enroll::ensure_user_credential(paths, &owner)?.bearer())
 }
@@ -238,22 +238,19 @@ mod tests {
     use ccteam_im::mcp::MCP_PROTOCOL_VERSION;
     use serde_json::json;
 
-    /// Exact set of MCP tool names (8 tools; `screenshot` culled and the
-    /// bare-name status beacon alias added 2026-07-26).
+    /// Exact set of MCP tool names (6 tools after the 2026-08-31 merge).
     const EXPECTED_TOOL_NAMES: &[&str] = &[
+        "agent",
+        "agent_read",
+        "agent_stop",
         "chat_send_file",
         "grok_claude_codex_kimi",
-        "session_collect",
-        "session_dispatch",
-        "session_list",
-        "session_spawn",
-        "session_stop",
         "status",
     ];
 
     #[test]
     fn tool_definitions_count_matches_spec() {
-        assert_eq!(tool_definitions().len(), 8);
+        assert_eq!(tool_definitions().len(), 6);
         assert_eq!(tool_definitions().len(), EXPECTED_TOOL_NAMES.len());
     }
 
@@ -273,10 +270,10 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 8, "tool names must be unique");
+        assert_eq!(names.len(), 6, "tool names must be unique");
         for tool in &tools {
             // Wire names are BARE — the client namespaces by server key
-            // (`mcp__ccteam__session_spawn`); a baked-in prefix doubles up.
+            // (`mcp__ccteam__agent`); a baked-in prefix doubles up.
             assert!(!tool["name"].as_str().unwrap().starts_with("ccteam__"));
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
@@ -428,7 +425,9 @@ mod tests {
             "method": "initialize",
             "params": {}
         });
-        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
@@ -496,9 +495,11 @@ mod tests {
             "method": "tools/list",
             "params": {}
         });
-        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 6);
         let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         names.sort();
         let mut expected = EXPECTED_TOOL_NAMES.to_vec();
@@ -521,8 +522,11 @@ mod tests {
             "ccteam__status",
             "ccteam__screenshot",
             "ccteam__chat_send_file",
-            "ccteam__session_spawn",
-            "ccteam__session_list",
+            "session_spawn",
+            "session_dispatch",
+            "session_collect",
+            "session_list",
+            "session_stop",
         ] {
             assert!(!names.contains(&gone), "culled tool present: {gone}");
         }
@@ -546,7 +550,9 @@ mod tests {
                 "arguments": { "slug": "no-such-slug-xyz", "lines": 5 }
             }
         });
-        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .unwrap();
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -567,7 +573,11 @@ mod tests {
             "method": "notifications/initialized",
             "params": {}
         });
-        assert!(ccteam_im::mcp::handle_request(&paths, &req).await.is_none());
+        assert!(
+            ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -583,7 +593,9 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "status", "arguments": {} }
         });
-        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .unwrap();
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();
         assert_eq!(parsed["projects"].as_array().unwrap().len(), 0);
@@ -602,7 +614,9 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "ccteam__no_such_tool", "arguments": {} }
         });
-        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .unwrap();
         assert_eq!(resp["result"]["isError"], true);
     }
 
@@ -619,7 +633,9 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "status", "arguments": {} }
         });
-        let resp = ccteam_im::mcp::handle_request(&paths, &req).await.unwrap();
+        let resp = ccteam_im::mcp::handle_request(&paths, &req, &ccteam_im::mcp::ToolFace::full())
+            .await
+            .unwrap();
         assert_eq!(resp["result"]["isError"], false);
         let content = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(content).unwrap();

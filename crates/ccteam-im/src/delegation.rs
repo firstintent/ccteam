@@ -61,6 +61,9 @@ pub struct DelegationSignal {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DelegationSummary<'a> {
     pub sid: &'a str,
+    /// The child's harness (`claude` / `codex` / …): the parent reads it off
+    /// the one-line header, so it never has to ask which vendor answered.
+    pub vendor: &'a str,
     pub turn_id: &'a str,
     pub turn: u64,
     pub outcome: DelegationOutcome,
@@ -78,7 +81,13 @@ pub(crate) enum DelegationOutcome {
     },
 }
 
-pub(crate) const INLINE_RESULT_MAX_CHARS: usize = 10_000;
+/// Cap on the answer text an INLINE `agent{wait}` result carries: the `final`
+/// tier. The caller blocked for this answer, so it gets the widest excerpt any
+/// wake-up carries — but not a transcript, and not its own private tier four
+/// times that (issue #195: `notify` went frugal by default while the inline
+/// path, the one a correct orchestrator actually takes, kept 4000). The
+/// excerpt's marker names the exact `agent_read` call for the rest.
+pub(crate) const INLINE_RESULT_MAX_CHARS: usize = NOTIFICATION_ANSWER_MAX_CHARS;
 
 pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option<u64> {
     status
@@ -87,8 +96,42 @@ pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option
         .map(|pct| pct.round() as u64)
 }
 
+/// How full one session's context window is right now, read from the LATEST
+/// turn status in its transcript mirror. `None` when the session has no turn
+/// yet, or the vendor reported no window (never a fabricated 0).
+///
+/// One reader, every surface: the MCP roster rows, the caller's own `you` row
+/// on `status{detail:"usage"}`, and the web session list all answer "how much
+/// room is left" from this — a second copy of the read is how two surfaces
+/// start disagreeing about one session.
+///
+/// BOUNDED BY CONSTRUCTION. It costs one BACKWARDS tail of `turns.jsonl`, not a
+/// whole-transcript scan: this is per-row on endpoints a browser polls, and a
+/// long-lived session's transcript is megabytes. A window is a live fact, so
+/// only the recent tail can hold a current one — past [`CONTEXT_TAIL_TURNS`]
+/// statusless turns the honest answer is "unobserved", not a reading from an
+/// hour of work ago. Callers still pay it only for the rows they actually
+/// emit, never for a whole fleet before a cut.
+pub fn latest_context_pct(project_dir: &std::path::Path, sid: &str) -> Option<u64> {
+    let turns =
+        ccteam_harness::execution::turns_mirror::last_n_turns(project_dir, sid, CONTEXT_TAIL_TURNS)
+            .ok()?;
+    let status = turns.into_iter().rev().find_map(|turn| turn.status)?;
+    context_pct(Some(&status))
+}
+
+/// How far back [`latest_context_pct`] looks for a turn that carried a status.
+/// Vendors that report one report it at nearly every turn boundary, so this is
+/// far past "the last one that had it" while keeping the read O(tail).
+const CONTEXT_TAIL_TURNS: usize = 50;
+
 impl DelegationSummary<'_> {
-    pub(crate) fn notification_text(&self) -> String {
+    /// The completion turn the parent receives. `max_chars` is the excerpt cap
+    /// its watch asked for ([`NOTIFICATION_ANSWER_MAX_CHARS`] for `final`,
+    /// [`BRIEF_NOTIFICATION_ANSWER_MAX_CHARS`] for `brief`): the wake-up POINT
+    /// is a property of the task, how much rides along is the parent's context
+    /// budget, so they are separate axes.
+    pub(crate) fn notification_text(&self, max_chars: usize) -> String {
         let outcome = match &self.outcome {
             DelegationOutcome::Done => format!("{} done", self.sid),
             DelegationOutcome::Failed { kind, .. } => format!(
@@ -99,19 +142,26 @@ impl DelegationSummary<'_> {
                     .unwrap_or("vendor error")
             ),
         };
+        // `s12 done · codex · turn 7 · ctx 19%` — the same field order as the
+        // web bubble footer and the IM status line (vendor before the metrics).
+        let vendor = if self.vendor.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", self.vendor)
+        };
         let first = match self.context_pct {
             Some(pct) => format!(
-                "{outcome} · turn {} · ctx {pct}%{}",
+                "{outcome}{vendor} · turn {} · ctx {pct}%{}",
                 self.turn,
                 if pct >= 85 { "⚠" } else { "" }
             ),
-            None => format!("{outcome} · turn {}", self.turn),
+            None => format!("{outcome}{vendor} · turn {}", self.turn),
         };
-        let answer = truncate_head_tail_with_marker(
-            self.answer.trim(),
-            NOTIFICATION_ANSWER_MAX_CHARS,
-            |omitted| full_answer_marker(omitted, self.sid),
-        );
+        let answer_text = self.answer.trim();
+        let total_chars = answer_text.chars().count();
+        let answer = truncate_head_tail_with_marker(answer_text, max_chars, |omitted| {
+            full_answer_marker(omitted, total_chars, self.sid)
+        });
         if answer.text.is_empty() {
             first
         } else {
@@ -121,6 +171,7 @@ impl DelegationSummary<'_> {
 
     pub(crate) fn inline_result(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut result = serde_json::Map::new();
+        result.insert("sid".into(), serde_json::json!(self.sid));
         result.insert("turn_id".into(), serde_json::json!(self.turn_id));
         result.insert("turn".into(), serde_json::json!(self.turn));
         let (kind, error) = match &self.outcome {
@@ -136,9 +187,10 @@ impl DelegationSummary<'_> {
         if let Some(pct) = self.context_pct {
             result.insert("context_pct".into(), serde_json::json!(pct));
         }
+        let total_chars = self.answer.chars().count();
         let answer =
             truncate_head_tail_with_marker(self.answer, INLINE_RESULT_MAX_CHARS, |omitted| {
-                full_answer_marker(omitted, self.sid)
+                full_answer_marker(omitted, total_chars, self.sid)
             });
         result.insert("result_text".into(), serde_json::json!(answer.text));
         if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
@@ -155,9 +207,9 @@ impl DelegationSummary<'_> {
 }
 
 /// The `notified_turns` key recording that a turn's BOUNDARY notification was
-/// handled. Distinct from the plain turn-id key (used by interim/`all`
-/// notifications) so an `all`-mode watch still gets its "task finished, child
-/// idle" wake-up after having been notified of the same turn's text.
+/// handled. Distinct from the plain turn-id keys the reconcile bookkeeping
+/// records per mirrored turn, so a folded interim turn can never be mistaken
+/// for its task's delivered completion.
 pub fn final_dedup_key(turn_id: &str) -> String {
     format!("{turn_id}#final")
 }
@@ -231,39 +283,55 @@ pub(crate) fn truncate_head_tail_with_marker(
     }
 }
 
-/// Max characters of child answer embedded in a completion notification.
-pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 4_000;
+/// Max characters of child answer embedded in a `final` completion
+/// notification — the default. A parent that wants the whole thing calls
+/// `agent_read`; a parent that wants less asks for `notify:"brief"`.
+pub const NOTIFICATION_ANSWER_MAX_CHARS: usize = 2_000;
 
-pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
-    format!("…[+{omitted} chars: session_collect{{sid:{child_sid},tail:true}}]…")
+/// The `notify:"brief"` excerpt cap: enough to know what happened, cheap
+/// enough to wake a parent on many children.
+pub const BRIEF_NOTIFICATION_ANSWER_MAX_CHARS: usize = 500;
+
+/// The excerpt cap a watch's notify mode asks for.
+pub fn notification_answer_max_chars(mode: ccteam_harness::NotifyMode) -> usize {
+    match mode {
+        ccteam_harness::NotifyMode::Brief => BRIEF_NOTIFICATION_ANSWER_MAX_CHARS,
+        _ => NOTIFICATION_ANSWER_MAX_CHARS,
+    }
+}
+
+/// `agent_read{max_chars}` — the character budget across the turns one
+/// transcript read returns: its default and the bounds the parameter accepts.
+/// The default is a deliberate step above the brief notification's 500: a bare
+/// read after a notification should add something, and the pointer on any
+/// excerpt names the exact budget for the rest.
+pub(crate) const AGENT_READ_DEFAULT_MAX_CHARS: usize = 1_000;
+pub(crate) const AGENT_READ_MIN_MAX_CHARS: usize = 100;
+pub(crate) const AGENT_READ_MAX_MAX_CHARS: usize = 50_000;
+
+/// The `max_chars` that reads a `total_chars`-long turn whole, within what the
+/// parameter accepts.
+pub(crate) fn read_budget_for(total_chars: usize) -> usize {
+    total_chars.clamp(AGENT_READ_MIN_MAX_CHARS, AGENT_READ_MAX_MAX_CHARS)
+}
+
+/// The pointer a truncated answer carries: the exact one-call recipe for the
+/// whole text (`n:1` = the newest turn, which the answer is at delivery), so
+/// the reader never has to guess a budget or page through history (issue
+/// #194: the frugal, correct read was discoverable only by trial).
+pub(crate) fn full_answer_marker(omitted: usize, total_chars: usize, child_sid: &str) -> String {
+    format!(
+        "…[+{omitted} chars: agent_read{{sid:{child_sid},n:1,max_chars:{}}}]…",
+        read_budget_for(total_chars)
+    )
 }
 
 /// Render the ordinary user-role completion turn sent to the parent.
-pub(crate) fn build_notification_text_with_outcome(summary: &DelegationSummary<'_>) -> String {
-    summary.notification_text()
-}
-
-/// Build the interim-note notification (an `all`-mode watch only): the child
-/// posted an assistant message but its vendor turn is STILL RUNNING — labeled
-/// so the parent can safely skim it without mistaking it for completion.
-pub fn build_interim_notification_text(
-    child_sid: &str,
-    vendor: AgentVendor,
-    title: Option<&str>,
-    turn_id: &str,
-    assistant_text: &str,
+pub(crate) fn build_notification_text_with_outcome(
+    summary: &DelegationSummary<'_>,
+    max_chars: usize,
 ) -> String {
-    let _ = (vendor, title, turn_id);
-    let excerpt = truncate_head_tail_with_marker(
-        assistant_text.trim(),
-        NOTIFICATION_ANSWER_MAX_CHARS,
-        |omitted| full_answer_marker(omitted, child_sid),
-    );
-    if excerpt.text.is_empty() {
-        format!("{child_sid} interim")
-    } else {
-        format!("{child_sid} interim\n{}", excerpt.text)
-    }
+    summary.notification_text(max_chars)
 }
 
 /// Lowercase wire name of a vendor — the key `cost_24h_by_vendor` uses and the
@@ -397,8 +465,9 @@ pub fn project_vendor_budget_cap(
 
 // ── guardrail denial reasons ────────────────────────────────────────────────
 
-/// Why an Ambient delegation was denied — the `reason` tag on the
-/// `delegation_denied` progress event + the human-readable error.
+/// Why a delegation was denied — the `reason` tag on the `delegation_denied`
+/// (engine guardrails) / `delegation_policy_denied` (Card H user hook) progress
+/// event + the human-readable error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
     /// Child depth would exceed `delegation.max_depth`.
@@ -411,10 +480,18 @@ pub enum DenyReason {
     Cycle,
     /// The vendor's trailing-24h project cost has reached its budget cap.
     Budget,
+    /// Card H — the user's own `pre-agent` policy hook exited 2 (deny). The
+    /// engine has no opinion here: it relays the script's verdict.
+    Policy,
+    /// Card H — the `pre-agent` hook could not deliver a verdict (timeout, an
+    /// exit code outside the dialect, not executable). Fail-closed like a deny,
+    /// but tagged apart on purpose: a rule that says no and a script that is
+    /// broken need different humans to act.
+    PolicyScriptError,
 }
 
 impl DenyReason {
-    /// The stable lowercase tag used in the `delegation_denied{reason}` event
+    /// The stable lowercase tag used in the `delegation_*denied{reason}` event
     /// + the human-readable error.
     pub fn tag(self) -> &'static str {
         match self {
@@ -423,6 +500,8 @@ impl DenyReason {
             DenyReason::Delegated => "delegated",
             DenyReason::Cycle => "cycle",
             DenyReason::Budget => "budget",
+            DenyReason::Policy => "policy",
+            DenyReason::PolicyScriptError => "policy_script_error",
         }
     }
 }
@@ -435,6 +514,7 @@ mod tests {
     fn notification_text_uses_minimal_done_header() {
         let t = DelegationSummary {
             sid: "s444",
+            vendor: "codex",
             turn_id: "codex-uuid",
             turn: 3,
             outcome: DelegationOutcome::Done,
@@ -442,8 +522,8 @@ mod tests {
             cost_usd: None,
             answer: "hello",
         }
-        .notification_text();
-        assert_eq!(t, "s444 done · turn 3 · ctx 31%\nhello");
+        .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
+        assert_eq!(t, "s444 done · codex · turn 3 · ctx 31%\nhello");
         assert!(!t.contains("[ccteam]"));
         assert!(!t.contains("--- final answer ---"));
         assert!(!t.contains("child is idle"));
@@ -454,6 +534,7 @@ mod tests {
     fn notification_text_folds_interim_notes() {
         let summary = DelegationSummary {
             sid: "s69",
+            vendor: "claude",
             turn_id: "s69-54",
             turn: 3,
             outcome: DelegationOutcome::Done,
@@ -462,21 +543,9 @@ mod tests {
             answer: "wave done",
         };
         assert_eq!(
-            build_notification_text_with_outcome(&summary),
-            "s69 done · turn 3 · ctx 3%\nwave done"
+            build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
+            "s69 done · claude · turn 3 · ctx 3%\nwave done"
         );
-    }
-
-    #[test]
-    fn interim_notification_text_states_still_working() {
-        let t = build_interim_notification_text(
-            "s69",
-            AgentVendor::Codex,
-            Some("wave"),
-            "s69-3",
-            "reading queue",
-        );
-        assert_eq!(t, "s69 interim\nreading queue");
     }
 
     #[test]
@@ -491,28 +560,85 @@ mod tests {
             "HEAD{}TAIL",
             "x".repeat(NOTIFICATION_ANSWER_MAX_CHARS + 500)
         );
-        let t = DelegationSummary {
+        let summary = DelegationSummary {
             sid: "s1",
+            vendor: "codex",
             turn_id: "s1-1",
             turn: 4,
             outcome: DelegationOutcome::Done,
             context_pct: None,
             cost_usd: None,
             answer: &long,
+        };
+        // `final` (the default) and `brief` differ only in the excerpt cap.
+        for cap in [
+            NOTIFICATION_ANSWER_MAX_CHARS,
+            BRIEF_NOTIFICATION_ANSWER_MAX_CHARS,
+        ] {
+            let t = summary.notification_text(cap);
+            assert!(t.contains("HEAD"));
+            assert!(t.contains("TAIL"));
+            assert!(t.contains("…[+"));
+            // The pointer is the exact recipe for the whole answer: 4 + 2500 + 4
+            // characters, read as the newest turn.
+            assert!(t.contains("agent_read{sid:s1,n:1,max_chars:2508}"), "{t}");
+            let embedded = t.split_once('\n').unwrap().1;
+            assert_eq!(embedded.chars().count(), cap);
         }
-        .notification_text();
-        assert!(t.contains("HEAD"));
-        assert!(t.contains("TAIL"));
-        assert!(t.contains("…[+"));
-        assert!(t.contains("session_collect{sid:s1,tail:true}"));
-        let embedded = t.split_once('\n').unwrap().1;
-        assert_eq!(embedded.chars().count(), NOTIFICATION_ANSWER_MAX_CHARS);
+    }
+
+    /// The read recipe stays inside what `agent_read{max_chars}` accepts.
+    #[test]
+    fn read_budget_is_clamped_to_the_parameter_bounds() {
+        assert_eq!(read_budget_for(7), AGENT_READ_MIN_MAX_CHARS);
+        assert_eq!(read_budget_for(2_508), 2_508);
+        assert_eq!(read_budget_for(1_000_000), AGENT_READ_MAX_MAX_CHARS);
+        assert_eq!(AGENT_READ_DEFAULT_MAX_CHARS, 1_000);
+    }
+
+    /// The documented tiers — and `brief` is what a dispatch gets unless it
+    /// asks (issue #194: frugality is the default, not a discovery).
+    #[test]
+    fn notification_caps_are_the_documented_tiers() {
+        use ccteam_harness::NotifyMode;
+        assert_eq!(NOTIFICATION_ANSWER_MAX_CHARS, 2_000);
+        assert_eq!(BRIEF_NOTIFICATION_ANSWER_MAX_CHARS, 500);
+        assert_eq!(INLINE_RESULT_MAX_CHARS, 2_000);
+        assert_eq!(notification_answer_max_chars(NotifyMode::Final), 2_000);
+        assert_eq!(notification_answer_max_chars(NotifyMode::Brief), 500);
+        assert_eq!(notification_answer_max_chars(NotifyMode::Off), 2_000);
+        assert_eq!(NotifyMode::default(), NotifyMode::Brief);
+        assert_eq!(notification_answer_max_chars(NotifyMode::default()), 500);
+    }
+
+    /// The inline result names the session it came from: an `agent` reply is
+    /// the only place a caller learns the sid it just hired.
+    #[test]
+    fn inline_result_carries_the_child_sid() {
+        let result = DelegationSummary {
+            sid: "s5",
+            vendor: "codex",
+            turn_id: "s5-1",
+            turn: 1,
+            outcome: DelegationOutcome::Done,
+            context_pct: None,
+            cost_usd: None,
+            answer: "ok",
+        }
+        .inline_result();
+        assert_eq!(result["sid"], serde_json::json!("s5"));
+        assert_eq!(result["status"], serde_json::json!("completed"));
+        assert_eq!(result["result_text"], serde_json::json!("ok"));
+        // A completed answer of "ok" must stay tiny.
+        let bytes = serde_json::to_string(&result).unwrap().len();
+        assert!(bytes <= 250, "inline completion is {bytes} B: {result:?}");
     }
 
     #[test]
     fn notification_text_failed_header_and_context_warning() {
         let summary = DelegationSummary {
             sid: "s444",
+            vendor: "codex",
             turn_id: "codex-uuid",
             turn: 3,
             outcome: DelegationOutcome::Failed {
@@ -524,8 +650,8 @@ mod tests {
             answer: "oops",
         };
         assert_eq!(
-            build_notification_text_with_outcome(&summary),
-            "s444 FAILED (turn_timeout) · turn 3 · ctx 31%\noops"
+            build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
+            "s444 FAILED (turn_timeout) · codex · turn 3 · ctx 31%\noops"
         );
     }
 
@@ -533,6 +659,7 @@ mod tests {
     fn notification_text_omits_unknown_context() {
         let t = DelegationSummary {
             sid: "s444",
+            vendor: "codex",
             turn_id: "s1-1",
             turn: 3,
             outcome: DelegationOutcome::Done,
@@ -540,8 +667,8 @@ mod tests {
             cost_usd: None,
             answer: "ok",
         }
-        .notification_text();
-        assert_eq!(t.lines().next(), Some("s444 done · turn 3"));
+        .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
+        assert_eq!(t.lines().next(), Some("s444 done · codex · turn 3"));
     }
 
     #[test]

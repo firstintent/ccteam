@@ -957,14 +957,12 @@ impl HarnessAdapter for ClaudeTuiAdapter {
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-        routing: TurnRouting,
+        _routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
-        if routing == TurnRouting::Queue {
-            return Err(HarnessError::NotImplemented {
-                reason: "claude terminal does not expose a distinct queued-turn channel".into(),
-            });
-        }
-        // The frozen terminal protocol can type into either an idle composer or
+        // No distinct queued-turn channel here: a `Queue` request takes the
+        // only path there is (typed into the pane) and is reported as what it
+        // became (`TurnRouting` contract). The frozen terminal protocol can
+        // type into either an idle composer or
         // the active turn but cannot distinguish them without scraping pane
         // state. Reporting Injected is safe: Gateway consults this disposition
         // only when its own turn marker was already in flight; the idle path
@@ -1215,6 +1213,9 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             context,
             effort: None,
             goal: None,
+            // The frozen terminal protocol persists no `status.json`, so it
+            // has no observation to stamp.
+            generation: None,
         })
     }
 

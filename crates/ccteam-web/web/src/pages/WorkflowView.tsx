@@ -308,12 +308,12 @@ export default function WorkflowView({
                 "MCP Servers",
                 zh ? (
                   <>
-                    注册进各 vendor 配置的工具服务器;ccteam 自身 = 8 个 <code>mcp__ccteam__*</code> 工具,默认
+                    注册进各 vendor 配置的工具服务器;ccteam 自身 = 6 个 <code>mcp__ccteam__*</code> 工具,默认
                     stream-json 会话经 curated mcp-config 注入。
                   </>
                 ) : (
                   <>
-                    Tool servers registered into each vendor&apos;s config; ccteam itself = 8{" "}
+                    Tool servers registered into each vendor&apos;s config; ccteam itself = 6{" "}
                     <code>mcp__ccteam__*</code> tools, injected into stream-json sessions via the curated
                     mcp-config.
                   </>
@@ -323,8 +323,8 @@ export default function WorkflowView({
                 {flowRow(
                   "ccteam",
                   zh
-                    ? "8 tools · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp 自检"
-                    : "8 tools · status(+grok_claude_codex_kimi) / chat_send_file / session_* · doctor --verify-mcp",
+                    ? "6 tools · status(+grok_claude_codex_kimi) / chat_send_file / agent · agent_read · agent_stop · doctor --verify-mcp 自检"
+                    : "6 tools · status(+grok_claude_codex_kimi) / chat_send_file / agent · agent_read · agent_stop · doctor --verify-mcp",
                   mcp?.ccteam_registered ? (
                     <span className="badge ok">{t("mcpOk")}</span>
                   ) : (

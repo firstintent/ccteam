@@ -27,8 +27,18 @@ pub struct HotConfig<T> {
     /// Parse the current value. Captures what the parse needs (e.g. the root),
     /// so callers aren't tied to a fixed loader signature.
     load: Box<dyn Fn() -> Result<T> + Send + Sync>,
-    /// `(mtime_at_parse, value)`; `None` until the first successful read.
-    cached: Mutex<Option<(SystemTime, Arc<T>)>>,
+    /// The last parse and what it was keyed on; `None` until the first
+    /// successful read.
+    cached: Mutex<Option<CacheEntry<T>>>,
+}
+
+/// One cached parse. `mtime`+`len` identify the file contents; `read_at` is
+/// when we parsed, and it is what makes a same-tick rewrite visible.
+struct CacheEntry<T> {
+    mtime: SystemTime,
+    len: u64,
+    read_at: SystemTime,
+    value: Arc<T>,
 }
 
 impl<T> HotConfig<T> {
@@ -51,21 +61,36 @@ impl<T> HotConfig<T> {
     /// When the file is missing its mtime is unavailable, so `load` runs every
     /// call (it should return a sensible default); once the file exists, reads
     /// are served from cache until its mtime advances.
+    ///
+    /// A cache keyed on mtime ALONE cannot see a rewrite that lands inside the
+    /// filesystem's timestamp granularity: the second write keeps the mtime the
+    /// first one had, and the stale parse is served until some later edit moves
+    /// the clock — an operator's config change silently ignored. Two guards
+    /// close that: the file's length is part of the key, and a parse whose read
+    /// was not strictly newer than the mtime it saw is never reused (the same
+    /// "racily clean" rule git applies to its index). The cost is one extra
+    /// parse for a file touched in the same tick as the read.
     pub fn get(&self) -> Result<Arc<T>> {
-        let mtime = std::fs::metadata(&self.watch_path)
-            .and_then(|m| m.modified())
+        let stat = std::fs::metadata(&self.watch_path)
+            .and_then(|meta| meta.modified().map(|mtime| (mtime, meta.len())))
             .ok();
         let mut guard = self.cached.lock().unwrap_or_else(|e| e.into_inner());
-        if let (Some(mt), Some((cached_mt, val))) = (mtime, guard.as_ref()) {
-            if *cached_mt == mt {
-                return Ok(Arc::clone(val));
+        if let (Some((mtime, len)), Some(entry)) = (stat, guard.as_ref()) {
+            if entry.mtime == mtime && entry.len == len && entry.mtime < entry.read_at {
+                return Ok(Arc::clone(&entry.value));
             }
         }
-        let val = Arc::new((self.load)()?);
-        if let Some(mt) = mtime {
-            *guard = Some((mt, Arc::clone(&val)));
+        let read_at = SystemTime::now();
+        let value = Arc::new((self.load)()?);
+        if let Some((mtime, len)) = stat {
+            *guard = Some(CacheEntry {
+                mtime,
+                len,
+                read_at,
+                value: Arc::clone(&value),
+            });
         }
-        Ok(val)
+        Ok(value)
     }
 
     /// The watched file path.

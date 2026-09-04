@@ -63,7 +63,7 @@ The installer runs the daemon; `ccteam status` reprints your link (`http://<lan-
 
 - six formation playbooks (commander & crews, driver & advisor, cross review, bake-off, research triangulation, cost pyramid) that prefill the launcher with a vendor lineup
 - a Chat tab per session (plus a byte-faithful terminal where applicable), including a clock on the composer to queue delayed user turns above the input
-- a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place
+- a Team page: the live delegation topology — vendor, the model and reasoning effort each session is actually running, cost, every row a real link so a parent and its delegate open side by side — plus a division-of-labor charter (the per-project `routing.md` agents read via `status`) edited in place, and a Runs tab listing every ccteam Flow run with the sessions it hired
 - a DSH page that opens DeepSeek Harness Web inside ccteam: the daemon authenticates the request, starts or attaches the right local DSH web instance, and gives each logged-in user a separate DSH home
 - a cost pill with daily budget caps
 - a per-project ⋯ menu in the sidebar: start a session there, copy its path, or take the project out of ccteam (deregister + stop its live sessions — your directory and code are never touched)
@@ -73,7 +73,7 @@ Everything the console does is also `/api/v1` (OpenAPI at `/api/docs`).
 
 **3 · Orchestrate a team from inside a claude session**
 
-Any registered session can hire the others — say it in plain language and `session_spawn` / `dispatch` / `collect` run under the hood (with an honest `working` / `idle` signal, so nobody guesses from silence):
+Any registered session can hire the others — say it in plain language and `agent` / `agent_read` run under the hood (with an honest `working` / `idle` signal, so nobody guesses from silence):
 
 ```text
 Spawn a codex session, have it implement RFC-12 and run the tests; report back when green.
@@ -90,18 +90,34 @@ Register a satellite with a join token (Settings → Access) — it dials out to
 
 > Satellite execution currently runs Claude sessions; the other vendors run on the daemon's machine.
 
+**5 · Orchestrate in code, not in a prompt**
+
+When the shape of the work is known, write it down instead of asking for it. A **flow** is a plain JS script the ccteam runner executes — `agent()` / `parallel()` / `pipeline()` / `phase()` over real cross-harness hires, every leaf its own session on the ledger:
+
+```sh
+ccteam flow new branch-review          # scaffold a script + the API it can call
+ccteam flow run branch-review.flow.js --args '{"base":"main"}' --budget 5
+ccteam flow eval <run-id>              # grade a finished run with a flow of your own
+```
+
+Runs are journaled, so a run survives a daemon restart and `--resume` picks it back up — the workers outlive the runner. `--parallel` / `--max-agents` / `--max-cost` are the brakes, and the Team page's **Runs** tab shows every run with the sessions it hired.
+
+Independently, a **policy hook** — `<project>/.ccteam/hooks/pre-agent`, any executable, re-read on every call — gates *every* delegation, whether a human, an agent or a flow made it. It is handed the caller, the request and the live per-harness quota map on stdin; exit `0` allows, exit `2` denies with your stderr relayed verbatim to the calling agent, and a broken script refuses distinguishably rather than silently opening.
+
 ---
 
-Under all four modes are the same **eight MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
+Under all five modes are the same **six MCP tools**, available to every session, to your plain hand-started CLIs once registered, and to **any external agent** that presents an enrollment credential over `POST /mcp` — one credential per vendor config or per copy-button, and the daemon issues each *process* its own identity when it connects, so two agents sharing a config are still two callers with their own ledger rows and their own children:
 
 ```text
-session_spawn · session_dispatch · session_collect · session_list · session_stop
+agent · agent_read · agent_stop
 status (+ its discovery alias grok_claude_codex_kimi) · chat_send_file
 ```
 
 The daemon routes and records — at-least-once notifications across restarts, idempotency keys, a child's turn written to disk before its parent is told, guardrails that refuse runaway fan-out with a reason. When a web-driven session finishes autonomous work while nobody is watching the console, the final answer is mirrored to your IM; the IM `/status` card shows your session's working children at a glance. It never schedules; *when* to delegate lives in prompts you version.
 
 - Plain-language walkthrough → [orchestration guide](docs/orchestration.md)
+- MCP tool reference (all six tools, faces, protocol) → [mcp.md](docs/mcp.md)
+- Policy hooks & flows (the script API, run journal, evaluation loop) → [hook-dynamic-workflows.md](docs/hook-dynamic-workflows.md) ([中文](docs/hook-dynamic-workflows-cn.md))
 - Every command → manual ([English](docs/usage.md) · [中文](docs/usage-cn.md))
 
 ## Inside DeepSeek Harness
@@ -111,11 +127,11 @@ ccteam also lives natively inside [DeepSeek Harness](https://www.npmjs.com/packa
 | Face | For | What it gives you |
 |---|---|---|
 | **Workbench** | People using DSH Web | A full-page ccteam workbench opened from a button at the bottom of DSH's sidebar: the cross-harness team tree (search, per-project fold/unfold, hover ⋯ menu), a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, mid-turn model/effort switch, interrupt), and a details column — docks beside DSH's own panes or expands full-page. |
-| **Tools** | DSH agents (the LLM) | The same eight MCP tools described above, callable from inside a DSH session. |
+| **Tools** | DSH agents (the LLM) | The same six MCP tools described above, callable from inside a DSH session. |
 | **Transport** | ccteam | The channel that lets ccteam hire a DSH session the way it hires any other harness. |
 | **Engine** | You | The ccteam daemon itself, shipped with the plugin as a platform package (`@ccteam/engine-<os>-<cpu>`): installed, started and supervised from the **Engine** section of the plugin's settings card — state, version, **Start / Stop / Restart / Update engine**, a *Start the engine when the plugin loads* switch, the engine log. |
 
-Install it with `dsh plugin --profile web add @ccteam/ccteam-ui` and restart `dsh web`: the plugin brings the engine, starts the daemon, and picks up your console token from `~/.ccteam` on the same machine — nothing to paste. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `session_spawn` with `vendor:"dsh"`), the plugin and its credentials are materialized for you. Either way it is one daemon shared with the CLI and ccteam web: the plugin attaches to a running one, never starts a second one against another `~/.ccteam`, and never stops it when DSH restarts. The full setup (both install paths, coexistence rules, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
+Install it with `dsh plugin --profile web add @ccteam/ccteam-ui` and restart `dsh web`: the plugin brings the engine, starts the daemon, and picks up your console token from `~/.ccteam` on the same machine — nothing to paste. If your DSH is already running *through* ccteam (`/new dsh`, the ccteam **DSH** page, or `agent` with `vendor:"dsh"`), the plugin and its credentials are materialized for you. Either way it is one daemon shared with the CLI and ccteam web: the plugin attaches to a running one, never starts a second one against another `~/.ccteam`, and never stops it when DSH restarts. The full setup (both install paths, coexistence rules, troubleshooting) is in the [DSH plugin guide](docs/dsh-plugin.md) ([中文](docs/dsh-plugin-cn.md)).
 
 ## Install
 
@@ -194,12 +210,12 @@ After you reboot your computer, run `ccteam start` again to bring ccteam back.
 Delegation is explicit — an agent (or you) says who does what, and the bridge handles identity, routing, delivery, and the ledger:
 
 ```text
-session_spawn{vendor:"codex", title:"impl",  task:"implement RFC-12, run tests, report"}
-session_spawn{vendor:"grok",  title:"probe", task:"profile the hot path", wait_seconds:120}
-session_spawn{vendor:"kimi",  title:"chore", task:"apply the rename across every module"}
+agent{vendor:"codex", title:"impl",  task:"implement RFC-12, run tests, report"}
+agent{vendor:"grok",  title:"probe", task:"profile the hot path", wait:120}
+agent{vendor:"kimi",  title:"chore", task:"apply the rename across every module"}
 ```
 
-Async by default: the completion notification lands in the parent's chat like a colleague reporting back. `wait_seconds` is for sub-minute answers you need inline.
+Async by default: the completion notification lands in the parent's chat like a colleague reporting back. `wait` is for sub-minute answers you need inline.
 
 **Common workflows:**
 

@@ -166,8 +166,8 @@ describe("HomeView (landing page)", () => {
     expect(html).toContain("调研三角");
     expect(html).toContain("金字塔用工");
     // The card carries its composer prompt as the hover title; the commander
-    // flagship's prompt drives real A2A delegation (session_spawn/dispatch).
-    expect(html).toContain("session_spawn");
+    // flagship's prompt drives real A2A delegation (the `agent` tool).
+    expect(html).toContain("用 agent 派工");
     expect(html).toContain("择优合并成最终答案");
     // The old recents grid is gone (recents live in the sidebar rail), and
     // the retired single-vendor cards (code/fast/bulk era) don't resurface.

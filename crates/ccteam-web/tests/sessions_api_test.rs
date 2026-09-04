@@ -221,7 +221,7 @@ async fn session_turn_no_gateway_is_503() {
 }
 
 #[tokio::test]
-async fn session_stop_no_gateway_is_503() {
+async fn agent_stop_no_gateway_is_503() {
     let tmp = TempDir::new().unwrap();
     let addr = spawn_server(AppState::new(fake_paths(tmp.path()))).await;
     let client = reqwest::Client::new();
@@ -546,6 +546,95 @@ async fn session_events_reconnect_with_last_event_id_replays_the_gap() {
 }
 
 // ── v0.8.21 history + resume + external-import (gateway-attached, real HTTP) ──
+
+/// U4 — a session row carries `context_pct` once the session has reported its
+/// context, and OMITS it before then (a fabricated `0` reads as "all the room
+/// in the world", which is the opposite of the truth for a session that just
+/// filled its window). Same reader the MCP roster uses, so the phone and the
+/// browser can never disagree about one session.
+#[tokio::test]
+async fn session_rows_carry_context_pct_once_observed() {
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    let project_dir = paths.projects_root.join("demo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let factory = Arc::new(|vendor, _protocol| {
+        Arc::new(FakeAdapter { vendor }) as Arc<dyn HarnessAdapter + Send + Sync>
+    });
+    let gateway =
+        ccteam_im::gateway::Gateway::new_with_factory(factory, "demo", project_dir.clone());
+    let addr = spawn_server(AppState::new(paths).with_gateway_owned(gateway)).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1");
+
+    let sid = client
+        .post(format!("{base}/projects/demo/sessions"))
+        .json(&serde_json::json!({"role": "", "vendor": "claude"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let rows = |base: String, client: reqwest::Client| async move {
+        client
+            .get(format!("{base}/projects/demo/sessions"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    };
+
+    // Before any turn: the key is absent, never zero.
+    let before = rows(base.clone(), client.clone()).await;
+    assert_eq!(before.as_array().unwrap().len(), 1, "{before}");
+    assert!(
+        before[0].get("context_pct").is_none(),
+        "unobserved context must be omitted: {before}"
+    );
+
+    // The session reports 63% of its window used.
+    ccteam_harness::execution::turns_mirror::append_turn(
+        &project_dir,
+        &sid,
+        &ccteam_harness::execution::turns_mirror::TurnRecord {
+            turn_id: format!("{sid}-1"),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: "ok".into(),
+            usage: serde_json::Value::Null,
+            status: Some(ccteam_harness::TurnStatus {
+                model: None,
+                context: Some(ccteam_harness::ContextUsage::known(
+                    63,
+                    100,
+                    ccteam_harness::ContextSource::Reported,
+                )),
+                turn: 1,
+                cost_usd: None,
+                tokens_total: None,
+            }),
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
+        },
+    )
+    .unwrap();
+
+    let after = rows(base, client).await;
+    assert_eq!(after[0]["sid"], sid.as_str());
+    assert_eq!(after[0]["context_pct"], 63, "{after}");
+}
 
 /// End-to-end user flow over a real router + real gateway: create a session
 /// (meta.json lands on disk), stop it (meta.json SURVIVES the stop), the live

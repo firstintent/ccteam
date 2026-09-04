@@ -43,6 +43,7 @@ pub mod rmux_backend;
 pub mod tmux_backend;
 pub mod tmux_ops;
 pub mod typed_event_tap;
+pub mod usage_catalog;
 pub mod vendor_compat;
 
 pub use adapter::{
@@ -52,12 +53,13 @@ pub use adapter::{
     ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection,
     ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome, EventAttachment,
     ExecutionMode, GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope,
-    PermissionMode, RecoveredTurn, RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget,
-    SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId,
-    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV,
-    CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+    ModelWindow, PermissionMode, RecoveredTurn, RunningTask, SessionHandle, SessionProtocol,
+    SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent,
+    ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild,
+    TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage,
+    UnobservedTurnCtx, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV,
+    CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, KIMI_BIN_ENV,
+    OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -93,7 +95,7 @@ pub use execution::opencode_acp::{OpencodeAcpAdapter, OPENCODE_ACP_ADAPTER_NAME}
 pub use execution::pi_rpc::{
     bridge_source as pi_bridge_source, PiApprovalDecision, PiDialogKind, PiDialogRequest,
     PiDialogResponse, PiInteractionResolver, PiRoleDocument, PiRoleReader, PiRpcAdapter,
-    PI_BIN_ENV, PI_RPC_ADAPTER_NAME, REQUIRED_MCP_TOOL_NAMES as PI_REQUIRED_MCP_TOOL_NAMES,
+    KNOWN_MCP_TOOL_NAMES as PI_KNOWN_MCP_TOOL_NAMES, PI_BIN_ENV, PI_RPC_ADAPTER_NAME,
 };
 pub use execution::remote_exec::{
     connect as remote_exec_connect, ExecExit, ExecFile, ExecSpec, ExecStarted, RemoteExecTarget,
@@ -101,9 +103,9 @@ pub use execution::remote_exec::{
 };
 pub use execution::satellite_exec::{run_exec_session, SatelliteExecCtx};
 pub use execution::session_meta::{
-    apply_title, discover_external_claude_sessions, list_session_metas, read_session_meta,
-    touch_last_active, truncate_title, write_session_meta, ExternalClaudeSession, SessionMeta,
-    SessionOrigin, TitleSource,
+    apply_title, discover_external_claude_sessions, list_session_metas,
+    list_session_metas_reporting, read_session_meta, touch_last_active, truncate_title,
+    write_session_meta, ExternalClaudeSession, SessionMeta, SessionOrigin, TitleSource,
 };
 pub use execution::turn_status::{
     render_status_line, render_status_metrics, truncate_status_title, StatusIdentity, TurnStatus,

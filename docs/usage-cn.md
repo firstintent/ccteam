@@ -139,7 +139,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 每次 daemon 启动(`ccteam start` / `ccteam daemon start`,含 DSH 插件的自动启动)会**自动**把 ccteam 自己的工具(雇会话/派活、发文件等)注册进**所有允许 ccteam 写配置的已安装 vendor**——Claude(`~/.claude.json`)、Codex(`~/.codex/config.toml`)、Grok(`~/.grok/config.toml`)、OpenCode(`~/.config/opencode/opencode.json`)、Kimi(`~/.kimi-code/mcp.json`)——这些 vendor 的普通会话都能指挥团队(Grok 侧可用 `grok mcp doctor` 验证连通)。写进去的是一枚**用户域 enrollment 凭据** —— 它只说明「这份配置是谁的」,per-process 身份由 daemon 在该 vendor 的会话连上来时签发,所以同一份配置隔一小时起的两个 agent 是两个 caller、各有自己的账本行。写入幂等且只合并(不碰你其它 MCP server 条目),未安装的 vendor 自动跳过;旧版 ccteam 留下的条目(`Bearer ccteam:<hex>` admin token,或 `command` 形式的 stdio 条目)一律读作**未注册**,下次启动自动替换。
 
-**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `session_spawn {vendor:"dsh", ...}` 直接接进该身份唯一的 DSH web 运行时——就是 **DSH** 菜单看到的那个空间(普通用户 `$CCTEAM_HOME/runtime/dsh/web/<user>/`,owner 真 `~/.dsh`)——所以雇出来的会话会实时出现在 DSH 侧栏、按项目 workspace 分组,同 sid 可冷恢复,token 用量会入账。ccteam 托管的运行时都预载了 `@ccteam/ccteam-ui`;你自己手起的 `dsh web`,在 **Hosts** 页一键注册插件(或 `dsh plugin --profile web add @ccteam/ccteam-ui`)后自行重启即可。你自己的 DSH 会话也能编排团队:在 daemon 所在机器上,插件会自己向 daemon 领取 enrollment 凭据(每个 DSH profile 一份,`dsh-plugin:<profile>`,幂等由 daemon 保证);daemon 在别处时,到 DSH Settings 粘贴 daemon URL 和 **Settings → Access** 里复制的 enrollment 凭据。两种情况下都拿到同一套 8 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
+**DSH 刻意不在这张 config-writer 表里**:它没有等价的全局 MCP 配置文件。从 ccteam 雇 DSH 不需要你安装插件:`/new dsh`、Web 的 DSH 页,或 MCP `agent {vendor:"dsh", task:"…"}` 直接接进该身份唯一的 DSH web 运行时——就是 **DSH** 菜单看到的那个空间(普通用户 `$CCTEAM_HOME/runtime/dsh/web/<user>/`,owner 真 `~/.dsh`)——所以雇出来的会话会实时出现在 DSH 侧栏、按项目 workspace 分组,同 sid 可冷恢复,token 用量会入账。ccteam 托管的运行时都预载了 `@ccteam/ccteam-ui`;你自己手起的 `dsh web`,在 **Hosts** 页一键注册插件(或 `dsh plugin --profile web add @ccteam/ccteam-ui`)后自行重启即可。你自己的 DSH 会话也能编排团队:在 daemon 所在机器上,插件会自己向 daemon 领取 enrollment 凭据(每个 DSH profile 一份,`dsh-plugin:<profile>`,幂等由 daemon 保证);daemon 在别处时,到 DSH Settings 粘贴 daemon URL 和 **Settings → Access** 里复制的 enrollment 凭据。两种情况下都拿到同一套 6 个工具;若还没绑定 ccteam 项目,第一次工具调用会要求你点名一个 slug,之后这个会话会记住。
 
 **Pi 也刻意不在 config-writer 表里**:它的受管会话由 ccteam 在 spawn 时挂自己的 bridge 扩展拿到团队工具,因此不写你任何 Pi 配置——反过来,你自己在 shell 里起的 `pi` 也就没有 ccteam 工具。需要给可写配置的 vendor 手动补注册时(比如手改过 vendor 配置)用 `ccteam config mcp`,或进 **主机** 页点 **「注册 ccteam MCP」**;主机页还显示这台机器上各 vendor 装没装、版本、是否就绪。
 
@@ -147,7 +147,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 **DSH** 页把原生 DeepSeek Harness Web 嵌进 ccteam 控制台,中间走伴生端口反代。它复用 ccteam 登录 cookie;反代会剥掉 ccteam cookie / bearer,不会把它们交给 DSH 进程或日志。
 
-一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`session_spawn`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `standard`,`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它;雇佣会话权限 preset 默认 `danger-full-access`(全文件访问、免审批),spawn 时选 `hitl` 则保留逐次审批。
+一个身份只跑**一个** DSH 运行时,ccteam 是它的第二个 client:从 ccteam 雇出来的 DSH 会话(`/new dsh`、`agent {vendor:"dsh"}`)就建在这个运行时里,所以它们会实时出现在本页侧栏、挂在项目 workspace 下;agent 干到一半你可以点开围观或插话,agent 的下一次 dispatch 接着同一条对话继续。雇佣会话会加入 DSH 四种 agent preset 之一(`standard` / `ptc` / `minimal` / `creator`,决定工具集),ccteam 默认 `standard`,`/new dsh mode=<m>`(或 spawn API 的 `mode`)可选其它;雇佣会话权限 preset 默认 `danger-full-access`(全文件访问、免审批),spawn 时选 `hitl` 则保留逐次审批。
 
 - **Owner**:使用真实 `~/.dsh` 空间。若本机已有原生 `dsh web` 跑在 `127.0.0.1:3080`,ccteam 会 attach 到它,不会再开第二个写同一个 home 的进程——此时雇 DSH 需要那个实例里装有 ccteam 插件(**Hosts** 页一键注册,然后你自己重启它;ccteam 绝不重启不是它起的进程)。没有原生实例时 ccteam 自己在临时 loopback 端口启动,插件已注册,且 ccteam 工作台已带上你自己的 REST token(即 admin web token,0600 写进你自己的 profile),无需粘贴。浏览器就在本机时可直接打开原生 URL;局域网/远程浏览器经 ccteam 代理访问。
 - **普通用户**:每个身份一个 `$CCTEAM_HOME/runtime/dsh/web/<user>/` 空间,预置 DSH base/web app 与 `@ccteam/ccteam-ui`;从 ccteam 雇的 DSH 会话也住这个家,所以会出现在 DSH 页里。profile 是合并式物化:用户自己装的 DSH 插件会保留,ccteam 的插件物化每次启动自愈。只要这台机器已有 DSH 登录,首次打开即可用:ccteam 会从机器的 DSH home 种子该身份的 DSH 配置文件,且在用户未改动时继续跟随这些字节。
@@ -175,12 +175,13 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 > 部分高级选项(terminal/rmux 协议、历史会话恢复与导入)目前仅对管理员开放,普通用户默认用标准 Claude / Codex / Grok 聊天会话;随功能稳定会逐步放开。
 
-### 团队页:拓扑与分工
+### 团队页:拓扑、分工与编排
 
-**团队**页是多 vendor 调度的驾驶舱,两个 tab:
+**团队**页是多 vendor 调度的驾驶舱,三个 tab:
 
 - **拓扑** —— 跨项目、跨主机的实时委派树:每会话一行(vendor 徽章、live 模型(live 会话显示真正在跑的模型)、状态点、成本、轮次),KPI 条下有 per-vendor 小计(live 数 + 花费,点击过滤)、最近委派滚动条,跨机时行上带 host 徽章。每个会话都是**真超链接** —— 右键/中键「打开 ↗」把父子会话开在两个浏览器 tab 里对照看。点行打开详情面板(模型/主机/父会话/深度/成本/实时活动/最近对话)。
 - **分工** —— 团队的分工管理:**vendor 名册按主机分组**(local 在前、在线优先、离线卫星默认折叠并显示已离线多久 —— 超 7 天名册会建议清理 —— 且带「移除」按钮;主机 id 恒显,两台机器 OS hostname 撞名也能分清;每家 vendor 列 installed/版本/就绪态与修复提示,npm 目录有新版时低调提示「↑ 可更新」,外加 live 会话数与花费 —— **点 vendor 卡直接跳到按该家过滤的拓扑**)+ **宪章编辑器** —— 就是 agent 经 `status` 工具读的那份项目级 `routing.md`。选项目、markdown 编辑/预览、保存;项目没有宪章时只读展示全局 `~/.ccteam/routing.md`,可一键「拷入起稿」(web 只写项目文件,全局文件的写入口仍在 CLI/文件系统)。诚实语义不变:宪章是 agent 主动 PULL 的建议文本(绝不注入),超 ~4k 字符在 `status` 里节选并给全文指针。
+- **编排** —— daemon 记到账本上的每一次 `ccteam flow run`,跨你可见的项目按新到旧排:名字、描述、状态(运行中 / 完成 / 出错 / 刹车 —— 刹车是护栏拒绝再雇新 agent,不是崩溃)、雇佣 agent 数、成本、耗时;展开一行看它真正雇了哪些会话(真链接)和触发它的会话。还没有 run 时这个 tab 就是上手入口:发起第一次 run 的三条命令,可复制。flow 只在 shell 里(或由任意会话)编写与启动,web 不启动 run;详见 [hook-dynamic-workflows-cn.md](hook-dynamic-workflows-cn.md)。
 - **编队起手** —— 分工 tab 上的六张卡(总控-工班 / 主力-顾问 / 交叉互审 / 并行竞标 / 调研三角 / 金字塔用工),点「起手」跳到首页 launcher 预填 vendor 阵容 —— 编排本身发生在你 spawn 的会话里。完整编队目录(含监工/值守/跨机三式)见 [orchestration-cn.md](orchestration-cn.md)。
 
 ### 插件市场:装角色 / 技能 / 工作流
@@ -218,7 +219,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 ### 外部 Agent 直连 MCP(`POST /mcp`)
 
-任何不由 ccteam 托管的 agent(你自己写的脚本、手起的 CLI、别的机器上的 agent)都可以拿 **enrollment 凭据**直接调 daemon 的 MCP 端点,得到与托管会话相同的 8 个工具:
+任何不由 ccteam 托管的 agent(你自己写的脚本、手起的 CLI、别的机器上的 agent)都可以拿 **enrollment 凭据**直接调 daemon 的 MCP 端点,得到与托管会话相同的 6 个工具:
 
 ```
 POST http://<host>:7331/mcp
@@ -227,7 +228,7 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 ```
 
 - **凭据只说明「这份配置是谁的」,身份由 daemon 在 `initialize` 时签发**:响应里的 `Mcp-Session-Id` 让**这个进程**成为一个独立 caller —— 它在账本里有自己的会话行(`managed_by: external`),它 spawn 的会话真的挂在它下面,而不是变成一堆根节点。之后每个请求必须同时带凭据与该 id(id 本身不是凭据,且 binding 只对开它的那枚凭据生效);id 过期返回 `404` 提示重新 `initialize`,用完可 `DELETE /mcp` 关闭。
-- **两种作用域**:每次 `ccteam daemon start` 会把**用户域**的机器凭据——无 label 的那个槽位,跨重启复用、从不重铸——写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;DSH 经 `@ccteam/ccteam-ui` 插件走同一套身份模型:插件向本机 daemon 领取自己的用户域凭据(label `dsh-plugin:<profile>`),daemon 在别处时用粘贴的那枚。用户域凭据不钉项目,故首个 `session_*` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
+- **两种作用域**:每次 `ccteam daemon start` 会把**用户域**的机器凭据——无 label 的那个槽位,跨重启复用、从不重铸——写进本机各 vendor 配置,所以手起的 Claude/Codex/Grok/OpenCode/Kimi 直接就有工具;DSH 经 `@ccteam/ccteam-ui` 插件走同一套身份模型:插件向本机 daemon 领取自己的用户域凭据(label `dsh-plugin:<profile>`),daemon 在别处时用粘贴的那枚。用户域凭据不钉项目,故首个 `agent` 调用必须显式传 `project`,且只接受本人可见的项目。**项目域**凭据 = 控制台复制按钮发的那枚(设置 → 接入,或 `POST /api/v1/projects/{slug}/enroll`):钉死一个 workspace,贴到别的机器也只够得着它,事后可列出、可吊销;secret 只在签发那一刻显示一次。
 - **反复启动的程序用 ensure 而不是 mint**:`POST /api/v1/enroll` 带 `ensure: true` 和 `label` 时按 (身份, label) 幂等——daemon 新建记录答 `201` 并附 bearer,记录已存在则答 `200` 且只附 `bearer_prefix`(secret 永不第二次回传);丢了自己那份的调用方发 `rotate: true` 换掉记录,而不是再堆一条。控制台自己的 mint(不带 `ensure`)仍每次新铸一枚。
 - **不做任何推断**:不看工作目录、不看来源地址、没有「最近用过的项目」—— 没有依据就直接拒绝,并告诉你可以点名哪些 slug。无权与不存在的项目/会话返回同一错误(防枚举);bearer-only,不收 cookie 或 query 参数;web 控制台令牌(那是 `/api/v1/**` 的凭据)在这里会被 401 拒绝并说明本端点认哪两族凭据。
 
@@ -302,7 +303,13 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 
 # 查看 / 接入
 /sessions [all]            列当前项目的会话(带 vendor · role · model · 上下文用量);`all` = 跨所有项目
-/status                    全队健康:每个会话 idle / working / stuck + model · 强度 · ctx
+/status                    当前会话的深度视图——无论什么状态都是同一张卡:idle / working /
+                           stuck,或 💤 released(下条消息即恢复;卡片读的是落盘事实)。
+                           含 model · 强度 · ctx、账号用量窗口(5h / 周;本会话没进程时
+                           向同 harness 的在线会话读,并按 harness 记住,所以一个进程都不在
+                           也照样显示;过了厂商自报的重置时间就丢弃,不显示过期数)、
+                           自己的后台工作、直接子会话,
+                           以及指向其余舰队的页脚(/sessions、/projects)
                            ctx 只在**真测到**时才显示:vendor 还没报过就是「未知」而非 0%,
                            且 daemon 重启后不丢
 /help                      列出网关命令
@@ -337,7 +344,7 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 ### 直接对话 + 收发文件
 
 - **不带前缀的消息** → 发给当前会话。
-- **非网关的 `/命令`**(`/compact`、`/clear`、`/model` …)→ 透传给当前 agent;弹窗型(如 `/model`)会弹**选项按钮**,点一下即应用。
+- **非网关的 `/命令`**(`/compact`、`/clear`、`/goal`、`/model` …)→ 透传给当前 agent;弹窗型(如 `/model`)会弹**选项按钮**,点一下即应用。Claude 只在空闲时解析斜杠命令,turn 进行中发出的会排队、在该 turn 结束后自动投递(有回执);turn 中发普通文本仍是插话进当前 turn。
 - **发图 / 发文件 + 一句说明** → agent 自动读取(报错截图、日志都行);agent 也能把文件发回你的 chat。
 - **回合进行中** → 一条活的进度消息(形如 `⏳ working… · 🔧 bash ×3`),最终答案单独成条(会提醒);超长回答自动分片;agent 中途要你拿主意时会弹**选项按钮**,点一下喂回答案、它继续往下跑。
 
@@ -347,7 +354,7 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 
 ### 让任何会话派活
 
-每个会话都能通过 `mcp__ccteam__session_*` 工具雇同事、派任务、收结论 —— 不用你手动切来切去,也不需要特殊角色,直接用自然语言交代:
+每个会话都能通过 `mcp__ccteam__agent` / `mcp__ccteam__agent_read` 工具雇同事、派任务、读答案 —— 不用你手动切来切去,也不需要特殊角色,直接用自然语言交代:
 
 ```text
 起一个 codex 会话,按 docs/rfc-12.md 实现,测试全过后汇报给我
@@ -357,7 +364,7 @@ list 每行形如 `d3 · s12 · 2026-07-26 09:00 · 预览…`(失败会带原�
 
 ### 模型路由
 
-会话决定叫谁干活时不必猜。一次 `status` 调用(MCP 工具,另有响应逐字节等同的发现别名 `grok_claude_codex_kimi`)就返回**厂商面板**——按你当前项目绑定的主机出:各 vendor 装没装、版本、诚实的 auth 信号(`ready` / `not_ready` / `unknown`——躺在 PATH 里绝不冒充已登录)、预算态、快照新鲜还是过期。面板旁边还有一份 **advisory 模型目录**(runtime 最近所见 + hub `models.json`,来源分开标注,永不当 spawn 白名单),以及你的**分工笔记**,原文透传。
+会话决定叫谁干活时不必猜。`status`(MCP 工具,另有响应逐字节等同的发现别名 `grok_claude_codex_kimi`)返回**分级**的紧凑 JSON。默认 `brief` 档就是「雇谁」这一个答案:你当前项目绑定的主机真正能雇哪些 vendor、团队最近 24 小时花了多少,以及仅在成立时才出现的两件事——卫星主机离线 / 快照过期的标记,和被预算触顶禁用的 vendor。要更厚就传 `detail`,而且只有这一次调用付这笔字节:`models` 加上各 vendor 观测到的模型 id 与思考强度梯,外加 hub `models.json` 目录(两个来源分开标注,都是 advisory,永不当雇人白名单);`vendors` 加上各 vendor 装没装 / 版本 / 诚实的 auth 信号(躺在 PATH 里绝不冒充已登录)/ 预算态与观测时间;`routing` 把你的**分工笔记**原文带上(来源、sha256、是否截断),没有笔记时告诉你它找过哪几个路径;`full` 再加 daemon 健康和你可见的每个项目的 24h 成本。
 
 你的分工是你自己写的 dumb markdown;ccteam 负责把它带给任何开口问的会话(在任何主机上都拿到同一份),但永不解析、不合并、不执行:
 
@@ -448,12 +455,29 @@ ccteam skill migrate-project        # 旧 .claude/skills 实体搬进 .agents/sk
 
 全局库与项目**不相灌**:库里的技能只在会话里按条消息引用(web ＋ 菜单),要进 git 的项目技能自己放 `.agents/skills/`。
 
+### `flow`(确定性编排)
+
+flow 是一段 JS 脚本,由 ccteam runner 对着 daemon 执行:`agent()` / `parallel()` / `pipeline()` / `phase()` 调度的是真实的跨 harness 雇佣,每个叶子都是账本上一个独立会话。进度走 stderr,最终一份 JSON 报告走 stdout。
+
+```bash
+ccteam flow new branch-review              # 在 .agents/flows/ 生成 <slug>.flow.js 并打印脚本 API
+ccteam flow run branch-review.flow.js      # 按 cwd 所属项目跑(--project <slug> 显式点名)
+ccteam flow run f.js --args '{"base":"main"}'   # JSON 作为 `args` 交给脚本
+ccteam flow run f.js --parallel 16 --max-agents 100 --max-cost 5 --budget 5
+ccteam flow run f.js --resume ~/.ccteam/runs/<id>   # 重放 journal,把这次 run 接着跑
+ccteam flow eval <run-id>                  # 用评审 flow 给已完成的 run 打分(.agents/flows/_eval.flow.js)
+```
+
+每次 run 都在 `~/.ccteam/runs/<id>` 落 journal(`--run-dir` 可自己指定),daemon 或机器重启都不丢:雇来的是真会话,活得比 runner 久,`--resume` 会重新挂上还在飞的那些而不是重雇。刹车是显式的 —— `--parallel`(同时在飞,默认 32)、`--max-agents`(单次 run 硬顶,默认 100)、`--max-cost` / `--budget`(超过这个花费就不再放新雇佣进来;`--budget` 同时是脚本看到的 `budget.total`)、`--watchdog <秒>`(脚本一直不让出就中止)。在受管会话里跑会自动按 `$CCTEAM_CHAT_SID` 归到那个会话名下;`--parent <sid>` 覆盖,`--parent ''` 关掉。
+
+flow 雇人和任何一次委派一样,照样过 `pre-agent` 策略 hook 与同一套护栏。脚本 API、hook 契约与评审闭环见 [hook-dynamic-workflows-cn.md](hook-dynamic-workflows-cn.md)。
+
 ### 运维
 
 ```bash
 ccteam status                  # daemon + 项目/会话 + 末尾两行 web token/url
 ccteam session ls              # 网关会话状态(daemon 离线降级标注)
-ccteam doctor --verify-mcp     # MCP 表面验收(8 工具 / 0 stub,漂移退出码 1)
+ccteam doctor --verify-mcp     # MCP 表面验收(6 工具 / 0 stub,漂移退出码 1)
 ```
 
 只重启 daemon(会话在重启后按 id 自动接回;正在跑 turn 的会话会被等到跑完,绝不重复起进程):
@@ -497,7 +521,7 @@ ccteam update --now                # 跳过等待在飞 turn 的排空,立即重
 
 重启永远不会把 daemon 搬到别处:`ccteam update`(与不带 flag 的 `ccteam daemon restart` 一样)重放 launcher 记录的 flag,daemon 早于这份记录时则用它在 `/health` 上报的绑定地址。两者都拿不到 —— 既无 launcher 记录、`/health` 也不应答(用 `--no-web` 起的 daemon,或早于身份面的旧构建)—— 就只换二进制、**拒绝**重启而不是瞎猜,并在提示里写出该跑的那条重启命令:带上 daemon 正在用的 flag 执行 `ccteam stop && ccteam start --web-bind <addr> [...]`,或 `ccteam daemon restart --web-bind <addr>`。
 
-daemon 重启对活会话意味着什么 = 按 id 恢复的合同,再加一条规则 —— **一个会话一个进程**:`terminal`/tmux 会话照常跑(独立进程树);默认 `stream-json` 会话的进程是被「放手」而不是被杀 —— 空闲的自己退出,turn 进行中的跑完这个 turn。新 daemon 凭 body 记录(`<project>/.ccteam/chat/<sid>/body.json`)认出这样的幸存者,绝不为同一会话再起第二个进程:会话显示为 `detached`(web 侧栏、`session_list activity:detached`、IM `/sessions`),发给它的消息排队、等该进程一退出就投递,`/stop` / `session_stop` 立即结束它;它退出后 ccteam 从 Claude 自己的 transcript 里找回它这段时间给出的回答并投递(IM/web 回复、委派通知),再按 id 重建会话。ACP(grok/kimi/opencode)与 codex 进程随 daemon 一起结束;在飞的 turn 被打断,下条消息按 id 恢复上下文。`ccteam status` 与 `ccteam doctor` 显示安装渠道、运行中 vs 二进制版本、以及是否有新版本(惰性检查,最多每 ~20h 一次;`preferences.toml` 的 `check_for_update` 可关)。**卫星自己更新** —— 在每台上跑 `ccteam update`;控制台的主机页与 `ccteam status` 会标出版本落后于 daemon 的主机。
+daemon 重启对活会话意味着什么 = 按 id 恢复的合同,再加一条规则 —— **一个会话一个进程**:`terminal`/tmux 会话照常跑(独立进程树);默认 `stream-json` 会话的进程是被「放手」而不是被杀 —— 空闲的自己退出,turn 进行中的跑完这个 turn。新 daemon 凭 body 记录(`<project>/.ccteam/chat/<sid>/body.json`)认出这样的幸存者,绝不为同一会话再起第二个进程:会话显示为 `detached`(web 侧栏、`agent_read activity:detached`、IM `/sessions`),发给它的消息排队、等该进程一退出就投递,`/stop` / `agent_stop` 立即结束它;它退出后 ccteam 从 Claude 自己的 transcript 里找回它这段时间给出的回答并投递(IM/web 回复、委派通知),再按 id 重建会话。ACP(grok/kimi/opencode)与 codex 进程随 daemon 一起结束;在飞的 turn 被打断,下条消息按 id 恢复上下文。`ccteam status` 与 `ccteam doctor` 显示安装渠道、运行中 vs 二进制版本、以及是否有新版本(惰性检查,最多每 ~20h 一次;`preferences.toml` 的 `check_for_update` 可关)。**卫星自己更新** —— 在每台上跑 `ccteam update`;控制台的主机页与 `ccteam status` 会标出版本落后于 daemon 的主机。
 
 ### 多机(卫星节点)
 

@@ -9,7 +9,13 @@
 //! - The turn's **answer** is emitted exactly once as
 //!   [`ThreadEvent::ItemCompleted`] carrying
 //!   [`ThreadItemDetails::AgentMessage`] — the only event the pump
-//!   forwards to IM as a reply.
+//!   forwards to IM as a reply. The answer is EVERY top-level assistant
+//!   text block of the turn, in order — not just the last one. Claude's
+//!   `result.result` carries only the final text block, so a reply the
+//!   model wrote before its next tool call (typically an answer to a
+//!   human who spoke mid-turn) would otherwise vanish from turns.jsonl,
+//!   the IM reply and the delegation notification (issue #192).
+//!   Subagent blocks (`parent_tool_use_id` set) are never the answer.
 //! - A turn **failure** is [`ThreadEvent::TurnFailed`] (the pump forwards
 //!   `err.message` verbatim → the honest in-flight-loss / error signal).
 //! - Tool-use / thinking blocks become `ItemStarted{ToolCall}` /
@@ -34,8 +40,9 @@ pub struct StreamTranslator {
     /// `Some` while a turn is in flight (between first assistant block and
     /// its `result`).
     active_turn: Option<String>,
-    /// Accumulated assistant text for the active turn — the fallback final
-    /// text when `result.result` is empty.
+    /// Every top-level assistant text block of the active turn, in stream
+    /// order — this IS the turn's answer (`result.result` only repeats the
+    /// last block; see the module doc / issue #192).
     acc_text: String,
     /// Item-id counter for tool/reasoning items within a turn.
     item_seq: u64,
@@ -128,11 +135,10 @@ impl StreamTranslator {
             }
         }
         let (text, items) = extract_blocks(&env.message);
-        if !text.is_empty() {
-            if !self.acc_text.is_empty() {
-                self.acc_text.push('\n');
-            }
-            self.acc_text.push_str(&text);
+        // Subagent narration (`parent_tool_use_id` set) belongs to the
+        // Task tool's private thread, never to this session's reply.
+        if !text.is_empty() && env.parent_tool_use_id.is_none() {
+            push_paragraph(&mut self.acc_text, &text);
         }
         for ev in items {
             // Re-id with the translator's counter so item ids are stable
@@ -206,15 +212,19 @@ impl StreamTranslator {
             return out;
         }
 
-        // Success: final text = result.result if non-empty, else the
-        // accumulated assistant text. Emit the answer FIRST (so the pump
-        // finalizes the turn's progress epoch before the boundary event),
-        // then TurnCompleted with usage.
-        let final_text = r
-            .result
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| std::mem::take(&mut self.acc_text));
+        // Success: the answer = every top-level text block seen this turn
+        // (issue #192 — `result.result` is only the LAST block, so a reply
+        // written before a further tool call would be dropped). `result`
+        // is still honoured as the source of truth for text the stream
+        // never showed us (empty stream, or a tail the blocks lack). Emit
+        // the answer FIRST (so the pump finalizes the turn's progress epoch
+        // before the boundary event), then TurnCompleted with usage.
+        let mut final_text = std::mem::take(&mut self.acc_text);
+        if let Some(tail) = r.result.as_deref().filter(|s| !s.is_empty()) {
+            if !final_text.trim_end().ends_with(tail.trim_end()) {
+                push_paragraph(&mut final_text, tail);
+            }
+        }
         if !final_text.is_empty() {
             let id = self.next_item_id();
             out.push(ThreadEvent::ItemCompleted {
@@ -232,6 +242,18 @@ impl StreamTranslator {
         self.acc_text.clear();
         out
     }
+}
+
+/// Append one text block as its own paragraph (blank-line separated, so
+/// consecutive blocks read the way Claude's own transcript shows them).
+fn push_paragraph(acc: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !acc.is_empty() {
+        acc.push_str("\n\n");
+    }
+    acc.push_str(text);
 }
 
 /// One non-text content block worth surfacing as a progress item.
@@ -256,10 +278,7 @@ fn extract_blocks(message: &Value) -> (String, Vec<BlockItem>) {
                 match kind {
                     "text" => {
                         if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(t);
+                            push_paragraph(&mut text, t);
                         }
                     }
                     "tool_use" => {
@@ -430,6 +449,53 @@ mod tests {
             session_id: "u-1".into(),
         }));
         assert_eq!(answer_text(&evs).as_deref(), Some("accumulated answer"));
+    }
+
+    #[test]
+    fn mid_turn_text_blocks_are_all_part_of_the_answer() {
+        // issue #192 — measured wire shape (claude 2.1.258): one `assistant`
+        // event per content block; `result.result` = the LAST text block
+        // only. A reply written before a further tool call must survive.
+        let mut t = StreamTranslator::new();
+        t.ingest(assistant(
+            json!([{"type": "text", "text": "ALPHA report here."}]),
+        ));
+        t.ingest(assistant(json!([
+            {"type": "tool_use", "name": "Bash", "input": {"command": "echo hi"}, "id": "tu-1"}
+        ])));
+        t.ingest(assistant(json!([{"type": "text", "text": "BETA done."}])));
+        let evs = t.ingest(result_ok("BETA done."));
+        assert_eq!(
+            answer_text(&evs).as_deref(),
+            Some("ALPHA report here.\n\nBETA done.")
+        );
+    }
+
+    #[test]
+    fn result_text_unseen_in_the_stream_is_still_kept() {
+        // `result.result` stays authoritative for anything the blocks never
+        // carried (never dropped, never duplicated).
+        let mut t = StreamTranslator::new();
+        t.ingest(assistant(json!([{"type": "text", "text": "narration"}])));
+        let evs = t.ingest(result_ok("final from result only"));
+        assert_eq!(
+            answer_text(&evs).as_deref(),
+            Some("narration\n\nfinal from result only")
+        );
+    }
+
+    #[test]
+    fn subagent_text_never_joins_the_answer() {
+        let mut t = StreamTranslator::new();
+        t.ingest(Outbound::Assistant(MessageEnvelope {
+            message: json!({"role": "assistant",
+                "content": [{"type": "text", "text": "subagent chatter"}]}),
+            session_id: "u-1".into(),
+            parent_tool_use_id: Some("tu-9".into()),
+        }));
+        t.ingest(assistant(json!([{"type": "text", "text": "top-level"}])));
+        let evs = t.ingest(result_ok("top-level"));
+        assert_eq!(answer_text(&evs).as_deref(), Some("top-level"));
     }
 
     #[test]

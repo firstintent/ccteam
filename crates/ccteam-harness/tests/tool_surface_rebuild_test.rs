@@ -6,7 +6,7 @@
 //! a stated, actionable answer rather than a silent success — a session whose
 //! tool face died is fully alive and looks fine, so a no-op that reports
 //! success is indistinguishable from a working rebuild until an agent tries to
-//! call `session_spawn` and finds nothing there.
+//! call `agent` and finds nothing there.
 //!
 //! No vendor CAN rebuild in place (claude stream-json's `mcp_reconnect` was the
 //! last claimant and was withdrawn once it was measured swapping the session's

@@ -264,6 +264,7 @@ async fn end_to_end_turn_completed_writes_progress_jsonl_with_vendor_codex() {
         role: "codex-bot".into(),
     };
     let ctx = SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "demo-codex".into(),
         sid: "codex-sid-1".into(),

@@ -64,6 +64,8 @@ pub fn external_node_meta(
         AgentVendor::Claude | AgentVendor::Codex | AgentVendor::Pi => SessionProtocol::StreamJson,
     };
     let mut meta = SessionMeta {
+        model_pinned_generation: None,
+        tool_face: None,
         managed_by: ManagedBy::External,
         stopped_at: None,
         sid: sid.to_string(),
@@ -112,10 +114,9 @@ pub fn external_node_meta(
 
 /// Why a driveable surface refuses an external sid.
 ///
-/// One message, one place: `session_dispatch` / `session_stop` /
-/// `session_collect` must say what this session IS rather than "not found",
-/// because the caller can see it in `session_list` and would otherwise read a
-/// correct refusal as a bug.
+/// One message, one place: `agent` / `agent_stop` / `agent_read` must say what
+/// this session IS rather than "not found", because the caller can see it in
+/// the `agent_read` roster and would otherwise read a correct refusal as a bug.
 pub fn not_driveable_error(tool: &str, sid: &str) -> String {
     format!(
         "{tool}: session {sid} is a hand-started agent that enrolled with ccteam \
@@ -218,8 +219,8 @@ mod tests {
 
     #[test]
     fn the_refusal_says_what_the_session_is_not_that_it_is_missing() {
-        let msg = not_driveable_error("session_dispatch", "s42");
-        assert!(msg.contains("session_dispatch"));
+        let msg = not_driveable_error("agent", "s42");
+        assert!(msg.contains("agent"));
         assert!(msg.contains("s42"));
         assert!(msg.contains("external"));
         assert!(

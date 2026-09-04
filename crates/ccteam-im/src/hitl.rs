@@ -246,8 +246,7 @@ pub fn classify_tool_risk(tool_name: &str, tool_input: &serde_json::Value) -> Ap
         | "ls"
         | "ccteam_status"
         | "ccteam_grok_claude_codex_kimi"
-        | "ccteam_session_list"
-        | "ccteam_session_collect" => ApprovalRisk::Low,
+        | "ccteam_agent_read" => ApprovalRisk::Low,
         "Write"
         | "Edit"
         | "MultiEdit"
@@ -256,9 +255,8 @@ pub fn classify_tool_risk(tool_name: &str, tool_input: &serde_json::Value) -> Ap
         | "write"
         | "edit"
         | "ccteam_chat_send_file"
-        | "ccteam_session_spawn"
-        | "ccteam_session_dispatch"
-        | "ccteam_session_stop" => ApprovalRisk::Medium,
+        | "ccteam_agent"
+        | "ccteam_agent_stop" => ApprovalRisk::Medium,
         "Bash" | "KillShell" | "KillBash" | "bash" => {
             let command = tool_input
                 .get("command")
@@ -874,8 +872,7 @@ mod tests {
             "ls",
             "ccteam_status",
             "ccteam_grok_claude_codex_kimi",
-            "ccteam_session_list",
-            "ccteam_session_collect",
+            "ccteam_agent_read",
         ] {
             assert_eq!(classify_tool_risk(tool, &json!({})), ApprovalRisk::Low);
         }
@@ -883,9 +880,8 @@ mod tests {
             "write",
             "edit",
             "ccteam_chat_send_file",
-            "ccteam_session_spawn",
-            "ccteam_session_dispatch",
-            "ccteam_session_stop",
+            "ccteam_agent",
+            "ccteam_agent_stop",
         ] {
             assert_eq!(classify_tool_risk(tool, &json!({})), ApprovalRisk::Medium);
         }

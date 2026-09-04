@@ -120,6 +120,7 @@ mod tests {
 
     fn ctx(mode: PermissionMode) -> SpawnCtx {
         SpawnCtx {
+            generation: 0,
             slug: "demo".to_string(),
             sid: "s42".to_string(),
             owner: "user:web-api".into(),

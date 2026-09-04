@@ -14,6 +14,7 @@ import {
   emptyFold,
   historyToRows,
   loadRows,
+  mergeHistory,
   renderFold,
   rowsKeyFor,
   saveRows,
@@ -360,5 +361,83 @@ describe("chatTranscript historyToRows", () => {
         ],
       },
     ]);
+  });
+});
+
+describe("chatTranscript mergeHistory (GitHub #186 A)", () => {
+  const page = (assistant: string): SessionHistoryEvent[] => [
+    { turn_id: "t1", ts: "2026-08-19T10:00:00Z", role: "cto", user: "q", assistant },
+  ];
+  const answer = (id: string, content: string): SessionEvent => ({ id, kind: "answer", content });
+  const approval = (id: string): SessionEvent => ({
+    id,
+    kind: "answer",
+    content: "run it?",
+    options: [{ label: "Allow", id: "allow" }],
+    token: "tok",
+  });
+
+  it("re-applies a reply that raced the history fetch, exactly once", () => {
+    const seeded = historyToRows(page(""));
+    const rows = mergeHistory([], seeded, [answer("e1", "late")], 0);
+    expect(rows.map((r) => r.content)).toEqual(["q", "late"]);
+  });
+
+  it("skips a late reply the page already mirrors (no double bubble)", () => {
+    const seeded = historyToRows(page("late"));
+    const rows = mergeHistory([], seeded, [answer("e1", "late")], 0);
+    expect(rows.filter((r) => r.content === "late")).toHaveLength(1);
+  });
+
+  it("treats frames delivered before the request as mirrored by the page", () => {
+    const seeded = historyToRows(page(""));
+    // barrier=1: the reply was buffered BEFORE the request left → the page
+    // is authoritative for it (here: intentionally absent = not re-added).
+    const rows = mergeHistory([], seeded, [answer("e1", "old")], 1);
+    expect(rows.map((r) => r.content)).toEqual(["q"]);
+  });
+
+  it("carries an unresolved approval delivered on this stream across a reseed", () => {
+    const current = appendEvent([], approval("ap1"));
+    const seeded = historyToRows(page("earlier"));
+    const rows = mergeHistory(current, seeded, [approval("ap1")], 1);
+    expect(rows.map((r) => r.kind)).toEqual(["user", "assistant", "approval"]);
+    expect(rows[2]!.id).toBe("ap1");
+  });
+
+  it("drops a resolved approval and a stale one the stream never delivered", () => {
+    const resolved: TranscriptRow = { ...appendEvent([], approval("ap1"))[0]!, resolved: true };
+    const stale = appendEvent([], approval("ap-old"))[0]!;
+    const seeded = historyToRows(page("earlier"));
+    const rows = mergeHistory([resolved, stale], seeded, [approval("ap1")], 1);
+    expect(rows.some((r) => r.kind === "approval")).toBe(false);
+  });
+
+  it("applies a late approval / finalizing progress after the page", () => {
+    const seeded = historyToRows(page("earlier"));
+    const rows = mergeHistory(
+      [],
+      seeded,
+      [approval("ap2"), { kind: "progress", content: "✅ done", done: true }],
+      0,
+    );
+    expect(rows.map((r) => r.kind)).toEqual(["user", "assistant", "approval", "system"]);
+  });
+});
+
+describe("chatTranscript fold row time (GitHub #186 B)", () => {
+  const step = (item: string, ts: string): SessionEvent => ({
+    kind: "activity",
+    content: "",
+    ts,
+    activity: { kind: "tool_call", name: "Bash", summary: `Bash(${item})`, status: "started", item_id: item },
+  });
+
+  it("advances the folded row's ts to the latest step", () => {
+    let rows = appendEvent([], step("a", "2026-08-19T10:00:00Z"));
+    rows = appendEvent(rows, step("b", "2026-08-19T10:19:00Z"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ts).toBe("2026-08-19T10:19:00Z");
+    expect(rows[0]!.content).toContain("×2");
   });
 });

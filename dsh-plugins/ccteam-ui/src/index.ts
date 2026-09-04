@@ -2,7 +2,7 @@
  * Host half of `@ccteam/ccteam-ui` — ONE package carrying all three faces of
  * the ccteam ⇄ DSH connection:
  *
- *   1. TOOL face      — the eight ccteam MCP tools as DSH tools, so a DSH agent
+ *   1. TOOL face      — the six ccteam MCP tools as DSH tools, so a DSH agent
  *                       can hire and drive the rest of the team (tools.ts).
  *   2. TRANSPORT face — an ACP server on a unix socket, so ccteam can hire THIS
  *                       runtime's sessions (transport.ts); managed only, armed
@@ -102,7 +102,7 @@ export const Config: Schema<Config> = Schema.object({
  * Rust side gates the handshake on it (`MIN_DSH_CLIENT_VERSION`), so it must
  * stay in step with package.json — asserted by tests/host-exports.test.ts.
  */
-export const PACKAGE_VERSION = '0.10.5'
+export const PACKAGE_VERSION = '0.11.0'
 
 /**
  * The engine version this plugin is published against — package.json
@@ -114,7 +114,7 @@ export const PACKAGE_VERSION = '0.10.5'
  * repairs — the engine is older, so update the engine; the plugin is older, so
  * update the plugin.
  */
-export const ENGINE_VERSION = '0.10.5'
+export const ENGINE_VERSION = '0.11.0'
 
 export interface ApplyContext extends BffContext {
   /**

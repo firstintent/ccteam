@@ -6,6 +6,13 @@ mod commands;
 // (pid-detach lifecycle over `ccteam_core::daemon`) + the one-time
 // legacy systemd/launchd takeover (PRD F4; single Rust implementation).
 mod daemon_cli;
+// `ccteam flow run` — the dynamic-workflow runner's CLI face. The runner core
+// lives in `ccteam-flow`; this only supplies credential, project and run dir.
+mod flow;
+// The run-level envelope of a `ccteam flow run` (which hires belonged to one
+// run, and how it ended) submitted to the project ledger. Best-effort: a
+// missing daemon costs the run nothing but its visibility in the web UI.
+mod flow_bridge;
 mod legacy_takeover;
 mod mcp_serve;
 // v0.9.7 — `ccteam update`: channel-aware self-update (standalone replays
@@ -217,11 +224,91 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Author, run and evaluate dynamic workflow scripts: `ccteam flow new|run|eval`.
+    Flow {
+        #[command(subcommand)]
+        cmd: FlowCommand,
+    },
     /// Set up ccteam (MCP registration, IM token) and view or set preferences.
     Config {
         /// Empty = interactive menu; `show`; `get <key>`; `<key> <value>` to set.
         #[arg(value_name = "ARGS", num_args = 0..=2)]
         args: Vec<String>,
+    },
+}
+
+/// `ccteam flow` group: `new` writes one, `run` drives it, `eval` judges a
+/// finished run. The group exists because a workflow has a lifecycle (list /
+/// show / resume) that will want more verbs still, and a flat `ccteam flow-run`
+/// would have to be renamed to get them.
+#[derive(Subcommand)]
+enum FlowCommand {
+    /// Scaffold a flow script and print the script surface: `ccteam flow new <name>`.
+    New {
+        /// Name of the flow; slugified into `<slug>.flow.js`.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Where to write it (default: the project's `.agents/flows/`, else the cwd).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+    /// Run a workflow script against the daemon: progress on stderr, one JSON report on stdout.
+    Run {
+        /// Workflow script (a `.js` file exporting `meta` + a default async function).
+        #[arg(value_name = "SCRIPT")]
+        script: PathBuf,
+        /// Workspace slug (default: the project the cwd belongs to).
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+        /// JSON value handed to the script as `args`.
+        #[arg(long, value_name = "JSON")]
+        args: Option<String>,
+        /// Agents in flight at once (default 32).
+        #[arg(long, value_name = "N")]
+        parallel: Option<usize>,
+        /// Hard cap on agents this run may start (default 100).
+        #[arg(long, value_name = "N")]
+        max_agents: Option<usize>,
+        /// Stop admitting new agents past this spend.
+        #[arg(long, value_name = "USD")]
+        max_cost: Option<f64>,
+        /// The script-visible `budget.total`, and a hard ceiling.
+        #[arg(long, value_name = "USD")]
+        budget: Option<f64>,
+        /// Journal directory (default: a new one under `~/.ccteam/runs/`).
+        #[arg(long, value_name = "DIR", conflicts_with = "resume")]
+        run_dir: Option<PathBuf>,
+        /// Continue the run in this directory, replaying its journal.
+        #[arg(long, value_name = "DIR")]
+        resume: Option<PathBuf>,
+        /// Abort a script that never yields after this many seconds (default: off).
+        #[arg(long, value_name = "SECS")]
+        watchdog: Option<u64>,
+        /// Attribute hires to this managed session in the delegation tree
+        /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions;
+        /// pass an empty string to disable the ambient default).
+        #[arg(long, value_name = "SID")]
+        parent: Option<String>,
+    },
+    /// Evaluate a finished run with a flow of your own: `ccteam flow eval <run-dir>`.
+    Eval {
+        /// A run directory, or the bare run id of one under `~/.ccteam/runs/`.
+        #[arg(value_name = "RUN")]
+        run: String,
+        /// Evaluator script (default: `.agents/flows/_eval.flow.js`, else
+        /// `~/.ccteam/flows/_eval.flow.js`).
+        #[arg(long, value_name = "SCRIPT")]
+        script: Option<PathBuf>,
+        /// Workspace slug (default: the project the cwd belongs to).
+        #[arg(long, value_name = "SLUG")]
+        project: Option<String>,
+        /// Stop admitting new agents past this spend.
+        #[arg(long, value_name = "USD")]
+        max_cost: Option<f64>,
+        /// Attribute hires to this managed session in the delegation tree
+        /// (default: `$CCTEAM_CHAT_SID`, present inside managed sessions).
+        #[arg(long, value_name = "SID")]
+        parent: Option<String>,
     },
 }
 
@@ -796,6 +883,47 @@ fn main() -> Result<()> {
             verify_mcp_json: json,
             repair_progress,
         }),
+        Command::Flow { cmd } => match cmd {
+            FlowCommand::Run {
+                script,
+                project,
+                args,
+                parallel,
+                max_agents,
+                max_cost,
+                budget,
+                run_dir,
+                resume,
+                watchdog,
+                parent,
+            } => flow::run(flow::FlowRunRequest {
+                script,
+                project,
+                args,
+                parallel,
+                max_agents,
+                max_cost,
+                budget,
+                run_dir,
+                resume,
+                watchdog,
+                parent,
+            }),
+            FlowCommand::New { name, dir } => flow::new_script(flow::FlowNewRequest { name, dir }),
+            FlowCommand::Eval {
+                run,
+                script,
+                project,
+                max_cost,
+                parent,
+            } => flow::eval(flow::FlowEvalRequest {
+                run,
+                script,
+                project,
+                max_cost,
+                parent,
+            }),
+        },
         Command::Config { args } => run_config(args),
     }
 }

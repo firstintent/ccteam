@@ -511,17 +511,24 @@ pub enum TurnInput {
 /// delivered.
 ///
 /// This is **user-turn routing**, not system-prompt injection: ccteam forwards
-/// the user's text unchanged through a vendor-native channel. Adapters report
-/// unsupported paths explicitly; where both are supported, an idle session
-/// starts a normal turn for either variant.
+/// the user's text unchanged through a vendor-native channel. The routing is
+/// the caller's PREFERENCE; [`TurnSubmission::disposition`] is what actually
+/// happened. An adapter that lacks the requested channel uses the one it has
+/// (a steer-only vendor injects a `Queue` request, a queue-only vendor queues
+/// an `Inject` request) and reports that truthfully, never cancels the active
+/// turn, and never refuses the message. An idle session starts a normal turn
+/// for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnRouting {
-    /// Merge the message into the active vendor turn at its next safe point.
-    /// Adapters without a native steer/interject channel may explicitly
-    /// degrade to [`TurnRouting::Queue`] rather than cancel the active turn.
+    /// Merge the message into the active vendor turn at its next safe point —
+    /// a human steering the work they are watching.
     Inject,
-    /// Preserve the message as a distinct FIFO follow-up turn.
+    /// Preserve the message as a distinct FIFO follow-up turn — a message
+    /// nobody is steering with, such as a ccteam-authored delegation
+    /// completion notification (issue #194: on claude a mid-turn stdin line is
+    /// shown to the model twice, once as a queued-command preview and once as
+    /// the next prompt; a distinct turn is charged once).
     Queue,
 }
 
@@ -989,6 +996,19 @@ pub fn format_tokens(n: u64) -> String {
 pub struct ThreadStatus {
     pub model: Option<String>,
     pub context: Option<ContextUsage>,
+    /// Which thread generation observed this ([`SpawnCtx::generation`]).
+    ///
+    /// `docs-local/issues/#14②` — `status.json` is keyed by SID, but a sid
+    /// outlives its threads, so an unstamped observation cannot say whether it
+    /// describes the thread running now or the one a `/role` switch retired.
+    /// Every writer stamps its own generation; readers compare. A late write
+    /// from a retired thread is then simply not selected, with no gating, no
+    /// abort ordering and no check/write race to lose.
+    ///
+    /// `None` = a file written before the stamp existed, or a spawn with no
+    /// generation. Treated as satisfying no pin — see `respawn_tuning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     /// Reasoning-effort level the model will actually run at (Claude Opus
     /// 4.6+ / Codex), e.g. `low` / `medium` / `high` / `xhigh` / `max`.
     /// `None` for builds/models without an effort axis. Default-skipped so
@@ -1022,6 +1042,36 @@ pub struct AccountUsage {
     pub weekly_severity: Option<String>,
     /// Pay-as-you-go extra-credit utilization (%), when enabled.
     pub credits_pct: Option<u8>,
+    /// PER-MODEL weekly windows the vendor meters separately from the shared
+    /// one (claude's `seven_day_opus` / `seven_day_sonnet`). Empty for a vendor
+    /// that meters one pool, which is why this is `default`-skipped: the
+    /// on-disk cache and every reader stay valid without it.
+    ///
+    /// Kept OUT of the flat `weekly_*` triple on purpose — the aggregate weekly
+    /// window and a model's own window are different facts, and a caller
+    /// choosing WHICH model to hire needs the one that constrains that model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_windows: Vec<ModelWindow>,
+}
+
+/// One model's own weekly rate-limit window, as the vendor meters it.
+///
+/// `model` is the vendor's own bucket name (claude: `opus` / `sonnet` — the
+/// suffix of its `seven_day_<model>` key), passed through verbatim: ccteam
+/// never maps it onto a model id it did not hear.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelWindow {
+    /// Vendor's model / bucket name, verbatim.
+    pub model: String,
+    /// Window utilization (%), 0-100. `None` when the vendor reported the
+    /// bucket with no number (never a fabricated 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pct: Option<u8>,
+    /// The vendor's own ISO-8601 reset time for THIS window; `None` when it
+    /// declared none (the cache then bounds the row by the weekly natural
+    /// length — see `usage_catalog::last_known_usage_in`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
 }
 
 /// One in-flight subagent / workflow task, reflected from the harness's OWN
@@ -1193,6 +1243,20 @@ pub struct ThreadErrorEvent {
 pub struct SpawnCtx {
     pub slug: String,
     pub sid: String,
+    /// Which THREAD of this sid is starting. A sid outlives any one thread —
+    /// a `/role` switch, a resume, a rebuild all re-spawn under the same sid —
+    /// and the gateway mints a fresh, monotonic generation for each.
+    ///
+    /// `docs-local/issues/#14②` — the adapter stamps it onto every
+    /// [`ThreadStatus`] it persists, so an observation says WHICH thread made
+    /// it. That is what lets a reader ignore a write from a retired thread
+    /// without having to stop it first: a late write is harmless by
+    /// construction rather than by winning a race against a shutdown.
+    ///
+    /// `0` = "no generation" (a spawn outside the gateway: tests, the flow
+    /// orchestrator). Such a stamp never satisfies a pin.
+    pub generation: u64,
+    // (see `generation_stamp` for the `0 → None` normalization every writer uses)
     /// Canonical owner tag for this session (`user:web-api`, `user:<id>`, or
     /// the IM owner tag). Adapters that need identity-scoped local resources
     /// consume this; other vendors ignore it.
@@ -1258,6 +1322,15 @@ pub struct SpawnCtx {
     /// location is a transport parameter, not an adapter branch). `None`
     /// (the overwhelming majority) = local spawn, unchanged.
     pub remote: Option<crate::execution::remote_exec::RemoteExecTarget>,
+}
+
+impl SpawnCtx {
+    /// This thread's generation as a [`ThreadStatus::generation`] stamp:
+    /// `None` for the `0` sentinel, so a spawn with no generation never
+    /// produces an observation that could satisfy a pin.
+    pub fn generation_stamp(&self) -> Option<u64> {
+        (self.generation != 0).then_some(self.generation)
+    }
 }
 
 /// V0.6.0 F107 — canonical [`UnifiedTokenUsage`] lives in `ccteam-cost`
@@ -2039,6 +2112,7 @@ mod tests {
     #[test]
     fn thread_status_suffix_combines_model_and_ctx() {
         let full = ThreadStatus {
+            generation: None,
             model: Some("claude-opus-4-8[1m]".into()),
             context: Some(ContextUsage::known(
                 188_000,
@@ -2090,6 +2164,7 @@ mod tests {
             context: None,
             effort: None,
             goal: None,
+            generation: None,
         };
         assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));
         // Default (statusless) → nothing to append.

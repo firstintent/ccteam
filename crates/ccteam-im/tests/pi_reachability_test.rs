@@ -90,7 +90,7 @@ async fn start_stub_mcp() -> (tokio::task::JoinHandle<()>, String) {
                     // The adapter refuses a partial tool set, so serve exactly
                     // the eight the bridge contract requires.
                     "tools/list" => serde_json::json!({
-                        "tools": ccteam_harness::PI_REQUIRED_MCP_TOOL_NAMES
+                        "tools": ccteam_harness::PI_KNOWN_MCP_TOOL_NAMES
                             .iter()
                             .map(|name| serde_json::json!({
                                 "name": name,

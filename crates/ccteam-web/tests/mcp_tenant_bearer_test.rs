@@ -9,7 +9,7 @@
 //! every process that vendor ever starts, so what it carries cannot say which
 //! caller is speaking. Measured: two `codex` runs in different repos
 //! authenticated as the same machine-wide caller, neither could be a delegation
-//! parent, and their `session_spawn` children mounted as ROOTS in a project
+//! parent, and their `agent` children mounted as ROOTS in a project
 //! nobody had named. A credential a static file can carry must therefore grant
 //! nothing by itself, so the tier it bought is deleted rather than narrowed. The
 //! console token keeps its own job: `/api/v1/**`, cookies, the SPA.
@@ -110,7 +110,7 @@ async fn the_web_token_family_is_refused_for_both_identities_and_every_method() 
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                               "params":{"name":"session_list","arguments":{}}}),
+                               "params":{"name":"agent_read","arguments":{}}}),
             serde_json::json!({"jsonrpc":"2.0","id":1,"method":"permission/ask","params":{}}),
         ] {
             let method = body["method"].as_str().unwrap().to_string();

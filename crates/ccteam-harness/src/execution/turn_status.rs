@@ -24,19 +24,24 @@ pub struct StatusIdentity<'a> {
     pub title: Option<&'a str>,
 }
 
-/// Render the compact, shared status line used by text surfaces.
+/// Render the compact, shared status line used by text surfaces:
+/// `→ slug/sid (role) · vendor · model · turn N · ctx P% · $cost 「title」`.
+/// Field order mirrors the web bubble footer (`HH:MM · vendor · sid · model ·
+/// turn N · ctx P%`), so a person reading both surfaces sees one shape; the
+/// IM line additionally carries slug / role / cost / title because an IM chat
+/// multiplexes many sessions.
 pub fn render_status_line(id: &StatusIdentity<'_>, st: &TurnStatus) -> String {
     let mut segments = vec![format!("→ {}/{}", id.slug, id.sid)];
     if !id.role.is_empty() {
         segments[0].push_str(&format!(" ({})", id.role));
     }
-    let model = st.model.as_deref().filter(|model| !model.is_empty());
-    match (id.vendor.is_empty(), model) {
-        (false, Some(model)) => segments.push(format!("{} {model}", id.vendor)),
-        (false, None) => segments.push(id.vendor.to_string()),
-        (true, Some(model)) => segments.push(model.to_string()),
-        (true, None) => {}
+    if !id.vendor.is_empty() {
+        segments.push(id.vendor.to_string());
     }
+    if let Some(model) = st.model.as_deref().filter(|model| !model.is_empty()) {
+        segments.push(model.to_string());
+    }
+    segments.push(format!("turn {}", st.turn));
     if let Some(context) = st.context.as_ref() {
         if let Some(pct) = context.pct() {
             let pct = pct.round() as u64;
@@ -44,7 +49,6 @@ pub fn render_status_line(id: &StatusIdentity<'_>, st: &TurnStatus) -> String {
             segments.push(format!("ctx {pct}%{warning}"));
         }
     }
-    segments.push(format!("turn {}", st.turn));
     if let Some(cost) = st.cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0) {
         let rendered = if cost > 0.0 && cost < 0.005 {
             "<0.01".to_string()
@@ -147,7 +151,7 @@ mod tests {
     fn renders_full_line() {
         assert_eq!(
             render_status_line(&id(), &status()),
-            "→ cct/s42 (reviewer) · codex gpt-5.3-codex · ctx 19% · turn 7 · $0.42"
+            "→ cct/s42 (reviewer) · codex · gpt-5.3-codex · turn 7 · ctx 19% · $0.42"
         );
     }
 

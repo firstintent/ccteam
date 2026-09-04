@@ -19,7 +19,7 @@ web 控制台的移植。
 | 面 | 面向谁 | 提供什么 |
 |---|---|---|
 | **工作台** | 使用 DSH Web 的人 | DSH 里的 ccteam 工作台：整页界面，含跨 harness 团队树、原生级会话（流式 Markdown、工具步骤、选择提示、附件、打断）和详情栏，入口是 DSH 自己侧栏底部的 ccteam 按钮。 |
-| **工具** | DSH 会话里的 agent（LLM） | 在 DSH 会话中注册 ccteam 的 8 个 MCP 工具，让 DSH agent 也能雇用与驱动团队其他成员。 |
+| **工具** | DSH 会话里的 agent（LLM） | 在 DSH 会话中注册 ccteam 的 6 个 MCP 工具，让 DSH agent 也能雇用与驱动团队其他成员。插件在加载时一次性注册，所以 DSH 会话永远看到完整一套；ccteam 按 caller 组合的工具面只作用于直连 `POST /mcp` 的 harness。 |
 | **传输** | ccteam | ccteam 雇用 DSH 会话所走的 ACP 通道。只有 profile 行里带 socket 路径时才启用，而那只有 ccteam 托管的运行时才会写。 |
 | **引擎** | 你 | ccteam daemon 本身：插件把 `ccteam` 二进制作为平台包一起带来，负责安装、启动，并在设置卡最上面给出「引擎」段（状态、版本、启动 / 停止 / 重启 / 更新引擎）。 |
 
@@ -72,7 +72,7 @@ https://raw.githubusercontent.com/firstintent/ccteam/main/install.sh | sh`，
 然后 `ccteam start`——见 [usage.md](usage.md)）。插件随后有三种来法：
 
 - **由 ccteam 物化（零步骤）。** 如果 DSH 是通过 ccteam 使用的——`/new dsh`、
-  ccteam 的 **DSH** 页面，或 `session_spawn` 传入 `vendor:"dsh"`——ccteam 会
+  ccteam 的 **DSH** 页面，或 `agent` 传入 `vendor:"dsh"`——ccteam 会
   把这个插件和对应凭据物化到你这个身份的 DSH 运行环境里。确认：DSH 侧栏底部
   出现 **ccteam** 按钮；ccteam 雇用的 DSH 会话能回答 `status` 工具调用。
 - **从 ccteam web 注册。** 管理员打开 **Settings → Hosts**，对检测到的本机

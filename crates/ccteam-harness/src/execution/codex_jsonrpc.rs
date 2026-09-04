@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -44,6 +45,11 @@ const NOTIFICATION_BUFFER: usize = 256;
 /// Outbound buffer size: how many JSONL frames may be queued by `call()`
 /// before backpressure. 64 is plenty — callers serialise per-turn.
 const WRITER_BUFFER: usize = 64;
+
+/// How long a SIGTERM'd app-server gets to exit on its own before SIGKILL.
+/// Measured on codex-cli 0.149: ~30 ms. The budget only matters for a wedged
+/// process.
+const CHILD_STOP_GRACE: Duration = Duration::from_secs(3);
 
 type Pending = HashMap<i64, oneshot::Sender<Result<Value, JsonRpcError>>>;
 
@@ -109,7 +115,12 @@ impl CodexJsonRpcClient {
             .arg("app-server")
             .arg("--listen")
             .arg("stdio://")
-            .kill_on_drop(true)
+            // Deliberately NOT `kill_on_drop`: tokio's drop signal is SIGKILL,
+            // which skips the app-server's own shutdown and orphans its
+            // `codex-code-mode-host` helper (measured). Termination is owned
+            // by [`Self::terminate_stdio_child`] and `Drop`: SIGTERM first,
+            // wait, SIGKILL only as the fallback (GitHub #189).
+            .kill_on_drop(false)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -165,8 +176,14 @@ impl CodexJsonRpcClient {
         }
     }
 
-    /// Terminate the stdio app-server child owned by this client.
-    /// UDS connections have no child here and return an error.
+    /// Terminate the stdio app-server child owned by this client and wait
+    /// until it is gone: SIGTERM first (the app-server shuts down cleanly in
+    /// tens of milliseconds — releasing every loaded thread's writer lock and
+    /// taking its `codex-code-mode-host` helper with it), SIGKILL only if it
+    /// is still alive after [`CHILD_STOP_GRACE`]. Returns once the process is
+    /// REAPED, so a caller that re-dials afterwards can never race the old
+    /// process for a thread's writer lock (GitHub #189). UDS
+    /// connections have no child here and return an error.
     pub async fn terminate_stdio_child(&self) -> Result<()> {
         let child = {
             let mut guard = self
@@ -178,11 +195,7 @@ impl CodexJsonRpcClient {
             };
             child
         };
-        let mut child = child;
-        child
-            .kill()
-            .await
-            .context("kill codex app-server stdio child")?;
+        stop_child(child, CHILD_STOP_GRACE).await;
         self._reader_task.abort();
         self._writer_task.abort();
         tokio::task::yield_now().await;
@@ -247,6 +260,47 @@ impl CodexJsonRpcClient {
             .await
             .with_context(|| format!("send jsonrpc notification {method}"))?;
         Ok(())
+    }
+}
+
+impl Drop for CodexJsonRpcClient {
+    /// A client dropped WITHOUT an explicit [`Self::terminate_stdio_child`]
+    /// (daemon shutdown, adapter torn down) still ends its child gracefully:
+    /// SIGTERM is sent synchronously — delivered even while the runtime is
+    /// shutting down and no task can run any more — and, when a runtime is
+    /// still available, a detached waiter reaps the child (SIGKILL fallback).
+    fn drop(&mut self) {
+        let child = self.child.get_mut().ok().and_then(|slot| slot.take());
+        let Some(child) = child else { return };
+        signal_term(&child);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(stop_child(child, CHILD_STOP_GRACE));
+        }
+    }
+}
+
+/// SIGTERM a still-running child. A pid that is already gone (ESRCH) or
+/// already reaped (`id() == None`) is silently fine.
+fn signal_term(child: &Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: `libc::kill` is FFI-safe with any pid / signal pair; a
+        // stale pid yields ESRCH, which is deliberately ignored.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+/// SIGTERM, wait up to `grace`, then SIGKILL — and always reap.
+async fn stop_child(mut child: Child, grace: Duration) {
+    signal_term(&child);
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        tracing::warn!(
+            ?grace,
+            "codex app-server child ignored SIGTERM within the grace period; sending SIGKILL"
+        );
+        let _ = child.kill().await;
     }
 }
 

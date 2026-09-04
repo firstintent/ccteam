@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { SessionStatus } from "./sessionsApi";
-import { contextPct, formatContext, formatStatusLine, formatTurnStatus, humanizeTokens } from "./statusLine";
+import { contextPct, formatContext, formatStatusLine, formatTurnStatus, humanizeTokens, formatElapsed } from "./statusLine";
 
 function status(over: Partial<SessionStatus> = {}): SessionStatus {
   return {
@@ -152,5 +152,16 @@ describe("formatTurnStatus", () => {
   it("omits unknown context and renders nothing without a status", () => {
     expect(formatTurnStatus({ turn: 2, tokens_total: 12_345 })).toEqual({ text: "turn 2", warn: false });
     expect(formatTurnStatus()).toBeNull();
+  });
+});
+
+describe("formatElapsed (GitHub #186 B)", () => {
+  it("renders m:ss under an hour and h:mm:ss past it", () => {
+    expect(formatElapsed(0)).toBe("0:00");
+    expect(formatElapsed(59_999)).toBe("0:59");
+    expect(formatElapsed(754_000)).toBe("12:34");
+    expect(formatElapsed(3_600_000 + 5_000)).toBe("1:00:05");
+    expect(formatElapsed(-10)).toBe("0:00");
+    expect(formatElapsed(Number.NaN)).toBe("0:00");
   });
 });

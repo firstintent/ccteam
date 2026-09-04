@@ -79,3 +79,26 @@ input_per_1m = 0.8
 cached_input_per_1m = 0.08
 cache_creation_per_1m = 1.0
 output_per_1m = 4.0
+
+# Claude 5 family — verified 2026-09-01 against the bundled claude-api
+# reference (cached 2026-06-24, platform.claude.com/docs pricing): input/
+# output are the published sheet; cache read = 0.1x input and cache write
+# (1h ephemeral) = 1.25x input, the same ratios every row above encodes.
+# OWNER-VERIFY before ship (LEDGER-1: prices are owner-checked).
+[models."claude-sonnet-5"]
+input_per_1m = 2.0
+cached_input_per_1m = 0.2
+cache_creation_per_1m = 2.5
+output_per_1m = 10.0
+
+[models."claude-opus-5"]
+input_per_1m = 5.0
+cached_input_per_1m = 0.5
+cache_creation_per_1m = 6.25
+output_per_1m = 25.0
+
+[models."claude-fable-5"]
+input_per_1m = 10.0
+cached_input_per_1m = 1.0
+cache_creation_per_1m = 12.5
+output_per_1m = 50.0

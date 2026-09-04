@@ -280,12 +280,28 @@ fn last_progress_event_ts(paths: &CcteamPaths, slug: &str) -> Option<DateTime<Ut
 ///
 /// Reads the flat `~/.ccteam/progress/<slug>.jsonl` file.
 pub fn collect_recent_events(paths: &CcteamPaths, slug: &str, n: usize) -> Result<Vec<Value>> {
-    let path = paths.progress_jsonl(slug);
-    read_tail_events(&path, n)
+    Ok(crate::journal::tail_valid(&paths.progress_jsonl(slug), n)?.events)
 }
 
-fn read_tail_events(path: &std::path::Path, n: usize) -> Result<Vec<Value>> {
-    Ok(crate::journal::tail_valid(path, n)?.events)
+/// Tail the newest `n` progress rows the caller KEEPS, reading at most
+/// `max_bytes` of the journal — the read for sparse row kinds (a handful of
+/// flow envelopes among thousands of chat and tool rows), where a window
+/// measured in file rows fills with noise and answers nothing about the rows
+/// asked for. Returns the kept rows oldest first, plus `has_more`: true when
+/// an (n+1)th kept row exists or the byte budget ran out before the file
+/// start — never inferred from `len() >= n` (s523 R2).
+pub fn collect_recent_events_where<F>(
+    paths: &CcteamPaths,
+    slug: &str,
+    n: usize,
+    max_bytes: u64,
+    pick: F,
+) -> Result<(Vec<Value>, bool)>
+where
+    F: FnMut(&[u8]) -> crate::journal::Pick<Value>,
+{
+    let tail = crate::journal::tail_select(&paths.progress_jsonl(slug), n, None, max_bytes, pick)?;
+    Ok((tail.events, tail.has_more))
 }
 
 // ---------------- V0.4.0 F67 WorkflowSummary ----------------

@@ -20,7 +20,7 @@ Installing it once gives you three faces and an engine supervisor:
 | Face | Audience | What it provides |
 |---|---|---|
 | **Workbench** | people using DSH Web | The ccteam workbench in DSH — a whole-page surface with the cross-harness team tree, a native-grade conversation (streaming Markdown, tool steps, choice prompts, attachments, interrupt) and a details column, opened with the ccteam button at the bottom of DSH’s own sidebar. |
-| **Tools** | DSH agents (the LLM) | The eight ccteam MCP tools inside DSH sessions, so a DSH agent can hire and drive the rest of the team. |
+| **Tools** | DSH agents (the LLM) | The six ccteam MCP tools inside DSH sessions, so a DSH agent can hire and drive the rest of the team. The plugin registers them once when it loads, so a DSH session always sees the full set — the per-caller tool face ccteam composes at connect time applies to harnesses that talk to `POST /mcp` directly. |
 | **Transport** | ccteam | The ACP server that lets ccteam hire DSH sessions. It arms itself only when the profile row carries a socket path, which only a ccteam-managed runtime writes. |
 | **Engine** | you | The ccteam daemon itself: the plugin ships the `ccteam` binary as a platform package, installs it, starts the daemon, and shows an **Engine** section (state, version, **Start / Stop / Restart / Update engine**) at the top of its settings card. |
 
@@ -83,7 +83,7 @@ then `ccteam start` — see [usage.md](usage.md)). Then get the plugin in one
 of three ways:
 
 - **Materialized by ccteam (zero steps).** When DSH runs *through* ccteam —
-  `/new dsh`, the ccteam **DSH** page, or `session_spawn` with
+  `/new dsh`, the ccteam **DSH** page, or `agent` with
   `vendor:"dsh"` — ccteam materializes the plugin and its credentials in your
   identity's DSH runtime. Check: the DSH sidebar has a **ccteam** button at
   its bottom, and a DSH session hired by ccteam can answer the `status` tool

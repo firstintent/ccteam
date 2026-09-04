@@ -6,7 +6,7 @@ faces, and every DSH profile that installs it gets all three:
 | Face | For | What it is |
 | --- | --- | --- |
 | **Workbench** | people using DSH Web | A cross-harness session tree, an embedded chat view and one-click spawn, reached from a native sidebar-footer button and rendered entirely with DSH's own UI primitives and design tokens. |
-| **Tools** | the DSH agent | The eight ccteam MCP tools, under their original names, so a DSH session can hire and drive the rest of the team. |
+| **Tools** | the DSH agent | The six ccteam MCP tools, under their original names, so a DSH session can hire and drive the rest of the team. |
 | **Transport** | ccteam | An ACP server on a unix socket, so ccteam can hire this runtime's sessions. Armed only when the profile's row carries `transportSocket`, which only a ccteam-managed runtime sets. |
 
 Built the way a DSH client plugin is built: `dsh.client` in package.json

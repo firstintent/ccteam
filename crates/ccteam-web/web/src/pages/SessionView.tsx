@@ -48,12 +48,13 @@ import {
   appendRow,
   historyToRows,
   loadRows,
+  mergeHistory,
   nextRowId,
   saveRows,
   type TranscriptRow,
 } from "./chatTranscript";
 import { railSessionLabel } from "./railHelpers";
-import { contextPct, formatTurnStatus } from "../lib/statusLine";
+import { contextPct, formatElapsed, formatTurnStatus } from "../lib/statusLine";
 
 function formatAttachmentSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -74,6 +75,41 @@ function rowTimeParts(ts: string, now: Date): { date: boolean; year: boolean } |
     date: when.toDateString() !== now.toDateString(),
     year: when.getFullYear() !== now.getFullYear(),
   };
+}
+
+/** Live "still working" line under the streaming cursor (GitHub #186
+ *  B): elapsed time since the turn was sent, ticking every second, plus the
+ *  clock time of the last frame this session emitted — so a turn whose only
+ *  visible activity is one long tool call still reads as alive, not stuck. */
+export function BusyHeartbeat({
+  since,
+  lastEventTs,
+  lang,
+}: {
+  since: number | null;
+  lastEventTs?: string;
+  lang: Lang;
+}) {
+  const t = makeT(lang);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const last = lastEventTs ? new Date(lastEventTs) : null;
+  const lastText =
+    last && !Number.isNaN(last.getTime())
+      ? last.toLocaleTimeString(lang === "en" ? "en-US" : "zh-CN", { hour12: false })
+      : null;
+  const parts: string[] = [];
+  if (since !== null) parts.push(`${t("busyElapsed")} ${formatElapsed(now - since)}`);
+  if (lastText) parts.push(`${t("busyLastEvent")} ${lastText}`);
+  if (parts.length === 0) return null;
+  return (
+    <span className="turn-status" data-testid="busy-heartbeat">
+      {parts.join(" · ")}
+    </span>
+  );
 }
 
 export function RowTime({ ts, lang }: { ts?: string; lang: Lang }) {
@@ -162,6 +198,8 @@ export default function SessionView({
   const [editingTitle, setEditingTitle] = useState(false);
   const [pendingTitle, setPendingTitle] = useState<string | null>(null);
   const [busyMark, setBusyMark] = useState<number | null>(null);
+  const [busySince, setBusySince] = useState<number | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
   const [statusModel, setStatusModel] = useState<string | null>(null);
   const [statusEffort, setStatusEffort] = useState<string | null>(null);
@@ -186,33 +224,53 @@ export default function SessionView({
     eventsRef.current = events;
   }, [events]);
 
-  // ---- authoritative seed: mirrored history (mount-scoped) -----------------
-  useEffect(() => {
-    let cancelled = false;
-    const request = ++historyRequestRef.current;
-    getHistory(sid)
-      .then((h) => {
-        if (cancelled || request !== historyRequestRef.current) return;
-        const seeded = historyToRows(h.events);
-        if (seeded.length > 0) setRows(seeded);
-        const latest = [...seeded].reverse().find((row) => row.kind === "assistant" && row.status);
-        if (latest?.status) {
-          setStatusModel(latest.status.model ?? null);
-          setCtxPct(contextPct(latest.status.context));
-        }
-        setHistoryPage({
-          hasMore: h.has_more === true,
-          nextBefore: h.next_before ?? null,
-          loadingEarlier: false,
+  // ---- authoritative seed: mirrored history -------------------------------
+  // ONE seed path for the mount, every reconnect and the retry button. The
+  // page is applied through `mergeHistory` on top of whatever the live
+  // stream delivered while the fetch was in flight (`barrier` = frames
+  // already buffered when the request left), so a reply that lands between
+  // the server's turns.jsonl read and our render is re-applied instead of
+  // being wiped by a plain `setRows(history)` — the GitHub #186
+  // "TG has the answer, web shows a bare completed turn" race — and an
+  // outstanding approval prompt survives a reseed. A failed fetch is SHOWN
+  // (`history-error` banner + retry), never silently left as stale rows.
+  const seedHistory = useCallback(
+    (replaceEmpty: boolean) => {
+      const request = ++historyRequestRef.current;
+      const barrier = eventsRef.current.length;
+      getHistory(sid)
+        .then((h) => {
+          if (request !== historyRequestRef.current) return;
+          const seeded = historyToRows(h.events);
+          const events = eventsRef.current;
+          if (seeded.length > 0 || replaceEmpty) {
+            setRows((current) => mergeHistory(current, seeded, events, barrier));
+            foldedRef.current = events.length;
+          }
+          const latest = [...seeded].reverse().find((row) => row.kind === "assistant" && row.status);
+          if (latest?.status) {
+            setStatusModel(latest.status.model ?? null);
+            setCtxPct(contextPct(latest.status.context));
+          }
+          setHistoryPage({
+            hasMore: h.has_more === true,
+            nextBefore: h.next_before ?? null,
+            loadingEarlier: false,
+          });
+          setHistoryError(null);
+        })
+        .catch((error) => {
+          if (request !== historyRequestRef.current) return;
+          setHistoryError(error instanceof Error ? error.message : String(error));
         });
-      })
-      .catch(() => {
-        /* best-effort — keep the localStorage rows (or empty) on error */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sid]);
+    },
+    [sid],
+  );
+
+  // Mount: the localStorage rows stay when the server has no history yet.
+  useEffect(() => {
+    seedHistory(false);
+  }, [seedHistory]);
 
   // The first successful open races the mount seed above, so epoch 1 needs no
   // second fetch. Every later open follows a real disconnect: the server's
@@ -220,26 +278,8 @@ export default function SessionView({
   // longer contains every missed answer.
   useEffect(() => {
     if (connectionEpoch <= 1) return;
-    let cancelled = false;
-    const request = ++historyRequestRef.current;
-    getHistory(sid)
-      .then((h) => {
-        if (cancelled || request !== historyRequestRef.current) return;
-        foldedRef.current = eventsRef.current.length;
-        setRows(historyToRows(h.events));
-        setHistoryPage({
-          hasMore: h.has_more === true,
-          nextBefore: h.next_before ?? null,
-          loadingEarlier: false,
-        });
-      })
-      .catch(() => {
-        /* best-effort — keep the current transcript on reseed failure */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sid, connectionEpoch]);
+    seedHistory(true);
+  }, [seedHistory, connectionEpoch]);
 
   const loadEarlier = useCallback(() => {
     if (!historyPage.hasMore || !historyPage.nextBefore || historyPage.loadingEarlier) return;
@@ -285,6 +325,7 @@ export default function SessionView({
   // ---- per-session status (model + effort + ctx%) --------------------------
   const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
   const busy = busyMark !== null && doneCount === busyMark;
+  const lastEventTs = events.length > 0 ? events[events.length - 1]?.ts : undefined;
   useEffect(() => {
     let cancelled = false;
     getSessionStatus(sid)
@@ -383,8 +424,10 @@ export default function SessionView({
       const shown = names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
       pushRow({ kind: "user", content: shown });
       setBusyMark(doneCount);
+      setBusySince(Date.now());
       submitTurn(sid, content, attachments).catch((e) => {
         setBusyMark(null);
+        setBusySince(null);
         const detail = e instanceof Error ? e.message : "unknown";
         pushRow({
           kind: "system",
@@ -486,7 +529,6 @@ export default function SessionView({
   const serverTitle = session ? railSessionLabel(session) : sid;
   const title = pendingTitle ?? serverTitle;
   const vendor = session?.vendor ?? "claude";
-  const who = `${vendor} · ${sid}${displayStatusModel ? ` · ${displayStatusModel}` : ""}`;
 
   // The conversation composer reflects this session's FIXED spawn parameters
   // (locked: picking toasts; /model via the input still works). What the live
@@ -604,6 +646,21 @@ export default function SessionView({
               data-testid="chat-scroll"
             >
               <div className="chat-inner">
+                {historyError ? (
+                  <div className="msg system" data-testid="history-error" role="alert">
+                    <div className="bubble">
+                      {t("historyLoadFailed")}: {historyError}{" "}
+                      <button
+                        type="button"
+                        className="btn ghost mini"
+                        data-testid="history-retry"
+                        onClick={() => seedHistory(false)}
+                      >
+                        {t("retry")}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 {historyPage.hasMore ? (
                   <button
                     type="button"
@@ -688,7 +745,6 @@ export default function SessionView({
                   // assistant — full Markdown document (红线: never plain text).
                   return (
                     <div key={row.id} className="msg agent fade-in">
-                      <span className="who">{who}</span>
                       <div className="bubble md">
                         {row.content ? <Markdown content={row.content} /> : null}
                         <OutboundAttachments
@@ -697,16 +753,21 @@ export default function SessionView({
                         />
                       </div>
                       {(() => {
-                        // One footer line: `HH:MM · s12 · turn N · ctx N%` — the
-                        // model already heads the bubble, the ledger lives on
-                        // the session pages.
+                        // ONE footer line, no bubble header:
+                        // `HH:MM · claude · s12 · <model> · turn N · ctx N%` —
+                        // identity + model + metrics once, in the order the IM
+                        // status line uses (`render_status_line`), so the two
+                        // surfaces read the same. The ledger lives on the
+                        // session pages.
                         const footer = formatTurnStatus(row.status);
-                        const tail = footer ? `${sid} · ${footer.text}` : null;
-                        if (!row.ts && !tail) return null;
+                        const model = row.status?.model || displayStatusModel;
+                        const tail = [vendor, sid, model, footer?.text]
+                          .filter((part): part is string => !!part)
+                          .join(" · ");
                         return (
                           <span className={`turn-status${footer?.warn ? " warn" : ""}`}>
                             <RowTime ts={row.ts} lang={lang} />
-                            {tail ? (row.ts ? ` · ${tail}` : tail) : null}
+                            {row.ts ? ` · ${tail}` : tail}
                           </span>
                         );
                       })()}
@@ -717,6 +778,7 @@ export default function SessionView({
                   <div className="msg agent" aria-label="生成中" data-testid="streaming-cursor">
                     <div className="bubble">
                       <span className="cursor" />
+                      <BusyHeartbeat since={busySince} lastEventTs={lastEventTs} lang={lang} />
                     </div>
                   </div>
                 ) : null}

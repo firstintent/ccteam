@@ -15,19 +15,23 @@ pub const BRIDGE_STATUS_KEY: &str = "ccteam.bridge";
 pub const PERMISSION_DIALOG_TITLE: &str = "__ccteam_permission_v1__";
 pub const MAX_PERMISSION_ENVELOPE_BYTES: usize = 64 * 1024;
 
-/// The managed-session surface expected from the daemon. The bridge itself
+/// Every ccteam MCP tool a managed session may be served. The bridge itself
 /// contains no copy of this list: it registers and reports what `tools/list`
-/// actually returned. This adapter-side set makes a partial daemon response a
-/// spawn failure, and the web `/mcp` integration test locks it to the server.
-pub const REQUIRED_MCP_TOOL_NAMES: &[&str] = &[
+/// actually returned. This adapter-side set turns an UNKNOWN name into a spawn
+/// failure, and the web `/mcp` integration test locks it to the server's full
+/// face.
+///
+/// It is a KNOWN set, not a required one: the daemon composes the face per
+/// caller, so a depth-capped or `tools:"read"` child legitimately sees a subset
+/// (and a `tools:"none"` child sees nothing at all). Demanding the full list
+/// would make exactly the sessions the face exists to slim down fail to start.
+pub const KNOWN_MCP_TOOL_NAMES: &[&str] = &[
     "status",
     "grok_claude_codex_kimi",
     "chat_send_file",
-    "session_spawn",
-    "session_dispatch",
-    "session_collect",
-    "session_list",
-    "session_stop",
+    "agent",
+    "agent_read",
+    "agent_stop",
 ];
 
 const BRIDGE_SOURCE: &str = include_str!("ccteam_bridge.mjs");
@@ -100,25 +104,31 @@ fn set_private_permissions(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Gate the names the bridge reported at `session_start`: no duplicates, and
+/// every name must be one ccteam actually ships. A SUBSET is valid (the daemon
+/// serves a per-caller face) and so is the EMPTY set (`agent{tools:"none"}`).
 pub fn validate_ready_names(names: &[String]) -> Result<(), String> {
     let actual: HashSet<&str> = names.iter().map(String::as_str).collect();
     if actual.len() != names.len() {
         return Err("Pi bridge reported duplicate tool names".to_string());
     }
-    let expected: HashSet<String> = REQUIRED_MCP_TOOL_NAMES
+    let known: HashSet<String> = KNOWN_MCP_TOOL_NAMES
         .iter()
         .map(|name| format!("ccteam_{name}"))
         .collect();
-    let actual: HashSet<String> = actual.into_iter().map(str::to_string).collect();
-    if actual != expected {
-        let mut actual: Vec<_> = actual.into_iter().collect();
-        let mut expected: Vec<_> = expected.into_iter().collect();
-        actual.sort();
-        expected.sort();
+    let mut unknown: Vec<&str> = actual
+        .iter()
+        .filter(|name| !known.contains(**name))
+        .copied()
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        let mut known: Vec<_> = known.into_iter().collect();
+        known.sort();
         return Err(format!(
-            "Pi bridge tool set mismatch: expected [{}], got [{}]",
-            expected.join(", "),
-            actual.join(", ")
+            "Pi bridge reported unknown ccteam tools [{}]; known: [{}]",
+            unknown.join(", "),
+            known.join(", ")
         ));
     }
     Ok(())
@@ -153,8 +163,7 @@ pub fn auto_allows_tool(tool_name: &str) -> bool {
             | "ls"
             | "ccteam_status"
             | "ccteam_grok_claude_codex_kimi"
-            | "ccteam_session_list"
-            | "ccteam_session_collect"
+            | "ccteam_agent_read"
     )
 }
 
@@ -241,7 +250,7 @@ mod tests {
         ] {
             assert!(!bridge_source().contains(forbidden), "found {forbidden}");
         }
-        for name in REQUIRED_MCP_TOOL_NAMES {
+        for name in KNOWN_MCP_TOOL_NAMES {
             assert!(
                 !bridge_source().contains(&format!("\"{name}\"")),
                 "bridge must discover `{name}` from tools/list"
@@ -251,12 +260,19 @@ mod tests {
     }
 
     #[test]
-    fn ready_gate_uses_names_not_a_count() {
-        let names = REQUIRED_MCP_TOOL_NAMES
+    fn ready_gate_accepts_any_subset_of_the_known_face_and_rejects_strangers() {
+        let names = KNOWN_MCP_TOOL_NAMES
             .iter()
             .map(|name| format!("ccteam_{name}"))
             .collect::<Vec<_>>();
         validate_ready_names(&names).unwrap();
-        assert!(validate_ready_names(&names[..names.len() - 1]).is_err());
+        // A per-caller face is a SUBSET — a depth-capped child gets one tool,
+        // and a `tools:"none"` child gets none. Both are ready.
+        validate_ready_names(&names[..1]).unwrap();
+        validate_ready_names(&[]).unwrap();
+        // A name ccteam does not ship is a wiring bug, not a slim face.
+        assert!(validate_ready_names(&["ccteam_session_spawn".to_string()]).is_err());
+        // Duplicates still fail.
+        assert!(validate_ready_names(&[names[0].clone(), names[0].clone()]).is_err());
     }
 }

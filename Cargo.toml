@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.5"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -77,6 +77,17 @@ async-trait = "0.1"
 # V0.6.0 F107 — `BoxStream<'static, ThreadEvent>` return for the
 # events() trait method.
 futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# Dynamic-workflow runner (ccteam-flow): an embedded QuickJS interpreter is the
+# only way to give workflow authors real JavaScript control flow (loops,
+# conditionals, top-level await) while keeping the host in charge of every
+# side effect. `futures` wires async host functions (each `agent()` is an A2A
+# hire that awaits a real session turn); `parallel` adds the Send/Sync bounds
+# so a run future can be `tokio::spawn`ed by the daemon later. Default
+# features are off on purpose: no module loader, no dynamic library loading,
+# no `chrono` — a workflow script must not be able to reach the filesystem,
+# the network, or the wall clock.
+rquickjs = { version = "0.12", default-features = false, features = ["std", "futures", "parallel"] }
 
 # Lark/Feishu WebSocket long-connection frame codec (pbbp2.proto).
 # The `derive` feature is on by default and powers `#[derive(prost::Message)]`

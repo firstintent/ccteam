@@ -40,7 +40,7 @@
 //!
 //! Both entries are named `ccteam` — they must be, because the server name is
 //! the tool-name prefix every agent-facing contract is written against
-//! (`mcp__ccteam__*`; grok's own `ccteam__session_list`). So on every dialect
+//! (`mcp__ccteam__*`; grok's own `ccteam__agent_read`). So on every dialect
 //! the projection below is a same-name collision with the machine credential,
 //! and who wins is decided by the vendor, not by ccteam:
 //!

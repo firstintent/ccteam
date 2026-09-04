@@ -31,7 +31,7 @@
 //! session is DOING (`working|idle|stale|stuck`, resolved through the shared
 //! [`super::sessions_api::ProjectActivity`] — the same
 //! `ccteam_core::stall::classify_session_activity` the session rail, IM
-//! `/status` and MCP `session_list` answer through; `detached` keeps its own
+//! `/status` and MCP `agent_read` answer through; `detached` keeps its own
 //! word). `residency` says whether ccteam is HOLDING a process for it
 //! (`resident|released|stopped|detached|external`).
 //!
@@ -517,7 +517,9 @@ mod tests {
         depth: u32,
     ) {
         let mut m = ccteam_harness::SessionMeta {
+            model_pinned_generation: None,
             mode: None,
+            tool_face: None,
             managed_by: Default::default(),
             stopped_at: None,
             sid: sid.to_string(),
@@ -630,6 +632,7 @@ mod tests {
             SessionView {
                 driveable: true,
                 detached: None,
+                context_pct: None,
                 sid: "s1".to_string(),
                 project: "demo".to_string(),
                 role: "brain".to_string(),
@@ -722,6 +725,7 @@ mod tests {
             SessionView {
                 driveable: true,
                 detached: None,
+                context_pct: None,
                 sid: "s1".to_string(),
                 project: "demo".to_string(),
                 role: "brain".to_string(),

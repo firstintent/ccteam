@@ -34,7 +34,7 @@ pub mod spawn_spec;
 pub mod translate;
 pub mod transport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -108,6 +108,29 @@ struct LiveSession {
     /// Adapter-local vendor-turn occupancy for truthful Started vs Injected
     /// submission receipts. Set before writing input; cleared on TurnResult.
     active_turn: Arc<AtomicBool>,
+    /// Input lines that arrived while a turn was in flight and must NOT be
+    /// written mid-turn — verbatim, FIFO, one queue for two shapes:
+    /// - vendor slash commands (`/goal`, `/compact`, …): Claude parses a slash
+    ///   line only when idle; mid-turn it is a steer the MODEL reads as prose
+    ///   (issue #193: `/goal …` typed while the planner was working surfaced as
+    ///   "the user sent a new message");
+    /// - `TurnRouting::Queue` user text — a ccteam-authored follow-up such as a
+    ///   delegation completion notification: claude shows a mid-turn stdin line
+    ///   to the model TWICE, as a `queued_command` preview inside the running
+    ///   turn and again as the prompt of the next one (issue #194: every
+    ///   completion report charged the orchestrator double), so it waits for
+    ///   the boundary and becomes exactly one turn.
+    ///
+    /// The status tap writes the next line the moment a `result` closes the
+    /// turn, so a command lands where the CLI executes it and a notification
+    /// is read once. Mirrored to `deferred-input.json` in the session's chat
+    /// dir ([`persist_deferred_input`]) so a daemon restart mid-turn does not
+    /// lose what was parked: the next `start_thread` of the same sid reloads
+    /// it, and the tap flushes it after that life's first `result` — the
+    /// message that triggered the resume runs first, as its own turn, and what
+    /// was parked follows in order. A line leaves the queue only once it has
+    /// been written to the CLI; the disk copy follows the write.
+    deferred_input: Arc<StdMutex<VecDeque<String>>>,
 }
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -219,9 +242,10 @@ fn spawn_status_tap(
     status: Arc<StdMutex<ThreadStatus>>,
     running_tasks: Arc<StdMutex<TaskTracker>>,
     active_turn: Arc<AtomicBool>,
+    deferred_input: Arc<StdMutex<VecDeque<String>>>,
     project_dir: PathBuf,
     sid: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
         // v0.8.20 — throttle the mid-turn context refresh so `/sessions` tracks
@@ -324,7 +348,80 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
-                        active_turn.store(false, Ordering::Release);
+                        // Clear occupancy and claim the next deferred input
+                        // line (a slash command, issue #193; a queued turn,
+                        // issue #194) under ONE lock, so a submission racing
+                        // this `result` either sees the turn still open (→
+                        // parked, popped right here) or already closed (→
+                        // written directly) — never parked behind a turn that
+                        // has already ended.
+                        let next = match deferred_input.lock() {
+                            Ok(mut q) => {
+                                active_turn.store(false, Ordering::Release);
+                                let next = q.pop_front();
+                                if next.is_some() {
+                                    active_turn.store(true, Ordering::Release);
+                                }
+                                next
+                            }
+                            Err(_) => {
+                                active_turn.store(false, Ordering::Release);
+                                None
+                            }
+                        };
+                        if let Some(line) = next {
+                            // Each deferred line starts its own turn; the rest
+                            // of the queue waits for the next `result`. A line
+                            // leaves the queue only once it is written: on a
+                            // failed write (the child is gone) it goes back to
+                            // the front, and the on-disk mirror — which still
+                            // holds it — is what the next life of this sid
+                            // reloads. The mirror follows a successful write,
+                            // so a crash in between replays the line (at-
+                            // least-once), never loses it.
+                            match transport.send_line(protocol::user_text_line(&line)).await {
+                                Ok(()) => {
+                                    let rest = deferred_input.lock().map(|q| q.clone()).ok();
+                                    if let Some(rest) = rest {
+                                        if let Err(error) =
+                                            persist_deferred_input(&project_dir, &sid, &rest)
+                                        {
+                                            tracing::warn!(
+                                                session = %sid,
+                                                %error,
+                                                "stream-json: deferred input mirror was not updated"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    // Back to the front — and the mirror re-synced
+                                    // under the same lock: a park that landed while
+                                    // this write was in flight persisted a queue
+                                    // WITHOUT this line, and the next life of the sid
+                                    // reloads only what is on disk.
+                                    if let Ok(mut q) = deferred_input.lock() {
+                                        q.push_front(line.clone());
+                                        if let Err(error) =
+                                            persist_deferred_input(&project_dir, &sid, &q)
+                                        {
+                                            tracing::warn!(
+                                                session = %sid,
+                                                %error,
+                                                "stream-json: deferred input mirror was not re-synced"
+                                            );
+                                        }
+                                    }
+                                    active_turn.store(false, Ordering::Release);
+                                    tracing::warn!(
+                                        session = %sid,
+                                        %error,
+                                        line = %line,
+                                        "stream-json: deferred input was not delivered; kept for the next life"
+                                    );
+                                }
+                            }
+                        }
                         effort_probed_this_turn = false;
                         // The turn ended — BLOCKING tasks cannot still be running,
                         // so drop them as a safety net in case a terminal task
@@ -409,7 +506,71 @@ fn spawn_status_tap(
                 }
             }
         }
-    });
+    })
+}
+
+/// `<project>/.ccteam/chat/<sid>/deferred-input.json` — the on-disk mirror of
+/// [`LiveSession::deferred_input`]: a JSON array of the parked lines, oldest
+/// first. Absent when nothing is parked.
+fn deferred_input_path(project_dir: &Path, sid: &str) -> PathBuf {
+    super::turns_mirror::chat_dir(project_dir, sid).join("deferred-input.json")
+}
+
+/// Mirror the parked queue to disk (the file is removed when the queue is
+/// empty). Callers decide what a failure means: a parked notification must be
+/// durable before it is accepted (the notifier spends the child's watch on the
+/// acceptance), a slash command or a post-write update is best-effort.
+fn persist_deferred_input(
+    project_dir: &Path,
+    sid: &str,
+    queue: &VecDeque<String>,
+) -> anyhow::Result<()> {
+    let path = deferred_input_path(project_dir, sid);
+    if queue.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
+    }
+    let lines: Vec<&String> = queue.iter().collect();
+    std::fs::create_dir_all(path.parent().expect("chat dir has a parent"))?;
+    let bytes = serde_json::to_vec(&lines)?;
+    super::fs_atomic::atomic_write_durable(&path, &bytes)
+}
+
+/// The parked lines a previous process life of this sid left behind
+/// (missing or unreadable → empty).
+fn load_deferred_input(project_dir: &Path, sid: &str) -> VecDeque<String> {
+    std::fs::read(deferred_input_path(project_dir, sid))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .map(VecDeque::from)
+        .unwrap_or_default()
+}
+
+/// Adapter-side correlation id for one accepted user line (the pump keys
+/// `turns.jsonl` off its own sequence; this id only serves logs and the
+/// gateway's per-input bookkeeping).
+fn synthetic_turn_id() -> TurnId {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    TurnId::new(format!("turn-{nanos:x}"))
+}
+
+/// Receipt for a vendor slash command parked behind the in-flight turn
+/// (issue #193). Says WHEN it runs so the user does not mistake the wait
+/// for a silent drop; `position` > 1 means others are queued ahead of it.
+fn deferred_slash_receipt(line: &str, position: usize) -> String {
+    let ahead = if position > 1 {
+        format!("（前面还有 {} 条排队）", position - 1)
+    } else {
+        String::new()
+    };
+    format!(
+        "⏳ `{line}` 已排队{ahead}：会话正在执行当前 turn，Claude 只在空闲时解析斜杠命令（turn 中发出会被当作普通文本交给模型），当前 turn 结束后自动执行。"
+    )
 }
 
 /// True for a task that legitimately OUTLIVES the turn that spawned it, so the
@@ -607,7 +768,13 @@ async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::Acc
     if body.subtype != "success" {
         return None;
     }
-    let resp = body.response.as_ref()?;
+    parse_get_usage_response(body.response.as_ref()?)
+}
+
+/// The `get_usage` response body → [`crate::AccountUsage`]. Pure, so the wire
+/// shape is testable without a live child (the transport half above is the
+/// only part that needs one).
+fn parse_get_usage_response(resp: &serde_json::Value) -> Option<crate::AccountUsage> {
     let rl = resp.get("rate_limits");
     let five = rl.and_then(|r| r.get("five_hour"));
     let seven = rl.and_then(|r| r.get("seven_day"));
@@ -643,12 +810,109 @@ async fn get_account_usage(transport: &StreamJsonTransport) -> Option<crate::Acc
         weekly_resets_at: resets(seven),
         weekly_severity,
         credits_pct: pct(extra),
+        model_windows: model_windows(rl),
     };
     if usage == crate::AccountUsage::default() {
         None
     } else {
         Some(usage)
     }
+}
+
+/// Per-model weekly windows out of the `rate_limits` object.
+///
+/// Claude meters some models on their OWN weekly clock, and spells that three
+/// different ways depending on build + server feature flag. All three are read,
+/// most-specific first, and the first that yields rows wins — they describe the
+/// same fact, so merging them would double-count it:
+///
+/// 1. `rate_limits.model_scoped: [{display_name, utilization, resets_at}]` —
+///    the current, server-gated shape. `resets_at` is already ISO-8601 (the CLI
+///    converts the epoch before emitting) and `utilization` is 0-100.
+/// 2. Fixed siblings `rate_limits.seven_day_{opus,sonnet}` — the same
+///    `{utilization, resets_at}` shape as the shared `seven_day` window.
+/// 3. `rate_limits.limits[]` entries with `kind == "weekly_scoped"`:
+///    `{scope: {model: {display_name}}, percent, resets_at}`.
+///
+/// The model name is whatever the vendor called it (`display_name`, e.g.
+/// `"Fable"`), passed through verbatim — ccteam never maps a vendor bucket onto
+/// a model id, because they are not the same namespace.
+fn model_windows(rate_limits: Option<&serde_json::Value>) -> Vec<crate::ModelWindow> {
+    let Some(rl) = rate_limits else {
+        return Vec::new();
+    };
+    let row = |model: Option<&str>, pct: Option<u8>, resets_at: Option<String>| {
+        let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+        // A bucket the vendor named but reported nothing about is not a fact.
+        (pct.is_some() || resets_at.is_some()).then(|| crate::ModelWindow {
+            model: model.to_string(),
+            pct,
+            resets_at,
+        })
+    };
+    let pct_of = |v: &serde_json::Value, key: &str| {
+        v.get(key)
+            .and_then(|v| v.as_f64())
+            .map(|f| f.round().clamp(0.0, 100.0) as u8)
+    };
+    let resets_of = |v: &serde_json::Value| {
+        v.get("resets_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+
+    // (1) the declared per-model array.
+    if let Some(entries) = rl.get("model_scoped").and_then(|v| v.as_array()) {
+        let rows: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                row(
+                    entry.get("display_name").and_then(|v| v.as_str()),
+                    pct_of(entry, "utilization"),
+                    resets_of(entry),
+                )
+            })
+            .collect();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+
+    // (2) the fixed per-model siblings of the shared weekly window.
+    let rows: Vec<_> = [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")]
+        .iter()
+        .filter_map(|(key, model)| {
+            let window = rl.get(key)?;
+            row(
+                Some(model),
+                pct_of(window, "utilization"),
+                resets_of(window),
+            )
+        })
+        .collect();
+    if !rows.is_empty() {
+        return rows;
+    }
+
+    // (3) the raw `limits[]` feed, model-scoped entries only.
+    rl.get("limits")
+        .and_then(|v| v.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("weekly_scoped"))
+                .filter_map(|entry| {
+                    row(
+                        entry
+                            .pointer("/scope/model/display_name")
+                            .and_then(|v| v.as_str()),
+                        pct_of(entry, "percent"),
+                        resets_of(entry),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The reasoning-effort levels claude accepts (Opus 4.6+), low→high. Mirrors
@@ -1361,25 +1625,43 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             effort: None,
             // Goal is read from the transcript on `thread_status`, not the tap.
             goal: None,
+            // Stamp this THREAD, so every observation the tap persists says
+            // which one made it (`docs-local/issues/#14②`). Seeded once here:
+            // the tap and the `/model` handler both clone this shared status,
+            // so no writer has to remember.
+            generation: ctx.generation_stamp(),
         }));
         // v0.8.20 `/status` — the live running-subagent/workflow list, kept
         // current by the SAME status tap from claude's `system:task_*` events.
         let running_tasks: Arc<StdMutex<TaskTracker>> =
             Arc::new(StdMutex::new(TaskTracker::default()));
         let active_turn = Arc::new(AtomicBool::new(false));
+        // Whatever a previous process life parked behind a turn it never got
+        // to finish (daemon restart mid-turn) is still owed to this sid. It is
+        // NOT written here: the message that resumed the session is about to be
+        // submitted and deserves a clean turn of its own (an eager replay would
+        // turn it into a steer of a stale notification's turn); the status tap
+        // flushes the parked lines after that turn's `result`, in order.
+        let deferred_input: Arc<StdMutex<VecDeque<String>>> = Arc::new(StdMutex::new(
+            load_deferred_input(&ctx.project_dir, &ctx.sid),
+        ));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
         // show model + context% as the session burns context; ALSO reflect the
         // `system:task_*` lifecycle into `running_tasks` for `/status`.
-        spawn_status_tap(
+        // The transport owns the tap's handle so closing one stops the other —
+        // a tap outliving its transport would write the NEXT thread's
+        // `status.json` (see `StreamJsonTransport::status_task`).
+        transport.attach_status_task(spawn_status_tap(
             Arc::clone(&transport),
             Arc::clone(&status),
             Arc::clone(&running_tasks),
             Arc::clone(&active_turn),
+            Arc::clone(&deferred_input),
             ctx.project_dir.clone(),
             ctx.sid.clone(),
-        );
+        ));
         // HITL: only a hitl session (`--permission-prompt-tool stdio`) ever
         // receives `can_use_tool` reverse RPCs. Spawn the dispatcher that
         // resolves each via the wired resolver (→ IM approve/deny) and
@@ -1446,7 +1728,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             status,
             running_tasks,
             active_turn,
+            deferred_input,
         };
+        let live = Arc::new(live);
         // Body record lifecycle: the record written at spawn is cleared the
         // moment THIS daemon observes the child's exit (stdout EOF). A
         // `detach` (daemon shutdown) closes the transport too, but leaves the
@@ -1465,7 +1749,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         self.live
             .lock()
             .unwrap()
-            .insert(uuid.clone(), Arc::new(live));
+            .insert(uuid.clone(), Arc::clone(&live));
 
         tracing::info!(
             event = "stream_json_started",
@@ -1516,11 +1800,6 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         input: TurnInput,
         routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
-        if routing == TurnRouting::Queue {
-            return Err(HarnessError::NotImplemented {
-                reason: "claude stream-json does not expose a distinct queued-turn channel".into(),
-            });
-        }
         let Some(live) = self.lookup(&h.identity) else {
             // Registry miss = the session was idle-released / closed: nothing was
             // sent, so this is a recoverable ThreadDied (caller resumes + retries
@@ -1546,6 +1825,48 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 format!("Tool result for {call_id}: {body}")
             }
         };
+        if routing == TurnRouting::Queue {
+            // A distinct follow-up turn was asked for (a ccteam-authored
+            // delegation completion notification). Mid-turn, claude shows a
+            // stdin line to the model TWICE — as a `queued_command` preview
+            // inside the running turn, then again as the next prompt (issue
+            // #194: every completion report charged the orchestrator double)
+            // — so park it and let the status tap write it right after this
+            // turn's `result`, where it is read exactly once. Idle, the same
+            // line simply starts a turn below. Check-and-park under the queue
+            // lock, like the slash path: the tap clears `active_turn` and pops
+            // under the same lock, so this never parks behind a turn that has
+            // already ended.
+            //
+            // Durable BEFORE it is accepted: the delegation notifier spends the
+            // child's watch on this Ok, so a parked line that only lived in
+            // memory would turn a daemon crash into a lost notification. The
+            // mirror is written under the queue lock (the tap cannot flush the
+            // line in between); if the disk refuses, the line is taken back
+            // and written now instead — read twice by claude, never lost.
+            let parked = match live.deferred_input.lock() {
+                Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
+                    queue.push_back(text.clone());
+                    match persist_deferred_input(&live.project_dir, &live.identity.sid, &queue) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            queue.pop_back();
+                            tracing::warn!(
+                                session = %live.identity.sid,
+                                %error,
+                                "stream-json: queued turn could not be mirrored to disk; \
+                                 writing it mid-turn instead"
+                            );
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if parked {
+                return Ok(TurnSubmission::queued(synthetic_turn_id()));
+            }
+        }
         let was_active = live.active_turn.swap(true, Ordering::AcqRel);
         if let Err(error) = live
             .transport
@@ -1561,13 +1882,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             )));
         }
 
-        // Synthesize a turn id (the pump keys turns.jsonl off its own seq;
-        // this id is only for adapter-side correlation / logs).
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let turn_id = TurnId::new(format!("turn-{nanos:x}"));
+        let turn_id = synthetic_turn_id();
         if was_active {
             Ok(TurnSubmission::injected(turn_id))
         } else {
@@ -1983,6 +2298,42 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 } else {
                     format!("/{name} {}", d.args.trim())
                 };
+                // Mid-turn, the CLI would hand this line to the model as a
+                // steer instead of executing it (issue #193) — park it until
+                // the turn's `result` and say so, rather than letting the
+                // command silently degrade into prose.
+                // Check-and-park under the queue lock: the status tap clears
+                // `active_turn` and pops under the same lock, so this can never
+                // park behind a turn that has already ended.
+                if let Some(live) = self.lookup(&h.identity) {
+                    let parked = match live.deferred_input.lock() {
+                        Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
+                            queue.push_back(line.clone());
+                            // Best-effort mirror: a slash command is not an
+                            // at-least-once contract, so a disk refusal keeps
+                            // it parked in memory rather than degrading it
+                            // into prose (issue #193).
+                            if let Err(error) = persist_deferred_input(
+                                &live.project_dir,
+                                &live.identity.sid,
+                                &queue,
+                            ) {
+                                tracing::warn!(
+                                    session = %live.identity.sid,
+                                    %error,
+                                    "stream-json: deferred slash command was not mirrored to disk"
+                                );
+                            }
+                            Some(queue.len())
+                        }
+                        _ => None,
+                    };
+                    if let Some(position) = parked {
+                        return Ok(DirectiveOutcome::Done {
+                            receipt: deferred_slash_receipt(&line, position),
+                        });
+                    }
+                }
                 let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
                 Ok(DirectiveOutcome::Turn(turn))
             }
@@ -2027,6 +2378,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     context: p.context,
                     effort: l.effort.or(p.effort),
                     goal: None,
+                    // The LIVE thread is the one being described here.
+                    generation: l.generation.or(p.generation),
                 },
                 (Some(l), None) => l,
                 (None, Some(p)) => p,
@@ -2129,6 +2482,155 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
 }
 
 #[cfg(test)]
+mod account_usage_tests {
+    use super::parse_get_usage_response;
+    use serde_json::json;
+
+    /// The `get_usage` response for a Max account whose server DOES send the
+    /// declared per-model array. Key set pinned against a live claude 2.1.245.
+    fn live_shaped_response() -> serde_json::Value {
+        json!({
+            "subscription_type": "max",
+            "rate_limits": {
+                "five_hour": {"utilization": 8.2, "resets_at": "2026-08-31T14:00:00Z"},
+                "seven_day": {"utilization": 23.4, "resets_at": "2026-09-03T00:00:00Z"},
+                "model_scoped": [
+                    {"display_name": "Fable", "utilization": 16.0, "resets_at": "2026-09-03T00:00:00Z"},
+                    {"display_name": "Sonnet", "utilization": 4.4, "resets_at": "2026-09-03T00:00:00Z"}
+                ],
+                "extra_usage": {"utilization": 3.0},
+                "limits": [{"group": "weekly", "severity": "warning"}]
+            }
+        })
+    }
+
+    #[test]
+    fn reads_every_window_including_the_per_model_ones() {
+        let usage = parse_get_usage_response(&live_shaped_response()).expect("a real observation");
+        assert_eq!(usage.subscription.as_deref(), Some("max"));
+        assert_eq!(usage.five_hour_pct, Some(8));
+        assert_eq!(
+            usage.five_hour_resets_at.as_deref(),
+            Some("2026-08-31T14:00:00Z")
+        );
+        assert_eq!(usage.weekly_pct, Some(23));
+        assert_eq!(usage.credits_pct, Some(3));
+
+        // Per-model rows carry the vendor's OWN display name, verbatim and in
+        // the order it listed them.
+        let rows: Vec<(&str, Option<u8>)> = usage
+            .model_windows
+            .iter()
+            .map(|w| (w.model.as_str(), w.pct))
+            .collect();
+        assert_eq!(rows, vec![("Fable", Some(16)), ("Sonnet", Some(4))]);
+        assert_eq!(
+            usage.model_windows[0].resets_at.as_deref(),
+            Some("2026-09-03T00:00:00Z")
+        );
+    }
+
+    /// Without the server-gated array, the fixed `seven_day_<model>` siblings
+    /// carry the same fact — and only one of the two spellings is ever read, so
+    /// a build that sends both cannot double-count.
+    #[test]
+    fn falls_back_to_the_fixed_per_model_siblings() {
+        let usage = parse_get_usage_response(&json!({
+            "rate_limits": {
+                "seven_day": {"utilization": 23.0},
+                "seven_day_opus": {"utilization": 61.0, "resets_at": "2026-09-03T00:00:00Z"},
+                "seven_day_sonnet": {"utilization": 2.0}
+            }
+        }))
+        .unwrap();
+        let rows: Vec<(&str, Option<u8>)> = usage
+            .model_windows
+            .iter()
+            .map(|w| (w.model.as_str(), w.pct))
+            .collect();
+        assert_eq!(rows, vec![("Opus", Some(61)), ("Sonnet", Some(2))]);
+
+        // The declared array wins when both are present.
+        let both = parse_get_usage_response(&json!({
+            "rate_limits": {
+                "model_scoped": [{"display_name": "Fable", "utilization": 9.0}],
+                "seven_day_opus": {"utilization": 61.0}
+            }
+        }))
+        .unwrap();
+        assert_eq!(both.model_windows.len(), 1);
+        assert_eq!(both.model_windows[0].model, "Fable");
+    }
+
+    /// Last resort: the raw `limits[]` feed. Only `weekly_scoped` entries are
+    /// per-model; anything else there describes the shared pool.
+    #[test]
+    fn falls_back_to_the_scoped_limits_feed() {
+        let usage = parse_get_usage_response(&json!({
+            "rate_limits": {
+                "limits": [
+                    {"kind": "weekly", "percent": 23.0},
+                    {
+                        "kind": "weekly_scoped",
+                        "scope": {"model": {"display_name": "Fable"}},
+                        "percent": 71.0,
+                        "resets_at": "2026-09-03T00:00:00Z"
+                    }
+                ]
+            }
+        }))
+        .expect("a scoped entry alone is worth reporting");
+        assert_eq!(usage.model_windows.len(), 1);
+        assert_eq!(usage.model_windows[0].model, "Fable");
+        assert_eq!(usage.model_windows[0].pct, Some(71));
+    }
+
+    /// An account metered as ONE pool reports no per-model rows — the list is
+    /// empty, never invented from the shared weekly window.
+    #[test]
+    fn a_single_pool_account_gets_no_model_rows() {
+        let usage = parse_get_usage_response(&json!({
+            "subscription_type": "pro",
+            "rate_limits": {"five_hour": {"utilization": 1.0}}
+        }))
+        .unwrap();
+        assert!(usage.model_windows.is_empty());
+    }
+
+    /// Fail-closed on every shape that says nothing: a named-but-empty bucket
+    /// is not a row, a nameless one is never emitted, and a response with no
+    /// numbers at all is `None` (the caller keeps whatever it knew before).
+    #[test]
+    fn refuses_to_invent_rows_from_an_empty_answer() {
+        assert!(parse_get_usage_response(&json!({})).is_none());
+        assert!(parse_get_usage_response(&json!({"rate_limits": {}})).is_none());
+        assert!(parse_get_usage_response(&json!({
+            "rate_limits": {"seven_day_opus": {}, "model_scoped": [{"utilization": 5.0}]}
+        }))
+        .is_none());
+        assert!(parse_get_usage_response(&json!({
+            "rate_limits": {"limits": [{"kind": "weekly_scoped", "percent": 5.0}]}
+        }))
+        .is_none());
+    }
+
+    /// A per-model bucket is a real observation on its own: an account whose
+    /// shared windows are absent still reports that model's headroom.
+    #[test]
+    fn a_model_only_answer_is_still_an_observation() {
+        let usage = parse_get_usage_response(&json!({
+            "rate_limits": {"model_scoped": [
+                {"display_name": "Fable", "utilization": 61.0, "resets_at": "2026-09-03T00:00:00Z"}
+            ]}
+        }))
+        .expect("a per-model window alone is worth reporting");
+        assert_eq!(usage.weekly_pct, None);
+        assert_eq!(usage.model_windows.len(), 1);
+        assert_eq!(usage.model_windows[0].model, "Fable");
+    }
+}
+
+#[cfg(test)]
 mod effort_tests {
     use super::protocol::{McpServerStatus, SystemMsg};
     use super::{
@@ -2165,6 +2667,7 @@ mod effort_tests {
             dir.path(),
             "s1",
             &ThreadStatus {
+                generation: None,
                 model: Some("default".to_string()),
                 context: None,
                 effort: None,
@@ -2178,6 +2681,7 @@ mod effort_tests {
             dir.path(),
             "s2",
             &ThreadStatus {
+                generation: None,
                 model: Some("claude-opus-4-8[1m]".to_string()),
                 context: None,
                 effort: None,

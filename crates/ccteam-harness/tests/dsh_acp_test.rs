@@ -242,6 +242,7 @@ fn adapter() -> DshAcpAdapter {
 
 fn spawn_ctx(tmp: &TempDir, sid: &str) -> SpawnCtx {
     SpawnCtx {
+        generation: 0,
         mode: None,
         slug: "demo".into(),
         sid: sid.into(),
@@ -268,7 +269,9 @@ fn spawn_ctx_with_model(tmp: &TempDir, sid: &str) -> SpawnCtx {
 
 fn write_meta(project: &Path, sid: &str, vendor_uuid: &str) {
     let meta = SessionMeta {
+        model_pinned_generation: None,
         mode: None,
+        tool_face: None,
         managed_by: Default::default(),
         stopped_at: None,
         sid: sid.into(),

@@ -280,13 +280,11 @@ impl HarnessAdapter for ClaudeBgAdapter {
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-        routing: TurnRouting,
+        _routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
-        if routing == TurnRouting::Queue {
-            return Err(HarnessError::NotImplemented {
-                reason: "claude bg does not expose a distinct queued-turn channel".into(),
-            });
-        }
+        // One channel only: every routing request takes it and is reported as
+        // a started turn (`TurnRouting` contract — a preference, never a
+        // refusal).
         self.submit_turn(h, input)
             .await
             .map(TurnSubmission::started)
@@ -416,8 +414,12 @@ impl HarnessAdapter for ClaudeBgAdapter {
 mod tests {
     use super::*;
 
+    /// `TurnRouting` is a preference, never a refusal: a `Queue` request on
+    /// the one-channel bg adapter takes that channel and is reported as what
+    /// it became — a started turn — instead of a `NotImplemented` that would
+    /// drop a ccteam-authored follow-up on the floor.
     #[tokio::test]
-    async fn routed_queue_is_rejected_honestly() {
+    async fn routed_queue_takes_the_only_channel_instead_of_refusing() {
         let handle = ThreadHandle {
             vendor: AgentVendor::Claude,
             mode: ExecutionMode::Bg,
@@ -425,14 +427,14 @@ mod tests {
             started_at: Utc::now(),
             raw_extras: serde_json::json!({}),
         };
-        let error = ClaudeBgAdapter::new()
+        let submitted = ClaudeBgAdapter::new()
             .submit_turn_routed(
                 &handle,
                 TurnInput::UserText("later".into()),
                 TurnRouting::Queue,
             )
             .await
-            .expect_err("queue path is unsupported");
-        assert!(matches!(error, HarnessError::NotImplemented { .. }));
+            .expect("the only channel, honestly reported");
+        assert_eq!(submitted.disposition, crate::TurnDisposition::Started);
     }
 }

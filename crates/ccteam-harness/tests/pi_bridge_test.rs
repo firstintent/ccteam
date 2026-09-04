@@ -70,6 +70,7 @@ impl TestEnv {
 
     fn ctx(&self, permission_mode: PermissionMode) -> SpawnCtx {
         SpawnCtx {
+            generation: 0,
             mode: None,
             slug: "pi-bridge".into(),
             sid: "s901".into(),
@@ -255,7 +256,7 @@ async fn managed_pi_spawn_performs_mcp_handshake_with_session_bearer() {
 
 #[tokio::test]
 #[serial]
-async fn bridge_executes_status_and_session_list_while_skip_prompts_zero_times() {
+async fn bridge_executes_status_and_agent_read_while_skip_prompts_zero_times() {
     let capture = McpCapture::default();
     let (server, url) = start_fake_mcp(capture.clone()).await;
     let env = TestEnv::new(&url);
@@ -293,10 +294,7 @@ async fn bridge_executes_status_and_session_list_while_skip_prompts_zero_times()
                 .map(str::to_string)
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        tool_names,
-        ["status".to_string(), "session_list".to_string()]
-    );
+    assert_eq!(tool_names, ["status".to_string(), "agent_read".to_string()]);
 }
 
 #[tokio::test]

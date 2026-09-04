@@ -49,18 +49,16 @@ afterEach(() => {
 })
 
 describe('apply', () => {
-  it('registers exactly the eight original ccteam tool names', () => {
+  it('registers exactly the six ccteam tool names', () => {
     const h = makeFakeCtx()
     apply(h.ctx as never)
 
     expect(h.tools.map(tool => tool.name).sort()).toEqual([
+      'agent',
+      'agent_read',
+      'agent_stop',
       'chat_send_file',
       'grok_claude_codex_kimi',
-      'session_collect',
-      'session_dispatch',
-      'session_list',
-      'session_spawn',
-      'session_stop',
       'status',
     ])
   })

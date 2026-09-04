@@ -24,7 +24,7 @@ vi.hoisted(() => {
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 
-import SessionView, { RowTime } from "./SessionView";
+import SessionView, { BusyHeartbeat, RowTime } from "./SessionView";
 import { rowsKeyFor } from "./chatTranscript";
 import type { SessionView as SessionSummary } from "../lib/sessionsApi";
 import type { SessionEvent } from "../hooks/useSessionEvents";
@@ -733,5 +733,204 @@ describe("RowTime date visibility", () => {
   it("renders nothing for absent or unparseable ts", () => {
     expect(renderToString(<RowTime lang="en" />)).toBe("");
     expect(renderToString(<RowTime ts="not-a-date" lang="en" />)).toBe("");
+  });
+});
+
+describe("SessionView history seed vs live stream (GitHub #186)", () => {
+  interface StreamState {
+    events: SessionEvent[];
+    connected: boolean;
+    connectionEpoch: number;
+    lastError: string | null;
+    gatewayUnavailable: boolean;
+  }
+  const healthy = (): StreamState => ({
+    events: [],
+    connected: true,
+    connectionEpoch: 1,
+    lastError: null,
+    gatewayUnavailable: false,
+  });
+  const historyPage = (assistant: string) => ({
+    sid: "s9",
+    events: [{ turn_id: "t1", ts: "now", role: "cto", user: "prompt", assistant }],
+  });
+
+  /** Mount SessionView against a mutable stream box + history mock; the
+   *  returned `render()` re-renders the SAME mounted instance. */
+  async function mountSeedView(
+    box: { stream: StreamState },
+    history: ReturnType<typeof vi.fn>,
+  ) {
+    const harness = createHookHarness();
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
+      useSessionEvents: () => box.stream,
+    }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: history,
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+    }));
+    const View = (await import("./SessionView")).default;
+    return () => harness.render(() => View({ sid: "s9", session: SESSION }));
+  }
+
+  function unmockSeedView() {
+    vi.doUnmock("react");
+    vi.doUnmock("../hooks/useSessionEvents");
+    vi.doUnmock("../lib/sessionsApi");
+    vi.resetModules();
+  }
+
+  const settle = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  it("keeps a reply that arrived over SSE while the mount fetch was in flight", async () => {
+    const box = { stream: healthy() };
+    let resolveHistory: (value: unknown) => void = () => {};
+    const history = vi.fn().mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveHistory = resolve;
+      }),
+    );
+    try {
+      const render = await mountSeedView(box, history);
+      render(); // mount: the fetch leaves with an empty buffer
+      expect(history).toHaveBeenCalledTimes(1);
+      // The turn completes while the fetch is in flight: the live frame is
+      // folded first…
+      box.stream = {
+        ...box.stream,
+        events: [{ id: "e1", kind: "answer", content: "late-answer", ts: "2026-08-19T10:20:00Z" }],
+      };
+      render();
+      expect(collectElementText(render())).toContain("late-answer");
+      // …then the page lands, read by the server BEFORE the reply was mirrored.
+      resolveHistory(historyPage(""));
+      await settle();
+      const text = collectElementText(render());
+      expect(text).toContain("prompt");
+      expect(text.filter((value) => value === "late-answer")).toHaveLength(1);
+    } finally {
+      unmockSeedView();
+    }
+  });
+
+  it("does not double a reply the page already mirrors", async () => {
+    const box = { stream: healthy() };
+    let resolveHistory: (value: unknown) => void = () => {};
+    const history = vi.fn().mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveHistory = resolve;
+      }),
+    );
+    try {
+      const render = await mountSeedView(box, history);
+      render();
+      box.stream = {
+        ...box.stream,
+        events: [{ id: "e1", kind: "answer", content: "late-answer" }],
+      };
+      render();
+      resolveHistory(historyPage("late-answer"));
+      await settle();
+      const text = collectElementText(render());
+      expect(text.filter((value) => value === "late-answer")).toHaveLength(1);
+    } finally {
+      unmockSeedView();
+    }
+  });
+
+  it("shows a visible banner when the history fetch fails, and retries on click", async () => {
+    const box = { stream: healthy() };
+    const history = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("boom 503"))
+      .mockResolvedValueOnce(historyPage("from-history"));
+    try {
+      const render = await mountSeedView(box, history);
+      render();
+      await settle();
+      let tree = render();
+      const banner = findByTestId(tree, "history-error");
+      expect(banner).not.toBeNull();
+      expect(collectElementText(tree).join(" ")).toContain("boom 503");
+      (findByTestId(tree, "history-retry")?.props.onClick as () => void)();
+      await settle();
+      tree = render();
+      expect(history).toHaveBeenCalledTimes(2);
+      expect(findByTestId(tree, "history-error")).toBeNull();
+      expect(collectElementText(tree)).toContain("from-history");
+    } finally {
+      unmockSeedView();
+    }
+  });
+
+  it("carries an outstanding approval prompt across a reconnect reseed", async () => {
+    const box = {
+      stream: {
+        ...healthy(),
+        events: [
+          {
+            id: "ap1",
+            kind: "answer" as const,
+            content: "run rm -rf?",
+            options: [{ label: "Allow", id: "allow" }],
+            token: "tok",
+          },
+        ],
+      },
+    };
+    const history = vi.fn().mockResolvedValue(historyPage("earlier"));
+    try {
+      const render = await mountSeedView(box, history);
+      render();
+      await settle();
+      let text = collectElementText(render());
+      expect(text).toContain("run rm -rf?");
+      expect(text).toContain("earlier");
+      // A real disconnect → reseed: the prompt is not in history, but it is
+      // still outstanding — it must not vanish.
+      box.stream = { ...box.stream, connectionEpoch: 2 };
+      render();
+      await settle();
+      text = collectElementText(render());
+      expect(history).toHaveBeenCalledTimes(2);
+      expect(text.filter((value) => value === "run rm -rf?")).toHaveLength(1);
+      expect(text).toContain("earlier");
+    } finally {
+      unmockSeedView();
+    }
+  });
+});
+
+describe("BusyHeartbeat (GitHub #186 B)", () => {
+  it("renders elapsed time and the last event clock while a turn runs", () => {
+    const since = Date.now() - 754_000; // 12:34 ago
+    const html = renderToString(
+      <BusyHeartbeat since={since} lastEventTs="2026-08-19T10:20:31Z" lang="zh" />,
+    );
+    expect(html).toContain('data-testid="busy-heartbeat"');
+    expect(html).toContain("已运行 12:34");
+    expect(html).toContain("最近事件");
+  });
+
+  it("renders nothing when there is nothing to report", () => {
+    expect(renderToString(<BusyHeartbeat since={null} lang="en" />)).toBe("");
   });
 });

@@ -3,18 +3,41 @@ import { SessionCredentialStore } from '../src/credentials.js'
 import { CcteamMcpClient, CcteamMcpClientPool, CCTEAM_TOOL_DEFINITIONS, registerCcteamTools } from '../src/tools.js'
 
 describe('ccteam tools', () => {
-  it('keeps the original MCP tool registration count and names', () => {
+  it('mirrors the daemon MCP tool surface: six tools, exact names', () => {
     const names = CCTEAM_TOOL_DEFINITIONS.map(tool => tool.name).sort()
-    expect(CCTEAM_TOOL_DEFINITIONS).toHaveLength(8)
+    expect(CCTEAM_TOOL_DEFINITIONS).toHaveLength(6)
     expect(names).toEqual([
+      'agent',
+      'agent_read',
+      'agent_stop',
       'chat_send_file',
       'grok_claude_codex_kimi',
-      'session_collect',
-      'session_dispatch',
-      'session_list',
-      'session_spawn',
-      'session_stop',
       'status',
+    ])
+  })
+
+  // The definitions are a MIRROR of the daemon's own schema (crates/ccteam-im
+  // /src/mcp/protocol.rs). DSH registers them once at load, so a drifted copy
+  // is a tool the model calls with parameters the daemon rejects.
+  it('mirrors the parameters that changed most recently', () => {
+    const agent = CCTEAM_TOOL_DEFINITIONS.find(tool => tool.name === 'agent')
+    const notify = (agent?.inputSchema as { properties: Record<string, { enum?: string[] }> })
+      .properties.notify
+    expect(notify.enum).toEqual(['final', 'brief', 'off'])
+
+    const read = CCTEAM_TOOL_DEFINITIONS.find(tool => tool.name === 'agent_read')
+    const props = (read?.inputSchema as { properties: Record<string, { type?: string }> }).properties
+    expect(props.wait?.type).toBe('integer')
+    expect(Object.keys(props)).toEqual([
+      'sid',
+      'n',
+      'tail',
+      'since',
+      'max_chars',
+      'wait',
+      'project',
+      'activity',
+      'tree',
     ])
   })
 
@@ -175,7 +198,7 @@ describe('ccteam tools', () => {
       }),
     })
 
-    const result = await client.callTool('session_spawn', { task: 'x' })
+    const result = await client.callTool('agent', { task: 'x' })
 
     expect(result.isError).toBe(true)
     expect(result.content[0]?.text).toBe('name a workspace: alpha, beta')

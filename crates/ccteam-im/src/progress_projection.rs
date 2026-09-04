@@ -15,7 +15,7 @@ use ccteam_core::{CcteamPaths, CostSummary};
 use ccteam_harness::execution::progress_bridge::{
     self, ProgressCheckpoint, ProgressCostContribution, AGENT_DONE, CHAT_TURN_COMPLETED,
     DELEGATION_COLLECTED, DELEGATION_COMPLETED, DELEGATION_DENIED, DELEGATION_DISPATCHED,
-    DELEGATION_NOTIFIED, DELEGATION_SPAWNED, DELEGATION_STOPPED,
+    DELEGATION_NOTIFIED, DELEGATION_POLICY_DENIED, DELEGATION_SPAWNED, DELEGATION_STOPPED,
 };
 use ccteam_harness::AgentVendor;
 use chrono::{DateTime, Utc};
@@ -647,11 +647,16 @@ fn fold_delegation(state: &mut SlugState, kind: &str, event: &Value, now: DateTi
         DELEGATION_NOTIFIED => &mut state.delegations.notified,
         DELEGATION_COLLECTED => &mut state.delegations.collected,
         DELEGATION_STOPPED => &mut state.delegations.stopped,
-        DELEGATION_DENIED => &mut state.delegations.denied,
+        // Card H — a policy-hook refusal is a delegation denial like any
+        // other for counting purposes: leaving it out would let a project run
+        // a policy that stops half its delegations while the dashboard reads
+        // zero denials.
+        DELEGATION_DENIED | DELEGATION_POLICY_DENIED => &mut state.delegations.denied,
         _ => return,
     };
     *counter = counter.saturating_add(1);
-    if kind != DELEGATION_NOTIFIED && kind != DELEGATION_DENIED {
+    let denied = matches!(kind, DELEGATION_DENIED | DELEGATION_POLICY_DENIED);
+    if kind != DELEGATION_NOTIFIED && !denied {
         return;
     }
 

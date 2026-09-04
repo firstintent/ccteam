@@ -129,6 +129,7 @@ async fn serve_scalar_js() -> impl IntoResponse {
         (name = "hosts", description = "Host registry + agent report (local + satellites: join-token/join; reverse control channel + exec dial-back ride WS at /hosts/channel and /hosts/exec/{nonce}; register-mcp)"),
         (name = "users", description = "档1 per-user web tenant management (admin-gated; web-first, no CLI — mint personal links, list, delete)"),
         (name = "status", description = "Daemon-wide status snapshot (health · sessions live/idle · 24h cost · budget cap · per-session cost)"),
+        (name = "usage", description = "Per-harness ACCOUNT quota windows (5h / 7d / per-model 7d / credits) as the daemon last observed them — cache + live same-harness sessions, no network probe. A harness with no unexpired observation is absent."),
         (name = "dsh", description = "DSH web companion lifecycle: status/start/stop. `state: disabled` means the daemon was started with `--dsh-web-bind off`; no companion port is listening."),
         (name = "projects", description = "Project lifecycle + detail"),
         (name = "roles", description = "Project-scoped agent roles (`.claude/agents/<role>.md`)"),
@@ -202,6 +203,10 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))
+        // Per-harness ACCOUNT quota windows — the script-side twin of the MCP
+        // `status{detail:"usage"}` body. No project named, so no project ACL;
+        // any authenticated identity reads it (machine state, not user data).
+        .routes(routes!(super::usage::handle_usage))
         .routes(routes!(super::dsh::handle_dsh_status))
         .routes(routes!(super::dsh::handle_dsh_start))
         .routes(routes!(super::dsh::handle_dsh_stop))
@@ -256,6 +261,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
             super::sessions_api::handle_create_session
         ))
         .routes(routes!(super::evolution::handle_evolution))
+        .routes(routes!(super::flow_runs::handle_flow_runs))
         // v0.8.22 P1 — GET history + PATCH rename share `/api/v1/sessions/{sid}`.
         .routes(routes!(
             super::sessions_api::handle_session_history,

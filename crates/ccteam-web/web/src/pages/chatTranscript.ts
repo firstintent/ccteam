@@ -253,7 +253,10 @@ export function appendEvent(rows: TranscriptRow[], ev: SessionEvent): Transcript
     const last = rows[rows.length - 1];
     if (last && last.kind === "activity" && last.fold) {
       const fold = foldActivity(last.fold, ev.activity);
-      const merged: TranscriptRow = { ...last, fold, content: renderFold(fold) };
+      // The fold row's time is the LATEST step's, so a long turn's one
+      // activity line visibly advances instead of pinning the first step's
+      // clock (GitHub #186 B).
+      const merged: TranscriptRow = { ...last, fold, content: renderFold(fold), ts: ev.ts ?? last.ts };
       return [...rows.slice(0, -1), merged];
     }
     const fold = foldActivity(emptyFold(), ev.activity);
@@ -267,6 +270,55 @@ export function appendEvent(rows: TranscriptRow[], ev: SessionEvent): Transcript
   }
   const row = eventToRow(ev);
   return row ? appendRow(rows, row) : rows;
+}
+
+/** Apply an authoritative history page on top of what the live stream
+ *  delivered WHILE that page was being fetched (GitHub #186 A).
+ *
+ *  `events` is the sid's whole SSE buffer and `barrier` how much of it was
+ *  already buffered when the history request left. Everything before the
+ *  barrier was mirrored to turns.jsonl before it was fanned out, hence is
+ *  represented by `seeded` (or is transient activity) — with ONE exception:
+ *  approval prompts never enter history, so an unresolved approval row that
+ *  arrived on this stream is carried over from `current`. Frames after the
+ *  barrier raced the server's read and are re-applied, deduplicating a
+ *  reply the page already mirrors by content, so a reply can neither vanish
+ *  (`setRows(history)` over a just-folded answer — the "TG has it, web shows
+ *  a bare completed turn" report) nor double. Pure — unit-testable. */
+export function mergeHistory(
+  current: TranscriptRow[],
+  seeded: TranscriptRow[],
+  events: SessionEvent[],
+  barrier: number,
+): TranscriptRow[] {
+  let next = [...seeded];
+  const delivered = new Set(
+    events.slice(0, barrier).flatMap((ev) => (ev.id ? [ev.id] : [])),
+  );
+  for (const row of current) {
+    if (
+      row.kind === "approval" &&
+      !row.resolved &&
+      delivered.has(row.id) &&
+      !next.some((r) => r.id === row.id)
+    ) {
+      next = appendRow(next, row);
+    }
+  }
+  for (const ev of events.slice(barrier)) {
+    const isApproval = ev.options !== undefined && ev.options.length > 0;
+    if (
+      ev.kind === "answer" &&
+      !isApproval &&
+      ev.content &&
+      seeded.some((r) => r.kind === "assistant" && r.content === ev.content)
+    ) {
+      continue; // already mirrored into this page
+    }
+    if (ev.id && next.some((r) => r.id === ev.id)) continue;
+    next = appendEvent(next, ev);
+  }
+  return next;
 }
 
 /** Seed a transcript from mirrored history (`GET /sessions/{sid}`). Each

@@ -10,11 +10,13 @@
 //! text + token usage the live pump would have mirrored.
 //!
 //! What counts as "the answer" mirrors the live translator
-//! (`translate.rs`): one answer per vendor turn, taken from the message that
-//! ENDS the turn (`stop_reason: end_turn` — the transcript's equivalent of a
-//! `result` record; tool-use-only and mid-turn narration messages are
-//! progress, not answers). Usage is summed over every assistant message after
-//! the cut, which is what a turn's `result.usage` adds up to.
+//! (`translate.rs`): one answer per vendor turn = every top-level assistant
+//! text block of that turn in order (a reply written before a further tool
+//! call is part of the answer — issue #192), the turn ending at the message
+//! with `stop_reason: end_turn` (the transcript's equivalent of a `result`
+//! record). Tool-use-only messages contribute usage, not text. Usage is
+//! summed over every assistant message after the cut, which is what a
+//! turn's `result.usage` adds up to.
 //!
 //! Same sanctioned path as the terminal protocol's transcript track (read the
 //! vendor's file; never a pane scrape, never a prompt). Anything that does not
@@ -43,6 +45,8 @@ pub fn recover_after(
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let mut texts: Vec<String> = Vec::new();
+    // Text blocks of the turn currently being folded (flushed at end_turn).
+    let mut turn_text = String::new();
     let mut ended_at: Option<DateTime<Utc>> = None;
     let mut input: u64 = 0;
     let mut output: u64 = 0;
@@ -88,9 +92,16 @@ pub fn recover_after(
                     .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
                     .filter_map(|b| b.get("text").and_then(Value::as_str))
                     .collect::<Vec<_>>()
-                    .join("")
+                    .join("\n\n")
             })
             .unwrap_or_default();
+        let text = text.trim();
+        if !text.is_empty() {
+            if !turn_text.is_empty() {
+                turn_text.push_str("\n\n");
+            }
+            turn_text.push_str(text);
+        }
         if let Some(usage) = message.and_then(|m| m.get("usage")) {
             usage_seen = true;
             input += usage
@@ -111,8 +122,8 @@ pub fn recover_after(
                 .unwrap_or(0);
         }
         ended_at = Some(ended_at.map_or(ts, |prev: DateTime<Utc>| prev.max(ts)));
-        // Only the message that ends a vendor turn carries the turn's answer
-        // (the live path mirrors `result.result`, never mid-turn narration).
+        // The message that ends a vendor turn flushes everything the turn
+        // said (the live path folds the same blocks into one answer row).
         if message
             .and_then(|m| m.get("stop_reason"))
             .and_then(Value::as_str)
@@ -120,7 +131,7 @@ pub fn recover_after(
         {
             continue;
         }
-        let text = text.trim();
+        let text = std::mem::take(&mut turn_text);
         if text.is_empty() {
             continue;
         }
@@ -129,7 +140,7 @@ pub fn recover_after(
             // mirror write of the same message: already recorded.
             continue;
         }
-        texts.push(text.to_string());
+        texts.push(text);
     }
 
     if texts.is_empty() {
@@ -204,7 +215,8 @@ mod tests {
                 "tool_use",
             ),
             // Mid-turn narration (text + a tool call in one message, stop =
-            // tool_use): progress, not the answer — counts usage only.
+            // tool_use) is part of the turn's answer (issue #192) — folded
+            // into the row the end_turn message closes.
             assistant_stop(
                 "2026-08-19T02:30:30.000Z",
                 vec![
@@ -239,7 +251,10 @@ mod tests {
 
         let cut = Utc.with_ymd_and_hms(2026, 8, 19, 2, 9, 0).unwrap();
         let recovered = recover_after(&path, cut, Some("observed answer")).expect("recovered");
-        assert_eq!(recovered.assistant, "first unobserved\n\nDONE");
+        assert_eq!(
+            recovered.assistant,
+            "Let me check the file first.\n\nfirst unobserved\n\nDONE"
+        );
         assert_eq!(recovered.usage["input_tokens"], 16);
         assert_eq!(recovered.usage["output_tokens"], 29);
         assert_eq!(recovered.usage["cache_read_input_tokens"], 100);

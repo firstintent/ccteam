@@ -60,6 +60,10 @@ pub mod onboarding;
 pub mod outbound_format;
 pub mod pending;
 pub mod pending_turns;
+// Card H — the user-programmable `pre-agent` policy hook every `agent` call
+// passes through. The engine owns the guardrails nobody can express
+// differently; everything past that is a script the team's owner writes.
+pub mod policy;
 pub mod principals;
 pub mod progress;
 pub mod progress_projection;
@@ -72,6 +76,9 @@ pub mod scheduled;
 mod session_catalog;
 pub mod three_layer_sec;
 pub mod transport;
+/// Wire shape for vendor-account usage, shared by the MCP `status` body and
+/// the REST `/api/v1/usage` route (one fact, one spelling).
+pub mod usage_view;
 
 use std::collections::HashMap;
 use std::fs;
@@ -176,6 +183,22 @@ pub fn default_routing_state_path() -> PathBuf {
 /// never let an `s<N>` be handed out twice).
 pub fn next_sid_path_in(ccteam_root: &Path) -> PathBuf {
     ccteam_root.join("state").join("sessions").join("next-sid")
+}
+
+/// The monotonic THREAD-generation counter
+/// (`~/.ccteam/state/sessions/next-generation`).
+///
+/// `docs-local/issues/#14②` — a generation identifies which thread of a sid
+/// made an observation, and `SessionMeta::model_pinned_generation` compares
+/// against it with `>=`. That comparison is only sound if generations never go
+/// backwards, so the counter is persisted for the same reason `next-sid` is:
+/// a restart that reset it would let a new thread's stamp fall below a pin
+/// written before the restart, and the pin would then never resolve.
+pub fn next_generation_path_in(ccteam_root: &Path) -> PathBuf {
+    ccteam_root
+        .join("state")
+        .join("sessions")
+        .join("next-generation")
 }
 
 /// Resolve the session-id counter for the current user

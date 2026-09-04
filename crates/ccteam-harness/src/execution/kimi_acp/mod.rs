@@ -46,6 +46,21 @@
 //! user gets meanwhile is the gateway's silence watchdog, which now reports the
 //! turn's elapsed time and last observed activity. Fix belongs upstream.
 //!
+//! ## No account-level usage surface (why `account_usage` stays `None`)
+//!
+//! Kimi's ACP contract publishes two usage-shaped commands and NEITHER is
+//! account-scoped: `/status` reports this session's model/permission/context
+//! and `/usage` reports this session's token counters (`formatUsageReport` in
+//! `references/kimi-code` `packages/acp-adapter/src/session.ts` — total /
+//! current turn / per-model token totals, then the same context line). There
+//! is no subscription tier, no rate-limit window, and no reset time anywhere on
+//! the wire, so this adapter keeps the trait's default `None` and the vendor
+//! simply does not appear in the usage map. The account-level numbers kimi
+//! does publish live behind an authenticated HTTP endpoint against its
+//! credential file, which is a different surface with a different owner (the
+//! admin-gated vendor-quota probe), not something a session adapter reaches
+//! into. Reading kimi's private session logs to synthesize one is a red line.
+//!
 //! ## Context usage arrives by pull, not push
 //!
 //! Kimi emits no `usage_update` and its `session/prompt` result carries no
@@ -260,6 +275,7 @@ impl KimiAcpAdapter {
         cwd: PathBuf,
         info: ModelInfo,
         permission_mode: PermissionMode,
+        generation: Option<u64>,
     ) -> Arc<LiveSession> {
         crate::model_catalog::record_vendor_models_best_effort(
             "kimi",
@@ -278,6 +294,9 @@ impl KimiAcpAdapter {
             model: info.model,
             window_tokens: info.window,
             effort: info.effort,
+            // Stamp this THREAD so every observation the turn runner
+            // persists says which one made it (`docs-local/issues/#14②`).
+            generation,
             ..Default::default()
         }));
         // A reconnect (idle-release, capacity eviction, daemon restart) rejoins
@@ -352,6 +371,7 @@ impl KimiAcpAdapter {
             context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
+            generation: st.generation,
         }
     }
 
@@ -626,6 +646,7 @@ impl HarnessAdapter for KimiAcpAdapter {
             cwd,
             info,
             ctx.permission_mode,
+            ctx.generation_stamp(),
         );
         // Spawn-time model + effort through the SAME vendor-native seams the
         // `/model` directive uses: `session/set_model` for the model (kimi's

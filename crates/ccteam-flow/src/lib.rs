@@ -1,27 +1,86 @@
-//! ccteam-flow: workflow orchestration engine and filesystem watchers.
+//! ccteam-flow — the dynamic-workflow runner.
 //!
-//! This crate owns the runtime flow layer that compiles workflow specs
-//! into long-running daemon behavior. Stable data primitives remain in
-//! `ccteam-core`; process execution primitives live in `ccteam-harness`.
+//! A workflow is a plain JavaScript file. Its control flow is deterministic
+//! and written by a human (or by an agent, once); its *work* is done by
+//! ccteam sessions. Every `agent()` call in the script is an A2A hire on any
+//! harness — claude, codex, grok, opencode, kimi, pi, dsh — and therefore a
+//! real ledger session with a sid, a transcript and a cost, not an anonymous
+//! subprocess.
+//!
+//! ```text
+//!   script.js ──► engine (QuickJS)  ──► scheduler ──► FlowClient ──► daemon
+//!                      │                    │              │
+//!                   prelude              brakes,        hire / wait /
+//!                (traps + hooks)      pools, ramp        stop / usage
+//!                      │
+//!                   journal.jsonl  ◄── every call, twice (dispatch, done)
+//! ```
+//!
+//! What the RUNNER deliberately does NOT do: talk to the network, spawn a
+//! process, read `$HOME`, print anything, or call an LLM. Its single door out
+//! is [`FlowClient`], and the two implementations of that trait are the only
+//! places anything else happens — `FakeClient` (deterministic, for tests) and
+//! [`McpFlowClient`] (`POST /mcp` against a running daemon). The CLI that
+//! drives a run lives outside.
+//!
+//! # Contract
+//!
+//! * a script opens with `export const meta = {name, description, phases?}`,
+//!   a pure literal, extracted before anything runs;
+//! * `Date.now()`, `Math.random()`, argless `new Date()` and
+//!   `Intl.DateTimeFormat` throw — they would make a resume produce a
+//!   different program;
+//! * `agent()` never throws for a worker's failure (it resolves `null`) but
+//!   always throws for the author's (unknown option, tripped brake);
+//! * `parallel()` is a barrier, `pipeline()` is not;
+//! * a run is resumable from its journal, and the first call whose inputs
+//!   changed invalidates every cached answer after it.
+//!
+//! # Example
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), ccteam_flow::FlowError> {
+//! use std::sync::Arc;
+//! use ccteam_flow::{run_workflow, FakeClient, RunConfig, ScriptSource};
+//!
+//! let client = Arc::new(FakeClient::new());
+//! let report = run_workflow(
+//!     ScriptSource::path("review.js"),
+//!     RunConfig::new("/tmp/run-1", client),
+//! )
+//! .await?;
+//! println!("{} agents, {:.2} USD", report.totals.agents, report.totals.cost_usd);
+//! # Ok(())
+//! # }
+//! ```
 
-pub mod artifact_watcher;
-pub mod orchestrator;
-pub mod workflow;
-pub mod workflow_watcher;
+mod engine;
+mod journal;
 
-pub use artifact_watcher::{
-    AgentTeamsWatcher, AgentTeamsWatcherConfig, ArtifactEvent, ArtifactWatcher, WatchKind,
-    DEBOUNCE_WINDOW, TEAMS_DISCOVERY_INTERVAL,
-};
-pub use orchestrator::{
-    CancelReason, Orchestrator, OrchestratorConfig, TeamEvent, DEFAULT_CLAUDE_MODEL,
-};
-pub use workflow::{
-    AgentSpec, AgentTeamSpec, BudgetSpec, CleanupOnStop, Executor, OnTimeout,
-    PlanApprovalOnTimeout, PlanApprovalSpec, SuggestedTeammate, SuggestedTeammateKind, Trigger,
-    WorkflowError, WorkflowMode, WorkflowSpec,
-};
-pub use workflow_watcher::{
-    WorkflowFileEvent, WorkflowFileEventKind, WorkflowFileWatcher,
-    DEBOUNCE_WINDOW as WORKFLOW_WATCHER_DEBOUNCE_WINDOW,
-};
+#[cfg(test)]
+mod tests;
+
+pub mod client;
+pub mod error;
+pub mod mcp_client;
+pub mod meta;
+pub mod progress;
+pub mod run;
+pub mod scheduler;
+pub mod schema;
+
+#[cfg(feature = "test-util")]
+pub mod fake;
+
+pub use client::{AgentOutcome, ClientError, FlowClient, HireSpec, Hired};
+pub use error::FlowError;
+pub use journal::{call_key, CacheReport, JournalEntry};
+pub use mcp_client::{McpEndpoint, McpFlowClient};
+pub use meta::{assert_deterministic, extract_meta, PhaseMeta, WorkflowMeta, DETERMINISM_HINT};
+pub use progress::{ProgressCallback, ProgressEvent};
+pub use run::{run_workflow, AgentRecord, RunConfig, RunReport, RunTotals, ScriptSource};
+pub use scheduler::{Brakes, RunControl, SchedulerConfig, VendorPools, HARD_AGENT_CAP};
+pub use schema::SCHEMA_RETRY_PROMPT;
+
+#[cfg(feature = "test-util")]
+pub use fake::{FakeCall, FakeClient, FakeReply};

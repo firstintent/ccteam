@@ -483,6 +483,36 @@ mod tests {
         );
     }
 
+    /// LEDGER-1 — the Claude 5 family and the gpt-5.6 Codex family price
+    /// from their own rows (live probes showed cost 0 because these rows
+    /// were missing, silently excluded from sums).
+    #[test]
+    fn claude_5_family_and_gpt_5_6_are_priced() {
+        let m_out = UnifiedTokenUsage {
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let sonnet5 = estimate_cost(&m_out, Vendor::Claude, "claude-sonnet-5").unwrap();
+        assert!(
+            (sonnet5 - 10.0).abs() < 0.01,
+            "sonnet-5 out != $10 ({sonnet5})"
+        );
+        let fable = estimate_cost(&m_out, Vendor::Claude, "claude-fable-5").unwrap();
+        assert!((fable - 50.0).abs() < 0.01, "fable-5 out != $50 ({fable})");
+        let sol = estimate_cost(&m_out, Vendor::Codex, "gpt-5.6-sol").unwrap();
+        assert!((sol - 20.0).abs() < 0.01, "gpt-5.6-sol out != $20 ({sol})");
+        // Cache write prices at 1.25x input, same ratio as every other row.
+        let m_cache = UnifiedTokenUsage {
+            cache_creation_input_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        let opus5 = estimate_cost(&m_cache, Vendor::Claude, "claude-opus-5").unwrap();
+        assert!(
+            (opus5 - 6.25).abs() < 0.01,
+            "opus-5 cache write != $6.25 ({opus5})"
+        );
+    }
+
     #[test]
     fn opus_4_8_is_priced_not_sonnet_fallback() {
         // The owner's primary model. It MUST have its own row — it was missing,

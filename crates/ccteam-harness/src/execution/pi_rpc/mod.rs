@@ -26,7 +26,7 @@ use bridge::{
 };
 pub use bridge::{
     bridge_source, PiApprovalDecision, PiDialogKind, PiDialogRequest, PiDialogResponse,
-    PiInteractionResolver, REQUIRED_MCP_TOOL_NAMES,
+    PiInteractionResolver, KNOWN_MCP_TOOL_NAMES,
 };
 use protocol::{
     response_data, PiAvailableModels, PiContextUsage, PiEvent, PiExtensionUiRequest, PiModel,
@@ -598,6 +598,9 @@ impl PiRpcAdapter {
             effort: effective_effort,
             context: None,
             goal: None,
+            // Seeded once at spawn; the event task clones this cached status,
+            // so every persisted observation carries the stamp.
+            generation: ctx.generation_stamp(),
         };
         let (event_tx, _) = broadcast::channel(256);
         let live = Arc::new(LiveSession {
@@ -1171,7 +1174,7 @@ impl HarnessAdapter for PiRpcAdapter {
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-        routing: TurnRouting,
+        _routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
         let text = match input {
             TurnInput::UserText(text) => text,
@@ -1188,11 +1191,9 @@ impl HarnessAdapter for PiRpcAdapter {
         let (turn_id, disposition, permit, command) = {
             let mut state = live.translate.lock().unwrap();
             if let Some(active) = state.translator.active_turn_id().map(str::to_string) {
-                if routing == TurnRouting::Queue {
-                    return Err(HarnessError::NotImplemented {
-                        reason: "Pi follow_up shares the active agent_settled epoch; distinct queued canonical turns are not supported".into(),
-                    });
-                }
+                // Pi's follow_up shares the active `agent_settled` epoch, so a
+                // `Queue` request rides the steer and is reported as
+                // `Injected` (`TurnRouting` contract: preference, not refusal).
                 let gate = state.completion.as_ref().ok_or_else(|| {
                     HarnessError::Io("Pi active turn is missing completion gate".into())
                 })?;
@@ -1556,6 +1557,9 @@ impl HarnessAdapter for PiRpcAdapter {
             effort: Some(state.thinking_level),
             context: stats.context_usage.map(context_from_pi),
             goal: None,
+            // Carry the spawn-seeded stamp: this refresh describes the SAME
+            // thread (`docs-local/issues/#14②`).
+            generation: live.cached_status.lock().unwrap().generation,
         };
         *live.cached_status.lock().unwrap() = status.clone();
         write_status_file(&live.project_dir, &live.sid, &status);
