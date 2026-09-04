@@ -22,7 +22,7 @@ use ccteam_harness::execution::transcript_tail::anthropic_project_dir;
 use ccteam_harness::{
     AgentSpecBrief, AgentVendor, ChoiceSelection, Directive, DirectiveOutcome, ExecutionMode,
     HarnessAdapter, HarnessError, PermissionMode, SpawnCtx, ThreadEvent, ThreadItemDetails,
-    TurnInput,
+    TurnDisposition, TurnInput, TurnRouting,
 };
 use futures::StreamExt;
 use serial_test::serial;
@@ -617,6 +617,180 @@ async fn slash_during_turn_is_deferred_until_the_turn_ends() {
         "the slash line reaches the CLI verbatim, after the turn"
     );
     std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// Wait for `n` vendor turn boundaries on `events`, failing loudly otherwise.
+async fn await_completed_turns(
+    events: &mut futures::stream::BoxStream<'static, ThreadEvent>,
+    n: usize,
+) {
+    let mut completed = 0;
+    while completed < n {
+        match tokio::time::timeout(Duration::from_secs(10), events.next()).await {
+            Ok(Some(ThreadEvent::TurnCompleted { .. })) => completed += 1,
+            Ok(Some(_)) => {}
+            other => panic!("expected {n} completed turns, got {other:?} after {completed}"),
+        }
+    }
+}
+
+fn deferred_input_file(tmp: &Path, sid: &str) -> PathBuf {
+    tmp.join(".ccteam")
+        .join("chat")
+        .join(sid)
+        .join("deferred-input.json")
+}
+
+/// issue #194 — a `TurnRouting::Queue` line (a delegation completion
+/// notification) sent while a turn is in flight is NOT written mid-turn: claude
+/// would show it to the model twice (queued-command preview + next prompt). It
+/// is parked, reported as `Queued`, mirrored to disk, and written verbatim as
+/// its own turn right after the running turn's `result`.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "1.5");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("long task".into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let queued = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("s7 done · claude · turn 1".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        queued.disposition,
+        TurnDisposition::Queued,
+        "mid-turn, a Queue request is parked, not steered"
+    );
+    // Not written yet — and durably parked for a daemon that dies right now.
+    let logged = std::fs::read_to_string(&user_log).unwrap_or_default();
+    assert_eq!(logged.lines().collect::<Vec<_>>(), vec!["long task"]);
+    let parked: Vec<String> = serde_json::from_slice(
+        &std::fs::read(deferred_input_file(tmp.path(), "s9")).expect("parked line mirrored"),
+    )
+    .unwrap();
+    assert_eq!(parked, vec!["s7 done · claude · turn 1".to_string()]);
+
+    // Two vendor turns complete: the long task, then the notification as its
+    // own turn — written exactly once.
+    await_completed_turns(&mut events, 2).await;
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec!["long task", "s7 done · claude · turn 1"],
+        "the notification reaches the CLI verbatim, once, after the turn"
+    );
+    assert!(
+        !deferred_input_file(tmp.path(), "s9").exists(),
+        "the on-disk mirror is dropped once the line is written"
+    );
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// A `Queue` request on an IDLE session starts a turn at once — the routing is
+/// a preference about the running turn, not a delay.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn queued_text_when_idle_starts_a_turn_at_once() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+
+    let started = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("s7 done · claude · turn 1".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.disposition, TurnDisposition::Started);
+    await_completed_turns(&mut events, 1).await;
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec!["s7 done · claude · turn 1"]
+    );
+    assert!(!deferred_input_file(tmp.path(), "s9").exists());
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// The parked queue outlives the daemon: what a previous process life mirrored
+/// to `deferred-input.json` (a notification parked behind a turn the daemon did
+/// not live to see end) is replayed by the next `start_thread` of the same sid
+/// — first line at once, the rest one turn at a time — and the mirror is
+/// consumed as it goes.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn parked_input_left_by_a_previous_daemon_is_replayed_on_start() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    let file = deferred_input_file(tmp.path(), "s9");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        serde_json::to_vec(&["s7 done · claude · turn 1", "s8 done · codex · turn 2"]).unwrap(),
+    )
+    .unwrap();
+
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+    await_completed_turns(&mut events, 2).await;
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec!["s7 done · claude · turn 1", "s8 done · codex · turn 2"],
+        "both parked lines reach the CLI, in order, each as its own turn"
+    );
+    assert!(!file.exists(), "the mirror is consumed once replayed");
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 

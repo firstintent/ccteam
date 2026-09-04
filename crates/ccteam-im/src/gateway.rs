@@ -287,6 +287,21 @@ impl Default for TurnOrigin {
     }
 }
 
+/// The vendor channel a turn's origin asks for. A human's message joins the
+/// running turn (`Inject`: they are steering work they can see). A
+/// ccteam-authored turn — a delegation completion notification — is a distinct
+/// follow-up (`Queue`): nobody is steering with it, and on claude a mid-turn
+/// stdin line is shown to the model twice, as a queued-command preview and then
+/// as the next prompt (issue #194: every completion report charged the
+/// orchestrator double). A vendor without a queued-turn channel takes its
+/// mid-turn path and reports the disposition it actually used.
+fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
+    match origin {
+        TurnOrigin::User => TurnRouting::Inject,
+        TurnOrigin::Internal => TurnRouting::Queue,
+    }
+}
+
 impl TurnOrigins {
     fn record(&mut self, turn_id: String, origin: TurnOrigin) {
         self.by_turn.insert(turn_id, origin);
@@ -8643,7 +8658,7 @@ impl Gateway {
             .map(|g| g.is_some())
             .unwrap_or(false);
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
-        let requested_routing = TurnRouting::Inject;
+        let requested_routing = routing_for_origin(origin);
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
         if !was_in_flight {
             session.steered_this_turn.store(false, Ordering::SeqCst);
@@ -13782,14 +13797,14 @@ impl Gateway {
             .map(|started| started.is_some())
             .unwrap_or(false);
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
-        let requested_routing = TurnRouting::Inject;
-        let provisional_inject = was_in_flight;
+        let requested_routing = routing_for_origin(origin);
+        let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
         if !was_in_flight {
             session.steered_this_turn.store(false, Ordering::SeqCst);
             if let Ok(mut started) = session.turn_started_at.lock() {
                 *started = Some(Instant::now());
             }
-        } else {
+        } else if provisional_inject {
             session.steered_this_turn.store(true, Ordering::SeqCst);
         }
         let project_dir = self
@@ -19771,14 +19786,17 @@ mod tests {
         ) -> Result<ccteam_harness::TurnSubmission, HarnessError> {
             self.routings.lock().await.push(routing);
             let had_active = !self.submissions.lock().await.is_empty();
-            let disposition =
-                if self.degrade_inject_to_queue && had_active && routing == TurnRouting::Inject {
-                    TurnDisposition::Queued
-                } else if had_active && routing == TurnRouting::Inject {
-                    TurnDisposition::Injected
-                } else {
-                    TurnDisposition::Started
-                };
+            // A `Queue` request against an active turn queues; so does an
+            // `Inject` on the queue-only double (`degrade_inject_to_queue`).
+            let queues = routing == TurnRouting::Queue
+                || (self.degrade_inject_to_queue && routing == TurnRouting::Inject);
+            let disposition = if had_active && queues {
+                TurnDisposition::Queued
+            } else if had_active && routing == TurnRouting::Inject {
+                TurnDisposition::Injected
+            } else {
+                TurnDisposition::Started
+            };
             let turn_id = self.submit_turn(h, input).await?;
             Ok(match disposition {
                 TurnDisposition::Started => ccteam_harness::TurnSubmission::started(turn_id),
@@ -20024,7 +20042,12 @@ mod tests {
 
         // This sink-less fake emits an answer but no TurnCompleted boundary,
         // leaving the first vendor turn marked in flight for the steer below.
-        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
+        // Both messages are a HUMAN's (`User` origin): a steer is something a
+        // person does to work they are watching.
+        gateway
+            .submit_to_sid_with_origin(&sid, "first".into(), TurnOrigin::User)
+            .await
+            .unwrap();
         let first_started = gateway.sessions[&sid]
             .turn_started_at
             .lock()
@@ -20032,7 +20055,10 @@ mod tests {
             .expect("first turn start");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        gateway.submit_to_sid(&sid, "steer".into()).await.unwrap();
+        gateway
+            .submit_to_sid_with_origin(&sid, "steer".into(), TurnOrigin::User)
+            .await
+            .unwrap();
         let after_steer = gateway.sessions[&sid]
             .turn_started_at
             .lock()
@@ -20048,7 +20074,62 @@ mod tests {
         assert_eq!(
             fake.routings.lock().await.as_slice(),
             &[TurnRouting::Inject, TurnRouting::Inject],
-            "the application route is explicitly Inject for every message"
+            "a human's message is explicitly routed Inject every time"
+        );
+    }
+
+    /// issue #194 — a ccteam-authored turn (a delegation completion
+    /// notification) asks for a DISTINCT follow-up turn, never a steer: on
+    /// claude a mid-turn stdin line is shown to the model twice. A human's
+    /// message keeps steering. The fake reports the queued disposition, and the
+    /// gateway treats it as it treats every queued turn: no steer flag, the
+    /// original turn's start preserved.
+    #[tokio::test]
+    async fn internal_turns_are_routed_as_a_queued_follow_up_not_a_steer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+
+        gateway
+            .submit_to_sid_with_origin(&sid, "human asks".into(), TurnOrigin::User)
+            .await
+            .unwrap();
+        let started = gateway.sessions[&sid]
+            .turn_started_at
+            .lock()
+            .unwrap()
+            .expect("turn in flight");
+        // `submit_to_sid` is the A2A / notifier path: Internal origin.
+        gateway
+            .submit_to_sid(&sid, "s7 done · claude · turn 1\nok".into())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.routings.lock().await.as_slice(),
+            &[TurnRouting::Inject, TurnRouting::Queue],
+            "human = Inject, ccteam-authored = Queue"
+        );
+        assert!(
+            !gateway.sessions[&sid]
+                .steered_this_turn
+                .load(Ordering::SeqCst),
+            "a queued follow-up is not a steer"
+        );
+        assert_eq!(
+            *gateway.sessions[&sid].turn_started_at.lock().unwrap(),
+            Some(started),
+            "the running turn keeps its start; the queued one opens its own on TurnStarted"
         );
     }
 
@@ -20104,8 +20185,14 @@ mod tests {
             .unwrap()
             .sid;
 
-        gateway.submit_to_sid(&sid, "first".into()).await.unwrap();
-        gateway.submit_to_sid(&sid, "queued".into()).await.unwrap();
+        gateway
+            .submit_to_sid_with_origin(&sid, "first".into(), TurnOrigin::User)
+            .await
+            .unwrap();
+        gateway
+            .submit_to_sid_with_origin(&sid, "queued".into(), TurnOrigin::User)
+            .await
+            .unwrap();
         assert!(
             !gateway.sessions[&sid]
                 .steered_this_turn

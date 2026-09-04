@@ -83,7 +83,8 @@ pub(crate) enum DelegationOutcome {
 
 /// Cap on the answer text an INLINE `agent{wait}` result carries. The caller
 /// asked to block on this answer, so it gets more than a notification does —
-/// but not a transcript: `agent_read{sid,tail:true}` is one call away.
+/// but not a transcript: the excerpt's marker names the exact `agent_read`
+/// call for the rest.
 pub(crate) const INLINE_RESULT_MAX_CHARS: usize = 4_000;
 
 pub(crate) fn context_pct(status: Option<&ccteam_harness::TurnStatus>) -> Option<u64> {
@@ -154,8 +155,10 @@ impl DelegationSummary<'_> {
             ),
             None => format!("{outcome}{vendor} · turn {}", self.turn),
         };
-        let answer = truncate_head_tail_with_marker(self.answer.trim(), max_chars, |omitted| {
-            full_answer_marker(omitted, self.sid)
+        let answer_text = self.answer.trim();
+        let total_chars = answer_text.chars().count();
+        let answer = truncate_head_tail_with_marker(answer_text, max_chars, |omitted| {
+            full_answer_marker(omitted, total_chars, self.sid)
         });
         if answer.text.is_empty() {
             first
@@ -182,9 +185,10 @@ impl DelegationSummary<'_> {
         if let Some(pct) = self.context_pct {
             result.insert("context_pct".into(), serde_json::json!(pct));
         }
+        let total_chars = self.answer.chars().count();
         let answer =
             truncate_head_tail_with_marker(self.answer, INLINE_RESULT_MAX_CHARS, |omitted| {
-                full_answer_marker(omitted, self.sid)
+                full_answer_marker(omitted, total_chars, self.sid)
             });
         result.insert("result_text".into(), serde_json::json!(answer.text));
         if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
@@ -294,8 +298,30 @@ pub fn notification_answer_max_chars(mode: ccteam_harness::NotifyMode) -> usize 
     }
 }
 
-pub(crate) fn full_answer_marker(omitted: usize, child_sid: &str) -> String {
-    format!("…[+{omitted} chars: agent_read{{sid:{child_sid},tail:true}}]…")
+/// `agent_read{max_chars}` — the character budget across the turns one
+/// transcript read returns: its default and the bounds the parameter accepts.
+/// The default is a deliberate step above the brief notification's 500: a bare
+/// read after a notification should add something, and the pointer on any
+/// excerpt names the exact budget for the rest.
+pub(crate) const AGENT_READ_DEFAULT_MAX_CHARS: usize = 1_000;
+pub(crate) const AGENT_READ_MIN_MAX_CHARS: usize = 100;
+pub(crate) const AGENT_READ_MAX_MAX_CHARS: usize = 50_000;
+
+/// The `max_chars` that reads a `total_chars`-long turn whole, within what the
+/// parameter accepts.
+pub(crate) fn read_budget_for(total_chars: usize) -> usize {
+    total_chars.clamp(AGENT_READ_MIN_MAX_CHARS, AGENT_READ_MAX_MAX_CHARS)
+}
+
+/// The pointer a truncated answer carries: the exact one-call recipe for the
+/// whole text (`n:1` = the newest turn, which the answer is at delivery), so
+/// the reader never has to guess a budget or page through history (issue
+/// #194: the frugal, correct read was discoverable only by trial).
+pub(crate) fn full_answer_marker(omitted: usize, total_chars: usize, child_sid: &str) -> String {
+    format!(
+        "…[+{omitted} chars: agent_read{{sid:{child_sid},n:1,max_chars:{}}}]…",
+        read_budget_for(total_chars)
+    )
 }
 
 /// Render the ordinary user-role completion turn sent to the parent.
@@ -551,13 +577,25 @@ mod tests {
             assert!(t.contains("HEAD"));
             assert!(t.contains("TAIL"));
             assert!(t.contains("…[+"));
-            assert!(t.contains("agent_read{sid:s1,tail:true}"));
+            // The pointer is the exact recipe for the whole answer: 4 + 2500 + 4
+            // characters, read as the newest turn.
+            assert!(t.contains("agent_read{sid:s1,n:1,max_chars:2508}"), "{t}");
             let embedded = t.split_once('\n').unwrap().1;
             assert_eq!(embedded.chars().count(), cap);
         }
     }
 
-    /// G3 — the defaults halved, and `brief` is a quarter of that.
+    /// The read recipe stays inside what `agent_read{max_chars}` accepts.
+    #[test]
+    fn read_budget_is_clamped_to_the_parameter_bounds() {
+        assert_eq!(read_budget_for(7), AGENT_READ_MIN_MAX_CHARS);
+        assert_eq!(read_budget_for(2_508), 2_508);
+        assert_eq!(read_budget_for(1_000_000), AGENT_READ_MAX_MAX_CHARS);
+        assert_eq!(AGENT_READ_DEFAULT_MAX_CHARS, 1_000);
+    }
+
+    /// The documented tiers — and `brief` is what a dispatch gets unless it
+    /// asks (issue #194: frugality is the default, not a discovery).
     #[test]
     fn notification_caps_are_the_documented_tiers() {
         use ccteam_harness::NotifyMode;
@@ -567,6 +605,8 @@ mod tests {
         assert_eq!(notification_answer_max_chars(NotifyMode::Final), 2_000);
         assert_eq!(notification_answer_max_chars(NotifyMode::Brief), 500);
         assert_eq!(notification_answer_max_chars(NotifyMode::Off), 2_000);
+        assert_eq!(NotifyMode::default(), NotifyMode::Brief);
+        assert_eq!(notification_answer_max_chars(NotifyMode::default()), 500);
     }
 
     /// The inline result names the session it came from: an `agent` reply is

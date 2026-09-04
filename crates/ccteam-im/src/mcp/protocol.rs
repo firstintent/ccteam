@@ -248,7 +248,7 @@ pub fn tool_definitions() -> Vec<Value> {
     let mut tools: Vec<Value> = vec![
         json!({
             "name": "status",
-            "description": "Which agents this project's host can hire and what the team spent today. Brief by default; `detail` adds model ids + efforts (models), install/auth/budget (vendors), routing notes (routing), account quota + context (usage), or everything (full).",
+            "description": "Which agents this host can hire and what the team spent today; `detail` adds model ids + efforts (models), install/auth/budget (vendors), routing notes (routing), quota + context (usage), or everything (full).",
             "inputSchema": schema(json!({
                 "detail": { "type": "string", "enum": ["brief", "models", "vendors", "routing", "usage", "full"], "description": "Default brief." }
             }), &[]),
@@ -291,7 +291,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a new session and dispatch `task` to it; with `sid` → follow up on that session. `wait` returns the answer inline; 0 (default) is async: one completion notification when the task's turn ends, or `agent_read{sid,wait}` when the reply says notify_deliverable:false. Tell children to answer tersely, never to dump code or diffs.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a session and give it `task`; with `sid` → follow up there. `wait` returns the answer inline; 0 (default) is async: one completion notification (brief excerpt) arrives when the task's turn ends, so never poll for it; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Tell children to answer tersely.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
                 "sid": { "type": "string", "description": "Existing session to task; omit to hire a new one." },
@@ -309,7 +309,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                 "notify": {
                     "type": "string",
                     "enum": ["final", "brief", "off"],
-                    "description": "Turn-end wake: final (2000-char excerpt, default), brief (500), off."
+                    "description": "Turn-end wake: brief (500-char excerpt, default), final (2000), off."
                 },
                 "tools": {
                     "type": "string",
@@ -329,13 +329,13 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → that session's transcript, newest first unless `since` pages forward; empty means no answer yet.",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript, newest first; `since:<cursor>` → unread turns oldest first, `remaining` = still unread; `n:0` → status only; empty turns = no answer yet.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows/turns (default 10, max 500)." },
                 "tail": { "type": "boolean", "description": "With `sid`: newest first (default true unless `since`)." },
                 "since": { "type": "string", "description": "With `sid`: only turns after this turn_id cursor." },
-                "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 4000)." },
+                "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 1000)." },
                 "wait": { "type": "integer", "description": "With `sid`: seconds to wait for an in-flight turn to end (0-240)." },
                 "project": { "type": "string", "description": "Roster filter: this project slug only." },
                 "activity": {
@@ -349,7 +349,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_stop",
-            "description": "Stop a session you delegated. Explicit command, never a proactive kill; `agent_read{sid}` still reads its transcript.",
+            "description": "Stop a session you delegated; `agent_read{sid}` still reads its transcript.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Session to stop." }
             }), &["sid"]),

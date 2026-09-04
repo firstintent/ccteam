@@ -417,11 +417,11 @@ fn nearest_slug<'a>(input: &str, candidates: &'a [String]) -> Option<&'a str> {
 /// Default page size for BOTH `agent_read` branches (roster rows and
 /// transcript turns). Ten is what a caller reads; more is a `n` away.
 const AGENT_READ_DEFAULT_N: usize = 10;
-/// Default character budget across the turns one `agent_read{sid}` returns.
-const AGENT_READ_DEFAULT_MAX_CHARS: usize = 4_000;
-const AGENT_READ_MIN_MAX_CHARS: usize = 500;
-const AGENT_READ_MAX_MAX_CHARS: usize = 50_000;
 use crate::delegation::{DelegationOutcome, DelegationSummary};
+/// Default character budget across the turns one `agent_read{sid}` returns.
+use crate::delegation::{
+    AGENT_READ_DEFAULT_MAX_CHARS, AGENT_READ_MAX_MAX_CHARS, AGENT_READ_MIN_MAX_CHARS,
+};
 
 /// Keep inline waits below the shortest common MCP client deadline (~300s),
 /// leaving 60s for spawn/submit work around the wait itself. Requests above it
@@ -3161,10 +3161,11 @@ struct NotifyRequest {
 }
 
 impl NotifyRequest {
-    /// No `notify` arg — `final`, but only because nobody said otherwise.
+    /// No `notify` arg — the harness default (`brief`), but only because nobody
+    /// said otherwise.
     const fn defaulted() -> Self {
         Self {
-            mode: ccteam_harness::NotifyMode::Final,
+            mode: ccteam_harness::NotifyMode::Brief,
             explicit: false,
         }
     }
@@ -3603,24 +3604,62 @@ async fn dispatch_wait_for_completion(
     .inline_result()
 }
 
+/// One page of a session's transcript, as `agent_read{sid}` answers it.
+struct TranscriptPage {
+    rows: Vec<serde_json::Value>,
+    /// `turn_id` of the last row on the page — the paging cursor. `None` when
+    /// the page is empty.
+    cursor: Option<String>,
+    /// Matching turns NOT on this page: the still-unread newer ones for a
+    /// forward (`since`) read, the older ones for a tail read. Said out loud
+    /// because "I gave you one of three" must never look like "that is all"
+    /// (issue #194: a `since` + `n:1` read returned the oldest unread turn and
+    /// the caller took it for the newest).
+    remaining: usize,
+    /// `turn_id` of the newest matching turn in the whole transcript, whatever
+    /// the page shows — the answer to "has it said anything new?" on a
+    /// status-only (`n:0`) read.
+    latest: Option<String>,
+}
+
+/// Rows `agent_read{sid}` shows: assistant-side turns, plus every row that
+/// carries a terminal `outcome`, whose text is routinely empty. TWO writers
+/// produce such rows: a vendor turn that failed before it said anything
+/// (`outcome:"failed"`), and the boot reconcile's `"unobserved"` row for a turn
+/// the restarted daemon never watched end — both are facts a poller must see
+/// instead of the PREVIOUS successful answer. Dropping those pages the FAILURE
+/// out: the session then reads "not working, here is the last row", and the
+/// newest row left is the PREVIOUS successful answer, which a polling caller
+/// returns as the result of the task that just failed. An empty `content` is
+/// the documented "no answer yet" shape and costs nothing to carry; the
+/// failure it comes with is the whole point of the row.
+fn is_transcript_row(turn: &ccteam_harness::execution::turns_mirror::TurnRecord) -> bool {
+    !turn.assistant.is_empty() || turn.outcome.is_some()
+}
+
 /// v0.8.7 review-fix (R-L3) — pure paging core of [`run_agent_read_transcript`],
-/// extracted so the cursor/truncation contract is unit-testable without a
-/// gateway or filesystem. Given ALL mirrored turns, an optional `since`
-/// turn-id cursor, and a page size `n`, returns `(rows, next_cursor,
-/// truncated)`:
+/// extracted so the cursor/paging contract is unit-testable without a gateway
+/// or filesystem. Given ALL mirrored turns, an optional `since` turn-id
+/// cursor, a page size `n` and the direction, it:
 ///
-/// - keeps only assistant-side turns AFTER `since` (or all when `since` is
-///   `None` / not found — never silently lose turns on a stale cursor),
-/// - returns the OLDEST `n` of those (so repeated polls page forward in order),
-/// - `truncated` is true when more than `n` were available → the caller polls
-///   again with `next_cursor` to fetch the remainder (the old code kept the
-///   NEWEST `n` and dropped the middle of a > `n` burst).
+/// - keeps only transcript rows AFTER `since` (or all when `since` is `None` /
+///   not found — never silently lose turns on a stale cursor),
+/// - returns the OLDEST `n` of those (so repeated polls page forward in
+///   order), or the NEWEST `n` when `tail` is set,
+/// - counts what it withheld in `remaining` and names the newest turn in
+///   `latest`, so the caller can tell "one of three" from "that is all"
+///   (issue #194) and page on with `cursor`.
 fn page_collected_turns(
     all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
     since: Option<&str>,
     n: usize,
     tail: bool,
-) -> (Vec<serde_json::Value>, Option<String>, bool) {
+) -> TranscriptPage {
+    let latest = all
+        .iter()
+        .rev()
+        .find(|turn| is_transcript_row(turn))
+        .map(|turn| turn.turn_id.clone());
     let after: Vec<&ccteam_harness::execution::turns_mirror::TurnRecord> = match since {
         Some(cursor) => match all.iter().position(|t| t.turn_id == cursor) {
             Some(idx) => all.iter().skip(idx + 1).collect(),
@@ -3632,19 +3671,7 @@ fn page_collected_turns(
     };
     let mut rows: Vec<serde_json::Value> = after
         .iter()
-        // Assistant-side turns — plus every row that carries a terminal
-        // `outcome`, whose text is routinely empty. TWO writers produce such
-        // rows: a vendor turn that failed before it said anything
-        // (`outcome:"failed"`), and the boot reconcile's `"unobserved"` row
-        // for a turn the restarted daemon never watched end — both are facts
-        // a poller must see instead of the PREVIOUS successful answer.
-        // Dropping those pages the FAILURE out: the session then reads "not
-        // working, here is the last row", and the newest row left is the
-        // PREVIOUS successful answer, which a polling caller returns as the
-        // result of the task that just failed. An empty `content` is the
-        // documented "no answer yet" shape and costs nothing to carry; the
-        // failure it comes with is the whole point of the row.
-        .filter(|t| !t.assistant.is_empty() || t.outcome.is_some())
+        .filter(|t| is_transcript_row(t))
         .map(|t| {
             let mut row = serde_json::json!({"turn_id": t.turn_id, "content": t.assistant});
             if let Some(outcome) = t.outcome.as_deref() {
@@ -3659,21 +3686,52 @@ fn page_collected_turns(
             row
         })
         .collect();
-    let truncated = rows.len() > n;
+    let remaining = rows.len().saturating_sub(n);
     if tail {
         // v0.9.1 — the "final answer" shape: keep the NEWEST n (chronological
         // order preserved inside the page).
-        let drop = rows.len().saturating_sub(n);
-        rows.drain(..drop);
+        rows.drain(..remaining);
     } else {
         rows.truncate(n);
     }
-    let last_turn_id = rows
+    let cursor = rows
         .last()
         .and_then(|r| r.get("turn_id"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    (rows, last_turn_id, truncated)
+    TranscriptPage {
+        rows,
+        cursor,
+        remaining,
+        latest,
+    }
+}
+
+/// The `turn_id` of the row right before `turn_id` in the mirror (any row,
+/// user or assistant) — the `since` cursor that makes a forward read of `n:1`
+/// land exactly on `turn_id`.
+fn previous_turn_id<'a>(
+    all: &'a [ccteam_harness::execution::turns_mirror::TurnRecord],
+    turn_id: &str,
+) -> Option<&'a str> {
+    let position = all.iter().position(|turn| turn.turn_id == turn_id)?;
+    position
+        .checked_sub(1)
+        .map(|previous| all[previous].turn_id.as_str())
+}
+
+/// The exact one-call read of a whole turn — what a truncated transcript row
+/// points at instead of a vague "read more". `previous` is the row before it
+/// (see [`previous_turn_id`]); the first row of a transcript is reached as the
+/// oldest turn instead.
+fn whole_turn_recipe(sid: &str, previous: Option<&str>, total_chars: usize) -> String {
+    let budget = crate::delegation::read_budget_for(total_chars);
+    match previous {
+        Some(previous) => {
+            format!("agent_read{{sid:{sid},since:{previous},n:1,max_chars:{budget}}}")
+        }
+        None => format!("agent_read{{sid:{sid},tail:false,n:1,max_chars:{budget}}}"),
+    }
 }
 
 fn collect_max_chars(args: &serde_json::Value) -> usize {
@@ -3736,8 +3794,14 @@ fn collected_turn_budgets(lengths: &[usize], max_chars: usize) -> Vec<usize> {
 }
 
 /// Apply the collect character budget to the already-selected turn page.
-/// Returns `(original_total_chars, any_content_truncated)`.
-fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (usize, bool) {
+/// `recipe(turn_id, total_chars)` names the exact read of one whole turn, and
+/// rides on every excerpt's marker. Returns `(original_total_chars,
+/// any_content_truncated)`.
+fn bound_collected_turns(
+    rows: &mut [serde_json::Value],
+    max_chars: usize,
+    recipe: &dyn Fn(&str, usize) -> String,
+) -> (usize, bool) {
     let lengths: Vec<usize> = rows
         .iter()
         .map(|row| {
@@ -3762,8 +3826,12 @@ fn bound_collected_turns(rows: &mut [serde_json::Value], max_chars: usize) -> (u
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let turn_id = row
+            .get("turn_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let bounded = crate::delegation::truncate_head_tail_with_marker(content, budget, |n| {
-            format!("…[+{n} chars: agent_read{{sid, since, n}}]…")
+            format!("…[+{n} chars: {}]…", recipe(turn_id, original_chars))
         });
         row["content"] = serde_json::json!(bounded.text);
         truncated |= bounded.truncated;
@@ -3893,7 +3961,12 @@ async fn settle_until_the_final_turn_lands(
 /// Default is NEWEST-first: the overwhelmingly common read is "what did it
 /// answer", and the old oldest-first default made a caller page through a
 /// transcript it had already seen to reach it. Passing `since` flips the
-/// default to forward paging, which is the shape that cursor is for.
+/// default to forward paging, which is the shape that cursor is for — and the
+/// body then says what it withheld (`remaining`) and what the newest turn is
+/// (`latest`), so an oldest-unread page can never pass for the newest answer.
+/// `n:0` is the status-only read: the same body with no turn text at all —
+/// activity, `latest`, and how many turns are unread past `since` — for the
+/// caller whose question is "is it done?" (issue #194).
 async fn run_agent_read_transcript(
     args: &serde_json::Value,
     gateway: &GatewayHandle,
@@ -3904,10 +3977,11 @@ async fn run_agent_read_transcript(
     // never spawned, so the honest answer is what the session is — not an empty
     // page or an "unknown session" from the resolve below.
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
+    // `n:0` is legal here (status only); the roster keeps its floor of 1.
     let n = args
         .get("n")
         .and_then(|v| v.as_u64())
-        .map(|x| (x as usize).clamp(1, 500))
+        .map(|x| (x as usize).min(500))
         .unwrap_or(AGENT_READ_DEFAULT_N);
     let tail = args
         .get("tail")
@@ -3988,10 +4062,17 @@ async fn run_agent_read_transcript(
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
     // `page_collected_turns`.
-    let (mut rows, last_turn_id, page_truncated) =
-        page_collected_turns(&all, since.as_deref(), n, tail);
-    let (_total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars);
-    let truncated = page_truncated || content_truncated;
+    let page = page_collected_turns(&all, since.as_deref(), n, tail);
+    let TranscriptPage {
+        mut rows,
+        cursor,
+        remaining,
+        latest,
+    } = page;
+    let recipe = |turn_id: &str, total_chars: usize| {
+        whole_turn_recipe(&resolved.sid, previous_turn_id(&all, turn_id), total_chars)
+    };
+    let (_total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars, &recipe);
 
     let activity = classify_session_activity(
         projection.as_deref(),
@@ -4008,10 +4089,21 @@ async fn run_agent_read_transcript(
         tokens_total,
     });
     body.insert("turns".into(), serde_json::json!(rows));
-    if let Some(cursor) = last_turn_id.clone() {
+    if let Some(cursor) = cursor.as_deref() {
         body.insert("cursor".into(), serde_json::json!(cursor));
     }
-    if truncated {
+    // What the page did NOT show, stated as numbers and ids: `remaining`
+    // matching turns off the page, and `latest` when the newest turn is not the
+    // one the cursor points at (always on a status-only read).
+    if remaining > 0 {
+        body.insert("remaining".into(), serde_json::json!(remaining));
+    }
+    if let Some(latest) = latest.filter(|latest| Some(latest.as_str()) != cursor.as_deref()) {
+        body.insert("latest".into(), serde_json::json!(latest));
+    }
+    // `truncated` is about TEXT: a returned turn was cut to fit `max_chars`
+    // (its marker carries the exact read of the whole turn).
+    if content_truncated {
         body.insert("truncated".into(), serde_json::json!(true));
     }
     // `status: "stopped"` used to mean nothing more than "not live", which
@@ -4037,7 +4129,7 @@ async fn run_agent_read_transcript(
                 &resolved.sid,
                 m.vendor,
                 &m.host,
-                last_turn_id.as_deref(),
+                cursor.as_deref(),
                 None,
                 None,
             );
@@ -5002,6 +5094,8 @@ mod session_tool_tests {
                     "context_pct",
                     "cost_usd",
                     "cursor",
+                    "latest",
+                    "remaining",
                     "residency",
                     "tokens_total",
                     "truncated",
@@ -7394,40 +7488,53 @@ mod session_tool_tests {
 
     /// A burst of MORE than `n` turns after the cursor must NOT silently drop
     /// the middle: `page_collected_turns` returns the OLDEST `n`, sets the
-    /// cursor to that page's boundary, and flags `truncated` so a follow-up
-    /// poll fetches the rest. Walking the cursor returns EVERY turn in order.
+    /// cursor to that page's boundary, and counts the `remaining` so a
+    /// follow-up poll fetches the rest. Walking the cursor returns EVERY turn
+    /// in order.
     #[test]
     fn page_collected_turns_pages_a_burst_without_loss() {
         let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
         // First poll, no cursor, page size 10.
-        let (rows, cursor, truncated) = page_collected_turns(&all, None, 10, false);
-        assert_eq!(rows.len(), 10);
-        assert!(truncated, "25 > 10 ⇒ truncated");
-        assert_eq!(rows[0]["turn_id"], "t0", "oldest-first (not the newest 10)");
-        assert_eq!(rows[9]["turn_id"], "t9");
-        assert_eq!(cursor.as_deref(), Some("t9"), "cursor = boundary turn");
+        let page = page_collected_turns(&all, None, 10, false);
+        assert_eq!(page.rows.len(), 10);
+        assert_eq!(page.remaining, 15, "25 − 10 still to read");
+        assert_eq!(
+            page.rows[0]["turn_id"], "t0",
+            "oldest-first (not the newest 10)"
+        );
+        assert_eq!(page.rows[9]["turn_id"], "t9");
+        assert_eq!(page.cursor.as_deref(), Some("t9"), "cursor = boundary turn");
+        assert_eq!(
+            page.latest.as_deref(),
+            Some("t24"),
+            "the newest turn is named whatever the page shows"
+        );
 
         // Second poll from the boundary.
-        let (rows2, cursor2, truncated2) = page_collected_turns(&all, Some("t9"), 10, false);
-        assert_eq!(rows2.len(), 10);
-        assert!(truncated2);
+        let page2 = page_collected_turns(&all, Some("t9"), 10, false);
+        assert_eq!(page2.rows.len(), 10);
+        assert_eq!(page2.remaining, 5);
         assert_eq!(
-            rows2[0]["turn_id"], "t10",
+            page2.rows[0]["turn_id"], "t10",
             "no gap — resumes right after t9"
         );
-        assert_eq!(cursor2.as_deref(), Some("t19"));
+        assert_eq!(page2.cursor.as_deref(), Some("t19"));
 
         // Third poll drains the remainder.
-        let (rows3, _c3, truncated3) = page_collected_turns(&all, Some("t19"), 10, false);
-        assert_eq!(rows3.len(), 5);
-        assert!(!truncated3, "final page is not truncated");
-        assert_eq!(rows3[0]["turn_id"], "t20");
-        assert_eq!(rows3[4]["turn_id"], "t24");
+        let page3 = page_collected_turns(&all, Some("t19"), 10, false);
+        assert_eq!(page3.rows.len(), 5);
+        assert_eq!(page3.remaining, 0, "final page withholds nothing");
+        assert_eq!(page3.rows[0]["turn_id"], "t20");
+        assert_eq!(page3.rows[4]["turn_id"], "t24");
+        assert_eq!(
+            page3.cursor, page3.latest,
+            "the last page ends at the newest turn"
+        );
 
         // The three pages reconstruct the full ordered set — zero loss.
         let mut seen: Vec<String> = Vec::new();
-        for page in [&rows, &rows2, &rows3] {
-            for r in page {
+        for rows in [&page.rows, &page2.rows, &page3.rows] {
+            for r in rows {
                 seen.push(r["turn_id"].as_str().unwrap().to_string());
             }
         }
@@ -7435,19 +7542,19 @@ mod session_tool_tests {
         assert_eq!(seen, expected, "every turn returned exactly once, in order");
     }
 
-    /// A short backlog (≤ `n`) returns everything, `truncated:false`, cursor =
+    /// A short backlog (≤ `n`) returns everything, nothing remaining, cursor =
     /// last turn. An unknown cursor returns everything (never silently lose).
     #[test]
     fn page_collected_turns_short_and_unknown_cursor() {
         let all: Vec<_> = (0..3).map(|i| turn(&format!("t{i}"))).collect();
-        let (rows, cursor, truncated) = page_collected_turns(&all, None, 20, false);
-        assert_eq!(rows.len(), 3);
-        assert!(!truncated);
-        assert_eq!(cursor.as_deref(), Some("t2"));
+        let page = page_collected_turns(&all, None, 20, false);
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.remaining, 0);
+        assert_eq!(page.cursor.as_deref(), Some("t2"));
         // Unknown cursor → all turns (defensive, no loss).
-        let (rows_u, _c, trunc_u) = page_collected_turns(&all, Some("ghost"), 20, false);
-        assert_eq!(rows_u.len(), 3);
-        assert!(!trunc_u);
+        let unknown = page_collected_turns(&all, Some("ghost"), 20, false);
+        assert_eq!(unknown.rows.len(), 3);
+        assert_eq!(unknown.remaining, 0);
     }
 
     /// v0.9.1 — `tail:true` returns the NEWEST `n` (chronological inside the
@@ -7455,17 +7562,49 @@ mod session_tool_tests {
     #[test]
     fn page_collected_turns_tail_returns_newest() {
         let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
-        let (rows, cursor, truncated) = page_collected_turns(&all, None, 3, true);
-        assert_eq!(rows.len(), 3);
-        assert!(truncated, "25 > 3 ⇒ truncated");
-        assert_eq!(rows[0]["turn_id"], "t22", "newest 3, oldest of them first");
-        assert_eq!(rows[2]["turn_id"], "t24", "ends at the newest turn");
-        assert_eq!(cursor.as_deref(), Some("t24"));
+        let page = page_collected_turns(&all, None, 3, true);
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.remaining, 22, "the older 22 are off the page");
+        assert_eq!(
+            page.rows[0]["turn_id"], "t22",
+            "newest 3, oldest of them first"
+        );
+        assert_eq!(page.rows[2]["turn_id"], "t24", "ends at the newest turn");
+        assert_eq!(page.cursor.as_deref(), Some("t24"));
+        assert_eq!(
+            page.latest, page.cursor,
+            "a tail page always ends at the newest turn"
+        );
         // `since` still applies before the tail cut.
-        let (rows2, _c, trunc2) = page_collected_turns(&all, Some("t22"), 5, true);
-        assert_eq!(rows2.len(), 2, "only t23/t24 exist after t22");
-        assert!(!trunc2);
-        assert_eq!(rows2[0]["turn_id"], "t23");
+        let page2 = page_collected_turns(&all, Some("t22"), 5, true);
+        assert_eq!(page2.rows.len(), 2, "only t23/t24 exist after t22");
+        assert_eq!(page2.remaining, 0);
+        assert_eq!(page2.rows[0]["turn_id"], "t23");
+    }
+
+    /// issue #194 — the field report: a `since` + `n:1` read is the OLDEST
+    /// unread turn, and the body now says so — `remaining` counts what is
+    /// still unread and `latest` names the newest turn — so it can never pass
+    /// for the newest answer. `n:0` is the body-free status read.
+    #[test]
+    fn page_collected_turns_says_what_it_withheld() {
+        let all: Vec<_> = (7..10).map(|i| turn(&format!("s1587-{i}"))).collect();
+        let page = page_collected_turns(&all, Some("s1587-7"), 1, false);
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0]["turn_id"], "s1587-8", "oldest unread first");
+        assert_eq!(page.cursor.as_deref(), Some("s1587-8"));
+        assert_eq!(page.remaining, 1, "one newer turn was withheld");
+        assert_eq!(page.latest.as_deref(), Some("s1587-9"));
+
+        let status = page_collected_turns(&all, Some("s1587-7"), 0, false);
+        assert!(status.rows.is_empty(), "n:0 carries no text");
+        assert_eq!(status.cursor, None);
+        assert_eq!(status.remaining, 2, "unread count since the cursor");
+        assert_eq!(status.latest.as_deref(), Some("s1587-9"));
+
+        let caught_up = page_collected_turns(&all, Some("s1587-9"), 0, false);
+        assert_eq!(caught_up.remaining, 0);
+        assert_eq!(caught_up.latest.as_deref(), Some("s1587-9"));
     }
 
     /// A vendor turn that failed before it said anything writes kind/error and
@@ -7482,7 +7621,8 @@ mod session_tool_tests {
         failed.error = Some("Selected model is at capacity.".into());
         let all = vec![turn("t1"), failed];
 
-        let (rows, cursor, _truncated) = page_collected_turns(&all, None, 10, true);
+        let page = page_collected_turns(&all, None, 10, true);
+        let (rows, cursor) = (page.rows, page.cursor);
         assert_eq!(rows.len(), 2, "the failure is a row, not a gap: {rows:?}");
         assert_eq!(rows[1]["turn_id"], "t2");
         assert_eq!(rows[1]["content"], "", "empty text, not a dropped row");
@@ -7499,7 +7639,7 @@ mod session_tool_tests {
         // user-side half of an exchange has no business in an answer page.
         let mut silent = turn("t3");
         silent.assistant = String::new();
-        let (quiet, _c, _t) = page_collected_turns(&[silent], None, 10, true);
+        let quiet = page_collected_turns(&[silent], None, 10, true).rows;
         assert!(quiet.is_empty(), "{quiet:?}");
     }
 
@@ -7568,9 +7708,12 @@ mod session_tool_tests {
 
     #[test]
     fn collect_max_chars_defaults_and_clamps() {
-        assert_eq!(collect_max_chars(&json!({})), 4_000);
-        assert_eq!(collect_max_chars(&json!({ "max_chars": 1 })), 500);
-        assert_eq!(collect_max_chars(&json!({ "max_chars": -10 })), 500);
+        assert_eq!(collect_max_chars(&json!({})), 1_000);
+        assert_eq!(collect_max_chars(&json!({ "max_chars": 1 })), 100);
+        assert_eq!(collect_max_chars(&json!({ "max_chars": -10 })), 100);
+        // The small polling window the field report reached for is honoured,
+        // not silently widened.
+        assert_eq!(collect_max_chars(&json!({ "max_chars": 300 })), 300);
         assert_eq!(collect_max_chars(&json!({ "max_chars": 999_999 })), 50_000);
         assert_eq!(collect_max_chars(&json!({ "max_chars": 12_345 })), 12_345);
     }
@@ -7582,7 +7725,8 @@ mod session_tool_tests {
             json!({ "turn_id": "t1", "content": "short" }),
             json!({ "turn_id": "t2", "content": long }),
         ];
-        let (total_chars, truncated) = bound_collected_turns(&mut rows, 500);
+        let recipe = |turn_id: &str, total: usize| format!("read {turn_id} whole ({total})");
+        let (total_chars, truncated) = bound_collected_turns(&mut rows, 500, &recipe);
         assert_eq!(total_chars, 5 + 908);
         assert!(truncated);
         let returned: usize = rows
@@ -7594,7 +7738,26 @@ mod session_tool_tests {
         let excerpt = rows[1]["content"].as_str().unwrap();
         assert!(excerpt.starts_with("HEAD"));
         assert!(excerpt.ends_with("TAIL"));
-        assert!(excerpt.contains("agent_read{sid, since, n}"), "{excerpt}");
+        // The marker carries the recipe for THAT turn with ITS full length.
+        assert!(excerpt.contains("read t2 whole (908)"), "{excerpt}");
+    }
+
+    /// The recipe on a truncated transcript row is an exact one-call read of
+    /// that turn: `since` = the row before it, `n:1`, `max_chars` = its length.
+    #[test]
+    fn whole_turn_recipe_names_the_exact_read() {
+        let all: Vec<_> = ["t0", "t1", "t2"].iter().map(|id| turn(id)).collect();
+        assert_eq!(previous_turn_id(&all, "t2"), Some("t1"));
+        assert_eq!(previous_turn_id(&all, "t0"), None);
+        assert_eq!(previous_turn_id(&all, "ghost"), None);
+        assert_eq!(
+            whole_turn_recipe("s5", Some("t1"), 908),
+            "agent_read{sid:s5,since:t1,n:1,max_chars:908}"
+        );
+        assert_eq!(
+            whole_turn_recipe("s5", None, 7),
+            "agent_read{sid:s5,tail:false,n:1,max_chars:100}"
+        );
     }
 
     // ========================================================================
@@ -9186,7 +9349,8 @@ mod session_tool_tests {
             ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
                 .unwrap();
         assert_eq!(watch.parent_sid, principal);
-        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+        // issue #194 — frugal by default: nobody asked for the 2000-char tier.
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Brief, "{watch:?}");
     }
 
     /// v0.10.1 (issue #184) — a dispatch to a session the caller never
@@ -9280,7 +9444,7 @@ mod session_tool_tests {
         let watch =
             ccteam_harness::read_delegation_watch(tmp.path(), child["sid"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Brief, "{watch:?}");
     }
 
     /// The refusal sits BEHIND the ACL, not in front of it: a tenant who can see

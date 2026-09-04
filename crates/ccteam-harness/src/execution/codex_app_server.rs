@@ -1901,13 +1901,11 @@ impl HarnessAdapter for CodexAppServerAdapter {
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-        routing: TurnRouting,
+        _routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
-        if routing == TurnRouting::Queue {
-            return Err(HarnessError::NotImplemented {
-                reason: "codex app-server does not expose a distinct queued-turn channel".into(),
-            });
-        }
+        // codex has no distinct queued-turn channel: a `Queue` request rides
+        // the steer path below and is reported as `Injected` (`TurnRouting`
+        // contract — the routing is a preference, the disposition the truth).
         // Deterministic precondition: guarantee this thread is resident on the
         // current connection (resume-once-per-epoch) BEFORE sending the turn,
         // so `turn/start` can never hit `thread not found`.

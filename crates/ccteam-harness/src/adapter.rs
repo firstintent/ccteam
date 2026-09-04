@@ -511,17 +511,24 @@ pub enum TurnInput {
 /// delivered.
 ///
 /// This is **user-turn routing**, not system-prompt injection: ccteam forwards
-/// the user's text unchanged through a vendor-native channel. Adapters report
-/// unsupported paths explicitly; where both are supported, an idle session
-/// starts a normal turn for either variant.
+/// the user's text unchanged through a vendor-native channel. The routing is
+/// the caller's PREFERENCE; [`TurnSubmission::disposition`] is what actually
+/// happened. An adapter that lacks the requested channel uses the one it has
+/// (a steer-only vendor injects a `Queue` request, a queue-only vendor queues
+/// an `Inject` request) and reports that truthfully, never cancels the active
+/// turn, and never refuses the message. An idle session starts a normal turn
+/// for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnRouting {
-    /// Merge the message into the active vendor turn at its next safe point.
-    /// Adapters without a native steer/interject channel may explicitly
-    /// degrade to [`TurnRouting::Queue`] rather than cancel the active turn.
+    /// Merge the message into the active vendor turn at its next safe point —
+    /// a human steering the work they are watching.
     Inject,
-    /// Preserve the message as a distinct FIFO follow-up turn.
+    /// Preserve the message as a distinct FIFO follow-up turn — a message
+    /// nobody is steering with, such as a ccteam-authored delegation
+    /// completion notification (issue #194: on claude a mid-turn stdin line is
+    /// shown to the model twice, once as a queued-command preview and once as
+    /// the next prompt; a distinct turn is charged once).
     Queue,
 }
 

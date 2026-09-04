@@ -493,13 +493,11 @@ impl HarnessAdapter for CodexExecAdapter {
         &self,
         h: &ThreadHandle,
         input: TurnInput,
-        routing: TurnRouting,
+        _routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
-        if routing == TurnRouting::Queue {
-            return Err(HarnessError::NotImplemented {
-                reason: "codex exec does not expose a distinct queued-turn channel".into(),
-            });
-        }
+        // One channel only: every routing request takes it and is reported as
+        // a started turn (`TurnRouting` contract — a preference, never a
+        // refusal).
         self.submit_turn(h, input)
             .await
             .map(TurnSubmission::started)

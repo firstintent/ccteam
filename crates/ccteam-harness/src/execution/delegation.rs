@@ -32,14 +32,18 @@ use super::turns_mirror::chat_dir;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotifyMode {
     /// Notify once, at the vendor turn boundary — the child finished the
-    /// dispatched task and went idle (default; interim narration stays in the
-    /// ledger).
-    #[default]
+    /// dispatched task and went idle — with the LONGER excerpt (interim
+    /// narration stays in the ledger either way).
     Final,
-    /// Same boundary as [`Self::Final`], a SHORTER excerpt. The wake-up point
-    /// is a property of the task; how much of the answer rides along is the
-    /// parent's context budget, so the two are separate axes and only the cap
-    /// differs here.
+    /// Same boundary as [`Self::Final`], a SHORTER excerpt — the default. The
+    /// wake-up point is a property of the task; how much of the answer rides
+    /// along is the parent's context budget, so the two are separate axes and
+    /// only the cap differs here. Brief by default because the parent is the
+    /// scarcest context in a team (issue #194: a planner paid 2000 chars ×
+    /// twenty children for reports it only needed the verdict line of); the
+    /// whole answer is always one exact `agent_read` call away, and a parent
+    /// that wants it pushed asks for `final`.
+    #[default]
     Brief,
     /// Never notify — ledger-only, the parent polls `agent_read`.
     Off,

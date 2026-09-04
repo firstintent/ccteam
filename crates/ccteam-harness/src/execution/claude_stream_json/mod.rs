@@ -108,14 +108,25 @@ struct LiveSession {
     /// Adapter-local vendor-turn occupancy for truthful Started vs Injected
     /// submission receipts. Set before writing input; cleared on TurnResult.
     active_turn: Arc<AtomicBool>,
-    /// Vendor slash commands (`/goal`, `/compact`, …) that arrived while a turn
-    /// was in flight, verbatim, FIFO. Claude parses a slash line only when
-    /// idle — a line written mid-turn is a steer the MODEL reads as prose
-    /// (issue #193: `/goal …` typed while the planner was working surfaced as
-    /// "the user sent a new message"). The status tap writes the next one the
-    /// moment a `result` closes the turn, so the command lands where the CLI
-    /// actually executes it.
-    deferred_slash: Arc<StdMutex<VecDeque<String>>>,
+    /// Input lines that arrived while a turn was in flight and must NOT be
+    /// written mid-turn — verbatim, FIFO, one queue for two shapes:
+    /// - vendor slash commands (`/goal`, `/compact`, …): Claude parses a slash
+    ///   line only when idle; mid-turn it is a steer the MODEL reads as prose
+    ///   (issue #193: `/goal …` typed while the planner was working surfaced as
+    ///   "the user sent a new message");
+    /// - `TurnRouting::Queue` user text — a ccteam-authored follow-up such as a
+    ///   delegation completion notification: claude shows a mid-turn stdin line
+    ///   to the model TWICE, as a `queued_command` preview inside the running
+    ///   turn and again as the prompt of the next one (issue #194: every
+    ///   completion report charged the orchestrator double), so it waits for
+    ///   the boundary and becomes exactly one turn.
+    ///
+    /// The status tap writes the next line the moment a `result` closes the
+    /// turn, so a command lands where the CLI executes it and a notification
+    /// is read once. Mirrored to `deferred-input.json` in the session's chat
+    /// dir ([`persist_deferred_input`]) so a daemon restart mid-turn does not
+    /// lose what was parked: the next `start_thread` of the same sid replays it.
+    deferred_input: Arc<StdMutex<VecDeque<String>>>,
 }
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
@@ -227,7 +238,7 @@ fn spawn_status_tap(
     status: Arc<StdMutex<ThreadStatus>>,
     running_tasks: Arc<StdMutex<TaskTracker>>,
     active_turn: Arc<AtomicBool>,
-    deferred_slash: Arc<StdMutex<VecDeque<String>>>,
+    deferred_input: Arc<StdMutex<VecDeque<String>>>,
     project_dir: PathBuf,
     sid: String,
 ) -> tokio::task::JoinHandle<()> {
@@ -333,39 +344,44 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
-                        // Clear occupancy and claim the next deferred slash
-                        // command (issue #193) under ONE lock, so a directive
-                        // racing this `result` either sees the turn still open
-                        // (→ parked, popped right here) or already closed (→
-                        // submitted directly) — never parked behind a turn
-                        // that has already ended.
-                        let next = match deferred_slash.lock() {
+                        // Clear occupancy and claim the next deferred input
+                        // line (a slash command, issue #193; a queued turn,
+                        // issue #194) under ONE lock, so a submission racing
+                        // this `result` either sees the turn still open (→
+                        // parked, popped right here) or already closed (→
+                        // written directly) — never parked behind a turn that
+                        // has already ended.
+                        let next = match deferred_input.lock() {
                             Ok(mut q) => {
                                 active_turn.store(false, Ordering::Release);
                                 let next = q.pop_front();
                                 if next.is_some() {
                                     active_turn.store(true, Ordering::Release);
                                 }
-                                next
+                                next.map(|line| (line, q.clone()))
                             }
                             Err(_) => {
                                 active_turn.store(false, Ordering::Release);
                                 None
                             }
                         };
-                        if let Some(line) = next {
-                            // Each deferred command starts its own turn; the
-                            // rest of the queue waits for the next `result`.
-                            if let Err(error) =
-                                transport.send_line(protocol::user_text_line(&line)).await
-                            {
-                                active_turn.store(false, Ordering::Release);
-                                tracing::warn!(
-                                    session = %sid,
-                                    %error,
-                                    line = %line,
-                                    "stream-json: deferred slash command was not delivered"
-                                );
+                        if let Some((line, rest)) = next {
+                            // Each deferred line starts its own turn; the rest
+                            // of the queue waits for the next `result`. The
+                            // on-disk mirror drops the line only once it is
+                            // written: a crash in between replays it (at-least-
+                            // once), never loses it.
+                            match transport.send_line(protocol::user_text_line(&line)).await {
+                                Ok(()) => persist_deferred_input(&project_dir, &sid, &rest),
+                                Err(error) => {
+                                    active_turn.store(false, Ordering::Release);
+                                    tracing::warn!(
+                                        session = %sid,
+                                        %error,
+                                        line = %line,
+                                        "stream-json: deferred input was not delivered"
+                                    );
+                                }
                             }
                         }
                         effort_probed_this_turn = false;
@@ -453,6 +469,61 @@ fn spawn_status_tap(
             }
         }
     })
+}
+
+/// `<project>/.ccteam/chat/<sid>/deferred-input.json` — the on-disk mirror of
+/// [`LiveSession::deferred_input`]: a JSON array of the parked lines, oldest
+/// first. Absent when nothing is parked.
+fn deferred_input_path(project_dir: &Path, sid: &str) -> PathBuf {
+    super::turns_mirror::chat_dir(project_dir, sid).join("deferred-input.json")
+}
+
+/// Mirror the parked queue to disk (the file is removed when the queue is
+/// empty). Best-effort: a write failure is logged and never fails the
+/// submission that parked the line — the in-memory queue still delivers it
+/// within this daemon's life; only the restart replay is lost.
+fn persist_deferred_input(project_dir: &Path, sid: &str, queue: &VecDeque<String>) {
+    let path = deferred_input_path(project_dir, sid);
+    let result = if queue.is_empty() {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    } else {
+        let lines: Vec<&String> = queue.iter().collect();
+        std::fs::create_dir_all(path.parent().expect("chat dir has a parent"))
+            .map_err(anyhow::Error::from)
+            .and_then(|()| serde_json::to_vec(&lines).map_err(anyhow::Error::from))
+            .and_then(|bytes| super::fs_atomic::atomic_write_durable(&path, &bytes))
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            session = %sid,
+            %error,
+            "stream-json: deferred input was not mirrored to disk"
+        );
+    }
+}
+
+/// The parked lines a previous process life of this sid left behind
+/// (missing or unreadable → empty).
+fn load_deferred_input(project_dir: &Path, sid: &str) -> VecDeque<String> {
+    std::fs::read(deferred_input_path(project_dir, sid))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+        .map(VecDeque::from)
+        .unwrap_or_default()
+}
+
+/// Adapter-side correlation id for one accepted user line (the pump keys
+/// `turns.jsonl` off its own sequence; this id only serves logs and the
+/// gateway's per-input bookkeeping).
+fn synthetic_turn_id() -> TurnId {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    TurnId::new(format!("turn-{nanos:x}"))
 }
 
 /// Receipt for a vendor slash command parked behind the in-flight turn
@@ -1147,6 +1218,41 @@ fn init_timeout() -> Duration {
 }
 
 impl ClaudeStreamJsonAdapter {
+    /// Write the first parked input line of an IDLE session (a replay after
+    /// `start_thread` loaded `deferred-input.json`). The status tap flushes the
+    /// rest, one turn per `result`. Pop and send first, mirror second: a crash
+    /// in between replays the line (at-least-once) rather than losing it.
+    async fn kick_deferred_input(live: &LiveSession) {
+        let next = match live.deferred_input.lock() {
+            Ok(mut queue) if !live.active_turn.load(Ordering::Acquire) => {
+                let next = queue.pop_front();
+                if next.is_some() {
+                    live.active_turn.store(true, Ordering::Release);
+                }
+                next.map(|line| (line, queue.clone()))
+            }
+            _ => None,
+        };
+        let Some((line, rest)) = next else {
+            return;
+        };
+        match live
+            .transport
+            .send_line(protocol::user_text_line(&line))
+            .await
+        {
+            Ok(()) => persist_deferred_input(&live.project_dir, &live.identity.sid, &rest),
+            Err(error) => {
+                live.active_turn.store(false, Ordering::Release);
+                tracing::warn!(
+                    session = %live.identity.sid,
+                    %error,
+                    "stream-json: replay of parked input was not delivered"
+                );
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1532,8 +1638,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let running_tasks: Arc<StdMutex<TaskTracker>> =
             Arc::new(StdMutex::new(TaskTracker::default()));
         let active_turn = Arc::new(AtomicBool::new(false));
-        let deferred_slash: Arc<StdMutex<VecDeque<String>>> =
-            Arc::new(StdMutex::new(VecDeque::new()));
+        // Whatever a previous process life parked behind a turn it never got
+        // to finish (daemon restart mid-turn) is still owed to this sid.
+        let deferred_input: Arc<StdMutex<VecDeque<String>>> = Arc::new(StdMutex::new(
+            load_deferred_input(&ctx.project_dir, &ctx.sid),
+        ));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
@@ -1547,7 +1656,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             Arc::clone(&status),
             Arc::clone(&running_tasks),
             Arc::clone(&active_turn),
-            Arc::clone(&deferred_slash),
+            Arc::clone(&deferred_input),
             ctx.project_dir.clone(),
             ctx.sid.clone(),
         ));
@@ -1617,8 +1726,9 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             status,
             running_tasks,
             active_turn,
-            deferred_slash,
+            deferred_input,
         };
+        let live = Arc::new(live);
         // Body record lifecycle: the record written at spawn is cleared the
         // moment THIS daemon observes the child's exit (stdout EOF). A
         // `detach` (daemon shutdown) closes the transport too, but leaves the
@@ -1637,7 +1747,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         self.live
             .lock()
             .unwrap()
-            .insert(uuid.clone(), Arc::new(live));
+            .insert(uuid.clone(), Arc::clone(&live));
+        // Replay what the previous process life parked (see
+        // `LiveSession::deferred_input`): the first line starts a turn now, the
+        // tap flushes the rest one turn at a time.
+        Self::kick_deferred_input(&live).await;
 
         tracing::info!(
             event = "stream_json_started",
@@ -1688,11 +1802,6 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         input: TurnInput,
         routing: TurnRouting,
     ) -> Result<TurnSubmission, HarnessError> {
-        if routing == TurnRouting::Queue {
-            return Err(HarnessError::NotImplemented {
-                reason: "claude stream-json does not expose a distinct queued-turn channel".into(),
-            });
-        }
         let Some(live) = self.lookup(&h.identity) else {
             // Registry miss = the session was idle-released / closed: nothing was
             // sent, so this is a recoverable ThreadDied (caller resumes + retries
@@ -1718,6 +1827,30 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 format!("Tool result for {call_id}: {body}")
             }
         };
+        if routing == TurnRouting::Queue {
+            // A distinct follow-up turn was asked for (a ccteam-authored
+            // delegation completion notification). Mid-turn, claude shows a
+            // stdin line to the model TWICE — as a `queued_command` preview
+            // inside the running turn, then again as the next prompt (issue
+            // #194: every completion report charged the orchestrator double)
+            // — so park it and let the status tap write it right after this
+            // turn's `result`, where it is read exactly once. Idle, the same
+            // line simply starts a turn below. Check-and-park under the queue
+            // lock, like the slash path: the tap clears `active_turn` and pops
+            // under the same lock, so this never parks behind a turn that has
+            // already ended.
+            let parked = match live.deferred_input.lock() {
+                Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
+                    queue.push_back(text.clone());
+                    Some(queue.clone())
+                }
+                _ => None,
+            };
+            if let Some(queue) = parked {
+                persist_deferred_input(&live.project_dir, &live.identity.sid, &queue);
+                return Ok(TurnSubmission::queued(synthetic_turn_id()));
+            }
+        }
         let was_active = live.active_turn.swap(true, Ordering::AcqRel);
         if let Err(error) = live
             .transport
@@ -1733,13 +1866,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             )));
         }
 
-        // Synthesize a turn id (the pump keys turns.jsonl off its own seq;
-        // this id is only for adapter-side correlation / logs).
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let turn_id = TurnId::new(format!("turn-{nanos:x}"));
+        let turn_id = synthetic_turn_id();
         if was_active {
             Ok(TurnSubmission::injected(turn_id))
         } else {
@@ -2163,14 +2290,18 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 // `active_turn` and pops under the same lock, so this can never
                 // park behind a turn that has already ended.
                 if let Some(live) = self.lookup(&h.identity) {
-                    if let Ok(mut q) = live.deferred_slash.lock() {
-                        if live.active_turn.load(Ordering::Acquire) {
-                            q.push_back(line.clone());
-                            let position = q.len();
-                            return Ok(DirectiveOutcome::Done {
-                                receipt: deferred_slash_receipt(&line, position),
-                            });
+                    let parked = match live.deferred_input.lock() {
+                        Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
+                            queue.push_back(line.clone());
+                            Some(queue.clone())
                         }
+                        _ => None,
+                    };
+                    if let Some(queue) = parked {
+                        persist_deferred_input(&live.project_dir, &live.identity.sid, &queue);
+                        return Ok(DirectiveOutcome::Done {
+                            receipt: deferred_slash_receipt(&line, queue.len()),
+                        });
                     }
                 }
                 let turn = self.submit_turn(h, TurnInput::UserText(line)).await?;
