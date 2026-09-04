@@ -125,7 +125,11 @@ struct LiveSession {
     /// turn, so a command lands where the CLI executes it and a notification
     /// is read once. Mirrored to `deferred-input.json` in the session's chat
     /// dir ([`persist_deferred_input`]) so a daemon restart mid-turn does not
-    /// lose what was parked: the next `start_thread` of the same sid replays it.
+    /// lose what was parked: the next `start_thread` of the same sid reloads
+    /// it, and the tap flushes it after that life's first `result` — the
+    /// message that triggered the resume runs first, as its own turn, and what
+    /// was parked follows in order. A line leaves the queue only once it has
+    /// been written to the CLI; the disk copy follows the write.
     deferred_input: Arc<StdMutex<VecDeque<String>>>,
 }
 
@@ -358,28 +362,48 @@ fn spawn_status_tap(
                                 if next.is_some() {
                                     active_turn.store(true, Ordering::Release);
                                 }
-                                next.map(|line| (line, q.clone()))
+                                next
                             }
                             Err(_) => {
                                 active_turn.store(false, Ordering::Release);
                                 None
                             }
                         };
-                        if let Some((line, rest)) = next {
+                        if let Some(line) = next {
                             // Each deferred line starts its own turn; the rest
-                            // of the queue waits for the next `result`. The
-                            // on-disk mirror drops the line only once it is
-                            // written: a crash in between replays it (at-least-
-                            // once), never loses it.
+                            // of the queue waits for the next `result`. A line
+                            // leaves the queue only once it is written: on a
+                            // failed write (the child is gone) it goes back to
+                            // the front, and the on-disk mirror — which still
+                            // holds it — is what the next life of this sid
+                            // reloads. The mirror follows a successful write,
+                            // so a crash in between replays the line (at-
+                            // least-once), never loses it.
                             match transport.send_line(protocol::user_text_line(&line)).await {
-                                Ok(()) => persist_deferred_input(&project_dir, &sid, &rest),
+                                Ok(()) => {
+                                    let rest = deferred_input.lock().map(|q| q.clone()).ok();
+                                    if let Some(rest) = rest {
+                                        if let Err(error) =
+                                            persist_deferred_input(&project_dir, &sid, &rest)
+                                        {
+                                            tracing::warn!(
+                                                session = %sid,
+                                                %error,
+                                                "stream-json: deferred input mirror was not updated"
+                                            );
+                                        }
+                                    }
+                                }
                                 Err(error) => {
+                                    if let Ok(mut q) = deferred_input.lock() {
+                                        q.push_front(line.clone());
+                                    }
                                     active_turn.store(false, Ordering::Release);
                                     tracing::warn!(
                                         session = %sid,
                                         %error,
                                         line = %line,
-                                        "stream-json: deferred input was not delivered"
+                                        "stream-json: deferred input was not delivered; kept for the next life"
                                     );
                                 }
                             }
@@ -479,30 +503,25 @@ fn deferred_input_path(project_dir: &Path, sid: &str) -> PathBuf {
 }
 
 /// Mirror the parked queue to disk (the file is removed when the queue is
-/// empty). Best-effort: a write failure is logged and never fails the
-/// submission that parked the line — the in-memory queue still delivers it
-/// within this daemon's life; only the restart replay is lost.
-fn persist_deferred_input(project_dir: &Path, sid: &str, queue: &VecDeque<String>) {
+/// empty). Callers decide what a failure means: a parked notification must be
+/// durable before it is accepted (the notifier spends the child's watch on the
+/// acceptance), a slash command or a post-write update is best-effort.
+fn persist_deferred_input(
+    project_dir: &Path,
+    sid: &str,
+    queue: &VecDeque<String>,
+) -> anyhow::Result<()> {
     let path = deferred_input_path(project_dir, sid);
-    let result = if queue.is_empty() {
-        match std::fs::remove_file(&path) {
+    if queue.is_empty() {
+        return match std::fs::remove_file(&path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
             _ => Ok(()),
-        }
-    } else {
-        let lines: Vec<&String> = queue.iter().collect();
-        std::fs::create_dir_all(path.parent().expect("chat dir has a parent"))
-            .map_err(anyhow::Error::from)
-            .and_then(|()| serde_json::to_vec(&lines).map_err(anyhow::Error::from))
-            .and_then(|bytes| super::fs_atomic::atomic_write_durable(&path, &bytes))
-    };
-    if let Err(error) = result {
-        tracing::warn!(
-            session = %sid,
-            %error,
-            "stream-json: deferred input was not mirrored to disk"
-        );
+        };
     }
+    let lines: Vec<&String> = queue.iter().collect();
+    std::fs::create_dir_all(path.parent().expect("chat dir has a parent"))?;
+    let bytes = serde_json::to_vec(&lines)?;
+    super::fs_atomic::atomic_write_durable(&path, &bytes)
 }
 
 /// The parked lines a previous process life of this sid left behind
@@ -1218,41 +1237,6 @@ fn init_timeout() -> Duration {
 }
 
 impl ClaudeStreamJsonAdapter {
-    /// Write the first parked input line of an IDLE session (a replay after
-    /// `start_thread` loaded `deferred-input.json`). The status tap flushes the
-    /// rest, one turn per `result`. Pop and send first, mirror second: a crash
-    /// in between replays the line (at-least-once) rather than losing it.
-    async fn kick_deferred_input(live: &LiveSession) {
-        let next = match live.deferred_input.lock() {
-            Ok(mut queue) if !live.active_turn.load(Ordering::Acquire) => {
-                let next = queue.pop_front();
-                if next.is_some() {
-                    live.active_turn.store(true, Ordering::Release);
-                }
-                next.map(|line| (line, queue.clone()))
-            }
-            _ => None,
-        };
-        let Some((line, rest)) = next else {
-            return;
-        };
-        match live
-            .transport
-            .send_line(protocol::user_text_line(&line))
-            .await
-        {
-            Ok(()) => persist_deferred_input(&live.project_dir, &live.identity.sid, &rest),
-            Err(error) => {
-                live.active_turn.store(false, Ordering::Release);
-                tracing::warn!(
-                    session = %live.identity.sid,
-                    %error,
-                    "stream-json: replay of parked input was not delivered"
-                );
-            }
-        }
-    }
-
     pub fn new() -> Self {
         Self::default()
     }
@@ -1639,7 +1623,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             Arc::new(StdMutex::new(TaskTracker::default()));
         let active_turn = Arc::new(AtomicBool::new(false));
         // Whatever a previous process life parked behind a turn it never got
-        // to finish (daemon restart mid-turn) is still owed to this sid.
+        // to finish (daemon restart mid-turn) is still owed to this sid. It is
+        // NOT written here: the message that resumed the session is about to be
+        // submitted and deserves a clean turn of its own (an eager replay would
+        // turn it into a steer of a stale notification's turn); the status tap
+        // flushes the parked lines after that turn's `result`, in order.
         let deferred_input: Arc<StdMutex<VecDeque<String>>> = Arc::new(StdMutex::new(
             load_deferred_input(&ctx.project_dir, &ctx.sid),
         ));
@@ -1748,10 +1736,6 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             .lock()
             .unwrap()
             .insert(uuid.clone(), Arc::clone(&live));
-        // Replay what the previous process life parked (see
-        // `LiveSession::deferred_input`): the first line starts a turn now, the
-        // tap flushes the rest one turn at a time.
-        Self::kick_deferred_input(&live).await;
 
         tracing::info!(
             event = "stream_json_started",
@@ -1839,15 +1823,33 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             // lock, like the slash path: the tap clears `active_turn` and pops
             // under the same lock, so this never parks behind a turn that has
             // already ended.
+            //
+            // Durable BEFORE it is accepted: the delegation notifier spends the
+            // child's watch on this Ok, so a parked line that only lived in
+            // memory would turn a daemon crash into a lost notification. The
+            // mirror is written under the queue lock (the tap cannot flush the
+            // line in between); if the disk refuses, the line is taken back
+            // and written now instead — read twice by claude, never lost.
             let parked = match live.deferred_input.lock() {
                 Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
                     queue.push_back(text.clone());
-                    Some(queue.clone())
+                    match persist_deferred_input(&live.project_dir, &live.identity.sid, &queue) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            queue.pop_back();
+                            tracing::warn!(
+                                session = %live.identity.sid,
+                                %error,
+                                "stream-json: queued turn could not be mirrored to disk; \
+                                 writing it mid-turn instead"
+                            );
+                            false
+                        }
+                    }
                 }
-                _ => None,
+                _ => false,
             };
-            if let Some(queue) = parked {
-                persist_deferred_input(&live.project_dir, &live.identity.sid, &queue);
+            if parked {
                 return Ok(TurnSubmission::queued(synthetic_turn_id()));
             }
         }
@@ -2293,14 +2295,28 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     let parked = match live.deferred_input.lock() {
                         Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
                             queue.push_back(line.clone());
-                            Some(queue.clone())
+                            // Best-effort mirror: a slash command is not an
+                            // at-least-once contract, so a disk refusal keeps
+                            // it parked in memory rather than degrading it
+                            // into prose (issue #193).
+                            if let Err(error) = persist_deferred_input(
+                                &live.project_dir,
+                                &live.identity.sid,
+                                &queue,
+                            ) {
+                                tracing::warn!(
+                                    session = %live.identity.sid,
+                                    %error,
+                                    "stream-json: deferred slash command was not mirrored to disk"
+                                );
+                            }
+                            Some(queue.len())
                         }
                         _ => None,
                     };
-                    if let Some(queue) = parked {
-                        persist_deferred_input(&live.project_dir, &live.identity.sid, &queue);
+                    if let Some(position) = parked {
                         return Ok(DirectiveOutcome::Done {
-                            receipt: deferred_slash_receipt(&line, queue.len()),
+                            receipt: deferred_slash_receipt(&line, position),
                         });
                     }
                 }

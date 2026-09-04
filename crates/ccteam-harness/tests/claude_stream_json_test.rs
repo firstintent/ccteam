@@ -754,12 +754,13 @@ async fn queued_text_when_idle_starts_a_turn_at_once() {
 
 /// The parked queue outlives the daemon: what a previous process life mirrored
 /// to `deferred-input.json` (a notification parked behind a turn the daemon did
-/// not live to see end) is replayed by the next `start_thread` of the same sid
-/// — first line at once, the rest one turn at a time — and the mirror is
-/// consumed as it goes.
+/// not live to see end) is reloaded by the next `start_thread` of the same sid
+/// and flushed after that life's FIRST turn — the message that resumed the
+/// session runs first, as its own clean turn; the parked lines follow in order,
+/// one turn each — and the mirror is consumed as it goes.
 #[tokio::test(flavor = "current_thread")]
 #[serial]
-async fn parked_input_left_by_a_previous_daemon_is_replayed_on_start() {
+async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn() {
     let tmp = tempfile::TempDir::new().unwrap();
     setup(tmp.path());
     let user_log = tmp.path().join("user.log");
@@ -783,14 +784,101 @@ async fn parked_input_left_by_a_previous_daemon_is_replayed_on_start() {
         .await
         .expect("start");
     let mut events = adapter.events(&handle);
+    // Nothing is written by the spawn itself: the resume was asked for by a
+    // message that is about to arrive, and it gets the first turn.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !user_log.exists(),
+        "no eager replay: {:?}",
+        std::fs::read_to_string(&user_log)
+    );
+    let submitted = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("hello after restart".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        submitted.disposition,
+        TurnDisposition::Started,
+        "the resuming message is a clean turn, not a steer of a stale notification"
+    );
+    await_completed_turns(&mut events, 3).await;
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec![
+            "hello after restart",
+            "s7 done · claude · turn 1",
+            "s8 done · codex · turn 2"
+        ],
+        "the resuming message first, then both parked lines in order, one turn each"
+    );
+    assert!(!file.exists(), "the mirror is consumed once flushed");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// A parked notification must be durable BEFORE the adapter accepts it (the
+/// notifier spends the child's watch on that acceptance). When the mirror
+/// cannot be written, the line is not parked in memory only — it is written
+/// now, mid-turn, and reported as the steer it became: read twice by claude,
+/// never lost across a crash.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn unmirrorable_queue_request_is_written_now_instead_of_parked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "1.5");
+    // A directory where the mirror file must go: every write of it fails.
+    std::fs::create_dir_all(deferred_input_file(tmp.path(), "s9")).unwrap();
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("long task".into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let submitted = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("s7 done · claude · turn 1".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        submitted.disposition,
+        TurnDisposition::Injected,
+        "an unmirrorable park degrades to the mid-turn write and says so"
+    );
+    // The fake reads (and logs) stdin lines one turn at a time, so the line
+    // shows up once the long task's result is out — as claude would run it.
     await_completed_turns(&mut events, 2).await;
     let logged = std::fs::read_to_string(&user_log).unwrap();
     assert_eq!(
         logged.lines().collect::<Vec<_>>(),
-        vec!["s7 done · claude · turn 1", "s8 done · codex · turn 2"],
-        "both parked lines reach the CLI, in order, each as its own turn"
+        vec!["long task", "s7 done · claude · turn 1"],
+        "delivered through the CLI's own queue, never held in memory only"
     );
-    assert!(!file.exists(), "the mirror is consumed once replayed");
+    assert!(
+        deferred_input_file(tmp.path(), "s9").is_dir(),
+        "no mirror was written around the refusing path"
+    );
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
