@@ -395,8 +395,22 @@ fn spawn_status_tap(
                                     }
                                 }
                                 Err(error) => {
+                                    // Back to the front — and the mirror re-synced
+                                    // under the same lock: a park that landed while
+                                    // this write was in flight persisted a queue
+                                    // WITHOUT this line, and the next life of the sid
+                                    // reloads only what is on disk.
                                     if let Ok(mut q) = deferred_input.lock() {
                                         q.push_front(line.clone());
+                                        if let Err(error) =
+                                            persist_deferred_input(&project_dir, &sid, &q)
+                                        {
+                                            tracing::warn!(
+                                                session = %sid,
+                                                %error,
+                                                "stream-json: deferred input mirror was not re-synced"
+                                            );
+                                        }
                                     }
                                     active_turn.store(false, Ordering::Release);
                                     tracing::warn!(
