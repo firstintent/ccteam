@@ -3320,7 +3320,7 @@ async fn dispatch_task(
         } else {
             notify.mode
         };
-        crate::gateway::Gateway::arm_delegation_watch_shared(
+        let armed = crate::gateway::Gateway::arm_delegation_watch_shared(
             Arc::clone(gateway),
             sid,
             caller_sid,
@@ -3331,6 +3331,15 @@ async fn dispatch_task(
         )
         .await
         .map_err(|error| mcp_gateway_error(tool, &error))?;
+        // No watch means no completion edge and no notification. Submitting
+        // anyway hands the caller a normal-looking dispatch and then waits
+        // forever for an answer that can never be delivered (issue #7), so the
+        // failure belongs here, before the task goes out.
+        if !armed {
+            return Err(format!(
+                "{tool}: no completion watch could be registered for {sid} (unknown session)"
+            ));
+        }
         // Before the task is even submitted: this caller will block on the
         // boundary, so the completion is its to take inline and the notifier
         // must not ALSO push it (issue #195 — the parent paid a whole extra

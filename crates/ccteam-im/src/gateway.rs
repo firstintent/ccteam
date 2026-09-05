@@ -12886,7 +12886,10 @@ impl Gateway {
         title: Option<String>,
         dispatched_turn: Option<String>,
     ) -> bool {
-        let Some(resolved) = self.session_resolve(child_sid) else {
+        // A watch is a DISK fact: all it needs is the child's project, which an
+        // idle-released session still carries in its `meta.json`. Resolving
+        // live-only silently skipped every cold child (issue #7).
+        let Some(resolved) = self.session_resolve_any(child_sid) else {
             return false;
         };
         let project_dir = resolved.project_dir;
@@ -12986,14 +12989,18 @@ impl Gateway {
                 .map_err(|_| GatewayRequestError::QueueDeadline)?;
         let (project_dir, slug, session_generation) = {
             let guard = deadline.lock(&gateway).await?;
-            let Some(resolved) = guard.session_resolve(child_sid) else {
+            // Live-or-disk, for the reason [`Self::arm_delegation_watch`] gives:
+            // the dispatch that follows resumes the child, so a live thread is
+            // `submit`'s precondition, never the watch's (issue #7).
+            let Some(resolved) = guard.session_resolve_any(child_sid) else {
                 return Ok(false);
             };
+            // `None` = the child is cold right now. Not an error: the fence
+            // below reads it as "there was no body to be replaced".
             let generation = guard
                 .sessions
                 .get(child_sid)
-                .map(|session| session.generation)
-                .ok_or_else(|| anyhow!("current session missing: {child_sid}"))?;
+                .map(|session| session.generation);
             (resolved.project_dir, resolved.project, generation)
         };
         let io_dir = project_dir.clone();
@@ -13047,9 +13054,19 @@ impl Gateway {
             }
         };
         let committed = {
-            let session_matches = guard.sessions.get(child_sid).is_some_and(|session| {
-                session.generation == session_generation && session.project == slug
-            });
+            let session_matches = match (guard.sessions.get(child_sid), session_generation) {
+                // Live at both ends: it must still be the same body.
+                (Some(session), Some(armed)) => {
+                    session.generation == armed && session.project == slug
+                }
+                // Cold when the watch was written, resumed while it was being
+                // written: a sid is monotonic and never reused, so the project
+                // settles identity by itself.
+                (Some(session), None) => session.project == slug,
+                // Still cold, or released mid-write: nothing can have taken its
+                // place under the same sid.
+                (None, _) => true,
+            };
             if !session_matches {
                 false
             } else {
@@ -29903,6 +29920,119 @@ mod tests {
             2,
             "re-dispatch subscribes to the next task"
         );
+    }
+
+    /// A child that has gone quiet since its last task is COLD: idle release
+    /// takes its row out of the live map and leaves only `meta.json`. The
+    /// dispatch that follows resumes it, so arming the completion watch must
+    /// not require a live body — resolving live-only skipped the watch
+    /// silently, and the parent then waited forever for a completion nobody
+    /// was watching for (issue #7: measured on s1617's children s1639/s1621,
+    /// released 06:39Z/22:35Z, dispatched 07:59Z/07:36Z, boundaries at
+    /// 08:02Z/08:03Z reached nobody).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_watch_arms_for_a_child_released_since_its_last_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+
+        let (parent_sid, child_sid) = {
+            let mut gw = gateway.lock().await;
+            let parent = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            let child = gw
+                .create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid;
+            // Exactly what an idle release does: the body goes, the ledger row
+            // on disk stays, and the sid stays resumable.
+            gw.sessions.remove(&child);
+            (parent, child)
+        };
+        assert!(
+            !gateway.lock().await.is_session_live(&child_sid),
+            "fixture: the child is cold before the dispatch"
+        );
+
+        let armed = Gateway::arm_delegation_watch_shared(
+            Arc::clone(&gateway),
+            &child_sid,
+            &parent_sid,
+            ccteam_harness::NotifyMode::Final,
+            Some("cold follow-up".into()),
+            Some("turn-cold".into()),
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        assert!(armed, "a cold child still gets a watch");
+        assert!(
+            ccteam_harness::read_delegation_watch(&project_dir, &child_sid).is_some(),
+            "delegation.json is durable, so a restart reconcile can still deliver"
+        );
+        assert!(
+            gateway
+                .lock()
+                .await
+                .armed_delegation_watch_sids()
+                .contains(&child_sid),
+            "the hot-path mirror is armed too"
+        );
+
+        // The resumed child finishes the task: the parent hears about it.
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child_sid.clone(),
+                turn_id: format!("{child_sid}-1"),
+                tail: "cold child answered".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child_sid}-1")],
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &parent_sid).len(),
+            1,
+            "the completion of a cold-resumed child reaches its parent"
+        );
+
+        // An id with neither a live body nor a `meta.json` arms nothing — the
+        // `false` that `dispatch_task` turns into a hard error rather than a
+        // dispatch whose answer can never be delivered.
+        let unknown = Gateway::arm_delegation_watch_shared(
+            Arc::clone(&gateway),
+            "s999999",
+            &parent_sid,
+            ccteam_harness::NotifyMode::Final,
+            None,
+            None,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        assert!(!unknown, "an unknown sid can never be watched");
     }
 
     /// Mid-turn narration stays ledger-only whatever the mode; only the idle
