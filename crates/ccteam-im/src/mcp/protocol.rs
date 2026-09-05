@@ -332,7 +332,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
             "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript, newest first; `since:<cursor>` → unread turns oldest first, `remaining` = still unread; `n:0` → status only; empty turns = no answer yet.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
-                "n": { "type": "integer", "description": "Max rows: roster 10, transcript 1 (max 500)." },
+                "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
                 "tail": { "type": "boolean", "description": "With `sid`: newest first (default true unless `since`)." },
                 "since": { "type": "string", "description": "With `sid`: only turns after this turn_id cursor." },
                 "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 1000)." },

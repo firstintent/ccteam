@@ -414,10 +414,14 @@ fn nearest_slug<'a>(input: &str, candidates: &'a [String]) -> Option<&'a str> {
         .map(|(_, candidate)| candidate.as_str())
 }
 
-/// Default page size for BOTH `agent_read` branches (roster rows and
-/// transcript turns). Ten is what a caller reads; more is a `n` away.
-const AGENT_READ_DEFAULT_N: usize = 10;
-/// Default turns a transcript read returns. ONE, not the roster's ten: the
+/// Default roster page size. FIVE: a caller asks the roster who is working
+/// for it right now, and that is a handful of children — a longer page spends
+/// its context on rows it did not ask about (measured on a planner reading
+/// 25 rows: 38% of the metadata bytes were the titles of historical sessions
+/// it had no decision to make about). More is an `n` away, and `total` +
+/// `truncated` always say when the cap bit.
+const AGENT_READ_DEFAULT_N: usize = 5;
+/// Default turns a transcript read returns. ONE, not the roster's five: the
 /// overwhelmingly common question a `sid` read asks is "what did it answer",
 /// and that is the newest turn. Ten turns is transcript replay — a rarer need,
 /// and one the caller says out loud. Ten of them sharing one character budget
@@ -3954,6 +3958,25 @@ fn classify_session_activity(
     Some(activity.status.activity.to_string())
 }
 
+/// One decimal place. A ledger total is read for its magnitude, and the f64
+/// the vendor accrued into (`326.49616805000005`) spends twenty characters of
+/// the caller's context to say `326.5`.
+fn round_cost_usd(cost: f64) -> f64 {
+    (cost * 10.0).round() / 10.0
+}
+
+/// `12345` -> `12k`, `146752597` -> `147m`. A token total is read as a SIZE,
+/// never as an exact figure — `context_pct` is what a caller actually decides
+/// on — so nine raw digits are nine characters of noise.
+fn abbreviate_tokens(total: u64) -> String {
+    match total {
+        n if n < 1_000 => n.to_string(),
+        n if n < 1_000_000 => format!("{}k", (n as f64 / 1_000.0).round() as u64),
+        n if n < 1_000_000_000 => format!("{}m", (n as f64 / 1_000_000.0).round() as u64),
+        n => format!("{:.1}b", n as f64 / 1_000_000_000.0),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct SessionRow {
     activity: String,
@@ -3962,7 +3985,7 @@ struct SessionRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tokens_total: Option<u64>,
+    tokens_total: Option<String>,
 }
 
 fn session_row_fields(row: SessionRow) -> serde_json::Map<String, serde_json::Value> {
@@ -4150,8 +4173,11 @@ async fn run_agent_read_transcript(
         &resolved.sid,
     )
     .ok();
-    let cost_usd = meta.as_ref().and_then(|m| m.cost_usd);
-    let tokens_total = meta.as_ref().and_then(|m| m.tokens_total);
+    let cost_usd = meta.as_ref().and_then(|m| m.cost_usd).map(round_cost_usd);
+    let tokens_total = meta
+        .as_ref()
+        .and_then(|m| m.tokens_total)
+        .map(abbreviate_tokens);
     let latest_status = all.iter().rev().find_map(|turn| turn.status.clone());
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
@@ -4436,8 +4462,8 @@ async fn run_agent_read_roster_at(
             let mut row = session_row_fields(SessionRow {
                 activity: activity.clone(),
                 context_pct: context_pcts.get(&v.sid).copied(),
-                cost_usd: v.cost_usd,
-                tokens_total: v.tokens_total,
+                cost_usd: v.cost_usd.map(round_cost_usd),
+                tokens_total: v.tokens_total.map(abbreviate_tokens),
             });
             row.insert("sid".into(), serde_json::json!(v.sid));
             if !v.role.is_empty() {
@@ -7936,11 +7962,34 @@ mod session_tool_tests {
     }
 
     /// The transcript branch answers "what did it say" with ONE turn; the
-    /// roster keeps its ten one-line rows.
+    /// roster answers "who is working for me" with a handful of rows.
     #[test]
     fn transcript_and_roster_defaults_are_not_the_same_number() {
         assert_eq!(AGENT_READ_TRANSCRIPT_DEFAULT_N, 1);
-        assert_eq!(AGENT_READ_DEFAULT_N, 10);
+        assert_eq!(AGENT_READ_DEFAULT_N, 5);
+    }
+
+    /// A ledger figure is read for its magnitude. Full f64 precision and nine
+    /// raw token digits are characters the caller pays for and decides nothing
+    /// with (`context_pct` is what it steers on).
+    #[test]
+    fn a_ledger_figure_is_stated_at_reading_precision() {
+        // Values measured off real sessions (excore s1480 / s1641 / s1617).
+        assert_eq!(round_cost_usd(326.49616805000005), 326.5);
+        assert_eq!(round_cost_usd(3.6579032499999995), 3.7);
+        assert_eq!(round_cost_usd(0.0), 0.0);
+        // What lands in the caller's context, not just what the f64 equals.
+        assert_eq!(
+            serde_json::to_string(&round_cost_usd(326.49616805000005)).unwrap(),
+            "326.5"
+        );
+
+        assert_eq!(abbreviate_tokens(999), "999");
+        assert_eq!(abbreviate_tokens(12_345), "12k");
+        assert_eq!(abbreviate_tokens(174_558), "175k");
+        assert_eq!(abbreviate_tokens(146_752_597), "147m");
+        assert_eq!(abbreviate_tokens(723_973_606), "724m");
+        assert_eq!(abbreviate_tokens(1_500_000_000), "1.5b");
     }
 
     // ========================================================================
@@ -10895,7 +10944,11 @@ mod tool_face_tests {
         // Asking for ten still pages ten, newest last.
         let ten = read(json!({ "sid": child, "n": 10 })).await;
         let turns = ten["turns"].as_array().unwrap();
-        assert_eq!(turns.len(), AGENT_READ_DEFAULT_N);
+        assert_eq!(
+            turns.len(),
+            10,
+            "an explicit `n` is the page, not a default"
+        );
         assert_eq!(turns[0]["turn_id"], "t5");
 
         let forward = read(json!({ "sid": child, "since": "t1" })).await;
