@@ -2071,6 +2071,75 @@ const AGENT_SPAWN_ONLY_PARAMS: &[&str] = &[
     "parent_sid",
 ];
 
+/// A `task_file` is capped at what a brief is, not at what a file can be: the
+/// text becomes one user turn in someone's context either way.
+const TASK_FILE_MAX_BYTES: u64 = 256 * 1024;
+
+/// Fold `task_file` into the `task` the rest of the call sees.
+///
+/// The task text is the one thing a dispatch must carry, and carrying it
+/// INLINE spends it twice in the caller's own context — once building it, once
+/// as this argument — for a parent that never reads it back (measured on a
+/// planner: 199.7 KB across 43 dispatches, none of it re-read). Reading the
+/// file here changes nothing else about the delegation: the same bytes become
+/// the same verbatim user turn down the same path, and the daemon reads them
+/// as the uid the caller could already read them as, so this adds no reach.
+///
+/// Honest scope: the path is resolved on the DAEMON's filesystem. For a
+/// project bound to a satellite that is the right end anyway — the content
+/// crosses the wire, a path never would (`remote_exec`, the satellite is a
+/// protocol-blind byte pump) — but a caller whose file lives somewhere else
+/// must pass `task` instead.
+///
+/// Returns the rewritten args when it fired, `None` when there was no
+/// `task_file` (the overwhelmingly common call).
+fn resolve_task_file(args: &serde_json::Value) -> std::result::Result<Option<Value>, String> {
+    let Some(raw) = args.get("task_file") else {
+        return Ok(None);
+    };
+    let path = raw
+        .as_str()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "agent: `task_file` must be a non-empty path".to_string())?;
+    // Two sources for one field is a question about which one won, and the
+    // answer is never visible in the transcript. Refuse instead of picking.
+    if args.get("task").is_some() {
+        return Err("agent: give `task` or `task_file`, not both".to_string());
+    }
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "agent: `task_file` must be absolute (the daemon's cwd is not yours): `{}`",
+            path.display()
+        ));
+    }
+    let len = std::fs::metadata(path)
+        .map_err(|error| format!("agent: task_file `{}`: {error}", path.display()))?
+        .len();
+    if len > TASK_FILE_MAX_BYTES {
+        return Err(format!(
+            "agent: task_file `{}` is {len} bytes, over the {TASK_FILE_MAX_BYTES} cap — send a brief, not a corpus",
+            path.display()
+        ));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("agent: task_file `{}`: {error}", path.display()))?;
+    if text.trim().is_empty() {
+        return Err(format!(
+            "agent: task_file `{}` is empty — say what the agent should do",
+            path.display()
+        ));
+    }
+    let mut owned = args.clone();
+    let Some(object) = owned.as_object_mut() else {
+        return Err("agent: arguments must be an object".to_string());
+    };
+    object.insert("task".into(), Value::String(text));
+    object.remove("task_file");
+    Ok(Some(owned))
+}
+
 /// `agent` — hire a new session (`task` alone) or task one you already have
 /// (`task` + `sid`). One tool, because the two are the same act with one
 /// parameter of difference; they share task, wait, notify, title and
@@ -2081,6 +2150,11 @@ async fn run_agent(
     caller: McpCaller,
     paths: &CcteamPaths,
 ) -> std::result::Result<String, String> {
+    // Normalized FIRST, so every branch below — validation, policy facts,
+    // spawn-and-dispatch, dispatch-to-sid — sees one `task` and a new one
+    // gets it for free.
+    let resolved_task_file = resolve_task_file(args)?;
+    let args = resolved_task_file.as_ref().unwrap_or(args);
     if args.get("host").is_some() {
         return Err(format!(
             "agent: {}",
@@ -2099,7 +2173,10 @@ async fn run_agent(
         .map(str::trim)
         .is_none_or(str::is_empty)
     {
-        return Err("agent: missing `task` — say what the agent should do".to_string());
+        return Err(
+            "agent: missing `task` — say what the agent should do (or point `task_file` at it)"
+                .to_string(),
+        );
     }
     let dispatching = addresses_a_session(args);
     if dispatching {
@@ -6286,6 +6363,126 @@ mod session_tool_tests {
         assert!(text.contains("\"sessions\""), "got: {text}");
     }
 
+    /// `task_file` is one field folded into another before anything else looks
+    /// at the call. What it must never do is change WHAT the child receives.
+    #[test]
+    fn a_task_file_becomes_the_task_and_refuses_every_ambiguity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let brief_path = tmp.path().join("brief-MM-298.md");
+        let brief = "【派发词·MM-298·checker】\n工位（只读）：/home/ubuntu/wt/MM-298\n";
+        std::fs::write(&brief_path, brief).unwrap();
+        let at = |value: serde_json::Value| resolve_task_file(&value);
+
+        // The overwhelmingly common call: untouched, not even cloned.
+        assert!(at(json!({"task": "inline"})).unwrap().is_none());
+
+        let rewritten = at(json!({"sid": "s7", "task_file": brief_path.to_str().unwrap()}))
+            .unwrap()
+            .expect("the file became the task");
+        assert_eq!(rewritten["task"], json!(brief), "verbatim, byte for byte");
+        assert!(
+            rewritten.get("task_file").is_none(),
+            "the pointer does not travel with the task"
+        );
+        assert_eq!(rewritten["sid"], json!("s7"), "other arguments survive");
+
+        // Two sources for one field: refused, never silently picked — which of
+        // the two won would not be visible in any transcript afterwards.
+        assert!(
+            at(json!({"task": "inline", "task_file": brief_path.to_str().unwrap()}))
+                .unwrap_err()
+                .contains("not both")
+        );
+        // A relative path would resolve against the DAEMON's cwd, not the
+        // caller's, and quietly read the wrong file.
+        assert!(at(json!({"task_file": "brief-MM-298.md"}))
+            .unwrap_err()
+            .contains("absolute"));
+        assert!(at(json!({"task_file": ""}))
+            .unwrap_err()
+            .contains("non-empty"));
+        assert!(at(json!({"task_file": tmp.path().join("nope.md").to_str().unwrap()})).is_err());
+
+        let empty = tmp.path().join("empty.md");
+        std::fs::write(&empty, "   \n\t\n").unwrap();
+        assert!(at(json!({"task_file": empty.to_str().unwrap()}))
+            .unwrap_err()
+            .contains("empty"));
+
+        let fat = tmp.path().join("corpus.md");
+        std::fs::write(&fat, vec![b'x'; TASK_FILE_MAX_BYTES as usize + 1]).unwrap();
+        assert!(at(json!({"task_file": fat.to_str().unwrap()}))
+            .unwrap_err()
+            .contains("cap"));
+    }
+
+    /// End to end: the bytes reach the child's transcript exactly as an inline
+    /// `task` would have, while the caller's own context carried a path.
+    #[tokio::test]
+    async fn a_task_file_lands_in_the_child_exactly_as_an_inline_task_would() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (paths, gateway, _alice_sid, _bob_sid, _admin_sid) =
+            gateway_with_tenant_projects(tmp.path()).await;
+        let brief =
+            "【派发词·MM-298·checker】\n工位（只读）：/home/ubuntu/wt/MM-298\n回报 ≤8 行。\n";
+        let brief_path = tmp.path().join("brief-MM-298.md");
+        std::fs::write(&brief_path, brief).unwrap();
+
+        let hire = |args: serde_json::Value| {
+            let gateway = &gateway;
+            let paths = &paths;
+            async move {
+                let response = execute_session_tool_with_paths(
+                    &call("agent", args),
+                    Some(gateway),
+                    McpCaller::User {
+                        user_id: "ualice".into(),
+                    },
+                    paths,
+                )
+                .await;
+                assert_eq!(response["result"]["isError"], false, "{response}");
+                let body: serde_json::Value = serde_json::from_str(
+                    response["result"]["content"][0]["text"].as_str().unwrap(),
+                )
+                .unwrap();
+                body["sid"].as_str().unwrap().to_string()
+            }
+        };
+
+        let by_file = hire(json!({
+            "project": "alice",
+            "vendor": "claude",
+            "task_file": brief_path.to_str().unwrap(),
+        }))
+        .await;
+        let by_inline = hire(json!({
+            "project": "alice",
+            "vendor": "claude",
+            "task": brief,
+        }))
+        .await;
+
+        let alice_dir = paths.projects_root.join("alice");
+        let first_user = |sid: &str| {
+            ccteam_harness::execution::turns_mirror::read_all_turns(&alice_dir, sid)
+                .unwrap()
+                .into_iter()
+                .find_map(|turn| (!turn.user.is_empty()).then_some(turn.user))
+        };
+        assert_eq!(
+            first_user(&by_file).as_deref(),
+            Some(brief.trim()),
+            "the child got the file's bytes, through the SAME trim an inline \
+             task goes through — one normalization, not two"
+        );
+        assert_eq!(
+            first_user(&by_file),
+            first_user(&by_inline),
+            "a path and an inline brief are the same delegation"
+        );
+    }
+
     #[tokio::test]
     async fn user_spawn_is_root_owned_by_tenant_and_spoofed_caller_fields_are_ignored() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7103,11 +7300,11 @@ mod session_tool_tests {
         );
         assert_eq!(
             run(json!({"vendor": "claude"})).await.unwrap_err(),
-            "agent: missing `task` — say what the agent should do"
+            "agent: missing `task` — say what the agent should do (or point `task_file` at it)"
         );
         assert_eq!(
             run(json!({"task": "  "})).await.unwrap_err(),
-            "agent: missing `task` — say what the agent should do"
+            "agent: missing `task` — say what the agent should do (or point `task_file` at it)"
         );
         // A follow-up may not reconfigure the session it is only messaging.
         assert_eq!(

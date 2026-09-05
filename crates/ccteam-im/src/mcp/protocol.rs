@@ -270,7 +270,7 @@ pub fn tool_definitions() -> Vec<Value> {
 pub fn chat_tool_definitions() -> Vec<Value> {
     vec![json!({
         "name": "chat_send_file",
-        "description": "Send a local file (image or document) to your own bound chat — a chat user cannot open a path.",
+        "description": "Send a local file to your own bound chat — a chat user cannot open a path.",
         "inputSchema": schema(json!({
             "path": { "type": "string", "description": "Absolute path on the daemon's filesystem." },
             "caption": { "type": "string", "description": "Optional caption." },
@@ -291,9 +291,10 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you already have. No `sid` → spawn a session and give it `task`; with `sid` → follow up there. `wait` returns the answer inline; 0 (default) is async: one completion notification (brief excerpt) arrives when the task's turn ends, so never poll for it; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Tell children to answer tersely.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. `wait` returns the answer inline; 0 (default) is async: a completion notification arrives when the task's turn ends, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Tell children to answer tersely.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
+                "task_file": { "type": "string", "description": "Absolute path holding it — keeps a long brief out of your context." },
                 "sid": { "type": "string", "description": "Existing session to task; omit to hire a new one." },
                 "vendor": {
                     "type": "string",
@@ -322,9 +323,9 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "enum": ["skip", "hitl"],
                     "description": "hitl asks your chat to approve tool calls (default skip)."
                 },
-                "idempotency_key": { "type": "string", "description": "Retry key: a retry replays the original call (~1h)." },
+                "idempotency_key": { "type": "string", "description": "Retry key: replays the original call (~1h)." },
                 "parent_sid": { "type": "string", "description": "Your own sid when ccteam does not manage you." }
-            }), &["task"]),
+            }), &[]),
             "annotations": { "destructiveHint": false },
         }),
         json!({
@@ -834,7 +835,14 @@ mod tests {
             .into_iter()
             .find(|t| t["name"] == "agent")
             .expect("agent defined");
-        assert_eq!(agent["inputSchema"]["required"], json!(["task"]));
+        // Nothing is schema-required: the task arrives as `task` OR
+        // `task_file`, and "exactly one" is a handler check, not a JSON-Schema
+        // one (`run_agent` refuses both-or-neither with a readable error).
+        assert!(
+            agent["inputSchema"]["required"].is_null(),
+            "an empty required list is omitted, not spelled out"
+        );
+        assert!(agent["inputSchema"]["properties"]["task_file"].is_object());
         let props = &agent["inputSchema"]["properties"];
         for key in [
             "sid",
