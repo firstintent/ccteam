@@ -3754,15 +3754,30 @@ async fn dispatch_wait_for_completion(
     // that covers the whole task.
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(wait.effective_seconds);
+    let Some(request_id) = request_id else {
+        // No request of our own (an admin caller): the first boundary is the
+        // only thing there is to wait for.
+        let observed = await_turn_boundary(gateway, child_sid, deadline, &mut rx, false).await;
+        return finish_dispatch_wait(
+            gateway,
+            child_sid,
+            receipt,
+            None,
+            observed,
+            notification_route,
+        )
+        .await;
+    };
+    // Wait in short slices and re-check OUR request each time. The boundary
+    // event is only a hint: the notifier resolves the request off the pump a
+    // moment later, and a wait that decided on the event alone would either
+    // return holding a sibling's answer or sit out its whole timeout for one
+    // that had already arrived.
+    const REQUEST_POLL: std::time::Duration = std::time::Duration::from_millis(100);
     let mut answered = false;
     loop {
-        let observed = await_turn_boundary(gateway, child_sid, deadline, &mut rx, false).await;
-        let Some(request_id) = request_id else {
-            // No request of our own (an admin caller): the first boundary is
-            // the only thing there is to wait for.
-            answered = observed;
-            break;
-        };
+        let slice = deadline.min(tokio::time::Instant::now() + REQUEST_POLL);
+        let _ = await_turn_boundary(gateway, child_sid, slice, &mut rx, false).await;
         // A request that has left the store (its parent became unreachable and
         // the notifier dropped it) is as done as one that answered — there is
         // nothing left to wait for.
@@ -3774,12 +3789,32 @@ async fn dispatch_wait_for_completion(
             answered = true;
             break;
         }
-        if !observed {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
-        // A boundary that belonged to some OTHER task of this child. Keep
-        // waiting for ours.
     }
+    finish_dispatch_wait(
+        gateway,
+        child_sid,
+        receipt,
+        Some(request_id),
+        answered,
+        notification_route,
+    )
+    .await
+}
+
+/// Release the inline claim and render what the wait is holding: this
+/// request's own answer, or the delivery facts that say why it is not here
+/// yet.
+async fn finish_dispatch_wait(
+    gateway: &GatewayHandle,
+    child_sid: &str,
+    receipt: &crate::gateway::TurnReceipt,
+    request_id: Option<&str>,
+    answered: bool,
+    notification_route: CompletionNotificationRoute,
+) -> serde_json::Map<String, serde_json::Value> {
     // Release the claim, and pick up a boundary the notifier suppressed in our
     // favour: that happens when the child finished in the same instant our
     // deadline expired, and the answer is then ours to report rather than

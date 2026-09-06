@@ -13481,10 +13481,12 @@ impl Gateway {
     /// A turn opened on `child_sid`: every request bound to it is now OBSERVED
     /// executing — the fourth of the four delivery facts, and the one a stdin
     /// flush never proves.
-    fn mark_delegation_requests_executing(&mut self, child_sid: &str, exec_turn_id: &str) {
-        let Some(mirror) = self.delegations.get_mut(child_sid) else {
-            return;
-        };
+    fn mark_delegation_requests_executing(
+        &mut self,
+        child_sid: &str,
+        exec_turn_id: &str,
+    ) -> Option<(PathBuf, ccteam_harness::DelegationRequests)> {
+        let mirror = self.delegations.get_mut(child_sid)?;
         let mut changed = false;
         for request in mirror.store.requests.iter_mut() {
             if request.turn_id.as_deref() == Some(exec_turn_id)
@@ -13500,18 +13502,9 @@ impl Gateway {
                 changed = true;
             }
         }
-        if changed {
-            let project_dir = mirror.project_dir.clone();
-            let store = mirror.store.clone();
-            let child = child_sid.to_string();
-            std::thread::spawn(move || {
-                if let Err(error) =
-                    ccteam_harness::write_delegation_requests(&project_dir, &child, &store)
-                {
-                    tracing::warn!(%child, %error, "ccteam-im: failed to persist executing state");
-                }
-            });
-        }
+        // The caller writes it OFF the gateway lock; nothing here touches the
+        // filesystem while the hot path is blocked on us.
+        changed.then(|| (mirror.project_dir.clone(), mirror.store.clone()))
     }
 
     /// Drop ONE request (its dispatch never went out, or it was withdrawn).
@@ -13981,9 +13974,23 @@ impl Gateway {
                     if !watch_set.read().unwrap().contains(&child_sid) {
                         continue;
                     }
-                    crate::latency::gateway_lock(&gateway, "notifier.executing")
+                    let persist = crate::latency::gateway_lock(&gateway, "notifier.executing")
                         .await
                         .mark_delegation_requests_executing(&child_sid, &exec_turn_id);
+                    if let Some((project_dir, store)) = persist {
+                        let child = child_sid.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(error) = ccteam_harness::write_delegation_requests(
+                                &project_dir,
+                                &child,
+                                &store,
+                            ) {
+                                tracing::warn!(%child, %error,
+                                    "ccteam-im: failed to persist the executing state");
+                            }
+                        })
+                        .await;
+                    }
                 }
                 crate::delegation::DelegationPulse::Signal(signal) => {
                     let watched = watch_set.read().unwrap().contains(&signal.child_sid);
@@ -30876,14 +30883,27 @@ mod tests {
             "{}",
             notes[0].user
         );
-        let after = ccteam_harness::read_delegation_requests(&project_dir, child_sid).unwrap();
+        // The durable write follows the notification submit, so watch for it
+        // rather than assuming it has already landed.
+        let mut outstanding = vec![];
+        for _ in 0..200 {
+            outstanding = ccteam_harness::read_delegation_requests(&project_dir, child_sid)
+                .map(|store| {
+                    store
+                        .outstanding()
+                        .map(|request| request.request_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if outstanding.len() <= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(
-            after
-                .outstanding()
-                .map(|request| request.request_id.clone())
-                .collect::<Vec<_>>(),
+            outstanding,
             vec![cleanup_id],
-            "the request whose turn never ran is still owed: {after:?}"
+            "the request whose turn never ran is still owed"
         );
     }
 
@@ -31872,13 +31892,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("budget"), "budget: {e}");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let events =
-            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
-        assert!(events.iter().any(|e| {
-            e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied")
-                && e.get("reason").and_then(|v| v.as_str()) == Some("budget")
-        }));
+        // The ledger append runs off the caller's thread, so WATCH for the row
+        // instead of sleeping a guessed amount: a fixed 25 ms was long enough
+        // on an idle machine and not on a busy one.
+        let denied = |events: &[serde_json::Value]| {
+            events.iter().any(|e| {
+                e.get("event").and_then(|v| v.as_str()) == Some("delegation_denied")
+                    && e.get("reason").and_then(|v| v.as_str()) == Some("budget")
+            })
+        };
+        let mut events = vec![];
+        for _ in 0..200 {
+            events =
+                ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
+            if denied(&events) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(denied(&events), "{events:#?}");
     }
 
     /// issue #196 — the durable row carries the turn's conclusion, so a
