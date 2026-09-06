@@ -291,7 +291,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. `wait` returns the answer inline; 0 (default) is async: a completion notification arrives when the task's turn ends, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Tell children to answer tersely.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. Answers `request_id` + `status` started|injected|queued (+queue_position). `wait` returns that request's answer; 0 (default) is async and its completion names it, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Answer tersely.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
                 "task_file": { "type": "string", "description": "Absolute path holding it — keeps a long brief out of your context." },
@@ -310,7 +310,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                 "notify": {
                     "type": "string",
                     "enum": ["final", "brief", "off"],
-                    "description": "Turn-end wake: brief (500-char excerpt, default), final (2000), off."
+                    "description": "Turn-end wake: brief (500-char excerpt), final (2000), off. Omitted keeps your last choice here."
                 },
                 "tools": {
                     "type": "string",
@@ -330,12 +330,13 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript, newest first; `since:<cursor>` → unread turns oldest first, `remaining` = still unread; `n:0` → status only; empty turns = no answer yet.",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
                 "tail": { "type": "boolean", "description": "With `sid`: newest first (default true unless `since`)." },
                 "since": { "type": "string", "description": "With `sid`: only turns after this turn_id cursor." },
+                "turn": { "type": "string", "description": "With `sid`: exactly this turn_id." },
                 "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 1000)." },
                 "wait": { "type": "integer", "description": "With `sid`: seconds to wait for an in-flight turn to end (0-240)." },
                 "project": { "type": "string", "description": "Roster filter: this project slug only." },
@@ -464,13 +465,20 @@ mod tests {
     /// G1 — the ambient tax an ORCHESTRATOR pays on its first turn. Every
     /// byte here is charged to every session before it has done anything, so
     /// the budget is a hard gate, not a guideline.
+    ///
+    /// 5000 → 5200 B for the delegation-request facts (issue #201): `status`
+    /// started|injected|queued with a `queue_position`, the `request_id` a
+    /// completion names, `turn:<id>` for the exact re-read, and that an
+    /// omitted `notify` inherits. An orchestrator that could not see any of
+    /// them re-sent one instruction three times and then stopped a
+    /// 400k-context child it believed was ignoring it — ~190 B against that.
     #[test]
     fn full_face_tools_list_fits_byte_budget() {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5000,
-            "full tools/list is {bytes} B; budget is 5000 B"
+            bytes <= 5200,
+            "full tools/list is {bytes} B; budget is 5200 B"
         );
     }
 
@@ -510,7 +518,9 @@ mod tests {
             }),
         };
         let ambient = compact_len(&tools_list_response(&face)) + instructions_for(&face).len();
-        assert!(ambient <= 2200, "leaf ambient cost is {ambient} B");
+        // 2200 → 2340 B with the read face's share of the same facts: what the
+        // session still owes (`requests`) and the exact `turn:<id>` re-read.
+        assert!(ambient <= 2340, "leaf ambient cost is {ambient} B");
     }
 
     #[test]
@@ -904,6 +914,7 @@ mod tests {
             "n",
             "tail",
             "since",
+            "turn",
             "max_chars",
             "wait",
             "project",

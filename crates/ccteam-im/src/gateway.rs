@@ -30784,6 +30784,264 @@ mod tests {
         (parent, child)
     }
 
+    // ====================================================================
+    // GitHub #197 (B) — restart reconcile rebinds by IDENTITY, and two
+    // parents on one child each get their own answer.
+    // ====================================================================
+
+    /// A daemon that died between BINDING a request and notifying its parent
+    /// resolves it by the execution turn the answer ran under — never by
+    /// "the newest turn", which is how an older answer became a newer
+    /// request's completion. The newer request, whose turn never ran, is still
+    /// outstanding afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_restart_between_bind_and_notify_resolves_by_identity() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s90";
+        // The answer the previous daemon watched land, tagged with the
+        // execution turn it ran under.
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                exec_turn_id: Some("x-first".into()),
+                turn_id: format!("{child_sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: "the verdict: ship it".into(),
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+                conclusion: None,
+            },
+        )
+        .unwrap();
+        // Two requests: the first bound to that turn, the second to a turn
+        // that never ran (its line is still parked in the adapter's mirror).
+        let mut store = ccteam_harness::DelegationRequests::default();
+        for (title, bound) in [("verdict", "x-first"), ("cleanup", "x-second")] {
+            let mut request = ccteam_harness::DelegationRequest::accepted(
+                &parent_sid,
+                ccteam_harness::NotifyMode::Final,
+                Some(title.to_string()),
+                TurnRouting::Queue,
+                None,
+            );
+            request.state = ccteam_harness::RequestState::Executing;
+            request.turn_id = Some(bound.to_string());
+            store.accept(request);
+        }
+        let cleanup_id = store.requests[1].request_id.clone();
+        ccteam_harness::write_delegation_requests(&project_dir, child_sid, &store).unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let mut notes = vec![];
+        for _ in 0..200 {
+            notes = ccteam_notification_turns(&project_dir, &parent_sid);
+            if !notes.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(notes.len(), 1, "exactly the request that was answered");
+        assert!(notes[0].user.contains("«verdict»"), "{}", notes[0].user);
+        assert!(
+            !notes[0].user.contains("«cleanup»"),
+            "an older answer must never be reported as a newer request's: {}",
+            notes[0].user
+        );
+        assert!(
+            notes[0].user.contains("1 still queued"),
+            "{}",
+            notes[0].user
+        );
+        let after = ccteam_harness::read_delegation_requests(&project_dir, child_sid).unwrap();
+        assert_eq!(
+            after
+                .outstanding()
+                .map(|request| request.request_id.clone())
+                .collect::<Vec<_>>(),
+            vec![cleanup_id],
+            "the request whose turn never ran is still owed: {after:?}"
+        );
+    }
+
+    /// A daemon that died between ACCEPTING a request and binding it knows it
+    /// cannot say whether the vendor ever saw it. That request is left
+    /// outstanding with delivery UNKNOWN — never resolved off somebody else's
+    /// boundary, and never reported as confirmed-undelivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_restart_between_accept_and_bind_leaves_delivery_unknown() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s91";
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                exec_turn_id: Some("x-someone-elses".into()),
+                turn_id: format!("{child_sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: "an answer to the child's own human".into(),
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+                conclusion: None,
+            },
+        )
+        .unwrap();
+        let mut store = ccteam_harness::DelegationRequests::default();
+        store.accept(ccteam_harness::DelegationRequest::accepted(
+            &parent_sid,
+            ccteam_harness::NotifyMode::Final,
+            Some("never delivered?".into()),
+            TurnRouting::Queue,
+            None,
+        ));
+        ccteam_harness::write_delegation_requests(&project_dir, child_sid, &store).unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent_sid).is_empty(),
+            "a turn nobody's request was bound to answers nobody"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(child_sid, 10);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["state"], serde_json::json!("accepted"), "{rows:?}");
+        assert_eq!(
+            rows[0]["delivery"]["written"],
+            serde_json::json!("unknown"),
+            "a crash before the submit returned makes delivery unknowable, \
+             and unknown is not `false`: {rows:?}"
+        );
+    }
+
+    /// Two parents hire the same child. Each boundary wakes exactly the parent
+    /// whose request it answered, with that request's own mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn two_parents_on_one_child_each_get_their_own_notification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (first_parent, child) = delegation_pair(&gateway).await;
+        let second_parent = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        {
+            let mut gw = gateway.lock().await;
+            for (parent, title, turn) in [
+                (&first_parent, "for the first", "x-1"),
+                (&second_parent, "for the second", "x-2"),
+            ] {
+                let request_id = gw
+                    .accept_delegation_request(
+                        &child,
+                        parent,
+                        ccteam_harness::NotifyMode::Final,
+                        Some(title.to_string()),
+                        TurnRouting::Queue,
+                        None,
+                    )
+                    .expect("the child accepts both requests");
+                gw.bind_delegation_request_for_test(&child, &request_id, turn);
+            }
+        }
+        let boundary = |n: u32, exec: &str, text: &str| crate::delegation::DelegationSignal {
+            child_sid: child.clone(),
+            turn_id: format!("{child}-{n}"),
+            exec_turn_id: Some(exec.to_string()),
+            tail: text.to_string(),
+            vendor: AgentVendor::Claude,
+            host: "local".into(),
+            boundary: true,
+            vendor_error: false,
+            interim_notes: 0,
+            covered_turns: vec![format!("{child}-{n}")],
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
+            conclusion: None,
+        };
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(1, "x-1", "the first parent's answer"),
+        )
+        .await;
+        let first = ccteam_notification_turns(&project_dir, &first_parent);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].user.contains("«for the first»"));
+        assert!(
+            ccteam_notification_turns(&project_dir, &second_parent).is_empty(),
+            "the other parent's task has not finished"
+        );
+
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(2, "x-2", "the second parent's answer"),
+        )
+        .await;
+        let second = ccteam_notification_turns(&project_dir, &second_parent);
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(second[0].user.contains("«for the second»"));
+        assert_eq!(
+            ccteam_notification_turns(&project_dir, &first_parent).len(),
+            1,
+            "the first parent is not told twice"
+        );
+    }
+
     /// Count minimal completion notification turns delivered to `sid`.
     fn ccteam_notification_turns(
         project_dir: &std::path::Path,

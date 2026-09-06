@@ -6049,9 +6049,80 @@ mod session_tool_tests {
         }
     }
 
+    /// A stub that owns a real turn FIFO: one turn runs, the rest wait, and a
+    /// test releases them one at a time. What that buys the request tests
+    /// (issue #201): three tasks are genuinely outstanding at once, each with
+    /// its own execution-turn identity, and the boundary of one is a fact the
+    /// test controls rather than a race with the pump.
+    #[derive(Default)]
+    struct StubTurnQueue {
+        seq: std::sync::atomic::AtomicUsize,
+        /// Per thread identity, so a parent and its child do not share a FIFO.
+        state: std::sync::Mutex<std::collections::HashMap<String, StubTurnQueueState>>,
+    }
+
+    #[derive(Default)]
+    struct StubTurnQueueState {
+        active: Option<String>,
+        waiting: std::collections::VecDeque<String>,
+        parked: std::collections::HashMap<String, Vec<ccteam_harness::ThreadEvent>>,
+    }
+
+    impl StubTurnQueue {
+        /// Reserve the turn a message will run in — started when idle, queued
+        /// with a 1-based position behind whatever is already waiting.
+        fn claim(
+            &self,
+            identity: &str,
+        ) -> (String, ccteam_harness::TurnDisposition, Option<usize>) {
+            let n = self
+                .seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            let id = format!("x{n}");
+            let mut states = self.state.lock().unwrap();
+            let state = states.entry(identity.to_string()).or_default();
+            if state.active.is_none() {
+                state.active = Some(id.clone());
+                (id, ccteam_harness::TurnDisposition::Started, None)
+            } else {
+                state.waiting.push_back(id.clone());
+                let position = state.waiting.len();
+                (id, ccteam_harness::TurnDisposition::Queued, Some(position))
+            }
+        }
+
+        fn park(&self, identity: &str, turn_id: &str, events: Vec<ccteam_harness::ThreadEvent>) {
+            self.state
+                .lock()
+                .unwrap()
+                .entry(identity.to_string())
+                .or_default()
+                .parked
+                .insert(turn_id.to_string(), events);
+        }
+
+        /// Run the turn in flight to its boundary and hand the queue to the
+        /// next one. Returns its events, in order.
+        fn run_active(&self, identity: &str) -> Vec<ccteam_harness::ThreadEvent> {
+            let mut states = self.state.lock().unwrap();
+            let Some(state) = states.get_mut(identity) else {
+                return Vec::new();
+            };
+            let Some(active) = state.active.take() else {
+                return Vec::new();
+            };
+            state.active = state.waiting.pop_front();
+            state.parked.remove(&active).unwrap_or_default()
+        }
+    }
+
     #[derive(Clone, Default)]
     struct StubAdapter {
         spawns: std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+        /// When set, submissions take a real FIFO ([`StubTurnQueue`]) instead
+        /// of completing the moment they are accepted.
+        queue: Option<std::sync::Arc<StubTurnQueue>>,
         /// v0.9.0 W2 — when true, `submit_turn` enqueues an echo AgentMessage
         /// the pump folds into an `Answer` (for the dispatch-wait tests).
         /// Default false = empty event stream (existing principal tests).
@@ -6070,6 +6141,27 @@ mod session_tool_tests {
         >,
         notify: std::sync::Arc<tokio::sync::Notify>,
         spawn_barrier: Option<std::sync::Arc<StubSpawnBarrier>>,
+    }
+
+    impl StubAdapter {
+        /// Run the identity's in-flight turn to its boundary: its parked events
+        /// reach the pump, and the next queued turn takes over.
+        async fn run_next_turn(&self, identity: &str) {
+            let events = self
+                .queue
+                .as_ref()
+                .expect("a queueing stub")
+                .run_active(identity);
+            let mut queued = self.events.lock().await;
+            for event in events {
+                queued.push_back((identity.to_string(), event));
+            }
+            drop(queued);
+            // `notify_waiters` (not `notify_one`): one shared cell serves every
+            // session's pump here, and a permit handed to the wrong waiter
+            // stalls the pump the event was for.
+            self.notify.notify_waiters();
+        }
     }
 
     #[async_trait::async_trait]
@@ -6189,9 +6281,50 @@ mod session_tool_tests {
             _routing: ccteam_harness::TurnRouting,
         ) -> std::result::Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError>
         {
-            self.submit_turn(h, input)
-                .await
-                .map(ccteam_harness::TurnSubmission::started)
+            let Some(queue) = self.queue.clone() else {
+                return self
+                    .submit_turn(h, input)
+                    .await
+                    .map(ccteam_harness::TurnSubmission::started);
+            };
+            let text = match input {
+                ccteam_harness::TurnInput::UserText(t) => t,
+                _ => String::new(),
+            };
+            let (turn_id, disposition, position) = queue.claim(&h.identity);
+            queue.park(
+                &h.identity,
+                &turn_id,
+                vec![
+                    ccteam_harness::ThreadEvent::TurnStarted {
+                        turn_id: turn_id.clone(),
+                    },
+                    ccteam_harness::ThreadEvent::ItemCompleted {
+                        item: ccteam_harness::ThreadItem {
+                            id: format!("msg-{turn_id}"),
+                            details: ccteam_harness::ThreadItemDetails::AgentMessage(format!(
+                                "echo: {text}"
+                            )),
+                        },
+                    },
+                    ccteam_harness::ThreadEvent::TurnCompleted {
+                        turn_id: turn_id.clone(),
+                        usage: Default::default(),
+                        model: None,
+                        conclusion: None,
+                    },
+                ],
+            );
+            let turn_id = ccteam_harness::TurnId::new(turn_id);
+            Ok(match disposition {
+                ccteam_harness::TurnDisposition::Queued => {
+                    ccteam_harness::TurnSubmission::queued_at(
+                        turn_id,
+                        position.expect("a queued claim reports its position"),
+                    )
+                }
+                _ => ccteam_harness::TurnSubmission::started(turn_id),
+            })
         }
         async fn rebuild_tool_surface(
             &self,
@@ -8630,6 +8763,90 @@ mod session_tool_tests {
         (handle, principal, drx)
     }
 
+    /// A dispatch gateway whose child holds a REAL turn FIFO: one turn runs,
+    /// the rest wait, and the test releases them one at a time. Every adapter
+    /// shares the queue, the event log and the wakeup, so the returned handle
+    /// drives whichever session the test names. The notifier runs, as it does
+    /// in production. Returns `(gateway, parent sid, adapter)`.
+    async fn queueing_dispatch_gateway(
+        project_dir: &std::path::Path,
+    ) -> (GatewayHandle, String, StubAdapter) {
+        let shared = StubAdapter {
+            answer: true,
+            queue: Some(std::sync::Arc::new(StubTurnQueue::default())),
+            ..Default::default()
+        };
+        let handed = shared.clone();
+        let factory: std::sync::Arc<
+            dyn Fn(
+                    ccteam_harness::AgentVendor,
+                    ccteam_harness::SessionProtocol,
+                )
+                    -> std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+                + Send
+                + Sync,
+        > = std::sync::Arc::new(move |_, _| {
+            std::sync::Arc::new(handed.clone())
+                as std::sync::Arc<dyn ccteam_harness::HarnessAdapter + Send + Sync>
+        });
+        let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
+        mark_stub_vendors_installed(&mut gw);
+        let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
+        gw.set_delegation_notifier_tx(dtx);
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gw.set_event_sink(etx);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+        let principal = gw
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let handle = std::sync::Arc::new(tokio::sync::Mutex::new(gw));
+        tokio::spawn(Gateway::run_delegation_notifier(
+            std::sync::Arc::clone(&handle),
+            drx,
+        ));
+        (handle, principal, shared)
+    }
+
+    /// The thread identity a `StubAdapter` gave `sid` (its FIFO key).
+    fn stub_identity(sid: &str) -> String {
+        format!("alpha--{sid}")
+    }
+
+    /// Poll a session's mirrored USER rows — the notification turns a parent
+    /// received — until `want` of them land, or give up.
+    async fn await_notifications(
+        project_dir: &std::path::Path,
+        parent_sid: &str,
+        want: usize,
+    ) -> Vec<String> {
+        for _ in 0..400 {
+            let rows: Vec<String> =
+                ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, parent_sid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|turn| turn.user.contains(" done · ") || turn.user.contains(" FAILED "))
+                    .map(|turn| turn.user)
+                    .collect();
+            if rows.len() >= want {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        ccteam_harness::execution::turns_mirror::read_all_turns(project_dir, parent_sid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|turn| turn.user.contains(" done · ") || turn.user.contains(" FAILED "))
+            .map(|turn| turn.user)
+            .collect()
+    }
+
     pub(super) fn parse(body: &str) -> serde_json::Value {
         serde_json::from_str(body).unwrap()
     }
@@ -8690,6 +8907,497 @@ mod session_tool_tests {
             root,
             secrets,
         )
+    }
+
+    // ====================================================================
+    // GitHub #197 (B/C/F) — a dispatch is a REQUEST, and its answer knows
+    // whose it is. The three failures these cover were measured on
+    // s932→s933/s936 (a parent that could not see its own queue re-sent one
+    // instruction three times and then stopped a 400k-context child) and
+    // s1688→s1689 (a 15-minute decision made off the wrong answer).
+    // ====================================================================
+
+    /// A running, B and C queued: each dispatch is told its own request id and
+    /// where in the queue it actually sits. Before this, all three answered a
+    /// flat `pending` with no way to tell "running" from "third in line".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn queued_dispatches_report_their_own_identity_and_position() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let dispatch = |task: &str, title: &str| {
+            let args = json!({ "sid": &child, "task": task, "title": title });
+            let gw = &gw;
+            let principal = principal.clone();
+            async move {
+                parse(
+                    &run_agent_dispatch(
+                        &ambient(&principal, "alpha", args),
+                        gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            }
+        };
+        let a = dispatch("verdict please", "verdict").await;
+        let b = dispatch("then the cleanup", "cleanup").await;
+        let c = dispatch("and the release note", "release-note").await;
+
+        assert_eq!(a["status"], json!("started"), "{a}");
+        assert!(a.get("queue_position").is_none(), "nothing is queued: {a}");
+        assert_eq!(b["status"], json!("queued"), "{b}");
+        assert_eq!(b["queue_position"], json!(1), "1-based, oldest first: {b}");
+        assert_eq!(c["status"], json!("queued"), "{c}");
+        assert_eq!(c["queue_position"], json!(2), "{c}");
+
+        // Three distinct identities, and three distinct execution turns.
+        let ids: Vec<&str> = [&a, &b, &c]
+            .iter()
+            .map(|r| {
+                r["request_id"]
+                    .as_str()
+                    .expect("every dispatch is a request")
+            })
+            .collect();
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "{a} {b} {c}"
+        );
+        let turns: Vec<&str> = [&a, &b, &c]
+            .iter()
+            .map(|r| r["turn_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            turns.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "a queued task names the turn it WILL run in: {a} {b} {c}"
+        );
+
+        // The four delivery facts, kept apart. A queued task has not reached
+        // the harness; a started one has, but that is not proof it was read.
+        assert_eq!(a["delivery"]["written"], json!(true), "{a}");
+        assert_eq!(a["delivery"]["executing"], json!("unknown"), "{a}");
+        assert_eq!(b["delivery"]["queued"], json!(true), "{b}");
+        assert_eq!(b["delivery"]["written"], json!(false), "{b}");
+    }
+
+    /// A finishes: only A's parent is woken, the header names A's request and
+    /// title, and it says how much of that child's work is still owed. B and C
+    /// stay outstanding — the boundary that ended A is not their answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_boundary_notifies_only_the_request_it_answered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, stub) = queueing_dispatch_gateway(&project_dir).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut sent = Vec::new();
+        for (task, title) in [
+            ("verdict please", "verdict"),
+            ("then the cleanup", "cleanup"),
+            ("and the release note", "release-note"),
+        ] {
+            sent.push(parse(
+                &run_agent_dispatch(
+                    &ambient(
+                        &principal,
+                        "alpha",
+                        json!({ "sid": &child, "task": task, "title": title }),
+                    ),
+                    &gw,
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap(),
+            ));
+        }
+
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let notes = await_notifications(&project_dir, &principal, 1).await;
+        assert_eq!(notes.len(), 1, "one boundary wakes one request: {notes:?}");
+        let header = notes[0].lines().next().unwrap_or_default().to_string();
+        assert!(
+            header.contains(sent[0]["request_id"].as_str().unwrap()),
+            "the header names the request that was answered: {header}"
+        );
+        assert!(
+            header.contains("«verdict»"),
+            "…and its OWN title, not a later dispatch's: {header}"
+        );
+        assert!(
+            header.contains("2 still queued"),
+            "…and what the child still owes: {header}"
+        );
+        assert!(
+            !header.contains("cleanup") && !header.contains("release-note"),
+            "{header}"
+        );
+
+        // B and C are untouched: their turns have not run.
+        let read = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "n": 0 })),
+                &gw,
+                McpCaller::Ambient,
+                &CcteamPaths {
+                    root: tmp.path().join("home"),
+                    projects_root: tmp.path().join("projects"),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let outstanding: Vec<&str> = read["requests"]
+            .as_array()
+            .expect("a read carries the child's request rows")
+            .iter()
+            .filter(|row| row["state"] != json!("answered"))
+            .map(|row| row["title"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(outstanding, ["cleanup", "release-note"], "{read}");
+
+        // B's turn runs next: ITS request is the one that gets reported.
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let notes = await_notifications(&project_dir, &principal, 2).await;
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let second = notes[1].lines().next().unwrap_or_default().to_string();
+        assert!(
+            second.contains(sent[1]["request_id"].as_str().unwrap()),
+            "the queued task's flush bound it to its own turn: {second}"
+        );
+        assert!(second.contains("«cleanup»"), "{second}");
+        assert!(second.contains("1 still queued"), "{second}");
+    }
+
+    /// issue #201 R6 — the ordinal on a completion header counts turns that
+    /// FINISHED, not messages that were accepted. Three tasks are handed to a
+    /// child that has completed one, and its first answer used to arrive
+    /// labelled `turn 3`: the parent read the number as "you are on your third
+    /// reply" and trusted it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn the_turn_ordinal_counts_completed_turns_not_accepted_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, stub) = queueing_dispatch_gateway(&project_dir).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for task in ["first", "second", "third"] {
+            run_agent_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "task": task, "title": task }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        }
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let notes = await_notifications(&project_dir, &principal, 1).await;
+        let header = notes[0].lines().next().unwrap_or_default().to_string();
+        assert!(
+            header.contains(" · turn 1 ·") || header.ends_with(" · turn 1"),
+            "three messages were accepted, ONE turn finished: {header}"
+        );
+
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let notes = await_notifications(&project_dir, &principal, 2).await;
+        let header = notes[1].lines().next().unwrap_or_default().to_string();
+        assert!(
+            header.contains(" · turn 2 ·") || header.ends_with(" · turn 2"),
+            "{header}"
+        );
+    }
+
+    /// `agent{wait}` waits for ITS request. A sibling finishing first is not
+    /// the answer, and the wait does not return holding it (issue #201: the
+    /// first boundary of the child used to end every wait on that child).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_never_returns_a_sibling_tasks_answer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, stub) = queueing_dispatch_gateway(&project_dir).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A runs; B waits behind it.
+        run_agent_dispatch(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": &child, "task": "task A", "title": "A" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+
+        let waiter = {
+            let gw = std::sync::Arc::clone(&gw);
+            let principal = principal.clone();
+            let child = child.clone();
+            tokio::spawn(async move {
+                parse(
+                    &run_agent_dispatch(
+                        &ambient(
+                            &principal,
+                            "alpha",
+                            json!({ "sid": &child, "task": "task B", "title": "B", "wait": 20 }),
+                        ),
+                        &gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            })
+        };
+        // Let B be accepted and queued before A's boundary lands.
+        for _ in 0..200 {
+            let queued = gw
+                .lock()
+                .await
+                .outstanding_request_ids(&child, &principal)
+                .len();
+            if queued == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        stub.run_next_turn(&stub_identity(&child)).await;
+        // A's answer belongs to A's (async) dispatch, so the parent is woken
+        // for it — and the waiter is still waiting.
+        let notes = await_notifications(&project_dir, &principal, 1).await;
+        assert!(notes[0].contains("«A»"), "{notes:?}");
+        assert!(!waiter.is_finished(), "B's wait must not take A's answer");
+
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let answer = waiter.await.expect("the waiter finishes");
+        assert_eq!(answer["status"], json!("completed"), "{answer}");
+        assert!(
+            answer["result_text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("task B"),
+            "the wait returns ITS OWN task's answer: {answer}"
+        );
+    }
+
+    /// A follow-up that names no `notify` keeps the mode this parent chose for
+    /// its outstanding work on this child; an explicit one overrides. Reverting
+    /// to the default mid-conversation is how a deliberate `final` became a
+    /// 443-character `brief` and a parent decided off the excerpt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_omitted_notify_inherits_this_parents_own_precedent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dispatch = |args: serde_json::Value| {
+            let gw = &gw;
+            let principal = principal.clone();
+            async move {
+                run_agent_dispatch(&ambient(&principal, "alpha", args), gw, McpCaller::Ambient)
+                    .await
+                    .unwrap()
+            }
+        };
+        dispatch(json!({ "sid": &child, "task": "…", "title": "the verdict", "notify": "final" }))
+            .await;
+        dispatch(json!({ "sid": &child, "task": "…", "title": "a follow-up" })).await;
+        dispatch(json!({ "sid": &child, "task": "…", "title": "and one more", "notify": "brief" }))
+            .await;
+
+        let store = ccteam_harness::read_delegation_requests(tmp.path(), &child)
+            .expect("the child holds its requests");
+        let modes: Vec<&str> = store
+            .requests
+            .iter()
+            .map(|request| request.notify.as_str())
+            .collect();
+        assert_eq!(
+            modes,
+            ["final", "final", "brief"],
+            "an omitted notify inherits, an explicit one overrides: {store:?}"
+        );
+        // Titles are per request and never rewritten by a later dispatch.
+        let titles: Vec<&str> = store
+            .requests
+            .iter()
+            .map(|request| request.title.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(titles, ["the verdict", "a follow-up", "and one more"]);
+    }
+
+    /// The full-read recipe on a truncated excerpt still reads THAT answer
+    /// after the child has finished a later turn. `n:1` was only correct at
+    /// the instant of delivery (issue #201).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_old_excerpts_recipe_still_reads_its_own_answer() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let verdict = format!("VERDICT{}END", "v".repeat(4_000));
+        for (id, text) in [
+            (format!("{child}-1"), verdict.clone()),
+            (format!("{child}-2"), "confirmed, ready to ship".to_string()),
+        ] {
+            append_turn(
+                tmp.path(),
+                &child,
+                &TurnRecord {
+                    exec_turn_id: None,
+                    turn_id: id,
+                    ts: chrono::Utc::now(),
+                    vendor: "claude".into(),
+                    role: String::new(),
+                    user: String::new(),
+                    assistant: text,
+                    usage: serde_json::Value::Null,
+                    status: None,
+                    tool_calls: vec![],
+                    attachments: vec![],
+                    outcome: None,
+                    error_kind: None,
+                    error: None,
+                    conclusion: None,
+                },
+            )
+            .unwrap();
+        }
+        // The excerpt a truncated read of the verdict hands back.
+        let cut = parse(
+            &run_agent_read(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "turn": format!("{child}-1"), "max_chars": 300 }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        let content = cut["turns"][0]["content"].as_str().unwrap().to_string();
+        let recipe = content
+            .split("agent_read{")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("a truncated row carries the exact read")
+            .to_string();
+        assert!(
+            recipe.contains(&format!("turn:{child}-1")),
+            "the recipe names the turn, not a position: {recipe}"
+        );
+        assert!(!recipe.contains("n:1"), "{recipe}");
+
+        // Follow it AFTER a newer turn exists: it still reads the verdict.
+        let whole = parse(
+            &run_agent_read(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "turn": format!("{child}-1"), "max_chars": 50_000 }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(whole["turns"].as_array().map(Vec::len), Some(1), "{whole}");
+        assert_eq!(whole["turns"][0]["content"], json!(verdict), "{whole}");
+        // …and a turn the transcript does not hold is an error, never a page
+        // of something else.
+        let missing = run_agent_read(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": &child, "turn": "s0-ghost" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+            &paths,
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.contains("no turn s0-ghost"), "{missing}");
     }
 
     fn assert_exact_keys(value: &serde_json::Value, expected: &[&str]) {

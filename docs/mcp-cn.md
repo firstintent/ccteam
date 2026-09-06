@@ -43,20 +43,31 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 
 - **不带 `sid` = 新雇。**`vendor` 选 harness —— `claude`(默认)/ `codex` / `grok` / `opencode` / `kimi` / `pi` / `dsh` —— 响应总是带**新** sid。`model` / `effort` 原样传给 vendor(省略走默认;vendor 拒绝的值 = 雇佣失败,绝不静默忽略)。`role` 指 `.claude/agents/<role>.md`(省略 = roleless,裸 vendor 自读项目 `CLAUDE.md`/`AGENTS.md`)。`mode` 仅 DSH(`standard` | `ptc` | `minimal` | `creator`)。`permission_mode:"hitl"` 把审批弹到你绑定的 chat;默认 `skip` 不弹。`tools` 设子会话自己的面(§2)。`title`(≤80 字符)只进账本与团队视图,绝不进任何 prompt。`parent_sid` 用于 ccteam 不管理你时保住委派边。
 - **带 `sid` = 续派**;`released` 会话先按 sid 复活。此形态下雇佣类参数一律拒绝而非静默忽略。
-- `wait` —— 内联等待秒数,0–240(默认 0 = async)。超时回 `status:"pending"`,**绝不取消子任务**。
+- `wait` —— 内联等待秒数,0–240(默认 0 = async)。它等的是**这一次请求**的答案:同一子会话里另一个任务先完成,那是那次请求的完成、不是你的,照常推给你。超时回 `answered:false` + 下面那组送达事实,**绝不取消子任务**。
 - `idempotency_key` —— 同 key 重试重放原调用而非翻倍(新雇按项目、续派按子会话;内存态,~1 小时)。重放响应多一个 `idempotent_replay:true`。
 - **没有 `host`**(机器跟随项目绑定)、**没有 `protocol`**(信道由 vendor 推导);传了都是硬错,退役的 `wait_seconds` 同理(已改名 `wait`)。
 
-响应(紧凑 JSON):async → `{sid, turn_id, status:"pending"}`(任务排在重启前旧进程后面时是 `status:"queued"`;完成通知到不了你时带 `notify_deliverable:false` —— 那就用 `agent_read{sid,wait}`)。内联 → `{sid, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`;`result_text` 保留 2000 字符头尾节选(与推送通知的 `final` 同档),标记里写明读全文的精确调用 `agent_read{sid,n:1,max_chars}`。用 `wait` 拿到答案的那次任务不会再推完成通知:答案已在你手上,绝不会再送第二遍。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
+**每一次调用都是一条有身份的请求。** ccteam 在写进 vendor **之前**就铸出 `request_id` 并落盘,它自带自己的 parent、`notify` 档位、`title` 与生命周期(`accepted` → `queued` | `submitted` → `executing` → `answered` | `failed`)。一条请求**只**由它绑定的那个执行 turn 来了结 —— 绝不按最新、按时间戳或按假定的排队位置匹配 —— 所以对同一个忙碌子会话的第二次派工,既拿不走第一次的答案,也改不掉它的名字、更改不了它通知谁。
+
+响应(紧凑 JSON):async → `{sid, request_id, turn_id, status, delivery, queue_position?}`。
+
+- `status` 是 adapter **实际做了什么**:`started`(子会话空闲,这条开了一个新 turn)、`injected`(汇入正在跑的那个 turn)、`queued`(独立的后续 turn,在排队 —— 任务排在重启前旧进程后面时也是这个形状,并附一条 `hint`)。
+- `queue_position` 从 1 起算,只在 adapter 看得见自己的 FIFO 时出现。`turn_id` 指的是这个任务**将要**跑在哪个执行 turn 里,排队期间就已经给了。
+- `delivery` 把四件不同的事分开:`accepted`(ccteam 已持久持有)、`queued`(还被 ccteam 留在 harness 前面)、`written`(字节已写进 harness)、`executing`(观察到承载它的 turn 开始了)。冲进 stdin 不等于模型读了,所以在 turn 真的开起来之前 `executing` 一律是 `"unknown"`;凡是 ccteam 观察不到的,都说 `"unknown"`,不给一个自信的 `false`。
+- 完成通知到不了你时带 `notify_deliverable:false` —— 那就用 `agent_read{sid,wait}`。
+
+内联(`wait`)→ `{sid, request_id, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`,其中 `turn_id` 就是回答**这一条请求**的那行 transcript;`result_text` 保留 2000 字符头尾节选(与推送通知的 `final` 同档),标记里写明读全文的精确调用 `agent_read{sid,turn:<turn_id>,max_chars}`。等待超时回 `{sid, request_id, turn_id, status, state, delivery, answered:false}` —— `state` 是这条请求当下的生命周期状态,所以「还排在第三位」和「正在跑」分得开。用 `wait` 拿到答案的那**条请求**不会再推完成通知:答案已在你手上,绝不会再送第二遍。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
 
 ### `agent_read` —— 名册,或一份 transcript
 
-`{sid?, n?, tail?, since?, max_chars?, wait?, project?, activity?, tree?}` —— 只读;`sid` 决定你拿到什么。
+`{sid?, n?, tail?, since?, turn?, max_chars?, wait?, project?, activity?, tree?}` —— 只读;`sid` 决定你拿到什么。
 
 - **不带 `sid` = 名册**,最近活跃在前 —— 受管会话看到的是**自己项目**(点名别的项目会被拒,与其他按 sid 寻址的调用一致),web/租户 caller 看到自己拥有的项目:`n` 行(默认 10,最多 500),过滤器 `project` 与 `activity`(`working` | `idle` | `stale` | `stuck` | `all`),`tree:true` **只对返回行**铺委派拓扑。行 = `{sid, vendor, model?, role?, title?, activity, residency?, context_pct?, parent_sid?, is_self?, waiting_approval?, host?, cost_usd?, tokens_total?}`,空字段省略;`is_self` 标你自己那行;`truncated:true` + `total` 只在截断时出现。`residency` 只在 ccteam 不持进程时出现:`released` 在你下次 `agent{sid}` 时复活 —— 复用它,别雇双胞胎;`stopped` 是被用户显式结束的。
-- **带 `sid` = 该会话的 transcript**,默认**最新在前**(`tail` 默认 true;给了 `since` 则从 turn_id 游标向前翻页 —— **最旧的未读在前**,所以 `since` + `n:1` 拿到的是最旧一条未读,绝不是最新答案的捷径)。这里 `n` 默认 **1** 条 ——「它答了什么」就是最新那一条,花名册的 10 是给一行一个会话用的;`max_chars` 默认 1000(100–50000)。超长保留 70% 头 / 30% 尾节选,标记就是读全那一条 turn 的精确调用;当标记比它省下的文本还贵时整条返回;整页每行都会掉到 ~200 字符以下时,丢掉最旧的几行(计入 `remaining`)而不是把每行都剁碎。全文永远在账本里。返回体:`{activity, context_pct?, cursor?, remaining?, latest?, cost_usd?, tokens_total?, residency?, truncated?, turns:[{turn_id, content, outcome?, error_kind?, error?}]}` —— `cursor` = 本页最后一条;`remaining` = 本页没给的匹配 turn 数(`since` 读时 = 仍未读的条数);`latest` = 最新一条的 turn_id,只在本页没有落在它上面时出现;`truncated:true` = 某条返回文本被 `max_chars` 截断。空 `turns` = 还没答案;`activity:"working"` = turn 进行中。
+- **带 `sid` = 该会话的 transcript**,默认**最新在前**(`tail` 默认 true;给了 `since` 则从 turn_id 游标向前翻页 —— **最旧的未读在前**,所以 `since` + `n:1` 拿到的是最旧一条未读,绝不是最新答案的捷径)。这里 `n` 默认 **1** 条 ——「它答了什么」就是最新那一条,花名册的 10 是给一行一个会话用的;`max_chars` 默认 1000(100–50000)。超长保留 70% 头 / 30% 尾节选,标记就是读全那一条 turn 的精确调用;当标记比它省下的文本还贵时整条返回;整页每行都会掉到 ~200 字符以下时,丢掉最旧的几行(计入 `remaining`)而不是把每行都剁碎。全文永远在账本里。返回体:`{activity, context_pct?, cursor?, remaining?, latest?, cost_usd?, tokens_total?, residency?, truncated?, requests?, resolved_requests?, turns:[{turn_id, content, outcome?, error_kind?, error?}]}` —— `cursor` = 本页最后一条;`remaining` = 本页没给的匹配 turn 数(`since` 读时 = 仍未读的条数);`latest` = 最新一条的 turn_id,只在本页没有落在它上面时出现;`truncated:true` = 某条返回文本被 `max_chars` 截断。空 `turns` = 还没答案;`activity:"working"` = turn 进行中。
+- **`requests`** —— 这个会话还欠谁什么:未决的在前(按受理顺序),后面跟一段有界的已了结记录,至多十条。每行 `{request_id, parent_sid, state, notify, title?, queue_position?, turn_id?, answered_turn?, created_at, delivery}`,`delivery` 与派发响应里的四件事同义。派工方由此看见自己的队列,而不是靠猜。
+- **`turn:<turn_id>`** —— 精确取那一条 turn,此后这个会话再完成多少个 turn 都不影响。每条被截断的节选,配方指的就是它:`n:1` 的意思是「最新那条」,而那只是节选被写出的那一瞬间成立。transcript 里没有的 turn 会报错,绝不给你别的一页。
 - **`n:0` = 只要状态**:同一返回体但没有任何 turn 文本 —— `activity`、`context_pct`、`latest`,带 `since` 时还有未读条数 `remaining`。这是最便宜的「做完了吗?有新话吗?」读法。你很少需要它:自己雇的会话完成通知会自己到、以它为准;只轮询那些回了 `notify_deliverable:false` 的会话,而且优先用 `wait` 而不是循环。
-- `wait`(随 `sid`)—— 目标 turn 在飞时挂住这次读的秒数,0–240(默认 0)。到边界 → 含最终 turn 的正常返回体;超时 → 正常返回体 + `activity:"working"`;没有在飞 turn → 立即返回。**零新增字段**,超时也绝不动那个 turn。循环 `agent_read{sid,wait:240,since:<cursor>}` 就是等一个比内联 `agent{wait}` 更久的子会话的正解 —— 不要自己去 tail 它的 `turns.jsonl`。若等到边界的正是派任务的 parent,该任务的完成通知会被抑制:答案已经在你手上。
+- `wait`(随 `sid`)—— 目标 turn 在飞时挂住这次读的秒数,0–240(默认 0)。到边界 → 含最终 turn 的正常返回体,外加 `resolved_requests`:这次读了结了**你的**哪几条任务,点名给出,答案就不会被误当成另一条任务的。超时 → 正常返回体 + `activity:"working"`;没有在飞 turn → 立即返回。超时绝不动那个 turn。循环 `agent_read{sid,wait:240,since:<cursor>}` 就是等一个比内联 `agent{wait}` 更久的子会话的正解 —— 不要自己去 tail 它的 `turns.jsonl`。若等到边界的正是派任务的 parent,该任务的完成通知会被抑制:答案已经在你手上。
 - 退役的 `limit` 参数 = 硬错(已改名 `n`)。
 
 ### `agent_stop` —— 显式结束一个会话
@@ -111,15 +122,15 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 
 ## 4. 完成通知
 
-每个 `agent` 任务都挂 watch(除非你退订),**在 vendor turn 边界只报一次** —— 话痨子会话的中途叙述只进账本。通知 = 一行头 —— `s12 done · codex · turn 7 · ctx 19%`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选:
+每个 `agent` 任务都挂 watch(除非你退订),**在它自己那条请求绑定的那个 turn 的边界只报一次** —— 话痨子会话的中途叙述只进账本;同一子会话里另一个任务先完成,那是那条任务的回报、不是你的。通知 = 一行头 —— `s12 done · codex · turn 7 · ctx 19% · «核对修复» req-18d2… · 还排队 2`(85% 起带 `⚠`;失败写 `s12 FAILED (<kind>) …`)—— 加一段答案节选。头里点名**哪一条**请求答了、以及**它自己的** title(后来的派工绝不改前面那条的名字),`还排队 N` 是这个子会话还欠你多少。`turn N` 数的是**已完成**的 turn,不是被接受的消息数:给一个只完成了一个 turn 的子会话派三条任务,报的是 `turn 1`。
 
 | `notify` | 节选 | 用途 |
 |---|---|---|
-| `brief`(默认) | 500 字符头尾 + 读全文的精确调用 `agent_read{sid,n:1,max_chars}` | 默认档:裁决 + 坐标;parent 是团队里最稀缺的上下文,全文永远一次精确调用可得 |
+| `brief`(默认) | 500 字符头尾 + 读全文的精确调用 `agent_read{sid,turn:<turn_id>,max_chars}` | 默认档:裁决 + 坐标;parent 是团队里最稀缺的上下文,全文永远一次精确调用可得 |
 | `final` | 2000 字符,同样形状 | 想把全文推过来的 parent |
 | `off` | 无(只记账本) | 发完不管 |
 
-布尔仍认(`true`→final,`false`→off);退役的 `all` 传上来是可读错误(它的行为本来就等同 `final`)。答案被你内联取走的那次任务(`agent{wait}`,或在边界返回的 `agent_read{sid,wait}`)根本不发通知:这个决定在声明 wait 时就做了、不是事后撤销,所以两条路不可能都投递。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话,**只送一次**。通知是独立的后续 turn,绝不是 steer:parent 正在 turn 中时,通知在该 turn 结束后立刻送达(claude 会把 turn 中写进 stdin 的一行给模型看两遍 —— 先作为 queued-command 预览,再作为下一条 prompt —— 所以边界才是它恰好被读一次的地方;暂存的那行落盘,daemon 重启不丢)。进程间隙 = 排队,resume 时送达。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,`initialize` 的 instructions 一开始就讲明,用 `agent{wait}` 或 `agent_read{sid,wait}` 代替。派给不是你雇的会话 = handoff:照跑照记账,但不给你订阅,除非显式传 `notify`。
+省略 `notify` 时**继承**你在这个子会话上仍未决的最近一次选择;显式给的覆盖;没有先例才用默认 `brief`。(续派时悄悄回落默认,正是一次刻意的 `final` 半路变成 443 字符 `brief` 的原因。)布尔仍认(`true`→final,`false`→off);退役的 `all` 传上来是可读错误(它的行为本来就等同 `final`)。答案被你内联取走的那次任务(`agent{wait}`,或在边界返回的 `agent_read{sid,wait}`)根本不发通知:这个决定在声明 wait 时就做了、不是事后撤销,所以两条路不可能都投递。这个抑制是按**请求**算的:你阻塞在 B 上,A 的完成照样推给你 —— 那条你并没有拿在手上。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话,**只送一次**。通知是独立的后续 turn,绝不是 steer:parent 正在 turn 中时,通知在该 turn 结束后立刻送达(claude 会把 turn 中写进 stdin 的一行给模型看两遍 —— 先作为 queued-command 预览,再作为下一条 prompt —— 所以边界才是它恰好被读一次的地方;暂存的那行落盘,daemon 重启不丢)。进程间隙 = 排队,resume 时送达。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,`initialize` 的 instructions 一开始就讲明,用 `agent{wait}` 或 `agent_read{sid,wait}` 代替。派给不是你雇的会话 = handoff:照跑照记账,但不给你订阅,除非显式传 `notify`。
 
 ## 5. 协议细节
 
