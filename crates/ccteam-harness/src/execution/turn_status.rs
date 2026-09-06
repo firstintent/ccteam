@@ -248,8 +248,9 @@ mod tests {
 
     #[test]
     fn zero_token_ledger_is_unknown_not_rendered() {
-        // Codex accrues no per-turn usage on `TurnCompleted`, so a zero ledger
-        // means "unknown", never "0.0k tok".
+        // A ledger can legitimately hold no tokens yet (a turn boundary the
+        // pump has not folded, a vendor that reports usage out of band), so a
+        // zero ledger means "unknown", never "0.0k tok".
         let st = TurnStatus {
             model: None,
             context: None,

@@ -2185,7 +2185,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                                 turn_usage = None;
                                             }
                                             if let Some(usage) =
-                                                codex_turn_usage_from_notification(&notif)
+                                                codex_last_request_usage_from_notification(&notif)
                                             {
                                                 turn_usage = Some(usage);
                                             }
@@ -4080,17 +4080,98 @@ fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
     serde_json::from_value(raw).ok()
 }
 
-/// Extract the current turn's token buckets from Codex's dedicated usage
-/// notification. The terminal `error` notification carries no usage, so the
-/// per-subscriber event stream retains this `last` block until the terminal
-/// boundary and attaches it there.
-fn codex_turn_usage_from_notification(notif: &Notification) -> Option<UnifiedTokenUsage> {
+/// One Codex usage bucket (`tokenUsage.last` / `tokenUsage.total`) exactly as
+/// the live app-server spells it: camelCase, every field present. There are
+/// deliberately no defaults and no snake_case aliases — codex emits ONE shape
+/// (53,106 buckets on this daemon's ledgers, not a single exception), so any
+/// other shape is protocol drift and must fail closed rather than be guessed
+/// at.
+///
+/// That strictness is the whole point. `UnifiedTokenUsage` has
+/// `#[serde(default)]` on every field and no `deny_unknown_fields`, so
+/// deserialising the camelCase wire block straight into it SUCCEEDED and
+/// yielded all zeros — a silent mis-key, not an error, which is what put zero
+/// tokens on every codex ledger row (GitHub #197 H1). A required field turns
+/// the next such drift into a `None` the caller can see instead of a
+/// confident zero.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexUsageBucket {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+}
+
+impl CodexUsageBucket {
+    /// Codex reports NESTED buckets, the canonical shape wants DISJOINT ones.
+    /// On the wire `cachedInputTokens ⊆ inputTokens` and
+    /// `reasoningOutputTokens ⊆ outputTokens` (OpenAI's breakdown convention);
+    /// `estimate_cost` instead ADDS its four buckets, and Anthropic — whose
+    /// shape `UnifiedTokenUsage` follows — reports them already disjoint. So
+    /// the subsets are subtracted out here, at the adapter, which is where a
+    /// vendor wire shape becomes canonical. Feeding the nested numbers through
+    /// unchanged would bill the cached prompt at BOTH the input and the cached
+    /// rate and the hidden CoT at twice the output rate.
+    ///
+    /// Invariant this preserves, verified against all 3,845 live rows with no
+    /// exception: `total()` == the wire's own `totalTokens`.
+    fn to_unified(self) -> UnifiedTokenUsage {
+        UnifiedTokenUsage {
+            input_tokens: self.input_tokens.saturating_sub(self.cached_input_tokens),
+            cached_input_tokens: self.cached_input_tokens,
+            output_tokens: self
+                .output_tokens
+                .saturating_sub(self.reasoning_output_tokens),
+            // Codex's prompt cache is read-only: `cacheWriteInputTokens` is
+            // present on the wire and 0 in every observed row, and no OpenAI
+            // model carries a cache-creation SKU.
+            cache_creation_input_tokens: None,
+            reasoning_output_tokens: (self.reasoning_output_tokens > 0)
+                .then_some(self.reasoning_output_tokens),
+            reported_cost_usd: None,
+        }
+    }
+}
+
+/// Usage of the most recent Responses request on this thread, read from
+/// Codex's `thread/tokenUsage/updated.tokenUsage.last`. The terminal `error`
+/// notification carries no usage, so the per-subscriber event stream retains
+/// this block until the terminal boundary and attaches it there.
+///
+/// NOT the turn's usage — a LOWER BOUND of it. `last` is one request, and a
+/// turn is many: 147 of the 156 turns on this daemon's ledgers took more than
+/// one usage notification, one of them 1,368. The turn's true cost is the
+/// delta of the sibling `total` field (cumulative per thread, monotonic across
+/// turns in all 5 multi-turn threads observed), but that baseline is NOT
+/// knowable from what this stream sees: a released or resumed session hands
+/// the dispatcher its first notification mid-thread, where a stale or absent
+/// baseline would over-bill by hundreds of millions of tokens. Settling it
+/// needs a live trace of the undeduplicated notification stream across a turn
+/// boundary — the sampled progress log cannot answer it. Deferred to
+/// `docs-local/issues/#202`; until then a turn bills its final request, which
+/// is honest and directionally right, where it used to bill zero.
+///
+/// Fails CLOSED: an unrecognised bucket shape yields `None` (usage stays
+/// unknown) and warns once, rather than deserialising to a confident zero the
+/// way the previous straight-to-`UnifiedTokenUsage` parse did (GitHub #197 H1).
+fn codex_last_request_usage_from_notification(notif: &Notification) -> Option<UnifiedTokenUsage> {
     if notif.method != "thread/tokenUsage/updated" {
         return None;
     }
     let token_usage = pluck_val(&notif.params, "token_usage", "tokenUsage")?;
     let last = token_usage.get("last")?.clone();
-    serde_json::from_value(last).ok()
+    match serde_json::from_value::<CodexUsageBucket>(last) {
+        Ok(bucket) => Some(bucket.to_unified()),
+        Err(err) => {
+            crate::warn_unknown_vendor_token(
+                "codex:tokenUsage.last",
+                &err.to_string(),
+                "token usage left UNKNOWN for this turn rather than billed as zero",
+            );
+            None
+        }
+    }
 }
 
 /// LEDGER-1 — the real `turn/completed` wire carries NO usage field; the
@@ -4831,15 +4912,15 @@ mod tests {
                 "turnId": "u-1",
                 "tokenUsage": {
                     "last": {
-                        "input_tokens": 80,
-                        "output_tokens": 21,
-                        "cached_input_tokens": 7,
-                        "reasoning_output_tokens": 3
+                        "inputTokens": 80,
+                        "outputTokens": 21,
+                        "cachedInputTokens": 7,
+                        "reasoningOutputTokens": 3
                     }
                 }
             }),
         };
-        let usage = codex_turn_usage_from_notification(&usage_notification)
+        let usage = codex_last_request_usage_from_notification(&usage_notification)
             .expect("token usage notification must expose the last turn");
         let error_notification = Notification {
             method: "error".into(),
@@ -4855,13 +4936,113 @@ mod tests {
         enrich_codex_turn_failed(&mut event, Some(usage), Some("gpt-5.3-codex".into()));
         match event {
             ThreadEvent::TurnFailed { usage, model, .. } => {
-                assert_eq!(usage.input_tokens, 80);
-                assert_eq!(usage.output_tokens, 21);
+                // Canonical buckets are DISJOINT, the wire's are nested:
+                // 80 prompt tokens of which 7 cached, 21 output of which 3
+                // hidden CoT (see `CodexUsageBucket::to_unified`).
+                assert_eq!(usage.input_tokens, 80 - 7);
+                assert_eq!(usage.output_tokens, 21 - 3);
                 assert_eq!(usage.cached_input_tokens, 7);
                 assert_eq!(usage.reasoning_output_tokens, Some(3));
+                assert_eq!(usage.total(), 80 + 21, "the wire's own total");
                 assert_eq!(model.as_deref(), Some("gpt-5.3-codex"));
             }
             other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    /// GitHub #197 H1 — the live `thread/tokenUsage/updated` wire, copied
+    /// verbatim from a captured `codex_token_usage` progress row. Every one of
+    /// the 3,845 rows on the daemon's ledger carries this camelCase shape;
+    /// `UnifiedTokenUsage` spells its fields snake_case and defaults them all,
+    /// so the old straight `from_value` parsed it to zeros WITHOUT erroring —
+    /// which is why every codex session billed 0 tokens (sid s932: 8 rows, all
+    /// zero) while claude sessions billed fine.
+    #[test]
+    fn codex_last_request_usage_reads_the_live_camelcase_wire() {
+        let notif = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "tokenUsage": {
+                    "last": {
+                        "cacheWriteInputTokens": 0,
+                        "cachedInputTokens": 7936,
+                        "inputTokens": 15463,
+                        "outputTokens": 302,
+                        "reasoningOutputTokens": 110,
+                        "totalTokens": 15765
+                    },
+                    "modelContextWindow": 258400
+                }
+            }),
+        };
+        let usage = codex_last_request_usage_from_notification(&notif)
+            .expect("the live usage notification must yield the turn's tokens");
+
+        // Nested on the wire → disjoint in the canonical shape, so the four
+        // buckets can be summed and priced without double-billing.
+        assert_eq!(usage.input_tokens, 15_463 - 7_936, "uncached prompt only");
+        assert_eq!(usage.cached_input_tokens, 7_936);
+        assert_eq!(usage.output_tokens, 302 - 110, "visible output only");
+        assert_eq!(usage.reasoning_output_tokens, Some(110));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        // The invariant that proves the split is faithful: the canonical total
+        // reproduces the wire's own `totalTokens`, exactly.
+        assert_eq!(usage.total(), 15_765);
+    }
+
+    /// A turn with no hidden reasoning keeps `reasoning_output_tokens` unset
+    /// (the "None for Claude" contract), and the totals still reconcile.
+    #[test]
+    fn codex_last_request_usage_without_reasoning_reports_no_reasoning_bucket() {
+        let notif = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "threadId": "t-1",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0,
+                        "inputTokens": 14_598,
+                        "outputTokens": 263,
+                        "reasoningOutputTokens": 0,
+                        "totalTokens": 14_861
+                    }
+                }
+            }),
+        };
+        let usage = codex_last_request_usage_from_notification(&notif).expect("usage");
+        assert_eq!(usage.input_tokens, 14_598);
+        assert_eq!(usage.output_tokens, 263);
+        assert_eq!(usage.reasoning_output_tokens, None);
+        assert_eq!(usage.total(), 14_861);
+    }
+
+    /// GitHub #197 H1 — drift must fail CLOSED. A bucket that is not the shape
+    /// codex emits leaves usage UNKNOWN, never a confident zero: a zero row
+    /// prices to $0 and silently drags the 24h budget ledger down, whereas
+    /// `None` folds nothing and the turn renders as unknown. This is the exact
+    /// failure that hid the original bug — the old parse accepted anything
+    /// because every field defaulted.
+    #[test]
+    fn a_misshaped_usage_bucket_is_unknown_not_zero() {
+        for last in [
+            // snake_case: a shape codex does not emit (and no longer humoured).
+            json!({ "input_tokens": 80, "output_tokens": 21,
+                    "cached_input_tokens": 7, "reasoning_output_tokens": 3 }),
+            // A renamed/partial bucket — protocol drift.
+            json!({ "inputTokens": 80 }),
+            json!({ "promptTokens": 80, "completionTokens": 21 }),
+            json!({}),
+        ] {
+            let notif = Notification {
+                method: "thread/tokenUsage/updated".into(),
+                params: json!({ "threadId": "t-1", "tokenUsage": { "last": last } }),
+            };
+            assert!(
+                codex_last_request_usage_from_notification(&notif).is_none(),
+                "an unrecognised bucket must not bill: {last}"
+            );
         }
     }
 
