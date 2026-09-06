@@ -835,6 +835,7 @@ fn stage_web_outbound_file(
         outcome: None,
         error_kind: None,
         error: None,
+        conclusion: None,
     };
     if let Err(err) = append_turn(&session.project_dir, &session.sid, &record) {
         for path in staged_paths {
@@ -3719,6 +3720,7 @@ async fn dispatch_wait_for_completion(
         answer: record
             .map(|turn| turn.assistant.as_str())
             .unwrap_or_default(),
+        conclusion: record.and_then(|turn| turn.conclusion.as_deref()),
     }
     .inline_result()
 }
@@ -3793,6 +3795,12 @@ fn page_collected_turns(
         .filter(|t| is_transcript_row(t))
         .map(|t| {
             let mut row = serde_json::json!({"turn_id": t.turn_id, "content": t.assistant});
+            // Steers this row's own cut only (a cut row shows the conclusion,
+            // not the narration's head — issue #196); `bound_collected_turns`
+            // strips it, so the wire never carries a second copy of the text.
+            if let Some(conclusion) = t.conclusion.as_deref() {
+                row["conclusion"] = serde_json::json!(conclusion);
+            }
             if let Some(outcome) = t.outcome.as_deref() {
                 row["outcome"] = serde_json::json!(outcome);
             }
@@ -3978,6 +3986,7 @@ fn bound_collected_turns(
         .collect();
     let total_chars = lengths.iter().sum();
     if total_chars <= max_chars {
+        strip_bounding_fields(rows);
         return (total_chars, false);
     }
     let budgets = collected_turn_budgets(&lengths, max_chars);
@@ -3990,6 +3999,7 @@ fn bound_collected_turns(
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let conclusion = row.get("conclusion").and_then(|v| v.as_str());
         let turn_id = row
             .get("turn_id")
             .and_then(|v| v.as_str())
@@ -4003,11 +4013,24 @@ fn bound_collected_turns(
         if original_chars <= budget + mark(original_chars - budget).chars().count() {
             continue;
         }
-        let bounded = crate::delegation::truncate_head_tail_with_marker(content, budget, mark);
+        // The same excerpt rule as a completion notification: a cut row shows
+        // the turn's conclusion, not the head of its narration (issue #196).
+        let bounded = crate::delegation::answer_excerpt(content, conclusion, budget, mark);
         row["content"] = serde_json::json!(bounded.text);
         truncated |= bounded.truncated;
     }
+    strip_bounding_fields(rows);
     (total_chars, truncated)
+}
+
+/// A row's `conclusion` exists to steer its own cut; the wire never carries a
+/// second copy of a turn's text.
+fn strip_bounding_fields(rows: &mut [serde_json::Value]) {
+    for row in rows.iter_mut() {
+        if let Some(object) = row.as_object_mut() {
+            object.remove("conclusion");
+        }
+    }
 }
 
 /// v0.9.1 — honest per-sid activity for the MCP surfaces: the SAME resolver the
@@ -5876,6 +5899,7 @@ mod session_tool_tests {
                             turn_id: format!("turn-{}", h.identity),
                             usage: Default::default(),
                             model: None,
+                            conclusion: None,
                         },
                     ));
                 }
@@ -7819,6 +7843,7 @@ mod session_tool_tests {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         }
     }
 
@@ -8018,6 +8043,7 @@ mod session_tool_tests {
                     outcome: failure.map(|_| "failed".to_string()),
                     error_kind: failure.map(|(kind, _)| kind.to_string()),
                     error: failure.map(|(_, error)| error.to_string()),
+                    conclusion: None,
                 },
             )
             .unwrap();
@@ -8076,6 +8102,38 @@ mod session_tool_tests {
         assert!(excerpt.ends_with("TAIL"));
         // The marker carries the recipe for THAT turn with ITS full length.
         assert!(excerpt.contains("read t2 whole (908)"), "{excerpt}");
+    }
+
+    /// issue #196 — a cut transcript row shows the turn's conclusion (behind
+    /// the marker for its narration), and the steering field never reaches
+    /// the wire — cut or not.
+    #[test]
+    fn a_cut_transcript_row_shows_the_conclusion_and_hides_the_steering_field() {
+        let narration = "narration ".repeat(80);
+        let receipt = "RECEIPT: all green".to_string();
+        let long = format!("{narration}\n\n{receipt}");
+        let mut rows = vec![
+            json!({ "turn_id": "t1", "content": "short", "conclusion": "short" }),
+            json!({ "turn_id": "t2", "content": long, "conclusion": receipt }),
+        ];
+        let recipe = |turn_id: &str, total: usize| format!("read {turn_id} whole ({total})");
+        let (_total, truncated) = bound_collected_turns(&mut rows, 300, &recipe);
+        assert!(truncated);
+        let excerpt = rows[1]["content"].as_str().unwrap();
+        assert!(excerpt.ends_with("RECEIPT: all green"), "{excerpt}");
+        assert!(excerpt.starts_with("…[+"), "{excerpt}");
+        assert!(excerpt.contains("read t2 whole (820)"), "{excerpt}");
+        assert!(!excerpt.contains("narration narration"), "{excerpt}");
+        for row in &rows {
+            assert!(row.get("conclusion").is_none(), "{row}");
+        }
+
+        // A page that fits is untouched — except that the steering field is
+        // still stripped.
+        let mut fits = vec![json!({ "turn_id": "t1", "content": "ok", "conclusion": "ok" })];
+        let (_total, truncated) = bound_collected_turns(&mut fits, 300, &recipe);
+        assert!(!truncated);
+        assert_eq!(fits[0], json!({ "turn_id": "t1", "content": "ok" }));
     }
 
     /// The recipe on a truncated transcript row is an exact one-call read of
@@ -8693,6 +8751,7 @@ mod session_tool_tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();
@@ -9143,6 +9202,7 @@ mod session_tool_tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();
@@ -10883,6 +10943,7 @@ mod tool_face_tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();

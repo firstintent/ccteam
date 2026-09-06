@@ -428,6 +428,7 @@ impl HarnessAdapter for CodexExecAdapter {
                             // Synthetic clean-exit completion: no usage, no
                             // model on the wire → unpriced (exposed).
                             model: None,
+                            conclusion: None,
                         });
                     }
                     Ok(s) => {
@@ -693,6 +694,7 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
                 turn_id: turn_id.0.clone(),
                 usage,
                 model,
+                conclusion: None,
             }]
         }
         "turn.failed" => vec![ThreadEvent::TurnFailed {

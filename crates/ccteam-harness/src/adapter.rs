@@ -445,6 +445,12 @@ pub struct RecoveredTurn {
     pub usage: serde_json::Value,
     /// Vendor timestamp of the last recovered message.
     pub ended_at: DateTime<Utc>,
+    /// The conclusion of the last recovered turn (the text of the message
+    /// that ended it) — the same field a live `TurnCompleted` carries, so a
+    /// notification built from a recovered turn selects the same excerpt
+    /// the live path would have. `None` when the recovered text is its own
+    /// conclusion.
+    pub conclusion: Option<String>,
 }
 
 /// Cross-vendor thread handle, returned from
@@ -662,6 +668,15 @@ pub enum ThreadEvent {
         /// is unpriced (exposed, never billed at a fallback rate).
         #[serde(default)]
         model: Option<String>,
+        /// The turn's CONCLUSION: the text the model wrote after its last
+        /// tool call — Claude's `result.result`, the block a disciplined
+        /// worker puts its completion receipt in. `None` when the vendor
+        /// draws no such boundary, or when the whole answer IS the
+        /// conclusion (a single text block). The answer itself still rides
+        /// `ItemCompleted{AgentMessage}` whole (issue #192); this is what a
+        /// bounded excerpt of it prefers to show (issue #196).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conclusion: Option<String>,
     },
     TurnFailed {
         turn_id: String,

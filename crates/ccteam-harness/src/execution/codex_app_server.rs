@@ -3219,6 +3219,7 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 turn_id: pluck_turn_id_from_params(&notif.params),
                 usage: pluck_usage(&notif.params).unwrap_or_default(),
                 model: None,
+                conclusion: None,
             },
             CodexTurnOutcome::Failed { kind, message } => ThreadEvent::TurnFailed {
                 turn_id: pluck_turn_id_from_params(&notif.params),
@@ -3420,6 +3421,7 @@ pub fn build_progress_line(
             turn_id,
             usage,
             model,
+            ..
         } => {
             // Prefer the turn's own canonical model; fall back to the spawn
             // ctx model. Determinism: an unknown / absent model prices to
@@ -4665,6 +4667,7 @@ mod tests {
             turn_id: "u-1".into(),
             usage: UnifiedTokenUsage::default(),
             model: None,
+            conclusion: None,
         };
         enrich_codex_turn_completed(&mut event, Some(tracker_last));
         let ThreadEvent::TurnCompleted { usage, .. } = &event else {
@@ -4681,6 +4684,7 @@ mod tests {
                 ..Default::default()
             },
             model: None,
+            conclusion: None,
         };
         enrich_codex_turn_completed(&mut inlined, Some(tracker_last));
         let ThreadEvent::TurnCompleted { usage, .. } = &inlined else {

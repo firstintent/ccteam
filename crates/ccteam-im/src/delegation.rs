@@ -31,8 +31,12 @@ pub struct DelegationSignal {
     /// for a boundary signal this is the turn holding the FINAL answer).
     pub turn_id: String,
     /// Full assistant text. The notification builder applies its own bounded
-    /// head/tail excerpt; the durable session ledger retains this verbatim.
+    /// excerpt; the durable session ledger retains this verbatim.
     pub tail: String,
+    /// The turn's conclusion (`TurnRecord::conclusion`): the text after the
+    /// child's last tool call, when the vendor marks it and it is shorter
+    /// than `tail`. The excerpt prefers it over the head of the narration.
+    pub conclusion: Option<String>,
     /// The child's vendor (for the notification text + the progress event).
     pub vendor: AgentVendor,
     /// The child's host (`local` or a satellite id).
@@ -69,7 +73,11 @@ pub(crate) struct DelegationSummary<'a> {
     pub outcome: DelegationOutcome,
     pub context_pct: Option<u64>,
     pub cost_usd: Option<f64>,
+    /// Every text block of the turn, in order (the ledger row's `assistant`).
     pub answer: &'a str,
+    /// The turn's conclusion when the vendor marked one shorter than `answer`
+    /// (the ledger row's `conclusion`): what a bounded excerpt shows first.
+    pub conclusion: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +138,9 @@ impl DelegationSummary<'_> {
     /// its watch asked for ([`NOTIFICATION_ANSWER_MAX_CHARS`] for `final`,
     /// [`BRIEF_NOTIFICATION_ANSWER_MAX_CHARS`] for `brief`): the wake-up POINT
     /// is a property of the task, how much rides along is the parent's context
-    /// budget, so they are separate axes.
+    /// budget, so they are separate axes. What the cap keeps is decided by
+    /// [`answer_excerpt`]: the whole answer when it fits, else the child's
+    /// conclusion before its narration.
     pub(crate) fn notification_text(&self, max_chars: usize) -> String {
         let outcome = match &self.outcome {
             DelegationOutcome::Done => format!("{} done", self.sid),
@@ -159,7 +169,7 @@ impl DelegationSummary<'_> {
         };
         let answer_text = self.answer.trim();
         let total_chars = answer_text.chars().count();
-        let answer = truncate_head_tail_with_marker(answer_text, max_chars, |omitted| {
+        let answer = answer_excerpt(answer_text, self.conclusion, max_chars, |omitted| {
             full_answer_marker(omitted, total_chars, self.sid)
         });
         if answer.text.is_empty() {
@@ -188,10 +198,12 @@ impl DelegationSummary<'_> {
             result.insert("context_pct".into(), serde_json::json!(pct));
         }
         let total_chars = self.answer.chars().count();
-        let answer =
-            truncate_head_tail_with_marker(self.answer, INLINE_RESULT_MAX_CHARS, |omitted| {
-                full_answer_marker(omitted, total_chars, self.sid)
-            });
+        let answer = answer_excerpt(
+            self.answer,
+            self.conclusion,
+            INLINE_RESULT_MAX_CHARS,
+            |omitted| full_answer_marker(omitted, total_chars, self.sid),
+        );
         result.insert("result_text".into(), serde_json::json!(answer.text));
         if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
             result.insert("error_kind".into(), serde_json::json!(kind));
@@ -278,6 +290,66 @@ pub(crate) fn truncate_head_tail_with_marker(
         .collect();
     BoundedText {
         text: format!("{head}{marker_text}{tail}"),
+        truncated: true,
+        total_chars,
+    }
+}
+
+/// What a bounded surface shows of one turn's answer within `max_chars`:
+///
+/// 1. the whole answer when it fits — the cap is a budget, not a filter;
+/// 2. otherwise the turn's CONCLUSION (the text after the child's last tool
+///    call, when the vendor marked one shorter than the answer) behind ONE
+///    marker standing in for the narration before it; the conclusion is
+///    head/tail-cut itself only when it cannot fit next to that marker;
+/// 3. otherwise the 70/30 head/tail preview.
+///
+/// Rule 2 is issue #196: since #192 the answer is narration + conclusion in
+/// stream order, so a head-biased preview showed "Reading the tests…" and cut
+/// the receipt the worker wrote last — the one thing the parent woke up for.
+/// `marker` receives the exact number of omitted source characters whichever
+/// rule fired, so the read recipe it carries is always for the whole answer.
+pub(crate) fn answer_excerpt(
+    answer: &str,
+    conclusion: Option<&str>,
+    max_chars: usize,
+    marker: impl Fn(usize) -> String,
+) -> BoundedText {
+    let total_chars = answer.chars().count();
+    if total_chars <= max_chars {
+        return BoundedText {
+            text: answer.to_string(),
+            truncated: false,
+            total_chars,
+        };
+    }
+    let conclusion = conclusion
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .filter(|c| c.chars().count() < total_chars);
+    let Some(conclusion) = conclusion else {
+        return truncate_head_tail_with_marker(answer, max_chars, marker);
+    };
+    let conclusion_chars = conclusion.chars().count();
+    let narration_chars = total_chars - conclusion_chars;
+    let lead = marker(narration_chars);
+    if lead.chars().count() + 1 + conclusion_chars <= max_chars {
+        return BoundedText {
+            text: format!("{lead}\n{conclusion}"),
+            truncated: true,
+            total_chars,
+        };
+    }
+    // The conclusion cannot ride whole next to its marker: head/tail-cut IT,
+    // the marker counting the narration it also stands in for. The cap is
+    // pulled under the conclusion's own length so the cut (and the recipe)
+    // always happens — every excerpt of a cut answer names the whole read.
+    let cap = max_chars.min(conclusion_chars.saturating_sub(1));
+    let cut = truncate_head_tail_with_marker(conclusion, cap, |omitted| {
+        marker(omitted + narration_chars)
+    });
+    BoundedText {
+        text: cut.text,
         truncated: true,
         total_chars,
     }
@@ -521,6 +593,7 @@ mod tests {
             context_pct: Some(31),
             cost_usd: None,
             answer: "hello",
+            conclusion: None,
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
         assert_eq!(t, "s444 done · codex · turn 3 · ctx 31%\nhello");
@@ -541,6 +614,7 @@ mod tests {
             context_pct: Some(3),
             cost_usd: Some(0.42),
             answer: "wave done",
+            conclusion: None,
         };
         assert_eq!(
             build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
@@ -569,6 +643,7 @@ mod tests {
             context_pct: None,
             cost_usd: None,
             answer: &long,
+            conclusion: None,
         };
         // `final` (the default) and `brief` differ only in the excerpt cap.
         for cap in [
@@ -584,6 +659,123 @@ mod tests {
             assert!(t.contains("agent_read{sid:s1,n:1,max_chars:2508}"), "{t}");
             let embedded = t.split_once('\n').unwrap().1;
             assert_eq!(embedded.chars().count(), cap);
+        }
+    }
+
+    /// issue #196 — the shape measured on excore s908: five narration blocks
+    /// (647 chars) then a 420-char receipt. A brief (500) excerpt used to show
+    /// the narration's head and ~135 chars of the receipt's tail; it now shows
+    /// the receipt whole behind one marker for the narration it skipped.
+    #[test]
+    fn brief_excerpt_is_the_conclusion_not_the_narrations_head() {
+        let narration = (1..=5)
+            .map(|n| format!("Narration block {n}: {}", "reading the tests… ".repeat(6)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let receipt = format!(
+            "READY for review · card@abc123 · checks: {}GREEN",
+            "GREEN · ".repeat(44)
+        );
+        let answer = format!("{narration}\n\n{receipt}");
+        let total = answer.chars().count();
+        assert!(total > 1_000 && receipt.chars().count() < 450, "{total}");
+        let summary = DelegationSummary {
+            sid: "s908",
+            vendor: "claude",
+            turn_id: "s908-1",
+            turn: 1,
+            outcome: DelegationOutcome::Done,
+            context_pct: Some(17),
+            cost_usd: None,
+            answer: &answer,
+            conclusion: Some(&receipt),
+        };
+        let text = summary.notification_text(BRIEF_NOTIFICATION_ANSWER_MAX_CHARS);
+        let (header, excerpt) = text.split_once('\n').unwrap();
+        assert_eq!(header, "s908 done · claude · turn 1 · ctx 17%");
+        assert!(
+            excerpt.chars().count() <= BRIEF_NOTIFICATION_ANSWER_MAX_CHARS,
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.ends_with(&receipt),
+            "the receipt rides whole: {excerpt}"
+        );
+        assert!(!excerpt.contains("Narration block 1"), "{excerpt}");
+        // The marker counts exactly the narration (+ its separator) and names
+        // the read of the WHOLE answer, not of the receipt.
+        let omitted = total - receipt.chars().count();
+        assert!(
+            excerpt.starts_with(&format!(
+                "…[+{omitted} chars: agent_read{{sid:s908,n:1,max_chars:{total}}}]…\n"
+            )),
+            "{excerpt}"
+        );
+        // The inline result applies the same rule at its own cap.
+        let inline = summary.inline_result();
+        assert_eq!(
+            inline["result_text"],
+            serde_json::json!(answer),
+            "fits 2000 → whole"
+        );
+    }
+
+    /// A conclusion that cannot ride whole next to its marker is head/tail-cut
+    /// itself, and the marker still counts the narration it stands in for.
+    #[test]
+    fn an_oversized_conclusion_is_cut_with_the_narration_counted() {
+        let narration = "n".repeat(300);
+        let conclusion = format!("HEAD{}TAIL", "c".repeat(792));
+        let answer = format!("{narration}\n\n{conclusion}");
+        let got = answer_excerpt(&answer, Some(&conclusion), 500, |omitted| {
+            format!("[+{omitted}]")
+        });
+        assert!(got.truncated);
+        assert_eq!(got.total_chars, 1_102);
+        assert_eq!(got.text.chars().count(), 500);
+        assert!(got.text.starts_with("HEAD"), "{}", got.text);
+        assert!(got.text.ends_with("TAIL"), "{}", got.text);
+        // 1102 total − 500 shown + the marker's own length = what the marker
+        // must report as omitted; it must exceed the narration alone.
+        let marker_start = got.text.find("[+").unwrap();
+        let marker_end = got.text[marker_start..].find(']').unwrap() + marker_start;
+        let omitted: usize = got.text[marker_start + 2..marker_end].parse().unwrap();
+        assert!(omitted > 300, "{omitted}");
+        assert_eq!(omitted, 1_102 - (500 - (marker_end + 1 - marker_start)));
+
+        // The band where the conclusion fits the cap alone but not with its
+        // marker still yields a cut WITH a recipe — never a bare conclusion.
+        // 498 chars: fits the cap alone, not next to a marker.
+        let conclusion = format!("HEAD{}TAIL", "c".repeat(490));
+        let answer = format!("{narration}\n\n{conclusion}");
+        let got = answer_excerpt(&answer, Some(&conclusion), 500, |omitted| {
+            format!("[+{omitted}]")
+        });
+        assert!(got.truncated);
+        assert!(got.text.contains("[+"), "{}", got.text);
+        assert!(got.text.chars().count() <= 500);
+        assert!(got.text.starts_with("HEAD") && got.text.ends_with("TAIL"));
+    }
+
+    /// The cap is a budget, not a filter: an answer that fits is shown whole
+    /// even when a conclusion is known; without a conclusion (or with one that
+    /// IS the answer) the head/tail preview stands.
+    #[test]
+    fn answer_excerpt_rules_in_order() {
+        let fits = "short narration\n\nshort receipt";
+        let got = answer_excerpt(fits, Some("short receipt"), 500, |n| format!("[+{n}]"));
+        assert!(!got.truncated);
+        assert_eq!(got.text, fits);
+
+        let long = format!("HEAD{}TAIL", "x".repeat(1_000));
+        for conclusion in [None, Some(long.as_str()), Some(""), Some("   ")] {
+            let got = answer_excerpt(&long, conclusion, 100, |n| format!("[+{n}]"));
+            assert!(got.truncated);
+            assert_eq!(got.text.chars().count(), 100);
+            assert!(
+                got.text.starts_with("HEAD") && got.text.ends_with("TAIL"),
+                "{conclusion:?}"
+            );
         }
     }
 
@@ -624,6 +816,7 @@ mod tests {
             context_pct: None,
             cost_usd: None,
             answer: "ok",
+            conclusion: None,
         }
         .inline_result();
         assert_eq!(result["sid"], serde_json::json!("s5"));
@@ -648,6 +841,7 @@ mod tests {
             context_pct: Some(31),
             cost_usd: None,
             answer: "oops",
+            conclusion: None,
         };
         assert_eq!(
             build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
@@ -666,6 +860,7 @@ mod tests {
             context_pct: None,
             cost_usd: None,
             answer: "ok",
+            conclusion: None,
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
         assert_eq!(t.lines().next(), Some("s444 done · codex · turn 3"));

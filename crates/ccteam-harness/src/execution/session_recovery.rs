@@ -155,6 +155,7 @@ mod tests {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         }
     }
 
@@ -227,6 +228,7 @@ mod tests {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         };
         let s = format_recovery_prompt(&[turn]);
         assert!(!s.contains("[user] "));

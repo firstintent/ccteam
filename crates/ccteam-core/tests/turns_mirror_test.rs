@@ -22,6 +22,7 @@ fn turn(id: &str, user: &str, assistant: &str) -> TurnRecord {
         outcome: None,
         error_kind: None,
         error: None,
+        conclusion: None,
     }
 }
 

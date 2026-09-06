@@ -171,6 +171,7 @@ impl PiTurnTranslator {
                             turn_id: active.turn_id,
                             usage: active.usage,
                             model: active.model,
+                            conclusion: None,
                         },
                     ],
                     settled: true,
@@ -193,6 +194,7 @@ impl PiTurnTranslator {
                     turn_id: active.turn_id,
                     usage: active.usage,
                     model: active.model,
+                    conclusion: None,
                 });
                 TranslateOutput {
                     events,

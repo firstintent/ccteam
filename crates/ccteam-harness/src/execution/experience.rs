@@ -612,6 +612,7 @@ mod tests {
                 outcome: Some("failed".into()),
                 error_kind: Some("max_tokens".into()),
                 error: Some("output truncated".into()),
+                conclusion: None,
             },
         )
         .unwrap();
@@ -681,6 +682,7 @@ mod tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();

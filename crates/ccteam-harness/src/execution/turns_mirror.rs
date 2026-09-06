@@ -79,6 +79,14 @@ pub struct TurnRecord {
     /// emitted on this turn).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub assistant: String,
+    /// The turn's conclusion — the text after the assistant's last tool
+    /// call (Claude's `result.result`), when the vendor marks that boundary
+    /// AND it is shorter than `assistant`. A bounded excerpt of the turn
+    /// (completion notification, inline result, `agent_read` row) shows this
+    /// instead of the head of the narration (issue #196). Absent = the row's
+    /// `assistant` is its own conclusion or the vendor drew no boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conclusion: Option<String>,
     /// Token / cost accounting. Free-form `Value` so the wire shape
     /// stays aligned with whatever `UnifiedTokenUsage` evolves to.
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -207,6 +215,7 @@ mod tests {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         }
     }
 

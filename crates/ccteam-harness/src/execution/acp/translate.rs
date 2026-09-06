@@ -621,6 +621,7 @@ fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<Thread
             turn_id,
             usage: UnifiedTokenUsage::default(),
             model: state.model.clone(),
+            conclusion: None,
         },
     ]
 }
@@ -713,6 +714,7 @@ pub fn finalize_from_prompt_result(
         turn_id,
         usage,
         model: terminal_model,
+        conclusion: None,
     });
     out
 }

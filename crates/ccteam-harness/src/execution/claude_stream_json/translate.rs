@@ -16,6 +16,12 @@
 //!   human who spoke mid-turn) would otherwise vanish from turns.jsonl,
 //!   the IM reply and the delegation notification (issue #192).
 //!   Subagent blocks (`parent_tool_use_id` set) are never the answer.
+//! - The turn's **conclusion** — the text after the last tool call, which
+//!   is what `result.result` carries — rides [`ThreadEvent::TurnCompleted`]
+//!   separately, so a bounded excerpt of the answer (the completion
+//!   notification a parent wakes up to) can show the receipt the model
+//!   wrote last instead of the head of its narration (issue #196). Omitted
+//!   when it IS the whole answer (a single-block turn).
 //! - A turn **failure** is [`ThreadEvent::TurnFailed`] (the pump forwards
 //!   `err.message` verbatim → the honest in-flight-loss / error signal).
 //! - Tool-use / thinking blocks become `ItemStarted{ToolCall}` /
@@ -44,6 +50,9 @@ pub struct StreamTranslator {
     /// order — this IS the turn's answer (`result.result` only repeats the
     /// last block; see the module doc / issue #192).
     acc_text: String,
+    /// The last top-level text block of the active turn — the conclusion's
+    /// fallback when `result.result` is empty (see the module doc).
+    last_text: Option<String>,
     /// Item-id counter for tool/reasoning items within a turn.
     item_seq: u64,
     /// Canonical model id (`message.model`) of the active turn's latest
@@ -82,6 +91,7 @@ impl StreamTranslator {
             let id = format!("sj-{}", self.turn_seq);
             self.active_turn = Some(id.clone());
             self.acc_text.clear();
+            self.last_text = None;
             self.item_seq = 0;
             self.turn_model = None;
             out.push(ThreadEvent::TurnStarted { turn_id: id });
@@ -107,6 +117,7 @@ impl StreamTranslator {
     /// clean idle close), so a graceful stop emits no spurious failure.
     pub fn on_close(&mut self) -> Option<ThreadEvent> {
         self.acc_text.clear();
+        self.last_text = None;
         let model = self.turn_model.take();
         self.active_turn
             .take()
@@ -139,6 +150,7 @@ impl StreamTranslator {
         // Task tool's private thread, never to this session's reply.
         if !text.is_empty() && env.parent_tool_use_id.is_none() {
             push_paragraph(&mut self.acc_text, &text);
+            self.last_text = Some(text);
         }
         for ev in items {
             // Re-id with the translator's counter so item ids are stable
@@ -209,6 +221,7 @@ impl StreamTranslator {
                 model,
             });
             self.acc_text.clear();
+            self.last_text = None;
             return out;
         }
 
@@ -220,11 +233,20 @@ impl StreamTranslator {
         // the answer FIRST (so the pump finalizes the turn's progress epoch
         // before the boundary event), then TurnCompleted with usage.
         let mut final_text = std::mem::take(&mut self.acc_text);
-        if let Some(tail) = r.result.as_deref().filter(|s| !s.is_empty()) {
+        let last_text = self.last_text.take();
+        let result_text = r.result.as_deref().filter(|s| !s.is_empty());
+        if let Some(tail) = result_text {
             if !final_text.trim_end().ends_with(tail.trim_end()) {
                 push_paragraph(&mut final_text, tail);
             }
         }
+        // The conclusion = the vendor's `result.result` (measured: the LAST
+        // text block), else the last block the stream showed; carried only
+        // when the answer holds more than it (issue #196).
+        let conclusion = result_text
+            .map(str::to_string)
+            .or(last_text)
+            .filter(|conclusion| conclusion.trim() != final_text.trim());
         if !final_text.is_empty() {
             let id = self.next_item_id();
             out.push(ThreadEvent::ItemCompleted {
@@ -238,6 +260,7 @@ impl StreamTranslator {
             turn_id,
             usage,
             model,
+            conclusion,
         });
         self.acc_text.clear();
         out
@@ -334,6 +357,15 @@ mod tests {
                 ThreadItemDetails::AgentMessage(t) => Some(t.clone()),
                 _ => None,
             },
+            _ => None,
+        })
+    }
+
+    /// The `conclusion` the turn's boundary event carried (`None` = the
+    /// answer is its own conclusion).
+    fn conclusion_of(evs: &[ThreadEvent]) -> Option<String> {
+        evs.iter().find_map(|e| match e {
+            ThreadEvent::TurnCompleted { conclusion, .. } => conclusion.clone(),
             _ => None,
         })
     }
@@ -469,6 +501,36 @@ mod tests {
             answer_text(&evs).as_deref(),
             Some("ALPHA report here.\n\nBETA done.")
         );
+        // issue #196 — the boundary names the block after the last tool call
+        // as the turn's conclusion, so an excerpt can prefer it.
+        assert_eq!(conclusion_of(&evs).as_deref(), Some("BETA done."));
+    }
+
+    #[test]
+    fn conclusion_falls_back_to_the_last_stream_block_without_result_text() {
+        let mut t = StreamTranslator::new();
+        t.ingest(assistant(json!([{"type": "text", "text": "narration"}])));
+        t.ingest(assistant(json!([
+            {"type": "tool_use", "name": "Bash", "input": {"command": "true"}, "id": "tu-1"}
+        ])));
+        t.ingest(assistant(json!([{"type": "text", "text": "the receipt"}])));
+        let evs = t.ingest(result_ok(""));
+        assert_eq!(
+            answer_text(&evs).as_deref(),
+            Some("narration\n\nthe receipt")
+        );
+        assert_eq!(conclusion_of(&evs).as_deref(), Some("the receipt"));
+    }
+
+    #[test]
+    fn a_single_block_answer_carries_no_conclusion() {
+        // The answer IS the conclusion: carrying it twice would only cost the
+        // ledger a copy and the excerpt nothing.
+        let mut t = StreamTranslator::new();
+        t.ingest(assistant(json!([{"type": "text", "text": "hi there"}])));
+        let evs = t.ingest(result_ok("hi there"));
+        assert_eq!(answer_text(&evs).as_deref(), Some("hi there"));
+        assert_eq!(conclusion_of(&evs), None);
     }
 
     #[test]
@@ -481,6 +543,10 @@ mod tests {
         assert_eq!(
             answer_text(&evs).as_deref(),
             Some("narration\n\nfinal from result only")
+        );
+        assert_eq!(
+            conclusion_of(&evs).as_deref(),
+            Some("final from result only")
         );
     }
 
@@ -496,6 +562,11 @@ mod tests {
         t.ingest(assistant(json!([{"type": "text", "text": "top-level"}])));
         let evs = t.ingest(result_ok("top-level"));
         assert_eq!(answer_text(&evs).as_deref(), Some("top-level"));
+        assert_eq!(
+            conclusion_of(&evs),
+            None,
+            "subagent text is never the conclusion either"
+        );
     }
 
     #[test]

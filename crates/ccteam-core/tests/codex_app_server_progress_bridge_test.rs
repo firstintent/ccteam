@@ -146,6 +146,7 @@ fn build_progress_line_turn_completed_tags_vendor_codex() {
         turn_id: "turn-9".into(),
         usage,
         model: None,
+        conclusion: None,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).expect("turn/completed must bridge");
     assert_eq!(row["event"], "agent_done");
@@ -224,6 +225,7 @@ fn cost_summary_rolls_bridged_agent_done_into_codex_bucket() {
         turn_id: "turn-1".into(),
         usage,
         model: None,
+        conclusion: None,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).unwrap();
     let summary = cost_summary_from_events(&[row]).expect("cost summary");

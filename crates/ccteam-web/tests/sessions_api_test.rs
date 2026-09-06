@@ -627,6 +627,7 @@ async fn session_rows_carry_context_pct_once_observed() {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         },
     )
     .unwrap();
@@ -1073,6 +1074,7 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();

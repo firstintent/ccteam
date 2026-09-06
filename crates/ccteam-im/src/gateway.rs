@@ -3461,6 +3461,7 @@ impl Gateway {
                     outcome: None,
                     error_kind: None,
                     error: None,
+                    conclusion: turn.conclusion.clone(),
                 },
                 format!(
                     "↩️ {sid} finished this turn while ccteam was restarting; its answer was \
@@ -3491,6 +3492,7 @@ impl Gateway {
                         outcome: Some("unobserved".to_string()),
                         error_kind: Some("body_unobserved".to_string()),
                         error: Some(note),
+                        conclusion: None,
                     },
                     String::new(),
                     true,
@@ -3570,6 +3572,7 @@ impl Gateway {
                 context_pct: None,
                 turn: meta.turn_count,
                 error_kind: record.error_kind.clone(),
+                conclusion: recovered.as_ref().and_then(|turn| turn.conclusion.clone()),
             });
         }
         tracing::info!(session = %sid, recovered = recovered.is_some(), "ccteam-im: unobserved turn reported");
@@ -6737,6 +6740,12 @@ impl Gateway {
                             || matches!(&evt, ThreadEvent::TurnCompleted { .. })
                         {
                           let answer_count = answer_texts.len();
+                          // The turn's conclusion rides its boundary event and belongs
+                          // to the FINAL answer row of the turn only (issue #196).
+                          let turn_conclusion = match &evt {
+                              ThreadEvent::TurnCompleted { conclusion, .. } => conclusion.clone(),
+                              _ => None,
+                          };
                           for (answer_index, text) in answer_texts.into_iter().enumerate() {
                             let is_final_answer = is_turn_boundary
                                 && answer_index.saturating_add(1) == answer_count;
@@ -6885,6 +6894,11 @@ impl Gateway {
                                     outcome: failure.map(|_| "failed".to_string()),
                                     error_kind: failure.map(|err| err.kind.clone()),
                                     error: failure.map(|err| err.message.clone()),
+                                    conclusion: if is_final_answer {
+                                        turn_conclusion.clone()
+                                    } else {
+                                        None
+                                    },
                                 };
                                 match ccteam_harness::execution::turns_mirror::append_turn(
                                     dir,
@@ -6936,6 +6950,7 @@ impl Gateway {
                                                         .map(|status| status.turn)
                                                         .unwrap_or(vendor_turn),
                                                     error_kind: record.error_kind.clone(),
+                                                    conclusion: None,
                                                 });
                                             }
                                         } else {
@@ -7106,6 +7121,7 @@ impl Gateway {
                                     context_pct: turn_last_context_pct.take(),
                                     turn: vendor_turn,
                                     error_kind: None,
+                                    conclusion: turn_conclusion.clone(),
                                 });
                             }
                             if let Some((final_text, reply_to)) = mirror_answer {
@@ -8088,6 +8104,7 @@ impl Gateway {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         };
         if let Err(err) =
             ccteam_harness::execution::turns_mirror::append_turn(&project_dir, &session.id, &record)
@@ -13250,6 +13267,7 @@ impl Gateway {
                     turn: signal.turn,
                     cost_usd: None,
                     answer: &signal.tail,
+                    conclusion: signal.conclusion.as_deref(),
                 },
                 excerpt_cap,
             )
@@ -13495,6 +13513,7 @@ impl Gateway {
                             .map(|status| status.turn)
                             .unwrap_or_default(),
                         error_kind: last.error_kind.clone(),
+                        conclusion: last.conclusion.clone(),
                     });
                 }
             }
@@ -14002,6 +14021,7 @@ impl Gateway {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         };
         if let Err(error) = ccteam_harness::execution::turns_mirror::append_turn(
             &plan.project_dir,
@@ -15772,6 +15792,7 @@ fn turn_terminal_accounting(
             turn_id,
             usage,
             model,
+            conclusion: None,
         }
         | ThreadEvent::TurnFailed {
             turn_id,
@@ -15878,6 +15899,7 @@ mod open_work_items_tests {
                 turn_id: "t1".into(),
                 usage: UnifiedTokenUsage::default(),
                 model: None,
+                conclusion: None,
             },
         );
         assert!(
@@ -18143,6 +18165,7 @@ mod tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();
@@ -19860,6 +19883,7 @@ mod tests {
                             // one so the pump's chat_turn_completed mirror exercises
                             // the per-turn model path.
                             model: Some("claude-sonnet-4-6".to_string()),
+                            conclusion: None,
                         },
                     ));
                 }
@@ -21799,6 +21823,7 @@ mod tests {
             outcome: None,
             error_kind: None,
             error: None,
+            conclusion: None,
         };
         append_turn(&project_dir, &sid1, &mk("t1", "from-sid1")).unwrap();
         append_turn(&project_dir, &sid2, &mk("t2", "from-sid2")).unwrap();
@@ -22538,6 +22563,7 @@ mod tests {
             context_pct: None,
             turn: 1,
             error_kind: None,
+            conclusion: None,
         })
         .unwrap();
 
@@ -22823,6 +22849,7 @@ mod tests {
                     turn_id: "background-turn".into(),
                     usage: Default::default(),
                     model: None,
+                    conclusion: None,
                 },
             ));
         }
@@ -24775,6 +24802,7 @@ mod tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();
@@ -29764,6 +29792,7 @@ mod tests {
             context_pct: None,
             turn: n as u64,
             error_kind: None,
+            conclusion: None,
         };
         // Three interim narration messages inside the running turn → silence.
         for n in 1..=3 {
@@ -29788,6 +29817,7 @@ mod tests {
             context_pct: None,
             turn: 4,
             error_kind: None,
+            conclusion: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
@@ -29863,6 +29893,7 @@ mod tests {
             context_pct: None,
             turn: n as u64,
             error_kind: None,
+            conclusion: None,
         };
         Gateway::deliver_delegation_signal_shared(
             Arc::clone(&gateway),
@@ -30009,6 +30040,7 @@ mod tests {
                 context_pct: None,
                 turn: 1,
                 error_kind: None,
+                conclusion: None,
             },
         )
         .await;
@@ -30097,6 +30129,7 @@ mod tests {
             context_pct: None,
             turn: n as u64,
             error_kind: None,
+            conclusion: None,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(1, false)).await;
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(2, false)).await;
@@ -30159,6 +30192,7 @@ mod tests {
                 context_pct: None,
                 turn: 1,
                 error_kind: None,
+                conclusion: None,
             },
         )
         .await;
@@ -30350,6 +30384,99 @@ mod tests {
         }));
     }
 
+    /// issue #196 — the durable row carries the turn's conclusion, so a
+    /// notification rebuilt after a restart cuts exactly like the live one:
+    /// a `brief` watch over a long narrated turn wakes the parent with the
+    /// child's receipt, not the head of "Reading the tests…".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn delegation_reconcile_excerpt_is_the_childs_conclusion() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s908";
+        let narration = (1..=5)
+            .map(|n| format!("Narration block {n}: {}", "reading the tests… ".repeat(6)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let receipt = "READY for review · GOV-1 @ 20d2dc48c · checks GREEN · risk none";
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                turn_id: format!("{child_sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: format!("{narration}\n\n{receipt}"),
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+                conclusion: Some(receipt.to_string()),
+            },
+        )
+        .unwrap();
+        ccteam_harness::write_delegation_watch(
+            &project_dir,
+            child_sid,
+            &ccteam_harness::DelegationWatch::armed(
+                &parent_sid,
+                ccteam_harness::NotifyMode::Brief,
+                Some("gov".into()),
+                Some(format!("{child_sid}-1")),
+            ),
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let mut notification = None;
+        for _ in 0..200 {
+            notification = read_all_turns(&project_dir, &parent_sid)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|turn| turn.user.starts_with(&format!("{child_sid} done · ")));
+            if notification.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let text = notification
+            .expect("reconcile delivers the notification")
+            .user;
+        let (_header, excerpt) = text.split_once('\n').unwrap();
+        assert!(
+            excerpt.chars().count() <= crate::delegation::BRIEF_NOTIFICATION_ANSWER_MAX_CHARS,
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.ends_with(receipt),
+            "the receipt rides whole: {excerpt}"
+        );
+        assert!(!excerpt.contains("Narration block 1"), "{excerpt}");
+        assert!(
+            excerpt.starts_with("…[+")
+                && excerpt.contains(&format!("agent_read{{sid:{child_sid},n:1,max_chars:")),
+            "{excerpt}"
+        );
+    }
+
     /// Chaos: a durable watch + a completed child turn on disk, loaded by a
     /// FRESH gateway (daemon-restart), delivers the missed notification EXACTLY
     /// once; a second reconcile over the same state delivers none.
@@ -30393,6 +30520,7 @@ mod tests {
                 outcome: None,
                 error_kind: None,
                 error: None,
+                conclusion: None,
             },
         )
         .unwrap();
@@ -30485,6 +30613,7 @@ mod tests {
                     outcome: None,
                     error_kind: None,
                     error: None,
+                    conclusion: None,
                 },
             )
             .unwrap();
