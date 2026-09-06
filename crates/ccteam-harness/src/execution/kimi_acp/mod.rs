@@ -432,6 +432,7 @@ impl KimiAcpAdapter {
             AcpTurnRoute::Queue {
                 turn_id,
                 degraded_from_inject,
+                position,
             } => {
                 if degraded_from_inject {
                     tracing::debug!(
@@ -439,7 +440,7 @@ impl KimiAcpAdapter {
                         "kimi ACP has no native interject method; queued active-turn message"
                     );
                 }
-                Ok(TurnSubmission::queued(TurnId(turn_id)))
+                Ok(TurnSubmission::queued_at(TurnId(turn_id), position))
             }
             AcpTurnRoute::Inject { .. } => Err(HarnessError::Io(
                 "kimi ACP routing selected unsupported native inject".into(),

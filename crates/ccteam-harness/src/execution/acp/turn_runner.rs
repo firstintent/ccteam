@@ -139,6 +139,10 @@ pub enum AcpTurnRoute {
     Queue {
         turn_id: String,
         degraded_from_inject: bool,
+        /// 1-based waiting position in this session's own FIFO. ACP owns that
+        /// FIFO, so it can say where the message sits — and a dispatcher told
+        /// only "pending" re-sent the same instruction three times (#201).
+        position: usize,
     },
 }
 
@@ -173,6 +177,7 @@ pub fn route_acp_turn(
         return AcpTurnRoute::Queue {
             turn_id,
             degraded_from_inject: routing == TurnRouting::Inject,
+            position: state.pending.len(),
         };
     }
 

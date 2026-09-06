@@ -469,7 +469,9 @@ impl GrokAcpAdapter {
                 .spawn(turn_id.clone(), turn_done, prompt_sent, text);
                 Ok(TurnSubmission::started(TurnId(turn_id)))
             }
-            AcpTurnRoute::Queue { turn_id, .. } => Ok(TurnSubmission::queued(TurnId(turn_id))),
+            AcpTurnRoute::Queue {
+                turn_id, position, ..
+            } => Ok(TurnSubmission::queued_at(TurnId(turn_id), position)),
             AcpTurnRoute::Inject {
                 active_turn_id,
                 prompt_sent,
