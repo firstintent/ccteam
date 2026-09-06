@@ -130,6 +130,12 @@ while True:
     if n == 1 and os.environ.get("FAKE_SJ_INIT_MCP_FAILED") == "1":
         emit({"type":"system","subtype":"init","session_id":sid,
               "mcp_servers":[{"name":"ccteam","status":"failed"}]})
+    # The daemon wrote a line the CLI never runs: accepted into stdin, no
+    # assistant block, no result, no turn. Models the window between a
+    # write-ahead flush and the turn it was supposed to open (issue #201).
+    swallow = os.environ.get("FAKE_SJ_SWALLOW_AFTER_TURNS")
+    if swallow and n > int(swallow):
+        continue
     if os.environ.get("FAKE_SJ_DIE_MID_TURN") == "1":
         # Emit an assistant block (turn now in flight) then die WITHOUT a
         # result — the in-flight-loss fault.
@@ -661,6 +667,35 @@ fn deferred_input_file(tmp: &Path, sid: &str) -> PathBuf {
         .join("deferred-input.json")
 }
 
+/// The durable parked-input mirror, or `None` when there is no file.
+fn read_deferred_mirror(tmp: &Path, sid: &str) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(deferred_input_file(tmp, sid)).ok()?;
+    Some(serde_json::from_slice(&bytes).expect("the mirror is JSON"))
+}
+
+/// Wait for the mirror file to go. The write-ahead record is retired by the
+/// turn boundary that consumed the line, and the tap writes that off the
+/// caller's thread — so this watches for the fact instead of guessing a delay.
+async fn await_no_deferred_mirror(tmp: &Path, sid: &str) {
+    for _ in 0..200 {
+        if !deferred_input_file(tmp, sid).exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "the mirror still exists: {:?}",
+        read_deferred_mirror(tmp, sid)
+    );
+}
+
+/// Write a mirror as a previous process life would have left it.
+fn write_deferred_mirror(tmp: &Path, sid: &str, mirror: serde_json::Value) {
+    let file = deferred_input_file(tmp, sid);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec(&mirror).unwrap()).unwrap();
+}
+
 /// issue #194 — a `TurnRouting::Queue` line (a delegation completion
 /// notification) sent while a turn is in flight is NOT written mid-turn: claude
 /// would show it to the model twice (queued-command preview + next prompt). It
@@ -708,12 +743,14 @@ async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
     // Not written yet — and durably parked for a daemon that dies right now.
     let logged = std::fs::read_to_string(&user_log).unwrap_or_default();
     assert_eq!(logged.lines().collect::<Vec<_>>(), vec!["long task"]);
-    let parked: Vec<serde_json::Value> = serde_json::from_slice(
-        &std::fs::read(deferred_input_file(tmp.path(), "s9")).expect("parked line mirrored"),
-    )
-    .unwrap();
+    let mirror = read_deferred_mirror(tmp.path(), "s9").expect("parked line mirrored");
+    let parked = mirror["parked"].as_array().unwrap();
     assert_eq!(parked.len(), 1);
     assert_eq!(parked[0]["text"], "s7 done · claude · turn 1");
+    assert!(
+        mirror.get("in_flight").is_none(),
+        "nothing has been handed to the CLI yet: {mirror}"
+    );
     // The receipt names the turn the parked line WILL open, and the mirror
     // carries the same id — that binding is what a dispatcher's request is
     // resolved by, across a restart included (issue #201).
@@ -733,10 +770,9 @@ async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
         vec!["long task", "s7 done · claude · turn 1"],
         "the notification reaches the CLI verbatim, once, after the turn"
     );
-    assert!(
-        !deferred_input_file(tmp.path(), "s9").exists(),
-        "the on-disk mirror is dropped once the line is written"
-    );
+    // Dropped once the boundary RETIRES it — not once the bytes went out.
+    // In between it is the write-ahead record that survives a crash.
+    await_no_deferred_mirror(tmp.path(), "s9").await;
     std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
@@ -777,7 +813,7 @@ async fn queued_text_when_idle_starts_a_turn_at_once() {
         logged.lines().collect::<Vec<_>>(),
         vec!["s7 done · claude · turn 1"]
     );
-    assert!(!deferred_input_file(tmp.path(), "s9").exists());
+    await_no_deferred_mirror(tmp.path(), "s9").await;
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
@@ -795,16 +831,17 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
     let user_log = tmp.path().join("user.log");
     std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
     let file = deferred_input_file(tmp.path(), "s9");
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(
-        &file,
-        serde_json::to_vec(&[
-            serde_json::json!({"turn_id": "sj-prev-1", "text": "s7 done · claude · turn 1"}),
-            serde_json::json!({"turn_id": "sj-prev-2", "text": "s8 done · codex · turn 2"}),
-        ])
-        .unwrap(),
-    )
-    .unwrap();
+    write_deferred_mirror(
+        tmp.path(),
+        "s9",
+        serde_json::json!({
+            "schema": 2,
+            "parked": [
+                {"turn_id": "sj-prev-1", "text": "s7 done · claude · turn 1"},
+                {"turn_id": "sj-prev-2", "text": "s8 done · codex · turn 2"},
+            ],
+        }),
+    );
 
     let adapter = ClaudeStreamJsonAdapter::new();
     let handle = adapter
@@ -856,7 +893,11 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
     assert_eq!(completed[0], submitted.turn_id.0);
     assert_eq!(completed[1], "sj-prev-1");
     assert_eq!(completed[2], "sj-prev-2");
-    assert!(!file.exists(), "the mirror is consumed once flushed");
+    await_no_deferred_mirror(tmp.path(), "s9").await;
+    assert!(
+        !file.exists(),
+        "the mirror is consumed once every line is spent"
+    );
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
@@ -984,6 +1025,190 @@ async fn an_injected_line_names_the_turn_it_joined() {
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
+/// GitHub #197 (B) — WRITE-AHEAD. The tap flushed a parked line to the CLI and
+/// the daemon died before any turn opened for it: the line existed nowhere but
+/// the child's stdin buffer, so it used to be lost outright (the mirror was
+/// emptied the instant the write returned). It is now recorded as IN FLIGHT
+/// before the bytes go out, and the next life of the sid replays it — exactly
+/// once, under the same execution-turn id its dispatcher's request is bound to.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn a_flushed_line_whose_turn_never_ran_is_replayed_by_the_next_life() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "1.5");
+    // The CLI accepts the flushed line and never runs it — the crash window.
+    std::env::set_var("FAKE_SJ_SWALLOW_AFTER_TURNS", "1");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("long task".into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let queued = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("s7 done · claude · turn 1".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.disposition, TurnDisposition::Queued);
+    let dispatched_turn = queued.turn_id.0.clone();
+    // The long task ends; the tap flushes the parked line into a CLI that
+    // swallows it. No second turn will ever open.
+    await_completed_turns(&mut events, 1).await;
+    let mut mirror = serde_json::Value::Null;
+    for _ in 0..200 {
+        mirror = read_deferred_mirror(tmp.path(), "s9").unwrap_or(serde_json::Value::Null);
+        if !mirror["in_flight"].is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        mirror["in_flight"]["turn_id"],
+        serde_json::json!(dispatched_turn),
+        "the line is durable BEFORE its bytes go out, under the turn id it \
+         will open: {mirror}"
+    );
+    assert_eq!(mirror["in_flight"]["text"], "s7 done · claude · turn 1");
+    assert!(mirror["parked"].as_array().unwrap().is_empty(), "{mirror}");
+
+    // The daemon dies here — the body goes with it.
+    adapter.close_thread(&handle).await.unwrap();
+    drop(events);
+    std::env::remove_var("FAKE_SJ_SWALLOW_AFTER_TURNS");
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::fs::write(&user_log, "").unwrap();
+
+    // The next life of the same sid.
+    let next = ClaudeStreamJsonAdapter::new();
+    let handle = next
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("restart");
+    let mut events = next.events(&handle);
+    let resumed = next
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("hello after restart".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    let completed = collect_completed_turn_ids(&mut events, 2).await;
+    assert_eq!(
+        std::fs::read_to_string(&user_log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["hello after restart", "s7 done · claude · turn 1"],
+        "the lost line runs in the new life, once, after the resuming message"
+    );
+    assert_eq!(completed[0], resumed.turn_id.0);
+    assert_eq!(
+        completed[1], dispatched_turn,
+        "and under the id its dispatcher's request was bound to"
+    );
+    await_no_deferred_mirror(tmp.path(), "s9").await;
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// The other half of the write-ahead rule: an in-flight line whose turn DID run
+/// is spent, not owed. The transcript is the witness — a row carrying that
+/// execution-turn id means the model saw the line, and replaying it would ask
+/// the child to do the same work twice.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn an_in_flight_line_whose_turn_already_answered_is_not_replayed() {
+    use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    write_deferred_mirror(
+        tmp.path(),
+        "s9",
+        serde_json::json!({
+            "schema": 2,
+            "in_flight": {"turn_id": "sj-prev-1", "text": "s7 done · claude · turn 1"},
+            "parked": [],
+        }),
+    );
+    // The previous life's turn DID run and left its answer behind.
+    append_turn(
+        tmp.path(),
+        "s9",
+        &TurnRecord {
+            exec_turn_id: Some("sj-prev-1".into()),
+            turn_id: "s9-1".into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: "acknowledged".into(),
+            usage: serde_json::Value::Null,
+            status: None,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
+            conclusion: None,
+        },
+    )
+    .unwrap();
+
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+    adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("hello after restart".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    await_completed_turns(&mut events, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&user_log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["hello after restart"],
+        "a line whose turn already answered is never asked for twice"
+    );
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
 /// A mirror this build cannot read is discarded, not half-understood: replaying
 /// lines whose turn identity is unknown would hand a dispatcher an answer it
 /// could never correlate. Pre-1.0, there is no migration.
@@ -994,10 +1219,8 @@ async fn an_unreadable_parked_mirror_is_discarded() {
     setup(tmp.path());
     let user_log = tmp.path().join("user.log");
     std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
-    let file = deferred_input_file(tmp.path(), "s9");
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    // The pre-#201 shape: bare strings, no turn identity.
-    std::fs::write(&file, serde_json::to_vec(&["s7 done"]).unwrap()).unwrap();
+    // The pre-#201 shape: a bare array, no turn identity, no schema.
+    write_deferred_mirror(tmp.path(), "s9", serde_json::json!(["s7 done"]));
 
     let adapter = ClaudeStreamJsonAdapter::new();
     let handle = adapter
