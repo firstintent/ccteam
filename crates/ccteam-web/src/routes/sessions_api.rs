@@ -2367,6 +2367,7 @@ mod tests {
         // Key the mirror by the session sid (the trailing `s<N>`), not the role.
         let sid = "s1";
         let mk = |id: &str, user: &str, assistant: &str| TurnRecord {
+            exec_turn_id: None,
             turn_id: id.into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
@@ -2413,6 +2414,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path();
         let mk = |id: &str, assistant: &str| TurnRecord {
+            exec_turn_id: None,
             turn_id: id.into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
@@ -2453,6 +2455,7 @@ mod tests {
     #[test]
     fn turn_to_event_carries_user_and_assistant() {
         let turn = TurnRecord {
+            exec_turn_id: None,
             turn_id: "t9".into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),

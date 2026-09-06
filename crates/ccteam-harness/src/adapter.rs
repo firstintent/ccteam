@@ -562,6 +562,12 @@ pub struct TurnSubmission {
     pub turn_id: TurnId,
     pub input_id: String,
     pub disposition: TurnDisposition,
+    /// 1-based waiting position when the adapter owns the FIFO this message
+    /// was parked in. `None` = this message was not queued, or the adapter
+    /// cannot observe a position — a caller reports `unknown`, never 0
+    /// (issue #201: a dispatcher told only "pending" re-sent the same
+    /// instruction three times).
+    pub queue_position: Option<usize>,
     completion_guard: Option<Box<dyn Send + 'static>>,
 }
 
@@ -586,6 +592,14 @@ impl TurnSubmission {
         Self::with_disposition(turn_id, TurnDisposition::Queued)
     }
 
+    /// A queued message whose adapter knows where in its own FIFO it sits.
+    pub fn queued_at(turn_id: TurnId, position: usize) -> Self {
+        debug_assert!(position > 0, "queue positions are 1-based");
+        let mut submission = Self::queued(turn_id);
+        submission.queue_position = Some(position);
+        submission
+    }
+
     fn with_disposition(turn_id: TurnId, disposition: TurnDisposition) -> Self {
         Self::with_input_id(turn_id, next_turn_input_id(), disposition)
     }
@@ -599,6 +613,7 @@ impl TurnSubmission {
             input_id: input_id.into(),
             turn_id,
             disposition,
+            queue_position: None,
             completion_guard: None,
         }
     }
@@ -630,6 +645,7 @@ impl std::fmt::Debug for TurnSubmission {
             .field("turn_id", &self.turn_id)
             .field("input_id", &self.input_id)
             .field("disposition", &self.disposition)
+            .field("queue_position", &self.queue_position)
             .field("completion_fenced", &self.completion_guard.is_some())
             .finish()
     }

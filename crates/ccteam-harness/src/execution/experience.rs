@@ -593,6 +593,7 @@ mod tests {
             project,
             "s1",
             &super::super::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: "turn-1".into(),
                 ts: now,
                 vendor: "opencode".into(),
@@ -669,6 +670,7 @@ mod tests {
             project,
             "s1",
             &super::super::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: "s1-1".into(),
                 ts: now,
                 vendor: "claude".into(),

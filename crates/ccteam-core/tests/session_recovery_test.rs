@@ -8,6 +8,7 @@ use tempfile::TempDir;
 
 fn turn(id: &str, user: &str, assistant: &str) -> TurnRecord {
     TurnRecord {
+        exec_turn_id: None,
         turn_id: id.into(),
         ts: Utc::now(),
         vendor: "claude".into(),

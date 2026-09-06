@@ -32,19 +32,94 @@
 //! [`Outbound`] and returns the events it produced. The transport's
 //! `events()` task owns one translator and drives it.
 
+use std::sync::{Arc, Mutex};
+
 use serde_json::Value;
 
 use super::protocol::{MessageEnvelope, Outbound, ResultMsg};
 use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
 
+/// The session's EXECUTION-turn identity, shared by the submit path and this
+/// translator.
+///
+/// stream-json used to run two disjoint id spaces: `submit_turn` handed the
+/// caller a `turn-<nanos>` receipt while the event stream reported `sj-N`, so
+/// nothing downstream could say which submission a `TurnCompleted` belonged to
+/// — the gateway's own turn-origin bookkeeping never matched either, and a
+/// dispatcher could not be told which of its queued tasks had just answered
+/// (issue #201). One id, minted by whoever delivers the line and reported by
+/// the turn it opens, is what makes a request correlatable end to end.
+///
+/// Ids embed the process clock so a line parked across a daemon restart keeps
+/// an identity nothing in the next life can collide with — that is what lets a
+/// restart reconcile rebind an outstanding request by identity instead of
+/// guessing from order.
+#[derive(Debug, Default)]
+pub struct TurnIdentity {
+    seq: u64,
+    /// Reserved by a delivered line that is about to open a turn.
+    pending: Option<String>,
+    /// The turn the translator currently has in flight.
+    active: Option<String>,
+}
+
+impl TurnIdentity {
+    /// A fresh, process-unique execution-turn id.
+    pub fn mint(&mut self) -> String {
+        self.seq += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("sj-{nanos:x}-{:x}", self.seq)
+    }
+
+    /// Claim `id` for the turn the next delivered line opens.
+    pub fn reserve(&mut self, id: &str) {
+        self.pending = Some(id.to_string());
+    }
+
+    /// Undo a reservation whose line never reached the child.
+    pub fn clear_reservation(&mut self, id: &str) {
+        if self.pending.as_deref() == Some(id) {
+            self.pending = None;
+        }
+    }
+
+    /// The turn a line written RIGHT NOW would belong to: the one in flight,
+    /// else the one a delivered line has already reserved.
+    pub fn current(&self) -> Option<String> {
+        self.active.clone().or_else(|| self.pending.clone())
+    }
+
+    /// Open a turn: the reserved id when a delivery claimed one, else a fresh
+    /// id (a turn the vendor started on its own).
+    pub fn open(&mut self) -> String {
+        let id = self.pending.take().unwrap_or_else(|| self.mint());
+        self.active = Some(id.clone());
+        id
+    }
+
+    /// Close the turn in flight.
+    pub fn close(&mut self) {
+        self.active = None;
+    }
+
+    /// Take a reservation that will never open a turn (the stream closed).
+    pub fn take_pending(&mut self) -> Option<String> {
+        self.pending.take()
+    }
+}
+
 /// Per-session translation state. One per live stream-json session.
 #[derive(Debug, Default)]
 pub struct StreamTranslator {
-    /// Monotonic per-session turn counter (synthesizes turn ids; the pump
-    /// keys turns.jsonl off its OWN seq, so these need only be unique).
-    turn_seq: u64,
+    /// Execution-turn identity, shared with the submit path so a submission
+    /// receipt names the turn that will actually report the answer.
+    identity: Arc<Mutex<TurnIdentity>>,
     /// `Some` while a turn is in flight (between first assistant block and
-    /// its `result`).
+    /// its `result`) — a local mirror of the shared cell, so item ids stay
+    /// correlatable without holding the lock.
     active_turn: Option<String>,
     /// Every top-level assistant text block of the active turn, in stream
     /// order — this IS the turn's answer (`result.result` only repeats the
@@ -65,8 +140,35 @@ pub struct StreamTranslator {
 }
 
 impl StreamTranslator {
+    /// A standalone translator that owns its own identity space (unit tests,
+    /// and any consumer without a live session behind it).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A translator sharing the live session's execution-turn identity, so the
+    /// id a submission was given is the id its turn reports.
+    pub fn attached(identity: Arc<Mutex<TurnIdentity>>) -> Self {
+        Self {
+            identity,
+            ..Self::default()
+        }
+    }
+
+    /// Mint through the shared cell, tolerating a poisoned lock by falling
+    /// back to a locally unique id rather than panicking the pump.
+    fn open_turn_id(&mut self) -> String {
+        match self.identity.lock() {
+            Ok(mut identity) => identity.open(),
+            Err(poisoned) => poisoned.into_inner().open(),
+        }
+    }
+
+    fn close_turn_id(&mut self) {
+        match self.identity.lock() {
+            Ok(mut identity) => identity.close(),
+            Err(poisoned) => poisoned.into_inner().close(),
+        }
     }
 
     /// Ingest one outbound message, returning the neutral events it
@@ -87,8 +189,7 @@ impl StreamTranslator {
 
     fn ensure_turn_started(&mut self, out: &mut Vec<ThreadEvent>) {
         if self.active_turn.is_none() {
-            self.turn_seq += 1;
-            let id = format!("sj-{}", self.turn_seq);
+            let id = self.open_turn_id();
             self.active_turn = Some(id.clone());
             self.acc_text.clear();
             self.last_text = None;
@@ -119,8 +220,24 @@ impl StreamTranslator {
         self.acc_text.clear();
         self.last_text = None;
         let model = self.turn_model.take();
+        // A line delivered but never answered (the child died before its first
+        // assistant block) has an id reserved and no turn in flight. Failing it
+        // under THAT id is what lets the dispatcher that submitted it see its
+        // own request fail instead of waiting forever (issue #201).
+        let reserved = match self.identity.lock() {
+            Ok(mut identity) => {
+                identity.close();
+                identity.take_pending()
+            }
+            Err(poisoned) => {
+                let mut identity = poisoned.into_inner();
+                identity.close();
+                identity.take_pending()
+            }
+        };
         self.active_turn
             .take()
+            .or(reserved)
             .map(|turn_id| ThreadEvent::TurnFailed {
                 turn_id,
                 err: ThreadErrorEvent {
@@ -185,10 +302,8 @@ impl StreamTranslator {
         // A `result` can arrive without a preceding assistant block (a
         // pure error / empty turn) — still synthesize a turn id.
         self.ensure_turn_started(&mut out);
-        let turn_id = self
-            .active_turn
-            .take()
-            .unwrap_or_else(|| "sj-0".to_string());
+        let turn_id = self.active_turn.take().unwrap_or_default();
+        self.close_turn_id();
         let usage = r
             .usage
             .as_ref()

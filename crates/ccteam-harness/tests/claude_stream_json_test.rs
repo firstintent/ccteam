@@ -620,6 +620,25 @@ async fn slash_during_turn_is_deferred_until_the_turn_ends() {
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
+/// Wait for `n` vendor turn boundaries and return their turn ids, in order.
+async fn collect_completed_turn_ids(
+    events: &mut futures::stream::BoxStream<'static, ThreadEvent>,
+    n: usize,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    while ids.len() < n {
+        match tokio::time::timeout(Duration::from_secs(10), events.next()).await {
+            Ok(Some(ThreadEvent::TurnCompleted { turn_id, .. })) => ids.push(turn_id),
+            Ok(Some(_)) => {}
+            other => panic!(
+                "expected {n} completed turns, got {other:?} after {}",
+                ids.len()
+            ),
+        }
+    }
+    ids
+}
+
 /// Wait for `n` vendor turn boundaries on `events`, failing loudly otherwise.
 async fn await_completed_turns(
     events: &mut futures::stream::BoxStream<'static, ThreadEvent>,
@@ -689,11 +708,21 @@ async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
     // Not written yet — and durably parked for a daemon that dies right now.
     let logged = std::fs::read_to_string(&user_log).unwrap_or_default();
     assert_eq!(logged.lines().collect::<Vec<_>>(), vec!["long task"]);
-    let parked: Vec<String> = serde_json::from_slice(
+    let parked: Vec<serde_json::Value> = serde_json::from_slice(
         &std::fs::read(deferred_input_file(tmp.path(), "s9")).expect("parked line mirrored"),
     )
     .unwrap();
-    assert_eq!(parked, vec!["s7 done · claude · turn 1".to_string()]);
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0]["text"], "s7 done · claude · turn 1");
+    // The receipt names the turn the parked line WILL open, and the mirror
+    // carries the same id — that binding is what a dispatcher's request is
+    // resolved by, across a restart included (issue #201).
+    assert_eq!(parked[0]["turn_id"], serde_json::json!(queued.turn_id.0));
+    assert_eq!(
+        queued.queue_position,
+        Some(1),
+        "the caller is told where in the queue it sits, not just `pending`"
+    );
 
     // Two vendor turns complete: the long task, then the notification as its
     // own turn — written exactly once.
@@ -769,7 +798,11 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(
         &file,
-        serde_json::to_vec(&["s7 done · claude · turn 1", "s8 done · codex · turn 2"]).unwrap(),
+        serde_json::to_vec(&[
+            serde_json::json!({"turn_id": "sj-prev-1", "text": "s7 done · claude · turn 1"}),
+            serde_json::json!({"turn_id": "sj-prev-2", "text": "s8 done · codex · turn 2"}),
+        ])
+        .unwrap(),
     )
     .unwrap();
 
@@ -805,7 +838,7 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
         TurnDisposition::Started,
         "the resuming message is a clean turn, not a steer of a stale notification"
     );
-    await_completed_turns(&mut events, 3).await;
+    let completed = collect_completed_turn_ids(&mut events, 3).await;
     let logged = std::fs::read_to_string(&user_log).unwrap();
     assert_eq!(
         logged.lines().collect::<Vec<_>>(),
@@ -816,7 +849,183 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
         ],
         "the resuming message first, then both parked lines in order, one turn each"
     );
+    // Rebind by IDENTITY across the restart: each replayed line's turn reports
+    // the id the previous daemon minted for it, so a dispatcher's outstanding
+    // request resolves to its own answer and not to whichever turn finished
+    // first (issue #201).
+    assert_eq!(completed[0], submitted.turn_id.0);
+    assert_eq!(completed[1], "sj-prev-1");
+    assert_eq!(completed[2], "sj-prev-2");
     assert!(!file.exists(), "the mirror is consumed once flushed");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// issue #201 — every accepted line names the EXECUTION turn it will run in,
+/// so a dispatcher can bind its request to a turn that starts minutes later.
+/// Two queued tasks get two distinct ids, in queue order, and each id is the
+/// one its own `TurnCompleted` reports: the completion of the first can never
+/// be mistaken for the answer to the second.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn each_queued_line_names_the_turn_that_will_answer_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "1.5");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+
+    let running = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("task A".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    assert_eq!(running.disposition, TurnDisposition::Started);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let first = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("task B".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .unwrap();
+    let second = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("task C".into()),
+            TurnRouting::Queue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.disposition, TurnDisposition::Queued);
+    assert_eq!(second.disposition, TurnDisposition::Queued);
+    assert_eq!(first.queue_position, Some(1), "1-based, oldest first");
+    assert_eq!(second.queue_position, Some(2));
+    assert_ne!(first.turn_id.0, second.turn_id.0);
+    assert_ne!(running.turn_id.0, first.turn_id.0);
+
+    let completed = collect_completed_turn_ids(&mut events, 3).await;
+    assert_eq!(
+        completed,
+        vec![
+            running.turn_id.0.clone(),
+            first.turn_id.0.clone(),
+            second.turn_id.0.clone()
+        ],
+        "each turn reports the id its own receipt named"
+    );
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// A mid-turn steer joins the turn already running and says so, naming that
+/// same turn — several steers legitimately share one execution turn.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn an_injected_line_names_the_turn_it_joined() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "1.5");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+
+    let started = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("task A".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let steer = adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("also check the tests".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    assert_eq!(steer.disposition, TurnDisposition::Injected);
+    assert_eq!(steer.queue_position, None, "nothing was queued");
+    assert_eq!(
+        steer.turn_id.0, started.turn_id.0,
+        "the steer joined the running turn and names it"
+    );
+    let completed = collect_completed_turn_ids(&mut events, 1).await;
+    assert_eq!(completed, vec![started.turn_id.0]);
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
+/// A mirror this build cannot read is discarded, not half-understood: replaying
+/// lines whose turn identity is unknown would hand a dispatcher an answer it
+/// could never correlate. Pre-1.0, there is no migration.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn an_unreadable_parked_mirror_is_discarded() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    let file = deferred_input_file(tmp.path(), "s9");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    // The pre-#201 shape: bare strings, no turn identity.
+    std::fs::write(&file, serde_json::to_vec(&["s7 done"]).unwrap()).unwrap();
+
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .expect("start");
+    let mut events = adapter.events(&handle);
+    adapter
+        .submit_turn_routed(
+            &handle,
+            TurnInput::UserText("hello after restart".into()),
+            TurnRouting::Inject,
+        )
+        .await
+        .unwrap();
+    await_completed_turns(&mut events, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.lines().collect::<Vec<_>>(),
+        vec!["hello after restart"],
+        "nothing from the unreadable mirror is replayed"
+    );
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 

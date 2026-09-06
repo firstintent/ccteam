@@ -428,6 +428,11 @@ const AGENT_READ_DEFAULT_N: usize = 5;
 /// was measured at 73% pointer / 27% content (issue #195); `remaining` and
 /// `latest` say when there is more.
 const AGENT_READ_TRANSCRIPT_DEFAULT_N: usize = 1;
+/// How many delegation request rows a transcript read carries. Outstanding
+/// work first, so the answer to "what does this child still owe me" is never
+/// pushed off by resolved history; bounded so a busy child cannot flood the
+/// reader's context with bookkeeping.
+const AGENT_READ_REQUEST_ROWS: usize = 10;
 /// Below this a returned turn carries more pointer than prose, so the page
 /// drops whole rows (counted in `remaining`) instead of shredding every one.
 const MIN_USEFUL_ROW_CHARS: usize = 200;
@@ -822,6 +827,7 @@ fn stage_web_outbound_file(
             .unwrap_or_default();
     }
     let record = TurnRecord {
+        exec_turn_id: None,
         turn_id: event.id.clone(),
         ts: chrono::Utc::now(),
         vendor: session.vendor.clone(),
@@ -2886,6 +2892,7 @@ async fn run_agent_spawn_at(
             wait_seconds,
             notify,
             title.clone(),
+            idem_key.clone(),
             deadline,
         )
         .await?;
@@ -3206,6 +3213,7 @@ async fn run_agent_dispatch(
         wait_seconds,
         notify,
         title,
+        idem_key.clone(),
         deadline,
     )
     .await?;
@@ -3337,13 +3345,12 @@ fn derive_title_from_task(task: &str) -> String {
 }
 
 /// by BOTH `agent` and `agent{task}` (one-call
-/// spawn+dispatch, the dominant delegation flow). Subscribe (if waiting) →
-/// submit the task as a verbatim user turn → arm the delegation watch (agent
-/// callers only; `caller_sid` empty = admin, no watch; a target the caller
-/// never delegated is ledger-only unless `notify` was explicit) → emit
-/// `delegation_dispatched` → optionally block inline for the child's answer.
-/// Returns the response FRAGMENT (`turn_id`/`status`/result fields/`hint`)
-/// the caller merges into its own body; `tool` prefixes error strings.
+/// spawn+dispatch, the dominant delegation flow). Accept + persist the REQUEST
+/// (before anything reaches the vendor) → submit the task as a verbatim user
+/// turn → bind the request to the execution turn the adapter gave it → emit
+/// `delegation_dispatched` → optionally block inline for THIS request's answer.
+/// Returns the response FRAGMENT (`request_id`/`status`/`delivery`/result
+/// fields) the caller merges into its own body; `tool` prefixes error strings.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_task(
     gateway: &GatewayHandle,
@@ -3354,10 +3361,11 @@ async fn dispatch_task(
     wait_seconds: u64,
     notify: NotifyRequest,
     title: Option<String>,
+    idempotency_key: Option<String>,
     deadline: crate::gateway::GatewayDeadline,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
-    let (rx, parent_is_external, peer_unsubscribed) = {
+    let (rx, parent_is_external, peer_unsubscribed, precedent) = {
         let gw = deadline
             .lock(gateway)
             .await
@@ -3365,8 +3373,8 @@ async fn dispatch_task(
         // Whether a completion turn is deliverable is a property of the PARENT's
         // ledger row, not of the caller's auth tier: a hand-started client dials
         // in over MCP, so there is no thread to steer and no session to resume.
-        // Asked once, here, so the armed watch and the response fragment can
-        // never disagree about it.
+        // Asked once, here, so the recorded request and the response fragment
+        // can never disagree about it.
         let parent_is_external = is_delegation && gw.is_external_node(caller_sid);
         // Subscribe BEFORE submitting so a fast child can't answer before we
         // start listening (the wait races the child's own turn).
@@ -3379,58 +3387,85 @@ async fn dispatch_task(
         // to a session the caller never delegated is a HANDOFF: the target has
         // its own parent, or is a root with its own human. `agent_read` draws
         // no edge for it (that tree is spawn lineage) and `agent_stop` refuses
-        // it, so a watch armed here is an edge nobody can see or take down. The
-        // default `notify` is a default, not a request — only an explicit one
-        // subscribes the caller to a session it does not own.
+        // it, so a subscription made here is an edge nobody can see or take
+        // down. The default `notify` is a default, not a request — only an
+        // explicit one subscribes the caller to a session it does not own.
         let peer_unsubscribed =
             is_delegation && !notify.explicit && !gw.lineage_reaches(sid, caller_sid);
-        (rx, parent_is_external, peer_unsubscribed)
+        // What this caller last asked for on this child, if anything is still
+        // outstanding — the precedent an omitted `notify` inherits.
+        let precedent = if is_delegation && !notify.explicit {
+            gw.delegation_notify_precedent(sid, caller_sid)
+        } else {
+            None
+        };
+        (rx, parent_is_external, peer_unsubscribed, precedent)
     };
-    if is_delegation {
-        // The watch is armed either way — the completion edge belongs in the
-        // ledger (`delegation_completed` fires off the mirror, whatever the
-        // notify mode). Durable watch IO is explicitly outside the gateway
-        // mutex; a generation fence rejects a concurrently replaced child. An
-        // external parent gets it with notifications OFF: left on, the first
-        // completion would submit into a session ccteam must never re-spawn,
-        // fail, and drop the watch — silently ending that child's completion
+    // A follow-up that names no mode keeps the mode this parent chose for its
+    // outstanding work on this child. Silently reverting to the default turned
+    // a deliberate `final` into a 443-character `brief` mid-conversation, and
+    // the parent made a fifteen-minute decision off the excerpt (issue #201).
+    let effective_notify = if notify.explicit {
+        notify.mode
+    } else {
+        precedent.unwrap_or(notify.mode)
+    };
+    let request_id = if is_delegation {
+        // The request is recorded either way — the completion edge belongs in
+        // the ledger (`delegation_completed` fires off it, whatever the notify
+        // mode). Durable IO is explicitly outside the gateway mutex; a
+        // generation fence rejects a concurrently replaced child. An external
+        // parent gets it with notifications OFF: left on, the first completion
+        // would submit into a session ccteam must never re-spawn, fail, and
+        // drop the request — silently ending that child's completion
         // accounting. A peer handoff gets the same treatment for the opposite
         // reason: the edge is real and worth recording, the subscription was
         // never asked for.
         let watch_notify = if parent_is_external || peer_unsubscribed {
             ccteam_harness::NotifyMode::Off
         } else {
-            notify.mode
+            effective_notify
         };
-        let armed = crate::gateway::Gateway::arm_delegation_watch_shared(
+        let accepted = crate::gateway::Gateway::accept_delegation_request_shared(
             Arc::clone(gateway),
             sid,
             caller_sid,
             watch_notify,
             title.clone(),
-            None,
+            // Stage 2 keeps the existing routing policy: a ccteam-authored
+            // follow-up is a distinct queued turn (issue #194).
+            ccteam_harness::TurnRouting::Queue,
+            idempotency_key,
             deadline,
         )
         .await
         .map_err(|error| mcp_gateway_error(tool, &error))?;
-        // No watch means no completion edge and no notification. Submitting
+        // No record means no completion edge and no notification. Submitting
         // anyway hands the caller a normal-looking dispatch and then waits
         // forever for an answer that can never be delivered (issue #7), so the
         // failure belongs here, before the task goes out.
-        if !armed {
+        let Some(accepted) = accepted else {
             return Err(format!(
                 "{tool}: no completion watch could be registered for {sid} (unknown session)"
             ));
-        }
-        // Before the task is even submitted: this caller will block on the
-        // boundary, so the completion is its to take inline and the notifier
-        // must not ALSO push it (issue #195 — the parent paid a whole extra
-        // turn for the second copy).
+        };
+        // Before the task is even submitted: this caller will block on THIS
+        // request's answer, so the completion is its to take inline and the
+        // notifier must not ALSO push it (issue #195 — the parent paid a whole
+        // extra turn for the second copy). Per request: a sibling task
+        // finishing meanwhile is still pushed, because the caller is not
+        // holding that one.
         if wait_seconds > 0 {
-            gateway.lock().await.claim_inline_wait(sid, wait_seconds);
+            gateway
+                .lock()
+                .await
+                .claim_request_wait(sid, &accepted, wait_seconds);
         }
-    }
-    let turn_id = match crate::gateway::Gateway::submit_to_sid_shared(
+        Some(accepted)
+    } else {
+        None
+    };
+    let receipt = match crate::gateway::Gateway::submit_to_sid_receipt_shared(
         Arc::clone(gateway),
         sid,
         task,
@@ -3438,16 +3473,29 @@ async fn dispatch_task(
     )
     .await
     {
-        Ok(turn_id) => turn_id,
+        Ok(receipt) => receipt,
         Err(error) => {
-            if is_delegation {
-                crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), sid)
-                    .await;
+            if let Some(request_id) = request_id.as_deref() {
+                crate::gateway::Gateway::drop_delegation_request_shared(
+                    Arc::clone(gateway),
+                    sid,
+                    request_id,
+                )
+                .await;
             }
             return Err(mcp_gateway_error(tool, &error));
         }
     };
-    if is_delegation {
+    if let Some(request_id) = request_id.as_deref() {
+        // Bind BEFORE the caller is told anything: a boundary that arrives in
+        // the next millisecond must already know whose answer it is.
+        crate::gateway::Gateway::bind_delegation_request_shared(
+            Arc::clone(gateway),
+            sid,
+            request_id,
+            &receipt,
+        )
+        .await;
         let gw = gateway.lock().await;
         if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
             gw.emit_delegation_progress(
@@ -3457,7 +3505,7 @@ async fn dispatch_task(
                 sid,
                 vendor,
                 &host,
-                Some(&turn_id),
+                Some(&receipt.turn_id),
                 title.as_deref(),
                 None,
             );
@@ -3473,8 +3521,8 @@ async fn dispatch_task(
         tracing::warn!(
             tool,
             child_sid = %sid,
-            turn_id = %turn_id,
-            notify = notify.mode.as_str(),
+            turn_id = %receipt.turn_id,
+            notify = effective_notify.as_str(),
             parent_is_external,
             "ccteam MCP completion notification unavailable: caller has no managed parent session; poll agent_read"
         );
@@ -3483,7 +3531,7 @@ async fn dispatch_task(
             tool,
             caller_sid,
             child_sid = %sid,
-            turn_id = %turn_id,
+            turn_id = %receipt.turn_id,
             "ccteam MCP handoff to a session the caller did not delegate: ledger-only, no completion watch armed"
         );
     }
@@ -3493,26 +3541,28 @@ async fn dispatch_task(
         Ok(dispatch_wait_for_completion(
             gateway,
             sid,
-            &turn_id,
+            &receipt,
+            request_id.as_deref(),
             InlineWaitWindow {
                 effective_seconds: wait_seconds,
             },
             rx,
-            is_delegation,
             notification_route,
         )
         .await)
     } else {
         let mut m = serde_json::Map::new();
         m.insert("sid".to_string(), serde_json::json!(sid));
-        m.insert("turn_id".to_string(), serde_json::json!(turn_id));
-        if turn_id.starts_with("queued-behind-body:") {
+        if let Some(request_id) = request_id.as_deref() {
+            m.insert("request_id".to_string(), serde_json::json!(request_id));
+        }
+        insert_delivery_facts(&mut m, &receipt);
+        if receipt.queued_behind_body {
             // One sid, one body: the child's process from before a ccteam
             // restart is still finishing its turn; the task is queued behind
             // it and runs the moment that body exits (the notification then
             // arrives as usual). The only surviving `hint`: nothing else in
             // the response says why nothing is happening yet.
-            m.insert("status".to_string(), serde_json::json!("queued"));
             m.insert(
                 "hint".to_string(),
                 serde_json::json!(
@@ -3520,8 +3570,6 @@ async fn dispatch_task(
                      ends it now"
                 ),
             );
-        } else {
-            m.insert("status".to_string(), serde_json::json!("pending"));
         }
         if !notification_route.is_deliverable() {
             // The one fact a caller cannot infer: no notification is coming,
@@ -3532,17 +3580,72 @@ async fn dispatch_task(
     }
 }
 
+/// The delivery facts a dispatch response carries. `status` is what the adapter
+/// DID — `started` / `injected` / `queued` — not the flat `pending` every
+/// dispatch used to answer (issue #201: a parent that could not tell "running"
+/// from "third in a queue" re-sent the same instruction three times and then
+/// stopped a 400k-context child it believed was ignoring it).
+///
+/// `delivery` keeps the four facts apart. ccteam accepting a request, ccteam
+/// retaining it, the bytes reaching the harness, and the harness being observed
+/// running it are four different claims; a stdin flush is not proof the model
+/// read anything, so `executing` is `unknown` until a turn is observed to open.
+fn insert_delivery_facts(
+    m: &mut serde_json::Map<String, serde_json::Value>,
+    receipt: &crate::gateway::TurnReceipt,
+) {
+    m.insert("turn_id".to_string(), serde_json::json!(receipt.turn_id));
+    m.insert("status".to_string(), serde_json::json!(receipt.status()));
+    if let Some(position) = receipt.queue_position {
+        m.insert("queue_position".to_string(), serde_json::json!(position));
+    }
+    let queued = receipt.status() == "queued";
+    m.insert(
+        "delivery".to_string(),
+        serde_json::json!({
+            "accepted": true,
+            "queued": queued,
+            "written": !queued,
+            "executing": "unknown",
+        }),
+    );
+}
+
 /// An inline wait that ran out: the child is still working (a timeout NEVER
-/// cancels it), so the honest answer is the same `pending` an async call gets.
+/// cancels it), so the honest answer is that the task has not answered yet —
+/// with the delivery facts, so the caller can tell "running" from "still third
+/// in the queue" instead of reading one flat `pending` for both (issue #201).
 fn pending_dispatch_response(
     sid: &str,
-    turn_id: &str,
+    receipt: &crate::gateway::TurnReceipt,
+    request_id: Option<&str>,
+    delivery: Option<serde_json::Value>,
     notification_route: CompletionNotificationRoute,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut response = serde_json::Map::new();
     response.insert("sid".to_string(), serde_json::json!(sid));
-    response.insert("turn_id".to_string(), serde_json::json!(turn_id));
-    response.insert("status".to_string(), serde_json::json!("pending"));
+    if let Some(request_id) = request_id {
+        response.insert("request_id".to_string(), serde_json::json!(request_id));
+    }
+    insert_delivery_facts(&mut response, receipt);
+    // The live row wins over the submit-time guess: a task that was third in
+    // the queue when it was accepted may be running by now.
+    if let Some(row) = delivery {
+        if let Some(state) = row.get("state").and_then(|s| s.as_str()) {
+            response.insert("state".to_string(), serde_json::json!(state));
+        }
+        if let Some(position) = row.get("queue_position") {
+            response.insert("queue_position".to_string(), position.clone());
+        } else {
+            response.remove("queue_position");
+        }
+        if let Some(facts) = row.get("delivery") {
+            response.insert("delivery".to_string(), facts.clone());
+        }
+    }
+    // The task has not answered: distinct from the delivery `status` above,
+    // which says where the message got to.
+    response.insert("answered".to_string(), serde_json::json!(false));
     if !notification_route.is_deliverable() {
         response.insert("notify_deliverable".into(), serde_json::json!(false));
     }
@@ -3572,7 +3675,7 @@ async fn await_turn_boundary(
     gateway: &GatewayHandle,
     sid: &str,
     deadline: tokio::time::Instant,
-    mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
+    rx: &mut tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     armed: bool,
 ) -> bool {
     // Re-check cadence for "answer seen, is the turn still in flight?".
@@ -3618,18 +3721,21 @@ async fn await_turn_boundary(
     }
 }
 
-/// v0.9.0 W2 (F2) — the OFF-lock half of a `wait_seconds>0` dispatch. Awaits an
-/// `Answer` for `child_sid` on the gateway broadcast until the deadline. NEVER
-/// holds the gateway lock across the await (lock discipline). On completion it
-/// reads the child's freshly-appended turn (clean text) + cost from meta and,
-/// for a delegation, disarms the watch (the caller already has the result
-/// inline — suppress the redundant notification). On timeout it returns
-/// `pending` and leaves the watch armed (the child is not cancelled). The
-/// caller placed an inline claim before the submit, so the notifier hands this
-/// boundary over instead of pushing a second copy of the answer; the claim is
-/// released here either way. When a request above the effective inline ceiling
-/// reaches that ceiling, the pending response also reports the
-/// requested/effective waits and an honest collect-or-notification hint.
+/// v0.9.0 W2 (F2) — the OFF-lock half of a `wait_seconds>0` dispatch. Awaits
+/// THIS REQUEST's own completion on the gateway broadcast until the deadline.
+/// NEVER holds the gateway lock across the await (lock discipline).
+///
+/// "Its own" is the whole point (issue #201). A parent that dispatched A and
+/// then waited on B used to be handed A's answer the moment A finished — the
+/// wait returned on the first turn boundary of the child, whichever task it
+/// belonged to. Here the boundary is only a wake-up: the wait ends when the
+/// caller's request reaches a terminal state, and the answer it returns is the
+/// transcript row that request was resolved against, not "the newest row".
+///
+/// The caller placed an inline claim before the submit, so the notifier hands
+/// this boundary over instead of pushing a second copy of the answer; the claim
+/// is released here either way. On timeout it returns the delivery facts and
+/// leaves the request outstanding (the child is not cancelled).
 ///
 /// v0.9.5 feedback fix — an `Answer` frame alone is NOT completion; see
 /// [`await_turn_boundary`], which owns that rule for every long poll.
@@ -3637,10 +3743,10 @@ async fn await_turn_boundary(
 async fn dispatch_wait_for_completion(
     gateway: &GatewayHandle,
     child_sid: &str,
-    turn_id: &str,
+    receipt: &crate::gateway::TurnReceipt,
+    request_id: Option<&str>,
     wait: InlineWaitWindow,
-    rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
-    is_delegation: bool,
+    mut rx: tokio::sync::broadcast::Receiver<crate::gateway::GatewayEvent>,
     notification_route: CompletionNotificationRoute,
 ) -> serde_json::Map<String, serde_json::Value> {
     // MCP-DX-1 — elapsed telemetry: the wait starts right after the submit, so
@@ -3648,33 +3754,78 @@ async fn dispatch_wait_for_completion(
     // that covers the whole task.
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(wait.effective_seconds);
-    let observed = await_turn_boundary(gateway, child_sid, deadline, rx, false).await;
-    // Release the claim placed before the submit, and pick up a boundary the
-    // notifier suppressed in our favour: that happens when the child finished
-    // in the same instant our deadline expired, and the answer is then ours to
-    // report rather than nobody's (the notification was already skipped).
-    let suppressed = if is_delegation {
-        gateway.lock().await.release_inline_wait(child_sid)
+    let mut answered = false;
+    loop {
+        let observed = await_turn_boundary(gateway, child_sid, deadline, &mut rx, false).await;
+        let Some(request_id) = request_id else {
+            // No request of our own (an admin caller): the first boundary is
+            // the only thing there is to wait for.
+            answered = observed;
+            break;
+        };
+        // A request that has left the store (its parent became unreachable and
+        // the notifier dropped it) is as done as one that answered — there is
+        // nothing left to wait for.
+        let state = {
+            let gw = gateway.lock().await;
+            gw.delegation_request_state(child_sid, request_id)
+        };
+        if state.is_none_or(|state| state.is_terminal()) {
+            answered = true;
+            break;
+        }
+        if !observed {
+            break;
+        }
+        // A boundary that belonged to some OTHER task of this child. Keep
+        // waiting for ours.
+    }
+    // Release the claim, and pick up a boundary the notifier suppressed in our
+    // favour: that happens when the child finished in the same instant our
+    // deadline expired, and the answer is then ours to report rather than
+    // nobody's (the notification was already skipped).
+    let (suppressed, delivery_row) = if let Some(request_id) = request_id {
+        let mut gw = gateway.lock().await;
+        let suppressed = gw.release_request_wait(child_sid, request_id);
+        let row = gw
+            .delegation_request_rows(child_sid, usize::MAX)
+            .into_iter()
+            .find(|row| row.get("request_id").and_then(|id| id.as_str()) == Some(request_id));
+        (suppressed, row)
     } else {
-        false
+        (false, None)
     };
-    if !observed && !suppressed {
-        return pending_dispatch_response(child_sid, turn_id, notification_route);
+    if !answered && !suppressed {
+        return pending_dispatch_response(
+            child_sid,
+            receipt,
+            request_id,
+            delivery_row,
+            notification_route,
+        );
     }
 
     // Resolve the child (sync) under a brief lock, then read its transcript
     // tail OFF the lock for a clean, unprefixed result.
-    let resolved = {
+    let (resolved, answered_turn) = {
         let gw = gateway.lock().await;
-        gw.session_resolve(child_sid)
+        let answered_turn = request_id.and_then(|id| gw.delegation_request_answer(child_sid, id));
+        (gw.session_resolve(child_sid), answered_turn)
     };
     let (result_record, cost_usd, meta_turn) = resolved
         .as_ref()
         .map(|r| {
-            let last =
+            let all =
                 ccteam_harness::execution::turns_mirror::read_all_turns(&r.project_dir, &r.sid)
-                    .ok()
-                    .and_then(|all| all.into_iter().rev().find(|t| !t.assistant.is_empty()));
+                    .unwrap_or_default();
+            // THE row this request was resolved against — not the newest one.
+            // Between the boundary and this read the child may already have
+            // finished a queued follow-up, and returning that as the answer is
+            // exactly the mix-up this wait exists to prevent (issue #201).
+            let last = answered_turn
+                .as_deref()
+                .and_then(|turn_id| all.iter().find(|t| t.turn_id == turn_id).cloned())
+                .or_else(|| all.into_iter().rev().find(|t| !t.assistant.is_empty()));
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
             // tokens, same semantics as agent_read/collect (tokens present
             // even for vendors with no USD price table).
@@ -3687,24 +3838,18 @@ async fn dispatch_wait_for_completion(
         })
         .unwrap_or((None, None, 0));
 
-    // The task is done and its answer rides back in THIS response, so the watch
-    // is spent. The notification was already suppressed at the boundary by the
-    // claim above; this clears the bookkeeping and covers the case where we
-    // reached the boundary before the notifier planned at all.
-    if is_delegation {
-        crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), child_sid)
-            .await;
-    }
-
     let record = result_record.as_ref();
     // The child's harness rides the mirrored turn (`TurnRecord.vendor`), the
     // same source the gateway's completion header uses; an unmirrored result
     // simply omits the field rather than guessing.
     let vendor = record.map(|turn| turn.vendor.clone()).unwrap_or_default();
+    let answer_turn_id = record
+        .map(|turn| turn.turn_id.as_str())
+        .unwrap_or(&receipt.turn_id);
     DelegationSummary {
         sid: child_sid,
         vendor: &vendor,
-        turn_id,
+        turn_id: answer_turn_id,
         turn: record
             .and_then(|turn| turn.status.as_ref().map(|status| status.turn))
             .unwrap_or(meta_turn),
@@ -3721,6 +3866,12 @@ async fn dispatch_wait_for_completion(
             .map(|turn| turn.assistant.as_str())
             .unwrap_or_default(),
         conclusion: record.and_then(|turn| turn.conclusion.as_deref()),
+        request_id,
+        // The header of an inline result names the task the caller is holding;
+        // it asked for this one by id, so the label adds nothing and the queue
+        // count belongs to the push path.
+        title: None,
+        remaining_queued: 0,
     }
     .inline_result()
 }
@@ -3758,6 +3909,27 @@ fn is_transcript_row(turn: &ccteam_harness::execution::turns_mirror::TurnRecord)
     !turn.assistant.is_empty() || turn.outcome.is_some()
 }
 
+/// `agent_read{sid,turn}` — the one page holding exactly that turn. Nothing
+/// is `remaining`: the caller asked for one row by name and got it, or an
+/// error naming the turn the transcript does not hold.
+fn exact_collected_turn(
+    all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+    turn_id: &str,
+) -> Option<TranscriptPage> {
+    let latest = all
+        .iter()
+        .rev()
+        .find(|turn| is_transcript_row(turn))
+        .map(|turn| turn.turn_id.clone());
+    let row = all.iter().find(|turn| turn.turn_id == turn_id)?;
+    Some(TranscriptPage {
+        rows: vec![collected_turn_row(row)],
+        cursor: Some(row.turn_id.clone()),
+        remaining: 0,
+        latest,
+    })
+}
+
 /// v0.8.7 review-fix (R-L3) — pure paging core of [`run_agent_read_transcript`],
 /// extracted so the cursor/paging contract is unit-testable without a gateway
 /// or filesystem. Given ALL mirrored turns, an optional `since` turn-id
@@ -3793,25 +3965,7 @@ fn page_collected_turns(
     let mut rows: Vec<serde_json::Value> = after
         .iter()
         .filter(|t| is_transcript_row(t))
-        .map(|t| {
-            let mut row = serde_json::json!({"turn_id": t.turn_id, "content": t.assistant});
-            // Steers this row's own cut only (a cut row shows the conclusion,
-            // not the narration's head — issue #196); `bound_collected_turns`
-            // strips it, so the wire never carries a second copy of the text.
-            if let Some(conclusion) = t.conclusion.as_deref() {
-                row["conclusion"] = serde_json::json!(conclusion);
-            }
-            if let Some(outcome) = t.outcome.as_deref() {
-                row["outcome"] = serde_json::json!(outcome);
-            }
-            if let Some(kind) = t.error_kind.as_deref() {
-                row["error_kind"] = serde_json::json!(kind);
-            }
-            if let Some(error) = t.error.as_deref() {
-                row["error"] = serde_json::json!(error);
-            }
-            row
-        })
+        .map(|t| collected_turn_row(t))
         .collect();
     let remaining = rows.len().saturating_sub(n);
     if tail {
@@ -3834,42 +3988,42 @@ fn page_collected_turns(
     }
 }
 
-/// The `turn_id` of the row right before `turn_id` in the mirror (any row,
-/// user or assistant) — the `since` cursor that makes a forward read of `n:1`
-/// land exactly on `turn_id`.
-fn previous_turn_id<'a>(
-    all: &'a [ccteam_harness::execution::turns_mirror::TurnRecord],
-    turn_id: &str,
-) -> Option<&'a str> {
-    let position = all.iter().position(|turn| turn.turn_id == turn_id)?;
-    position
-        .checked_sub(1)
-        .map(|previous| all[previous].turn_id.as_str())
+/// One transcript row as `agent_read{sid}` publishes it.
+fn collected_turn_row(
+    t: &ccteam_harness::execution::turns_mirror::TurnRecord,
+) -> serde_json::Value {
+    let mut row = serde_json::json!({"turn_id": t.turn_id, "content": t.assistant});
+    // Steers this row's own cut only (a cut row shows the conclusion,
+    // not the narration's head — issue #196); `bound_collected_turns`
+    // strips it, so the wire never carries a second copy of the text.
+    if let Some(conclusion) = t.conclusion.as_deref() {
+        row["conclusion"] = serde_json::json!(conclusion);
+    }
+    if let Some(outcome) = t.outcome.as_deref() {
+        row["outcome"] = serde_json::json!(outcome);
+    }
+    if let Some(kind) = t.error_kind.as_deref() {
+        row["error_kind"] = serde_json::json!(kind);
+    }
+    if let Some(error) = t.error.as_deref() {
+        row["error"] = serde_json::json!(error);
+    }
+    row
 }
 
 /// The exact one-call read of a whole turn — what a truncated transcript row
-/// points at instead of a vague "read more". The cheapest form that lands on
-/// THAT turn: the newest one needs no cursor at all (a default read is already
-/// `tail:true, n:1`), which is 32 characters the caller does not pay on the
-/// commonest row of all. Otherwise `previous` (see [`previous_turn_id`]) is the
-/// cursor to page from; the first row of a transcript is reached as the oldest
-/// turn instead.
-fn whole_turn_recipe(
-    sid: &str,
-    previous: Option<&str>,
-    total_chars: usize,
-    is_newest: bool,
-) -> String {
+/// points at instead of a vague "read more".
+///
+/// It names the TURN, not a position. The cheapest form used to be "the newest
+/// turn" (`n:1`), which is what a truncated row was at the instant it was
+/// written and stops being the moment the child finishes anything else — a
+/// parent that followed the recipe minutes later read a queued confirmation's
+/// answer and took it for the verdict it had asked for (issue #201). A cursor
+/// (`since:<previous>`) has the same defect one row further back: it depends
+/// on nothing being appended in between.
+fn whole_turn_recipe(sid: &str, turn_id: &str, total_chars: usize) -> String {
     let budget = crate::delegation::read_budget_for(total_chars);
-    if is_newest {
-        return format!("agent_read{{sid:{sid},n:1,max_chars:{budget}}}");
-    }
-    match previous {
-        Some(previous) => {
-            format!("agent_read{{sid:{sid},since:{previous},n:1,max_chars:{budget}}}")
-        }
-        None => format!("agent_read{{sid:{sid},tail:false,n:1,max_chars:{budget}}}"),
-    }
+    format!("agent_read{{sid:{sid},turn:{turn_id},max_chars:{budget}}}")
 }
 
 fn collect_max_chars(args: &serde_json::Value) -> usize {
@@ -4111,7 +4265,7 @@ async fn read_wait_for_turn_boundary(
     if wait == 0 {
         return false;
     }
-    let (rx, in_flight, resolved) = {
+    let (mut rx, in_flight, resolved) = {
         let gw = gateway.lock().await;
         (
             gw.subscribe_events(),
@@ -4125,7 +4279,7 @@ async fn read_wait_for_turn_boundary(
     }
     let before = resolved.as_ref().and_then(last_mirrored_turn_id);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
-    if !await_turn_boundary(gateway, sid, deadline, rx, true).await {
+    if !await_turn_boundary(gateway, sid, deadline, &mut rx, true).await {
         return false;
     }
     if let Some(resolved) = resolved.as_ref() {
@@ -4140,6 +4294,41 @@ fn last_mirrored_turn_id(resolved: &crate::gateway::SessionResolve) -> Option<St
         .ok()?
         .pop()
         .map(|turn| turn.turn_id)
+}
+
+/// Wait (briefly, bounded) for the notifier to record which of `waiting_on`
+/// this boundary resolved, and return them. The notifier runs off the pump
+/// while a reader reaches the same boundary through an event broadcast, so
+/// asking immediately is asking too early.
+async fn settle_until_a_request_resolves(
+    gateway: &GatewayHandle,
+    sid: &str,
+    caller_sid: &str,
+    waiting_on: &[String],
+) -> Vec<String> {
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+    if waiting_on.is_empty() {
+        return Vec::new();
+    }
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    loop {
+        let still: std::collections::HashSet<String> = gateway
+            .lock()
+            .await
+            .outstanding_request_ids(sid, caller_sid)
+            .into_iter()
+            .collect();
+        let resolved: Vec<String> = waiting_on
+            .iter()
+            .filter(|id| !still.contains(*id))
+            .cloned()
+            .collect();
+        if !resolved.is_empty() || tokio::time::Instant::now() >= deadline {
+            return resolved;
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Wait (briefly, bounded) for the boundary's own row to reach `turns.jsonl`.
@@ -4190,6 +4379,13 @@ async fn run_agent_read_transcript(
     // never spawned, so the honest answer is what the session is — not an empty
     // page or an "unknown session" from the resolve below.
     let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
+    // The EXACT selector. `since` is a cursor — "what came after this" — and a
+    // truncated excerpt used to point at `n:1`, "the newest turn", which is
+    // only what the excerpt showed at the instant it was written: fifteen
+    // minutes and one queued confirmation later that read returns a different
+    // answer and says nothing about it (issue #201). `turn:<turn_id>` names
+    // the one row, forever.
+    let exact_turn = args.get("turn").and_then(|v| v.as_str()).map(String::from);
     // `n:0` is legal here (status only); the roster keeps its floor of 1.
     let n = args
         .get("n")
@@ -4231,16 +4427,37 @@ async fn run_agent_read_transcript(
         .to_string();
     let claimed = read_wait > 0 && !caller_sid.is_empty() && {
         let mut gw = gateway.lock().await;
-        gw.delegation_watch_parent(&sid).as_deref() == Some(caller_sid.as_str())
-            && gw.claim_inline_wait(&sid, read_wait)
+        gw.parent_holds_delegation_request(&sid, &caller_sid)
+            && gw.claim_read_wait(&sid, &caller_sid, read_wait)
+    };
+    // WHICH of the caller's tasks were outstanding when the wait began. The
+    // ones that are gone afterwards are the ones this read resolved — a
+    // question the reader could not answer at all before, and the reason a
+    // parent took a queued confirmation's answer for its verdict (issue #201).
+    let waiting_on: Vec<String> = if claimed {
+        gateway
+            .lock()
+            .await
+            .outstanding_request_ids(&sid, &caller_sid)
+    } else {
+        Vec::new()
     };
     let reached = read_wait_for_turn_boundary(gateway, &sid, args).await;
+    let mut resolved_requests: Vec<String> = Vec::new();
     if claimed {
-        let suppressed = gateway.lock().await.release_inline_wait(&sid);
-        if reached || suppressed {
-            crate::gateway::Gateway::disarm_delegation_watch_shared(Arc::clone(gateway), &sid)
-                .await;
+        if reached {
+            // The boundary landed. Give the notifier the moment it needs to
+            // record WHICH requests it answered — the claim is still held, so
+            // it cannot push a copy of what this read is about to return, and
+            // reporting "resolved nothing" while the bookkeeping is still in
+            // flight would be the vaguest possible answer to the one question
+            // this field exists for.
+            resolved_requests =
+                settle_until_a_request_resolves(gateway, &sid, &caller_sid, &waiting_on).await;
         }
+        // The notifier suppressed this boundary in our favour (or we reached
+        // it first); either way the caller now holds whatever it answered.
+        let _suppressed = gateway.lock().await.release_read_wait(&sid, &caller_sid);
     }
 
     // Resolve under the lock (sync) — with the child's in-flight turn, which is
@@ -4282,7 +4499,11 @@ async fn run_agent_read_transcript(
     // Apply the `since` cursor + page forward (R-L3 — oldest-first, no silent
     // drop of a > `n` burst; `tail:true` flips to newest-first). Pure logic in
     // `page_collected_turns`.
-    let page = page_collected_turns(&all, since.as_deref(), n, tail);
+    let page = match exact_turn.as_deref() {
+        Some(turn_id) => exact_collected_turn(&all, turn_id)
+            .ok_or_else(|| format!("agent_read: {sid} has no turn {turn_id}"))?,
+        None => page_collected_turns(&all, since.as_deref(), n, tail),
+    };
     let TranscriptPage {
         mut rows,
         mut cursor,
@@ -4302,15 +4523,8 @@ async fn run_agent_read_transcript(
             .and_then(|value| value.as_str())
             .map(String::from);
     }
-    let newest = latest.clone();
-    let recipe = |turn_id: &str, total_chars: usize| {
-        whole_turn_recipe(
-            &resolved.sid,
-            previous_turn_id(&all, turn_id),
-            total_chars,
-            newest.as_deref() == Some(turn_id),
-        )
-    };
+    let recipe =
+        |turn_id: &str, total_chars: usize| whole_turn_recipe(&resolved.sid, turn_id, total_chars);
     let (_total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars, &recipe);
 
     let activity = classify_session_activity(
@@ -4344,6 +4558,25 @@ async fn run_agent_read_transcript(
     // (its marker carries the exact read of the whole turn).
     if content_truncated {
         body.insert("truncated".into(), serde_json::json!(true));
+    }
+    // What this child OWES, and to whom. A dispatcher could not see its own
+    // queue at all: told only `pending`, it re-sent the same instruction three
+    // times and then stopped a child it believed was ignoring it (issue #201).
+    // Outstanding rows first, then the most recent resolved ones, bounded.
+    let requests = gateway
+        .lock()
+        .await
+        .delegation_request_rows(&sid, AGENT_READ_REQUEST_ROWS);
+    if !requests.is_empty() {
+        body.insert("requests".into(), serde_json::json!(requests));
+    }
+    // Which of the caller's own tasks this read resolved — the answer it is
+    // now holding, named, so it is never mistaken for another one.
+    if !resolved_requests.is_empty() {
+        body.insert(
+            "resolved_requests".into(),
+            serde_json::json!(resolved_requests),
+        );
     }
     // `status: "stopped"` used to mean nothing more than "not live", which
     // read as "this session is over" for a session that was merely between
@@ -4696,7 +4929,7 @@ async fn run_agent_stop(
     // the stop removes it from the live map.
     let stopped_meta = gw.session_vendor_host_slug(&sid);
     if !caller_sid.is_empty() {
-        gw.disarm_delegation_watch(&sid);
+        gw.drop_delegation_requests(&sid);
     }
     gw.stop_session(&sid)
         .await
@@ -5325,7 +5558,8 @@ mod session_tool_tests {
                 .is_some_and(|content| content.contains("echo: long job")),
             "the final turn is in the body the wait returned: {body}"
         );
-        // Zero new response fields: a long poll answers the SAME body shape.
+        // A long poll answers the SAME body shape as an ordinary read — plus
+        // the request bookkeeping every `sid` read carries (issue #201).
         for key in body.as_object().unwrap().keys() {
             assert!(
                 [
@@ -5335,7 +5569,9 @@ mod session_tool_tests {
                     "cursor",
                     "latest",
                     "remaining",
+                    "requests",
                     "residency",
+                    "resolved_requests",
                     "tokens_total",
                     "truncated",
                     "turns"
@@ -5402,6 +5638,7 @@ mod session_tool_tests {
             "slow job".to_string(),
             0,
             NotifyRequest::defaulted(),
+            None,
             None,
             crate::gateway::GatewayDeadline::start(),
         )
@@ -5473,8 +5710,13 @@ mod session_tool_tests {
 
     /// D4 — a long poll that returns AT the boundary leaves the parent holding
     /// the answer, so the completion notification would be a second copy: the
-    /// watch is disarmed exactly as an inline dispatch wait disarms it. A
-    /// reader that is not the watch's parent must not touch it.
+    /// reader's own request is resolved by the boundary it returned at, and it
+    /// is told WHICH request that was. A reader that is not the request's
+    /// parent must not touch it.
+    ///
+    /// The notifier runs, as it does in production: it is the single writer of
+    /// request resolution, and the reader's claim is what stops it pushing a
+    /// copy of the answer this read is returning (issue #201).
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn agent_read_wait_disarms_only_the_watching_parents_own_notification() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5482,8 +5724,7 @@ mod session_tool_tests {
             root: tmp.path().join("home"),
             projects_root: tmp.path().join("projects"),
         };
-        let (gw, principal, _drx) =
-            build_dispatch_gateway(true, false, 150, None, tmp.path()).await;
+        let (gw, principal) = dispatch_gateway_opts(true, false, 150, None, tmp.path()).await;
         let child = parse(
             &run_agent(
                 &ambient(&principal, "alpha", json!({ "task": "first job" })),
@@ -5497,21 +5738,44 @@ mod session_tool_tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(
-            gw.lock().await.delegation_watch_parent(&child).as_deref(),
-            Some(principal.as_str()),
-            "the dispatch armed the parent's watch"
-        );
-        run_agent_read(
-            &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 20 })),
-            &gw,
-            McpCaller::Ambient,
-            &paths,
-        )
-        .await
-        .unwrap();
         assert!(
-            gw.lock().await.delegation_watch_parent(&child).is_none(),
+            gw.lock()
+                .await
+                .parent_holds_delegation_request(&child, &principal),
+            "the dispatch recorded the parent's request"
+        );
+        let read = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 20 })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        // The read names WHICH of the caller's tasks it resolved, so the
+        // answer it is holding is never mistaken for another one (issue #201).
+        assert_eq!(
+            read["resolved_requests"].as_array().map(Vec::len),
+            Some(1),
+            "{read}"
+        );
+        // The notifier resolves off the pump, so give it the moment it needs.
+        let mut released = false;
+        for _ in 0..200 {
+            if !gw
+                .lock()
+                .await
+                .parent_holds_delegation_request(&child, &principal)
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            released,
             "the parent read the answer inline — no redundant notification"
         );
 
@@ -5538,6 +5802,7 @@ mod session_tool_tests {
             0,
             NotifyRequest::defaulted(),
             None,
+            None,
             crate::gateway::GatewayDeadline::start(),
         )
         .await
@@ -5550,9 +5815,10 @@ mod session_tool_tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            gw.lock().await.delegation_watch_parent(&child).as_deref(),
-            Some(principal.as_str()),
+        assert!(
+            gw.lock()
+                .await
+                .parent_holds_delegation_request(&child, &principal),
             "a third-party reader must not take the parent's notification away"
         );
     }
@@ -5652,18 +5918,26 @@ mod session_tool_tests {
                 1,
                 NotifyRequest::defaulted(),
                 None,
+                None,
                 crate::gateway::GatewayDeadline::start(),
             )
             .await
             .expect("a capped inline timeout is a normal pending response"),
         );
-        assert_eq!(response["status"], "pending");
+        // A lapsed wait says what it knows: the task has not answered, and
+        // where the message actually got to. One flat `pending` for both
+        // "running" and "third in a queue" is what made a parent re-send the
+        // same instruction three times (issue #201).
+        assert_eq!(response["answered"], serde_json::json!(false));
+        assert_eq!(response["status"], "started");
+        assert_eq!(response["state"], "submitted");
         assert_eq!(response["sid"], child);
+        assert!(response["request_id"].as_str().is_some());
         assert!(response["turn_id"].as_str().is_some());
         assert!(response.get("requested_wait_seconds").is_none());
         assert!(response.get("effective_wait_seconds").is_none());
-        // A timeout is `pending` and nothing else: the caller already knows
-        // what to do with a sid, and a hint is bytes it did not ask for.
+        // Still no prose: the caller already knows what to do with a sid, and
+        // a hint is bytes it did not ask for.
         assert!(response.get("hint").is_none());
         assert!(
             gateway.lock().await.session_turn_in_flight(&child),
@@ -7404,6 +7678,7 @@ mod session_tool_tests {
             6,
             NotifyRequest::defaulted(),
             None,
+            None,
             crate::gateway::GatewayDeadline::start(),
         )
         .await
@@ -7422,6 +7697,7 @@ mod session_tool_tests {
             vec![
                 "context_pct",
                 "cost_usd",
+                "request_id",
                 "result_text",
                 "sid",
                 "status",
@@ -7830,6 +8106,7 @@ mod session_tool_tests {
 
     pub(super) fn turn(id: &str) -> ccteam_harness::execution::turns_mirror::TurnRecord {
         ccteam_harness::execution::turns_mirror::TurnRecord {
+            exec_turn_id: None,
             turn_id: id.to_string(),
             ts: chrono::Utc::now(),
             vendor: "claude".to_string(),
@@ -8030,6 +8307,7 @@ mod session_tool_tests {
                 tmp.path(),
                 &child,
                 &ccteam_harness::execution::turns_mirror::TurnRecord {
+                    exec_turn_id: None,
                     turn_id: turn_id.into(),
                     ts: chrono::Utc::now(),
                     vendor: "claude".into(),
@@ -8136,28 +8414,33 @@ mod session_tool_tests {
         assert_eq!(fits[0], json!({ "turn_id": "t1", "content": "ok" }));
     }
 
-    /// The recipe on a truncated transcript row is an exact one-call read of
-    /// that turn: `since` = the row before it, `n:1`, `max_chars` = its length.
+    /// The recipe on a truncated transcript row names the exact turn, so it
+    /// still reads THAT answer after the child has finished others.
     #[test]
     fn whole_turn_recipe_names_the_exact_read() {
+        assert_eq!(
+            whole_turn_recipe("s5", "t1", 908),
+            "agent_read{sid:s5,turn:t1,max_chars:908}"
+        );
+        // The budget is clamped to what the parameter accepts, never 7.
+        assert_eq!(
+            whole_turn_recipe("s5", "t0", 7),
+            "agent_read{sid:s5,turn:t0,max_chars:100}"
+        );
+    }
+
+    /// `agent_read{turn}` returns that one row whatever has happened since,
+    /// and refuses a turn the transcript does not hold rather than paging to
+    /// something else.
+    #[test]
+    fn exact_turn_selector_returns_only_that_row() {
         let all: Vec<_> = ["t0", "t1", "t2"].iter().map(|id| turn(id)).collect();
-        assert_eq!(previous_turn_id(&all, "t2"), Some("t1"));
-        assert_eq!(previous_turn_id(&all, "t0"), None);
-        assert_eq!(previous_turn_id(&all, "ghost"), None);
-        assert_eq!(
-            whole_turn_recipe("s5", Some("t1"), 908, false),
-            "agent_read{sid:s5,since:t1,n:1,max_chars:908}"
-        );
-        assert_eq!(
-            whole_turn_recipe("s5", None, 7, false),
-            "agent_read{sid:s5,tail:false,n:1,max_chars:100}"
-        );
-        // The newest turn is what a default read already returns, so its
-        // recipe carries no cursor — 32 characters saved on the commonest row.
-        assert_eq!(
-            whole_turn_recipe("s5", Some("t1"), 908, true),
-            "agent_read{sid:s5,n:1,max_chars:908}"
-        );
+        let page = exact_collected_turn(&all, "t1").expect("t1 is in the transcript");
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0]["turn_id"], "t1");
+        assert_eq!(page.remaining, 0);
+        assert_eq!(page.latest.as_deref(), Some("t2"));
+        assert!(exact_collected_turn(&all, "ghost").is_none());
     }
 
     /// issue #195 — a pointer that costs more than the text it withholds makes
@@ -8307,7 +8590,7 @@ mod session_tool_tests {
     ) -> (
         GatewayHandle,
         String,
-        tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationPulse>,
     ) {
         let factory: std::sync::Arc<
             dyn Fn(
@@ -8728,6 +9011,7 @@ mod session_tool_tests {
             tmp.path(),
             child_sid,
             &ccteam_harness::execution::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: format!("{child_sid}-1"),
                 ts: chrono::Utc::now(),
                 vendor: "claude".into(),
@@ -8967,8 +9251,11 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_exact_keys(&r, &["sid", "status", "turn_id"]);
-        assert_eq!(r["status"], json!("pending"), "dispatch merged: {r}");
+        assert_exact_keys(&r, &["delivery", "request_id", "sid", "status", "turn_id"]);
+        // The disposition the adapter reported, not a flat `pending` (#201).
+        assert_eq!(r["status"], json!("started"), "dispatch merged: {r}");
+        assert_eq!(r["delivery"]["accepted"], json!(true), "{r}");
+        assert_eq!(r["delivery"]["executing"], json!("unknown"), "{r}");
         assert!(
             r["turn_id"].as_str().is_some_and(|t| !t.is_empty()),
             "turn_id present: {r}"
@@ -8999,7 +9286,7 @@ mod session_tool_tests {
         // follow-up. The caller's next move (poll) is the same either way.
         assert_eq!(spawned["notify_deliverable"], false, "{spawned}");
         assert!(
-            ccteam_harness::read_delegation_watch(tmp.path(), spawned_sid).is_none(),
+            ccteam_harness::read_delegation_requests(tmp.path(), spawned_sid).is_none(),
             "an admin fallback caller has no parent watch"
         );
 
@@ -9025,7 +9312,7 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert_eq!(dispatched["notify_deliverable"], false);
-        assert!(ccteam_harness::read_delegation_watch(tmp.path(), &child).is_none());
+        assert!(ccteam_harness::read_delegation_requests(tmp.path(), &child).is_none());
 
         let off_child = parse(
             &run_agent_spawn(
@@ -9071,6 +9358,7 @@ mod session_tool_tests {
             &r,
             &[
                 "context_pct",
+                "request_id",
                 "result_text",
                 "sid",
                 "status",
@@ -9189,6 +9477,7 @@ mod session_tool_tests {
             tmp.path(),
             &child,
             &ccteam_harness::execution::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: "answer-1".into(),
                 ts: chrono::Utc::now(),
                 vendor: "claude".into(),
@@ -9261,7 +9550,17 @@ mod session_tool_tests {
                 .await
                 .unwrap(),
         );
-        assert_exact_keys(&t2, &["idempotent_replay", "sid", "status", "turn_id"]);
+        assert_exact_keys(
+            &t2,
+            &[
+                "delivery",
+                "idempotent_replay",
+                "request_id",
+                "sid",
+                "status",
+                "turn_id",
+            ],
+        );
         assert_eq!(t1["turn_id"], t2["turn_id"], "replay returns the same turn");
         assert_eq!(t2["idempotent_replay"], true, "a replay says so");
     }
@@ -9428,7 +9727,9 @@ mod session_tool_tests {
             .await
             .unwrap(),
         );
-        assert_eq!(r2["status"], json!("pending"), "timeout: {r2}");
+        assert_eq!(r2["answered"], json!(false), "timeout: {r2}");
+        assert_eq!(r2["status"], json!("started"), "timeout: {r2}");
+        assert!(r2["request_id"].as_str().is_some(), "{r2}");
         assert!(r2.get("requested_wait_seconds").is_none(), "{r2}");
         assert!(r2.get("effective_wait_seconds").is_none(), "{r2}");
         assert!(
@@ -9477,6 +9778,7 @@ mod session_tool_tests {
             &r,
             &[
                 "context_pct",
+                "request_id",
                 "result_text",
                 "sid",
                 "status",
@@ -9814,10 +10116,14 @@ mod session_tool_tests {
         // watched (so the child's completion keeps hitting the ledger) with no
         // impossible delivery armed on it.
         let watch =
-            ccteam_harness::read_delegation_watch(tmp.path(), external["sid"].as_str().unwrap())
+            ccteam_harness::read_delegation_requests(tmp.path(), external["sid"].as_str().unwrap())
                 .expect("the delegation edge is still watched");
-        assert_eq!(watch.parent_sid, node);
-        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Off, "{watch:?}");
+        assert_eq!(watch.requests[0].parent_sid, node);
+        assert_eq!(
+            watch.requests[0].notify,
+            ccteam_harness::NotifyMode::Off,
+            "{watch:?}"
+        );
 
         // A managed parent has a transport, and keeps it.
         let managed = parse(
@@ -9835,11 +10141,15 @@ mod session_tool_tests {
         );
         assert!(managed.get("notify_deliverable").is_none(), "{managed}");
         let watch =
-            ccteam_harness::read_delegation_watch(tmp.path(), managed["sid"].as_str().unwrap())
+            ccteam_harness::read_delegation_requests(tmp.path(), managed["sid"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(watch.parent_sid, principal);
+        assert_eq!(watch.requests[0].parent_sid, principal);
         // issue #194 — frugal by default: nobody asked for the 2000-char tier.
-        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Brief, "{watch:?}");
+        assert_eq!(
+            watch.requests[0].notify,
+            ccteam_harness::NotifyMode::Brief,
+            "{watch:?}"
+        );
     }
 
     /// v0.10.1 (issue #184) — a dispatch to a session the caller never
@@ -9882,17 +10192,24 @@ mod session_tool_tests {
         );
         assert_exact_keys(
             &handoff,
-            &["notify_deliverable", "sid", "status", "turn_id"],
+            &[
+                "delivery",
+                "notify_deliverable",
+                "request_id",
+                "sid",
+                "status",
+                "turn_id",
+            ],
         );
         assert_eq!(handoff["notify_deliverable"], false, "{handoff}");
         // `notify_deliverable:false` IS the instruction to poll; a prose hint
         // saying so again is the manual this surface stopped being.
         assert!(handoff.get("hint").is_none(), "{handoff}");
-        let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer)
+        let watch = ccteam_harness::read_delegation_requests(tmp.path(), &peer)
             .expect("the handoff edge is still recorded in the ledger");
-        assert_eq!(watch.parent_sid, principal);
+        assert_eq!(watch.requests[0].parent_sid, principal);
         assert_eq!(
-            watch.notify,
+            watch.requests[0].notify,
             ccteam_harness::NotifyMode::Off,
             "a peer handoff is ledger-only: {watch:?}"
         );
@@ -9912,8 +10229,21 @@ mod session_tool_tests {
             .unwrap(),
         );
         assert!(explicit.get("notify_deliverable").is_none(), "{explicit}");
-        let watch = ccteam_harness::read_delegation_watch(tmp.path(), &peer).unwrap();
-        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Final, "{watch:?}");
+        let watch = ccteam_harness::read_delegation_requests(tmp.path(), &peer).unwrap();
+        // The opt-in is a NEW request. It does not reach back and subscribe
+        // the earlier handoff, which stays the ledger-only edge it was asked
+        // to be — one dispatch never rewrites another's terms (issue #201).
+        assert_eq!(watch.requests.len(), 2, "{watch:?}");
+        assert_eq!(
+            watch.requests[0].notify,
+            ccteam_harness::NotifyMode::Off,
+            "{watch:?}"
+        );
+        assert_eq!(
+            watch.requests[1].notify,
+            ccteam_harness::NotifyMode::Final,
+            "{watch:?}"
+        );
 
         // The caller's OWN child keeps the default notification.
         let child = parse(
@@ -9931,9 +10261,13 @@ mod session_tool_tests {
         );
         assert!(child.get("notify_deliverable").is_none(), "{child}");
         let watch =
-            ccteam_harness::read_delegation_watch(tmp.path(), child["sid"].as_str().unwrap())
+            ccteam_harness::read_delegation_requests(tmp.path(), child["sid"].as_str().unwrap())
                 .unwrap();
-        assert_eq!(watch.notify, ccteam_harness::NotifyMode::Brief, "{watch:?}");
+        assert_eq!(
+            watch.requests[0].notify,
+            ccteam_harness::NotifyMode::Brief,
+            "{watch:?}"
+        );
     }
 
     /// The refusal sits BEHIND the ACL, not in front of it: a tenant who can see
@@ -10022,7 +10356,7 @@ mod session_tool_tests {
             /// `alpha`'s working tree — its hook rung is `.ccteam/hooks/`.
             project_dir: PathBuf,
             /// Held so delegation signals have somewhere to land.
-            _signals: tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationSignal>,
+            _signals: tokio::sync::mpsc::UnboundedReceiver<crate::delegation::DelegationPulse>,
         }
 
         async fn fixture(tmp: &std::path::Path) -> Fixture {
@@ -10920,6 +11254,7 @@ mod tool_face_tests {
             &resolved.project_dir,
             &root,
             &ccteam_harness::execution::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: format!("{root}-1"),
                 ts: chrono::Utc::now(),
                 vendor: "claude".into(),

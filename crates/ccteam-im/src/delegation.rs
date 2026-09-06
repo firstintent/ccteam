@@ -24,12 +24,39 @@ use ccteam_harness::AgentVendor;
 /// - `boundary: true` — the vendor turn finished (`TurnCompleted` /
 ///   `TurnFailed` / `Error`). This is the default (`final`) notification point.
 #[derive(Debug, Clone)]
+pub enum DelegationPulse {
+    /// The child OPENED an execution turn. Requests bound to it are now
+    /// observed running — the one of the four delivery facts that a stdin
+    /// flush never proves (issue #201).
+    TurnOpened {
+        /// The child session whose turn opened.
+        child_sid: String,
+        /// The adapter's execution-turn id for it.
+        exec_turn_id: String,
+    },
+    /// A mirrored assistant message, or the turn boundary that ends a task.
+    Signal(DelegationSignal),
+}
+
+impl From<DelegationSignal> for DelegationPulse {
+    fn from(signal: DelegationSignal) -> Self {
+        DelegationPulse::Signal(signal)
+    }
+}
+
+/// One mirrored child message or turn boundary, on its way to the notifier.
+#[derive(Debug, Clone)]
 pub struct DelegationSignal {
     /// The child session whose message/turn just completed.
     pub child_sid: String,
     /// The mirrored turn id carrying this signal's `tail` (the dedup key;
     /// for a boundary signal this is the turn holding the FINAL answer).
     pub turn_id: String,
+    /// The ADAPTER's execution-turn id this boundary ended. A delegation
+    /// request is bound to it at submit time, so it is what says WHOSE task
+    /// just finished — never the newest title, a timestamp or a queue position
+    /// (issue #201). `None` on a channel that exposes no execution identity.
+    pub exec_turn_id: Option<String>,
     /// Full assistant text. The notification builder applies its own bounded
     /// excerpt; the durable session ledger retains this verbatim.
     pub tail: String,
@@ -78,6 +105,14 @@ pub(crate) struct DelegationSummary<'a> {
     /// The turn's conclusion when the vendor marked one shorter than `answer`
     /// (the ledger row's `conclusion`): what a bounded excerpt shows first.
     pub conclusion: Option<&'a str>,
+    /// The REQUEST this completion answers. The parent needs it to tell which
+    /// of its outstanding tasks came back (issue #201: three dispatches to one
+    /// child produced three identical-looking reports).
+    pub request_id: Option<&'a str>,
+    /// That request's own label — never a later dispatch's.
+    pub title: Option<&'a str>,
+    /// How many of this child's requests are still outstanding AFTER this one.
+    pub remaining_queued: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,7 +194,7 @@ impl DelegationSummary<'_> {
         } else {
             format!(" · {}", self.vendor)
         };
-        let first = match self.context_pct {
+        let mut first = match self.context_pct {
             Some(pct) => format!(
                 "{outcome}{vendor} · turn {} · ctx {pct}%{}",
                 self.turn,
@@ -167,10 +202,23 @@ impl DelegationSummary<'_> {
             ),
             None => format!("{outcome}{vendor} · turn {}", self.turn),
         };
+        // WHICH task answered, and what is still owed. A parent holding
+        // several tasks on one child could not tell its reports apart at all
+        // before this (issue #201) — and, told nothing about the queue, it
+        // re-sent the same instruction three times.
+        if let Some(title) = self.title.map(str::trim).filter(|t| !t.is_empty()) {
+            first.push_str(&format!(" · «{title}»"));
+        }
+        if let Some(request_id) = self.request_id.filter(|id| !id.is_empty()) {
+            first.push_str(&format!(" · {request_id}"));
+        }
+        if self.remaining_queued > 0 {
+            first.push_str(&format!(" · {} still queued", self.remaining_queued));
+        }
         let answer_text = self.answer.trim();
         let total_chars = answer_text.chars().count();
         let answer = answer_excerpt(answer_text, self.conclusion, max_chars, |omitted| {
-            full_answer_marker(omitted, total_chars, self.sid)
+            full_answer_marker(omitted, total_chars, self.sid, self.turn_id)
         });
         if answer.text.is_empty() {
             first
@@ -183,6 +231,9 @@ impl DelegationSummary<'_> {
         let mut result = serde_json::Map::new();
         result.insert("sid".into(), serde_json::json!(self.sid));
         result.insert("turn_id".into(), serde_json::json!(self.turn_id));
+        if let Some(request_id) = self.request_id.filter(|id| !id.is_empty()) {
+            result.insert("request_id".into(), serde_json::json!(request_id));
+        }
         result.insert("turn".into(), serde_json::json!(self.turn));
         let (kind, error) = match &self.outcome {
             DelegationOutcome::Done => {
@@ -202,7 +253,7 @@ impl DelegationSummary<'_> {
             self.answer,
             self.conclusion,
             INLINE_RESULT_MAX_CHARS,
-            |omitted| full_answer_marker(omitted, total_chars, self.sid),
+            |omitted| full_answer_marker(omitted, total_chars, self.sid, self.turn_id),
         );
         result.insert("result_text".into(), serde_json::json!(answer.text));
         if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
@@ -388,12 +439,22 @@ pub(crate) fn read_budget_for(total_chars: usize) -> usize {
 }
 
 /// The pointer a truncated answer carries: the exact one-call recipe for the
-/// whole text (`n:1` = the newest turn, which the answer is at delivery), so
-/// the reader never has to guess a budget or page through history (issue
-/// #194: the frugal, correct read was discoverable only by trial).
-pub(crate) fn full_answer_marker(omitted: usize, total_chars: usize, child_sid: &str) -> String {
+/// whole text, so the reader never has to guess a budget or page through
+/// history (issue #194: the frugal, correct read was discoverable only by
+/// trial).
+///
+/// It names the exact TURN (`turn:<turn_id>`), not "the newest one". `n:1` was
+/// only correct at the instant of delivery: a parent that read the excerpt
+/// fifteen minutes later — after the child had finished a queued confirmation
+/// turn — got a different answer entirely and did not know it (issue #201).
+pub(crate) fn full_answer_marker(
+    omitted: usize,
+    total_chars: usize,
+    child_sid: &str,
+    turn_id: &str,
+) -> String {
     format!(
-        "…[+{omitted} chars: agent_read{{sid:{child_sid},n:1,max_chars:{}}}]…",
+        "…[+{omitted} chars: agent_read{{sid:{child_sid},turn:{turn_id},max_chars:{}}}]…",
         read_budget_for(total_chars)
     )
 }
@@ -594,6 +655,9 @@ mod tests {
             cost_usd: None,
             answer: "hello",
             conclusion: None,
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
         assert_eq!(t, "s444 done · codex · turn 3 · ctx 31%\nhello");
@@ -615,6 +679,9 @@ mod tests {
             cost_usd: Some(0.42),
             answer: "wave done",
             conclusion: None,
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         };
         assert_eq!(
             build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
@@ -644,6 +711,9 @@ mod tests {
             cost_usd: None,
             answer: &long,
             conclusion: None,
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         };
         // `final` (the default) and `brief` differ only in the excerpt cap.
         for cap in [
@@ -655,8 +725,12 @@ mod tests {
             assert!(t.contains("TAIL"));
             assert!(t.contains("…[+"));
             // The pointer is the exact recipe for the whole answer: 4 + 2500 + 4
-            // characters, read as the newest turn.
-            assert!(t.contains("agent_read{sid:s1,n:1,max_chars:2508}"), "{t}");
+            // characters, naming THAT turn — still correct after the child has
+            // finished others (issue #201).
+            assert!(
+                t.contains("agent_read{sid:s1,turn:s1-1,max_chars:2508}"),
+                "{t}"
+            );
             let embedded = t.split_once('\n').unwrap().1;
             assert_eq!(embedded.chars().count(), cap);
         }
@@ -689,6 +763,9 @@ mod tests {
             cost_usd: None,
             answer: &answer,
             conclusion: Some(&receipt),
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         };
         let text = summary.notification_text(BRIEF_NOTIFICATION_ANSWER_MAX_CHARS);
         let (header, excerpt) = text.split_once('\n').unwrap();
@@ -707,7 +784,7 @@ mod tests {
         let omitted = total - receipt.chars().count();
         assert!(
             excerpt.starts_with(&format!(
-                "…[+{omitted} chars: agent_read{{sid:s908,n:1,max_chars:{total}}}]…\n"
+                "…[+{omitted} chars: agent_read{{sid:s908,turn:s908-1,max_chars:{total}}}]…\n"
             )),
             "{excerpt}"
         );
@@ -817,6 +894,9 @@ mod tests {
             cost_usd: None,
             answer: "ok",
             conclusion: None,
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         }
         .inline_result();
         assert_eq!(result["sid"], serde_json::json!("s5"));
@@ -842,6 +922,9 @@ mod tests {
             cost_usd: None,
             answer: "oops",
             conclusion: None,
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         };
         assert_eq!(
             build_notification_text_with_outcome(&summary, NOTIFICATION_ANSWER_MAX_CHARS),
@@ -861,6 +944,9 @@ mod tests {
             cost_usd: None,
             answer: "ok",
             conclusion: None,
+            request_id: None,
+            title: None,
+            remaining_queued: 0,
         }
         .notification_text(NOTIFICATION_ANSWER_MAX_CHARS);
         assert_eq!(t.lines().next(), Some("s444 done · codex · turn 3"));

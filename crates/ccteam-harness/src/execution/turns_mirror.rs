@@ -64,6 +64,14 @@ pub enum AttachmentRefKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub turn_id: String,
+    /// The ADAPTER's execution-turn id this row belongs to, when the channel
+    /// has one. `turn_id` above is ccteam's own per-row key; a vendor turn can
+    /// span several rows (interim narration) and a delegation request is bound
+    /// to the EXECUTION turn, so a restart reconcile needs the execution id on
+    /// disk to rebind an outstanding request to the answer it produced
+    /// (issue #201). Absent on rows written by channels that expose none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_turn_id: Option<String>,
     pub ts: DateTime<Utc>,
     /// Vendor scalar (`"claude"` / `"codex"`). Plain string here so the
     /// jsonl is hand-greppable; the orchestrator never mixes vendors in
@@ -202,6 +210,7 @@ mod tests {
 
     fn mk_turn(id: &str, role: &str, user: &str, assistant: &str) -> TurnRecord {
         TurnRecord {
+            exec_turn_id: None,
             turn_id: id.to_string(),
             ts: Utc::now(),
             vendor: "claude".to_string(),
