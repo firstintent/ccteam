@@ -170,8 +170,10 @@ pub struct ThreadLive {
     /// Reasoning-effort the thread runs at (codex `reasoningEffort`,
     /// lowercase: `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/custom).
     /// Seeded from the `thread/start` / `thread/resume` response
-    /// ([`pluck_effort`]) and `thread/settings/updated`. A queued `/model`
-    /// override is intent, not an observation. `None`
+    /// ([`pluck_effort`]) and `thread/settings/updated`. A `/model` pick is
+    /// intent, not an observation: on an idle thread it reaches codex over
+    /// `thread/settings/update` and comes back as a snapshot; on a busy one
+    /// it waits in the override map for the next `turn/start`. `None`
     /// when codex reports no effort. Surfaced in the `/sessions` statusline.
     pub effort: Option<String>,
     /// A resume response must not overwrite a newer settings notification.
@@ -1293,13 +1295,26 @@ impl CodexAppServerAdapter {
                     }
                 })
                 .await;
+                let Some(model) = model else {
+                    return Ok(Some(DirectiveOutcome::Done {
+                        receipt: "model override cleared.".to_string(),
+                    }));
+                };
+                // Idle thread: the pick reaches codex now, and `/status`
+                // follows through codex's own settings snapshot. Otherwise
+                // the queued override is the truth, and the receipt says so.
+                let applied = self
+                    .push_thread_settings(tid, &model, effort.as_deref())
+                    .await;
+                let pick = match &effort {
+                    Some(e) => format!("model → {model} (effort {e})"),
+                    None => format!("model → {model}"),
+                };
                 DirectiveOutcome::Done {
-                    receipt: match (&model, &effort) {
-                        (Some(m), Some(e)) => {
-                            format!("model → {m} (effort {e}); applies next turn.")
-                        }
-                        (Some(m), None) => format!("model → {m}; applies next turn."),
-                        _ => "model override cleared.".to_string(),
+                    receipt: if applied {
+                        format!("{pick}.")
+                    } else {
+                        format!("{pick}; applies next turn.")
                     },
                 }
             }
@@ -1535,6 +1550,67 @@ impl CodexAppServerAdapter {
     async fn set_override(&self, thread_id: &str, f: impl FnOnce(&mut SessionOverride)) {
         let mut map = self.overrides.lock().await;
         f(map.entry(thread_id.to_string()).or_default());
+    }
+
+    /// `/model` on an IDLE thread pushes the pick to codex right away over
+    /// `thread/settings/update` (codex 0.153.4, probed 2026-09-06 against the
+    /// real app-server: the response is `{}` and a `thread/settings/updated`
+    /// snapshot follows at once — the one path that updates the tracker
+    /// behind `/status`; an omitted `effort` keeps the thread's current one).
+    /// Before this the pick lived only in the override map until the next
+    /// `turn/start`, so `/status` on a fresh or idle session kept reporting
+    /// the model codex had resolved at `thread/start`
+    /// (docs-local/issues/#200, re-reported on s930 at 819b2d2d).
+    ///
+    /// Returns whether codex holds the setting now. `false` leaves the queued
+    /// override as the carriage for the next `turn/start`
+    /// ([`Self::apply_overrides`]):
+    /// - a turn is in flight: codex would snapshot the new model immediately
+    ///   while the running turn still uses the old one, and the terminal
+    ///   attribution (`ObservedNotification::model`) would relabel it;
+    /// - the thread cannot be loaded or the RPC fails (older codex, transport
+    ///   death): the pre-existing next-turn path is the honest fallback.
+    ///
+    /// The override stays set on success as well — resending it on
+    /// `turn/start` is idempotent, and it covers a thread codex reloads from
+    /// disk before any turn ran with the new setting.
+    async fn push_thread_settings(&self, tid: &str, model: &str, effort: Option<&str>) -> bool {
+        let busy = self
+            .tracker_snapshot(tid)
+            .await
+            .is_some_and(|t| t.active_turn.is_some());
+        if busy {
+            return false;
+        }
+        let client = match self.ensure_thread_loaded(tid).await {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(
+                    thread_id = tid,
+                    error = %err,
+                    "thread/settings/update skipped (thread not loadable); pick queued for next turn"
+                );
+                return false;
+            }
+        };
+        let mut params = json!({ "threadId": tid, "model": model });
+        if let Some(effort) = effort {
+            params["effort"] = Value::String(effort.to_string());
+        }
+        match self
+            .call_or_drop_dead(&client, "thread/settings/update", params)
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!(
+                    thread_id = tid,
+                    error = %err,
+                    "thread/settings/update failed; pick queued for next turn"
+                );
+                false
+            }
+        }
     }
 
     /// v0.8.5 D2 — return the (cached) flattened skills list, fetching from

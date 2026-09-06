@@ -647,10 +647,25 @@ async fn spawn_scripted_peer(
                             if let Some(id) = id {
                                 resp["id"] = id;
                             }
+                            // A handler may script server notifications that
+                            // follow its response (`notify: [..]`), the way
+                            // codex answers `thread/settings/update` with `{}`
+                            // and then a `thread/settings/updated` snapshot.
+                            let follow_ups = resp
+                                .as_object_mut()
+                                .and_then(|o| o.remove("notify"))
+                                .and_then(|v| v.as_array().cloned())
+                                .unwrap_or_default();
                             let mut bytes = serde_json::to_vec(&resp).unwrap();
                             bytes.push(b'\n');
                             let _ = w.write_all(&bytes).await;
                             let _ = w.flush().await;
+                            for n in follow_ups {
+                                let mut bytes = serde_json::to_vec(&n).unwrap();
+                                bytes.push(b'\n');
+                                let _ = w.write_all(&bytes).await;
+                                let _ = w.flush().await;
+                            }
                         }
                     }
                 }
@@ -1293,6 +1308,7 @@ fn d2_response(req: &Value) -> Value {
         }}),
         Some("thread/rollback") => json!({ "result": { "thread": { "id": "tid-d2" } } }),
         Some("thread/name/set") => json!({ "result": {} }),
+        Some("thread/settings/update") => json!({ "result": {} }),
         Some("thread/goal/set") => json!({ "result": { "goal": {
             "threadId": "tid-d2", "objective": "ship", "status": "active",
             "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0,
@@ -1769,12 +1785,22 @@ async fn d2_query_synth_class() {
 async fn d2_override_class_applies_on_next_turn() {
     let (adapter, h, seen, peer, sock) = d2_start("d2-override").await;
 
-    // /model gpt-5 high → override (no RPC yet).
+    // /model gpt-5 high → override + an immediate thread/settings/update
+    // (the thread is idle), never a turn.
     let out = adapter
         .handle_directive(&h, dir("model", "gpt-5 high"))
         .await
         .unwrap();
     assert!(matches!(out, DirectiveOutcome::Done { .. }));
+    {
+        let frames = seen.lock().unwrap();
+        let update = find_frame(&frames, "thread/settings/update")
+            .expect("idle /model pushes thread/settings/update");
+        assert_eq!(
+            update["params"],
+            json!({ "threadId": "tid-d2", "model": "gpt-5", "effort": "high" })
+        );
+    }
     // /personality friendly, /collab plan, /permissions read-only.
     let _ = adapter
         .handle_directive(&h, dir("personality", "friendly"))
@@ -2259,10 +2285,22 @@ async fn model_settings_pending_and_rejected_changes_do_not_relabel_turn() {
         }
     })
     .await;
-    adapter
+    let out = adapter
         .handle_directive(&h, dir("model", "unlisted-next-model xhigh"))
         .await
         .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => assert_eq!(
+            receipt, "model → unlisted-next-model (effort xhigh); applies next turn.",
+            "a busy thread keeps the pick queued and the receipt says so"
+        ),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(
+        find_frame(&seen.lock().unwrap(), "thread/settings/update").is_none(),
+        "no settings RPC while a turn is running: codex would snapshot the new model \
+         under a turn still running on the old one"
+    );
     adapter
         .submit_turn(&h, TurnInput::UserText("steer".into()))
         .await
@@ -2297,6 +2335,206 @@ async fn model_settings_pending_and_rejected_changes_do_not_relabel_turn() {
     let status = adapter.thread_status(&h).await.unwrap();
     assert_eq!(status.model.as_deref(), Some("original"));
     assert_eq!(status.effort.as_deref(), Some("high"));
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// #200 follow-up (s930): a `/model` pick on an IDLE thread must reach codex
+/// at once over `thread/settings/update`, and `/status` must follow through
+/// codex's own `thread/settings/updated` snapshot — a fresh session (turn 0)
+/// showed the spawn-resolved model right after the pick. The peer emulates
+/// codex 0.153.4 as probed: `{}` then a snapshot; an omitted `effort` keeps
+/// the thread's current one. Both entry points (direct args and the picker)
+/// are covered, and the next `turn/start` still carries the override.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_pick_on_idle_thread_reaches_codex_and_status_follows() {
+    let settings = Arc::new(StdMutex::new((
+        "gpt-5.6-sol".to_string(),
+        Some("xhigh".to_string()),
+    )));
+    let peer_settings = Arc::clone(&settings);
+    let (adapter, h, seen, peer, notif, sock) =
+        d2_start_with_handler("model-idle-push", move |req| {
+            if req["method"] != "thread/settings/update" {
+                return d2_response(req);
+            }
+            let mut current = peer_settings.lock().unwrap();
+            if let Some(model) = req["params"]["model"].as_str() {
+                current.0 = model.to_string();
+            }
+            if let Some(effort) = req["params"]["effort"].as_str() {
+                current.1 = Some(effort.to_string());
+            }
+            json!({ "result": {}, "notify": [{
+                "method": "thread/settings/updated",
+                "params": { "threadId": req["params"]["threadId"],
+                    "threadSettings": { "model": current.0, "effort": current.1 } }
+            }]})
+        })
+        .await;
+    // What codex resolved at thread/start.
+    notif
+        .send(json!({ "method": "thread/settings/updated", "params": {
+            "threadId": h.identity,
+            "threadSettings": { "model": "gpt-5.6-sol", "effort": "xhigh" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            adapter.thread_status(&h).await.unwrap().model.as_deref() == Some("gpt-5.6-sol")
+        }
+    })
+    .await;
+
+    // Direct args: model + effort.
+    let out = adapter
+        .handle_directive(&h, dir("model", "gpt-6-astra xhigh"))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => assert_eq!(
+            receipt, "model → gpt-6-astra (effort xhigh).",
+            "an applied pick does not promise a later turn"
+        ),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    {
+        let frames = seen.lock().unwrap();
+        let update = find_frame(&frames, "thread/settings/update").expect("settings RPC");
+        assert_eq!(
+            update["params"],
+            json!({ "threadId": h.identity, "model": "gpt-6-astra", "effort": "xhigh" })
+        );
+        assert!(
+            find_frame(&frames, "turn/start").is_none(),
+            "a pick is not a turn"
+        );
+    }
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            let status = adapter.thread_status(&h).await.unwrap();
+            status.model.as_deref() == Some("gpt-6-astra")
+                && status.effort.as_deref() == Some("xhigh")
+        }
+    })
+    .await;
+
+    // Picker re-entry with a model only: codex keeps the effort.
+    seen.lock().unwrap().clear();
+    let out = adapter
+        .handle_directive(&h, dir_choice("model", "tok", &["future-model-picker"]))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => {
+            assert_eq!(receipt, "model → future-model-picker.")
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    {
+        let frames = seen.lock().unwrap();
+        let update = find_frame(&frames, "thread/settings/update").expect("settings RPC");
+        assert_eq!(
+            update["params"],
+            json!({ "threadId": h.identity, "model": "future-model-picker" }),
+            "no effort given → none sent, so codex keeps the thread's own"
+        );
+    }
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            let status = adapter.thread_status(&h).await.unwrap();
+            status.model.as_deref() == Some("future-model-picker")
+                && status.effort.as_deref() == Some("xhigh")
+        }
+    })
+    .await;
+
+    // The override still rides the next turn/start (idempotent carriage).
+    seen.lock().unwrap().clear();
+    adapter
+        .submit_turn(&h, TurnInput::UserText("go".into()))
+        .await
+        .unwrap();
+    let frames = seen.lock().unwrap().clone();
+    let ts = find_frame(&frames, "turn/start").expect("turn/start");
+    assert_eq!(ts["params"]["model"], "future-model-picker");
+    assert_eq!(ts["params"]["effort"], "xhigh");
+
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// A codex without `thread/settings/update` (or a failing RPC) falls back to
+/// the queued override: the receipt promises the next turn, status stays on
+/// the observed model, and the next `turn/start` carries the pick.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_pick_falls_back_to_next_turn_when_settings_rpc_fails() {
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_handler("model-rpc-missing", |req| {
+        if req["method"] == "thread/settings/update" {
+            json!({ "error": { "code": -32601, "message": "method not found" } })
+        } else {
+            d2_response(req)
+        }
+    })
+    .await;
+    notif
+        .send(json!({ "method": "thread/settings/updated", "params": {
+            "threadId": h.identity,
+            "threadSettings": { "model": "gpt-5.6-sol", "effort": "high" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            adapter.thread_status(&h).await.unwrap().model.as_deref() == Some("gpt-5.6-sol")
+        }
+    })
+    .await;
+
+    let out = adapter
+        .handle_directive(&h, dir("model", "gpt-6-astra xhigh"))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => {
+            assert_eq!(
+                receipt,
+                "model → gpt-6-astra (effort xhigh); applies next turn."
+            )
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(find_frame(&seen.lock().unwrap(), "thread/settings/update").is_some());
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+    let ov = adapter.override_for_test(&h.identity).await;
+    assert_eq!(ov.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(ov.effort.as_deref(), Some("xhigh"));
+
+    seen.lock().unwrap().clear();
+    adapter
+        .submit_turn(&h, TurnInput::UserText("go".into()))
+        .await
+        .unwrap();
+    let frames = seen.lock().unwrap().clone();
+    let ts = find_frame(&frames, "turn/start").expect("turn/start");
+    assert_eq!(ts["params"]["model"], "gpt-6-astra");
+    assert_eq!(ts["params"]["effort"], "xhigh");
+
     peer.abort();
     let _ = std::fs::remove_file(sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
