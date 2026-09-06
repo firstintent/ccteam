@@ -3277,6 +3277,26 @@ impl NotifyRequest {
             explicit: true,
         }
     }
+
+    /// The mode this dispatch actually runs under: an explicit argument wins,
+    /// otherwise this parent's most recent outstanding request on this child
+    /// sets the precedent, otherwise the wire default (`brief`).
+    ///
+    /// THE one place that decides it (issue #201 F.1). Every dispatch path —
+    /// a caller's own child, a peer handoff, an external parent — asks here, so
+    /// a parent's deliberate `final` cannot be silently downgraded on the next
+    /// message by a path that forgot to look. It used to be: the parent made a
+    /// fifteen-minute decision off the 443-character excerpt that came back.
+    fn effective(self, precedent: Option<ccteam_harness::NotifyMode>) -> Self {
+        if self.explicit {
+            return self;
+        }
+        Self {
+            mode: precedent.unwrap_or(self.mode),
+            // Inherited, not named: a later follow-up inherits it in turn.
+            explicit: false,
+        }
+    }
 }
 
 /// The completion-notification route for one dispatch. A managed ambient
@@ -3365,6 +3385,20 @@ async fn dispatch_task(
     deadline: crate::gateway::GatewayDeadline,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let is_delegation = !caller_sid.is_empty();
+    // Claimed BEFORE anything is read or written, and held through the submit
+    // and the bind (issue #201). A child that answers in the microsecond after
+    // its line reached the vendor used to find its request still `Accepted`,
+    // resolve nothing, and lose the completion until a daemon restart; the
+    // notifier plans under this same claim, so it waits for the binding.
+    let store_claim = if is_delegation {
+        Some(
+            crate::gateway::Gateway::claim_delegation_store_within(gateway, sid, deadline)
+                .await
+                .map_err(|error| mcp_gateway_error(tool, &error))?,
+        )
+    } else {
+        None
+    };
     let (rx, parent_is_external, peer_unsubscribed, precedent) = {
         let gw = deadline
             .lock(gateway)
@@ -3383,15 +3417,6 @@ async fn dispatch_task(
         } else {
             None
         };
-        // v0.10.1 — is the target one of the caller's OWN sessions? A dispatch
-        // to a session the caller never delegated is a HANDOFF: the target has
-        // its own parent, or is a root with its own human. `agent_read` draws
-        // no edge for it (that tree is spawn lineage) and `agent_stop` refuses
-        // it, so a subscription made here is an edge nobody can see or take
-        // down. The default `notify` is a default, not a request — only an
-        // explicit one subscribes the caller to a session it does not own.
-        let peer_unsubscribed =
-            is_delegation && !notify.explicit && !gw.lineage_reaches(sid, caller_sid);
         // What this caller last asked for on this child, if anything is still
         // outstanding — the precedent an omitted `notify` inherits.
         let precedent = if is_delegation && !notify.explicit {
@@ -3399,17 +3424,28 @@ async fn dispatch_task(
         } else {
             None
         };
+        // v0.10.1 — is the target one of the caller's OWN sessions? A dispatch
+        // to a session the caller never delegated is a HANDOFF: the target has
+        // its own parent, or is a root with its own human. `agent_read` draws
+        // no edge for it (that tree is spawn lineage) and `agent_stop` refuses
+        // it, so a subscription made here is an edge nobody can see or take
+        // down. The default `notify` is a default, not a request — only an
+        // explicit one subscribes the caller to a session it does not own.
+        //
+        // A precedent IS such a request: this caller already has outstanding
+        // work on this peer under a mode it chose, so the follow-up inherits
+        // that mode instead of being silenced (issue #201 F.1 — the peer path
+        // is a dispatch path like any other).
+        let peer_unsubscribed = is_delegation
+            && !notify.explicit
+            && precedent.is_none()
+            && !gw.lineage_reaches(sid, caller_sid);
         (rx, parent_is_external, peer_unsubscribed, precedent)
     };
-    // A follow-up that names no mode keeps the mode this parent chose for its
-    // outstanding work on this child. Silently reverting to the default turned
-    // a deliberate `final` into a 443-character `brief` mid-conversation, and
-    // the parent made a fifteen-minute decision off the excerpt (issue #201).
-    let effective_notify = if notify.explicit {
-        notify.mode
-    } else {
-        precedent.unwrap_or(notify.mode)
-    };
+    // ONE decision, used by the recorded request AND by the response's
+    // notification route below, so the two can never disagree.
+    let notify = notify.effective(precedent);
+    let effective_notify = notify.mode;
     let request_id = if is_delegation {
         // The request is recorded either way — the completion edge belongs in
         // the ledger (`delegation_completed` fires off it, whatever the notify
@@ -3428,7 +3464,9 @@ async fn dispatch_task(
         };
         let accepted = crate::gateway::Gateway::accept_delegation_request_shared(
             Arc::clone(gateway),
-            sid,
+            store_claim
+                .as_ref()
+                .expect("a delegation holds its store claim"),
             caller_sid,
             watch_notify,
             title.clone(),
@@ -3478,7 +3516,9 @@ async fn dispatch_task(
             if let Some(request_id) = request_id.as_deref() {
                 crate::gateway::Gateway::drop_delegation_request_shared(
                     Arc::clone(gateway),
-                    sid,
+                    store_claim
+                        .as_ref()
+                        .expect("a delegation holds its store claim"),
                     request_id,
                 )
                 .await;
@@ -3491,7 +3531,9 @@ async fn dispatch_task(
         // the next millisecond must already know whose answer it is.
         crate::gateway::Gateway::bind_delegation_request_shared(
             Arc::clone(gateway),
-            sid,
+            store_claim
+                .as_ref()
+                .expect("a delegation holds its store claim"),
             request_id,
             &receipt,
         )
@@ -3511,6 +3553,10 @@ async fn dispatch_task(
             );
         }
     }
+    // The handover is complete: the request is bound, so the notifier may plan
+    // against it. Released BEFORE the inline wait below — a wait that held it
+    // would block the very boundary it is waiting for.
+    drop(store_claim);
     let notification_route = CompletionNotificationRoute::resolve(
         caller_sid,
         notify,
@@ -3628,6 +3674,14 @@ fn pending_dispatch_response(
         response.insert("request_id".to_string(), serde_json::json!(request_id));
     }
     insert_delivery_facts(&mut response, receipt);
+    // A named request with no row left in the store: it was dropped out from
+    // under the caller (a stop, or an unreachable parent). Everything ccteam
+    // knew about its fate went with it, so the state is `unknown` — not
+    // `queued`, not `answered`, and never a sibling's text.
+    if delivery.is_none() && request_id.is_some() {
+        response.insert("state".to_string(), serde_json::json!("unknown"));
+        response.remove("queue_position");
+    }
     // The live row wins over the submit-time guess: a task that was third in
     // the queue when it was accepted may be running by now.
     if let Some(row) = delivery {
@@ -3778,16 +3832,22 @@ async fn dispatch_wait_for_completion(
     loop {
         let slice = deadline.min(tokio::time::Instant::now() + REQUEST_POLL);
         let _ = await_turn_boundary(gateway, child_sid, slice, &mut rx, false).await;
-        // A request that has left the store (its parent became unreachable and
-        // the notifier dropped it) is as done as one that answered — there is
-        // nothing left to wait for.
         let state = {
             let gw = gateway.lock().await;
             gw.delegation_request_state(child_sid, request_id)
         };
-        if state.is_none_or(|state| state.is_terminal()) {
-            answered = true;
-            break;
+        match state {
+            Some(state) if state.is_terminal() => {
+                answered = true;
+                break;
+            }
+            // The row has LEFT the store: an `agent_stop` dropped it, or the
+            // notifier could not reach its parent. Nothing will resolve it now,
+            // so the wait ends — but "gone" is not "answered" (issue #201).
+            // Treating it as answered sent the caller to the transcript tail,
+            // where the newest row is a SIBLING's answer. It reports unknown.
+            None => break,
+            Some(_) => {}
         }
         if tokio::time::Instant::now() >= deadline {
             break;
@@ -3853,14 +3913,21 @@ async fn finish_dispatch_wait(
             let all =
                 ccteam_harness::execution::turns_mirror::read_all_turns(&r.project_dir, &r.sid)
                     .unwrap_or_default();
-            // THE row this request was resolved against — not the newest one.
-            // Between the boundary and this read the child may already have
-            // finished a queued follow-up, and returning that as the answer is
-            // exactly the mix-up this wait exists to prevent (issue #201).
-            let last = answered_turn
-                .as_deref()
-                .and_then(|turn_id| all.iter().find(|t| t.turn_id == turn_id).cloned())
-                .or_else(|| all.into_iter().rev().find(|t| !t.assistant.is_empty()));
+            // THE row this request was resolved against — never the newest
+            // one. Between the boundary and this read the child may already
+            // have finished a queued follow-up, and returning that as the
+            // answer is exactly the mix-up this wait exists to prevent (issue
+            // #201). With a request identity there is NO substitute: an answer
+            // we cannot name is reported as absent, not as somebody else's.
+            // Without one — an admin caller waiting on the child's next
+            // boundary — the newest row is what was waited for.
+            let last = match answered_turn.as_deref() {
+                Some(turn_id) => all.into_iter().find(|t| t.turn_id == turn_id),
+                None if request_id.is_none() => {
+                    all.into_iter().rev().find(|t| !t.assistant.is_empty())
+                }
+                None => None,
+            };
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
             // tokens, same semantics as agent_read/collect (tokens present
             // even for vendors with no USD price table).
@@ -4949,6 +5016,14 @@ async fn run_agent_stop(
             .unwrap_or("")
             .to_string(),
         McpCaller::Admin | McpCaller::User { .. } => String::new(),
+    };
+    // Dropping the child's requests is a store mutation like any other, so it
+    // queues behind whatever dispatch or notification is mid-write. Taken
+    // before the gateway lock (claim-then-lock order) and held across both.
+    let _store_claim = if caller_sid.is_empty() {
+        None
+    } else {
+        Some(crate::gateway::Gateway::claim_delegation_store(gateway, &sid).await)
     };
     let mut gw = gateway.lock().await;
     if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
@@ -6171,6 +6246,11 @@ mod session_tool_tests {
         narrate: bool,
         /// Delay (ms) before `events()` yields — forces a `wait` timeout.
         event_delay_ms: u64,
+        /// Run a STARTED turn to its boundary from inside `submit_turn_routed`,
+        /// then hold the call open long enough for the pump and the notifier to
+        /// have processed it. The pathological ordering behind issue #197: a
+        /// child that answers before the dispatcher has bound its request.
+        complete_inside_submit: bool,
         events: std::sync::Arc<
             tokio::sync::Mutex<std::collections::VecDeque<(String, ccteam_harness::ThreadEvent)>>,
         >,
@@ -6350,6 +6430,15 @@ mod session_tool_tests {
                     },
                 ],
             );
+            if self.complete_inside_submit
+                && disposition == ccteam_harness::TurnDisposition::Started
+            {
+                self.run_next_turn(&h.identity).await;
+                // The submit has not returned yet, so the caller cannot have
+                // bound anything. Long enough for the pump to translate the
+                // boundary and the notifier to reach it.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
             let turn_id = ccteam_harness::TurnId::new(turn_id);
             Ok(match disposition {
                 ccteam_harness::TurnDisposition::Queued => {
@@ -8806,9 +8895,19 @@ mod session_tool_tests {
     async fn queueing_dispatch_gateway(
         project_dir: &std::path::Path,
     ) -> (GatewayHandle, String, StubAdapter) {
+        queueing_dispatch_gateway_with(project_dir, false).await
+    }
+
+    /// [`queueing_dispatch_gateway`], with the option of a stub that answers a
+    /// started turn from INSIDE the submit call.
+    async fn queueing_dispatch_gateway_with(
+        project_dir: &std::path::Path,
+        complete_inside_submit: bool,
+    ) -> (GatewayHandle, String, StubAdapter) {
         let shared = StubAdapter {
             answer: true,
             queue: Some(std::sync::Arc::new(StubTurnQueue::default())),
+            complete_inside_submit,
             ..Default::default()
         };
         let handed = shared.clone();
@@ -10895,6 +10994,159 @@ mod session_tool_tests {
         );
     }
 
+    /// GitHub #197 (B) — the child answers BEFORE the dispatcher has bound its
+    /// request. The submit path used to release the child's store between the
+    /// accept and the bind, so a boundary that fast found the request still
+    /// `Accepted`, resolved nothing, and the completion was lost until a daemon
+    /// restart. Accept, submit and bind now run under one per-child claim that
+    /// the notifier also takes before it plans, so the boundary waits for the
+    /// binding — and the answer is delivered exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_child_that_answers_inside_the_submit_is_still_answered_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, _stub) = queueing_dispatch_gateway_with(&project_dir, true).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dispatched = parse(
+            &run_agent_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "task": "answer instantly", "title": "instant" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        let request_id = dispatched["request_id"].as_str().unwrap().to_string();
+        let notes = await_notifications(&project_dir, &principal, 1).await;
+        assert_eq!(notes.len(), 1, "delivered, and delivered once: {notes:?}");
+        assert!(notes[0].contains("«instant»"), "{}", notes[0]);
+        assert!(notes[0].contains(&request_id), "{}", notes[0]);
+        // And the request is closed, not left outstanding for a restart to find.
+        assert!(
+            gw.lock()
+                .await
+                .outstanding_request_ids(&child, &principal)
+                .is_empty(),
+            "the request resolved on its own boundary"
+        );
+    }
+
+    /// GitHub #197 (B) — a request that LEFT the store while its dispatcher was
+    /// blocked on it is `unknown`, never `answered`. The wait used to treat a
+    /// missing row as done and then read the transcript tail, so a caller
+    /// waiting on B whose request was dropped (an `agent_stop`, an unreachable
+    /// parent) was handed sibling A's answer as if it were B's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wait_on_a_request_the_store_lost_reports_unknown_not_a_siblings_answer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, stub) = queueing_dispatch_gateway(&project_dir).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        run_agent_dispatch(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": &child, "task": "task A", "title": "A" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let waiter = {
+            let gw = std::sync::Arc::clone(&gw);
+            let principal = principal.clone();
+            let child = child.clone();
+            tokio::spawn(async move {
+                parse(
+                    &run_agent_dispatch(
+                        &ambient(
+                            &principal,
+                            "alpha",
+                            json!({ "sid": &child, "task": "task B", "title": "B", "wait": 20 }),
+                        ),
+                        &gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            })
+        };
+        for _ in 0..200 {
+            if gw
+                .lock()
+                .await
+                .outstanding_request_ids(&child, &principal)
+                .len()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // A finishes and leaves its answer as the newest transcript row.
+        stub.run_next_turn(&stub_identity(&child)).await;
+        await_notifications(&project_dir, &principal, 1).await;
+        // B's row is dropped out from under the waiter, exactly as a stop does.
+        // A's resolution is committed off the notifier's own thread, so watch
+        // for it rather than assuming the notification implied it.
+        let mut outstanding = Vec::new();
+        for _ in 0..400 {
+            outstanding = gw.lock().await.outstanding_request_ids(&child, &principal);
+            if outstanding.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(outstanding.len(), 1, "{outstanding:?}");
+        let claim = Gateway::claim_delegation_store(&gw, &child).await;
+        Gateway::drop_delegation_request_shared(
+            std::sync::Arc::clone(&gw),
+            &claim,
+            &outstanding[0],
+        )
+        .await;
+        drop(claim);
+
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(15), waiter)
+            .await
+            .expect("the wait ends when its request can no longer resolve")
+            .expect("the waiter finishes");
+        assert_eq!(answer["answered"], json!(false), "{answer}");
+        assert_eq!(answer["state"], json!("unknown"), "{answer}");
+        assert!(
+            !serde_json::to_string(&answer).unwrap().contains("task A"),
+            "a lost request must never come back holding a sibling's answer: {answer}"
+        );
+    }
+
     /// v0.10.1 (issue #184) — a dispatch to a session the caller never
     /// delegated is a HANDOFF, not a delegation: the target has its own parent,
     /// or is a root with its own human. The default `notify` is a default, not a
@@ -11010,6 +11262,65 @@ mod session_tool_tests {
             watch.requests[0].notify,
             ccteam_harness::NotifyMode::Brief,
             "{watch:?}"
+        );
+    }
+
+    /// GitHub #197 (F.1) — notify inheritance is decided in ONE place and holds
+    /// on EVERY dispatch path, the peer handoff included. A caller that named
+    /// `final` on a peer has subscribed to that peer; the follow-up that names
+    /// no mode inherits it. The peer rule silences a first contact nobody asked
+    /// to be notified about — not a conversation already under way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_follow_up_to_a_peer_inherits_the_mode_its_dispatcher_chose() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal) = dispatch_gateway(false, 0, tmp.path()).await;
+        let peer = {
+            let mut g = gw.lock().await;
+            g.create_session_api(
+                "alpha".into(),
+                String::new(),
+                ccteam_harness::AgentVendor::Claude,
+                ccteam_harness::PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        run_agent_dispatch(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": &peer, "task": "take over the P0", "notify": "final" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let follow_up = parse(
+            &run_agent_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &peer, "task": "and the rollback note" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            follow_up.get("notify_deliverable").is_none(),
+            "the follow-up is subscribed, so the response says nothing about polling: {follow_up}"
+        );
+        let watch = ccteam_harness::read_delegation_requests(tmp.path(), &peer).unwrap();
+        assert_eq!(watch.requests.len(), 2, "{watch:?}");
+        assert_eq!(
+            watch.requests[1].notify,
+            ccteam_harness::NotifyMode::Final,
+            "an omitted notify keeps the mode this dispatcher chose for its \
+             outstanding work on this peer: {watch:?}"
         );
     }
 

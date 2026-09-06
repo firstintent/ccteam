@@ -47,7 +47,7 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 - `idempotency_key` —— 同 key 重试重放原调用而非翻倍(新雇按项目、续派按子会话;内存态,~1 小时)。重放响应多一个 `idempotent_replay:true`。
 - **没有 `host`**(机器跟随项目绑定)、**没有 `protocol`**(信道由 vendor 推导);传了都是硬错,退役的 `wait_seconds` 同理(已改名 `wait`)。
 
-**每一次调用都是一条有身份的请求。** ccteam 在写进 vendor **之前**就铸出 `request_id` 并落盘,它自带自己的 parent、`notify` 档位、`title` 与生命周期(`accepted` → `queued` | `submitted` → `executing` → `answered` | `failed`)。一条请求**只**由它绑定的那个执行 turn 来了结 —— 绝不按最新、按时间戳或按假定的排队位置匹配 —— 所以对同一个忙碌子会话的第二次派工,既拿不走第一次的答案,也改不掉它的名字、更改不了它通知谁。
+**每一次调用都是一条有身份的请求。** ccteam 在写进 vendor **之前**就铸出 `request_id` 并落盘,它自带自己的 parent、`notify` 档位、`title` 与生命周期(`accepted` → `queued` | `submitted` → `executing` → `answered` | `failed`)。一条请求**只**由它绑定的那个执行 turn 来了结 —— 绝不按最新、按时间戳或按假定的排队位置匹配 —— 所以对同一个忙碌子会话的第二次派工,既拿不走第一次的答案,也改不掉它的名字、更改不了它通知谁。这条规则双向成立:没有任何请求绑在上面的 turn 边界(子会话自己的人类问了它一句;或事件 id 派发侧根本看不到的通道,例如冻结的 `terminal` 协议)**什么都不了结** —— 那些未决请求继续等,送达状态是 `unknown`,而不是被别人的答案顺手关掉。
 
 响应(紧凑 JSON):async → `{sid, request_id, turn_id, status, delivery, queue_position?}`。
 
@@ -56,7 +56,7 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 - `delivery` 把四件不同的事分开:`accepted`(ccteam 已持久持有)、`queued`(还被 ccteam 留在 harness 前面)、`written`(字节已写进 harness)、`executing`(观察到承载它的 turn 开始了)。冲进 stdin 不等于模型读了,所以在 turn 真的开起来之前 `executing` 一律是 `"unknown"`;凡是 ccteam 观察不到的,都说 `"unknown"`,不给一个自信的 `false`。
 - 完成通知到不了你时带 `notify_deliverable:false` —— 那就用 `agent_read{sid,wait}`。
 
-内联(`wait`)→ `{sid, request_id, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`,其中 `turn_id` 就是回答**这一条请求**的那行 transcript;`result_text` 保留 2000 字符头尾节选(与推送通知的 `final` 同档),标记里写明读全文的精确调用 `agent_read{sid,turn:<turn_id>,max_chars}`。等待超时回 `{sid, request_id, turn_id, status, state, delivery, answered:false}` —— `state` 是这条请求当下的生命周期状态,所以「还排在第三位」和「正在跑」分得开。用 `wait` 拿到答案的那**条请求**不会再推完成通知:答案已在你手上,绝不会再送第二遍。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
+内联(`wait`)→ `{sid, request_id, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`,其中 `turn_id` 就是回答**这一条请求**的那行 transcript;`result_text` 保留 2000 字符头尾节选(与推送通知的 `final` 同档),标记里写明读全文的精确调用 `agent_read{sid,turn:<turn_id>,max_chars}`。等待超时回 `{sid, request_id, turn_id, status, state, delivery, answered:false}` —— `state` 是这条请求当下的生命周期状态,所以「还排在第三位」和「正在跑」分得开。你阻塞期间这条请求被移出账本了(`agent_stop`、parent 已不可达),回的是同一个形状但 `state:"unknown"`:现在没人会再了结它,而一个 ccteam 说不出名字的答案只会报「没有」,绝不拿别人的顶上。用 `wait` 拿到答案的那**条请求**不会再推完成通知:答案已在你手上,绝不会再送第二遍。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
 
 ### `agent_read` —— 名册,或一份 transcript
 
@@ -130,7 +130,7 @@ token 文件里是裸 hex,`ccteam:` 前缀由调用方自己加。loopback 绑�
 | `final` | 2000 字符,同样形状 | 想把全文推过来的 parent |
 | `off` | 无(只记账本) | 发完不管 |
 
-省略 `notify` 时**继承**你在这个子会话上仍未决的最近一次选择;显式给的覆盖;没有先例才用默认 `brief`。(续派时悄悄回落默认,正是一次刻意的 `final` 半路变成 443 字符 `brief` 的原因。)布尔仍认(`true`→final,`false`→off);退役的 `all` 传上来是可读错误(它的行为本来就等同 `final`)。答案被你内联取走的那次任务(`agent{wait}`,或在边界返回的 `agent_read{sid,wait}`)根本不发通知:这个决定在声明 wait 时就做了、不是事后撤销,所以两条路不可能都投递。这个抑制是按**请求**算的:你阻塞在 B 上,A 的完成照样推给你 —— 那条你并没有拿在手上。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话,**只送一次**。通知是独立的后续 turn,绝不是 steer:parent 正在 turn 中时,通知在该 turn 结束后立刻送达(claude 会把 turn 中写进 stdin 的一行给模型看两遍 —— 先作为 queued-command 预览,再作为下一条 prompt —— 所以边界才是它恰好被读一次的地方;暂存的那行落盘,daemon 重启不丢)。进程间隙 = 排队,resume 时送达。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,`initialize` 的 instructions 一开始就讲明,用 `agent{wait}` 或 `agent_read{sid,wait}` 代替。派给不是你雇的会话 = handoff:照跑照记账,但不给你订阅,除非显式传 `notify`。
+省略 `notify` 时**继承**你在这个子会话上仍未决的最近一次选择;显式给的覆盖;没有先例才用默认 `brief`。(续派时悄悄回落默认,正是一次刻意的 `final` 半路变成 443 字符 `brief` 的原因。)布尔仍认(`true`→final,`false`→off);退役的 `all` 传上来是可读错误(它的行为本来就等同 `final`)。答案被你内联取走的那次任务(`agent{wait}`,或在边界返回的 `agent_read{sid,wait}`)根本不发通知:这个决定在声明 wait 时就做了、不是事后撤销,所以两条路不可能都投递。这个抑制是按**请求**算的:你阻塞在 B 上,A 的完成照样推给你 —— 那条你并没有拿在手上。送达需要受管 parent:ccteam 把通知作为普通 user turn 追进 parent 的对话,**只送一次**。通知是独立的后续 turn,绝不是 steer:parent 正在 turn 中时,通知在该 turn 结束后立刻送达(claude 会把 turn 中写进 stdin 的一行给模型看两遍 —— 先作为 queued-command 预览,再作为下一条 prompt —— 所以边界才是它恰好被读一次的地方;暂存的那行落盘,daemon 重启不丢)。进程间隙 = 排队,resume 时送达。手起 parent 没有回程 —— 派发响应会说 `notify_deliverable:false`,`initialize` 的 instructions 一开始就讲明,用 `agent{wait}` 或 `agent_read{sid,wait}` 代替。派给不是你雇的会话 = handoff:**首次**接触照跑照记账,但不给你订阅,除非显式传 `notify`。继承是派发规则、不是子会话规则,这里同样成立 —— 你在这个 peer 上一旦点过名,后续续派就保持那个模式。
 
 ## 5. 协议细节
 

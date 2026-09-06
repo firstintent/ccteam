@@ -923,6 +923,36 @@ impl DelegationMirror {
     }
 }
 
+/// The single-flight claim over ONE child's delegation requests — its
+/// in-memory [`DelegationMirror`] and its durable `delegation.json` alike.
+///
+/// Holding it is the precondition of every mutation, and this type is how that
+/// is enforced: a mutator takes `&DelegationStoreClaim` and reads the child sid
+/// off it, so no signature exists that lets a caller mutate a child it has not
+/// claimed. Two `agent` calls on one busy child used to interleave their
+/// accept/bind pairs and the loser's binding vanished (issue #201 R3), and two
+/// `atomic_write_durable` calls on one path even raced their shared `.tmp` file
+/// into an ENOENT rename.
+///
+/// It is also the handover between the dispatch path and the notifier: a
+/// dispatcher holds it from accept through submit to bind, so a boundary that
+/// lands the microsecond after the vendor was written to waits for the binding
+/// instead of finding the request still `Accepted` and resolving nothing.
+///
+/// LOCK ORDER: acquired strictly BEFORE the gateway lock ([`SpawnClaims`]).
+pub struct DelegationStoreClaim {
+    child_sid: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl DelegationStoreClaim {
+    /// The child whose requests this claim covers — the only sid its holder
+    /// may mutate.
+    pub fn child_sid(&self) -> &str {
+        &self.child_sid
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DelegationSpawnReservation {
     project: String,
@@ -13079,6 +13109,54 @@ impl Gateway {
             .unwrap_or(false)
     }
 
+    /// Key of the per-child single-flight claim over a child's delegation
+    /// requests. One key, so every writer queues behind the same door.
+    fn delegation_claim_key(child_sid: &str) -> ChatKey {
+        ChatKey::new("delegation-store", child_sid, child_sid)
+    }
+
+    /// Take the claim over `child_sid`'s requests, waiting as long as it takes.
+    ///
+    /// For writers with nobody to fail back to — the notifier and the startup
+    /// reconcile. A caller answering a request within a queue budget uses
+    /// [`Self::claim_delegation_store_within`].
+    pub(crate) async fn claim_delegation_store(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        child_sid: &str,
+    ) -> DelegationStoreClaim {
+        let claims = Arc::clone(
+            &crate::latency::gateway_lock(gateway, "delegation.claim")
+                .await
+                .spawn_claims,
+        );
+        DelegationStoreClaim {
+            child_sid: child_sid.to_string(),
+            _guard: claims
+                .lock_for(&Self::delegation_claim_key(child_sid))
+                .await,
+        }
+    }
+
+    /// The deadline-bounded flavour, for a request path that owes its caller an
+    /// answer inside the queue budget.
+    pub(crate) async fn claim_delegation_store_within(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        child_sid: &str,
+        deadline: GatewayDeadline,
+    ) -> Result<DelegationStoreClaim> {
+        let claims = Arc::clone(&deadline.lock(gateway).await?.spawn_claims);
+        let guard = tokio::time::timeout_at(
+            deadline.expires_at.into(),
+            claims.lock_for(&Self::delegation_claim_key(child_sid)),
+        )
+        .await
+        .map_err(|_| GatewayRequestError::QueueDeadline)?;
+        Ok(DelegationStoreClaim {
+            child_sid: child_sid.to_string(),
+            _guard: guard,
+        })
+    }
+
     /// Accept one dispatch against `child_sid` and make it durable BEFORE the
     /// vendor is written to (issue #201).
     ///
@@ -13092,6 +13170,12 @@ impl Gateway {
     /// dispatch to a busy child used to overwrite the first one's watch, so
     /// the first task's completion arrived under the second task's name and
     /// went to whichever parent happened to dispatch last.
+    ///
+    /// TEST-ONLY, and gated so it stays that way: this is the one mutator that
+    /// does not take a [`DelegationStoreClaim`], because a `&mut self` caller
+    /// already holds the gateway lock and cannot await one. Production writes
+    /// go through [`Self::accept_delegation_request_shared`], under the claim.
+    #[cfg(test)]
     pub fn accept_delegation_request(
         &mut self,
         child_sid: &str,
@@ -13300,14 +13384,16 @@ impl Gateway {
             .map(|request| request.notify)
     }
 
-    /// Lock-narrowed durable request registration for MCP dispatch. Per-child
-    /// serialization lives beside the gateway lock; JSON read/fsync/rename run
-    /// on the blocking pool, and the live session generation is rechecked
-    /// before the hot-path mirror becomes visible.
+    /// Lock-narrowed durable request registration for MCP dispatch. JSON
+    /// read/fsync/rename run on the blocking pool, and the live session
+    /// generation is rechecked before the hot-path mirror becomes visible.
+    ///
+    /// The caller owns the [`DelegationStoreClaim`] and keeps it through the
+    /// submit and the bind, so the request cannot be observed half-registered.
     #[allow(clippy::too_many_arguments)]
     pub async fn accept_delegation_request_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        child_sid: &str,
+        claim: &DelegationStoreClaim,
         parent_sid: &str,
         notify: ccteam_harness::NotifyMode,
         title: Option<String>,
@@ -13315,12 +13401,7 @@ impl Gateway {
         idempotency_key: Option<String>,
         deadline: GatewayDeadline,
     ) -> Result<Option<String>> {
-        let claims = Arc::clone(&deadline.lock(&gateway).await?.spawn_claims);
-        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
-        let _claim =
-            tokio::time::timeout_at(deadline.expires_at.into(), claims.lock_for(&claim_key))
-                .await
-                .map_err(|_| GatewayRequestError::QueueDeadline)?;
+        let child_sid = claim.child_sid();
         let (project_dir, slug, session_generation) = {
             let guard = deadline.lock(&gateway).await?;
             // Live-or-disk, for the reason [`Self::accept_delegation_request`]
@@ -13442,10 +13523,11 @@ impl Gateway {
     /// answer it is.
     pub async fn bind_delegation_request_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        child_sid: &str,
+        claim: &DelegationStoreClaim,
         request_id: &str,
         receipt: &TurnReceipt,
     ) {
+        let child_sid = claim.child_sid();
         let persist = {
             let mut guard = crate::latency::gateway_lock(&gateway, "delegation.bind").await;
             let Some(mirror) = guard.delegations.get_mut(child_sid) else {
@@ -13511,12 +13593,10 @@ impl Gateway {
     /// The child's other requests are untouched.
     pub async fn drop_delegation_request_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
-        child_sid: &str,
+        claim: &DelegationStoreClaim,
         request_id: &str,
     ) {
-        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
-        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
-        let _claim = claims.lock_for(&claim_key).await;
+        let child_sid = claim.child_sid();
         let persist = {
             let mut guard = gateway.lock().await;
             let empty = {
@@ -13568,9 +13648,7 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         child_sid: &str,
     ) {
-        let claims = Arc::clone(&gateway.lock().await.spawn_claims);
-        let claim_key = ChatKey::new("delegation-watch", child_sid, child_sid);
-        let _claim = claims.lock_for(&claim_key).await;
+        let _claim = Self::claim_delegation_store(&gateway, child_sid).await;
         let project_dir = {
             let mut guard = gateway.lock().await;
             guard
@@ -13712,41 +13790,35 @@ impl Gateway {
         let slug = mirror.slug.clone();
         let project_dir = mirror.project_dir.clone();
         // Requests BOUND to the turn that just ended — the only ones this
-        // boundary can honestly resolve.
-        let mut resolved: Vec<ccteam_harness::DelegationRequest> = signal
+        // boundary can honestly resolve. Completion is matched by IDENTITY and
+        // nothing else: not by FIFO position, not by timestamp, not by
+        // "whatever is submitted" (issue #201).
+        let resolved: Vec<ccteam_harness::DelegationRequest> = signal
             .exec_turn_id
             .as_deref()
             .map(|exec| mirror.store.bound_to(exec).cloned().collect())
             .unwrap_or_default();
         if resolved.is_empty() {
-            // Nothing is bound to this turn. Either it is a turn nobody
-            // dispatched — the child's own human asked it something, and
-            // resolving somebody's request off it would be exactly the
-            // mis-attribution this design removes — or the channel reports
-            // turn ids the submit path never sees, so correlation is
-            // impossible on it at all. Only requests never OBSERVED executing
-            // can be the second case: a channel whose ids line up moves them
-            // to `Executing` when their turn opens. Queued requests are
-            // provably not running and are never resolved here.
-            let uncorrelated: Vec<ccteam_harness::DelegationRequest> = mirror
-                .store
-                .requests
-                .iter()
-                .filter(|request| request.state == ccteam_harness::RequestState::Submitted)
-                .cloned()
-                .collect();
-            if !uncorrelated.is_empty() {
+            // A boundary nobody's request is bound to answers NOBODY. It is a
+            // turn somebody else started — the child's own human typed to it,
+            // a recovered turn ended, an injected message completed — or it
+            // came off a channel whose event ids the submit path never sees
+            // (the frozen `terminal` protocol mints `turn-<nanos>` at
+            // send-keys time while its events carry hook-minted ids). Falling
+            // back to "resolve everything submitted" answered queued work off
+            // an unrelated turn and is exactly the mis-attribution this design
+            // removes; the honest state is that those requests stay where they
+            // are, with delivery `unknown` until a turn they ARE bound to ends.
+            let outstanding = mirror.store.outstanding().count();
+            if outstanding > 0 {
                 tracing::warn!(
                     child = %signal.child_sid,
                     exec_turn = ?signal.exec_turn_id,
-                    requests = uncorrelated.len(),
-                    "ccteam-im: this channel reports no execution-turn identity the dispatch \
-                     path can bind to; resolving its unobserved requests on this boundary"
+                    outstanding,
+                    "ccteam-im: turn boundary carries no request binding; \
+                     it resolves nothing and the outstanding requests keep waiting"
                 );
             }
-            resolved = uncorrelated;
-        }
-        if resolved.is_empty() {
             return None;
         }
         // What is left waiting on this child AFTER this boundary — the number
@@ -13823,9 +13895,16 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
     ) {
-        let plan = crate::latency::gateway_lock(&gateway, "notifier.plan")
-            .await
-            .plan_delegation_delivery(signal);
+        // Planning reads the bindings, so it queues behind whatever dispatch
+        // is still making them: a child that answers in the microsecond after
+        // its line was written must not be planned against a request the
+        // dispatcher has accepted but not yet bound (issue #201).
+        let plan = {
+            let _claim = Self::claim_delegation_store(&gateway, &signal.child_sid).await;
+            crate::latency::gateway_lock(&gateway, "notifier.plan")
+                .await
+                .plan_delegation_delivery(signal)
+        };
         let Some(plan) = plan else {
             return;
         };
@@ -13891,6 +13970,10 @@ impl Gateway {
 
         let mut to_record = plan.signal.covered_turns.clone();
         to_record.push(plan.dedup_key.clone());
+        // Re-claimed for the commit: the parent notifications above ran off
+        // both locks, and what is committed is the CURRENT mirror, not the
+        // snapshot the plan took.
+        let _claim = Self::claim_delegation_store(&gateway, &child).await;
         let store = {
             let mut guard = crate::latency::gateway_lock(&gateway, "notifier.commit").await;
             let Some(current) = guard.delegations.get_mut(&child) else {
@@ -13974,6 +14057,9 @@ impl Gateway {
                     if !watch_set.read().unwrap().contains(&child_sid) {
                         continue;
                     }
+                    // A store mutation: claimed like every other one, so it
+                    // cannot interleave with a dispatch's accept/bind pair.
+                    let _claim = Self::claim_delegation_store(&gateway, &child_sid).await;
                     let persist = crate::latency::gateway_lock(&gateway, "notifier.executing")
                         .await
                         .mark_delegation_requests_executing(&child_sid, &exec_turn_id);
@@ -14064,52 +14150,66 @@ impl Gateway {
                         suppressed: HashSet::new(),
                     },
                 ));
-                // A restart reconcile folds ALL missed turns into ONE boundary
-                // signal (latest text wins, earlier ones counted as interim
-                // notes): after a daemon restart the child is idle by
-                // construction (its process died with the daemon), so the "task
-                // finished / child idle" shape is the honest one — and a chatty
-                // child can't flood the parent with a backlog replay. Covered
-                // ids batch-record so a second reconcile delivers nothing.
-                let Some(last) = missed.last() else {
-                    continue;
-                };
-                // Which execution turn produced the answer, so the delivery
-                // resolves the request that ASKED for it. `None` leaves the
-                // signal uncorrelated, and only requests never observed
-                // executing can be resolved off it.
-                let exec_turn_id = missed
-                    .iter()
-                    .rev()
-                    .find_map(|turn| turn.exec_turn_id.clone());
-                let context_pct = crate::delegation::context_pct(last.status.as_ref());
-                pending.push(crate::delegation::DelegationSignal {
-                    child_sid: child_sid.clone(),
-                    turn_id: last.turn_id.clone(),
-                    exec_turn_id,
-                    tail: last.assistant.clone(),
-                    vendor,
-                    host: host.clone(),
-                    boundary: true,
-                    // Reconcile may race the live notifier at startup. A
-                    // durable failed turn must retain the same explicit
-                    // vendor-error outcome as its live boundary signal;
-                    // whichever delivery wins the dedup race is then
-                    // semantically identical.
-                    vendor_error: last.outcome.as_deref() == Some("failed")
-                        || last.error_kind.is_some()
-                        || last.error.is_some(),
-                    interim_notes: missed.len().saturating_sub(1),
-                    covered_turns: missed.iter().map(|t| t.turn_id.clone()).collect(),
-                    context_pct,
-                    turn: last
-                        .status
-                        .as_ref()
-                        .map(|status| status.turn)
-                        .unwrap_or_default(),
-                    error_kind: last.error_kind.clone(),
-                    conclusion: last.conclusion.clone(),
-                });
+                // ONE signal per EXECUTION turn an outstanding request is
+                // bound to — never one folded signal for the whole backlog.
+                // A daemon that missed three turns owes three parents three
+                // different answers, and a boundary resolves only what is
+                // bound to it, so folding them would strand every request but
+                // the last (issue #201). Turns nobody's request is bound to
+                // produce no signal at all: they can resolve nothing, and
+                // inventing a resolution off them is the mis-attribution this
+                // design removes.
+                //
+                // Within one execution turn the rows still fold (latest text
+                // wins, earlier ones counted as interim notes): after a
+                // restart the child is idle by construction — its process died
+                // with the daemon — so the "task finished / child idle" shape
+                // is the honest one, and a chatty child cannot flood its
+                // parent with a backlog replay.
+                let bound: std::collections::HashSet<String> = store
+                    .outstanding()
+                    .filter_map(|request| request.turn_id.clone())
+                    .collect();
+                let mut groups: Vec<(String, Vec<_>)> = Vec::new();
+                for turn in &missed {
+                    let Some(exec) = turn.exec_turn_id.clone().filter(|e| bound.contains(e)) else {
+                        continue;
+                    };
+                    match groups.iter_mut().find(|(id, _)| id == &exec) {
+                        Some((_, rows)) => rows.push(turn.clone()),
+                        None => groups.push((exec, vec![turn.clone()])),
+                    }
+                }
+                for (exec_turn_id, rows) in groups {
+                    let last = rows.last().expect("a group holds at least one row");
+                    pending.push(crate::delegation::DelegationSignal {
+                        child_sid: child_sid.clone(),
+                        turn_id: last.turn_id.clone(),
+                        exec_turn_id: Some(exec_turn_id),
+                        tail: last.assistant.clone(),
+                        vendor,
+                        host: host.clone(),
+                        boundary: true,
+                        // Reconcile may race the live notifier at startup. A
+                        // durable failed turn must retain the same explicit
+                        // vendor-error outcome as its live boundary signal;
+                        // whichever delivery wins the dedup race is then
+                        // semantically identical.
+                        vendor_error: last.outcome.as_deref() == Some("failed")
+                            || last.error_kind.is_some()
+                            || last.error.is_some(),
+                        interim_notes: rows.len().saturating_sub(1),
+                        covered_turns: rows.iter().map(|t| t.turn_id.clone()).collect(),
+                        context_pct: crate::delegation::context_pct(last.status.as_ref()),
+                        turn: last
+                            .status
+                            .as_ref()
+                            .map(|status| status.turn)
+                            .unwrap_or_default(),
+                        error_kind: last.error_kind.clone(),
+                        conclusion: last.conclusion.clone(),
+                    });
+                }
             }
         }
         // apply-under-lock: seed the mirror (never clobber a fresher live entry),
@@ -31062,6 +31162,183 @@ mod tests {
         );
     }
 
+    /// GitHub #197 (B) — a boundary NO request is bound to answers nobody.
+    ///
+    /// The child's own human asks it something, or a recovered turn ends, or an
+    /// injected message completes: the outstanding requests are not that turn's
+    /// to resolve. Falling back to "resolve everything submitted" — which is
+    /// what the code did — handed an unrelated turn's answer to queued work and
+    /// closed the request that was still waiting for its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_boundary_nothing_is_bound_to_answers_nobody() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+        let request_id = {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &child,
+                    &parent,
+                    ccteam_harness::NotifyMode::Final,
+                    Some("the dispatched task".into()),
+                    TurnRouting::Queue,
+                    None,
+                )
+                .expect("the child accepts the request");
+            // Submitted, bound to the turn its own line will open.
+            gw.bind_delegation_request_for_test(&child, &id, "x-mine");
+            id
+        };
+        let boundary = |n: u32, exec: &str, text: &str| crate::delegation::DelegationSignal {
+            child_sid: child.clone(),
+            turn_id: format!("{child}-{n}"),
+            exec_turn_id: Some(exec.to_string()),
+            tail: text.to_string(),
+            vendor: AgentVendor::Claude,
+            host: "local".into(),
+            boundary: true,
+            vendor_error: false,
+            interim_notes: 0,
+            covered_turns: vec![format!("{child}-{n}")],
+            context_pct: None,
+            turn: n as u64,
+            error_kind: None,
+            conclusion: None,
+        };
+
+        // Somebody else's turn ends on this child.
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(1, "x-someone-elses", "an answer to the child's own human"),
+        )
+        .await;
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "a turn nobody's request is bound to notifies nobody"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(&child, 10);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0]["state"],
+            serde_json::json!("submitted"),
+            "the request keeps waiting for its OWN turn: {rows:?}"
+        );
+
+        // …and when that turn ends, it is answered — by identity.
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(2, "x-mine", "the answer this request asked for"),
+        )
+        .await;
+        let notes = ccteam_notification_turns(&project_dir, &parent);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].user.contains("«the dispatched task»"),
+            "{}",
+            notes[0].user
+        );
+        assert!(notes[0].user.contains(&request_id), "{}", notes[0].user);
+    }
+
+    /// GitHub #197 (B, R3) — two parents dispatch to one child at the same
+    /// time. Every store mutation goes through that child's single claim, so
+    /// neither read-modify-write can lose the other's request or its binding —
+    /// and two `atomic_write_durable` calls cannot race their shared `.tmp`
+    /// file into a failed rename.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_dispatches_to_one_child_keep_both_requests_and_bindings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (first_parent, child) = delegation_pair(&gateway).await;
+        let second_parent = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        // Enough rounds that an unserialized read-modify-write is certain to
+        // interleave at least once; each round is a fresh pair of dispatches.
+        for round in 0..12u32 {
+            let mut tasks = Vec::new();
+            for (parent, label, notify) in [
+                (
+                    first_parent.clone(),
+                    format!("first-{round}"),
+                    ccteam_harness::NotifyMode::Final,
+                ),
+                (
+                    second_parent.clone(),
+                    format!("second-{round}"),
+                    ccteam_harness::NotifyMode::Brief,
+                ),
+            ] {
+                let gateway = Arc::clone(&gateway);
+                let child = child.clone();
+                tasks.push(tokio::spawn(async move {
+                    let claim = Gateway::claim_delegation_store(&gateway, &child).await;
+                    let id = Gateway::accept_delegation_request_shared(
+                        Arc::clone(&gateway),
+                        &claim,
+                        &parent,
+                        notify,
+                        Some(label.clone()),
+                        TurnRouting::Queue,
+                        None,
+                        GatewayDeadline::start(),
+                    )
+                    .await
+                    .expect("the store accepts under its own claim")
+                    .expect("the child is resolvable");
+                    Gateway::bind_delegation_request_shared(
+                        Arc::clone(&gateway),
+                        &claim,
+                        &id,
+                        &TurnReceipt::for_test(&format!("x-{label}"), TurnDisposition::Queued),
+                    )
+                    .await;
+                    (id, parent, label)
+                }));
+            }
+            let mut expected = Vec::new();
+            for task in tasks {
+                expected.push(task.await.expect("neither dispatch panics"));
+            }
+            let store = ccteam_harness::read_delegation_requests(&project_dir, &child)
+                .expect("the durable record survives both writers");
+            for (id, parent, label) in &expected {
+                let request = store
+                    .get(id)
+                    .unwrap_or_else(|| panic!("round {round}: {label} was overwritten: {store:?}"));
+                assert_eq!(&request.parent_sid, parent, "round {round}: {store:?}");
+                assert_eq!(request.title.as_deref(), Some(label.as_str()));
+                assert_eq!(
+                    request.turn_id.as_deref(),
+                    Some(format!("x-{label}").as_str()),
+                    "round {round}: a binding was lost: {store:?}"
+                );
+            }
+        }
+        let store = ccteam_harness::read_delegation_requests(&project_dir, &child).unwrap();
+        assert_eq!(store.outstanding().count(), 24, "{store:?}");
+        assert_eq!(
+            store
+                .outstanding()
+                .filter(|r| r.notify == ccteam_harness::NotifyMode::Final)
+                .count(),
+            12,
+            "each request keeps its OWN notify mode: {store:?}"
+        );
+    }
+
     /// Count minimal completion notification turns delivered to `sid`.
     fn ccteam_notification_turns(
         project_dir: &std::path::Path,
@@ -31460,9 +31737,10 @@ mod tests {
             "fixture: the child is cold before the dispatch"
         );
 
+        let claim = Gateway::claim_delegation_store(&gateway, &child_sid).await;
         let armed = Gateway::accept_delegation_request_shared(
             Arc::clone(&gateway),
-            &child_sid,
+            &claim,
             &parent_sid,
             ccteam_harness::NotifyMode::Final,
             Some("cold follow-up".into()),
@@ -31475,11 +31753,12 @@ mod tests {
         let armed_request = armed.clone().expect("a cold child still gets a request");
         Gateway::bind_delegation_request_shared(
             Arc::clone(&gateway),
-            &child_sid,
+            &claim,
             &armed_request,
             &TurnReceipt::for_test("turn-cold", TurnDisposition::Started),
         )
         .await;
+        drop(claim);
         assert!(
             ccteam_harness::read_delegation_requests(&project_dir, &child_sid).is_some(),
             "delegation.json is durable, so a restart reconcile can still deliver"
@@ -31523,9 +31802,10 @@ mod tests {
         // An id with neither a live body nor a `meta.json` arms nothing — the
         // `false` that `dispatch_task` turns into a hard error rather than a
         // dispatch whose answer can never be delivered.
+        let unknown_claim = Gateway::claim_delegation_store(&gateway, "s999999").await;
         let unknown = Gateway::accept_delegation_request_shared(
             Arc::clone(&gateway),
-            "s999999",
+            &unknown_claim,
             &parent_sid,
             ccteam_harness::NotifyMode::Final,
             None,
