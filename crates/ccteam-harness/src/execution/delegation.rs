@@ -289,6 +289,17 @@ pub struct DelegationRequests {
 /// a long-lived child's file cannot grow without limit.
 pub const RESOLVED_REQUEST_HISTORY: usize = 20;
 
+/// How many delivered turn keys the at-least-once dedup set remembers.
+///
+/// It used to remember all of them, so a child that ran for weeks carried
+/// every turn it had ever answered in a file rewritten on each dispatch. The
+/// oldest are dropped first, and dropping one is safe: the set only guards a
+/// restart reconcile, which delivers nothing for a turn whose request is no
+/// longer outstanding — and a notified turn's request is terminal by
+/// definition. The bound is far larger than any plausible
+/// crash-window backlog so the guard keeps working where it matters.
+pub const NOTIFIED_TURN_HISTORY: usize = 200;
+
 impl Default for DelegationRequests {
     fn default() -> Self {
         Self {
@@ -361,10 +372,19 @@ impl DelegationRequests {
         });
     }
 
-    /// Record a delivered boundary so a restart reconcile never repeats it.
+    /// Record a delivered boundary so a restart reconcile never repeats it,
+    /// keeping only the most recent [`NOTIFIED_TURN_HISTORY`].
     pub fn record_notified(&mut self, turn_key: &str) {
-        if !self.notified_turns.iter().any(|seen| seen == turn_key) {
-            self.notified_turns.push(turn_key.to_string());
+        if self.notified_turns.iter().any(|seen| seen == turn_key) {
+            return;
+        }
+        self.notified_turns.push(turn_key.to_string());
+        let over = self
+            .notified_turns
+            .len()
+            .saturating_sub(NOTIFIED_TURN_HISTORY);
+        if over > 0 {
+            self.notified_turns.drain(..over);
         }
     }
 
