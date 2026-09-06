@@ -1368,13 +1368,27 @@ async fn d2_start_with_notif(
     tokio::sync::mpsc::Sender<Value>,
     PathBuf,
 ) {
+    d2_start_with_handler(tag, d2_response).await
+}
+
+async fn d2_start_with_handler(
+    tag: &str,
+    handler: impl Fn(&Value) -> Value + Send + 'static,
+) -> (
+    CodexAppServerAdapter,
+    ccteam_harness::ThreadHandle,
+    Arc<StdMutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<Value>,
+    PathBuf,
+) {
     let sock = unique_socket_path(tag);
     std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
     let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
     let seen_for_peer = Arc::clone(&seen);
     let (peer, notif) = spawn_scripted_peer(sock.clone(), move |req| {
         seen_for_peer.lock().unwrap().push(req.clone());
-        d2_response(req)
+        handler(req)
     })
     .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2169,6 +2183,221 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
 
     drop(peer);
     let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// #200: official settings snapshots, including unseen model ids and a
+/// cleared effort, must update status without any events() consumer.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_settings_notification_updates_status_without_event_consumer() {
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_with_notif("model-settings").await;
+    adapter
+        .tracker_seed_model_for_test(&h.identity, Some("initial-model".into()))
+        .await;
+    for (model, effort) in [
+        ("future-model-2099", Some("xhigh")),
+        ("another-unlisted-model", None),
+    ] {
+        notif
+            .send(json!({
+                "method": "thread/settings/updated",
+                "params": { "threadId": h.identity,
+                    "threadSettings": { "model": model, "effort": effort } }
+            }))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let adapter = adapter.clone();
+            let h = h.clone();
+            async move {
+                let status = adapter.thread_status(&h).await.unwrap();
+                status.model.as_deref() == Some(model) && status.effort.as_deref() == effort
+            }
+        })
+        .await;
+    }
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// Pending intent cannot relabel an active turn, a steer, or a rejected
+/// turn/start. Only the vendor's effective settings update the live display.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_settings_pending_and_rejected_changes_do_not_relabel_turn() {
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_handler("settings-pending", |req| {
+        if req["method"] == "turn/start" {
+            json!({ "error": { "code": -32602, "message": "model unavailable" } })
+        } else {
+            d2_response(req)
+        }
+    })
+    .await;
+    notif
+        .send(json!({ "method": "thread/settings/updated", "params": {
+            "threadId": h.identity, "threadSettings": { "model": "original", "effort": "high" }
+        }}))
+        .await
+        .unwrap();
+    notif
+        .send(json!({ "method": "turn/started", "params": {
+            "threadId": h.identity, "turn": { "id": "active" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        async move {
+            adapter
+                .tracker_snapshot("tid-d2")
+                .await
+                .unwrap()
+                .active_turn
+                .is_some()
+        }
+    })
+    .await;
+    adapter
+        .handle_directive(&h, dir("model", "unlisted-next-model xhigh"))
+        .await
+        .unwrap();
+    adapter
+        .submit_turn(&h, TurnInput::UserText("steer".into()))
+        .await
+        .unwrap();
+    assert!(find_frame(&seen.lock().unwrap(), "turn/steer").is_some());
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("original"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+
+    notif
+        .send(json!({ "method": "turn/completed", "params": {
+            "threadId": h.identity, "turn": { "id": "active", "status": "completed" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        async move {
+            adapter
+                .tracker_snapshot("tid-d2")
+                .await
+                .unwrap()
+                .active_turn
+                .is_none()
+        }
+    })
+    .await;
+    assert!(adapter
+        .submit_turn(&h, TurnInput::UserText("rejected".into()))
+        .await
+        .is_err());
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("original"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// A slow event consumer sees the model at each terminal boundary, while
+/// status keeps the latest snapshot. Foreign threads cannot contaminate
+/// either model attribution or turn-local usage.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_settings_ordered_before_events_and_pinned_to_terminal_boundary() {
+    use futures::StreamExt;
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_notif("settings-ordered").await;
+    let mut events = adapter.events(&h);
+    // Poll once to attach the stream before sending notifications.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), events.next())
+            .await
+            .is_err()
+    );
+    for (index, directive, expected) in [
+        (
+            1,
+            dir("model", "future-model-direct ultra"),
+            "future-model-direct",
+        ),
+        (
+            2,
+            dir_choice("model", "test", &["future-model-picker low"]),
+            "future-model-picker",
+        ),
+    ] {
+        adapter.handle_directive(&h, directive).await.unwrap();
+        adapter
+            .submit_turn(&h, TurnInput::UserText("go".into()))
+            .await
+            .unwrap();
+        let effort = {
+            let frames = seen.lock().unwrap();
+            let request = frames
+                .iter()
+                .rev()
+                .find(|f| f["method"] == "turn/start")
+                .unwrap();
+            assert_eq!(request["params"]["model"], expected);
+            request["params"]["effort"].clone()
+        };
+        let turn = format!("settings-turn-{index}");
+        for frame in [
+            json!({ "method": "thread/settings/updated", "params": { "threadId": h.identity,
+                "threadSettings": { "model": expected, "effort": effort } } }),
+            json!({ "method": "turn/started", "params": { "threadId": h.identity,
+                "turn": { "id": turn } } }),
+            json!({ "method": "thread/settings/updated", "params": { "threadId": "foreign",
+                "threadSettings": { "model": "foreign-model", "effort": "high" } } }),
+            json!({ "method": "thread/tokenUsage/updated", "params": { "threadId": "foreign",
+                "tokenUsage": { "last": { "inputTokens": 9000, "outputTokens": 10 } } } }),
+            json!({ "method": "turn/completed", "params": { "threadId": h.identity,
+                "turn": { "id": turn, "status": "completed" } } }),
+            json!({ "method": "thread/settings/updated", "params": { "threadId": h.identity,
+                "threadSettings": { "model": "later-settings", "effort": null } } }),
+        ] {
+            notif.send(frame).await.unwrap();
+        }
+        wait_until(|| {
+            let adapter = adapter.clone();
+            async move {
+                adapter
+                    .tracker_snapshot("tid-d2")
+                    .await
+                    .unwrap()
+                    .model
+                    .as_deref()
+                    == Some("later-settings")
+            }
+        })
+        .await;
+        assert!(matches!(
+            events.next().await,
+            Some(ThreadEvent::TurnStarted { .. })
+        ));
+        match events.next().await.unwrap() {
+            ThreadEvent::TurnCompleted { model, usage, .. } => {
+                assert_eq!(model.as_deref(), Some(expected));
+                assert_eq!(
+                    usage.input_tokens, 0,
+                    "foreign usage cannot leak into this turn"
+                );
+            }
+            event => panic!("expected terminal event, got {event:?}"),
+        }
+        let status = adapter.thread_status(&h).await.unwrap();
+        assert_eq!(
+            status.model.as_deref(),
+            Some("later-settings"),
+            "slow consumers must not replay old state"
+        );
+        assert_eq!(status.effort, None);
+    }
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
 }
 
@@ -3062,8 +3291,12 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
             Some("initialize") => json!({ "result": {
                 "user_agent": "t/0", "codex_home": "/tmp/.codex",
                 "platform_family": "unix", "platform_os": "linux" } }),
-            Some("thread/resume") => json!({ "result": { "thread": { "thread_id": "t-prior" } } }),
+            Some("thread/resume") => json!({ "result": {
+                "thread": { "thread_id": "t-prior" },
+                "model": "future-resolved-model", "reasoningEffort": "xhigh"
+            } }),
             Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-fresh" } } }),
+            Some("turn/start") => json!({ "result": { "turn": { "id": "resumed-turn" } } }),
             _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
         }
     })
@@ -3124,8 +3357,8 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
                 cwd: tmp.path().to_path_buf(),
                 project_dir: tmp.path().to_path_buf(),
                 extra_args: vec![],
-                model_id: None,
-                effort: None,
+                model_id: Some("stale-spawn-model".into()),
+                effort: Some("low".into()),
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: "seKret".into(),
                 remote: None,
@@ -3134,8 +3367,24 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         .await
         .unwrap();
     assert_eq!(h.identity, "t-prior", "must resume the persisted thread id");
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("future-resolved-model"));
+    assert_eq!(status.effort.as_deref(), Some("xhigh"));
+    adapter
+        .submit_turn(&h, TurnInput::UserText("continue".into()))
+        .await
+        .unwrap();
 
     let seen = reqs.lock().unwrap().clone();
+    let turn = seen.iter().find(|r| r["method"] == "turn/start").unwrap();
+    assert!(
+        turn["params"].get("model").is_none(),
+        "resume must not reapply the spawn model"
+    );
+    assert!(
+        turn["params"].get("effort").is_none(),
+        "resume must not reapply the spawn effort"
+    );
     let resume = seen
         .iter()
         .find(|r| r["method"] == "thread/resume")

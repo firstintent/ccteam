@@ -6684,6 +6684,7 @@ impl Gateway {
                                 &session_id,
                             )
                             .await;
+                            let live_status = status_at_turn_boundary(live_status, &evt, session.vendor);
                             let meta_status = session_catalog.get(&session_id).map(|entry| entry.meta);
                             let projected = progress_projection.as_ref().and_then(|projection| {
                                 projection.session_snapshot(&session.project, &session_id)
@@ -6782,6 +6783,7 @@ impl Gateway {
                                     &session_id,
                                 )
                                 .await;
+                                let live_status = status_at_turn_boundary(live_status, &evt, session.vendor);
                                 let meta_status =
                                     session_catalog.get(&session_id).map(|entry| entry.meta);
                                 let projected = progress_projection.as_ref().and_then(|projection| {
@@ -15804,6 +15806,29 @@ fn turn_terminal_accounting(
     }
 }
 
+/// Live status can already describe the next turn when a slow pump receives
+/// this boundary. Codex's event carries its full observed model id. Other
+/// adapters can carry a billing id here (Claude omits the [1m] display tag),
+/// so retain their existing richer status source. This is a protocol
+/// distinction, never a model-id allowlist (docs-local/issues/#200).
+fn status_at_turn_boundary(
+    mut status: ThreadStatus,
+    evt: &ThreadEvent,
+    vendor: AgentVendor,
+) -> ThreadStatus {
+    if vendor != AgentVendor::Codex {
+        return status;
+    }
+    let model = match evt {
+        ThreadEvent::TurnCompleted { model, .. } | ThreadEvent::TurnFailed { model, .. } => model,
+        _ => return status,
+    };
+    if let Some(model) = model.as_ref().filter(|model| !model.is_empty()) {
+        status.model = Some(model.clone());
+    }
+    status
+}
+
 /// Whether this item is long-running work that can legitimately go silent
 /// between start and complete (tools, shell, search — not the final answer).
 fn is_openable_work_item(details: &ThreadItemDetails) -> bool {
@@ -22263,6 +22288,73 @@ mod tests {
                 .count(),
             1,
             "one IM status tail per vendor turn"
+        );
+    }
+
+    /// #200: a buffered Codex completion must retain its model all the way
+    /// through the IM footer and turns.jsonl, even if live status has advanced.
+    #[tokio::test]
+    async fn codex_turn_answer_and_mirror_use_the_terminal_model() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Codex));
+        let project = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", project.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new codex")
+            .await
+            .unwrap();
+        let mut answers = gateway.subscribe_events();
+        let session = gateway.sessions.values().next().unwrap();
+        let sid = session.id.clone();
+        let identity = session.thread.identity.clone();
+        fake.set_status(ThreadStatus {
+            model: Some("future-model-for-next-turn".into()),
+            ..Default::default()
+        })
+        .await;
+        {
+            let mut events = fake.events.lock().await;
+            for event in [
+                ThreadEvent::TurnStarted {
+                    turn_id: "prior-turn".into(),
+                },
+                ThreadEvent::ItemCompleted {
+                    item: ccteam_harness::ThreadItem {
+                        id: "answer".into(),
+                        details: ThreadItemDetails::AgentMessage(
+                            "completed with prior model".into(),
+                        ),
+                    },
+                },
+                ThreadEvent::TurnCompleted {
+                    turn_id: "prior-turn".into(),
+                    usage: Default::default(),
+                    model: Some("unlisted-model-for-this-turn".into()),
+                    conclusion: None,
+                },
+            ] {
+                events.push_back((identity.clone(), event));
+            }
+        }
+        fake.wake(&identity);
+        let answer = recv_answer(&mut answers).await;
+        assert_eq!(
+            answer.status.as_ref().and_then(|s| s.model.as_deref()),
+            Some("unlisted-model-for-this-turn")
+        );
+        assert!(answer
+            .content
+            .contains(" · codex · unlisted-model-for-this-turn · "));
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(project.path(), &sid).unwrap();
+        let turn = turns
+            .iter()
+            .find(|turn| !turn.assistant.is_empty())
+            .unwrap();
+        assert_eq!(
+            turn.status.as_ref().and_then(|s| s.model.as_deref()),
+            Some("unlisted-model-for-this-turn")
         );
     }
 

@@ -48,7 +48,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::execution::codex_jsonrpc::{CodexJsonRpcClient, JsonRpcError, Notification};
 use crate::execution::progress_bridge::{
@@ -151,7 +151,8 @@ pub struct ProgressBridgeCtx {
 /// (the real `turn/completed` wire has NO usage field — see
 /// `translate_notification`). `active_turn` is set on `turn/started` and
 /// cleared on `turn/completed` + terminal `error`. `model` is seeded from
-/// the spawn ctx / `thread/start` response.
+/// the spawn ctx / `thread/start` response and refreshed by Codex's
+/// `thread/settings/updated` snapshots when settings actually take effect.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadLive {
     /// Latest context usage (total tokens + model context window) from
@@ -162,15 +163,19 @@ pub struct ThreadLive {
     pub active_turn: Option<String>,
     /// Model id for this thread. Seeded deterministically from the spawn
     /// ctx (user's explicit intent) else codex's resolved `result.model`
-    /// echoed by the `thread/start` / `thread/resume` response — see
+    /// echoed by the `thread/start` / `thread/resume` response, then updated
+    /// from `thread/settings/updated` — see
     /// [`pluck_model`]. Never inferred; `None` only if codex reports none.
     pub model: Option<String>,
     /// Reasoning-effort the thread runs at (codex `reasoningEffort`,
     /// lowercase: `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/custom).
     /// Seeded from the `thread/start` / `thread/resume` response
-    /// ([`pluck_effort`]) or a `/model <id> <effort>` directive. `None`
+    /// ([`pluck_effort`]) and `thread/settings/updated`. A queued `/model`
+    /// override is intent, not an observation. `None`
     /// when codex reports no effort. Surfaced in the `/sessions` statusline.
     pub effort: Option<String>,
+    /// A resume response must not overwrite a newer settings notification.
+    settings_revision: u64,
 }
 
 /// v0.8.5 D2.4 — the harness-level, vendor-scoped runtime state cache.
@@ -292,6 +297,10 @@ pub struct CodexAppServerAdapter {
 #[derive(Clone)]
 struct CachedConn {
     client: Arc<CodexJsonRpcClient>,
+    /// Notifications reach consumers only after the sole dispatcher has
+    /// applied their state. Slow consumers never replay stale snapshots into
+    /// the shared tracker (docs-local/issues/#200).
+    notifications: broadcast::Sender<ObservedNotification>,
     loaded: Arc<Mutex<HashSet<String>>>,
     /// mtime of `$CODEX_HOME/config.toml` captured when this app-server child
     /// was spawned. `codex app-server` snapshots its config at process start
@@ -301,6 +310,14 @@ struct CachedConn {
     /// differ, so a new session picks up edited config without a ccteam
     /// restart. `None` when the file couldn't be stat'd at dial time.
     config_mtime: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone)]
+struct ObservedNotification {
+    notification: Notification,
+    /// Model at this terminal boundary, before a later settings snapshot can
+    /// change the live tracker. Used for turn attribution, including failures.
+    model: Option<String>,
 }
 
 /// v0.8.5 D2 — one entry of the flattened `skills/list` cache.
@@ -444,9 +461,10 @@ impl CodexAppServerAdapter {
         // multiple `events()` streams never double-counts (arch §1.3).
         // The task exits when the broadcast closes (client dropped /
         // `forget_client`); a subsequent re-dial spawns a fresh one.
-        self.spawn_tracker_dispatcher(&shared);
+        let notifications = self.spawn_tracker_dispatcher(&shared);
         let conn = CachedConn {
             client: Arc::clone(&shared),
+            notifications,
             loaded: Arc::new(Mutex::new(HashSet::new())),
             config_mtime: codex_config_mtime(),
         };
@@ -532,7 +550,9 @@ impl CodexAppServerAdapter {
         // on-disk rollout AND subscribes this connection, so codex keeps it
         // resident for the connection's life). Holding `loaded` across the RPC
         // makes the resume exactly-once per (thread, connection).
-        self.call_or_drop_dead(&conn.client, "thread/resume", json!({ "threadId": tid }))
+        let settings_revision = self.settings_revision(tid).await;
+        let result = self
+            .call_or_drop_dead(&conn.client, "thread/resume", json!({ "threadId": tid }))
             .await
             .map_err(|e| {
                 HarnessError::SubmitFailed(format!(
@@ -540,6 +560,13 @@ impl CodexAppServerAdapter {
                     writer_held_hint(tid, &e)
                 ))
             })?;
+        self.seed_thread_settings(
+            tid,
+            settings_revision,
+            pluck_model(&result),
+            pluck_effort(&result),
+        )
+        .await;
         loaded.insert(tid.to_string());
         drop(loaded);
         // A freshly (re)loaded thread has no in-flight turn; clear any stale
@@ -600,13 +627,15 @@ impl CodexAppServerAdapter {
     /// that feeds the [`CodexThreadTracker`] and invalidates the skills
     /// cache. Deliberately NOT hung on `events()` (which stays a final-only
     /// presentation translator); the progress.jsonl mirror in `events()`
-    /// is unaffected. Returns the [`JoinHandle`] (mostly for tests; the
-    /// task self-terminates on broadcast close).
+    /// is unaffected. Returns the observed notification feed; the task
+    /// self-terminates when the client's raw notification feed closes.
     fn spawn_tracker_dispatcher(
         &self,
         client: &Arc<CodexJsonRpcClient>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> broadcast::Sender<ObservedNotification> {
         let mut rx = client.subscribe();
+        let (notifications, _) = broadcast::channel(256);
+        let tx = notifications.clone();
         let tracker = Arc::clone(&self.tracker);
         let skills_cache = Arc::clone(&self.skills_cache);
         let rate_limits = Arc::clone(&self.rate_limits);
@@ -628,6 +657,20 @@ impl CodexAppServerAdapter {
                                 *rate_limits.lock().await = Some(snap);
                             }
                         }
+                        let model = if matches!(notif.method.as_str(), "turn/completed" | "error") {
+                            match pluck_str(&notif.params, "thread_id", "threadId") {
+                                Some(tid) => {
+                                    tracker.lock().await.snapshot(tid).and_then(|t| t.model)
+                                }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let _ = tx.send(ObservedNotification {
+                            notification: notif,
+                            model,
+                        });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(n, "codex tracker dispatcher lagged");
@@ -636,7 +679,8 @@ impl CodexAppServerAdapter {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
-        })
+        });
+        notifications
     }
 
     /// Test hook: seed a thread's model in the tracker (production seeds it
@@ -649,6 +693,27 @@ impl CodexAppServerAdapter {
     /// Snapshot a thread's tracker state (test + `thread_status` use it).
     pub async fn tracker_snapshot(&self, thread_id: &str) -> Option<ThreadLive> {
         self.tracker.lock().await.snapshot(thread_id)
+    }
+
+    async fn settings_revision(&self, thread_id: &str) -> u64 {
+        self.tracker_snapshot(thread_id)
+            .await
+            .map_or(0, |live| live.settings_revision)
+    }
+
+    async fn seed_thread_settings(
+        &self,
+        thread_id: &str,
+        revision: u64,
+        model: Option<String>,
+        effort: Option<String>,
+    ) {
+        let mut tracker = self.tracker.lock().await;
+        let entry = tracker.entry(thread_id);
+        if entry.settings_revision == revision {
+            entry.model = model;
+            entry.effort = effort;
+        }
     }
 
     /// v0.8.5 D2.1 — fold the per-session override map for `thread_id` into a
@@ -1706,7 +1771,11 @@ impl HarnessAdapter for CodexAppServerAdapter {
             .ok()
             .map(|m| m.vendor_uuid)
             .filter(|u| !u.trim().is_empty());
-        let (thread_id, result) = match prior_uuid {
+        let settings_revision = match prior_uuid.as_deref() {
+            Some(tid) => self.settings_revision(tid).await,
+            None => 0,
+        };
+        let (thread_id, result, resumed) = match prior_uuid {
             Some(uuid) => {
                 let mut resume_params = json!({ "threadId": uuid });
                 if let Some(cfg) = mcp_config.clone() {
@@ -1718,7 +1787,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 {
                     Ok(result) => {
                         let tid = pluck_thread_id(&result).unwrap_or(uuid);
-                        (tid, result)
+                        (tid, result, true)
                     }
                     Err(resume_err) => {
                         tracing::warn!(
@@ -1749,7 +1818,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                 "thread/start response missing thread.thread_id: {result}"
                             ))
                         })?;
-                        (tid, result)
+                        (tid, result, false)
                     }
                 }
             }
@@ -1763,7 +1832,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
                         "thread/start response missing thread.thread_id: {result}"
                     ))
                 })?;
-                (tid, result)
+                (tid, result, false)
             }
         };
         // Advisory catalog capture: one cheap RPC on this thread's EXISTING
@@ -1805,7 +1874,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // display-only (tracker seeding below); now it actually reaches
         // codex. Effort values are codex's `ReasoningEffort` set
         // (`none|minimal|low|medium|high|xhigh`).
-        {
+        if !resumed {
             let model = ctx.model_id.clone().filter(|m| !m.trim().is_empty());
             let effort = ctx.effort.clone().filter(|e| !e.trim().is_empty());
             if model.is_some() || effort.is_some() {
@@ -1822,30 +1891,23 @@ impl HarnessAdapter for CodexAppServerAdapter {
         }
         // v0.8.5 D2.4 / v0.8.19 — seed the tracker's model + effort for this
         // thread so `/status` + `thread_status` can report them before the
-        // first tokenUsage notification arrives. DETERMINISTIC precedence:
-        // the user's explicit `ctx.model_id` wins; otherwise codex's RESOLVED
-        // model echoed in the `thread/start` response (`result.model` — see
-        // [`pluck_model`]). Never inferred. This fixes the blank statusline
-        // model for sessions started without an explicit model (codex's
-        // server default). Effort comes only from the response (codex owns
-        // it; `result.reasoningEffort`).
+        // first notification arrives. Only a fresh thread inherits spawn
+        // picks: on resume they describe its creation, not its current model.
+        // Codex's resolved response owns the resumed settings, unless a newer
+        // settings notification has already arrived during the RPC (#200).
         {
-            let model = ctx.model_id.clone().or_else(|| pluck_model(&result));
-            // v0.8.24 A-U3 — an explicit ctx effort wins (it is now also an
-            // override, so it is what codex will run); else the response echo.
-            let effort = ctx
-                .effort
-                .clone()
+            let model =
+                if resumed { None } else { ctx.model_id.clone() }.or_else(|| pluck_model(&result));
+            let effort = if resumed { None } else { ctx.effort.clone() }
                 .filter(|e| !e.trim().is_empty())
                 .or_else(|| pluck_effort(&result));
-            let mut tracker = self.tracker.lock().await;
-            let entry = tracker.entry(&thread_id);
-            if model.is_some() {
-                entry.model = model;
-            }
-            if effort.is_some() {
-                entry.effort = effort;
-            }
+            self.seed_thread_settings(
+                &thread_id,
+                if resumed { settings_revision } else { 0 },
+                model,
+                effort,
+            )
+            .await;
         }
         // V0.6.1 F122 — register a progress bridge so the events()
         // stream can mirror turn boundaries into progress.jsonl.
@@ -1859,7 +1921,10 @@ impl HarnessAdapter for CodexAppServerAdapter {
                     role: spec.role.clone(),
                     sid: ctx.sid.clone(),
                     slug: ctx.slug.clone(),
-                    model: ctx.model_id.clone(),
+                    model: self
+                        .tracker_snapshot(&thread_id)
+                        .await
+                        .and_then(|live| live.model),
                 },
             )
             .await;
@@ -1988,8 +2053,8 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // Error event and stop — orchestrator's progress.jsonl poller
         // remains the state-transition SoT (Wave 1 contract).
         let setup = async move {
-            match adapter_setup.client().await {
-                Ok(c) => Ok(c.subscribe()),
+            match adapter_setup.conn().await {
+                Ok(c) => Ok(c.notifications.subscribe()),
                 Err(err) => Err(ThreadErrorEvent {
                     kind: "connect".into(),
                     message: err.to_string(),
@@ -2031,20 +2096,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
                             async move {
                                 loop {
                                     match rx.recv().await {
-                                        Ok(notif) => {
-                                            // Apply the same notification in
-                                            // this ordered subscriber before
-                                            // translating a terminal event.
-                                            // The connection-wide dispatcher
-                                            // remains for live status reads,
-                                            // but can otherwise lag the event
-                                            // consumer by one notification.
-                                            if notif.method == "thread/tokenUsage/updated" {
-                                                apply_notification_to_tracker(
-                                                    &bridge.tracker,
-                                                    &notif,
-                                                )
-                                                .await;
+                                        Ok(observed) => {
+                                            let notif = observed.notification;
+                                            // Account notifications are shared; turn-local state
+                                            // must never absorb another thread's settings/usage.
+                                            if pluck_str(&notif.params, "thread_id", "threadId")
+                                                .is_some_and(|tid| tid != wanted)
+                                            {
+                                                continue;
                                             }
                                             if notif.method == "turn/started" {
                                                 turn_usage = None;
@@ -2065,18 +2124,14 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                                     enrich_codex_turn_completed(
                                                         &mut evt, turn_usage,
                                                     );
+                                                    if let ThreadEvent::TurnCompleted { model, .. } = &mut evt {
+                                                        *model = observed.model.clone();
+                                                    }
                                                 }
                                                 if matches!(evt, ThreadEvent::TurnFailed { .. }) {
-                                                    let fallback_model = match ctx
-                                                        .as_ref()
-                                                        .and_then(|ctx| ctx.model.clone())
-                                                    {
-                                                        Some(model) => Some(model),
-                                                        None => bridge
-                                                            .tracker_snapshot(&wanted)
-                                                            .await
-                                                            .and_then(|live| live.model),
-                                                    };
+                                                    let fallback_model = observed.model.or_else(|| {
+                                                        ctx.as_ref().and_then(|ctx| ctx.model.clone())
+                                                    });
                                                     enrich_codex_turn_failed(
                                                         &mut evt,
                                                         turn_usage,
@@ -2191,6 +2246,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
 
     async fn resume_thread(&self, persistent_id: &str) -> Result<ThreadHandle, HarnessError> {
         let client = self.client().await?;
+        let settings_revision = self.settings_revision(persistent_id).await;
         let result = self
             .call_or_drop_dead(
                 &client,
@@ -2210,18 +2266,13 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // deterministic source. This is what fixes the blank statusline model
         // on a daemon-restart-resumed codex session (e.g. the live s28).
         // Never inferred; only set from a real value codex reports.
-        {
-            let model = pluck_model(&result);
-            let effort = pluck_effort(&result);
-            let mut tracker = self.tracker.lock().await;
-            let entry = tracker.entry(&thread_id);
-            if model.is_some() {
-                entry.model = model;
-            }
-            if effort.is_some() {
-                entry.effort = effort;
-            }
-        }
+        self.seed_thread_settings(
+            &thread_id,
+            settings_revision,
+            pluck_model(&result),
+            pluck_effort(&result),
+        )
+        .await;
         Ok(ThreadHandle {
             vendor: AgentVendor::Codex,
             mode: ExecutionMode::Chat,
@@ -2338,15 +2389,15 @@ impl HarnessAdapter for CodexAppServerAdapter {
 
     async fn thread_status(&self, h: &ThreadHandle) -> Result<ThreadStatus, HarnessError> {
         // P3 (D2.4) — read the harness-owned tracker, fed by the single
-        // dispatcher from `thread/tokenUsage/updated` (usage) + spawn ctx
-        // (model). No RPC: this is a pure in-memory read.
+        // dispatcher from `thread/tokenUsage/updated` (usage) and
+        // `thread/settings/updated` (model/effort). No RPC or model-id table.
         let live = self.tracker_snapshot(&h.identity).await.unwrap_or_default();
         Ok(ThreadStatus {
             model: live.model,
             context: live.usage,
             // v0.8.19 — codex's RESOLVED reasoning effort, captured
-            // deterministically from the `thread/start` / `thread/resume`
-            // response (`result.reasoningEffort`). `None` when codex reports
+            // from `thread/start` / `thread/resume` and subsequent settings
+            // snapshots. `None` when codex reports
             // none (keeps the Codex suffix unchanged in that case).
             effort: live.effort,
             // Codex has a native `/goal` (thread/goal/*); surfacing it in the
@@ -3212,8 +3263,8 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // The lookup here returns `None` against a live binary → default
         // usage; it stays only to satisfy synthetic test fixtures that inline
         // `usage`. Do NOT "fix" it to read the turn object — there is nothing
-        // there to read. Codex per-turn cost is priced from `ctx.model` in
-        // `build_progress_line` (the wire carries no model here).
+        // there to read. The dispatcher captures the observed model at this
+        // boundary; events() attaches it before pricing in build_progress_line.
         "turn/completed" => Some(match codex_turn_outcome(&notif.params) {
             CodexTurnOutcome::Ok => ThreadEvent::TurnCompleted {
                 turn_id: pluck_turn_id_from_params(&notif.params),
@@ -3322,7 +3373,7 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // (it invalidates the skills/list cache, arch §1.3). It carries no
         // ThreadEvent and no progress.jsonl row; skip it silently here so it
         // doesn't hit the unknown-method warn path.
-        "skills/changed" => None,
+        "skills/changed" | "thread/settings/updated" => None,
         // V0.6.3 F144 — forward-compat: a `codex app-server` notification
         // `method` we don't yet propagate is **skipped** (`None`) so the
         // event stream is never broken — the orchestrator's
@@ -3782,6 +3833,9 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
 /// dispatcher calls it); `events()` never touches the tracker.
 ///
 /// - `turn/started` → set `active_turn` (turn id at `turn.id`, real wire).
+/// - `thread/settings/updated` → replace model/effort with the vendor's
+///   resolved snapshot, including clearing an absent/null effort. No model
+///   whitelist: a new id is data, not a ccteam release requirement (#200).
 /// - `turn/completed` → clear `active_turn`.
 /// - `error` with `willRetry == false` (terminal) → clear `active_turn`.
 ///   Retryable errors leave it set (the turn is still alive).
@@ -3806,6 +3860,15 @@ async fn apply_notification_to_tracker(
         return;
     };
     match notif.method.as_str() {
+        "thread/settings/updated" => {
+            if let Some(model) = pluck_model(&notif.params) {
+                let mut tracker = tracker.lock().await;
+                let entry = tracker.entry(&tid);
+                entry.model = Some(model);
+                entry.effort = pluck_effort(&notif.params);
+                entry.settings_revision = entry.settings_revision.saturating_add(1);
+            }
+        }
         "turn/started" => {
             let turn_id = pluck_turn_id_from_params(&notif.params);
             tracker.lock().await.entry(&tid).active_turn = Some(turn_id);
@@ -4158,6 +4221,78 @@ mod tests {
         // An in-flight turn does.
         tracker.entry("t-2").active_turn = Some("turn-9".into());
         assert!(tracker.any_active_turn());
+    }
+
+    /// Keep the settings contract in the CI lib-test baseline as well as
+    /// the adapter's scripted transport tests (docs-local/issues/#200).
+    #[tokio::test]
+    async fn tracker_settings_snapshot_accepts_new_ids_and_clears_effort() {
+        let tracker = Arc::new(Mutex::new(CodexThreadTracker::default()));
+        for settings in [
+            json!({"model": "unlisted-future-id", "effort": "ultra"}),
+            json!({"model": "model-without-effort", "effort": null}),
+            json!({"model": "unlisted-future-id", "effort": "high"}),
+            json!({"model": "model-omitting-effort"}),
+        ] {
+            apply_notification_to_tracker(
+                &tracker,
+                &Notification {
+                    method: "thread/settings/updated".into(),
+                    params: json!({"threadId": "t-1", "threadSettings": settings}),
+                },
+            )
+            .await;
+            let live = tracker.lock().await.snapshot("t-1").unwrap();
+            assert_eq!(live.model.as_deref(), settings["model"].as_str());
+            assert_eq!(live.effort.as_deref(), settings["effort"].as_str());
+        }
+        apply_notification_to_tracker(
+            &tracker,
+            &Notification {
+                method: "thread/settings/updated".into(),
+                params: json!({"threadId": "t-2", "threadSettings": {"model": "foreign"}}),
+            },
+        )
+        .await;
+        assert_eq!(
+            tracker
+                .lock()
+                .await
+                .snapshot("t-1")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("model-omitting-effort")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_response_cannot_overwrite_a_newer_settings_notification() {
+        let adapter = CodexAppServerAdapter::new();
+        let before_resume = adapter.settings_revision("t-1").await;
+        apply_notification_to_tracker(&adapter.tracker, &Notification {
+            method: "thread/settings/updated".into(),
+            params: json!({"threadId": "t-1", "threadSettings": {"model": "newer-model", "effort": "ultra"}}),
+        }).await;
+        adapter
+            .seed_thread_settings(
+                "t-1",
+                before_resume,
+                Some("old-response-model".into()),
+                Some("low".into()),
+            )
+            .await;
+        let live = adapter.tracker_snapshot("t-1").await.unwrap();
+        assert_eq!(live.model.as_deref(), Some("newer-model"));
+        assert_eq!(live.effort.as_deref(), Some("ultra"));
+
+        let next_resume = adapter.settings_revision("t-1").await;
+        adapter
+            .seed_thread_settings("t-1", next_resume, Some("resumed-model".into()), None)
+            .await;
+        let live = adapter.tracker_snapshot("t-1").await.unwrap();
+        assert_eq!(live.model.as_deref(), Some("resumed-model"));
+        assert_eq!(live.effort, None, "a resolved resume can clear effort");
     }
 
     #[test]
