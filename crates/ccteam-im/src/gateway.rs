@@ -15786,6 +15786,15 @@ fn thread_event_failure(evt: &ThreadEvent) -> Option<&ccteam_harness::ThreadErro
 /// failed turns deliberately share this projection so every paid token reaches
 /// the same existing `chat_turn_completed` ledger row without changing the
 /// progress schema.
+///
+/// Both arms bind ONLY the three accounting fields and ignore the rest of the
+/// payload: whether a turn is billed is a property of its boundary, never of
+/// what it said. GitHub #197 — issue #196 added `TurnCompleted.conclusion` and
+/// this arm was written `conclusion: None`, a value pattern, so every Claude
+/// turn that narrated before its receipt (nearly every working turn) stopped
+/// producing a ledger row, an experience row, usage on its transcript row and
+/// any meta token/cost fold. `..` keeps a field added tomorrow from un-billing
+/// a turn the same way.
 fn turn_terminal_accounting(
     evt: &ThreadEvent,
 ) -> Option<(&str, &ccteam_harness::UnifiedTokenUsage, Option<&str>)> {
@@ -15794,7 +15803,7 @@ fn turn_terminal_accounting(
             turn_id,
             usage,
             model,
-            conclusion: None,
+            ..
         }
         | ThreadEvent::TurnFailed {
             turn_id,
@@ -15803,6 +15812,82 @@ fn turn_terminal_accounting(
             ..
         } => Some((turn_id, usage, model.as_deref())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod turn_terminal_accounting_tests {
+    use super::*;
+    use ccteam_harness::{ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
+
+    fn usage() -> UnifiedTokenUsage {
+        UnifiedTokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        }
+    }
+
+    /// GitHub #197 A — what a turn *said* must never decide whether it is
+    /// billed. `TurnCompleted.conclusion` (issue #196) is payload: it is
+    /// `Some` for every Claude turn that narrated before its receipt, i.e.
+    /// nearly every real working turn. Matching it by value here silently
+    /// dropped the ledger row, the experience row, the usage on the final
+    /// transcript row and the whole meta fold for those turns. The arm binds
+    /// only the three accounting fields and ignores the rest, so a field added
+    /// to this event tomorrow cannot un-bill a turn either.
+    #[test]
+    fn accounting_ignores_the_turns_conclusion_payload() {
+        for conclusion in [None, Some("READY · checks GREEN".to_string())] {
+            let evt = ThreadEvent::TurnCompleted {
+                turn_id: "t1".into(),
+                usage: usage(),
+                model: Some("claude-sonnet-4-6".into()),
+                conclusion: conclusion.clone(),
+            };
+            let (turn_id, usage, model) = turn_terminal_accounting(&evt).unwrap_or_else(|| {
+                panic!("a completed turn is accounted whatever it concluded: {conclusion:?}")
+            });
+            assert_eq!(turn_id, "t1");
+            assert_eq!(usage.total(), 1_500);
+            assert_eq!(model, Some("claude-sonnet-4-6"));
+        }
+    }
+
+    /// A failed turn burned tokens too, and carries no conclusion to confuse
+    /// the arm — pinned so the or-pattern keeps both halves.
+    #[test]
+    fn accounting_covers_the_failed_boundary() {
+        let evt = ThreadEvent::TurnFailed {
+            turn_id: "t2".into(),
+            err: ccteam_harness::ThreadErrorEvent {
+                kind: "turn_failed".into(),
+                message: "output truncated".into(),
+            },
+            usage: usage(),
+            model: Some("vendor-reported-model".into()),
+        };
+        let (turn_id, usage, model) =
+            turn_terminal_accounting(&evt).expect("a failed turn is accounted");
+        assert_eq!(turn_id, "t2");
+        assert_eq!(usage.total(), 1_500);
+        assert_eq!(model, Some("vendor-reported-model"));
+    }
+
+    /// Only a terminal boundary is a billing event; mid-turn traffic is not.
+    #[test]
+    fn accounting_ignores_non_terminal_events() {
+        assert!(turn_terminal_accounting(&ThreadEvent::TurnStarted {
+            turn_id: "t3".into()
+        })
+        .is_none());
+        assert!(turn_terminal_accounting(&ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: "m1".into(),
+                details: ThreadItemDetails::AgentMessage("hi".into()),
+            },
+        })
+        .is_none());
     }
 }
 
@@ -19570,6 +19655,16 @@ mod tests {
         emit_turn_boundary: bool,
         /// Number of assistant messages emitted inside one vendor turn.
         assistant_messages: usize,
+        /// Text carried on `TurnCompleted.conclusion` — what a real Claude turn
+        /// stamps when it narrated before its receipt (issue #196). Off by
+        /// default, which is precisely why the fake could not catch GitHub #197:
+        /// accounting that value-matched `conclusion: None` stayed green here
+        /// while every narrated live turn went unbilled.
+        turn_conclusion: Option<String>,
+        /// Emit the turn boundary with NO assistant message — a successful turn
+        /// that produced no answer text (a pure tool run, or an answer the
+        /// vendor swallowed). Its tokens are still paid for.
+        suppress_answer: bool,
         /// Emit the structured paneless turn-start boundary before reply data.
         /// Opt-in so timing-sensitive tests can pause between start/completion.
         emit_turn_started: bool,
@@ -19659,6 +19754,8 @@ mod tests {
                 spawn_generations: Arc::new(Mutex::new(Vec::new())),
                 emit_turn_boundary: false,
                 assistant_messages: 1,
+                turn_conclusion: None,
+                suppress_answer: false,
                 emit_turn_started: false,
                 turn_failure: None,
                 interrupts: Arc::new(Mutex::new(Vec::new())),
@@ -19703,6 +19800,19 @@ mod tests {
 
         fn with_assistant_messages(mut self, count: usize) -> Self {
             self.assistant_messages = count.max(1);
+            self
+        }
+
+        /// Stamp `TurnCompleted.conclusion` — model a turn that narrated
+        /// before its receipt, the shape every real Claude turn carries.
+        fn with_turn_conclusion(mut self, conclusion: impl Into<String>) -> Self {
+            self.turn_conclusion = Some(conclusion.into());
+            self
+        }
+
+        /// Emit only the turn boundary: a successful turn with no answer text.
+        fn with_empty_answer(mut self) -> Self {
+            self.suppress_answer = true;
             self
         }
 
@@ -19873,6 +19983,9 @@ mod tests {
                 ));
             } else {
                 for index in 0..self.assistant_messages {
+                    if self.suppress_answer {
+                        break;
+                    }
                     let content = if index.saturating_add(1) == self.assistant_messages {
                         format!("{} echo: {text}", h.identity)
                     } else {
@@ -19908,7 +20021,7 @@ mod tests {
                             // one so the pump's chat_turn_completed mirror exercises
                             // the per-turn model path.
                             model: Some("claude-sonnet-4-6".to_string()),
-                            conclusion: None,
+                            conclusion: self.turn_conclusion.clone(),
                         },
                     ));
                 }
@@ -23656,6 +23769,205 @@ mod tests {
             "stream-json pump must mirror a chat_turn_completed carrying the sid to {}",
             progress.display()
         );
+    }
+
+    /// GitHub #197 A — the live regression, end to end through the pump.
+    /// A Claude turn that narrates before its receipt carries
+    /// `TurnCompleted.conclusion`; on the pre-fix arm that turn produced NO
+    /// `chat_turn_completed`, no experience row, no usage on its transcript
+    /// row and no meta fold — measured on excore, where s933's six completed
+    /// turns left the ledger empty. Accounting keys off the boundary, never
+    /// off what the turn said. The row count is asserted exactly: the answer
+    /// mirror and the boundary both run for this turn and must not double-bill.
+    #[tokio::test]
+    async fn narrated_turn_with_conclusion_reaches_ledger_experience_and_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let receipt = "READY for review · checks GREEN · risk none";
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                // start → narration → narration → receipt → boundary: the real
+                // stream-json turn shape, so the answers ride the boundary as
+                // one structured turn instead of being mirrored one by one.
+                .with_turn_started()
+                .with_turn_boundary()
+                .with_assistant_messages(3)
+                .with_turn_conclusion(receipt),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let ledger_rows = |()| {
+            ccteam_core::progress::read_all_events(&progress)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|event| {
+                    event.get("event").and_then(|value| value.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                        && event.get("sid").and_then(|value| value.as_str()) == Some(sid.as_str())
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut rows = Vec::new();
+        for _ in 0..100 {
+            rows = ledger_rows(());
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "a narrated turn bills exactly once at its boundary; got {rows:?}"
+        );
+        let usage: ccteam_harness::UnifiedTokenUsage =
+            serde_json::from_value(rows[0]["usage"].clone()).unwrap();
+        assert_eq!(usage.total(), 1_500, "the boundary's usage rides the row");
+        assert_eq!(rows[0]["model"].as_str(), Some("claude-sonnet-4-6"));
+
+        let mut experience = None;
+        let mut meta = None;
+        for _ in 0..100 {
+            experience = ccteam_harness::execution::experience::read_all_experience(&project_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|record| match record {
+                    ccteam_harness::execution::experience::ExperienceRecord::Turn(turn)
+                        if turn.sid == sid =>
+                    {
+                        Some(turn)
+                    }
+                    _ => None,
+                });
+            meta = read_session_meta(&project_dir, &sid)
+                .ok()
+                .filter(|session| session.tokens_total == Some(1_500));
+            if experience.is_some() && meta.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let experience = experience.expect("a narrated turn appends its experience row");
+        assert_eq!(experience.usage.map(|value| value.total()), Some(1_500));
+        assert!(
+            experience.cost_usd.is_some_and(|cost| cost > 0.0),
+            "a known model prices the turn: {:?}",
+            experience.cost_usd
+        );
+        let meta = meta.expect("a narrated turn folds into meta tokens/cost");
+        assert_eq!(meta.tokens_total, Some(1_500));
+        assert!(
+            meta.cost_usd.is_some_and(|cost| cost > 0.0),
+            "meta.cost_usd stayed blank: {:?}",
+            meta.cost_usd
+        );
+        assert_eq!(meta.observed_model.as_deref(), Some("claude-sonnet-4-6"));
+
+        // The usage on the FINAL transcript row comes from the same accounting
+        // projection, so it went null on the pre-fix arm too.
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &sid).unwrap();
+        let last = turns
+            .iter()
+            .rev()
+            .find(|turn| !turn.assistant.is_empty())
+            .expect("the pump mirrors the answer");
+        assert_eq!(
+            last.conclusion.as_deref(),
+            Some(receipt),
+            "the final row carries the turn's conclusion (issue #196)"
+        );
+        assert!(
+            !last.usage.is_null(),
+            "the final answer row carries the turn's usage: {:?}",
+            last.usage
+        );
+    }
+
+    /// GitHub #197 A — a successful turn that produced no answer text (a pure
+    /// tool run) still burned tokens, so it still bills. Accounting hangs off
+    /// the boundary, not off the presence of an answer to mirror.
+    #[tokio::test]
+    async fn silent_success_turn_is_still_accounted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_boundary()
+                .with_empty_answer(),
+        );
+        let mut gateway = Gateway::new(fake, "alpha", project_dir.clone());
+        gateway.enable_project_creation(paths.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        gateway
+            .submit_to_sid(&sid, "do a thing".into())
+            .await
+            .unwrap();
+
+        let progress = paths.progress_jsonl("alpha");
+        let mut row = None;
+        for _ in 0..100 {
+            row = ccteam_core::progress::read_all_events(&progress)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|event| {
+                    event.get("event").and_then(|value| value.as_str())
+                        == Some(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                        && event.get("sid").and_then(|value| value.as_str()) == Some(sid.as_str())
+                });
+            if row.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let row = row.unwrap_or_else(|| {
+            panic!(
+                "an answerless successful turn still bills to {}",
+                progress.display()
+            )
+        });
+        let usage: ccteam_harness::UnifiedTokenUsage =
+            serde_json::from_value(row["usage"].clone()).unwrap();
+        assert_eq!(usage.total(), 1_500);
     }
 
     #[tokio::test]
