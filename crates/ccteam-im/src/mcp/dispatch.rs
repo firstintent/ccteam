@@ -4661,23 +4661,25 @@ async fn run_agent_read_transcript(
         let _suppressed = gateway.lock().await.release_read_wait(&sid, &caller_sid);
     }
 
-    // Resolve under the lock (sync) — with the child's in-flight turn, which is
-    // a cheap in-memory peek — then DROP the guard before the fs read.
+    // Resolve under the lock (sync), then DROP the guard before the fs read.
     // Residency comes from the SAME lock hold as the resolve: two acquisitions
     // could disagree about a session that was released in between.
-    let (resolved, live, projection, residency, in_flight) = {
+    let (resolved, live, projection, residency) = {
         let gw = gateway.lock().await;
         (
             gw.session_resolve_any(&sid),
             gw.live_turn_for(&sid),
             gw.progress_projection(),
             gw.session_residency(&sid),
-            // The turn in flight, from the SAME hold: a partial that named a
-            // turn the residency in this body contradicts would be worse than
-            // no partial at all.
-            gw.in_flight_turn(&sid),
         )
     };
+    // The turn in flight is asked for SEPARATELY, because answering it means
+    // calling the adapter and no adapter may be called with the one global
+    // gateway mutex held — `agent_read` is on every orchestrator's hot path
+    // (GitHub #197 G, checker). It takes and releases the lock itself; a
+    // partial can only come from a session that was live, so it can never
+    // contradict the residency read above in the direction that would matter.
+    let in_flight = Gateway::in_flight_turn_shared(gateway, &sid).await;
     let resolved = resolved.ok_or_else(|| format!("agent_read: unknown session {sid}"))?;
 
     // Tail the ccteam-owned transcript mirror.

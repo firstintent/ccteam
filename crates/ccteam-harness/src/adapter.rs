@@ -1865,8 +1865,13 @@ pub trait HarnessAdapter: Send + Sync {
     /// not running, or this adapter cannot report one" — the record then says
     /// the narration is UNKNOWN rather than implying the turn was silent.
     ///
-    /// Must NOT block or do IO: it is called on the stop path with the gateway
-    /// lock held.
+    /// Must NOT block, do IO, or cost more than the cap: the stop path calls it
+    /// with the gateway lock held. An implementation that rendered the tail by
+    /// scanning the turn's whole accumulated text made that hold grow with
+    /// however long the child had been talking — keep the bounded tail as the
+    /// chunks arrive ([`NarrationAccumulator`]) and hand it over here. The READ
+    /// path does not rely on this alone: it resolves the handle under the lock
+    /// and calls this after releasing it.
     fn in_flight_narration(&self, _h: &ThreadHandle) -> Option<PartialNarration> {
         None
     }

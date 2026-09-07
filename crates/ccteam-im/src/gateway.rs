@@ -1321,6 +1321,43 @@ struct CutTurn {
     exec_turn_id: String,
     partial: Option<ccteam_harness::PartialNarration>,
 }
+/// The lock-held half of an in-flight read: a live session with a turn
+/// running, plus the cheap clones the adapter call needs. Everything expensive
+/// happens after the guard is dropped (see `Gateway::in_flight_turn_shared`).
+struct InFlightProbe {
+    adapter: Arc<dyn HarnessAdapter + Send + Sync>,
+    thread: ccteam_harness::ThreadHandle,
+    watched_turn: Option<String>,
+}
+
+/// Assemble the read from what the adapter answered. One place, so the three
+/// narration words mean the same thing wherever they are read.
+fn in_flight_turn_from(
+    exec_turn_id: String,
+    partial: Option<&ccteam_harness::PartialNarration>,
+    requests: Vec<String>,
+) -> InFlightTurn {
+    let (narration, text, omitted_chars) = match partial {
+        // The adapter could not be asked: the narration is UNKNOWN, which is
+        // not the same fact as a turn that has said nothing.
+        None => (InterruptedNarration::Unknown, String::new(), 0),
+        Some(partial) if partial.text.trim().is_empty() => {
+            (InterruptedNarration::Empty, String::new(), 0)
+        }
+        Some(partial) => (
+            InterruptedNarration::Recorded,
+            partial.text.clone(),
+            partial.omitted_chars,
+        ),
+    };
+    InFlightTurn {
+        exec_turn_id,
+        narration,
+        text,
+        omitted_chars,
+        requests,
+    }
+}
 
 /// A turn IN FLIGHT, as a read surface reports it (GitHub #197 G).
 ///
@@ -16155,47 +16192,88 @@ impl Gateway {
         })
     }
 
-    /// What `sid`'s in-flight turn has said so far, for a READ — `None` when
-    /// no turn is running or the session holds no process (GitHub #197 G).
+    /// The half of an in-flight read that needs the gateway lock: a live
+    /// session with a turn running, and the cheap clones an adapter call takes.
     ///
-    /// Reuses the stop path's capture ([`Self::capture_cut_turn`]), so the two
-    /// surfaces can never disagree about which turn is open or what it said,
-    /// and adds the requests bound to that turn. Read-only and lock-only: it
-    /// settles nothing, so a parent may look at a working child as often as it
-    /// likes without changing what happens when the turn ends.
-    pub fn in_flight_turn(&self, sid: &str) -> Option<InFlightTurn> {
-        let cut = self.capture_cut_turn(self.sessions.get(sid)?)?;
-        let (narration, text, omitted_chars) = match cut.partial.as_ref() {
-            // The adapter could not be asked: the narration is UNKNOWN, which
-            // is not the same fact as a turn that has said nothing.
-            None => (InterruptedNarration::Unknown, String::new(), 0),
-            Some(partial) if partial.text.trim().is_empty() => {
-                (InterruptedNarration::Empty, String::new(), 0)
-            }
-            Some(partial) => (
-                InterruptedNarration::Recorded,
-                partial.text.clone(),
-                partial.omitted_chars,
-            ),
-        };
-        let requests = self
-            .delegations
+    /// Split out so the adapter is asked OFF the lock — see
+    /// [`Self::in_flight_turn_shared`].
+    fn in_flight_probe(&self, sid: &str) -> Option<InFlightProbe> {
+        let session = self.sessions.get(sid)?;
+        let running = session
+            .turn_started_at
+            .lock()
+            .map(|started| started.is_some())
+            .unwrap_or(false);
+        if !running {
+            return None;
+        }
+        Some(InFlightProbe {
+            adapter: Arc::clone(&session.adapter),
+            thread: session.thread.clone(),
+            // The watchdog's armed turn — the fallback id for a channel that
+            // reports no partial of its own.
+            watched_turn: session
+                .watched_turn
+                .lock()
+                .ok()
+                .and_then(|armed| armed.as_ref().map(|(turn_id, _)| turn_id.clone())),
+        })
+    }
+
+    /// The requests bound to `exec_turn_id` on `sid` — the second, tiny half of
+    /// an in-flight read.
+    fn requests_bound_to(&self, sid: &str, exec_turn_id: &str) -> Vec<String> {
+        self.delegations
             .get(sid)
             .map(|mirror| {
                 mirror
                     .store
-                    .bound_to(&cut.exec_turn_id)
+                    .bound_to(exec_turn_id)
                     .map(|request| request.request_id.clone())
                     .collect()
             })
-            .unwrap_or_default();
-        Some(InFlightTurn {
-            exec_turn_id: cut.exec_turn_id,
-            narration,
-            text,
-            omitted_chars,
+            .unwrap_or_default()
+    }
+
+    /// What `sid`'s in-flight turn has said so far, for a READ — `None` when
+    /// no turn is running or the session holds no process (GitHub #197 G).
+    ///
+    /// Read-only: it settles nothing, so a parent may look at a working child
+    /// as often as it likes without changing what happens when the turn ends.
+    ///
+    /// LOCK DISCIPLINE (GitHub #197 G, checker): the adapter is asked with NO
+    /// gateway lock held — resolve the handle under the lock, release it, call
+    /// the adapter, then take the lock again for the bindings. `agent_read` is
+    /// on every orchestrator's hot path, and holding the one global mutex
+    /// across a vendor-side call put every route in the daemon behind whatever
+    /// that call costs. Two acquisitions cannot lie in the direction that
+    /// matters: a partial can only come from a session that was live in the
+    /// first hold, so "narration from a session the body says is gone" is not
+    /// reachable — only the harmless "the turn ended in between", which is what
+    /// an absent partial already means.
+    pub async fn in_flight_turn_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Option<InFlightTurn> {
+        let probe = crate::latency::gateway_lock(gateway, "read.in_flight.probe")
+            .await
+            .in_flight_probe(sid)?;
+        // ---- off the lock ----
+        let partial = probe.adapter.in_flight_narration(&probe.thread);
+        // The adapter's own id first (it knows which turn is OPEN); the
+        // watchdog arm is the fallback for a channel that reports no partial.
+        let exec_turn_id = partial
+            .as_ref()
+            .and_then(|p| p.exec_turn_id.clone())
+            .or(probe.watched_turn)?;
+        let requests = crate::latency::gateway_lock(gateway, "read.in_flight.bind")
+            .await
+            .requests_bound_to(sid, &exec_turn_id);
+        Some(in_flight_turn_from(
+            exec_turn_id,
+            partial.as_ref(),
             requests,
-        })
+        ))
     }
 
     /// Every queue file that could still be holding one of `sid`'s lines. ONE
@@ -21890,6 +21968,14 @@ mod tests {
         /// OOM / long idle); `start_thread` flips it back `true` so a resume
         /// "revives" it — exactly the stream-json dead-child → resume case.
         live: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, `in_flight_narration` tries the gateway mutex and records
+        /// whether it was FREE at that moment. A vendor call made under the one
+        /// global lock puts every route in the daemon behind it, so the read
+        /// path's discipline — resolve under the lock, release, THEN ask the
+        /// adapter — has to be checkable rather than asserted in a comment.
+        lock_probe: std::sync::Mutex<Option<std::sync::Weak<tokio::sync::Mutex<Gateway>>>>,
+        /// What the probe last saw. `false` until it has run.
+        lock_was_free: AtomicBool,
         /// v0.9 T2 — `close_thread` call count (stop path + discarded zombie
         /// resume both close).
         closes: AtomicUsize,
@@ -21962,6 +22048,8 @@ mod tests {
                 degrade_inject_to_queue: false,
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 events_notify: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                lock_probe: std::sync::Mutex::new(None),
+                lock_was_free: AtomicBool::new(false),
                 event_delay: std::time::Duration::ZERO,
                 resume_delay: std::time::Duration::ZERO,
                 start_delay: std::time::Duration::ZERO,
@@ -22260,6 +22348,17 @@ mod tests {
             self
         }
 
+        /// Watch the gateway mutex from inside `in_flight_narration`.
+        fn watch_gateway_lock(&self, gateway: &Arc<tokio::sync::Mutex<Gateway>>) {
+            *self.lock_probe.lock().unwrap() = Some(Arc::downgrade(gateway));
+            self.lock_was_free.store(false, Ordering::SeqCst);
+        }
+
+        /// Was the gateway mutex free the last time the adapter was asked?
+        fn lock_was_free(&self) -> bool {
+            self.lock_was_free.load(Ordering::SeqCst)
+        }
+
         fn with_start_barrier(mut self, barrier: Arc<TestStartBarrier>) -> Self {
             self.start_barrier = Some(barrier);
             self
@@ -22366,6 +22465,18 @@ mod tests {
             &self,
             h: &ThreadHandle,
         ) -> Option<ccteam_harness::PartialNarration> {
+            if let Some(gateway) = self
+                .lock_probe
+                .lock()
+                .ok()
+                .and_then(|probe| probe.as_ref().and_then(std::sync::Weak::upgrade))
+            {
+                // `try_lock` is non-blocking, and dropping the guard it may
+                // hand back is all this needs: the answer is whether anybody
+                // was holding the mutex while the adapter was being asked.
+                self.lock_was_free
+                    .store(gateway.try_lock().is_ok(), Ordering::SeqCst);
+            }
             let active = self
                 .turn_queues
                 .lock()
@@ -35154,6 +35265,47 @@ mod tests {
             rows.iter()
                 .any(|row| row.outcome.as_deref() == Some(INTERRUPTED_OUTCOME)),
             "the cut turn still leaves its record: {rows:?}"
+        );
+    }
+
+    /// GitHub #197 (G), checker — `agent_read`'s in-flight read must not ask
+    /// the adapter while it holds the one global gateway mutex.
+    ///
+    /// It used to: the read resolved the session and the partial in a single
+    /// hold, on the belief that the partial was "a cheap in-memory peek". On
+    /// the ACP path it was not — the tail was rendered by scanning and copying
+    /// everything the turn had said — so a talkative child put every route in
+    /// the daemon behind a copy that grew all turn. Both halves are fixed; this
+    /// pins the one that no amount of adapter discipline can guarantee.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_in_flight_read_asks_the_adapter_with_the_gateway_lock_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(
+            Arc::clone(&fake) as Arc<dyn HarnessAdapter + Send + Sync>,
+            "alpha",
+            tmp.path(),
+        );
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        // A turn in flight: no event sink here, so no pump ever clears it.
+        let exec_turn = gateway
+            .submit_to_sid("s1", "the migration".into())
+            .await
+            .unwrap();
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        fake.watch_gateway_lock(&gateway);
+
+        let seen = Gateway::in_flight_turn_shared(&gateway, "s1")
+            .await
+            .expect("a turn is in flight");
+        assert_eq!(seen.exec_turn_id, exec_turn);
+        assert_eq!(seen.narration, InterruptedNarration::Recorded);
+        assert!(
+            fake.lock_was_free(),
+            "the adapter was called while the gateway mutex was held"
         );
     }
 
