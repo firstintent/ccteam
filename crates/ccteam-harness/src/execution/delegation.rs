@@ -277,6 +277,27 @@ pub fn mint_request_id() -> String {
 /// answer to another).
 pub const DELEGATION_SCHEMA: u32 = 2;
 
+/// A completed boundary a delivery has CLAIMED but not yet finished.
+///
+/// The durable half of the two-phase notification protocol (issue #201).
+/// Written before the parent is woken and cleared only once it has been: an
+/// entry still here in a new process life means the previous one died mid-
+/// delivery and the notification is owed. At-least-once is the contract — a
+/// duplicate after a crash is acceptable, a lost completion is not — and within
+/// one life the in-memory twin of this list makes it at-most-once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveringBoundary {
+    /// The dedup key of the boundary being delivered.
+    pub turn_key: String,
+    /// The adapter's execution turn, for the log a human reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_turn_id: Option<String>,
+    /// The requests this boundary resolves.
+    pub request_ids: Vec<String>,
+    /// How many lives have tried. Diagnostic; nothing branches on it.
+    pub attempt: u32,
+}
+
 /// Every request one child holds, outstanding and recently resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRequests {
@@ -290,6 +311,10 @@ pub struct DelegationRequests {
     /// already in here.
     #[serde(default)]
     pub notified_turns: Vec<String>,
+    /// Boundaries claimed by a delivery that has not finished. See
+    /// [`DeliveringBoundary`].
+    #[serde(default)]
+    pub delivering: Vec<DeliveringBoundary>,
 }
 
 /// How many resolved requests are kept per child. Enough that a parent which
@@ -314,6 +339,7 @@ impl Default for DelegationRequests {
             schema: DELEGATION_SCHEMA,
             requests: Vec::new(),
             notified_turns: Vec::new(),
+            delivering: Vec::new(),
         }
     }
 }
@@ -396,9 +422,59 @@ impl DelegationRequests {
         }
     }
 
+    /// Claim a boundary for delivery: phase (a). Returns the attempt number, or
+    /// `None` when it was already delivered.
+    pub fn begin_delivery(
+        &mut self,
+        turn_key: &str,
+        exec_turn_id: Option<String>,
+        request_ids: Vec<String>,
+    ) -> Option<u32> {
+        if self.notified_turns.iter().any(|seen| seen == turn_key) {
+            return None;
+        }
+        if let Some(existing) = self
+            .delivering
+            .iter_mut()
+            .find(|entry| entry.turn_key == turn_key)
+        {
+            // A previous life left this behind: this one takes it over.
+            existing.attempt = existing.attempt.saturating_add(1);
+            existing.request_ids = request_ids;
+            existing.exec_turn_id = exec_turn_id;
+            return Some(existing.attempt);
+        }
+        self.delivering.push(DeliveringBoundary {
+            turn_key: turn_key.to_string(),
+            exec_turn_id,
+            request_ids,
+            attempt: 1,
+        });
+        Some(1)
+    }
+
+    /// Release a claimed boundary without recording it as delivered — the
+    /// delivery could not be made durable, so a reconcile must retry it.
+    pub fn abandon_delivery(&mut self, turn_key: &str) {
+        self.delivering.retain(|entry| entry.turn_key != turn_key);
+    }
+
+    /// Phase (c): the parent has been told. The boundary leaves `delivering`
+    /// and joins the dedup set, in one step so it can never be in neither.
+    pub fn finish_delivery(&mut self, turn_key: &str) {
+        self.delivering.retain(|entry| entry.turn_key != turn_key);
+        self.record_notified(turn_key);
+    }
+
+    /// Boundaries a PREVIOUS life claimed and never finished — what a restart
+    /// still owes. Live claims are tracked in memory, never read back from here.
+    pub fn owed_deliveries(&self) -> impl Iterator<Item = &DeliveringBoundary> {
+        self.delivering.iter()
+    }
+
     /// True when nothing is left to remember (the file can go).
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty() && self.notified_turns.is_empty()
+        self.requests.is_empty() && self.notified_turns.is_empty() && self.delivering.is_empty()
     }
 }
 

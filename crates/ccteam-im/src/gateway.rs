@@ -896,6 +896,13 @@ struct DelegationMirror {
     /// boundary (`agent_read{sid,wait}`), which holds whatever that boundary
     /// answered for it.
     read_waits: HashMap<String, Instant>,
+    /// Boundaries this PROCESS is delivering right now — the in-memory twin of
+    /// the durable `delivering` list. The durable one says "a delivery is
+    /// owed"; this one says "and it is already running here", which is what
+    /// makes delivery at-most-once within a life while staying at-least-once
+    /// across a crash. Empty on startup by construction, so a marker reloaded
+    /// from disk is always a previous life's and always gets redelivered.
+    delivering_now: HashSet<String>,
     /// Requests whose completion was handed to a blocked waiter instead of
     /// notified. The mark is what lets a waiter whose deadline expired in the
     /// same instant still report the answer — without it that razor-thin race
@@ -945,21 +952,70 @@ pub struct DelegationStoreClaim {
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
-impl ccteam_harness::DelegationStoreGuard for DelegationStoreClaim {
-    fn child_sid(&self) -> &str {
-        &self.child_sid
+/// The ONE way this crate writes `delegation.json`.
+///
+/// The seal is the type: `ccteam_harness`'s write functions demand a
+/// `DelegationStoreGuard`, the only implementor is this module's private
+/// ticket, and the ticket is only mintable in here from a live
+/// [`DelegationStoreClaim`]. Nothing outside can reach the file — not by
+/// forgetting the claim, and not by taking a shortcut around the mirror.
+mod delegation_store_io {
+    use super::DelegationStoreClaim;
+    use std::path::Path;
+
+    /// A `'static` witness of a held claim, for a durable write that runs on
+    /// the blocking pool while the claim stays held on the caller's task. True
+    /// exactly as long as that caller keeps holding it across the `await`.
+    struct Ticket(String);
+
+    impl ccteam_harness::DelegationStoreGuard for Ticket {
+        fn child_sid(&self) -> &str {
+            &self.0
+        }
     }
-}
 
-/// A `'static` witness of a held [`DelegationStoreClaim`], for a durable write
-/// that runs on the blocking pool while the claim itself stays held on the
-/// caller's task. Only constructible from a live claim, and true exactly as
-/// long as its caller keeps holding that claim across the `await`.
-pub struct DelegationWriteTicket(String);
+    fn ticket(claim: &DelegationStoreClaim) -> Ticket {
+        Ticket(claim.child_sid().to_string())
+    }
 
-impl ccteam_harness::DelegationStoreGuard for DelegationWriteTicket {
-    fn child_sid(&self) -> &str {
-        &self.0
+    /// Write `store` to `claim`'s child, on the blocking pool.
+    pub(super) async fn write(
+        project_dir: &Path,
+        claim: &DelegationStoreClaim,
+        store: ccteam_harness::DelegationRequests,
+    ) -> anyhow::Result<()> {
+        let (dir, guard) = (project_dir.to_path_buf(), ticket(claim));
+        tokio::task::spawn_blocking(move || {
+            ccteam_harness::write_delegation_requests(&dir, &guard, &store)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("delegation write task failed: {error}"))?
+    }
+
+    /// The same write, on the caller's thread — for a `&mut Gateway` path that
+    /// cannot await, and for seeding a store the mirror does not hold yet.
+    /// Every such caller is a test helper; production writes are async.
+    #[cfg(test)]
+    pub(super) fn write_blocking(
+        project_dir: &Path,
+        claim: &DelegationStoreClaim,
+        store: &ccteam_harness::DelegationRequests,
+    ) -> anyhow::Result<()> {
+        ccteam_harness::write_delegation_requests(project_dir, &ticket(claim), store)
+    }
+
+    /// Delete the child's record.
+    pub(super) fn remove_blocking(project_dir: &Path, claim: &DelegationStoreClaim) {
+        ccteam_harness::remove_delegation_requests(project_dir, &ticket(claim));
+    }
+
+    /// Delete it off the caller's thread.
+    pub(super) async fn remove(project_dir: &Path, claim: &DelegationStoreClaim) {
+        let (dir, guard) = (project_dir.to_path_buf(), ticket(claim));
+        let _ = tokio::task::spawn_blocking(move || {
+            ccteam_harness::remove_delegation_requests(&dir, &guard)
+        })
+        .await;
     }
 }
 
@@ -968,13 +1024,6 @@ impl DelegationStoreClaim {
     /// may mutate.
     pub fn child_sid(&self) -> &str {
         &self.child_sid
-    }
-
-    /// Hand the proof to the blocking pool for one write. The caller keeps
-    /// holding the claim until that write finishes; the ticket only carries
-    /// the sid across the thread boundary.
-    pub(crate) fn ticket(&self) -> DelegationWriteTicket {
-        DelegationWriteTicket(self.child_sid.clone())
     }
 
     /// A claim for a test that already holds `&mut Gateway`. That borrow IS the
@@ -1029,6 +1078,8 @@ struct DelegationDelivery {
 struct DelegationDeliveryPlan {
     signal: crate::delegation::DelegationSignal,
     generation: u64,
+    /// The boundary this plan claimed — released or finished by its commit.
+    dedup_key: String,
     slug: String,
     /// Every request this boundary resolves — each with its OWN parent, notify
     /// mode and title. A turn can answer several (injected steers share one).
@@ -13193,6 +13244,17 @@ impl Gateway {
             .unwrap_or(false)
     }
 
+    /// Seed a child's durable record directly, for a fixture standing in for a
+    /// previous daemon life. Goes through the claim like every other write.
+    #[cfg(test)]
+    pub(crate) fn seed_delegation_store_for_test(
+        project_dir: &Path,
+        claim: &DelegationStoreClaim,
+        store: &ccteam_harness::DelegationRequests,
+    ) -> Result<()> {
+        delegation_store_io::write_blocking(project_dir, claim, store)
+    }
+
     /// Key of the per-child single-flight claim over a child's delegation
     /// requests. One key, so every writer queues behind the same door.
     fn delegation_claim_key(child_sid: &str) -> ChatKey {
@@ -13287,7 +13349,7 @@ impl Gateway {
         );
         let request_id = request.request_id.clone();
         store.accept(request);
-        if let Err(e) = ccteam_harness::write_delegation_requests(&project_dir, claim, &store) {
+        if let Err(e) = delegation_store_io::write_blocking(&project_dir, claim, &store) {
             tracing::warn!(child = %child_sid, err = %e, "ccteam-im: failed to write delegation.json");
             return None;
         }
@@ -13306,6 +13368,7 @@ impl Gateway {
                 store: ccteam_harness::DelegationRequests::default(),
                 request_waits: HashMap::new(),
                 read_waits: HashMap::new(),
+                delivering_now: HashSet::new(),
                 suppressed: HashSet::new(),
             });
         entry.store = store;
@@ -13371,7 +13434,7 @@ impl Gateway {
         request.turn_id = Some(exec_turn_id.to_string());
         request.state = ccteam_harness::RequestState::Submitted;
         let store = mirror.store.clone();
-        let _ = ccteam_harness::write_delegation_requests(&project_dir, claim, &store);
+        let _ = delegation_store_io::write_blocking(&project_dir, claim, &store);
     }
 
     /// Declare that the caller is BLOCKING on `request_id`'s completion for
@@ -13512,7 +13575,7 @@ impl Gateway {
             (resolved.project_dir, resolved.project, generation)
         };
         let io_dir = project_dir.clone();
-        let io_child = claim.ticket();
+        let io_child = child_sid.to_string();
         let request = ccteam_harness::DelegationRequest::accepted(
             parent_sid,
             notify,
@@ -13521,25 +13584,27 @@ impl Gateway {
             idempotency_key,
         );
         let request_id = request.request_id.clone();
-        let (old_store, store) = tokio::task::spawn_blocking(move || {
-            // Read AND write inside the claim: an accept that snapshotted the
-            // file before somebody else's write would put back a store in
-            // which that write never happened (issue #201).
-            let old = ccteam_harness::read_delegation_requests(
-                &io_dir,
-                ccteam_harness::DelegationStoreGuard::child_sid(&io_child),
-            );
-            let mut store = old.clone().unwrap_or_default();
-            store.accept(request);
-            ccteam_harness::write_delegation_requests(&io_dir, &io_child, &store)?;
-            Ok::<_, anyhow::Error>((old, store))
+        // Read AND write inside the claim: an accept that snapshotted the file
+        // before somebody else's write would put back a store in which that
+        // write never happened (issue #201).
+        let old_store = tokio::task::spawn_blocking(move || {
+            ccteam_harness::read_delegation_requests(&io_dir, &io_child)
         })
         .await
         .map_err(|error| {
             GatewayRequestError::StorageReadCorrupt(format!(
                 "delegation request task failed for {child_sid}: {error}"
             ))
-        })??;
+        })?;
+        let mut store = old_store.clone().unwrap_or_default();
+        store.accept(request);
+        delegation_store_io::write(&project_dir, claim, store.clone())
+            .await
+            .map_err(|error| {
+                GatewayRequestError::StorageWriteFailed(format!(
+                    "accepting a request on {child_sid}: {error:#}"
+                ))
+            })?;
 
         let mut guard = match deadline.lock(&gateway).await {
             Ok(guard) => guard,
@@ -13592,6 +13657,7 @@ impl Gateway {
                         store: ccteam_harness::DelegationRequests::default(),
                         request_waits: HashMap::new(),
                         read_waits: HashMap::new(),
+                        delivering_now: HashSet::new(),
                         suppressed: HashSet::new(),
                     });
                 entry.store = store;
@@ -13618,28 +13684,41 @@ impl Gateway {
     async fn persist_delegation_store(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         claim: &DelegationStoreClaim,
-    ) {
+    ) -> Result<()> {
         let snapshot = crate::latency::gateway_lock(gateway, "delegation.persist")
             .await
             .delegations
             .get(claim.child_sid())
             .map(|mirror| (mirror.project_dir.clone(), mirror.store.clone()));
         let Some((project_dir, store)) = snapshot else {
-            return;
+            return Ok(());
         };
-        let child = claim.ticket();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Err(error) =
-                ccteam_harness::write_delegation_requests(&project_dir, &child, &store)
-            {
-                tracing::warn!(
-                    child = %ccteam_harness::DelegationStoreGuard::child_sid(&child),
-                    %error,
-                    "ccteam-im: failed to persist delegation.json"
-                );
+        if let Err(error) = delegation_store_io::write(&project_dir, claim, store).await {
+            tracing::warn!(
+                child = %claim.child_sid(),
+                %error,
+                "ccteam-im: failed to persist delegation.json"
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Release a delivery claim that could not be made durable, in memory and
+    /// (best effort) on disk. The completion stays owed.
+    async fn abandon_delivery(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        claim: &DelegationStoreClaim,
+        dedup_key: &str,
+    ) {
+        {
+            let mut guard = crate::latency::gateway_lock(gateway, "notifier.abandon").await;
+            if let Some(mirror) = guard.delegations.get_mut(claim.child_sid()) {
+                mirror.store.abandon_delivery(dedup_key);
+                mirror.delivering_now.remove(dedup_key);
             }
-        })
-        .await;
+        }
+        let _ = Self::persist_delegation_store(gateway, claim).await;
     }
 
     /// Put back what was on disk before a write that could not be committed.
@@ -13648,15 +13727,12 @@ impl Gateway {
         claim: &DelegationStoreClaim,
         old: Option<ccteam_harness::DelegationRequests>,
     ) {
-        let dir = project_dir.to_path_buf();
-        let child = claim.ticket();
-        let _ = tokio::task::spawn_blocking(move || match old {
+        match old {
             Some(old) => {
-                let _ = ccteam_harness::write_delegation_requests(&dir, &child, &old);
+                let _ = delegation_store_io::write(project_dir, claim, old).await;
             }
-            None => ccteam_harness::remove_delegation_requests(&dir, &child),
-        })
-        .await;
+            None => delegation_store_io::remove(project_dir, claim).await,
+        }
     }
 
     /// Bind an accepted request to what the adapter actually did with it: the
@@ -13680,7 +13756,7 @@ impl Gateway {
         receipt: &TurnReceipt,
     ) -> Result<()> {
         let child_sid = claim.child_sid();
-        let persist = {
+        {
             let mut guard = crate::latency::gateway_lock(&gateway, "delegation.bind").await;
             // A row that is not there cannot be bound, and pretending
             // otherwise hands the caller a dispatch whose completion nothing
@@ -13707,18 +13783,10 @@ impl Gateway {
                 Some(_) => ccteam_harness::RequestState::Submitted,
                 None => ccteam_harness::RequestState::Submitted,
             };
-            (mirror.project_dir.clone(), mirror.store.clone())
-        };
-        let (project_dir, store) = persist;
-        let child = claim.ticket();
-        let written = tokio::task::spawn_blocking(move || {
-            ccteam_harness::write_delegation_requests(&project_dir, &child, &store)
-        })
-        .await;
-        let failure = match written {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => format!("{error:#}"),
-            Err(error) => format!("delegation bind task failed: {error}"),
+        }
+        let failure = match Self::persist_delegation_store(&gateway, claim).await {
+            Ok(()) => return Ok(()),
+            Err(error) => format!("{error:#}"),
         };
         tracing::warn!(
             child = %child_sid,
@@ -13777,9 +13845,9 @@ impl Gateway {
         request_id: &str,
     ) {
         let child_sid = claim.child_sid();
-        let persist = {
+        let emptied = {
             let mut guard = gateway.lock().await;
-            let empty = {
+            let (empty, project_dir) = {
                 let Some(mirror) = guard.delegations.get_mut(child_sid) else {
                     return;
                 };
@@ -13789,26 +13857,26 @@ impl Gateway {
                     .retain(|request| request.request_id != request_id);
                 mirror.request_waits.remove(request_id);
                 mirror.suppressed.remove(request_id);
-                mirror.store.is_empty()
+                (mirror.store.is_empty(), mirror.project_dir.clone())
             };
-            let mirror = guard.delegations.get(child_sid).expect("checked above");
-            let persist = (mirror.project_dir.clone(), mirror.store.clone());
-            if empty {
+            empty.then(|| {
                 guard.delegations.remove(child_sid);
                 guard
                     .delegation_watch_set
                     .write()
                     .unwrap()
                     .remove(child_sid);
-            }
-            persist
+                project_dir
+            })
         };
-        let (project_dir, store) = persist;
-        let child = claim.ticket();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = ccteam_harness::write_delegation_requests(&project_dir, &child, &store);
-        })
-        .await;
+        // Nothing left to mirror = nothing left on disk. Otherwise the one
+        // persist path writes what the mirror now says.
+        match emptied {
+            Some(project_dir) => delegation_store_io::remove(&project_dir, claim).await,
+            None => {
+                let _ = Self::persist_delegation_store(&gateway, claim).await;
+            }
+        }
     }
 
     /// v0.9.0 W2 (F2) — drop EVERY request for a child (mirror + durable
@@ -13818,9 +13886,9 @@ impl Gateway {
         let child_sid = claim.child_sid();
         self.delegation_watch_set.write().unwrap().remove(child_sid);
         if let Some(m) = self.delegations.remove(child_sid) {
-            ccteam_harness::remove_delegation_requests(&m.project_dir, claim);
+            delegation_store_io::remove_blocking(&m.project_dir, claim);
         } else if let Some(resolved) = self.session_resolve(child_sid) {
-            ccteam_harness::remove_delegation_requests(&resolved.project_dir, claim);
+            delegation_store_io::remove_blocking(&resolved.project_dir, claim);
         }
     }
 
@@ -13848,11 +13916,7 @@ impl Gateway {
                 })
         };
         if let Some(project_dir) = project_dir {
-            let child_sid = claim.ticket();
-            let _ = tokio::task::spawn_blocking(move || {
-                ccteam_harness::remove_delegation_requests(&project_dir, &child_sid);
-            })
-            .await;
+            delegation_store_io::remove(&project_dir, claim).await;
         }
     }
 
@@ -14019,40 +14083,37 @@ impl Gateway {
             .outstanding()
             .filter(|request| !resolved.iter().any(|r| r.request_id == request.request_id))
             .count();
-        // The boundary is SPENT here, under the same lock that read it. It used
-        // to be claimed at commit — after the notification had gone out — so
-        // two deliveries of one boundary (the startup reconcile racing the live
-        // notifier; a retry after an aborted commit) both planned against an
-        // unresolved request and both woke the parent. At most once per
-        // (request, boundary), decided in one critical section.
-        let terminal = if signal.vendor_error {
-            ccteam_harness::RequestState::Failed
-        } else {
-            ccteam_harness::RequestState::Answered
-        };
-        for turn in signal
-            .covered_turns
-            .iter()
-            .cloned()
-            .chain(std::iter::once(dedup_key))
-        {
-            mirror.store.record_notified(&turn);
+        // PHASE (a) of the two-phase notification protocol: CLAIM the boundary,
+        // durably, before anyone is woken — and resolve nothing yet.
+        //
+        // Marking the requests answered here instead would have suppressed a
+        // completion that a crash stopped from ever being delivered; recording
+        // the claim only at commit let two deliveries of one boundary both wake
+        // the parent. The marker is the middle ground: it blocks a second
+        // delivery in THIS life (`delivering_now`), it survives on disk so a
+        // restart knows the notification is still owed, and it says nothing
+        // about the requests, which stay outstanding until the parent has
+        // actually been told. At-least-once across a crash, at-most-once
+        // within a life.
+        if mirror.delivering_now.contains(&dedup_key) {
+            return None;
         }
-        for resolved in resolved.iter() {
-            match mirror.store.get_mut(&resolved.request_id) {
-                Some(request) => {
-                    request.state = terminal;
-                    request.queue_position = None;
-                    request.answered_turn = Some(signal.turn_id.clone());
-                }
-                // It was in the store a line ago, under this claim. Loud,
-                // because it means something writes it unclaimed.
-                None => tracing::error!(
-                    child = %signal.child_sid,
-                    request = %resolved.request_id,
-                    "ccteam-im: a request vanished from the store mid-plan"
-                ),
-            }
+        let attempt = mirror.store.begin_delivery(
+            &dedup_key,
+            signal.exec_turn_id.clone(),
+            resolved
+                .iter()
+                .map(|request| request.request_id.clone())
+                .collect(),
+        )?;
+        mirror.delivering_now.insert(dedup_key.clone());
+        if attempt > 1 {
+            tracing::warn!(
+                child = %signal.child_sid,
+                turn = %dedup_key,
+                attempt,
+                "ccteam-im: redelivering a completion a previous life never finished"
+            );
         }
         let mut deliveries = Vec::new();
         for request in resolved {
@@ -14098,6 +14159,7 @@ impl Gateway {
         Some(DelegationDeliveryPlan {
             signal,
             generation,
+            dedup_key,
             slug,
             deliveries,
             emitter,
@@ -14128,16 +14190,31 @@ impl Gateway {
             let plan = crate::latency::gateway_lock(&gateway, "notifier.plan")
                 .await
                 .plan_delegation_delivery(&claim, signal);
-            // The plan CLAIMS the boundary — dedup key in, requests resolved —
-            // and that claim has to reach the disk before this claim is
-            // released. The next accept read-modify-writes the same file: with
-            // the decision still only in memory it wrote back a store in which
-            // the boundary had never been answered, and a restart delivered
-            // the completion a second time.
-            if plan.is_some() {
-                Self::persist_delegation_store(&gateway, &claim).await;
+            // The claim has to reach the DISK before this lock is released: the
+            // accept path read-modify-writes the same file, and a marker that
+            // lived only in memory was written straight back out of existence.
+            match plan.as_ref() {
+                None => None,
+                Some(plan) => match Self::persist_delegation_store(&gateway, &claim).await {
+                    Ok(()) => plan.dedup_key.clone().into(),
+                    // Nobody is notified on an unpersisted claim. The requests
+                    // stay outstanding and the marker is dropped, so the next
+                    // reconcile finds the completion still owed and retries it
+                    // — the alternative is a wake-up nothing on disk remembers.
+                    Err(error) => {
+                        tracing::warn!(
+                            child = %plan.signal.child_sid,
+                            exec_turn = ?plan.signal.exec_turn_id,
+                            %error,
+                            "ccteam-im: a delivery claim could not be persisted; \
+                             not notifying, leaving the completion owed"
+                        );
+                        Self::abandon_delivery(&gateway, &claim, &plan.dedup_key).await;
+                        None
+                    }
+                },
             }
-            plan
+            .map(|_| plan.expect("a claimed plan"))
         };
         let Some(plan) = plan else {
             return;
@@ -14220,6 +14297,19 @@ impl Gateway {
                 tracing::warn!(%child, "delegation store was replaced during unlocked delivery");
                 return;
             }
+            // PHASE (c): the parent has been told. Only NOW is the boundary
+            // spent — it leaves `delivering` and joins the dedup set in one
+            // step, and the requests it answered become terminal.
+            current.delivering_now.remove(&plan.dedup_key);
+            current.store.finish_delivery(&plan.dedup_key);
+            for turn in &plan.signal.covered_turns {
+                current.store.record_notified(turn);
+            }
+            let terminal = if plan.signal.vendor_error {
+                ccteam_harness::RequestState::Failed
+            } else {
+                ccteam_harness::RequestState::Answered
+            };
             for delivery in &plan.deliveries {
                 let id = &delivery.request.request_id;
                 if failed.iter().any(|f| f == id) {
@@ -14230,6 +14320,9 @@ impl Gateway {
                     continue;
                 }
                 if let Some(request) = current.store.get_mut(id) {
+                    request.state = terminal;
+                    request.queue_position = None;
+                    request.answered_turn = Some(plan.signal.turn_id.clone());
                     request.notified = delivery.notification.is_some();
                 }
             }
@@ -14246,7 +14339,19 @@ impl Gateway {
                 .map(|mirror| mirror.store.clone())
         };
         if store.is_some() {
-            Self::persist_delegation_store(&gateway, &claim).await;
+            if let Err(error) = Self::persist_delegation_store(&gateway, &claim).await {
+                // The parent HAS been told; only the record of it failed. The
+                // claim stays on disk, so the next reconcile redelivers — a
+                // duplicate, which the contract allows, rather than a silent
+                // divergence between what the parent knows and what the store
+                // does.
+                tracing::warn!(
+                    %child,
+                    %error,
+                    "ccteam-im: a delivered completion could not be recorded; it \
+                     stays claimed and will be redelivered"
+                );
+            }
         }
     }
 
@@ -14280,7 +14385,9 @@ impl Gateway {
                         .await
                         .mark_delegation_requests_executing(&claim, &exec_turn_id);
                     if changed {
-                        Self::persist_delegation_store(&gateway, &claim).await;
+                        // Best effort: the executing flag is a display fact, and
+                        // the next write of this store carries it anyway.
+                        let _ = Self::persist_delegation_store(&gateway, &claim).await;
                     }
                 }
                 crate::delegation::DelegationPulse::Signal(signal) => {
@@ -14352,6 +14459,7 @@ impl Gateway {
                         // notify normally.
                         request_waits: HashMap::new(),
                         read_waits: HashMap::new(),
+                        delivering_now: HashSet::new(),
                         suppressed: HashSet::new(),
                     },
                 ));
@@ -31181,7 +31289,7 @@ mod tests {
             store.accept(request);
         }
         let cleanup_id = store.requests[1].request_id.clone();
-        ccteam_harness::write_delegation_requests(
+        Gateway::seed_delegation_store_for_test(
             &project_dir,
             &DelegationStoreClaim::for_test(child_sid),
             &store,
@@ -31286,7 +31394,7 @@ mod tests {
             TurnRouting::Queue,
             None,
         ));
-        ccteam_harness::write_delegation_requests(
+        Gateway::seed_delegation_store_for_test(
             &project_dir,
             &DelegationStoreClaim::for_test(child_sid),
             &store,
@@ -31756,6 +31864,315 @@ mod tests {
                 .any(|request| request.title.as_deref() == Some("the follow-up")),
             "…and the accept is not lost either: {store:?}"
         );
+    }
+
+    /// GitHub #197 — the two-phase notification protocol, both halves.
+    ///
+    /// A life that died between claiming a boundary and finishing it leaves a
+    /// `delivering` marker with no `notified` record: the completion is still
+    /// owed, so the next life delivers it — once. A life that died after
+    /// finishing leaves the turn in `notified_turns`, and nothing is redelivered.
+    /// Marking the requests answered up front would have suppressed the first
+    /// case; recording the claim only at the end would have duplicated the
+    /// second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_delivery_a_previous_life_never_finished_is_redelivered_exactly_once() {
+        for (finished, want_notes) in [(false, 1usize), (true, 0)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let project_dir = tmp.path().to_path_buf();
+            let gateway = delegation_gateway(&project_dir).await;
+            let parent = {
+                let mut gw = gateway.lock().await;
+                gw.create_session_api(
+                    "alpha".into(),
+                    String::new(),
+                    AgentVendor::Claude,
+                    PermissionMode::Skip,
+                )
+                .await
+                .unwrap()
+                .sid
+            };
+            let child_sid = "s90";
+            let turn_key = format!("{child_sid}-1");
+            seed_answered_turn(&project_dir, child_sid, "x-1", "the verdict: ship it");
+            let mut store = ccteam_harness::DelegationRequests::default();
+            let mut request = ccteam_harness::DelegationRequest::accepted(
+                &parent,
+                ccteam_harness::NotifyMode::Final,
+                Some("verdict".into()),
+                TurnRouting::Queue,
+                None,
+            );
+            request.state = ccteam_harness::RequestState::Executing;
+            request.turn_id = Some("x-1".into());
+            let request_id = request.request_id.clone();
+            store.accept(request);
+            // Exactly what phase (a) leaves on disk…
+            store.begin_delivery(
+                &crate::delegation::final_dedup_key(&turn_key),
+                Some("x-1".into()),
+                vec![request_id],
+            );
+            if finished {
+                // …and what phase (c) turns it into.
+                store.finish_delivery(&crate::delegation::final_dedup_key(&turn_key));
+                store.record_notified(&turn_key);
+                store.requests[0].state = ccteam_harness::RequestState::Answered;
+                store.requests[0].notified = true;
+            }
+            Gateway::seed_delegation_store_for_test(
+                &project_dir,
+                &DelegationStoreClaim::for_test(child_sid),
+                &store,
+            )
+            .unwrap();
+
+            Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+            let mut notes = vec![];
+            for _ in 0..150 {
+                notes = ccteam_notification_turns(&project_dir, &parent);
+                if notes.len() >= want_notes {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            let notes = ccteam_notification_turns(&project_dir, &parent);
+            assert_eq!(
+                notes.len(),
+                want_notes,
+                "finished={finished}: an owed completion is delivered once, a \
+                 finished one never again: {notes:?}"
+            );
+            if want_notes > 0 {
+                // A second reconcile has nothing left to owe.
+                Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                assert_eq!(
+                    ccteam_notification_turns(&project_dir, &parent).len(),
+                    1,
+                    "the redelivery is recorded, so it does not repeat"
+                );
+                let store =
+                    ccteam_harness::read_delegation_requests(&project_dir, child_sid).unwrap();
+                assert!(store.delivering.is_empty(), "{store:?}");
+                assert!(
+                    store.notified_turns.iter().any(|turn| turn == &turn_key),
+                    "{store:?}"
+                );
+            }
+        }
+    }
+
+    /// GitHub #197 — DURING delivery, the disk says the completion is owed, not
+    /// that it was answered.
+    ///
+    /// This is the window a crash falls into. Marking the requests answered and
+    /// recording the dedup key up front closed it in the wrong direction: the
+    /// store said "delivered" while the parent had not been told, so a restart
+    /// skipped it and the completion was lost. Phase (a) writes a claim that
+    /// says "owed", and only phase (c) — after the parent turn is appended —
+    /// says "answered".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mid_delivery_the_store_says_owed_not_answered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        // A parent whose resume is slow, so the delivery sits in phase (b)
+        // long enough to read what a crash there would have found.
+        let factory: crate::daemon::AdapterFactory = Arc::new(|vendor, _protocol| {
+            Arc::new(
+                FakeAdapter::new(vendor)
+                    .with_turn_boundary()
+                    .with_start_delay(std::time::Duration::from_millis(900)),
+            ) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway = delegation_gateway_with_factory(&project_dir, factory).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+        let request_id = {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Final,
+                    Some("the task".into()),
+                    TurnRouting::Queue,
+                    None,
+                )
+                .expect("the child accepts the request");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                "x-1",
+            );
+            // Released: the notification has to resume it, and that is slow.
+            gw.sessions.remove(&parent);
+            id
+        };
+        let delivering = {
+            let gateway = Arc::clone(&gateway);
+            let child = child.clone();
+            tokio::spawn(async move {
+                Gateway::deliver_delegation_signal_shared(
+                    gateway,
+                    crate::delegation::DelegationSignal {
+                        child_sid: child.clone(),
+                        turn_id: format!("{child}-1"),
+                        exec_turn_id: Some("x-1".into()),
+                        tail: "the answer".into(),
+                        vendor: AgentVendor::Claude,
+                        host: "local".into(),
+                        boundary: true,
+                        vendor_error: false,
+                        interim_notes: 0,
+                        covered_turns: vec![format!("{child}-1")],
+                        context_pct: None,
+                        turn: 1,
+                        error_kind: None,
+                        conclusion: None,
+                    },
+                )
+                .await
+            })
+        };
+        // Mid-flight: the claim is durable, the answer is not.
+        let mut seen = None;
+        for _ in 0..100 {
+            let store = ccteam_harness::read_delegation_requests(&project_dir, &child);
+            if store
+                .as_ref()
+                .is_some_and(|store| !store.delivering.is_empty())
+            {
+                seen = store;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let store = seen.expect("phase (a) writes a claim before anyone is woken");
+        assert_eq!(store.delivering.len(), 1, "{store:?}");
+        assert_eq!(
+            store.delivering[0].request_ids,
+            vec![request_id],
+            "{store:?}"
+        );
+        assert!(
+            store.notified_turns.is_empty(),
+            "nothing is recorded as delivered until the parent has been told — a \
+             crash here would otherwise lose the completion: {store:?}"
+        );
+        assert_eq!(
+            store.requests[0].state,
+            ccteam_harness::RequestState::Submitted,
+            "the request is still owed: {store:?}"
+        );
+
+        delivering.await.expect("the delivery finishes");
+        let store = ccteam_harness::read_delegation_requests(&project_dir, &child).unwrap();
+        assert!(store.delivering.is_empty(), "{store:?}");
+        assert_eq!(
+            store.requests[0].state,
+            ccteam_harness::RequestState::Answered,
+            "{store:?}"
+        );
+        assert_eq!(ccteam_notification_turns(&project_dir, &parent).len(), 1);
+    }
+
+    /// GitHub #197 — a delivery claim that cannot be persisted notifies NOBODY.
+    /// Waking a parent on a claim no disk remembers is how one completion
+    /// became two after a restart; the completion stays owed instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_claim_that_cannot_be_persisted_notifies_nobody() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+        {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Final,
+                    Some("the task".into()),
+                    TurnRouting::Queue,
+                    None,
+                )
+                .expect("the child accepts the request");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                "x-1",
+            );
+        }
+        let chat_dir = ccteam_harness::execution::turns_mirror::chat_dir(&project_dir, &child);
+        let original = std::fs::metadata(&chat_dir).unwrap().permissions();
+        std::fs::set_permissions(&chat_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child.clone(),
+                turn_id: format!("{child}-1"),
+                exec_turn_id: Some("x-1".into()),
+                tail: "the answer".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child}-1")],
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
+                conclusion: None,
+            },
+        )
+        .await;
+        std::fs::set_permissions(&chat_dir, original).unwrap();
+
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "nobody is woken on a claim the disk never took"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(&child, 10);
+        assert_eq!(
+            rows[0]["state"],
+            serde_json::json!("submitted"),
+            "the request stays exactly as it was, so a reconcile retries it: {rows:?}"
+        );
+        let store = ccteam_harness::read_delegation_requests(&project_dir, &child).unwrap();
+        assert!(
+            store.delivering.is_empty() && store.notified_turns.is_empty(),
+            "an abandoned claim leaves nothing behind to skip on: {store:?}"
+        );
+    }
+
+    /// One mirrored answer, as a previous daemon watched it land.
+    fn seed_answered_turn(project_dir: &std::path::Path, sid: &str, exec: &str, text: &str) {
+        use ccteam_harness::execution::turns_mirror::{append_turn, TurnRecord};
+        append_turn(
+            project_dir,
+            sid,
+            &TurnRecord {
+                exec_turn_id: Some(exec.into()),
+                turn_id: format!("{sid}-1"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: text.into(),
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+                conclusion: None,
+            },
+        )
+        .unwrap();
     }
 
     /// GitHub #197 — a bind against a row that is no longer there is an ERROR
@@ -32822,7 +33239,7 @@ mod tests {
             },
         )
         .unwrap();
-        ccteam_harness::write_delegation_requests(
+        Gateway::seed_delegation_store_for_test(
             &project_dir,
             &DelegationStoreClaim::for_test(child_sid),
             &test_delegation_store(
@@ -32916,7 +33333,7 @@ mod tests {
             },
         )
         .unwrap();
-        ccteam_harness::write_delegation_requests(
+        Gateway::seed_delegation_store_for_test(
             &project_dir,
             &DelegationStoreClaim::for_test(child_sid),
             &test_delegation_store(
@@ -33011,7 +33428,7 @@ mod tests {
             )
             .unwrap();
         }
-        ccteam_harness::write_delegation_requests(
+        Gateway::seed_delegation_store_for_test(
             &project_dir,
             &DelegationStoreClaim::for_test(child_sid),
             &test_delegation_store(
