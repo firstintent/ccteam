@@ -312,6 +312,11 @@ pub fn session_tool_definitions() -> Vec<Value> {
                     "enum": ["final", "brief", "off"],
                     "description": "Turn-end wake: brief (500-char excerpt), final (2000), off. Omitted keeps your last choice here."
                 },
+                "routing": {
+                    "type": "string",
+                    "enum": ["inject", "queue"],
+                    "description": "Busy child: inject (default) steers its running turn, which then answers both; queue gives your task its own turn."
+                },
                 "tools": {
                     "type": "string",
                     "enum": ["full", "read", "none"],
@@ -477,13 +482,19 @@ mod tests {
     /// but the face never mentions is a field callers do not act on: a read
     /// that came back holding nothing looked identical to one whose task was
     /// dropped, which is the confusion this whole issue is about. ~120 B.
+    ///
+    /// 5320 → 5480 B for `agent{routing}` (issue #197 D). The default changed
+    /// — a follow-up on a busy child now STEERS its running turn instead of
+    /// queuing behind it — and a caller that cannot see the axis cannot ask
+    /// for the other one, nor know that the turn which answers a steer is the
+    /// one it joined. ~155 B for the parameter and its consequence.
     #[test]
     fn full_face_tools_list_fits_byte_budget() {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5320,
-            "full tools/list is {bytes} B; budget is 5320 B"
+            bytes <= 5480,
+            "full tools/list is {bytes} B; budget is 5480 B"
         );
     }
 

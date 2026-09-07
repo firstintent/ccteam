@@ -45,7 +45,10 @@ Your session hides the tool calls. You say the left column; the right column hap
 | "before merge, have a **different vendor review** this diff — MERGE / BLOCK with reasons" | a cross-vendor review gate: the builder never rubber-stamps its own work |
 | "**which vendors** are available here, and what do my routing notes say?" | one `status` call: which vendors this project's bound host can hire and what the team spent today — `status{detail:"routing"}` adds the selected project override / global fallback carried verbatim |
 | "**what sessions** are running? what did that fan-out cost?" | one `agent_read` call: the roster — busy or idle, per-member model and cost; `tree:true` draws who reports to whom |
-| "**stop s47**" | `agent_stop` explicitly closes that session (the transcript stays on disk and `agent_read` still reads it) |
+| "**tell s47 to skip the migration**" | a follow-up on a session that is already working **steers** it — the correction joins the turn in flight rather than waiting behind it. Say "and let it finish first" for the other channel (`routing:"queue"`), which gives your task its own turn |
+| "**stop s47**" | `agent_stop` explicitly closes that session (the transcript stays on disk and `agent_read` still reads it, including a record of the turn the stop cut short) |
+
+One trade-off worth knowing about the steer: the child answers a steered turn as **one** turn, so the completion you get back is that turn's answer — and on Claude the steering line is shown to the model twice (once as a mid-turn preview, once as the next prompt), which costs tokens. Steer when you are correcting work you can see; ask for a queued turn when you want a separate, quotable answer to the new task.
 
 Rule of thumb: **long work → background + completion notification** (close the laptop); **quick questions → wait inline**. Wire your session once (§8), then these phrases work as-is in your everyday session.
 

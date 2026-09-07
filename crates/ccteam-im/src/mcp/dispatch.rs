@@ -2719,6 +2719,10 @@ async fn run_agent_spawn_at(
     let title = title.or_else(|| task.as_deref().map(derive_title_from_task));
     let wait_seconds = inline_wait_seconds(args);
     let notify = parse_notify_mode("agent", args)?;
+    // Validated on the hire path too, so a typo is a refusal rather than a
+    // silently-ignored argument. A brand-new session is idle by construction,
+    // so whichever channel is named the adapter reports `started`.
+    let routing = parse_routing("agent", args)?;
     // Operator/unowned projects retain the caller-derived pool. Tenant-owned
     // projects ignore this fallback in the gateway and make every
     // agent inherit the tenant principal.
@@ -2892,6 +2896,7 @@ async fn run_agent_spawn_at(
             wait_seconds,
             notify,
             title.clone(),
+            routing,
             idem_key.clone(),
             deadline,
         )
@@ -3105,6 +3110,7 @@ async fn run_agent_dispatch(
 
     let wait_seconds = inline_wait_seconds(args);
     let notify = parse_notify_mode("agent", args)?;
+    let routing = parse_routing("agent", args)?;
     let title = args
         .get("title")
         .and_then(|v| v.as_str())
@@ -3213,6 +3219,7 @@ async fn run_agent_dispatch(
         wait_seconds,
         notify,
         title,
+        routing,
         idem_key.clone(),
         deadline,
     )
@@ -3245,6 +3252,34 @@ fn parse_notify_mode(
         Some(v) => ccteam_harness::NotifyMode::parse_value(v)
             .map(NotifyRequest::explicit)
             .map_err(|e| format!("{tool}: {e}")),
+    }
+}
+
+/// Parse the optional `routing` arg of `agent`: `"inject"` (default — the task
+/// joins the turn the child is already running, the same channel a human IM
+/// message takes) or `"queue"` (a distinct FIFO follow-up turn of its own).
+///
+/// The default is a STEER because that is what a parent tasking a child is
+/// (AGENTS.md: `agent{task,sid}` and an IM `@handle` are one route). What the
+/// vendor actually did comes back as the response's `status`, never as an echo
+/// of this argument: an adapter with no injection channel degrades to a queued
+/// turn and says `queued`.
+fn parse_routing(
+    tool: &str,
+    args: &serde_json::Value,
+) -> std::result::Result<ccteam_harness::TurnRouting, String> {
+    match args.get("routing") {
+        None | Some(serde_json::Value::Null) => Ok(ccteam_harness::TurnRouting::Inject),
+        Some(serde_json::Value::String(raw)) => match raw.trim().to_ascii_lowercase().as_str() {
+            "inject" => Ok(ccteam_harness::TurnRouting::Inject),
+            "queue" => Ok(ccteam_harness::TurnRouting::Queue),
+            other => Err(format!(
+                "{tool}: invalid routing `{other}` (expected `inject` | `queue`)"
+            )),
+        },
+        Some(other) => Err(format!(
+            "{tool}: invalid routing {other} (expected `inject` | `queue`)"
+        )),
     }
 }
 
@@ -3381,6 +3416,7 @@ async fn dispatch_task(
     wait_seconds: u64,
     notify: NotifyRequest,
     title: Option<String>,
+    routing: ccteam_harness::TurnRouting,
     idempotency_key: Option<String>,
     deadline: crate::gateway::GatewayDeadline,
 ) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
@@ -3470,9 +3506,11 @@ async fn dispatch_task(
             caller_sid,
             watch_notify,
             title.clone(),
-            // Stage 2 keeps the existing routing policy: a ccteam-authored
-            // follow-up is a distinct queued turn (issue #194).
-            ccteam_harness::TurnRouting::Queue,
+            // What the DISPATCHER asked for; what the adapter did with it is
+            // the request's state + bound turn (issue #197 D). A ccteam-authored
+            // completion notification is a different path entirely and stays
+            // queued (issue #194).
+            routing,
             idempotency_key,
             deadline,
         )
@@ -3507,6 +3545,7 @@ async fn dispatch_task(
         Arc::clone(gateway),
         sid,
         task,
+        routing,
         deadline,
     )
     .await
@@ -5815,6 +5854,7 @@ mod session_tool_tests {
             0,
             NotifyRequest::defaulted(),
             None,
+            ccteam_harness::TurnRouting::Inject,
             None,
             crate::gateway::GatewayDeadline::start(),
         )
@@ -5978,6 +6018,7 @@ mod session_tool_tests {
             0,
             NotifyRequest::defaulted(),
             None,
+            ccteam_harness::TurnRouting::Inject,
             None,
             crate::gateway::GatewayDeadline::start(),
         )
@@ -6099,6 +6140,7 @@ mod session_tool_tests {
                 1,
                 NotifyRequest::defaulted(),
                 None,
+                ccteam_harness::TurnRouting::Inject,
                 None,
                 crate::gateway::GatewayDeadline::start(),
             )
@@ -6250,11 +6292,15 @@ mod session_tool_tests {
     }
 
     impl StubTurnQueue {
-        /// Reserve the turn a message will run in — started when idle, queued
-        /// with a 1-based position behind whatever is already waiting.
+        /// Reserve the turn a message will run in — started when idle, and
+        /// mid-turn whatever the ROUTING asked for: joined to the turn already
+        /// running (`Inject`, so several messages share one execution turn, as
+        /// they do on claude / grok) or queued with a 1-based position behind
+        /// whatever is already waiting (`Queue`).
         fn claim(
             &self,
             identity: &str,
+            routing: ccteam_harness::TurnRouting,
         ) -> (String, ccteam_harness::TurnDisposition, Option<usize>) {
             let n = self
                 .seq
@@ -6263,13 +6309,19 @@ mod session_tool_tests {
             let id = format!("x{n}");
             let mut states = self.state.lock().unwrap();
             let state = states.entry(identity.to_string()).or_default();
-            if state.active.is_none() {
-                state.active = Some(id.clone());
-                (id, ccteam_harness::TurnDisposition::Started, None)
-            } else {
-                state.waiting.push_back(id.clone());
-                let position = state.waiting.len();
-                (id, ccteam_harness::TurnDisposition::Queued, Some(position))
+            match state.active.clone() {
+                None => {
+                    state.active = Some(id.clone());
+                    (id, ccteam_harness::TurnDisposition::Started, None)
+                }
+                Some(active) if routing == ccteam_harness::TurnRouting::Inject => {
+                    (active, ccteam_harness::TurnDisposition::Injected, None)
+                }
+                Some(_) => {
+                    state.waiting.push_back(id.clone());
+                    let position = state.waiting.len();
+                    (id, ccteam_harness::TurnDisposition::Queued, Some(position))
+                }
             }
         }
 
@@ -6317,6 +6369,11 @@ mod session_tool_tests {
         narrate: bool,
         /// Delay (ms) before `events()` yields — forces a `wait` timeout.
         event_delay_ms: u64,
+        /// Model a vendor with no injection channel: a mid-turn `Inject` is
+        /// safely served as a distinct queued turn, and the receipt says
+        /// `queued` — the disposition is what the adapter DID, never an echo
+        /// of what was asked for (issue #197 D).
+        degrade_inject: bool,
         /// Run a STARTED turn to its boundary from inside `submit_turn_routed`,
         /// then hold the call open long enough for the pump and the notifier to
         /// have processed it. The pathological ordering behind issue #197: a
@@ -6464,7 +6521,7 @@ mod session_tool_tests {
             &self,
             h: &ccteam_harness::ThreadHandle,
             input: ccteam_harness::TurnInput,
-            _routing: ccteam_harness::TurnRouting,
+            routing: ccteam_harness::TurnRouting,
         ) -> std::result::Result<ccteam_harness::TurnSubmission, ccteam_harness::HarnessError>
         {
             let Some(queue) = self.queue.clone() else {
@@ -6477,30 +6534,39 @@ mod session_tool_tests {
                 ccteam_harness::TurnInput::UserText(t) => t,
                 _ => String::new(),
             };
-            let (turn_id, disposition, position) = queue.claim(&h.identity);
-            queue.park(
-                &h.identity,
-                &turn_id,
-                vec![
-                    ccteam_harness::ThreadEvent::TurnStarted {
-                        turn_id: turn_id.clone(),
-                    },
-                    ccteam_harness::ThreadEvent::ItemCompleted {
-                        item: ccteam_harness::ThreadItem {
-                            id: format!("msg-{turn_id}"),
-                            details: ccteam_harness::ThreadItemDetails::AgentMessage(format!(
-                                "echo: {text}"
-                            )),
+            let routing = if self.degrade_inject {
+                ccteam_harness::TurnRouting::Queue
+            } else {
+                routing
+            };
+            let (turn_id, disposition, position) = queue.claim(&h.identity, routing);
+            // An injected message joins a turn whose events are already parked;
+            // re-parking would overwrite the answer that turn is going to give.
+            if disposition != ccteam_harness::TurnDisposition::Injected {
+                queue.park(
+                    &h.identity,
+                    &turn_id,
+                    vec![
+                        ccteam_harness::ThreadEvent::TurnStarted {
+                            turn_id: turn_id.clone(),
                         },
-                    },
-                    ccteam_harness::ThreadEvent::TurnCompleted {
-                        turn_id: turn_id.clone(),
-                        usage: Default::default(),
-                        model: None,
-                        conclusion: None,
-                    },
-                ],
-            );
+                        ccteam_harness::ThreadEvent::ItemCompleted {
+                            item: ccteam_harness::ThreadItem {
+                                id: format!("msg-{turn_id}"),
+                                details: ccteam_harness::ThreadItemDetails::AgentMessage(format!(
+                                    "echo: {text}"
+                                )),
+                            },
+                        },
+                        ccteam_harness::ThreadEvent::TurnCompleted {
+                            turn_id: turn_id.clone(),
+                            usage: Default::default(),
+                            model: None,
+                            conclusion: None,
+                        },
+                    ],
+                );
+            }
             if self.complete_inside_submit
                 && disposition == ccteam_harness::TurnDisposition::Started
             {
@@ -6518,7 +6584,12 @@ mod session_tool_tests {
                         position.expect("a queued claim reports its position"),
                     )
                 }
-                _ => ccteam_harness::TurnSubmission::started(turn_id),
+                ccteam_harness::TurnDisposition::Injected => {
+                    ccteam_harness::TurnSubmission::injected(turn_id)
+                }
+                ccteam_harness::TurnDisposition::Started => {
+                    ccteam_harness::TurnSubmission::started(turn_id)
+                }
             })
         }
         async fn rebuild_tool_surface(
@@ -8006,6 +8077,7 @@ mod session_tool_tests {
             6,
             NotifyRequest::defaulted(),
             None,
+            ccteam_harness::TurnRouting::Inject,
             None,
             crate::gateway::GatewayDeadline::start(),
         )
@@ -8975,12 +9047,23 @@ mod session_tool_tests {
         project_dir: &std::path::Path,
         complete_inside_submit: bool,
     ) -> (GatewayHandle, String, StubAdapter) {
-        let shared = StubAdapter {
-            answer: true,
-            queue: Some(std::sync::Arc::new(StubTurnQueue::default())),
-            complete_inside_submit,
-            ..Default::default()
-        };
+        queueing_dispatch_gateway_built(
+            project_dir,
+            StubAdapter {
+                answer: true,
+                queue: Some(std::sync::Arc::new(StubTurnQueue::default())),
+                complete_inside_submit,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// The shared body: one stub, one gateway, one principal session.
+    async fn queueing_dispatch_gateway_built(
+        project_dir: &std::path::Path,
+        shared: StubAdapter,
+    ) -> (GatewayHandle, String, StubAdapter) {
         let handed = shared.clone();
         let factory: std::sync::Arc<
             dyn Fn(
@@ -9017,6 +9100,22 @@ mod session_tool_tests {
             drx,
         ));
         (handle, principal, shared)
+    }
+
+    /// [`queueing_dispatch_gateway`] whose stub has no injection channel.
+    async fn queueing_dispatch_gateway_without_inject(
+        project_dir: &std::path::Path,
+    ) -> (GatewayHandle, String, StubAdapter) {
+        queueing_dispatch_gateway_built(
+            project_dir,
+            StubAdapter {
+                answer: true,
+                queue: Some(std::sync::Arc::new(StubTurnQueue::default())),
+                degrade_inject: true,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// The thread identity a `StubAdapter` gave `sid` (its FIFO key).
@@ -9143,7 +9242,7 @@ mod session_tool_tests {
             .to_string();
 
         let dispatch = |task: &str, title: &str| {
-            let args = json!({ "sid": &child, "task": task, "title": title });
+            let args = json!({ "sid": &child, "task": task, "title": title, "routing": "queue" });
             let gw = &gw;
             let principal = principal.clone();
             async move {
@@ -9201,6 +9300,161 @@ mod session_tool_tests {
         assert_eq!(b["delivery"]["written"], json!(false), "{b}");
     }
 
+    /// GitHub #197 (D) — a parent tasking a BUSY child steers the turn it is
+    /// already running, exactly as a human's IM message does; a caller that
+    /// wants its own turn boundary asks for one.
+    ///
+    /// Every `agent{sid,task}` used to be queued, because routing was derived
+    /// from the turn's ORIGIN and an A2A submit is internal. So a correction
+    /// sent to a working child sat behind it: measured on s932→s933, a ruling
+    /// sent at 17:38 reached claude at 17:52, and the parent — told only
+    /// `pending` — re-sent it twice more and then stopped the child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_follow_up_steers_the_running_turn_unless_its_own_turn_is_asked_for() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dispatch = |args: serde_json::Value| {
+            let gw = &gw;
+            let principal = principal.clone();
+            async move {
+                parse(
+                    &run_agent_dispatch(
+                        &ambient(&principal, "alpha", args),
+                        gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            }
+        };
+        let running = dispatch(json!({ "sid": &child, "task": "the long job" })).await;
+        assert_eq!(running["status"], json!("started"), "{running}");
+
+        // No `routing` named: the default is a steer.
+        let steer = dispatch(json!({ "sid": &child, "task": "one correction" })).await;
+        assert_eq!(
+            steer["status"],
+            json!("injected"),
+            "a follow-up on a busy child steers by default: {steer}"
+        );
+        assert_eq!(
+            steer["turn_id"], running["turn_id"],
+            "an injected task runs in the turn it JOINED: {steer}"
+        );
+        assert!(
+            steer.get("queue_position").is_none(),
+            "nothing is queued: {steer}"
+        );
+        assert_eq!(steer["delivery"]["queued"], json!(false), "{steer}");
+        assert_eq!(steer["delivery"]["written"], json!(true), "{steer}");
+        assert_ne!(
+            steer["request_id"], running["request_id"],
+            "sharing a turn is not sharing an identity: {steer}"
+        );
+
+        // …and the other channel is still one argument away.
+        let queued =
+            dispatch(json!({ "sid": &child, "task": "afterwards", "routing": "queue" })).await;
+        assert_eq!(queued["status"], json!("queued"), "{queued}");
+        assert_eq!(queued["queue_position"], json!(1), "{queued}");
+        assert_ne!(
+            queued["turn_id"], running["turn_id"],
+            "a queued task names the turn it WILL open: {queued}"
+        );
+    }
+
+    /// GitHub #197 (D) — `routing` says what the caller WANTS; `status` says
+    /// what the vendor did. A harness with no injection channel degrades to a
+    /// distinct turn and the response says so, so a parent never reads
+    /// `injected` for a task the model has not been shown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_vendor_that_cannot_inject_reports_queued_rather_than_claiming_injected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _stub) = queueing_dispatch_gateway_without_inject(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for task in ["the long job", "one correction"] {
+            let response = parse(
+                &run_agent_dispatch(
+                    &ambient(
+                        &principal,
+                        "alpha",
+                        json!({ "sid": &child, "task": task, "routing": "inject" }),
+                    ),
+                    &gw,
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap(),
+            );
+            let want = if task == "the long job" {
+                "started"
+            } else {
+                "queued"
+            };
+            assert_eq!(response["status"], json!(want), "{task}: {response}");
+        }
+    }
+
+    /// GitHub #197 (D) — an unknown routing word is a refusal, not a silently
+    /// ignored argument: the two channels behave differently enough that
+    /// guessing one for the caller is worse than saying no.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_routing_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = run_agent_dispatch(
+            &ambient(
+                &principal,
+                "alpha",
+                json!({ "sid": &child, "task": "x", "routing": "urgent" }),
+            ),
+            &gw,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("invalid routing `urgent`") && error.contains("`inject` | `queue`"),
+            "{error}"
+        );
+    }
+
     /// A finishes: only A's parent is woken, the header names A's request and
     /// title, and it says how much of that child's work is still owed. B and C
     /// stay outstanding — the boundary that ended A is not their answer.
@@ -9232,7 +9486,7 @@ mod session_tool_tests {
                     &ambient(
                         &principal,
                         "alpha",
-                        json!({ "sid": &child, "task": task, "title": title }),
+                        json!({ "sid": &child, "task": task, "title": title, "routing": "queue" }),
                     ),
                     &gw,
                     McpCaller::Ambient,
@@ -9326,7 +9580,7 @@ mod session_tool_tests {
                 &ambient(
                     &principal,
                     "alpha",
-                    json!({ "sid": &child, "task": task, "title": task }),
+                    json!({ "sid": &child, "task": task, "title": task, "routing": "queue" }),
                 ),
                 &gw,
                 McpCaller::Ambient,
@@ -9376,7 +9630,7 @@ mod session_tool_tests {
             &ambient(
                 &principal,
                 "alpha",
-                json!({ "sid": &child, "task": "task A", "title": "A" }),
+                json!({ "sid": &child, "task": "task A", "title": "A", "routing": "queue" }),
             ),
             &gw,
             McpCaller::Ambient,
@@ -9394,7 +9648,7 @@ mod session_tool_tests {
                         &ambient(
                             &principal,
                             "alpha",
-                            json!({ "sid": &child, "task": "task B", "title": "B", "wait": 20 }),
+                            json!({ "sid": &child, "task": "task B", "title": "B", "wait": 20, "routing": "queue" }),
                         ),
                         &gw,
                         McpCaller::Ambient,
@@ -11143,7 +11397,7 @@ mod session_tool_tests {
             &ambient(
                 &principal,
                 "alpha",
-                json!({ "sid": &child, "task": "task A", "title": "A" }),
+                json!({ "sid": &child, "task": "task A", "title": "A", "routing": "queue" }),
             ),
             &gw,
             McpCaller::Ambient,
@@ -11160,7 +11414,7 @@ mod session_tool_tests {
                         &ambient(
                             &principal,
                             "alpha",
-                            json!({ "sid": &child, "task": "task B", "title": "B", "wait": 20 }),
+                            json!({ "sid": &child, "task": "task B", "title": "B", "wait": 20, "routing": "queue" }),
                         ),
                         &gw,
                         McpCaller::Ambient,

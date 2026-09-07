@@ -302,6 +302,41 @@ fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
     }
 }
 
+/// What one submission asks for: WHO is asking (the delivery-side fact) and
+/// WHICH vendor channel to use (the submit-side one).
+///
+/// The two used to be one axis — routing was derived from the origin and from
+/// nothing else — so an A2A dispatch could not be a steer without also claiming
+/// that somebody in the child's chat had asked for it. `TurnOrigin::User` is
+/// what puts a session's answer back into its IM thread, so borrowing it for
+/// routing would push every delegated task's answer at a human who never asked
+/// (issue #194 / v0.10.1, the `has_addressee` gate). Two axes, one default:
+/// [`routing_for_origin`] still decides for every caller that has no opinion,
+/// so a new submit path keeps today's behaviour without naming it (issue #197
+/// D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnIntent {
+    origin: TurnOrigin,
+    routing: TurnRouting,
+}
+
+impl TurnIntent {
+    /// The default: the origin picks the channel.
+    fn from_origin(origin: TurnOrigin) -> Self {
+        Self {
+            origin,
+            routing: routing_for_origin(origin),
+        }
+    }
+
+    /// A caller that knows which channel it wants — an `agent{sid,task}`
+    /// dispatch, which is a steer by default (`routing:"inject"`) and a
+    /// distinct follow-up turn on request (`routing:"queue"`).
+    fn routed(origin: TurnOrigin, routing: TurnRouting) -> Self {
+        Self { origin, routing }
+    }
+}
+
 impl TurnOrigins {
     fn record(&mut self, turn_id: String, origin: TurnOrigin) {
         self.by_turn.insert(turn_id, origin);
@@ -6167,12 +6202,15 @@ impl Gateway {
             // Box::pin: drain ↔ submit_resolved are mutually recursive when
             // a not-live submit enqueues then drains (async recursion needs
             // indirection for a finite future type).
+            // A drained pending turn opens its own turn (the session has just
+            // been revived, so nothing is in flight to steer): the origin's own
+            // channel is the right one.
             match Box::pin(self.submit_resolved(
                 &chat,
                 session_id,
                 "",
                 turn.text,
-                origin,
+                TurnIntent::from_origin(origin),
                 turn.literal,
             ))
             .await
@@ -8303,7 +8341,7 @@ impl Gateway {
                 &item.sid,
                 "",
                 item.text.clone(),
-                TurnOrigin::User,
+                TurnIntent::from_origin(TurnOrigin::User),
                 true,
             )
             .await?
@@ -8497,7 +8535,7 @@ impl Gateway {
                 &session_id,
                 message_id,
                 payload,
-                TurnOrigin::User,
+                TurnIntent::from_origin(TurnOrigin::User),
                 false,
             )
             .await?
@@ -8939,9 +8977,10 @@ impl Gateway {
         session_id: &str,
         message_id: &str,
         payload: String,
-        origin: TurnOrigin,
+        intent: TurnIntent,
         literal_user_text: bool,
     ) -> Result<SubmitResult> {
+        let origin = intent.origin;
         if !literal_user_text {
             if let Some(directive) = parse_session_directive(&payload) {
                 // Directive path: PROBE-and-resume a dead child before dispatching
@@ -9045,7 +9084,7 @@ impl Gateway {
             .map(|g| g.is_some())
             .unwrap_or(false);
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
-        let requested_routing = routing_for_origin(origin);
+        let requested_routing = intent.routing;
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
         if !was_in_flight {
             session.steered_this_turn.store(false, Ordering::SeqCst);
@@ -14558,23 +14597,41 @@ impl Gateway {
         text: String,
         deadline: GatewayDeadline,
     ) -> Result<String> {
-        Self::submit_to_sid_shared_with_origin(gateway, sid, text, TurnOrigin::Internal, deadline)
-            .await
-            .map(|receipt| receipt.turn_id)
+        Self::submit_to_sid_shared_with_intent(
+            gateway,
+            sid,
+            text,
+            TurnIntent::from_origin(TurnOrigin::Internal),
+            deadline,
+        )
+        .await
+        .map(|receipt| receipt.turn_id)
     }
 
     /// The same A2A submit, keeping the adapter's full receipt: which turn the
     /// message runs in, what the adapter did with it, and where in the queue it
     /// sits. The dispatch path needs all three to bind a delegation request and
     /// to tell its caller the truth (issue #201).
+    /// `routing` is the dispatcher's choice, not the origin's: a parent tasking
+    /// a child steers by default (`Inject`, the same channel a human IM message
+    /// takes) and asks for a distinct FIFO follow-up turn with `Queue`. The
+    /// ORIGIN stays internal either way — nobody in the child's own chat asked
+    /// this question, so its answer must not be pushed at them.
     pub async fn submit_to_sid_receipt_shared(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
         text: String,
+        routing: TurnRouting,
         deadline: GatewayDeadline,
     ) -> Result<TurnReceipt> {
-        Self::submit_to_sid_shared_with_origin(gateway, sid, text, TurnOrigin::Internal, deadline)
-            .await
+        Self::submit_to_sid_shared_with_intent(
+            gateway,
+            sid,
+            text,
+            TurnIntent::routed(TurnOrigin::Internal, routing),
+            deadline,
+        )
+        .await
     }
 
     /// Lock-narrowed web submit. Gateway control commands retain their
@@ -14596,18 +14653,25 @@ impl Gateway {
                     .await;
             }
         }
-        Self::submit_to_sid_shared_with_origin(gateway, sid, text, TurnOrigin::User, deadline)
-            .await
-            .map(|receipt| receipt.turn_id)
+        Self::submit_to_sid_shared_with_intent(
+            gateway,
+            sid,
+            text,
+            TurnIntent::from_origin(TurnOrigin::User),
+            deadline,
+        )
+        .await
+        .map(|receipt| receipt.turn_id)
     }
 
-    async fn submit_to_sid_shared_with_origin(
+    async fn submit_to_sid_shared_with_intent(
         gateway: Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
         text: String,
-        origin: TurnOrigin,
+        intent: TurnIntent,
         deadline: GatewayDeadline,
     ) -> Result<TurnReceipt> {
+        let origin = intent.origin;
         // Resolve the reply route and cold-resume an absent entry without
         // holding the registry over the vendor handshake.
         let absent_resume_identity = {
@@ -14701,9 +14765,9 @@ impl Gateway {
                     )
                     .await?;
                     let mut guard = deadline.lock(&gateway).await?;
-                    guard.plan_unlocked_turn(sid, text.clone(), origin)?
+                    guard.plan_unlocked_turn(sid, text.clone(), intent)?
                 } else {
-                    guard.plan_unlocked_turn(sid, text.clone(), origin)?
+                    guard.plan_unlocked_turn(sid, text.clone(), intent)?
                 }
             };
             deadline.ensure_vendor_phase_can_start()?;
@@ -14910,8 +14974,9 @@ impl Gateway {
         &mut self,
         sid: &str,
         user_text: String,
-        origin: TurnOrigin,
+        intent: TurnIntent,
     ) -> Result<UnlockedTurnPlan> {
+        let origin = intent.origin;
         let session = self
             .sessions
             .get(sid)
@@ -14929,7 +14994,7 @@ impl Gateway {
             .map(|started| started.is_some())
             .unwrap_or(false);
         let prior_steered = session.steered_this_turn.load(Ordering::SeqCst);
-        let requested_routing = routing_for_origin(origin);
+        let requested_routing = intent.routing;
         let provisional_inject = was_in_flight && requested_routing == TurnRouting::Inject;
         if !was_in_flight {
             session.steered_this_turn.store(false, Ordering::SeqCst);
@@ -15101,7 +15166,14 @@ impl Gateway {
             web_api_chat()
         };
         match self
-            .submit_resolved(&reply_to, sid, "", text, origin, false)
+            .submit_resolved(
+                &reply_to,
+                sid,
+                "",
+                text,
+                TurnIntent::from_origin(origin),
+                false,
+            )
             .await?
         {
             // A turn's answer streams over the pump → SSE; hand back the turn id

@@ -44,6 +44,7 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 - **不带 `sid` = 新雇。**`vendor` 选 harness —— `claude`(默认)/ `codex` / `grok` / `opencode` / `kimi` / `pi` / `dsh` —— 响应总是带**新** sid。`model` / `effort` 原样传给 vendor(省略走默认;vendor 拒绝的值 = 雇佣失败,绝不静默忽略)。`role` 指 `.claude/agents/<role>.md`(省略 = roleless,裸 vendor 自读项目 `CLAUDE.md`/`AGENTS.md`)。`mode` 仅 DSH(`standard` | `ptc` | `minimal` | `creator`)。`permission_mode:"hitl"` 把审批弹到你绑定的 chat;默认 `skip` 不弹。`tools` 设子会话自己的面(§2)。`title`(≤80 字符)只进账本与团队视图,绝不进任何 prompt。`parent_sid` 用于 ccteam 不管理你时保住委派边。
 - **带 `sid` = 续派**;`released` 会话先按 sid 复活。此形态下雇佣类参数一律拒绝而非静默忽略。
 - `wait` —— 内联等待秒数,0–240(默认 0 = async)。它等的是**这一次请求**的答案:同一子会话里另一个任务先完成,那是那次请求的完成、不是你的,照常推给你。超时回 `answered:false` + 下面那组送达事实,**绝不取消子任务**。
+- `routing` —— 任务进入**忙碌**子会话时走哪条信道:`inject`(默认)并进它正在跑的那个 turn,与人在 IM 里说话同一条路;`queue` 给它一个独立的 FIFO 后续 turn。子会话空闲时两者无差别 —— 反正都开一个新 turn。注入不取消在飞 turn、不新建会话,也不从任务文本推断紧急度;两条信道由你选,没有任何自动合并、替换或语义覆盖。**代价要说清:**被注入的任务由它**并进去**的那个 turn 的边界了结,所以完成通知带的是那个 turn 的答复 —— 而在 claude 上,那个 turn 还刚把这行注入文本看了两遍(一遍是 turn 中的 queued_command 预览,一遍是下一个 prompt)。要纠正正在干活的子会话就 steer;要拿一份你打算据以决策的独立答复,就传 `routing:"queue"`。ccteam 自己生成的完成通知永远走 queue,与这个参数无关。
 - `idempotency_key` —— 同 key 重试重放原调用而非翻倍(新雇按项目、续派按子会话;内存态,~1 小时)。重放响应多一个 `idempotent_replay:true`。
 - **没有 `host`**(机器跟随项目绑定)、**没有 `protocol`**(信道由 vendor 推导);传了都是硬错,退役的 `wait_seconds` 同理(已改名 `wait`)。
 
@@ -51,7 +52,7 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 
 响应(紧凑 JSON):async → `{sid, request_id, turn_id, status, delivery, queue_position?}`。
 
-- `status` 是 adapter **实际做了什么**:`started`(子会话空闲,这条开了一个新 turn)、`injected`(汇入正在跑的那个 turn)、`queued`(独立的后续 turn,在排队 —— 任务排在重启前旧进程后面时也是这个形状,并附一条 `hint`)。
+- `status` 是 adapter **实际做了什么**,绝不是 `routing` 的回声:`started`(子会话空闲,这条开了一个新 turn)、`injected`(汇入正在跑的那个 turn)、`queued`(独立的后续 turn,在排队 —— 任务排在重启前旧进程后面时也是这个形状,并附一条 `hint`)。没有注入信道的 harness 会把 `inject` 安全降级成独立 turn 并如实报 `queued`,绝不会为一行模型根本没看到的文本谎称 `injected`。
 - `queue_position` 从 1 起算,只在 adapter 看得见自己的 FIFO 时出现。`turn_id` 指的是这个任务**将要**跑在哪个执行 turn 里,排队期间就已经给了。
 - `delivery` 把四件不同的事分开:`accepted`(ccteam 已持久持有)、`queued`(还被 ccteam 留在 harness 前面)、`written`(字节已写进 harness)、`executing`(观察到承载它的 turn 开始了)。冲进 stdin 不等于模型读了,所以在 turn 真的开起来之前 `executing` 一律是 `"unknown"`;凡是 ccteam 观察不到的,都说 `"unknown"`,不给一个自信的 `false`。
 - 完成通知到不了你时带 `notify_deliverable:false` —— 那就用 `agent_read{sid,wait}`。
