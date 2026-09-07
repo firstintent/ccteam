@@ -69,9 +69,9 @@ pub use execution::claude_stream_json::{persisted_session_model, ClaudeStreamJso
 pub use execution::claude_tui::{chat_session_name, parse_chat_session_name, CHAT_SESSION_PREFIX};
 pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::delegation::{
-    mint_request_id, read_delegation_requests, remove_delegation_requests,
-    scan_delegation_requests, write_delegation_requests, DelegationRequest, DelegationRequests,
-    DelegationStoreGuard, DeliveringBoundary, NotifyMode, RequestState,
+    delete_delegation_requests, mint_request_id, persist_delegation_requests,
+    read_delegation_requests, scan_delegation_requests, DelegationRequest, DelegationRequests,
+    DelegationStoreGuard, DelegationWriteGuard, DeliveringBoundary, NotifyMode, RequestState,
 };
 pub use execution::dsh_acp::{
     build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, identity_socket_path,

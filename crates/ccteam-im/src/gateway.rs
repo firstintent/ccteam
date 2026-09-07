@@ -966,16 +966,12 @@ mod delegation_store_io {
     /// A `'static` witness of a held claim, for a durable write that runs on
     /// the blocking pool while the claim stays held on the caller's task. True
     /// exactly as long as that caller keeps holding it across the `await`.
-    struct Ticket(String);
-
-    impl ccteam_harness::DelegationStoreGuard for Ticket {
-        fn child_sid(&self) -> &str {
-            &self.0
-        }
-    }
-
-    fn ticket(claim: &DelegationStoreClaim) -> Ticket {
-        Ticket(claim.child_sid().to_string())
+    ///
+    /// `DelegationWriteGuard` is a SEALED type: no crate can implement the
+    /// write guard itself, and this function is the only place in ccteam that
+    /// mints one.
+    fn ticket(claim: &DelegationStoreClaim) -> ccteam_harness::DelegationWriteGuard {
+        ccteam_harness::DelegationWriteGuard::for_child(claim.child_sid())
     }
 
     /// Write `store` to `claim`'s child, on the blocking pool.
@@ -986,7 +982,7 @@ mod delegation_store_io {
     ) -> anyhow::Result<()> {
         let (dir, guard) = (project_dir.to_path_buf(), ticket(claim));
         tokio::task::spawn_blocking(move || {
-            ccteam_harness::write_delegation_requests(&dir, &guard, &store)
+            ccteam_harness::persist_delegation_requests(&dir, &guard, &store)
         })
         .await
         .map_err(|error| anyhow::anyhow!("delegation write task failed: {error}"))?
@@ -1001,19 +997,19 @@ mod delegation_store_io {
         claim: &DelegationStoreClaim,
         store: &ccteam_harness::DelegationRequests,
     ) -> anyhow::Result<()> {
-        ccteam_harness::write_delegation_requests(project_dir, &ticket(claim), store)
+        ccteam_harness::persist_delegation_requests(project_dir, &ticket(claim), store)
     }
 
     /// Delete the child's record.
     pub(super) fn remove_blocking(project_dir: &Path, claim: &DelegationStoreClaim) {
-        ccteam_harness::remove_delegation_requests(project_dir, &ticket(claim));
+        ccteam_harness::delete_delegation_requests(project_dir, &ticket(claim));
     }
 
     /// Delete it off the caller's thread.
     pub(super) async fn remove(project_dir: &Path, claim: &DelegationStoreClaim) {
         let (dir, guard) = (project_dir.to_path_buf(), ticket(claim));
         let _ = tokio::task::spawn_blocking(move || {
-            ccteam_harness::remove_delegation_requests(&dir, &guard)
+            ccteam_harness::delete_delegation_requests(&dir, &guard)
         })
         .await;
     }
