@@ -499,41 +499,47 @@ impl GrokAcpAdapter {
                         }),
                     )
                     .await;
-                let response =
-                    match response {
-                        Ok(response) => response,
-                        Err(error) if grok_interject_missed_active_turn(&error) => {
-                            // Defensive compatibility for a Grok build that
-                            // explicitly rejects an idle interject. Current Grok
-                            // instead admits it and self-starts a turn; the shared
-                            // ACP translator captures that normal path.
-                            let queued_id = {
-                                let mut state = live.state.lock().map_err(|_| {
-                                    HarnessError::Io("grok state lock poisoned".into())
-                                })?;
-                                match route_acp_turn(&mut state, &text, TurnRouting::Queue, true) {
-                                    AcpTurnRoute::Queue { turn_id, .. } => turn_id,
-                                    _ => {
-                                        return Err(HarnessError::Io(
-                                            "grok late interject did not queue".into(),
-                                        ))
-                                    }
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) if grok_interject_missed_active_turn(&error) => {
+                        // Defensive compatibility for a Grok build that
+                        // explicitly rejects an idle interject. Current Grok
+                        // instead admits it and self-starts a turn; the shared
+                        // ACP translator captures that normal path.
+                        let (queued_id, position) = {
+                            let mut state = live
+                                .state
+                                .lock()
+                                .map_err(|_| HarnessError::Io("grok state lock poisoned".into()))?;
+                            match route_acp_turn(&mut state, &text, TurnRouting::Queue, true) {
+                                AcpTurnRoute::Queue {
+                                    turn_id, position, ..
+                                } => (turn_id, position),
+                                _ => {
+                                    return Err(HarnessError::Io(
+                                        "grok late interject did not queue".into(),
+                                    ))
                                 }
-                            };
-                            tracing::debug!(
-                                turn_id = %queued_id,
-                                error = %error,
-                                "grok ACP late interjection queued as follow-up"
-                            );
-                            return Ok(TurnSubmission::queued(TurnId(queued_id))
-                                .hold_completion(reservation));
-                        }
-                        Err(error) => {
-                            return Err(HarnessError::SubmitFailed(format!(
-                                "grok {GROK_INTERJECT_METHOD}: {error}"
-                            )))
-                        }
-                    };
+                            }
+                        };
+                        tracing::debug!(
+                            turn_id = %queued_id,
+                            position,
+                            error = %error,
+                            "grok ACP late interjection queued as follow-up"
+                        );
+                        // The FIFO knows where this landed; a dispatcher
+                        // told only "queued" cannot tell "next" from
+                        // "fourth" (issue #201).
+                        return Ok(TurnSubmission::queued_at(TurnId(queued_id), position)
+                            .hold_completion(reservation));
+                    }
+                    Err(error) => {
+                        return Err(HarnessError::SubmitFailed(format!(
+                            "grok {GROK_INTERJECT_METHOD}: {error}"
+                        )))
+                    }
+                };
                 if !grok_interject_was_admitted(&response) {
                     return Err(HarnessError::SubmitFailed(format!(
                         "grok {GROK_INTERJECT_METHOD}: unexpected response {response}"
