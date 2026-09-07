@@ -21909,6 +21909,55 @@ mod tests {
         );
     }
 
+    /// GitHub #197 (D) — routing became a DISPATCHER's choice; the notifier's
+    /// door did not move with it. Whatever a parent asks for on its own tasks,
+    /// a ccteam-authored completion notification is still a distinct queued
+    /// turn — the whole of issue #194's saving, and the one submit path that
+    /// must never take an argument for it.
+    #[tokio::test]
+    async fn the_notifier_door_still_queues_whatever_dispatchers_may_now_ask_for() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+
+        // A dispatcher steering a busy child — the new default.
+        Gateway::submit_to_sid_receipt_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "the task".into(),
+            TurnRouting::Inject,
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+        // The notifier's own door takes no routing argument at all.
+        Gateway::submit_to_sid_shared(
+            Arc::clone(&gateway),
+            &sid,
+            "s7 done · claude · turn 1\nok".into(),
+            GatewayDeadline::start(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fake.routings.lock().await.as_slice(),
+            &[TurnRouting::Inject, TurnRouting::Queue],
+            "a dispatch may steer; a completion notification never does"
+        );
+    }
+
     /// issue #194 — a ccteam-authored turn (a delegation completion
     /// notification) asks for a DISTINCT follow-up turn, never a steer: on
     /// claude a mid-turn stdin line is shown to the model twice. A human's
