@@ -149,6 +149,17 @@ steer 有一处代价值得知道:被 steer 的那个 turn 仍然是**一个** t
 | 「我把它停了 —— 我最后那条指令到底送到没有?」 | stop 自己的回包就写着。`agent_stop` 会答 `undelivered`(它没跑的那些任务,以及每条指令现在被哪个文件持有)与 `interrupted`(被打断的那个 turn,已写进 transcript,`agent_read` 看得到)。被保留的指令在该会话被 resume 时回放;不自动取消,也不自动重发。 |
 | 「派活翻车 / 想确认没重复派」 | `agent` 支持 `idempotency_key`,同键重试重放原来那次调用而不是再派一次(雇人按项目、续派按子会话各自计域);链路不稳时要求带上,或重试前先 `agent_read` 看一眼。 |
 
+### stop 会对你已经发出去的活做什么
+
+停一个会话结束的是它的**进程**,不是会话,更不是队列。ccteam 还替它拿着的东西一律原地不动:
+
+- **保留的指令按序回放。**该 sid 的队列文件里还剩什么 —— `deferred-input.json`(vendor 侧的停泊队列)与 `pending_turns.jsonl`(ccteam 自己的 FIFO)—— 会在**同一个 sid 的下一个生命**被重新载入,并在那个生命的**首个 `result`** 之后放出:唤醒会话的那条消息先跑、自成一个 turn,停泊的排在它后面,由旧到新。
+- **不丢弃、不合并、不去重、不改顺序。**显式 stop 不取消已排队的任务,ccteam 也绝不替你重发。
+- **被打断的那个 turn 不会重放** —— 它是被切断的,记录里就这么写(`outcome:"interrupted"`,`reason` = `stopped` 或 `body_exited`)。绑在它上面的请求以 interrupted 收束;重启后的 reconcile 绝不会把这条记录变成完成通知。
+- **空闲释放不是 stop。**为省内存被放掉的会话,它的每一条未决请求都保留,`agent_read{sid}` 照样列出它们的送达状态与 `retained_in` —— 它们随会话一起回来。
+
+想让某个排队任务不要跑,就 stop 之后不要再 resume 那个 sid;没有「部分取消」这种东西。
+
 ---
 
 ## 附录:工具速查

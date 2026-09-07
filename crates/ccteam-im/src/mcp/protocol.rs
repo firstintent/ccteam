@@ -356,7 +356,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_stop",
-            "description": "Stop a session you delegated; it ends the process, not the session — `agent_read{sid}` still reads its transcript, including a record of the turn this cut short. Answers `undelivered` (your tasks it never ran: `retained_in` = ccteam still holds that line and replays it, `delivery:unconfirmed` = written out, never seen running) and `interrupted{turn}`.",
+            "description": "Stop a session you delegated; it ends the process, not the session — `agent_read{sid}` still reads its transcript, including a record of the turn this cut short. Answers `undelivered` (your tasks it never ran; `delivery:unconfirmed` = written out, never seen running), `interrupted{turn,reason}`, and `settled:false` if that record could not be written. A stop CANCELS NOTHING: every line still held (`retained_in`) replays in order after the first result of that sid's next life.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Session to stop." }
             }), &["sid"]),
@@ -467,6 +467,25 @@ mod tests {
 
     // ── the byte gates (the point of the whole surface) ────────────────────
 
+    /// GitHub #197 (E) — the tool face must STATE the resume policy, not imply
+    /// it. A caller that does not know a stop cancels nothing either re-sends
+    /// the instruction (a whole turn on two sessions) or writes the task off;
+    /// both were measured, and neither is inferable from the response fields.
+    #[test]
+    fn agent_stop_states_that_a_stop_cancels_nothing() {
+        let stop = session_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "agent_stop")
+            .expect("agent_stop is on the full face");
+        let description = stop["description"].as_str().unwrap_or_default();
+        for phrase in ["CANCELS NOTHING", "replays", "first result", "retained_in"] {
+            assert!(
+                description.contains(phrase),
+                "the resume policy must be stated on the face; missing {phrase:?}: {description}"
+            );
+        }
+    }
+
     /// G1 — the ambient tax an ORCHESTRATOR pays on its first turn. Every
     /// byte here is charged to every session before it has done anything, so
     /// the budget is a hard gate, not a guideline.
@@ -482,6 +501,12 @@ mod tests {
     /// but the face never mentions is a field callers do not act on: a read
     /// that came back holding nothing looked identical to one whose task was
     /// dropped, which is the confusion this whole issue is about. ~120 B.
+    ///
+    /// 5800 → 5900 B for the RESUME POLICY on that same receipt (issue #197
+    /// E). "Nothing was cancelled, and here is exactly when it runs" is the
+    /// one thing a caller cannot infer from the fields, and the failure it
+    /// prevents — re-sending an instruction that was never dropped — costs a
+    /// whole turn on both sessions. ~80 B.
     ///
     /// 5480 → 5800 B for `agent_stop`'s receipt (issue #197 E). The tool
     /// stopped dropping the child's requests, so it now answers with what it
@@ -500,8 +525,8 @@ mod tests {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5800,
-            "full tools/list is {bytes} B; budget is 5800 B"
+            bytes <= 5900,
+            "full tools/list is {bytes} B; budget is 5900 B"
         );
     }
 

@@ -154,8 +154,19 @@ grok mcp doctor                  # the Grok axis: handshake OK, 6 tools discover
 | "it's been silent forever" | it's **working**, not stuck. Go do something else and come back for the report. |
 | "project not found" | you're not in a registered project directory. `cd` into one, or say the project name so the session passes `project:"<slug>"`. |
 | "grok doesn't work" | that machine doesn't have the grok CLI. `ccteam status` / capabilities shows which vendors this machine actually has. |
-| "I stopped it — did my last instruction ever land?" | the stop's own reply says so. `agent_stop` answers `undelivered` (the tasks it never ran, and which file still holds each line) and `interrupted` (the turn it cut, recorded in the transcript so `agent_read` shows it). A retained line replays if that session is ever resumed; nothing is auto-cancelled and nothing is auto-resent. |
+| "I stopped it — did my last instruction ever land?" | the stop's own reply says so. `agent_stop` answers `undelivered` (the tasks it never ran, and which file still holds each line) and `interrupted` (the turn it cut, recorded in the transcript so `agent_read` shows it). **A stop cancels nothing** — see the resume policy below. |
 | "did the delegation double-fire?" | `agent` takes an `idempotency_key` — a retry with the same key replays the original call instead of doubling it (scoped per project for a hire, per child for a follow-up). Ask for one on flaky links, or check `agent_read` before retrying. |
+
+### What a stop does to work you already sent
+
+Stopping a session ends its **process**, never the session and never the queue. Anything ccteam was still holding for it stays exactly where it is:
+
+- **Retained lines replay in order.** Whatever is still in that sid's queue files — `deferred-input.json` (the vendor-side parked queue) and `pending_turns.jsonl` (ccteam's own FIFO) — is reloaded by the **next life of that same sid** and flushed after that life's **first `result`**: the message that woke the session runs first, as its own turn, and everything parked follows behind it, oldest first.
+- **Nothing is dropped, merged, deduplicated or reordered.** An explicit stop does not cancel a queued task, and ccteam never re-sends one on your behalf either.
+- **The turn that was running is not replayed** — it was cut, and its record says so (`outcome:"interrupted"`, with `reason` = `stopped` or `body_exited`). The requests bound to it are closed as interrupted; a restart never turns that record into a completion.
+- **An idle release is not a stop.** A session ccteam let go of to save memory keeps every one of its outstanding requests, and `agent_read{sid}` keeps showing them with their delivery state and `retained_in` — they resume with the session.
+
+If you want a queued task *not* to run, stop the session **and** do not resume that sid; there is no partial cancel.
 
 ---
 
