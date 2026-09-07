@@ -1321,6 +1321,99 @@ struct CutTurn {
     exec_turn_id: String,
     partial: Option<ccteam_harness::PartialNarration>,
 }
+/// Rebuild each outstanding request's binding from the TRANSCRIPT before a
+/// restart delivers anything (GitHub #198/#199).
+///
+/// A vendor that wakes its own model answers one dispatched task across
+/// several turns, and the request is moved onto each new one as it opens. That
+/// move is a write to `delegation.json`; the turn itself is a write to
+/// `turns.jsonl`. If the daemon died between them — or the move simply could
+/// not be persisted — the record still points at an INTERMEDIATE turn while a
+/// later one is already on disk, and a reconcile that trusted the record would
+/// hand the parent a checkpoint and never mention the turn that answered.
+///
+/// So the chain is walked from the rows, which carry the edge
+/// ([`TurnRecord::continues_exec_turn`]): follow it forward from whatever the
+/// request is bound to and rebind to the LAST recorded turn of the chain.
+///
+/// What cannot be proven is not guessed. A fork (two rows continuing one turn,
+/// which nothing should produce) or a cycle marks the request so every surface
+/// reads it `unknown`, and so does a request whose bound turn is one its own
+/// `progress` trail says it merely rode THROUGH while nothing later was
+/// recorded: that turn provably did not answer it, and there is nothing else
+/// to offer. Those requests stay outstanding and notify nobody — the honest
+/// outcome, and the one the alternative (notifying the checkpoint) is worse
+/// than.
+///
+/// Pure, and re-derived from the transcript on every start, so nothing has to
+/// be persisted for it to be correct in the next life.
+fn repair_continuation_bindings(
+    store: &mut ccteam_harness::DelegationRequests,
+    rows: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+) {
+    let mut successors: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for row in rows {
+        let (Some(from), Some(to)) = (
+            row.continues_exec_turn.as_deref(),
+            row.exec_turn_id.as_deref(),
+        ) else {
+            continue;
+        };
+        if from != to {
+            successors.entry(from).or_default().insert(to);
+        }
+    }
+    for request in store.requests.iter_mut() {
+        if request.state.is_terminal() {
+            continue;
+        }
+        let Some(bound) = request.turn_id.clone() else {
+            continue;
+        };
+        let mut head = bound.clone();
+        let mut walked: HashSet<String> = HashSet::from([head.clone()]);
+        let mut ambiguous: Option<String> = None;
+        while let Some(next) = successors.get(head.as_str()) {
+            if next.len() > 1 {
+                ambiguous = Some(format!(
+                    "{} recorded turns continue {head}; this daemon cannot say which one answers",
+                    next.len()
+                ));
+                break;
+            }
+            let next = next
+                .iter()
+                .next()
+                .copied()
+                .expect("a non-empty successor set");
+            if !walked.insert(next.to_string()) {
+                ambiguous = Some(format!(
+                    "the recorded turn chain from {bound} loops at {next}"
+                ));
+                break;
+            }
+            head = next.to_string();
+        }
+        if let Some(reason) = ambiguous {
+            request.bind_error = Some(reason);
+            continue;
+        }
+        if head != bound {
+            request.turn_id = Some(head);
+            continue;
+        }
+        if request
+            .progress
+            .iter()
+            .any(|step| step.exec_turn_id == bound)
+        {
+            request.bind_error = Some(format!(
+                "{bound} ended without settling this request and no later turn was recorded"
+            ));
+        }
+    }
+}
+
 /// The lock-held half of an in-flight read: a live session with a turn
 /// running, plus the cheap clones the adapter call needs. Everything expensive
 /// happens after the guard is dropped (see `Gateway::in_flight_turn_shared`).
@@ -4165,6 +4258,7 @@ impl Gateway {
                     error_kind: None,
                     error: None,
                     conclusion: turn.conclusion.clone(),
+                    continues_exec_turn: None,
                 },
                 format!(
                     "↩️ {sid} finished this turn while ccteam was restarting; its answer was \
@@ -4197,6 +4291,7 @@ impl Gateway {
                         error_kind: Some("body_unobserved".to_string()),
                         error: Some(note),
                         conclusion: None,
+                        continues_exec_turn: None,
                     },
                     String::new(),
                     true,
@@ -6829,6 +6924,10 @@ impl Gateway {
             // turn a vendor opens to continue its own work arrives after it
             // and has to name what it is continuing (GitHub #198/#199).
             let mut last_exec_turn: Option<String> = None;
+            // What the OPEN turn continues, for the durable chain edge on its
+            // transcript rows. Cleared with `open_exec_turn`, so a turn ccteam
+            // asked for never inherits the previous one's edge.
+            let mut open_continues_from: Option<String> = None;
             // Completed vendor turns, for the ordinal a completion report
             // shows. Counted from EXECUTION boundaries, never from accepted
             // inputs: `turn 2` used to name the second message delivered while
@@ -7054,6 +7153,7 @@ impl Gateway {
                                 ccteam_harness::TurnOpening::Submitted => None,
                             };
                             last_exec_turn = Some(turn_id.clone());
+                            open_continues_from = continues_from.clone();
                             if let Some(dtx) = delegation_tx.as_ref() {
                                 let _ = dtx.send(
                                     crate::delegation::DelegationPulse::TurnOpened {
@@ -7737,6 +7837,12 @@ impl Gateway {
                                     exec_turn_id: thread_event_turn_id(&evt)
                                         .map(str::to_string)
                                         .or_else(|| open_exec_turn.clone()),
+                                    // The durable chain edge: which turn this
+                                    // one was opened to carry on. A restart
+                                    // walks it instead of trusting a binding
+                                    // whose rebind may not have reached disk
+                                    // (GitHub #198/#199).
+                                    continues_exec_turn: open_continues_from.clone(),
                                     turn_id: format!("{session_id}-{seq}"),
                                     ts: chrono::Utc::now(),
                                     vendor: vendor_str(session.vendor).to_string(),
@@ -8009,10 +8115,12 @@ impl Gateway {
                             }
                             structured_turn_open = false;
                             open_exec_turn = None;
+                            open_continues_from = None;
                           }
                           if matches!(&evt, ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)) {
                             structured_turn_open = false;
                             open_exec_turn = None;
+                            open_continues_from = None;
                           }
                           if is_turn_boundary {
                             turn_had_answer = false;
@@ -8979,6 +9087,7 @@ impl Gateway {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         if let Err(err) =
             ccteam_harness::execution::turns_mirror::append_turn(&project_dir, &session.id, &record)
@@ -15047,7 +15156,7 @@ impl Gateway {
         let mut seeds: Vec<(String, DelegationMirror)> = Vec::new();
         let mut pending: Vec<crate::delegation::DelegationSignal> = Vec::new();
         for (slug, dir) in &projects {
-            for (child_sid, store) in ccteam_harness::scan_delegation_requests(dir) {
+            for (child_sid, mut store) in ccteam_harness::scan_delegation_requests(dir) {
                 let (vendor, host) =
                     ccteam_harness::execution::session_meta::read_session_meta(dir, &child_sid)
                         .map(|m| (m.vendor, m.host))
@@ -15055,6 +15164,10 @@ impl Gateway {
                 let all_turns =
                     ccteam_harness::execution::turns_mirror::read_all_turns(dir, &child_sid)
                         .unwrap_or_default();
+                // The record's binding is a hint until the transcript agrees
+                // with it: a vendor continuation moves a request onto a new
+                // turn, and that move can lag the turn it moved onto.
+                repair_continuation_bindings(&mut store, &all_turns);
                 let missed: Vec<_> = all_turns
                     .iter()
                     .filter(|t| {
@@ -15103,8 +15216,12 @@ impl Gateway {
                 // with the daemon — so the "task finished / child idle" shape
                 // is the honest one, and a chatty child cannot flood its
                 // parent with a backlog replay.
+                // Only bindings this daemon can stand behind produce a
+                // signal. One it could not prove resolves nothing and waits,
+                // rather than answering with a turn that did not answer it.
                 let bound: std::collections::HashSet<String> = store
                     .outstanding()
+                    .filter(|request| request.bind_error.is_none())
                     .filter_map(|request| request.turn_id.clone())
                     .collect();
                 let mut groups: Vec<(String, Vec<_>)> = Vec::new();
@@ -15713,6 +15830,7 @@ impl Gateway {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         if let Err(error) = ccteam_harness::execution::turns_mirror::append_turn(
             &plan.project_dir,
@@ -16334,6 +16452,7 @@ impl Gateway {
                 error_kind: Some(reason.as_str().to_string()),
                 error: Some(interrupted_note(sid, narration, truncated)),
                 conclusion: None,
+                continues_exec_turn: None,
             };
             if let Err(error) =
                 ccteam_harness::execution::turns_mirror::append_turn(&project_dir, sid, &record)
@@ -20480,6 +20599,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -24467,6 +24587,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         append_turn(&project_dir, &sid1, &mk("t1", "from-sid1")).unwrap();
         append_turn(&project_dir, &sid2, &mk("t2", "from-sid2")).unwrap();
@@ -27728,6 +27849,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -32629,6 +32751,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -32742,6 +32865,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -33361,6 +33485,255 @@ mod tests {
             .status
             .activity
             .to_string()
+    }
+
+    /// GitHub #198/#199, checker — a restart must deliver the turn that
+    /// ANSWERED, not one the vendor later continued past.
+    ///
+    /// The request's binding is moved forward as each continuation turn opens,
+    /// and that move is a different durable write from the turn itself. When
+    /// the daemon dies in between (or the move cannot be persisted at all) the
+    /// record still points at the intermediate turn while the answer is
+    /// already on disk. Trusting the record there handed the parent a
+    /// checkpoint and dropped the answer — the same failure as before the fix,
+    /// arrived at from the other side. The chain edge lives on the rows, so
+    /// the reconcile walks it and rebinds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_restart_delivers_the_turn_that_answered_not_the_one_it_continued() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s90";
+        // A: the checkpoint, ended while a background task was still running.
+        chain_turn(&project_dir, child_sid, 1, "x-a", None, "started the build");
+        // B: the turn claude opened by ITSELF when that task finished.
+        chain_turn(
+            &project_dir,
+            child_sid,
+            2,
+            "x-b",
+            Some("x-a"),
+            "DONE · the build is green",
+        );
+
+        // …and a record whose rebind never reached disk: still on A, with A
+        // already marked as a boundary it only rode through.
+        let mut store = ccteam_harness::DelegationRequests::default();
+        let mut request = ccteam_harness::DelegationRequest::accepted(
+            &parent_sid,
+            ccteam_harness::NotifyMode::Final,
+            Some("the long task".into()),
+            TurnRouting::Queue,
+            None,
+        );
+        request.state = ccteam_harness::RequestState::Executing;
+        request.turn_id = Some("x-a".into());
+        request.note_progress("x-a");
+        let request_id = request.request_id.clone();
+        store.accept(request);
+        Gateway::seed_delegation_store_for_test(
+            &project_dir,
+            &DelegationStoreClaim::for_test(child_sid),
+            &store,
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        let notes = await_notifications(&project_dir, &parent_sid, 1).await;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].user.contains("DONE · the build is green"),
+            "the answer, not the checkpoint: {}",
+            notes[0].user
+        );
+        assert!(
+            !notes[0].user.contains("started the build"),
+            "{}",
+            notes[0].user
+        );
+        assert!(notes[0].user.contains(&request_id), "{}", notes[0].user);
+    }
+
+    /// …and when nothing later is recorded, the checkpoint is still not an
+    /// answer. The request reads `unknown` and keeps waiting rather than being
+    /// resolved by a turn its own trail says settled nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_restart_that_cannot_prove_which_turn_answered_notifies_nobody() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s91";
+        chain_turn(&project_dir, child_sid, 1, "x-a", None, "started the build");
+        let mut store = ccteam_harness::DelegationRequests::default();
+        let mut request = ccteam_harness::DelegationRequest::accepted(
+            &parent_sid,
+            ccteam_harness::NotifyMode::Final,
+            Some("the long task".into()),
+            TurnRouting::Queue,
+            None,
+        );
+        request.state = ccteam_harness::RequestState::Executing;
+        request.turn_id = Some("x-a".into());
+        request.note_progress("x-a");
+        store.accept(request);
+        Gateway::seed_delegation_store_for_test(
+            &project_dir,
+            &DelegationStoreClaim::for_test(child_sid),
+            &store,
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent_sid).is_empty(),
+            "a boundary the request rode through is not its answer"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(child_sid, 10);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0]["state"],
+            serde_json::json!("unknown"),
+            "the request keeps waiting, and says why: {rows:?}"
+        );
+    }
+
+    /// Two rows continuing one turn is a shape nothing should produce; if it
+    /// ever appears, the answer is `unknown`, never a coin toss.
+    #[test]
+    fn a_forked_turn_chain_is_unprovable_never_guessed() {
+        use ccteam_harness::execution::turns_mirror::TurnRecord;
+        let row = |turn: &str, exec: &str, continues: Option<&str>| TurnRecord {
+            turn_id: turn.into(),
+            exec_turn_id: Some(exec.into()),
+            continues_exec_turn: continues.map(str::to_string),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: "x".into(),
+            conclusion: None,
+            usage: serde_json::Value::Null,
+            status: None,
+            tool_calls: vec![],
+            attachments: vec![],
+            outcome: None,
+            error_kind: None,
+            error: None,
+        };
+        let bind = |store: &mut ccteam_harness::DelegationRequests, turn: &str| {
+            let mut request = ccteam_harness::DelegationRequest::accepted(
+                "s1",
+                ccteam_harness::NotifyMode::Final,
+                None,
+                TurnRouting::Queue,
+                None,
+            );
+            request.state = ccteam_harness::RequestState::Executing;
+            request.turn_id = Some(turn.into());
+            store.accept(request);
+        };
+
+        let mut store = ccteam_harness::DelegationRequests::default();
+        bind(&mut store, "x-a");
+        repair_continuation_bindings(
+            &mut store,
+            &[
+                row("t-1", "x-a", None),
+                row("t-2", "x-b", Some("x-a")),
+                row("t-3", "x-c", Some("x-a")),
+            ],
+        );
+        assert!(
+            store.requests[0].bind_error.is_some(),
+            "{:?}",
+            store.requests[0]
+        );
+        assert_eq!(store.requests[0].turn_id.as_deref(), Some("x-a"));
+
+        // A clean chain walks all the way to its last recorded turn.
+        let mut store = ccteam_harness::DelegationRequests::default();
+        bind(&mut store, "x-a");
+        repair_continuation_bindings(
+            &mut store,
+            &[
+                row("t-1", "x-a", None),
+                row("t-2", "x-b", Some("x-a")),
+                row("t-3", "x-c", Some("x-b")),
+            ],
+        );
+        assert_eq!(store.requests[0].bind_error, None);
+        assert_eq!(store.requests[0].turn_id.as_deref(), Some("x-c"));
+
+        // A cycle is unprovable too, and terminates.
+        let mut store = ccteam_harness::DelegationRequests::default();
+        bind(&mut store, "x-a");
+        repair_continuation_bindings(
+            &mut store,
+            &[
+                row("t-2", "x-b", Some("x-a")),
+                row("t-3", "x-a", Some("x-b")),
+            ],
+        );
+        assert!(store.requests[0].bind_error.is_some());
+    }
+
+    /// Append one turn of a vendor-continuation chain to a child's ledger.
+    fn chain_turn(
+        project_dir: &std::path::Path,
+        child_sid: &str,
+        seq: u32,
+        exec_turn_id: &str,
+        continues: Option<&str>,
+        assistant: &str,
+    ) {
+        ccteam_harness::execution::turns_mirror::append_turn(
+            project_dir,
+            child_sid,
+            &ccteam_harness::execution::turns_mirror::TurnRecord {
+                turn_id: format!("{child_sid}-{seq}"),
+                exec_turn_id: Some(exec_turn_id.to_string()),
+                continues_exec_turn: continues.map(str::to_string),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                assistant: assistant.to_string(),
+                conclusion: None,
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: None,
+                error_kind: None,
+                error: None,
+            },
+        )
+        .unwrap();
     }
 
     /// GitHub #197 (B) — a boundary NO request is bound to answers nobody.
@@ -34033,6 +34406,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -35105,6 +35479,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: Some(receipt.to_string()),
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -35600,6 +35975,7 @@ mod tests {
                 error_kind: Some("stopped".into()),
                 error: Some("s98 was stopped while this turn was running.".into()),
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -35679,6 +36055,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -35773,6 +36150,7 @@ mod tests {
                     error_kind: None,
                     error: None,
                     conclusion: None,
+                    continues_exec_turn: None,
                 },
             )
             .unwrap();

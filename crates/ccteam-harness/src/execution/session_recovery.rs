@@ -157,6 +157,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         }
     }
 
@@ -231,6 +232,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         let s = format_recovery_prompt(&[turn]);
         assert!(!s.contains("[user] "));

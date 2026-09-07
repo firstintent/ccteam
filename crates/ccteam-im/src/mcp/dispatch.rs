@@ -842,6 +842,7 @@ fn stage_web_outbound_file(
         error_kind: None,
         error: None,
         conclusion: None,
+        continues_exec_turn: None,
     };
     if let Err(err) = append_turn(&session.project_dir, &session.sid, &record) {
         for path in staged_paths {
@@ -8664,6 +8665,7 @@ mod session_tool_tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         }
     }
 
@@ -8865,6 +8867,7 @@ mod session_tool_tests {
                     error_kind: failure.map(|(kind, _)| kind.to_string()),
                     error: failure.map(|(_, error)| error.to_string()),
                     conclusion: None,
+                    continues_exec_turn: None,
                 },
             )
             .unwrap();
@@ -10336,6 +10339,7 @@ mod session_tool_tests {
                     error_kind: None,
                     error: None,
                     conclusion: None,
+                    continues_exec_turn: None,
                 },
             )
             .unwrap();
@@ -10746,6 +10750,7 @@ mod session_tool_tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -11202,6 +11207,7 @@ mod session_tool_tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -13364,6 +13370,7 @@ mod tool_face_tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();

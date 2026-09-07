@@ -24,6 +24,7 @@ fn turn(id: &str, user: &str, assistant: &str) -> TurnRecord {
         error_kind: None,
         error: None,
         conclusion: None,
+        continues_exec_turn: None,
     }
 }
 

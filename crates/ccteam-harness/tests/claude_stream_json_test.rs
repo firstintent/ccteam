@@ -1173,6 +1173,7 @@ async fn an_in_flight_line_whose_turn_already_answered_is_not_replayed() {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         },
     )
     .unwrap();
