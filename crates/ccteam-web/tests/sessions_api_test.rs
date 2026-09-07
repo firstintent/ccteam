@@ -604,6 +604,7 @@ async fn session_rows_carry_context_pct_once_observed() {
         &project_dir,
         &sid,
         &ccteam_harness::execution::turns_mirror::TurnRecord {
+            exec_turn_id: None,
             turn_id: format!("{sid}-1"),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
@@ -628,6 +629,7 @@ async fn session_rows_carry_context_pct_once_observed() {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         },
     )
     .unwrap();
@@ -1061,6 +1063,7 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
             &project_dir,
             &sid,
             &ccteam_harness::execution::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: format!("t{index:03}"),
                 ts: chrono::Utc::now(),
                 vendor: "claude".into(),
@@ -1075,6 +1078,7 @@ async fn session_history_defaults_to_newest_100_and_pages_backwards() {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();

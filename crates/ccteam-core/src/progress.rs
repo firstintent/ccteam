@@ -36,20 +36,21 @@ pub use ccteam_harness::execution::progress_bridge::{
     build_chat_permission_prompt_outstanding_event, build_chat_session_reset_event,
     build_chat_session_reset_event_with_reason, build_chat_session_reset_with_recovery_event,
     build_chat_session_started_event, build_chat_tool_call_started_event,
-    build_chat_turn_completed_event, build_chat_turn_running_long_event,
-    build_chat_turn_timeout_event, build_chat_turn_user_prompt_event,
-    build_codex_plan_updated_event, build_codex_rate_limit_event, build_codex_thread_status_event,
-    build_codex_token_usage_event, build_flow_brake_tripped_event, build_flow_run_finished_event,
-    build_flow_run_started_event, build_merger_lossy_partial_event,
-    build_session_body_detached_event, build_session_body_exited_event,
-    build_session_stream_detached_event, build_session_stream_reattached_event,
-    build_typed_event_event, CHAT_BOT_PERMANENT_FAILURE, CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE,
-    CHAT_MARKER_SELF_HEAL_ATTEMPT, CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET,
-    CHAT_SESSION_RESET_WITH_RECOVERY, CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED,
-    CHAT_TURN_COMPLETED, CHAT_TURN_RUNNING_LONG, CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT,
-    CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
-    FLOW_BRAKE_TRIPPED, FLOW_RUN_FINISHED, FLOW_RUN_STARTED, SESSION_BODY_DETACHED,
-    SESSION_BODY_EXITED, SESSION_EVICTED, SESSION_STREAM_DETACHED, SESSION_STREAM_REATTACHED,
+    build_chat_turn_completed_event, build_chat_turn_continues_event,
+    build_chat_turn_running_long_event, build_chat_turn_timeout_event,
+    build_chat_turn_user_prompt_event, build_codex_plan_updated_event,
+    build_codex_rate_limit_event, build_codex_thread_status_event, build_codex_token_usage_event,
+    build_flow_brake_tripped_event, build_flow_run_finished_event, build_flow_run_started_event,
+    build_merger_lossy_partial_event, build_session_body_detached_event,
+    build_session_body_exited_event, build_session_stream_detached_event,
+    build_session_stream_reattached_event, build_typed_event_event, CHAT_BOT_PERMANENT_FAILURE,
+    CHAT_COMPACT_DONE, CHAT_HOP_ESCALATE, CHAT_MARKER_SELF_HEAL_ATTEMPT,
+    CHAT_PERMISSION_PROMPT_OUTSTANDING, CHAT_SESSION_RESET, CHAT_SESSION_RESET_WITH_RECOVERY,
+    CHAT_SESSION_STARTED, CHAT_TOOL_CALL_STARTED, CHAT_TURN_COMPLETED, CHAT_TURN_CONTINUES,
+    CHAT_TURN_RUNNING_LONG, CHAT_TURN_TIMEOUT, CHAT_TURN_USER_PROMPT, CODEX_PLAN_UPDATED,
+    CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE, FLOW_BRAKE_TRIPPED,
+    FLOW_RUN_FINISHED, FLOW_RUN_STARTED, SESSION_BODY_DETACHED, SESSION_BODY_EXITED,
+    SESSION_EVICTED, SESSION_STREAM_DETACHED, SESSION_STREAM_REATTACHED,
 };
 
 /// Read the last parseable event from `path`, skipping corrupt trailing rows.
@@ -136,7 +137,10 @@ pub fn is_idle(last: Option<&Value>) -> bool {
             | SESSION_STREAM_DETACHED
             | SESSION_STREAM_REATTACHED
             | SESSION_BODY_DETACHED
-            | SESSION_BODY_EXITED
+            | SESSION_BODY_EXITED // NOT here on purpose: `CHAT_TURN_CONTINUES`. It says a turn ended
+                                  // while the vendor still held work that will wake its own model, so
+                                  // the session IS busy — falling through to "working" is the answer,
+                                  // not an oversight.
     )
 }
 

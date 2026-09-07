@@ -147,6 +147,7 @@ fn build_progress_line_turn_completed_tags_vendor_codex() {
         usage,
         model: None,
         conclusion: None,
+        continuation: ccteam_harness::TurnContinuation::Settled,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).expect("turn/completed must bridge");
     assert_eq!(row["event"], "agent_done");
@@ -197,6 +198,7 @@ fn build_progress_line_silent_for_item_events() {
     };
     let evt = ThreadEvent::TurnStarted {
         turn_id: "turn-9".into(),
+        opening: ccteam_harness::TurnOpening::Submitted,
     };
     assert!(
         build_progress_line(&evt, "codex-tid-7", &ctx).is_none(),
@@ -226,6 +228,7 @@ fn cost_summary_rolls_bridged_agent_done_into_codex_bucket() {
         usage,
         model: None,
         conclusion: None,
+        continuation: ccteam_harness::TurnContinuation::Settled,
     };
     let row = build_progress_line(&evt, "codex-tid-7", &ctx).unwrap();
     let summary = cost_summary_from_events(&[row]).expect("cost summary");

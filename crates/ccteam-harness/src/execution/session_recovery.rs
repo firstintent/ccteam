@@ -142,6 +142,7 @@ mod tests {
 
     fn mk_turn(id: &str, user: &str, assistant: &str) -> TurnRecord {
         TurnRecord {
+            exec_turn_id: None,
             turn_id: id.into(),
             ts: Utc::now(),
             vendor: "claude".into(),
@@ -156,6 +157,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         }
     }
 
@@ -215,6 +217,7 @@ mod tests {
         // System-directive-only turn (no user/assistant text) — should
         // not produce empty `[user]` / `[assistant]` lines.
         let turn = TurnRecord {
+            exec_turn_id: None,
             turn_id: "x".into(),
             ts: Utc::now(),
             vendor: "claude".into(),
@@ -229,6 +232,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         let s = format_recovery_prompt(&[turn]);
         assert!(!s.contains("[user] "));

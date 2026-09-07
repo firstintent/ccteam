@@ -291,7 +291,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. `wait` returns the answer inline; 0 (default) is async: a completion notification arrives when the task's turn ends, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Tell children to answer tersely.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. Answers `request_id` + `status` started|injected|queued (+queue_position). `wait` returns that request's answer; 0 (default) is async and its completion names it, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. A child doing background work answers over several turns; the completion is its last one. Answer tersely.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
                 "task_file": { "type": "string", "description": "Absolute path holding it — keeps a long brief out of your context." },
@@ -310,7 +310,12 @@ pub fn session_tool_definitions() -> Vec<Value> {
                 "notify": {
                     "type": "string",
                     "enum": ["final", "brief", "off"],
-                    "description": "Turn-end wake: brief (500-char excerpt, default), final (2000), off."
+                    "description": "Task-end wake: brief (500-char excerpt), final (2000), off. Omitted keeps your last choice here."
+                },
+                "routing": {
+                    "type": "string",
+                    "enum": ["inject", "queue"],
+                    "description": "Busy child: inject (default) steers its running turn; the CLI re-runs your line as the next turn, and THAT one answers it. queue gives your task its own turn."
                 },
                 "tools": {
                     "type": "string",
@@ -330,12 +335,13 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript, newest first; `since:<cursor>` → unread turns oldest first, `remaining` = still unread; `n:0` → status only; empty turns = no answer yet.",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes; `progress` = boundaries it rode through while its own background work ran). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. A turn still running answers `partial:true` + `in_flight{turn_id,narration,text?,requests}` — a bounded excerpt of what it has said, never an answer and never a reason to stop it. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
                 "tail": { "type": "boolean", "description": "With `sid`: newest first (default true unless `since`)." },
                 "since": { "type": "string", "description": "With `sid`: only turns after this turn_id cursor." },
+                "turn": { "type": "string", "description": "With `sid`: exactly this turn_id." },
                 "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 1000)." },
                 "wait": { "type": "integer", "description": "With `sid`: seconds to wait for an in-flight turn to end (0-240)." },
                 "project": { "type": "string", "description": "Roster filter: this project slug only." },
@@ -350,7 +356,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_stop",
-            "description": "Stop a session you delegated; `agent_read{sid}` still reads its transcript.",
+            "description": "Stop a session you delegated; it ends the process, not the session — `agent_read{sid}` still reads its transcript, including a record of the turn this cut short. Answers `undelivered` (your tasks it never ran; `delivery:unconfirmed` = written out, never seen running), `interrupted{turn,reason}`, and `settled:false` if that record could not be written. A stop CANCELS NOTHING: every line still held (`retained_in`) replays in order after the first result of that sid's next life.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Session to stop." }
             }), &["sid"]),
@@ -461,16 +467,84 @@ mod tests {
 
     // ── the byte gates (the point of the whole surface) ────────────────────
 
+    /// GitHub #197 (E) — the tool face must STATE the resume policy, not imply
+    /// it. A caller that does not know a stop cancels nothing either re-sends
+    /// the instruction (a whole turn on two sessions) or writes the task off;
+    /// both were measured, and neither is inferable from the response fields.
+    #[test]
+    fn agent_stop_states_that_a_stop_cancels_nothing() {
+        let stop = session_tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "agent_stop")
+            .expect("agent_stop is on the full face");
+        let description = stop["description"].as_str().unwrap_or_default();
+        for phrase in ["CANCELS NOTHING", "replays", "first result", "retained_in"] {
+            assert!(
+                description.contains(phrase),
+                "the resume policy must be stated on the face; missing {phrase:?}: {description}"
+            );
+        }
+    }
+
     /// G1 — the ambient tax an ORCHESTRATOR pays on its first turn. Every
     /// byte here is charged to every session before it has done anything, so
     /// the budget is a hard gate, not a guideline.
+    ///
+    /// 5000 → 5200 B for the delegation-request facts (issue #201): `status`
+    /// started|injected|queued with a `queue_position`, the `request_id` a
+    /// completion names, `turn:<id>` for the exact re-read, and that an
+    /// omitted `notify` inherits. An orchestrator that could not see any of
+    /// them re-sent one instruction three times and then stopped a
+    /// 400k-context child it believed was ignoring it — ~190 B against that.
+    ///
+    /// 5200 → 5320 B for `unknown_requests`. A field the response can carry
+    /// but the face never mentions is a field callers do not act on: a read
+    /// that came back holding nothing looked identical to one whose task was
+    /// dropped, which is the confusion this whole issue is about. ~120 B.
+    ///
+    /// 5800 → 5900 B for the RESUME POLICY on that same receipt (issue #197
+    /// E). "Nothing was cancelled, and here is exactly when it runs" is the
+    /// one thing a caller cannot infer from the fields, and the failure it
+    /// prevents — re-sending an instruction that was never dropped — costs a
+    /// whole turn on both sessions. ~80 B.
+    ///
+    /// 5480 → 5800 B for `agent_stop`'s receipt (issue #197 E). The tool
+    /// stopped dropping the child's requests, so it now answers with what it
+    /// cut short and what is still held — and a response field the face never
+    /// mentions is a field callers do not read: the instruction that sat
+    /// undelivered in a queue until the child was stopped is exactly the fact
+    /// nobody could learn. ~300 B.
+    ///
+    /// 5320 → 5480 B for `agent{routing}` (issue #197 D). The default changed
+    /// — a follow-up on a busy child now STEERS its running turn instead of
+    /// queuing behind it — and a caller that cannot see the axis cannot ask
+    /// for the other one, nor know that the turn which answers a steer is the
+    /// one it joined. ~155 B for the parameter and its consequence.
+    ///
+    /// 6100 → 6300 B for the vendor-continuation contract (GitHub #198/#199).
+    /// Three facts a caller cannot infer and is harmed by not knowing: a child
+    /// running background work answers over SEVERAL turns and the completion
+    /// is the last of them (measured: seven turns over 47 minutes, and the
+    /// pre-fix face said "turn end", so a parent read a checkpoint as the
+    /// answer); an INJECTED line is re-run by the CLI as the next turn, so
+    /// that turn answers it and not the one it joined — the face used to state
+    /// the opposite outright; and `progress` on a request row is what a reader
+    /// sees while it happens. ~170 B, most of it correcting a claim that was
+    /// wrong rather than adding one.
+    ///
+    /// 5900 → 6100 B for the in-flight read (issue #197 G). A parent whose
+    /// child read back as `turns:[]` for twenty-nine minutes stopped it to
+    /// find out what it was doing and lost the work; a field the face never
+    /// mentions is a field callers do not reach for, and the whole point of
+    /// this one is that it is reached for INSTEAD of a stop. ~165 B, which
+    /// also has to say the excerpt is not an answer.
     #[test]
     fn full_face_tools_list_fits_byte_budget() {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5000,
-            "full tools/list is {bytes} B; budget is 5000 B"
+            bytes <= 6300,
+            "full tools/list is {bytes} B; budget is 6300 B"
         );
     }
 
@@ -510,7 +584,16 @@ mod tests {
             }),
         };
         let ambient = compact_len(&tools_list_response(&face)) + instructions_for(&face).len();
-        assert!(ambient <= 2200, "leaf ambient cost is {ambient} B");
+        // 2200 → 2340 B with the read face's share of the same facts: what the
+        // session still owes (`requests`) and the exact `turn:<id>` re-read;
+        // 2340 → 2460 B for `unknown_requests`, which lands entirely on this
+        // face — `agent_read` is the whole leaf tool face; 2460 → 2600 B for
+        // the in-flight read (issue #197 G), which lands here for the same
+        // reason and is what a leaf's own watcher reads instead of stopping it;
+        // 2600 → 2700 B for the `progress` rows a request collects while the
+        // child's own background work runs (GitHub #198) — a leaf watching a
+        // busy sibling reads exactly this instead of concluding it is idle.
+        assert!(ambient <= 2700, "leaf ambient cost is {ambient} B");
     }
 
     #[test]
@@ -904,6 +987,7 @@ mod tests {
             "n",
             "tail",
             "since",
+            "turn",
             "max_chars",
             "wait",
             "project",

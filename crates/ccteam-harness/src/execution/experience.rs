@@ -593,6 +593,7 @@ mod tests {
             project,
             "s1",
             &super::super::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: "turn-1".into(),
                 ts: now,
                 vendor: "opencode".into(),
@@ -613,6 +614,7 @@ mod tests {
                 error_kind: Some("max_tokens".into()),
                 error: Some("output truncated".into()),
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();
@@ -669,6 +671,7 @@ mod tests {
             project,
             "s1",
             &super::super::turns_mirror::TurnRecord {
+                exec_turn_id: None,
                 turn_id: "s1-1".into(),
                 ts: now,
                 vendor: "claude".into(),
@@ -683,6 +686,7 @@ mod tests {
                 error_kind: None,
                 error: None,
                 conclusion: None,
+                continues_exec_turn: None,
             },
         )
         .unwrap();

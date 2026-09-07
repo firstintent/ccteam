@@ -64,6 +64,28 @@ pub enum AttachmentRefKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnRecord {
     pub turn_id: String,
+    /// The ADAPTER's execution-turn id this row belongs to, when the channel
+    /// has one. `turn_id` above is ccteam's own per-row key; a vendor turn can
+    /// span several rows (interim narration) and a delegation request is bound
+    /// to the EXECUTION turn, so a restart reconcile needs the execution id on
+    /// disk to rebind an outstanding request to the answer it produced
+    /// (issue #201). Absent on rows written by channels that expose none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_turn_id: Option<String>,
+    /// The execution turn this one CONTINUES: the vendor opened this turn by
+    /// itself to carry on that turn's work (claude answering its own
+    /// `<task-notification>`, or re-running a line ccteam injected mid-turn).
+    ///
+    /// The chain edge, on DISK, in the transcript. A restart used to rebuild a
+    /// delegation chain from the request's binding alone, so a rebind that had
+    /// not reached `delegation.json` yet made the reconcile hand the parent the
+    /// intermediate turn and ignore the one that actually answered — the very
+    /// mis-attribution the binding exists to prevent (GitHub #198/#199). The
+    /// edge is written with the turn itself, in the same durable append, so the
+    /// chain can be walked from the transcript no matter what the request
+    /// record managed to persist. Absent on every turn ccteam asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues_exec_turn: Option<String>,
     pub ts: DateTime<Utc>,
     /// Vendor scalar (`"claude"` / `"codex"`). Plain string here so the
     /// jsonl is hand-greppable; the orchestrator never mixes vendors in
@@ -202,6 +224,7 @@ mod tests {
 
     fn mk_turn(id: &str, role: &str, user: &str, assistant: &str) -> TurnRecord {
         TurnRecord {
+            exec_turn_id: None,
             turn_id: id.to_string(),
             ts: Utc::now(),
             vendor: "claude".to_string(),
@@ -216,6 +239,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         }
     }
 

@@ -313,13 +313,34 @@ async fn completion_edge_interject_surfaces_vendor_self_started_turn() {
         let mut completed = Vec::new();
         while let Some(event) = stream.next().await {
             match event {
-                ThreadEvent::TurnStarted { turn_id } => started.push(turn_id),
+                ThreadEvent::TurnStarted {
+                    turn_id, opening, ..
+                } => {
+                    // GitHub #198/#199 — ACP has no way for a vendor to wake
+                    // its own model. This turn has no matching `session/prompt`
+                    // only because grok admits an interjection while idle: the
+                    // content is still a line CCTEAM sent, so it opens a turn
+                    // of its own rather than continuing the previous one's
+                    // work, and no request's binding moves onto it.
+                    assert_eq!(opening, ccteam_harness::TurnOpening::Submitted);
+                    started.push(turn_id);
+                }
                 ThreadEvent::ItemCompleted { item } => {
                     if let ThreadItemDetails::AgentMessage(text) = item.details {
                         finals.push((item.id, text));
                     }
                 }
-                ThreadEvent::TurnCompleted { turn_id, .. } => {
+                ThreadEvent::TurnCompleted {
+                    turn_id,
+                    continuation,
+                    ..
+                } => {
+                    // …and every ACP boundary is the end of what it answered.
+                    assert_eq!(
+                        continuation,
+                        ccteam_harness::TurnContinuation::Settled,
+                        "an ACP boundary is always terminal"
+                    );
                     completed.push(turn_id);
                     if completed.len() == 2 {
                         break;
@@ -370,6 +391,73 @@ async fn completion_edge_interject_surfaces_vendor_self_started_turn() {
         }),
         "turn answers must not be torn together: {finals:?}"
     );
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
+/// GitHub #197 (G) — an ACP turn still running can say what it has said. The
+/// fake speaks one `agent_message_chunk` and finishes a second later, so the
+/// narration can only come from the in-flight buffer, and the thought it emits
+/// first must never join it.
+///
+/// End to end over the real ACP transport, so the live-handle → session-state
+/// lookup is proved and not just the fold. grok / kimi / opencode / dsh all
+/// answer through the one shared `acp::in_flight_narration`.
+#[tokio::test]
+#[serial]
+async fn in_flight_narration_reports_a_running_acp_turn() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-narrate"),
+        )
+        .await
+        .expect("start ok");
+
+    // Nothing running: no partial at all, which is a different answer from an
+    // empty one.
+    assert_eq!(adapter.in_flight_narration(&handle), None);
+
+    let turn = adapter
+        .submit_turn(&handle, TurnInput::UserText("__narrate__".into()))
+        .await
+        .expect("submit");
+    let mut partial = None;
+    for _ in 0..80 {
+        match adapter.in_flight_narration(&handle) {
+            Some(p) if !p.text.is_empty() => {
+                partial = Some(p);
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    let partial = partial.expect("the running turn's narration is readable");
+    assert_eq!(partial.text, "half a migration");
+    assert!(!partial.text.contains("thinking"), "thoughts are private");
+    assert!(!partial.truncated(), "{partial:?}");
+    assert_eq!(
+        partial.exec_turn_id.as_deref(),
+        Some(turn.0.as_str()),
+        "the partial names the EXECUTION turn a request is bound to: {partial:?}"
+    );
+
+    // Once the turn ends, that text is the ANSWER — never a partial.
+    let mut settled = false;
+    for _ in 0..200 {
+        if adapter.in_flight_narration(&handle).is_none() {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(settled, "a finished turn reports no partial");
 
     adapter.close_thread(&handle).await.unwrap();
     clear_fake();

@@ -246,6 +246,22 @@ fn persist_status(pending: Option<(StatusPersist, ThreadStatus)>) {
     }
 }
 
+/// One thread's in-flight turn and what it has said so far (GitHub #197 G).
+///
+/// Codex's shape is DELTA: `item/agentMessage/delta` ships fragments of one
+/// agent message, and the `item/completed` that closes the item carries its
+/// whole text. So a delta is appended (a fragment is not a snapshot) and the
+/// completed item replaces the fragments it was assembled from — see
+/// [`crate::NarrationAccumulator`]. Reasoning deltas
+/// (`item/reasoning/textDelta`) are never fed in: private thinking is not
+/// narration ccteam may show anyone.
+#[derive(Debug, Default)]
+pub struct ThreadNarration {
+    /// The open turn's id, or `None` when nothing is running.
+    turn_id: Option<String>,
+    text: crate::NarrationAccumulator,
+}
+
 /// v0.8.5 D2.4 — the harness-level, vendor-scoped runtime state cache.
 /// Keyed by codex `thread_id`. One per adapter instance (which is itself a
 /// per-vendor singleton, arch §1.1), fed by ONE dispatcher task per cached
@@ -334,6 +350,15 @@ pub struct CodexAppServerAdapter {
     /// v0.8.5 D2.4 — harness-owned per-thread live state (usage /
     /// active-turn / model). Fed by ONE dispatcher per cached client.
     tracker: Arc<Mutex<CodexThreadTracker>>,
+    /// GitHub #197 (G) — the PUBLIC narration of each thread's in-flight turn,
+    /// fed by the same sole dispatcher as `tracker`.
+    ///
+    /// A SEPARATE cell, behind a std mutex, because
+    /// [`HarnessAdapter::in_flight_narration`] is synchronous and is called
+    /// with the gateway lock held: it may not await, so it cannot read
+    /// `tracker`. It therefore carries the in-flight turn id itself —
+    /// `Some(turn_id)` IS "a turn is open on this thread".
+    narration: Arc<std::sync::Mutex<HashMap<String, ThreadNarration>>>,
     /// v0.8.5 D2.1 — per-session command overrides applied on `turn/start`.
     overrides: Arc<Mutex<HashMap<String, SessionOverride>>>,
     /// v0.8.5 D2 — cached `skills/list` result (flattened `(name, path)`),
@@ -402,6 +427,7 @@ impl Default for CodexAppServerAdapter {
             inner: Arc::new(Mutex::new(None)),
             bridges: Arc::new(Mutex::new(HashMap::new())),
             tracker: Arc::new(Mutex::new(CodexThreadTracker::default())),
+            narration: Arc::new(std::sync::Mutex::new(HashMap::new())),
             overrides: Arc::new(Mutex::new(HashMap::new())),
             skills_cache: Arc::new(Mutex::new(None)),
             rate_limits: Arc::new(Mutex::new(None)),
@@ -721,6 +747,7 @@ impl CodexAppServerAdapter {
         let (notifications, _) = broadcast::channel(256);
         let tx = notifications.clone();
         let tracker = Arc::clone(&self.tracker);
+        let narration = Arc::clone(&self.narration);
         let skills_cache = Arc::clone(&self.skills_cache);
         let rate_limits = Arc::clone(&self.rate_limits);
         tokio::spawn(async move {
@@ -728,6 +755,7 @@ impl CodexAppServerAdapter {
                 match rx.recv().await {
                     Ok(notif) => {
                         apply_notification_to_tracker(&tracker, &notif).await;
+                        apply_notification_to_narration(&narration, &notif);
                         if notif.method == "skills/changed" {
                             *skills_cache.lock().await = None;
                         }
@@ -2210,6 +2238,18 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let turn_id = pluck_turn_id(&result).ok_or_else(|| {
             HarnessError::SubmitFailed(format!("{method} response missing turn.id: {result}"))
         })?;
+        // Open the narration cell on the id the RPC just confirmed. Without
+        // this, a turn stopped before its first `agent_message` reported no
+        // in-flight turn at all — "this adapter cannot say" rather than "it
+        // had not spoken yet", which are different facts (issue #197 E/G). A
+        // steer joins the turn already open and keeps its narration.
+        {
+            let mut cells = match self.narration.lock() {
+                Ok(cells) => cells,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            begin_narration_locked(&mut cells, &h.identity, &turn_id);
+        }
         let turn_id = TurnId(turn_id);
         if was_active {
             Ok(TurnSubmission::injected_with_input_id(turn_id, input_id))
@@ -2285,7 +2325,7 @@ impl HarnessAdapter for CodexAppServerAdapter {
                                                 turn_usage = None;
                                             }
                                             if let Some(usage) =
-                                                codex_turn_usage_from_notification(&notif)
+                                                codex_last_request_usage_from_notification(&notif)
                                             {
                                                 turn_usage = Some(usage);
                                             }
@@ -2459,6 +2499,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        // The narration cell belongs to a LIVE turn on a live thread; a closed
+        // thread has neither, and its entry would otherwise outlive it for the
+        // whole daemon's life.
+        if let Ok(mut cells) = self.narration.lock() {
+            cells.remove(&h.identity);
+        }
         // `docs-local/issues/#203` — a close is a RESIDENCY release (idle /
         // capacity / explicit stop / a discarded twin), never the end of the
         // session: the sid stays resumable, and the next message must
@@ -2576,6 +2622,21 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // persisted `status.json` carries.
         let live = self.tracker_snapshot(&h.identity).await.unwrap_or_default();
         Ok(live.status())
+    }
+
+    /// What this thread's in-flight turn has said so far — `None` when no turn
+    /// is open (GitHub #197 E/G).
+    ///
+    /// Reads the sync narration cell, never the async tracker: this runs with
+    /// the gateway lock held and may not await.
+    fn in_flight_narration(&self, h: &ThreadHandle) -> Option<crate::PartialNarration> {
+        let cells = match self.narration.lock() {
+            Ok(cells) => cells,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let cell = cells.get(&h.identity)?;
+        let turn_id = cell.turn_id.clone()?;
+        Some(cell.text.partial(Some(turn_id)))
     }
 
     /// Interrupt the in-flight turn via codex's `turn/interrupt` RPC (the same
@@ -3414,6 +3475,10 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // fixtures use.
         "turn/started" => Some(ThreadEvent::TurnStarted {
             turn_id: pluck_turn_id_from_params(&notif.params),
+            // A codex thread runs a turn only because a `sendUserMessage`
+            // asked for one: there is no notification that means "the model
+            // woke itself", so no turn here continues another one's work.
+            opening: crate::TurnOpening::Submitted,
         }),
         // The turn's VERDICT lives in `turn.status` (+ `turn.error`), not in
         // the method name: codex reports a failed or interrupted turn through
@@ -3440,6 +3505,9 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 usage: pluck_usage(&notif.params).unwrap_or_default(),
                 model: None,
                 conclusion: None,
+                // `turn/completed` IS the end of the work: codex holds nothing
+                // that will re-open it (see `opening` above).
+                continuation: crate::TurnContinuation::Settled,
             },
             CodexTurnOutcome::Failed { kind, message } => ThreadEvent::TurnFailed {
                 turn_id: pluck_turn_id_from_params(&notif.params),
@@ -4096,6 +4164,94 @@ async fn apply_notification_to_tracker(
     }
 }
 
+/// GitHub #197 (G) — fold one codex notification into the in-flight narration
+/// cell. Called by the SAME sole dispatcher as
+/// [`apply_notification_to_tracker`], so ordering between the two can never
+/// disagree, and synchronous, so the cell can be read without awaiting.
+///
+/// Only PUBLIC agent messages are folded in. Reasoning items and their deltas
+/// are deliberately absent: an in-flight read must show exactly what the
+/// transcript would show, and nothing a `/status` reader could not already see.
+fn apply_notification_to_narration(
+    narration: &Arc<std::sync::Mutex<HashMap<String, ThreadNarration>>>,
+    notif: &Notification,
+) {
+    let Some(tid) = pluck_str(&notif.params, "thread_id", "threadId") else {
+        return;
+    };
+    let mut cells = match narration.lock() {
+        Ok(cells) => cells,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match notif.method.as_str() {
+        "turn/started" => {
+            let turn_id = pluck_turn_id_from_params(&notif.params);
+            begin_narration_locked(&mut cells, tid, &turn_id);
+        }
+        // A boundary hands the narration to the transcript; a retryable error
+        // leaves the turn alive, exactly as it leaves `active_turn` set.
+        "turn/completed" => {
+            cells.remove(tid);
+        }
+        "error" => {
+            if !pluck_bool(&notif.params, "will_retry", "willRetry").unwrap_or(false) {
+                cells.remove(tid);
+            }
+        }
+        "item/agentMessage/delta" => {
+            let delta = notif
+                .params
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let id = pluck_str(&notif.params, "item_id", "itemId").unwrap_or("");
+            cells
+                .entry(tid.to_string())
+                .or_default()
+                .text
+                .append_delta(id, delta);
+        }
+        "item/completed" => {
+            // The item's own final text, which replaces the fragments it was
+            // streamed as. Any other item type (a tool call, a reasoning
+            // block) is not narration and is skipped.
+            let item = notif.params.get("item").unwrap_or(&notif.params);
+            let is_message = matches!(
+                item.get("type").and_then(|v| v.as_str()),
+                Some("agent_message") | Some("agentMessage")
+            );
+            if !is_message {
+                return;
+            }
+            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| pluck_str(&notif.params, "item_id", "itemId"))
+                .unwrap_or("");
+            cells
+                .entry(tid.to_string())
+                .or_default()
+                .text
+                .set_snapshot(id, text);
+        }
+        _ => {}
+    }
+}
+
+/// Open `turn_id` on `tid`'s cell. IDEMPOTENT in the turn id: the submission
+/// that started the turn and the `turn/started` notification that reports it
+/// race (the notification can arrive before the RPC response), and whichever
+/// lands second must not wipe what the turn has already said.
+fn begin_narration_locked(cells: &mut HashMap<String, ThreadNarration>, tid: &str, turn_id: &str) {
+    let cell = cells.entry(tid.to_string()).or_default();
+    if cell.turn_id.as_deref() == Some(turn_id) {
+        return;
+    }
+    cell.turn_id = Some(turn_id.to_string());
+    cell.text.clear();
+}
+
 /// V0.8 rmux W4-fu — fold a camelCase identifier to snake_case so the
 /// emitted `progress.jsonl` `status` / `active_flags` values read in
 /// ccteam's snake_case house style regardless of the Codex wire casing
@@ -4188,17 +4344,98 @@ fn pluck_usage(v: &Value) -> Option<UnifiedTokenUsage> {
     serde_json::from_value(raw).ok()
 }
 
-/// Extract the current turn's token buckets from Codex's dedicated usage
-/// notification. The terminal `error` notification carries no usage, so the
-/// per-subscriber event stream retains this `last` block until the terminal
-/// boundary and attaches it there.
-fn codex_turn_usage_from_notification(notif: &Notification) -> Option<UnifiedTokenUsage> {
+/// One Codex usage bucket (`tokenUsage.last` / `tokenUsage.total`) exactly as
+/// the live app-server spells it: camelCase, every field present. There are
+/// deliberately no defaults and no snake_case aliases — codex emits ONE shape
+/// (53,106 buckets on this daemon's ledgers, not a single exception), so any
+/// other shape is protocol drift and must fail closed rather than be guessed
+/// at.
+///
+/// That strictness is the whole point. `UnifiedTokenUsage` has
+/// `#[serde(default)]` on every field and no `deny_unknown_fields`, so
+/// deserialising the camelCase wire block straight into it SUCCEEDED and
+/// yielded all zeros — a silent mis-key, not an error, which is what put zero
+/// tokens on every codex ledger row (GitHub #197 H1). A required field turns
+/// the next such drift into a `None` the caller can see instead of a
+/// confident zero.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexUsageBucket {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+}
+
+impl CodexUsageBucket {
+    /// Codex reports NESTED buckets, the canonical shape wants DISJOINT ones.
+    /// On the wire `cachedInputTokens ⊆ inputTokens` and
+    /// `reasoningOutputTokens ⊆ outputTokens` (OpenAI's breakdown convention);
+    /// `estimate_cost` instead ADDS its four buckets, and Anthropic — whose
+    /// shape `UnifiedTokenUsage` follows — reports them already disjoint. So
+    /// the subsets are subtracted out here, at the adapter, which is where a
+    /// vendor wire shape becomes canonical. Feeding the nested numbers through
+    /// unchanged would bill the cached prompt at BOTH the input and the cached
+    /// rate and the hidden CoT at twice the output rate.
+    ///
+    /// Invariant this preserves, verified against all 3,845 live rows with no
+    /// exception: `total()` == the wire's own `totalTokens`.
+    fn to_unified(self) -> UnifiedTokenUsage {
+        UnifiedTokenUsage {
+            input_tokens: self.input_tokens.saturating_sub(self.cached_input_tokens),
+            cached_input_tokens: self.cached_input_tokens,
+            output_tokens: self
+                .output_tokens
+                .saturating_sub(self.reasoning_output_tokens),
+            // Codex's prompt cache is read-only: `cacheWriteInputTokens` is
+            // present on the wire and 0 in every observed row, and no OpenAI
+            // model carries a cache-creation SKU.
+            cache_creation_input_tokens: None,
+            reasoning_output_tokens: (self.reasoning_output_tokens > 0)
+                .then_some(self.reasoning_output_tokens),
+            reported_cost_usd: None,
+        }
+    }
+}
+
+/// Usage of the most recent Responses request on this thread, read from
+/// Codex's `thread/tokenUsage/updated.tokenUsage.last`. The terminal `error`
+/// notification carries no usage, so the per-subscriber event stream retains
+/// this block until the terminal boundary and attaches it there.
+///
+/// NOT the turn's usage — a LOWER BOUND of it. `last` is one request, and a
+/// turn is many: 147 of the 156 turns on this daemon's ledgers took more than
+/// one usage notification, one of them 1,368. The turn's true cost is the
+/// delta of the sibling `total` field (cumulative per thread, monotonic across
+/// turns in all 5 multi-turn threads observed), but that baseline is NOT
+/// knowable from what this stream sees: a released or resumed session hands
+/// the dispatcher its first notification mid-thread, where a stale or absent
+/// baseline would over-bill by hundreds of millions of tokens. Settling it
+/// needs a live trace of the undeduplicated notification stream across a turn
+/// boundary — the sampled progress log cannot answer it. Deferred to
+/// `docs-local/issues/#202`; until then a turn bills its final request, which
+/// is honest and directionally right, where it used to bill zero.
+///
+/// Fails CLOSED: an unrecognised bucket shape yields `None` (usage stays
+/// unknown) and warns once, rather than deserialising to a confident zero the
+/// way the previous straight-to-`UnifiedTokenUsage` parse did (GitHub #197 H1).
+fn codex_last_request_usage_from_notification(notif: &Notification) -> Option<UnifiedTokenUsage> {
     if notif.method != "thread/tokenUsage/updated" {
         return None;
     }
     let token_usage = pluck_val(&notif.params, "token_usage", "tokenUsage")?;
     let last = token_usage.get("last")?.clone();
-    serde_json::from_value(last).ok()
+    match serde_json::from_value::<CodexUsageBucket>(last) {
+        Ok(bucket) => Some(bucket.to_unified()),
+        Err(err) => {
+            crate::warn_unknown_vendor_token(
+                "codex:tokenUsage.last",
+                &err.to_string(),
+                "token usage left UNKNOWN for this turn rather than billed as zero",
+            );
+            None
+        }
+    }
 }
 
 /// LEDGER-1 — the real `turn/completed` wire carries NO usage field; the
@@ -4405,6 +4642,145 @@ mod tests {
         // An in-flight turn does.
         tracker.entry("t-2").active_turn = Some("turn-9".into());
         assert!(tracker.any_active_turn());
+    }
+
+    /// GitHub #197 (G) — codex's own wire shape, folded into the in-flight
+    /// narration cell: `item/agentMessage/delta` fragments accumulate, the
+    /// `item/completed` that closes the item replaces them (never appends a
+    /// second copy of the same message), reasoning never enters, and the
+    /// boundary hands the narration to the transcript.
+    #[test]
+    fn narration_folds_codex_deltas_and_never_leaks_reasoning() {
+        let cells: Arc<std::sync::Mutex<HashMap<String, ThreadNarration>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let notif = |method: &str, params: Value| Notification {
+            method: method.to_string(),
+            params,
+        };
+        let read = |turn_expected: Option<&str>| {
+            let cells = cells.lock().unwrap();
+            match cells.get("t-1") {
+                None => None,
+                Some(cell) => {
+                    let partial = cell.text.partial(cell.turn_id.clone());
+                    assert_eq!(partial.exec_turn_id.as_deref(), turn_expected);
+                    Some(partial)
+                }
+            }
+        };
+
+        // No turn: the cell says nothing at all.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/agentMessage/delta",
+                json!({"threadId": "t-other", "itemId": "i-1", "delta": "elsewhere"}),
+            ),
+        );
+        assert!(read(None).is_none(), "another thread's message is not ours");
+
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "turn/started",
+                json!({"threadId": "t-1", "turn": {"id": "turn-7"}}),
+            ),
+        );
+        let empty = read(Some("turn-7")).expect("a started turn is in flight");
+        assert_eq!(
+            empty.text, "",
+            "it has not spoken yet — a FACT, not silence"
+        );
+
+        // Fragments of one item concatenate. Treating one as a snapshot would
+        // throw away everything said before it.
+        for delta in ["reading ", "the ", "brief"] {
+            apply_notification_to_narration(
+                &cells,
+                &notif(
+                    "item/agentMessage/delta",
+                    json!({"threadId": "t-1", "itemId": "i-1", "delta": delta}),
+                ),
+            );
+        }
+        assert_eq!(read(Some("turn-7")).unwrap().text, "reading the brief");
+
+        // Private reasoning is not narration, on either channel.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/reasoning/textDelta",
+                json!({"threadId": "t-1", "itemId": "r-1", "delta": "SECRET"}),
+            ),
+        );
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/completed",
+                json!({"threadId": "t-1", "item": {"id": "r-1", "type": "reasoning", "text": "SECRET"}}),
+            ),
+        );
+        assert_eq!(read(Some("turn-7")).unwrap().text, "reading the brief");
+
+        // The completed item's own text REPLACES its fragments.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/completed",
+                json!({"threadId": "t-1", "item": {"id": "i-1", "type": "agent_message", "text": "reading the brief"}}),
+            ),
+        );
+        assert_eq!(read(Some("turn-7")).unwrap().text, "reading the brief");
+
+        // A second message is its own paragraph.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/agentMessage/delta",
+                json!({"threadId": "t-1", "itemId": "i-2", "delta": "patching"}),
+            ),
+        );
+        assert_eq!(
+            read(Some("turn-7")).unwrap().text,
+            "reading the brief\n\npatching"
+        );
+
+        // A retryable error leaves the turn alive, exactly as it leaves
+        // `active_turn` set.
+        apply_notification_to_narration(
+            &cells,
+            &notif("error", json!({"threadId": "t-1", "willRetry": true})),
+        );
+        assert!(read(Some("turn-7")).is_some(), "a retry is not a boundary");
+
+        // The boundary does hand it over.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "turn/completed",
+                json!({"threadId": "t-1", "turnId": "turn-7"}),
+            ),
+        );
+        assert!(read(None).is_none(), "no turn, nothing to report");
+    }
+
+    /// The submission and the `turn/started` notification race — the
+    /// notification can land first. Whichever is second must not wipe what the
+    /// turn has already said.
+    #[test]
+    fn opening_the_same_turn_twice_keeps_what_it_said() {
+        let mut cells: HashMap<String, ThreadNarration> = HashMap::new();
+        begin_narration_locked(&mut cells, "t-1", "turn-7");
+        cells
+            .get_mut("t-1")
+            .unwrap()
+            .text
+            .append_delta("i-1", "half a migration");
+        begin_narration_locked(&mut cells, "t-1", "turn-7");
+        assert_eq!(cells["t-1"].text.text(), "half a migration");
+        // A DIFFERENT turn is a different narration.
+        begin_narration_locked(&mut cells, "t-1", "turn-8");
+        assert_eq!(cells["t-1"].text.text(), "");
     }
 
     /// Keep the settings contract in the CI lib-test baseline as well as
@@ -4619,7 +4995,18 @@ mod tests {
             }),
         };
         match translate_notification(&n, "t-1").expect("a completed turn must surface") {
-            ThreadEvent::TurnCompleted { turn_id, .. } => assert_eq!(turn_id, "u-4"),
+            ThreadEvent::TurnCompleted {
+                turn_id,
+                continuation,
+                ..
+            } => {
+                assert_eq!(turn_id, "u-4");
+                // GitHub #198 is a no-op here: the protocol has no notification
+                // that means "the thread woke itself", so `turn/completed` is
+                // always the end of the work and no request is ever carried
+                // past it.
+                assert_eq!(continuation, crate::TurnContinuation::Settled);
+            }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
     }
@@ -4939,15 +5326,15 @@ mod tests {
                 "turnId": "u-1",
                 "tokenUsage": {
                     "last": {
-                        "input_tokens": 80,
-                        "output_tokens": 21,
-                        "cached_input_tokens": 7,
-                        "reasoning_output_tokens": 3
+                        "inputTokens": 80,
+                        "outputTokens": 21,
+                        "cachedInputTokens": 7,
+                        "reasoningOutputTokens": 3
                     }
                 }
             }),
         };
-        let usage = codex_turn_usage_from_notification(&usage_notification)
+        let usage = codex_last_request_usage_from_notification(&usage_notification)
             .expect("token usage notification must expose the last turn");
         let error_notification = Notification {
             method: "error".into(),
@@ -4963,13 +5350,113 @@ mod tests {
         enrich_codex_turn_failed(&mut event, Some(usage), Some("gpt-5.3-codex".into()));
         match event {
             ThreadEvent::TurnFailed { usage, model, .. } => {
-                assert_eq!(usage.input_tokens, 80);
-                assert_eq!(usage.output_tokens, 21);
+                // Canonical buckets are DISJOINT, the wire's are nested:
+                // 80 prompt tokens of which 7 cached, 21 output of which 3
+                // hidden CoT (see `CodexUsageBucket::to_unified`).
+                assert_eq!(usage.input_tokens, 80 - 7);
+                assert_eq!(usage.output_tokens, 21 - 3);
                 assert_eq!(usage.cached_input_tokens, 7);
                 assert_eq!(usage.reasoning_output_tokens, Some(3));
+                assert_eq!(usage.total(), 80 + 21, "the wire's own total");
                 assert_eq!(model.as_deref(), Some("gpt-5.3-codex"));
             }
             other => panic!("expected TurnFailed, got {other:?}"),
+        }
+    }
+
+    /// GitHub #197 H1 — the live `thread/tokenUsage/updated` wire, copied
+    /// verbatim from a captured `codex_token_usage` progress row. Every one of
+    /// the 3,845 rows on the daemon's ledger carries this camelCase shape;
+    /// `UnifiedTokenUsage` spells its fields snake_case and defaults them all,
+    /// so the old straight `from_value` parsed it to zeros WITHOUT erroring —
+    /// which is why every codex session billed 0 tokens (sid s932: 8 rows, all
+    /// zero) while claude sessions billed fine.
+    #[test]
+    fn codex_last_request_usage_reads_the_live_camelcase_wire() {
+        let notif = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "threadId": "t-1",
+                "turnId": "u-1",
+                "tokenUsage": {
+                    "last": {
+                        "cacheWriteInputTokens": 0,
+                        "cachedInputTokens": 7936,
+                        "inputTokens": 15463,
+                        "outputTokens": 302,
+                        "reasoningOutputTokens": 110,
+                        "totalTokens": 15765
+                    },
+                    "modelContextWindow": 258400
+                }
+            }),
+        };
+        let usage = codex_last_request_usage_from_notification(&notif)
+            .expect("the live usage notification must yield the turn's tokens");
+
+        // Nested on the wire → disjoint in the canonical shape, so the four
+        // buckets can be summed and priced without double-billing.
+        assert_eq!(usage.input_tokens, 15_463 - 7_936, "uncached prompt only");
+        assert_eq!(usage.cached_input_tokens, 7_936);
+        assert_eq!(usage.output_tokens, 302 - 110, "visible output only");
+        assert_eq!(usage.reasoning_output_tokens, Some(110));
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        // The invariant that proves the split is faithful: the canonical total
+        // reproduces the wire's own `totalTokens`, exactly.
+        assert_eq!(usage.total(), 15_765);
+    }
+
+    /// A turn with no hidden reasoning keeps `reasoning_output_tokens` unset
+    /// (the "None for Claude" contract), and the totals still reconcile.
+    #[test]
+    fn codex_last_request_usage_without_reasoning_reports_no_reasoning_bucket() {
+        let notif = Notification {
+            method: "thread/tokenUsage/updated".into(),
+            params: json!({
+                "threadId": "t-1",
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 0,
+                        "inputTokens": 14_598,
+                        "outputTokens": 263,
+                        "reasoningOutputTokens": 0,
+                        "totalTokens": 14_861
+                    }
+                }
+            }),
+        };
+        let usage = codex_last_request_usage_from_notification(&notif).expect("usage");
+        assert_eq!(usage.input_tokens, 14_598);
+        assert_eq!(usage.output_tokens, 263);
+        assert_eq!(usage.reasoning_output_tokens, None);
+        assert_eq!(usage.total(), 14_861);
+    }
+
+    /// GitHub #197 H1 — drift must fail CLOSED. A bucket that is not the shape
+    /// codex emits leaves usage UNKNOWN, never a confident zero: a zero row
+    /// prices to $0 and silently drags the 24h budget ledger down, whereas
+    /// `None` folds nothing and the turn renders as unknown. This is the exact
+    /// failure that hid the original bug — the old parse accepted anything
+    /// because every field defaulted.
+    #[test]
+    fn a_misshaped_usage_bucket_is_unknown_not_zero() {
+        for last in [
+            // snake_case: a shape codex does not emit (and no longer humoured).
+            json!({ "input_tokens": 80, "output_tokens": 21,
+                    "cached_input_tokens": 7, "reasoning_output_tokens": 3 }),
+            // A renamed/partial bucket — protocol drift.
+            json!({ "inputTokens": 80 }),
+            json!({ "promptTokens": 80, "completionTokens": 21 }),
+            json!({}),
+        ] {
+            let notif = Notification {
+                method: "thread/tokenUsage/updated".into(),
+                params: json!({ "threadId": "t-1", "tokenUsage": { "last": last } }),
+            };
+            assert!(
+                codex_last_request_usage_from_notification(&notif).is_none(),
+                "an unrecognised bucket must not bill: {last}"
+            );
         }
     }
 
@@ -4987,6 +5474,7 @@ mod tests {
             usage: UnifiedTokenUsage::default(),
             model: None,
             conclusion: None,
+            continuation: crate::TurnContinuation::Settled,
         };
         enrich_codex_turn_completed(&mut event, Some(tracker_last));
         let ThreadEvent::TurnCompleted { usage, .. } = &event else {
@@ -5004,6 +5492,7 @@ mod tests {
             },
             model: None,
             conclusion: None,
+            continuation: crate::TurnContinuation::Settled,
         };
         enrich_codex_turn_completed(&mut inlined, Some(tracker_last));
         let ThreadEvent::TurnCompleted { usage, .. } = &inlined else {
@@ -5177,7 +5666,12 @@ mod tests {
         };
         let e = translate_notification(&n, "t-1").unwrap();
         match e {
-            ThreadEvent::TurnStarted { turn_id } => assert_eq!(turn_id, "u-7"),
+            ThreadEvent::TurnStarted { turn_id, opening } => {
+                assert_eq!(turn_id, "u-7");
+                // codex never wakes its own model: every turn is one ccteam
+                // asked for, so no boundary here continues another one.
+                assert_eq!(opening, crate::TurnOpening::Submitted);
+            }
             other => panic!("expected TurnStarted, got {other:?}"),
         }
     }

@@ -429,6 +429,7 @@ impl HarnessAdapter for CodexExecAdapter {
                             // model on the wire → unpriced (exposed).
                             model: None,
                             conclusion: None,
+                            continuation: crate::TurnContinuation::Settled,
                         });
                     }
                     Ok(s) => {
@@ -674,6 +675,8 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
         }
         "turn.started" => vec![ThreadEvent::TurnStarted {
             turn_id: turn_id.0.clone(),
+            // One `codex exec` run answers one prompt; nothing wakes it again.
+            opening: crate::TurnOpening::Submitted,
         }],
         "turn.completed" => {
             let usage = v
@@ -695,6 +698,7 @@ pub fn translate_jsonl_event(v: &Value, turn_id: &TurnId) -> Vec<ThreadEvent> {
                 usage,
                 model,
                 conclusion: None,
+                continuation: crate::TurnContinuation::Settled,
             }]
         }
         "turn.failed" => vec![ThreadEvent::TurnFailed {

@@ -366,6 +366,6 @@ async fn all_four_entry_spines_share_pi_role_recipe_and_rejection_contract() {
     }
 
     for sid in ["s1", rest_sid.as_str(), mcp_sid.as_str(), "s4"] {
-        gateway.stop_session(sid).await.unwrap();
+        gateway.stop_session_detached(sid).await.unwrap();
     }
 }

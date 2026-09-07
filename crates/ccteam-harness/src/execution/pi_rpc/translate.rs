@@ -70,6 +70,8 @@ impl PiTurnTranslator {
                 TranslateOutput {
                     events: vec![ThreadEvent::TurnStarted {
                         turn_id: active.turn_id.clone(),
+                        // pi runs a turn per request it is given.
+                        opening: crate::TurnOpening::Submitted,
                     }],
                     settled: false,
                 }
@@ -172,6 +174,7 @@ impl PiTurnTranslator {
                             usage: active.usage,
                             model: active.model,
                             conclusion: None,
+                            continuation: crate::TurnContinuation::Settled,
                         },
                     ],
                     settled: true,
@@ -195,6 +198,7 @@ impl PiTurnTranslator {
                     usage: active.usage,
                     model: active.model,
                     conclusion: None,
+                    continuation: crate::TurnContinuation::Settled,
                 });
                 TranslateOutput {
                     events,
@@ -356,6 +360,49 @@ mod tests {
                 "stopReason":reason, "errorMessage":"boom"
             }),
         }
+    }
+
+    /// GitHub #198/#199 — the vendor-continuation rule is a NO-OP on pi, and
+    /// that has to be asserted rather than assumed: pi's rpc bridge runs one
+    /// turn per request it is given and has no way to wake its own model, so
+    /// every turn it opens is one ccteam asked for and every boundary it
+    /// reports is the end of that turn's work. A request is never carried past
+    /// a pi boundary, and none of a pi turn's bindings ever move.
+    #[test]
+    fn a_pi_turn_is_always_submitted_and_always_settles() {
+        let mut translator = PiTurnTranslator::default();
+        translator.begin("t0".into()).unwrap();
+        let started = translator.ingest(PiEvent::AgentStart);
+        match started.events.as_slice() {
+            [ThreadEvent::TurnStarted { turn_id, opening }] => {
+                assert_eq!(turn_id, "t0");
+                assert_eq!(*opening, crate::TurnOpening::Submitted);
+            }
+            other => panic!("expected one TurnStarted, got {other:?}"),
+        }
+        translator.ingest(assistant("stop", "done", false, usage(1, 1, 0.1, 1)));
+        let settled = translator.ingest(PiEvent::AgentSettled);
+        assert!(settled.settled);
+        let Some(ThreadEvent::TurnCompleted { continuation, .. }) = settled.events.last() else {
+            panic!("expected a TurnCompleted, got {:?}", settled.events);
+        };
+        assert_eq!(*continuation, crate::TurnContinuation::Settled);
+
+        // …and the same on the tool-preamble path, which closes the turn
+        // through a different arm of the translator.
+        let mut translator = PiTurnTranslator::default();
+        translator.begin("t0b".into()).unwrap();
+        translator.ingest(assistant(
+            "toolUse",
+            "running it",
+            true,
+            usage(1, 1, 0.1, 0),
+        ));
+        let settled = translator.ingest(PiEvent::AgentSettled);
+        let Some(ThreadEvent::TurnCompleted { continuation, .. }) = settled.events.last() else {
+            panic!("expected a TurnCompleted, got {:?}", settled.events);
+        };
+        assert_eq!(*continuation, crate::TurnContinuation::Settled);
     }
 
     #[test]

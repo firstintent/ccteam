@@ -32,19 +32,144 @@
 //! [`Outbound`] and returns the events it produced. The transport's
 //! `events()` task owns one translator and drives it.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use serde_json::Value;
 
-use super::protocol::{MessageEnvelope, Outbound, ResultMsg};
-use crate::{ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, UnifiedTokenUsage};
+use super::protocol::{MessageEnvelope, Outbound, ResultMsg, SystemMsg};
+use crate::{
+    ThreadErrorEvent, ThreadEvent, ThreadItem, ThreadItemDetails, TurnContinuation, TurnOpening,
+    UnifiedTokenUsage,
+};
+
+/// The session's EXECUTION-turn identity, shared by the submit path and this
+/// translator.
+///
+/// stream-json used to run two disjoint id spaces: `submit_turn` handed the
+/// caller a `turn-<nanos>` receipt while the event stream reported `sj-N`, so
+/// nothing downstream could say which submission a `TurnCompleted` belonged to
+/// — the gateway's own turn-origin bookkeeping never matched either, and a
+/// dispatcher could not be told which of its queued tasks had just answered
+/// (issue #201). One id, minted by whoever delivers the line and reported by
+/// the turn it opens, is what makes a request correlatable end to end.
+///
+/// Ids embed the process clock so a line parked across a daemon restart keeps
+/// an identity nothing in the next life can collide with — that is what lets a
+/// restart reconcile rebind an outstanding request by identity instead of
+/// guessing from order.
+#[derive(Debug, Default)]
+pub struct TurnIdentity {
+    seq: u64,
+    /// Reserved by a delivered line that is about to open a turn.
+    pending: Option<String>,
+    /// The turn the translator currently has in flight.
+    active: Option<String>,
+    /// A line ccteam wrote INTO a running turn is not read there: claude shows
+    /// it to the model as a queued-command preview and then RE-RUNS it as the
+    /// prompt of the next turn. Until that turn opens, the boundary of the turn
+    /// the line joined answers nothing it was dispatched for (GitHub #199).
+    ///
+    /// A flag rather than a count, deliberately. Nothing in the protocol says
+    /// how claude batches two queued lines — one replay turn or two — and a
+    /// counter that guessed wrong would leave a request bound to a turn that
+    /// never opens. One expected continuation, cleared by the first turn the
+    /// vendor opens by itself, cannot strand anybody.
+    replay_pending: bool,
+}
+
+impl TurnIdentity {
+    /// A fresh, process-unique execution-turn id.
+    pub fn mint(&mut self) -> String {
+        self.seq += 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("sj-{nanos:x}-{:x}", self.seq)
+    }
+
+    /// Claim `id` for the turn the next delivered line opens.
+    pub fn reserve(&mut self, id: &str) {
+        self.pending = Some(id.to_string());
+    }
+
+    /// Undo a reservation whose line never reached the child.
+    pub fn clear_reservation(&mut self, id: &str) {
+        if self.pending.as_deref() == Some(id) {
+            self.pending = None;
+        }
+    }
+
+    /// The turn a line written RIGHT NOW would belong to: the one in flight,
+    /// else the one a delivered line has already reserved.
+    pub fn current(&self) -> Option<String> {
+        self.active.clone().or_else(|| self.pending.clone())
+    }
+
+    /// Record that a line was written into a turn already in flight, so the
+    /// boundary of THAT turn is known not to be the line's answer.
+    pub fn note_injected(&mut self) {
+        self.replay_pending = true;
+    }
+
+    /// Is claude still holding a line ccteam injected, to re-run as its next
+    /// prompt? Read at the boundary: while it is true the boundary settles
+    /// nothing.
+    pub fn has_pending_replay(&self) -> bool {
+        self.replay_pending
+    }
+
+    /// Open a turn: the reserved id when a delivery claimed one, else a fresh
+    /// id (a turn the vendor started on its own). The second half of the
+    /// answer is WHO opened it, which is what decides whether the previous
+    /// turn's bindings move onto this one.
+    pub fn open(&mut self) -> (String, TurnOpening) {
+        match self.pending.take() {
+            Some(id) => {
+                self.active = Some(id.clone());
+                (id, TurnOpening::Submitted)
+            }
+            None => {
+                // Nobody reserved this turn, so ccteam did not ask for it: it
+                // is claude re-running a queued line or answering its own
+                // `<task-notification>`. Either way one expected continuation
+                // has now arrived.
+                self.replay_pending = false;
+                let id = self.mint();
+                self.active = Some(id.clone());
+                (id, TurnOpening::VendorContinuation)
+            }
+        }
+    }
+
+    /// Close the turn in flight.
+    pub fn close(&mut self) {
+        self.active = None;
+    }
+
+    /// The stream is gone: nothing will replay anything. Kept separate from
+    /// [`Self::close`], which runs at every ordinary boundary — that is exactly
+    /// where a pending replay still matters.
+    pub fn forget_replay(&mut self) {
+        self.replay_pending = false;
+    }
+
+    /// Take a reservation that will never open a turn (the stream closed).
+    pub fn take_pending(&mut self) -> Option<String> {
+        self.pending.take()
+    }
+}
 
 /// Per-session translation state. One per live stream-json session.
 #[derive(Debug, Default)]
 pub struct StreamTranslator {
-    /// Monotonic per-session turn counter (synthesizes turn ids; the pump
-    /// keys turns.jsonl off its OWN seq, so these need only be unique).
-    turn_seq: u64,
+    /// Execution-turn identity, shared with the submit path so a submission
+    /// receipt names the turn that will actually report the answer.
+    identity: Arc<Mutex<TurnIdentity>>,
     /// `Some` while a turn is in flight (between first assistant block and
-    /// its `result`).
+    /// its `result`) — a local mirror of the shared cell, so item ids stay
+    /// correlatable without holding the lock.
     active_turn: Option<String>,
     /// Every top-level assistant text block of the active turn, in stream
     /// order — this IS the turn's answer (`result.result` only repeats the
@@ -62,11 +187,65 @@ pub struct StreamTranslator {
     /// the LAST assistant model wins for the turn's headline cost — the
     /// transcript path prices the finer per-message split.
     turn_model: Option<String>,
+    /// Ids from the latest `system:background_tasks_changed` snapshot — the
+    /// vendor's FULL list of what it currently runs in the background, re-sent
+    /// on every change. Non-empty at a `result` means claude will wake its own
+    /// model again when one of them finishes, so that `result` is not the end
+    /// of anything (GitHub #198).
+    ///
+    /// Tracked HERE rather than read off the session's shared task mirror: the
+    /// tap and this translator are two independent subscribers of one
+    /// broadcast, so the tap may not have folded the snapshot that precedes a
+    /// `result` by the time the translator reaches it. A subscriber's own
+    /// stream is ordered; another subscriber's progress is not.
+    background_tasks: HashSet<String>,
 }
 
 impl StreamTranslator {
+    /// A standalone translator that owns its own identity space (unit tests,
+    /// and any consumer without a live session behind it).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A translator sharing the live session's execution-turn identity, so the
+    /// id a submission was given is the id its turn reports.
+    pub fn attached(identity: Arc<Mutex<TurnIdentity>>) -> Self {
+        Self {
+            identity,
+            ..Self::default()
+        }
+    }
+
+    /// Mint through the shared cell, tolerating a poisoned lock by falling
+    /// back to a locally unique id rather than panicking the pump.
+    fn open_turn_id(&mut self) -> (String, TurnOpening) {
+        match self.identity.lock() {
+            Ok(mut identity) => identity.open(),
+            Err(poisoned) => poisoned.into_inner().open(),
+        }
+    }
+
+    /// What the vendor still holds at this boundary — see [`TurnContinuation`].
+    /// Two harness facts, no text: the background-task snapshot it last sent,
+    /// and whether a line ccteam injected is still waiting to be re-run.
+    fn continuation(&self) -> TurnContinuation {
+        let replay_pending = match self.identity.lock() {
+            Ok(identity) => identity.has_pending_replay(),
+            Err(poisoned) => poisoned.into_inner().has_pending_replay(),
+        };
+        if self.background_tasks.is_empty() && !replay_pending {
+            TurnContinuation::Settled
+        } else {
+            TurnContinuation::Pending
+        }
+    }
+
+    fn close_turn_id(&mut self) {
+        match self.identity.lock() {
+            Ok(mut identity) => identity.close(),
+            Err(poisoned) => poisoned.into_inner().close(),
+        }
     }
 
     /// Ingest one outbound message, returning the neutral events it
@@ -75,26 +254,51 @@ impl StreamTranslator {
         match out {
             Outbound::Assistant(env) => self.on_assistant(env),
             Outbound::TurnResult(r) => self.on_result(r),
-            // `user` replay echoes, init, control frames, partials: no
-            // neutral event (transcript authority + HITL handled elsewhere).
+            // A system line carries no neutral event, but the background-task
+            // snapshot on it decides whether the next `result` ends anything.
+            Outbound::System(sys) => {
+                self.on_system(&sys);
+                Vec::new()
+            }
+            // `user` replay echoes, control frames, partials: no neutral event
+            // (transcript authority + HITL handled elsewhere). A user line the
+            // vendor wrote ITSELF is not classified from its text — the turn it
+            // opens is recognised by having reserved no id (see
+            // [`TurnIdentity::open`]).
             Outbound::User(_)
-            | Outbound::System(_)
             | Outbound::ControlRequest(_)
             | Outbound::ControlResponse(_)
             | Outbound::Other => Vec::new(),
         }
     }
 
+    /// Adopt the vendor's latest background-task snapshot. Only the membership
+    /// matters here (is anything running at all), so the ids are kept without
+    /// interpretation — `/status`'s richer running-task list is the tap's job.
+    fn on_system(&mut self, sys: &SystemMsg) {
+        if sys.subtype != "background_tasks_changed" {
+            return;
+        }
+        self.background_tasks = sys
+            .tasks
+            .iter()
+            .filter(|task| !task.task_id.is_empty())
+            .map(|task| task.task_id.clone())
+            .collect();
+    }
+
     fn ensure_turn_started(&mut self, out: &mut Vec<ThreadEvent>) {
         if self.active_turn.is_none() {
-            self.turn_seq += 1;
-            let id = format!("sj-{}", self.turn_seq);
+            let (id, opening) = self.open_turn_id();
             self.active_turn = Some(id.clone());
             self.acc_text.clear();
             self.last_text = None;
             self.item_seq = 0;
             self.turn_model = None;
-            out.push(ThreadEvent::TurnStarted { turn_id: id });
+            out.push(ThreadEvent::TurnStarted {
+                turn_id: id,
+                opening,
+            });
         }
     }
 
@@ -119,8 +323,27 @@ impl StreamTranslator {
         self.acc_text.clear();
         self.last_text = None;
         let model = self.turn_model.take();
+        // A line delivered but never answered (the child died before its first
+        // assistant block) has an id reserved and no turn in flight. Failing it
+        // under THAT id is what lets the dispatcher that submitted it see its
+        // own request fail instead of waiting forever (issue #201).
+        self.background_tasks.clear();
+        let reserved = match self.identity.lock() {
+            Ok(mut identity) => {
+                identity.close();
+                identity.forget_replay();
+                identity.take_pending()
+            }
+            Err(poisoned) => {
+                let mut identity = poisoned.into_inner();
+                identity.close();
+                identity.forget_replay();
+                identity.take_pending()
+            }
+        };
         self.active_turn
             .take()
+            .or(reserved)
             .map(|turn_id| ThreadEvent::TurnFailed {
                 turn_id,
                 err: ThreadErrorEvent {
@@ -185,10 +408,11 @@ impl StreamTranslator {
         // A `result` can arrive without a preceding assistant block (a
         // pure error / empty turn) — still synthesize a turn id.
         self.ensure_turn_started(&mut out);
-        let turn_id = self
-            .active_turn
-            .take()
-            .unwrap_or_else(|| "sj-0".to_string());
+        // Read BEFORE the turn is closed: what the vendor still holds decides
+        // whether this boundary answers anybody (GitHub #198/#199).
+        let continuation = self.continuation();
+        let turn_id = self.active_turn.take().unwrap_or_default();
+        self.close_turn_id();
         let usage = r
             .usage
             .as_ref()
@@ -261,6 +485,7 @@ impl StreamTranslator {
             usage,
             model,
             conclusion,
+            continuation,
         });
         self.acc_text.clear();
         out
@@ -277,6 +502,15 @@ fn push_paragraph(acc: &mut String, text: &str) {
         acc.push_str("\n\n");
     }
     acc.push_str(text);
+}
+
+/// The PUBLIC text of one Anthropic `Message` — the text blocks a transcript
+/// would show, and nothing else. One definition of "what this session said",
+/// shared by the turn accumulator above and by the status tap's in-flight
+/// narration cell, so an interrupted turn's record can never widen to
+/// something the transcript would not show.
+pub(super) fn public_text(message: &Value) -> String {
+    extract_blocks(message).0
 }
 
 /// One non-text content block worth surfacing as a progress item.
@@ -357,6 +591,36 @@ mod tests {
                 ThreadItemDetails::AgentMessage(t) => Some(t.clone()),
                 _ => None,
             },
+            _ => None,
+        })
+    }
+
+    /// A `system:background_tasks_changed` snapshot carrying `ids`.
+    fn background(ids: &[&str]) -> Outbound {
+        Outbound::System(Box::new(SystemMsg {
+            subtype: "background_tasks_changed".into(),
+            tasks: ids
+                .iter()
+                .map(|id| super::super::protocol::BackgroundTaskRef {
+                    task_id: (*id).into(),
+                })
+                .collect(),
+            ..SystemMsg::default()
+        }))
+    }
+
+    /// What the turn's boundary said the vendor still holds.
+    fn continuation_of(evs: &[ThreadEvent]) -> Option<TurnContinuation> {
+        evs.iter().find_map(|e| match e {
+            ThreadEvent::TurnCompleted { continuation, .. } => Some(*continuation),
+            _ => None,
+        })
+    }
+
+    /// Who opened the turn these events belong to.
+    fn opening_of(evs: &[ThreadEvent]) -> Option<TurnOpening> {
+        evs.iter().find_map(|e| match e {
+            ThreadEvent::TurnStarted { opening, .. } => Some(*opening),
             _ => None,
         })
     }
@@ -653,10 +917,173 @@ mod tests {
         let _ = t.ingest(result_ok("two"));
         let id = |evs: &[ThreadEvent]| {
             evs.iter().find_map(|e| match e {
-                ThreadEvent::TurnStarted { turn_id } => Some(turn_id.clone()),
+                ThreadEvent::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
                 _ => None,
             })
         };
         assert_ne!(id(&a), id(&b));
+    }
+
+    /// GitHub #198 — claude wakes its own model. A `result` that lands while
+    /// its `background_tasks_changed` snapshot still names something is NOT the
+    /// end of the task: the CLI will inject a `<task-notification>` when that
+    /// task finishes and the model answers in a brand-new turn. Measured on a
+    /// live session: one dispatched task ran seven turns over 47 minutes and
+    /// the receipt was on the last one.
+    ///
+    /// Pre-fix this boundary was indistinguishable from a settled one, so the
+    /// dispatcher was woken by the child's first checkpoint and its request was
+    /// consumed — the real answer reached nobody.
+    #[test]
+    fn a_result_with_background_work_outstanding_settles_nothing() {
+        let mut t = StreamTranslator::new();
+        t.ingest(background(&["bg-1"]));
+        t.ingest(assistant(
+            json!([{"type": "text", "text": "kicked off a build"}]),
+        ));
+        let a = t.ingest(result_ok("kicked off a build"));
+        assert_eq!(
+            continuation_of(&a),
+            Some(TurnContinuation::Pending),
+            "a snapshot that still names a task means the vendor will be back"
+        );
+
+        // The task finishes: claude re-sends the snapshot, now empty, and wakes
+        // itself. Nothing reserved that turn's id, so it is a continuation.
+        t.ingest(background(&[]));
+        let b = t.ingest(assistant(
+            json!([{"type": "text", "text": "the build passed"}]),
+        ));
+        assert_eq!(opening_of(&b), Some(TurnOpening::VendorContinuation));
+        let b = [b, t.ingest(result_ok("the build passed"))].concat();
+        assert_eq!(
+            continuation_of(&b),
+            Some(TurnContinuation::Settled),
+            "an empty snapshot and nothing to replay: THIS is the receipt"
+        );
+    }
+
+    /// A turn ccteam asked for is never mistaken for one the vendor started:
+    /// the submit path reserves the id before the bytes go out, and a turn that
+    /// opens on a reserved id is `Submitted`. Only that keeps a continuation
+    /// from adopting the bindings of an unrelated turn.
+    #[test]
+    fn a_reserved_turn_is_submitted_and_an_unreserved_one_is_a_continuation() {
+        let identity = Arc::new(Mutex::new(TurnIdentity::default()));
+        let mut t = StreamTranslator::attached(Arc::clone(&identity));
+        let reserved = {
+            let mut ids = identity.lock().unwrap();
+            let id = ids.mint();
+            ids.reserve(&id);
+            id
+        };
+        let a = t.ingest(assistant(json!([{"type": "text", "text": "on it"}])));
+        assert_eq!(opening_of(&a), Some(TurnOpening::Submitted));
+        assert!(a.iter().any(|e| matches!(
+            e,
+            ThreadEvent::TurnStarted { turn_id, .. } if turn_id == &reserved
+        )));
+        t.ingest(result_ok("on it"));
+
+        let b = t.ingest(assistant(json!([{"type": "text", "text": "and now this"}])));
+        assert_eq!(opening_of(&b), Some(TurnOpening::VendorContinuation));
+    }
+
+    /// GitHub #199 — a line ccteam injects mid-turn is shown to the model as a
+    /// queued command and then RE-RUN as the next prompt, so the turn it joined
+    /// is not where it is answered. The joined turn's boundary therefore
+    /// settles nothing, and the replay turn's does.
+    #[test]
+    fn an_injected_line_is_answered_by_the_replay_turn_not_the_one_it_joined() {
+        let identity = Arc::new(Mutex::new(TurnIdentity::default()));
+        let mut t = StreamTranslator::attached(Arc::clone(&identity));
+        t.ingest(assistant(json!([{"type": "text", "text": "working"}])));
+        // The submit path's mid-turn branch: the line joins the running turn
+        // and claude is now holding it to re-run.
+        identity.lock().unwrap().note_injected();
+        let joined = t.ingest(result_ok("working"));
+        assert_eq!(
+            continuation_of(&joined),
+            Some(TurnContinuation::Pending),
+            "the injected line has not been read as a prompt yet"
+        );
+
+        let replay = t.ingest(assistant(json!([{"type": "text", "text": "done"}])));
+        assert_eq!(opening_of(&replay), Some(TurnOpening::VendorContinuation));
+        let replay = [replay, t.ingest(result_ok("done"))].concat();
+        assert_eq!(continuation_of(&replay), Some(TurnContinuation::Settled));
+    }
+
+    /// The two facts are independent: an empty snapshot alone does not settle a
+    /// turn that still owes a replay, and no pending replay does not settle a
+    /// turn whose vendor is still running something.
+    #[test]
+    fn either_held_fact_alone_keeps_a_boundary_open() {
+        let identity = Arc::new(Mutex::new(TurnIdentity::default()));
+        let mut t = StreamTranslator::attached(Arc::clone(&identity));
+        t.ingest(background(&[]));
+        // Injected INTO the running turn, which is the only moment the submit
+        // path can be holding a line claude will re-run: a flag set before any
+        // turn is open belongs to the turn that opens next and is consumed by
+        // it, exactly as `TurnIdentity::open` does.
+        t.ingest(assistant(json!([{"type": "text", "text": "a"}])));
+        identity.lock().unwrap().note_injected();
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("a"))),
+            Some(TurnContinuation::Pending)
+        );
+
+        let mut t = StreamTranslator::new();
+        t.ingest(background(&["bg-1"]));
+        t.ingest(assistant(json!([{"type": "text", "text": "b"}])));
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("b"))),
+            Some(TurnContinuation::Pending)
+        );
+    }
+
+    /// An ordinary turn with nothing in the background settles — the common
+    /// case must not have been made non-terminal by any of the above.
+    #[test]
+    fn a_plain_turn_settles() {
+        let mut t = StreamTranslator::new();
+        t.ingest(assistant(json!([{"type": "text", "text": "hi"}])));
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("hi"))),
+            Some(TurnContinuation::Settled)
+        );
+        // …and a snapshot that empties again releases the hold.
+        t.ingest(background(&["bg-1"]));
+        t.ingest(assistant(json!([{"type": "text", "text": "x"}])));
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("x"))),
+            Some(TurnContinuation::Pending)
+        );
+        t.ingest(background(&[]));
+        t.ingest(assistant(json!([{"type": "text", "text": "y"}])));
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("y"))),
+            Some(TurnContinuation::Settled)
+        );
+    }
+
+    /// A stream that dies takes the expectation with it: nothing will replay a
+    /// line into a child that is gone, so the next life must not open its first
+    /// turn already believing it owes a continuation.
+    #[test]
+    fn a_closed_stream_forgets_what_it_was_holding() {
+        let identity = Arc::new(Mutex::new(TurnIdentity::default()));
+        let mut t = StreamTranslator::attached(Arc::clone(&identity));
+        t.ingest(background(&["bg-1"]));
+        identity.lock().unwrap().note_injected();
+        t.ingest(assistant(json!([{"type": "text", "text": "working"}])));
+        let _ = t.on_close();
+        assert!(!identity.lock().unwrap().has_pending_replay());
+
+        t.ingest(assistant(json!([{"type": "text", "text": "next life"}])));
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("next life"))),
+            Some(TurnContinuation::Settled)
+        );
     }
 }

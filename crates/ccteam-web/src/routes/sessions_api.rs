@@ -1718,12 +1718,11 @@ pub(crate) async fn handle_session_stop(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = {
-        let mut guard = gw.lock().await;
-        guard.stop_session(&sid).await
-    };
+    // The shared door: it takes the child's delegation claim in the right
+    // order and makes the stop's record of what it cut short durable.
+    let result = ccteam_im::gateway::Gateway::stop_session_shared(gw, &sid).await;
     match result {
-        Ok(()) => Json(json!({"stopped": true})).into_response(),
+        Ok(_) => Json(json!({"stopped": true})).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "stop_session failed");
             unknown_session(&sid)
@@ -2367,6 +2366,7 @@ mod tests {
         // Key the mirror by the session sid (the trailing `s<N>`), not the role.
         let sid = "s1";
         let mk = |id: &str, user: &str, assistant: &str| TurnRecord {
+            exec_turn_id: None,
             turn_id: id.into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
@@ -2381,6 +2381,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         append_turn(project_dir, sid, &mk("t1", "review the diff", "LGTM")).unwrap();
         append_turn(project_dir, sid, &mk("t2", "and the tests?", "all green")).unwrap();
@@ -2413,6 +2414,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_dir = tmp.path();
         let mk = |id: &str, assistant: &str| TurnRecord {
+            exec_turn_id: None,
             turn_id: id.into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
@@ -2427,6 +2429,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         append_turn(project_dir, "s1", &mk("t1", "from-s1")).unwrap();
         append_turn(project_dir, "s2", &mk("t2", "from-s2")).unwrap();
@@ -2453,6 +2456,7 @@ mod tests {
     #[test]
     fn turn_to_event_carries_user_and_assistant() {
         let turn = TurnRecord {
+            exec_turn_id: None,
             turn_id: "t9".into(),
             ts: chrono::Utc::now(),
             vendor: "claude".into(),
@@ -2472,6 +2476,7 @@ mod tests {
             error_kind: None,
             error: None,
             conclusion: None,
+            continues_exec_turn: None,
         };
         let ev = turn_to_event(&turn);
         assert_eq!(ev["turn_id"], "t9");

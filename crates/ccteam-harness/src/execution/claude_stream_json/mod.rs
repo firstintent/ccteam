@@ -62,7 +62,7 @@ use crate::{
 use bridge::{ApprovalDecision, CanUseToolResolver, SlashClass};
 use protocol::{ClaudeModelOption, Outbound};
 use spawn_spec::StreamJsonSpawnInput;
-use translate::StreamTranslator;
+use translate::{StreamTranslator, TurnIdentity};
 use transport::StreamJsonTransport;
 
 /// §七 ⑤ — host-facet-friendly session identity. `sid → vendor_uuid` is a
@@ -130,8 +130,80 @@ struct LiveSession {
     /// message that triggered the resume runs first, as its own turn, and what
     /// was parked follows in order. A line leaves the queue only once it has
     /// been written to the CLI; the disk copy follows the write.
-    deferred_input: Arc<StdMutex<VecDeque<String>>>,
+    ///
+    /// Each entry carries the EXECUTION-turn id its line will open, minted at
+    /// park time and persisted with it: that is the identity a dispatcher's
+    /// request is bound to, and keeping it across a restart is what lets a
+    /// reconcile rebind by identity rather than by position (issue #201).
+    deferred_input: Arc<StdMutex<DeferredQueue>>,
+    /// The session's execution-turn identity — see [`TurnIdentity`]. Shared
+    /// with the event translator so a submission receipt names the turn that
+    /// will report the answer.
+    turn_ids: Arc<StdMutex<TurnIdentity>>,
+    /// The PUBLIC narration of the turn in flight, kept current by the status
+    /// tap and read by [`HarnessAdapter::in_flight_narration`] — by an explicit
+    /// stop, to record what it cut short, and by `agent_read{sid}`, to show a
+    /// working child's own words (issue #197 E/G). Bounded to the tail (see
+    /// [`crate::NarrationAccumulator`]) — the cell must not grow with a turn
+    /// that talks for half an hour.
+    ///
+    /// stream-json's shape is CUMULATIVE: each `assistant` message carries the
+    /// complete set of its own text blocks, so a message is folded in as a
+    /// SNAPSHOT keyed by its `message.id` and never appended twice.
+    narration: Arc<StdMutex<crate::NarrationAccumulator>>,
 }
+
+/// One line parked behind the in-flight turn, with the identity of the turn it
+/// will open.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DeferredLine {
+    /// The execution-turn id reserved for this line (see [`TurnIdentity`]).
+    turn_id: String,
+    /// The verbatim line to write — a vendor slash command or queued user text.
+    text: String,
+}
+
+/// One session's parked lines, in memory and on disk alike.
+///
+/// TWO sections, because "handed to the CLI" and "the CLI ran it" are
+/// different facts (issue #201). `in_flight` is the one line the status tap has
+/// written to the child whose turn nobody has yet observed ending; `parked` is
+/// everything still waiting behind it. Write-ahead: the line moves INTO
+/// `in_flight` on disk before its bytes go out, and only leaves when the turn
+/// boundary that consumed it arrives. Without that window the mirror was
+/// emptied the instant the write succeeded, so a daemon that died before the
+/// child ever ran the line lost a dispatched task outright — no turn, no
+/// answer, and nothing left on disk to replay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DeferredQueue {
+    /// Written to the CLI, not yet observed executing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    in_flight: Option<DeferredLine>,
+    /// Still behind the turn in flight, oldest first.
+    #[serde(default)]
+    parked: VecDeque<DeferredLine>,
+}
+
+impl DeferredQueue {
+    /// Nothing left to remember — the mirror file can go.
+    fn is_empty(&self) -> bool {
+        self.in_flight.is_none() && self.parked.is_empty()
+    }
+}
+
+/// The durable mirror's on-disk shape. A file that does not carry exactly this
+/// schema is unreadable, logged and ignored — pre-1.0 there is no migration,
+/// and replaying lines whose turn identity is unknown would hand a dispatcher
+/// an answer it can never correlate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DeferredMirror {
+    schema: u32,
+    #[serde(flatten)]
+    queue: DeferredQueue,
+}
+
+/// Bumped when the shape changes; the bare array of v1 no longer parses.
+const DEFERRED_INPUT_SCHEMA: u32 = 2;
 
 /// The Claude stream-json adapter. A per-vendor singleton (mirrors
 /// `CodexAppServerAdapter`) holding every live session keyed by its vendor
@@ -230,6 +302,19 @@ fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
     }
 }
 
+/// The live session cells the status tap shares with the submit path: the
+/// status snapshot it folds usage into, the running-task tracker, the vendor
+/// occupancy flag, the parked-input FIFO it flushes, and the execution-turn
+/// identity it reserves before writing a parked line.
+struct StatusTapCells {
+    status: Arc<StdMutex<ThreadStatus>>,
+    running_tasks: Arc<StdMutex<TaskTracker>>,
+    active_turn: Arc<AtomicBool>,
+    deferred_input: Arc<StdMutex<DeferredQueue>>,
+    turn_ids: Arc<StdMutex<TurnIdentity>>,
+    narration: Arc<StdMutex<crate::NarrationAccumulator>>,
+}
+
 /// Spawn the per-session status tap: keep the shared [`ThreadStatus`] current
 /// so [`HarnessAdapter::thread_status`] reports the live model + context-window
 /// usage without parsing a transcript. The `assistant` message updates the
@@ -239,13 +324,18 @@ fn preserve_1m_tag(current: Option<&str>, api_model: &str) -> String {
 /// Runs for the session's whole life (ends when the transport closes).
 fn spawn_status_tap(
     transport: Arc<StreamJsonTransport>,
-    status: Arc<StdMutex<ThreadStatus>>,
-    running_tasks: Arc<StdMutex<TaskTracker>>,
-    active_turn: Arc<AtomicBool>,
-    deferred_input: Arc<StdMutex<VecDeque<String>>>,
+    cells: StatusTapCells,
     project_dir: PathBuf,
     sid: String,
 ) -> tokio::task::JoinHandle<()> {
+    let StatusTapCells {
+        status,
+        running_tasks,
+        active_turn,
+        deferred_input,
+        turn_ids,
+        narration,
+    } = cells;
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
         // v0.8.20 — throttle the mid-turn context refresh so `/sessions` tracks
@@ -271,6 +361,28 @@ fn spawn_status_tap(
                 _ = transport.wait_closed() => return,
                 msg = sub.recv() => match msg {
                     Ok(Outbound::Assistant(env)) => {
+                        // Keep the turn's public narration current, for the
+                        // record an explicit stop leaves behind (issue #197 E).
+                        // TOP-LEVEL blocks only, and text only: a subagent's
+                        // messages and the model's thinking are not narration
+                        // this session may show anyone.
+                        if env.parent_tool_use_id.is_none() {
+                            let block = translate::public_text(&env.message);
+                            if !block.is_empty() {
+                                // Keyed by the vendor's own message id: this
+                                // wire re-states a message's whole text, so a
+                                // restated step must replace its paragraph
+                                // rather than duplicate it.
+                                let id = env
+                                    .message
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                if let Ok(mut n) = narration.lock() {
+                                    n.set_snapshot(id, &block);
+                                }
+                            }
+                        }
                         // Keep the live model id current from the API `model` field,
                         // carrying over a user-set `[1m]` tag (the API omits it).
                         let api_model = env
@@ -348,6 +460,11 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
+                        // The turn is over: its narration belongs to the
+                        // transcript now, not to the next turn's record.
+                        if let Ok(mut n) = narration.lock() {
+                            n.clear();
+                        }
                         // Clear occupancy and claim the next deferred input
                         // line (a slash command, issue #193; a queued turn,
                         // issue #194) under ONE lock, so a submission racing
@@ -355,53 +472,28 @@ fn spawn_status_tap(
                         // parked, popped right here) or already closed (→
                         // written directly) — never parked behind a turn that
                         // has already ended.
-                        let next = match deferred_input.lock() {
-                            Ok(mut q) => {
-                                active_turn.store(false, Ordering::Release);
-                                let next = q.pop_front();
-                                if next.is_some() {
-                                    active_turn.store(true, Ordering::Release);
-                                }
-                                next
-                            }
-                            Err(_) => {
-                                active_turn.store(false, Ordering::Release);
-                                None
-                            }
-                        };
-                        if let Some(line) = next {
-                            // Each deferred line starts its own turn; the rest
-                            // of the queue waits for the next `result`. A line
-                            // leaves the queue only once it is written: on a
-                            // failed write (the child is gone) it goes back to
-                            // the front, and the on-disk mirror — which still
-                            // holds it — is what the next life of this sid
-                            // reloads. The mirror follows a successful write,
-                            // so a crash in between replays the line (at-
-                            // least-once), never loses it.
+                        let next = advance_deferred_queue(
+                            &deferred_input,
+                            &turn_ids,
+                            &active_turn,
+                            &project_dir,
+                            &sid,
+                        );
+                        if let Some(parked) = next {
+                            let line = parked.text.clone();
                             match transport.send_line(protocol::user_text_line(&line)).await {
-                                Ok(()) => {
-                                    let rest = deferred_input.lock().map(|q| q.clone()).ok();
-                                    if let Some(rest) = rest {
-                                        if let Err(error) =
-                                            persist_deferred_input(&project_dir, &sid, &rest)
-                                        {
-                                            tracing::warn!(
-                                                session = %sid,
-                                                %error,
-                                                "stream-json: deferred input mirror was not updated"
-                                            );
-                                        }
-                                    }
-                                }
+                                Ok(()) => {}
                                 Err(error) => {
                                     // Back to the front — and the mirror re-synced
-                                    // under the same lock: a park that landed while
-                                    // this write was in flight persisted a queue
-                                    // WITHOUT this line, and the next life of the sid
-                                    // reloads only what is on disk.
+                                    // under the SAME lock hold: the next life of the
+                                    // sid reloads only what is on disk. The reserved
+                                    // identity goes back with it: no turn opened.
+                                    if let Ok(mut ids) = turn_ids.lock() {
+                                        ids.clear_reservation(&parked.turn_id);
+                                    }
                                     if let Ok(mut q) = deferred_input.lock() {
-                                        q.push_front(line.clone());
+                                        q.in_flight = None;
+                                        q.parked.push_front(parked.clone());
                                         if let Err(error) =
                                             persist_deferred_input(&project_dir, &sid, &q)
                                         {
@@ -510,20 +602,20 @@ fn spawn_status_tap(
 }
 
 /// `<project>/.ccteam/chat/<sid>/deferred-input.json` — the on-disk mirror of
-/// [`LiveSession::deferred_input`]: a JSON array of the parked lines, oldest
-/// first. Absent when nothing is parked.
+/// [`LiveSession::deferred_input`]: the line in flight plus the lines still
+/// parked behind it, oldest first. Absent when there is nothing of either.
 fn deferred_input_path(project_dir: &Path, sid: &str) -> PathBuf {
     super::turns_mirror::chat_dir(project_dir, sid).join("deferred-input.json")
 }
 
-/// Mirror the parked queue to disk (the file is removed when the queue is
-/// empty). Callers decide what a failure means: a parked notification must be
-/// durable before it is accepted (the notifier spends the child's watch on the
-/// acceptance), a slash command or a post-write update is best-effort.
+/// Mirror the queue to disk (the file is removed when nothing is left).
+/// Callers decide what a failure means: a parked notification must be durable
+/// before it is accepted (the notifier spends the child's watch on the
+/// acceptance), a slash command or a retirement is best-effort.
 fn persist_deferred_input(
     project_dir: &Path,
     sid: &str,
-    queue: &VecDeque<String>,
+    queue: &DeferredQueue,
 ) -> anyhow::Result<()> {
     let path = deferred_input_path(project_dir, sid);
     if queue.is_empty() {
@@ -532,31 +624,256 @@ fn persist_deferred_input(
             _ => Ok(()),
         };
     }
-    let lines: Vec<&String> = queue.iter().collect();
     std::fs::create_dir_all(path.parent().expect("chat dir has a parent"))?;
-    let bytes = serde_json::to_vec(&lines)?;
+    let bytes = serde_json::to_vec(&DeferredMirror {
+        schema: DEFERRED_INPUT_SCHEMA,
+        queue: queue.clone(),
+    })?;
     super::fs_atomic::atomic_write_durable(&path, &bytes)
 }
 
-/// The parked lines a previous process life of this sid left behind
-/// (missing or unreadable → empty).
-fn load_deferred_input(project_dir: &Path, sid: &str) -> VecDeque<String> {
-    std::fs::read(deferred_input_path(project_dir, sid))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
-        .map(VecDeque::from)
-        .unwrap_or_default()
+/// The lines a previous process life of this sid left behind (missing →
+/// empty). A mirror this build cannot read is LOGGED and dropped: pre-1.0
+/// there is no migration, and replaying lines whose turn identity is unknown
+/// would hand a dispatcher an answer it can never correlate (issue #201).
+///
+/// The IN-FLIGHT line is the interesting one. The previous life wrote it to the
+/// CLI and died before any boundary retired it, so whether the model ever saw
+/// it is unknowable from here — but the transcript answers it: a turn that ran
+/// under that id left a row carrying the id. No row means the line died in the
+/// child's stdin buffer and is replayed at the FRONT, in order, exactly once; a
+/// row means it ran, and replaying it would ask the child to do the work twice.
+fn load_deferred_input(project_dir: &Path, sid: &str) -> DeferredQueue {
+    let mut queue = read_deferred_mirror(project_dir, sid);
+    if let Some(in_flight) = queue.in_flight.take() {
+        if turn_left_a_transcript_row(project_dir, sid, &in_flight.turn_id) {
+            tracing::info!(
+                session = %sid,
+                turn = %in_flight.turn_id,
+                "stream-json: an in-flight parked line already ran; not replaying it"
+            );
+        } else {
+            tracing::warn!(
+                session = %sid,
+                turn = %in_flight.turn_id,
+                "stream-json: an in-flight parked line never opened a turn; replaying it"
+            );
+            queue.parked.push_front(in_flight);
+        }
+    }
+    queue
 }
 
-/// Adapter-side correlation id for one accepted user line (the pump keys
-/// `turns.jsonl` off its own sequence; this id only serves logs and the
-/// gateway's per-input bookkeeping).
-fn synthetic_turn_id() -> TurnId {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    TurnId::new(format!("turn-{nanos:x}"))
+/// The mirror exactly as it sits on disk — no replay decision applied.
+///
+/// Two readers want different things from the same file. A resume wants to
+/// know what to REPLAY ([`load_deferred_input`]); an explicit stop wants to
+/// know what is still RETAINED and, of that, which lines were handed to the
+/// CLI and which never were — "confirmed undelivered" and "delivery
+/// unconfirmed" are different things to tell a dispatcher (issue #197 E).
+fn read_deferred_mirror(project_dir: &Path, sid: &str) -> DeferredQueue {
+    let path = deferred_input_path(project_dir, sid);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return DeferredQueue::default();
+    };
+    match serde_json::from_slice::<DeferredMirror>(&bytes) {
+        Ok(mirror) if mirror.schema == DEFERRED_INPUT_SCHEMA => mirror.queue,
+        Ok(mirror) => {
+            tracing::warn!(
+                session = %sid,
+                path = %path.display(),
+                schema = mirror.schema,
+                want = DEFERRED_INPUT_SCHEMA,
+                "stream-json: parked input mirror has an unreadable schema; discarding it"
+            );
+            DeferredQueue::default()
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %sid,
+                path = %path.display(),
+                %error,
+                "stream-json: parked input mirror is unreadable; discarding it"
+            );
+            DeferredQueue::default()
+        }
+    }
+}
+
+/// The basename of the parked-input mirror, for a caller that must name the
+/// file a retained line is sitting in.
+pub const DEFERRED_INPUT_FILE: &str = "deferred-input.json";
+
+/// The execution-turn ids one session's parked-input mirror still holds.
+///
+/// The unit is the EXECUTION TURN id, not the text: that is the identity a
+/// delegation request is bound to, so a caller can say which of ITS tasks is
+/// retained without ever reading anybody's prompt back out of the mirror.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedInput {
+    /// Written to the CLI, no boundary observed: delivery is UNCONFIRMED. The
+    /// line is still retained — the next life replays it unless the transcript
+    /// shows the turn ran.
+    pub in_flight: Option<String>,
+    /// Never handed to the vendor, oldest first: confirmed UNDELIVERED, and
+    /// retained.
+    pub parked: Vec<String>,
+}
+
+impl RetainedInput {
+    /// Whether `exec_turn_id` is the one line that was written out.
+    pub fn is_in_flight(&self, exec_turn_id: &str) -> bool {
+        self.in_flight.as_deref() == Some(exec_turn_id)
+    }
+
+    /// Whether `exec_turn_id` is still waiting behind the harness.
+    pub fn is_parked(&self, exec_turn_id: &str) -> bool {
+        self.parked.iter().any(|id| id == exec_turn_id)
+    }
+}
+
+/// Read what a stopped (or merely released) sid still has parked — see
+/// [`RetainedInput`]. A missing or unreadable mirror is "nothing retained".
+pub fn retained_input(project_dir: &Path, sid: &str) -> RetainedInput {
+    let queue = read_deferred_mirror(project_dir, sid);
+    RetainedInput {
+        in_flight: queue.in_flight.map(|line| line.turn_id),
+        parked: queue.parked.into_iter().map(|line| line.turn_id).collect(),
+    }
+}
+
+/// Did any mirrored turn row run under `exec_turn_id`? The transcript is the
+/// only witness a new process life has that a previous one's write reached the
+/// model.
+fn turn_left_a_transcript_row(project_dir: &Path, sid: &str, exec_turn_id: &str) -> bool {
+    super::turns_mirror::read_all_turns(project_dir, sid)
+        .unwrap_or_default()
+        .iter()
+        .any(|turn| turn.exec_turn_id.as_deref() == Some(exec_turn_id))
+}
+
+/// What a caller wants done when the durable mirror refuses a park.
+enum OnUnmirrorable {
+    /// Take the line back — the caller writes it mid-turn instead. A parked
+    /// delegation notification must be durable BEFORE it is accepted: the
+    /// notifier spends the child's watch on that acceptance, so a line that
+    /// only ever lived in memory would turn a crash into a lost notification.
+    TakeItBack,
+    /// Keep it parked in memory. A slash command is not an at-least-once
+    /// contract, and a late command beats one the model reads as prose
+    /// (issue #193).
+    KeepItParked,
+}
+
+/// Park one line behind the turn in flight and mirror the queue — under ONE
+/// lock hold. Returns the execution-turn id reserved for it and its 1-based
+/// position, or `None` when the session is idle (the caller writes it now) or
+/// the mirror refused a line that must be durable.
+///
+/// The queue mutex is this session's only writer of `deferred-input.json`, and
+/// that is the whole contract: a snapshot persisted after the lock is released
+/// is not a mirror of anything, because whatever landed in the gap wrote its
+/// own snapshot and whichever call reached `rename` last erased the other's
+/// line for good.
+fn park_deferred_line(
+    queue: &StdMutex<DeferredQueue>,
+    turn_ids: &StdMutex<TurnIdentity>,
+    active_turn: &AtomicBool,
+    project_dir: &Path,
+    sid: &str,
+    text: &str,
+    on_unmirrorable: OnUnmirrorable,
+) -> Option<(String, usize)> {
+    let Ok(mut queue) = queue.lock() else {
+        return None;
+    };
+    // Check-and-park under the same lock the tap pops under, so this never
+    // parks behind a turn that has already ended.
+    if !active_turn.load(Ordering::Acquire) {
+        return None;
+    }
+    // The parked line's EXECUTION-turn id is minted here and travels with it: a
+    // caller is handed the id of the turn its task will run in even though that
+    // turn starts minutes later, so the completion can be matched back to THIS
+    // request and not to whatever else the child was doing (issue #201).
+    let turn_id = mint_turn_id(turn_ids);
+    queue.parked.push_back(DeferredLine {
+        turn_id: turn_id.clone(),
+        text: text.to_string(),
+    });
+    match persist_deferred_input(project_dir, sid, &queue) {
+        Ok(()) => Some((turn_id, queue.parked.len())),
+        Err(error) => {
+            tracing::warn!(
+                session = %sid,
+                %error,
+                "stream-json: parked line could not be mirrored to disk"
+            );
+            match on_unmirrorable {
+                OnUnmirrorable::TakeItBack => {
+                    queue.parked.pop_back();
+                    None
+                }
+                OnUnmirrorable::KeepItParked => Some((turn_id, queue.parked.len())),
+            }
+        }
+    }
+}
+
+/// Advance the queue at a turn boundary — under ONE lock hold, for the reason
+/// [`park_deferred_line`] gives.
+///
+/// Retires the line the ending turn consumed, takes the next one, reserves its
+/// execution-turn id, records it as IN FLIGHT and mirrors the result. The
+/// write-ahead is the point: the line is durable, under the turn id it will
+/// open, BEFORE its bytes go out, and it leaves the mirror only when the
+/// boundary that consumed it arrives. The old order — write, then delete — left
+/// a window in which the line existed nowhere but the child's stdin buffer, and
+/// a daemon that died there took the task with it.
+fn advance_deferred_queue(
+    queue: &StdMutex<DeferredQueue>,
+    turn_ids: &StdMutex<TurnIdentity>,
+    active_turn: &AtomicBool,
+    project_dir: &Path,
+    sid: &str,
+) -> Option<DeferredLine> {
+    let Ok(mut queue) = queue.lock() else {
+        active_turn.store(false, Ordering::Release);
+        return None;
+    };
+    active_turn.store(false, Ordering::Release);
+    let retired = queue.in_flight.take().is_some();
+    let next = queue.parked.pop_front();
+    if let Some(line) = next.as_ref() {
+        active_turn.store(true, Ordering::Release);
+        // The turn this line opens must report the id the dispatcher was handed
+        // at park time, or its request could never be resolved by identity.
+        if let Ok(mut ids) = turn_ids.lock() {
+            ids.reserve(&line.turn_id);
+        }
+        queue.in_flight = Some(line.clone());
+    }
+    if next.is_some() || retired {
+        if let Err(error) = persist_deferred_input(project_dir, sid, &queue) {
+            tracing::warn!(
+                session = %sid,
+                %error,
+                "stream-json: deferred input mirror was not written ahead"
+            );
+        }
+    }
+    next
+}
+
+/// Take the session's turn-identity lock, tolerating poisoning: a panicked
+/// holder must not take the whole session's submit path down with it.
+fn lock_turn_ids(ids: &StdMutex<TurnIdentity>) -> std::sync::MutexGuard<'_, TurnIdentity> {
+    ids.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Mint one execution-turn id off the session's shared identity.
+fn mint_turn_id(ids: &StdMutex<TurnIdentity>) -> String {
+    lock_turn_ids(ids).mint()
 }
 
 /// Receipt for a vendor slash command parked behind the in-flight turn
@@ -1642,9 +1959,13 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // submitted and deserves a clean turn of its own (an eager replay would
         // turn it into a steer of a stale notification's turn); the status tap
         // flushes the parked lines after that turn's `result`, in order.
-        let deferred_input: Arc<StdMutex<VecDeque<String>>> = Arc::new(StdMutex::new(
+        let deferred_input: Arc<StdMutex<DeferredQueue>> = Arc::new(StdMutex::new(
             load_deferred_input(&ctx.project_dir, &ctx.sid),
         ));
+        let turn_ids: Arc<StdMutex<TurnIdentity>> =
+            Arc::new(StdMutex::new(TurnIdentity::default()));
+        let narration: Arc<StdMutex<crate::NarrationAccumulator>> =
+            Arc::new(StdMutex::new(crate::NarrationAccumulator::default()));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
@@ -1655,10 +1976,14 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // `status.json` (see `StreamJsonTransport::status_task`).
         transport.attach_status_task(spawn_status_tap(
             Arc::clone(&transport),
-            Arc::clone(&status),
-            Arc::clone(&running_tasks),
-            Arc::clone(&active_turn),
-            Arc::clone(&deferred_input),
+            StatusTapCells {
+                status: Arc::clone(&status),
+                running_tasks: Arc::clone(&running_tasks),
+                active_turn: Arc::clone(&active_turn),
+                deferred_input: Arc::clone(&deferred_input),
+                turn_ids: Arc::clone(&turn_ids),
+                narration: Arc::clone(&narration),
+            },
             ctx.project_dir.clone(),
             ctx.sid.clone(),
         ));
@@ -1729,6 +2054,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             running_tasks,
             active_turn,
             deferred_input,
+            turn_ids,
+            narration,
         };
         let live = Arc::new(live);
         // Body record lifecycle: the record written at spawn is cleared the
@@ -1844,36 +2171,64 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             // mirror is written under the queue lock (the tap cannot flush the
             // line in between); if the disk refuses, the line is taken back
             // and written now instead — read twice by claude, never lost.
-            let parked = match live.deferred_input.lock() {
-                Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
-                    queue.push_back(text.clone());
-                    match persist_deferred_input(&live.project_dir, &live.identity.sid, &queue) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            queue.pop_back();
-                            tracing::warn!(
-                                session = %live.identity.sid,
-                                %error,
-                                "stream-json: queued turn could not be mirrored to disk; \
-                                 writing it mid-turn instead"
-                            );
-                            false
-                        }
-                    }
-                }
-                _ => false,
-            };
-            if parked {
-                return Ok(TurnSubmission::queued(synthetic_turn_id()));
+            //
+            // The parked line's EXECUTION-turn id is minted here, before it is
+            // durable, and travels with it: a caller is handed the id of the
+            // turn its task will run in even though that turn starts minutes
+            // later, so the completion can be matched back to THIS request and
+            // not to whatever else the child was doing (issue #201).
+            let parked = park_deferred_line(
+                &live.deferred_input,
+                &live.turn_ids,
+                &live.active_turn,
+                &live.project_dir,
+                &live.identity.sid,
+                &text,
+                OnUnmirrorable::TakeItBack,
+            );
+            if let Some((turn_id, position)) = parked {
+                return Ok(TurnSubmission::queued_at(TurnId::new(turn_id), position));
             }
         }
-        let was_active = live.active_turn.swap(true, Ordering::AcqRel);
+        // Reserve the identity BEFORE the bytes go out. An idle session's line
+        // opens a turn that must report THIS id; a mid-turn line joins the turn
+        // already running and the receipt names that one, so a dispatcher is
+        // told which turn its steer landed in rather than an id nothing else
+        // ever mentions.
+        let (turn_id, was_active) = {
+            let was_active = live.active_turn.swap(true, Ordering::AcqRel);
+            let mut ids = lock_turn_ids(&live.turn_ids);
+            if was_active {
+                // A turn is running; its id is authoritative. `current` can
+                // still be None in the sliver between a line being written and
+                // the child's first message — reserve one so both agree.
+                let id = ids.current().unwrap_or_else(|| {
+                    let id = ids.mint();
+                    ids.reserve(&id);
+                    id
+                });
+                // …and claude will re-run this line as the prompt of the NEXT
+                // turn, so the turn it joined does not end this dispatch. The
+                // binding rides the joined turn's id and moves onto the replay
+                // turn when that opens (GitHub #199).
+                ids.note_injected();
+                (id, true)
+            } else {
+                let id = ids.mint();
+                ids.reserve(&id);
+                (id, false)
+            }
+        };
         if let Err(error) = live
             .transport
             .send_line(protocol::user_text_line(&text))
             .await
         {
             live.active_turn.store(was_active, Ordering::Release);
+            if !was_active {
+                // Nothing was delivered, so no turn will open under this id.
+                lock_turn_ids(&live.turn_ids).clear_reservation(&turn_id);
+            }
             // Writer closed = the child exited mid-handoff (the probe→send
             // race): the line was NOT delivered, so it's a recoverable
             // ThreadDied the gateway resumes + retries once.
@@ -1882,12 +2237,30 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             )));
         }
 
-        let turn_id = synthetic_turn_id();
+        let turn_id = TurnId::new(turn_id);
         if was_active {
             Ok(TurnSubmission::injected(turn_id))
         } else {
             Ok(TurnSubmission::started(turn_id))
         }
+    }
+
+    /// What this session's in-flight turn has said so far — `None` when no
+    /// turn is open. The execution id comes from [`TurnIdentity::current`], so
+    /// a turn that has been submitted but has not produced its first message
+    /// yet still names the turn it reserved (an explicit stop in that window
+    /// records a turn that ran and said nothing, not a turn that never was).
+    fn in_flight_narration(&self, h: &ThreadHandle) -> Option<crate::PartialNarration> {
+        let live = self.lookup(&h.identity)?;
+        if !live.active_turn.load(Ordering::Acquire) {
+            return None;
+        }
+        let exec_turn_id = lock_turn_ids(&live.turn_ids).current();
+        let partial = match live.narration.lock() {
+            Ok(n) => n.partial(exec_turn_id),
+            Err(poisoned) => poisoned.into_inner().partial(exec_turn_id),
+        };
+        Some(partial)
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -1902,9 +2275,13 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         let status = Arc::clone(&live.status);
         let project_dir = live.project_dir.clone();
         let sid = live.identity.sid.clone();
+        // The translator shares the session's turn identity, so the id a
+        // submission was handed is the id its `TurnStarted`/`TurnCompleted`
+        // carry (issue #201 — they used to be two unrelated id spaces).
+        let translator_identity = Arc::clone(&live.turn_ids);
         let (tx, rx) = mpsc::channel::<ThreadEvent>(64);
         tokio::spawn(async move {
-            let mut translator = StreamTranslator::new();
+            let mut translator = StreamTranslator::attached(translator_identity);
             loop {
                 tokio::select! {
                     msg = sub.recv() => match msg {
@@ -2306,29 +2683,19 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 // `active_turn` and pops under the same lock, so this can never
                 // park behind a turn that has already ended.
                 if let Some(live) = self.lookup(&h.identity) {
-                    let parked = match live.deferred_input.lock() {
-                        Ok(mut queue) if live.active_turn.load(Ordering::Acquire) => {
-                            queue.push_back(line.clone());
-                            // Best-effort mirror: a slash command is not an
-                            // at-least-once contract, so a disk refusal keeps
-                            // it parked in memory rather than degrading it
-                            // into prose (issue #193).
-                            if let Err(error) = persist_deferred_input(
-                                &live.project_dir,
-                                &live.identity.sid,
-                                &queue,
-                            ) {
-                                tracing::warn!(
-                                    session = %live.identity.sid,
-                                    %error,
-                                    "stream-json: deferred slash command was not mirrored to disk"
-                                );
-                            }
-                            Some(queue.len())
-                        }
-                        _ => None,
-                    };
-                    if let Some(position) = parked {
+                    // A slash command carries a turn identity too: it opens a
+                    // turn of its own when it flushes, and the translator must
+                    // be able to name that turn.
+                    let parked = park_deferred_line(
+                        &live.deferred_input,
+                        &live.turn_ids,
+                        &live.active_turn,
+                        &live.project_dir,
+                        &live.identity.sid,
+                        &line,
+                        OnUnmirrorable::KeepItParked,
+                    );
+                    if let Some((_, position)) = parked {
                         return Ok(DirectiveOutcome::Done {
                             receipt: deferred_slash_receipt(&line, position),
                         });
@@ -2478,6 +2845,166 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         Ok(crate::execution::vendor_title::push_claude_custom_title(
             &target, title,
         ))
+    }
+}
+
+#[cfg(test)]
+mod deferred_queue_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// GitHub #197 — the queue mutex is this session's ONE writer of
+    /// `deferred-input.json`, and the mirror is written while it is held.
+    ///
+    /// It used to be snapshot-then-persist: the boundary path cloned the queue,
+    /// released the lock, and wrote. A park landing in that gap persisted its
+    /// own snapshot first and the stale one overwrote it — the line stayed in
+    /// memory, so nothing looked wrong until the process died, and the next
+    /// life of the sid replays only what is on disk.
+    ///
+    /// Eight parkers race one boundary loop while an auditor samples the
+    /// invariant continuously: a line the parker was TOLD was accepted is, at
+    /// every instant, either already handed out by a boundary or still in the
+    /// durable mirror. Never neither.
+    #[test]
+    fn a_park_racing_a_boundary_never_loses_a_line_from_the_mirror() {
+        const PARKERS: usize = 8;
+        const PER_PARKER: usize = 60;
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let sid = "s9";
+        let queue = Arc::new(StdMutex::new(DeferredQueue::default()));
+        let turn_ids = Arc::new(StdMutex::new(TurnIdentity::default()));
+        // A turn is always "in flight" here: every submission parks, and the
+        // boundary loop is what drains them.
+        let active = Arc::new(AtomicBool::new(true));
+        let accepted = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let handed_out = Arc::new(StdMutex::new(std::collections::HashSet::<String>::new()));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let violations = Arc::new(StdMutex::new(Vec::<String>::new()));
+
+        std::thread::scope(|scope| {
+            for _ in 0..PARKERS {
+                let (queue, turn_ids, active) = (
+                    Arc::clone(&queue),
+                    Arc::clone(&turn_ids),
+                    Arc::clone(&active),
+                );
+                let (project_dir, accepted, finished) = (
+                    project_dir.clone(),
+                    Arc::clone(&accepted),
+                    Arc::clone(&finished),
+                );
+                scope.spawn(move || {
+                    for n in 0..PER_PARKER {
+                        if let Some((turn_id, _)) = park_deferred_line(
+                            &queue,
+                            &turn_ids,
+                            &active,
+                            &project_dir,
+                            sid,
+                            &format!("task {n}"),
+                            OnUnmirrorable::TakeItBack,
+                        ) {
+                            // On disk before it is claimed accepted: that is
+                            // what `park_deferred_line` returning `Some` means.
+                            accepted.lock().unwrap().push(turn_id);
+                        }
+                    }
+                    finished.fetch_add(1, Ordering::Release);
+                });
+            }
+            {
+                let (queue, turn_ids, active) = (
+                    Arc::clone(&queue),
+                    Arc::clone(&turn_ids),
+                    Arc::clone(&active),
+                );
+                let (project_dir, handed_out, finished) = (
+                    project_dir.clone(),
+                    Arc::clone(&handed_out),
+                    Arc::clone(&finished),
+                );
+                scope.spawn(move || loop {
+                    let done = finished.load(Ordering::Acquire) == PARKERS;
+                    let line =
+                        advance_deferred_queue(&queue, &turn_ids, &active, &project_dir, sid);
+                    // A boundary re-opens the window the next park needs.
+                    active.store(true, Ordering::Release);
+                    match line {
+                        Some(line) => {
+                            handed_out.lock().unwrap().insert(line.turn_id);
+                        }
+                        // Nothing left to hand out and nobody is still parking.
+                        None if done => return,
+                        None => std::thread::yield_now(),
+                    }
+                });
+            }
+            let (project_dir, accepted, handed_out, finished, violations) = (
+                project_dir.clone(),
+                Arc::clone(&accepted),
+                Arc::clone(&handed_out),
+                Arc::clone(&finished),
+                Arc::clone(&violations),
+            );
+            scope.spawn(move || {
+                loop {
+                    let done = finished.load(Ordering::Acquire) == PARKERS;
+                    let claimed = accepted.lock().unwrap().clone();
+                    let on_disk = mirrored_turn_ids(&project_dir, sid);
+                    // Read the delivered set LAST: a line handed out between
+                    // the two reads shows up here, never as a false loss.
+                    let delivered = handed_out.lock().unwrap().clone();
+                    for id in claimed {
+                        if !on_disk.contains(&id) && !delivered.contains(&id) {
+                            violations.lock().unwrap().push(id);
+                        }
+                    }
+                    if done {
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+        });
+
+        let accepted = accepted.lock().unwrap().clone();
+        // A park landing in the instant between a boundary closing the turn and
+        // the next one opening is refused ("the session is idle, write it now")
+        // — the check-and-park rule working, not a loss.
+        assert!(
+            accepted.len() > PARKERS * PER_PARKER / 2,
+            "fixture parked almost nothing ({} of {})",
+            accepted.len(),
+            PARKERS * PER_PARKER
+        );
+        let violations = violations.lock().unwrap().clone();
+        assert!(
+            violations.is_empty(),
+            "{} accepted lines were, at some instant, neither delivered nor in \
+             the mirror — a crash there loses them: {:?}",
+            violations.len(),
+            &violations[..violations.len().min(4)]
+        );
+    }
+
+    /// Every turn id the durable mirror currently holds, in either section.
+    fn mirrored_turn_ids(project_dir: &Path, sid: &str) -> std::collections::HashSet<String> {
+        let path = deferred_input_path(project_dir, sid);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return std::collections::HashSet::new();
+        };
+        let Ok(mirror) = serde_json::from_slice::<DeferredMirror>(&bytes) else {
+            return std::collections::HashSet::new();
+        };
+        mirror
+            .queue
+            .parked
+            .iter()
+            .chain(mirror.queue.in_flight.iter())
+            .map(|line| line.turn_id.clone())
+            .collect()
     }
 }
 
@@ -3180,5 +3707,44 @@ mod effort_shape_tests {
             extract_effort_from_settings(&json!({"effective": {"effortLevel": "  "}})),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod in_flight_narration_tests {
+    /// GitHub #197 (E/G) — stream-json's shape is a CUMULATIVE snapshot per
+    /// message: claude re-states a step's whole text block set as the step
+    /// grows, so folding one in twice used to duplicate the paragraph. The
+    /// bounded-tail contract itself is proved on the shared accumulator
+    /// (`adapter.rs`); this pins the KEY this adapter folds with.
+    #[test]
+    fn a_restated_assistant_message_stays_one_paragraph() {
+        let mut n = crate::NarrationAccumulator::default();
+        let msg = |id: &str, text: &str| serde_json::json!({ "id": id, "content": [{ "type": "text", "text": text }] });
+        let first = msg("msg_01", "reading the brief");
+        n.set_snapshot(
+            first["id"].as_str().unwrap_or_default(),
+            &super::translate::public_text(&first),
+        );
+        let restated = msg("msg_01", "reading the brief, then the tests");
+        n.set_snapshot(
+            restated["id"].as_str().unwrap_or_default(),
+            &super::translate::public_text(&restated),
+        );
+        assert_eq!(n.text(), "reading the brief, then the tests");
+
+        let next = msg("msg_02", "patching now");
+        n.set_snapshot(
+            next["id"].as_str().unwrap_or_default(),
+            &super::translate::public_text(&next),
+        );
+        assert_eq!(
+            n.text(),
+            "reading the brief, then the tests\n\npatching now"
+        );
+
+        // A boundary hands the narration to the transcript.
+        n.clear();
+        assert_eq!(n.text(), "");
     }
 }

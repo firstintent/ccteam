@@ -1,17 +1,21 @@
-//! v0.9.0 W2 (F2/F7) — durable delegation watch: the crash-safe record of a
-//! parent's interest in a child's completion.
+//! Durable delegation requests: the crash-safe record of every dispatch a
+//! parent has outstanding against one child.
 //!
 //! Lives at `<project>/.ccteam/chat/<child_sid>/delegation.json`, written with
 //! the same `atomic_write_durable` (tmp+fsync+rename) discipline as `meta.json`
-//! so a power-loss can never leave a half-written watch. There is at most ONE
-//! watch per child (a later dispatch to the same child overwrites/updates it —
-//! "one child has one pending parent" per the steer semantics), and it lives
-//! only until the dispatched task's turn boundary, which spends it (the file is
-//! removed). The gateway
-//! keeps an in-memory mirror for the hot path; this file is the SoT that a
-//! daemon-restart reconcile reads to deliver any completion notifications that
-//! were missed while the daemon was down (at-least-once, deduped by
-//! `notified_turns`).
+//! so a power-loss can never leave a half-written record. A child holds MANY
+//! requests at once (issue #201: one watch per child meant a second dispatch
+//! silently took over the first one's parent, notify mode and title, and the
+//! first task's completion was reported under the second task's name). Each
+//! request carries its own identity, its own parent and its own notify mode
+//! from the moment ccteam accepts it — before the vendor is written to — and is
+//! resolved only by the execution turn it is BOUND to, never by recency,
+//! timestamp or queue position.
+//!
+//! The gateway keeps an in-memory mirror for the hot path; this file is the SoT
+//! that a daemon-restart reconcile reads to deliver any completion
+//! notifications that were missed while the daemon was down (at-least-once,
+//! deduped by `notified_turns`).
 
 use std::path::{Path, PathBuf};
 
@@ -20,15 +24,16 @@ use serde::{Deserialize, Serialize};
 
 use super::fs_atomic::atomic_write_durable;
 use super::turns_mirror::chat_dir;
+use crate::TurnRouting;
 
-/// When a delegation watch wakes the parent. The unit of the notification
+/// When a delegation request wakes its parent. The unit of the notification
 /// contract is the TASK (a vendor turn), not each mirrored assistant message —
 /// a chatty child (codex narrates checkpoints as separate messages inside one
-/// turn) must not flood the parent's context. In every mode the watch covers
-/// exactly ONE task: the turn boundary that ends the dispatched task also
-/// spends the watch (v0.10.1), so a child that keeps living its own life after
-/// the task — an IM root, a session someone else drives — never keeps feeding
-/// the dispatcher.
+/// turn) must not flood the parent's context. In every mode a request covers
+/// exactly ONE task: the boundary of the turn it is BOUND to resolves it and
+/// nothing else, so a child that keeps living its own life after the task — an
+/// IM root, a session someone else drives — never keeps feeding the
+/// dispatcher, and a second dispatch never inherits the first one's answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotifyMode {
     /// Notify once, at the vendor turn boundary — the child finished the
@@ -101,64 +106,517 @@ impl Serialize for NotifyMode {
 
 impl<'de> Deserialize<'de> for NotifyMode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // One parser for the wire and for the state file. The retired `all`
+        // used to be tolerated here so a `delegation.json` written before its
+        // removal still loaded; that shape is now rejected wholesale by
+        // [`DELEGATION_SCHEMA`], so the exception has nothing left to protect.
         let v = serde_json::Value::deserialize(d)?;
-        // State-file robustness, NOT an API alias: a `delegation.json` written
-        // before `all` was retired must still load, or a daemon restart would
-        // drop that child's completion notification entirely. It reads as the
-        // `final` the notifier has been treating it as since v0.9.5.
-        if v.as_str()
-            .is_some_and(|raw| raw.trim().eq_ignore_ascii_case("all"))
-        {
-            tracing::warn!("delegation watch carries retired notify `all`; reading it as `final`");
-            return Ok(NotifyMode::Final);
-        }
         NotifyMode::parse_value(&v).map_err(serde::de::Error::custom)
     }
 }
 
-/// One child's completion watch — who to notify, and what has already been
-/// notified (dedup key = `(child_sid, turn_id)`). Lifetime = ONE dispatched
-/// task: armed by a dispatch, spent by that task's turn boundary.
+/// Where one accepted dispatch stands. The four facts a parent needs are
+/// distinct on purpose (issue #201): ccteam accepting a request, ccteam
+/// retaining it in a queue, the bytes reaching the harness, and the harness
+/// being observed running it are four different claims, and a stdin flush is
+/// not proof the model read anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestState {
+    /// Persisted by ccteam; the harness has not been written to yet. After a
+    /// crash here delivery is UNKNOWN, never "not delivered".
+    Accepted,
+    /// Retained in a FIFO ahead of the harness — the vendor has not seen it.
+    Queued,
+    /// Written to the harness. Nothing has been observed executing it yet.
+    Submitted,
+    /// The harness opened the turn this request is bound to.
+    Executing,
+    /// That turn completed normally.
+    Answered,
+    /// That turn ended in a vendor error.
+    Failed,
+    /// The turn was cut short (an explicit stop).
+    Interrupted,
+    /// Confirmed never handed to the vendor.
+    Undelivered,
+}
+
+impl RequestState {
+    /// Terminal states no longer wait for a turn boundary.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RequestState::Answered
+                | RequestState::Failed
+                | RequestState::Interrupted
+                | RequestState::Undelivered
+        )
+    }
+
+    /// Stable lowercase wire token (the `agent_read{sid}` request rows).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestState::Accepted => "accepted",
+            RequestState::Queued => "queued",
+            RequestState::Submitted => "submitted",
+            RequestState::Executing => "executing",
+            RequestState::Answered => "answered",
+            RequestState::Failed => "failed",
+            RequestState::Interrupted => "interrupted",
+            RequestState::Undelivered => "undelivered",
+        }
+    }
+}
+
+/// One non-terminal turn boundary a request has already ridden through.
+///
+/// A vendor that wakes its own model ends several turns on one dispatched
+/// task: claude answers a `<task-notification>` in a brand-new turn every time
+/// a background task, a `Monitor` or an `Agent` it launched finishes. Those
+/// boundaries are real (they are billed, and their text is in the ledger) but
+/// they answer nothing, so the request keeps its binding and the parent is not
+/// woken. This is the trail that says so — what a reader sees instead of
+/// silence while a long task runs (GitHub #198/#199).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegationWatch {
-    /// The sid of the session to notify when a watched turn completes (the
-    /// dispatcher's principal — usually, but not necessarily, the spawner).
+pub struct RequestProgress {
+    /// The adapter's execution turn that ended without settling anything.
+    pub exec_turn_id: String,
+    /// ISO-8601 observation time (diagnostic; never a matching key).
+    pub at: String,
+}
+
+/// How many non-terminal boundaries one request remembers. A chain of vendor
+/// continuations has no upper bound in the protocol, and this record is
+/// rewritten on every dispatch — so the oldest are dropped and the count of
+/// what was dropped is not kept: the trail is for a reader, never a key.
+pub const REQUEST_PROGRESS_HISTORY: usize = 10;
+
+/// One accepted dispatch, with the identity everything else keys off.
+///
+/// Minted and written to disk BEFORE the vendor submit, so a crash in the
+/// window between acceptance and delivery leaves a request that says exactly
+/// that instead of vanishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRequest {
+    /// Opaque, monotone-per-process request identity (`req-<nanos>-<seq>`).
+    /// The ONLY key a completion is matched on.
+    pub request_id: String,
+    /// The sid of the session to notify when this request's turn completes
+    /// (the dispatcher's principal — usually, but not necessarily, the
+    /// spawner). Per REQUEST: two parents dispatching to one child each get
+    /// their own answer.
     pub parent_sid: String,
     /// When completion delivers a notification turn to `parent_sid` — see
-    /// [`NotifyMode`]. Deserializes the pre-v0.9.5 boolean form too.
+    /// [`NotifyMode`]. Per request: a follow-up that named no mode inherits
+    /// this parent's most recent outstanding request on this child, so a
+    /// deliberate `final` is never silently downgraded to the default.
     pub notify: NotifyMode,
     /// Optional short label carried into the notification / visualization
-    /// (ledger-only — NEVER concatenated into any dispatched prompt).
+    /// (ledger-only — NEVER concatenated into any dispatched prompt). Belongs
+    /// to THIS request; a later dispatch cannot rename it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// The turn id of the most recent dispatch (diagnostic).
+    /// The routing the dispatcher asked for. What the adapter actually did is
+    /// [`Self::state`] + [`Self::turn_id`].
+    pub routing: TurnRouting,
+    /// The caller's idempotency key, when it supplied one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatched_turn: Option<String>,
-    /// ISO-8601 dispatch time (diagnostic).
-    pub dispatched_at: String,
+    pub idempotency_key: Option<String>,
+    /// ISO-8601 acceptance time (diagnostic; NEVER a matching key).
+    pub created_at: String,
+    pub state: RequestState,
+    /// 1-based waiting position while [`RequestState::Queued`], when the
+    /// adapter can observe its own queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
+    /// The adapter's EXECUTION turn id this request is bound to. Several
+    /// injected requests legitimately share one; a queued request carries the
+    /// id of the turn its parked line will open (minted at park time and kept
+    /// across a restart, so a reconcile rebinds by identity).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// The `turns.jsonl` row id that answered it — what an exact re-read of
+    /// this request's own answer selects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_turn: Option<String>,
+    /// Whether the parent has been told. Separate from `state` so an
+    /// at-least-once redelivery after a restart cannot double-notify.
+    #[serde(default)]
+    pub notified: bool,
+    /// Non-terminal boundaries this request has already passed — see
+    /// [`RequestProgress`]. Newest last, bounded by
+    /// [`REQUEST_PROGRESS_HISTORY`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<RequestProgress>,
+    /// Why this request's binding could not be made durable, when that
+    /// happened. NEVER persisted — the whole point is that the write failed —
+    /// and never read back: it exists so the live surfaces report `unknown`
+    /// instead of a confident `queued` for a request whose correlation would
+    /// not survive a restart.
+    #[serde(skip)]
+    pub bind_error: Option<String>,
+}
+
+impl DelegationRequest {
+    /// A freshly accepted request: identity and parent are fixed here, before
+    /// anything is written to the vendor.
+    pub fn accepted(
+        parent_sid: impl Into<String>,
+        notify: NotifyMode,
+        title: Option<String>,
+        routing: TurnRouting,
+        idempotency_key: Option<String>,
+    ) -> Self {
+        Self {
+            request_id: mint_request_id(),
+            parent_sid: parent_sid.into(),
+            notify,
+            title,
+            routing,
+            idempotency_key,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            state: RequestState::Accepted,
+            queue_position: None,
+            turn_id: None,
+            answered_turn: None,
+            notified: false,
+            progress: Vec::new(),
+            bind_error: None,
+        }
+    }
+
+    /// Record a boundary that ended without settling this request, dropping the
+    /// oldest once the trail is full. Idempotent per execution turn: a boundary
+    /// re-delivered after a crash must not lengthen the trail.
+    pub fn note_progress(&mut self, exec_turn_id: &str) {
+        if self
+            .progress
+            .iter()
+            .any(|seen| seen.exec_turn_id == exec_turn_id)
+        {
+            return;
+        }
+        self.progress.push(RequestProgress {
+            exec_turn_id: exec_turn_id.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+        let over = self.progress.len().saturating_sub(REQUEST_PROGRESS_HISTORY);
+        if over > 0 {
+            self.progress.drain(..over);
+        }
+    }
+}
+
+static REQUEST_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-unique request identity. Time-ordered for readability only —
+/// nothing ever matches on the timestamp.
+pub fn mint_request_id() -> String {
+    let seq = REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("req-{nanos:x}-{seq:x}")
+}
+
+/// The on-disk shape version. A file that does not carry exactly this is
+/// unreadable, logged and ignored — pre-1.0 there is no migration, and a
+/// half-understood watch is worse than none (it would deliver one parent's
+/// answer to another).
+pub const DELEGATION_SCHEMA: u32 = 2;
+
+/// A completed boundary a delivery has CLAIMED but not yet finished.
+///
+/// The durable half of the two-phase notification protocol (issue #201).
+/// Written before the parent is woken and cleared only once it has been: an
+/// entry still here in a new process life means the previous one died mid-
+/// delivery and the notification is owed. At-least-once is the contract — a
+/// duplicate after a crash is acceptable, a lost completion is not — and within
+/// one life the in-memory twin of this list makes it at-most-once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveringBoundary {
+    /// The dedup key of the boundary being delivered.
+    pub turn_key: String,
+    /// The adapter's execution turn, for the log a human reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_turn_id: Option<String>,
+    /// The requests this boundary resolves.
+    pub request_ids: Vec<String>,
+    /// How many lives have tried. Diagnostic; nothing branches on it.
+    pub attempt: u32,
+}
+
+/// Every request one child holds, outstanding and recently resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRequests {
+    /// Rejects any older shape outright (see [`DELEGATION_SCHEMA`]).
+    pub schema: u32,
+    /// Outstanding requests first, in acceptance order, then a bounded tail of
+    /// resolved ones so a parent that reads late still sees what happened.
+    pub requests: Vec<DelegationRequest>,
     /// Completed child turns already notified — the at-least-once dedup set. A
     /// reconcile after a daemon restart delivers only the completed turns NOT
     /// already in here.
     #[serde(default)]
     pub notified_turns: Vec<String>,
+    /// Boundaries claimed by a delivery that has not finished. See
+    /// [`DeliveringBoundary`].
+    #[serde(default)]
+    pub delivering: Vec<DeliveringBoundary>,
 }
 
-impl DelegationWatch {
-    /// A fresh watch armed by a dispatch (no turns notified yet).
-    pub fn armed(
-        parent_sid: impl Into<String>,
-        notify: NotifyMode,
-        title: Option<String>,
-        dispatched_turn: Option<String>,
-    ) -> Self {
+/// How many resolved requests are kept per child. Enough that a parent which
+/// slept through several completions can still read what happened, bounded so
+/// a long-lived child's file cannot grow without limit.
+pub const RESOLVED_REQUEST_HISTORY: usize = 20;
+
+/// How many delivered turn keys the at-least-once dedup set remembers.
+///
+/// It used to remember all of them, so a child that ran for weeks carried
+/// every turn it had ever answered in a file rewritten on each dispatch. The
+/// oldest are dropped first, and dropping one is safe: the set only guards a
+/// restart reconcile, which delivers nothing for a turn whose request is no
+/// longer outstanding — and a notified turn's request is terminal by
+/// definition. The bound is far larger than any plausible
+/// crash-window backlog so the guard keeps working where it matters.
+pub const NOTIFIED_TURN_HISTORY: usize = 200;
+
+impl Default for DelegationRequests {
+    fn default() -> Self {
         Self {
-            parent_sid: parent_sid.into(),
-            notify,
-            title,
-            dispatched_turn,
-            dispatched_at: chrono::Utc::now().to_rfc3339(),
+            schema: DELEGATION_SCHEMA,
+            requests: Vec::new(),
             notified_turns: Vec::new(),
+            delivering: Vec::new(),
         }
+    }
+}
+
+impl DelegationRequests {
+    /// Append a newly accepted request (never replaces an existing one).
+    pub fn accept(&mut self, request: DelegationRequest) {
+        self.requests.push(request);
+        self.prune();
+    }
+
+    pub fn get(&self, request_id: &str) -> Option<&DelegationRequest> {
+        self.requests.iter().find(|r| r.request_id == request_id)
+    }
+
+    pub fn get_mut(&mut self, request_id: &str) -> Option<&mut DelegationRequest> {
+        self.requests
+            .iter_mut()
+            .find(|r| r.request_id == request_id)
+    }
+
+    /// Requests still waiting for an answer, in acceptance order.
+    pub fn outstanding(&self) -> impl Iterator<Item = &DelegationRequest> {
+        self.requests.iter().filter(|r| !r.state.is_terminal())
+    }
+
+    /// Outstanding requests bound to `turn_id` — exactly the ones a boundary
+    /// on that turn resolves. Never falls back to "the newest": an unbound
+    /// request belongs to no turn yet, and guessing is how one task's answer
+    /// was reported under another task's name.
+    pub fn bound_to<'a>(&'a self, turn_id: &'a str) -> impl Iterator<Item = &'a DelegationRequest> {
+        self.requests
+            .iter()
+            .filter(move |r| !r.state.is_terminal() && r.turn_id.as_deref() == Some(turn_id))
+    }
+
+    /// Record a non-terminal boundary against every outstanding request bound
+    /// to `exec_turn_id`, returning how many were touched. The bindings stay:
+    /// the vendor is still working on those tasks.
+    pub fn note_progress(&mut self, exec_turn_id: &str) -> usize {
+        let mut touched = 0;
+        for request in self.requests.iter_mut() {
+            if request.state.is_terminal() || request.turn_id.as_deref() != Some(exec_turn_id) {
+                continue;
+            }
+            request.note_progress(exec_turn_id);
+            touched += 1;
+        }
+        touched
+    }
+
+    /// Move every outstanding request bound to `from` onto `to` — the turn the
+    /// vendor opened by itself to continue that work. Returns how many moved.
+    ///
+    /// Identity, not recency: a request bound to some other turn (a line still
+    /// parked, a second dispatch already running elsewhere) is untouched, so a
+    /// continuation can never adopt work it is not continuing.
+    pub fn rebind_continuation(&mut self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut moved = 0;
+        for request in self.requests.iter_mut() {
+            if request.state.is_terminal() || request.turn_id.as_deref() != Some(from) {
+                continue;
+            }
+            request.turn_id = Some(to.to_string());
+            moved += 1;
+        }
+        moved
+    }
+
+    /// This parent's most recent outstanding request on this child — the
+    /// precedent an omitted `notify` inherits.
+    pub fn latest_outstanding_for(&self, parent_sid: &str) -> Option<&DelegationRequest> {
+        self.requests
+            .iter()
+            .rev()
+            .find(|r| !r.state.is_terminal() && r.parent_sid == parent_sid)
+    }
+
+    /// Keep every outstanding request and only the newest resolved ones.
+    fn prune(&mut self) {
+        let resolved = self
+            .requests
+            .iter()
+            .filter(|r| r.state.is_terminal())
+            .count();
+        if resolved <= RESOLVED_REQUEST_HISTORY {
+            return;
+        }
+        let mut drop_count = resolved - RESOLVED_REQUEST_HISTORY;
+        self.requests.retain(|r| {
+            if drop_count > 0 && r.state.is_terminal() {
+                drop_count -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Record a delivered boundary so a restart reconcile never repeats it,
+    /// keeping only the most recent [`NOTIFIED_TURN_HISTORY`].
+    pub fn record_notified(&mut self, turn_key: &str) {
+        if self.notified_turns.iter().any(|seen| seen == turn_key) {
+            return;
+        }
+        self.notified_turns.push(turn_key.to_string());
+        let over = self
+            .notified_turns
+            .len()
+            .saturating_sub(NOTIFIED_TURN_HISTORY);
+        if over > 0 {
+            self.notified_turns.drain(..over);
+        }
+    }
+
+    /// Claim a boundary for delivery: phase (a). Returns the attempt number, or
+    /// `None` when it was already delivered.
+    pub fn begin_delivery(
+        &mut self,
+        turn_key: &str,
+        exec_turn_id: Option<String>,
+        request_ids: Vec<String>,
+    ) -> Option<u32> {
+        if self.notified_turns.iter().any(|seen| seen == turn_key) {
+            return None;
+        }
+        if let Some(existing) = self
+            .delivering
+            .iter_mut()
+            .find(|entry| entry.turn_key == turn_key)
+        {
+            // A previous life left this behind: this one takes it over.
+            existing.attempt = existing.attempt.saturating_add(1);
+            existing.request_ids = request_ids;
+            existing.exec_turn_id = exec_turn_id;
+            return Some(existing.attempt);
+        }
+        self.delivering.push(DeliveringBoundary {
+            turn_key: turn_key.to_string(),
+            exec_turn_id,
+            request_ids,
+            attempt: 1,
+        });
+        Some(1)
+    }
+
+    /// Release a claimed boundary without recording it as delivered — the
+    /// delivery could not be made durable, so a reconcile must retry it.
+    pub fn abandon_delivery(&mut self, turn_key: &str) {
+        self.delivering.retain(|entry| entry.turn_key != turn_key);
+    }
+
+    /// Phase (c): the parent has been told. The boundary leaves `delivering`
+    /// and joins the dedup set, in one step so it can never be in neither.
+    pub fn finish_delivery(&mut self, turn_key: &str) {
+        self.delivering.retain(|entry| entry.turn_key != turn_key);
+        self.record_notified(turn_key);
+    }
+
+    /// Boundaries a PREVIOUS life claimed and never finished — what a restart
+    /// still owes. Live claims are tracked in memory, never read back from here.
+    pub fn owed_deliveries(&self) -> impl Iterator<Item = &DeliveringBoundary> {
+        self.delivering.iter()
+    }
+
+    /// True when nothing is left to remember (the file can go).
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty() && self.notified_turns.is_empty() && self.delivering.is_empty()
+    }
+}
+
+mod sealed {
+    /// Private supertrait: nothing outside this crate can name it, so nothing
+    /// outside this crate can implement [`super::DelegationStoreGuard`].
+    pub trait Sealed {}
+}
+
+/// Proof that the caller holds the single-flight claim over one child's
+/// requests.
+///
+/// Every DURABLE write goes through one of these, so a read-modify-write on
+/// `delegation.json` cannot be interleaved by construction rather than by
+/// discipline — two `agent` calls on one busy child used to lose the loser's
+/// binding, and a completion the notifier had already claimed could be
+/// overwritten by an accept reading a stale snapshot (issue #201). Reads are
+/// unguarded: a stale read is a stale read, never a lost write.
+///
+/// SEALED: [`DelegationWriteGuard`] is the only implementor there can ever be.
+/// A downstream crate cannot bring its own token and route around the one
+/// claimed write path, because it cannot name the private supertrait.
+///
+/// Honest scope: this crate cannot verify that a lock is actually held — the
+/// claim lives in the gateway. What the seal buys is that the guard cannot be
+/// implemented behind anyone's back; constructing [`DelegationWriteGuard`] on
+/// purpose is a deliberate, greppable act.
+///
+/// ```compile_fail
+/// struct MyTicket;
+/// impl ccteam_harness::DelegationStoreGuard for MyTicket {
+///     fn child_sid(&self) -> &str { "s1" }
+/// }
+/// ```
+pub trait DelegationStoreGuard: sealed::Sealed {
+    /// The child whose requests the holder may write.
+    fn child_sid(&self) -> &str;
+}
+
+/// The one guard. Minted by `ccteam-im`'s sealed store-IO module from a live
+/// per-child claim, and by this crate's own tests.
+pub struct DelegationWriteGuard(String);
+
+impl DelegationWriteGuard {
+    /// A guard for `child_sid`. The CALLER is asserting it holds that child's
+    /// single-flight claim; see [`DelegationStoreGuard`] for what that means.
+    pub fn for_child(child_sid: impl Into<String>) -> Self {
+        Self(child_sid.into())
+    }
+}
+
+impl sealed::Sealed for DelegationWriteGuard {}
+
+impl DelegationStoreGuard for DelegationWriteGuard {
+    fn child_sid(&self) -> &str {
+        &self.0
     }
 }
 
@@ -167,34 +625,66 @@ pub fn delegation_path(project_dir: &Path, child_sid: &str) -> PathBuf {
     chat_dir(project_dir, child_sid).join("delegation.json")
 }
 
-/// Read the watch for `child_sid` (best-effort: missing / unparseable → `None`).
-pub fn read_delegation_watch(project_dir: &Path, child_sid: &str) -> Option<DelegationWatch> {
-    let raw = std::fs::read_to_string(delegation_path(project_dir, child_sid)).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// Durably write the watch for `child_sid` (tmp+fsync+rename — same discipline
-/// as `meta.json`).
-pub fn write_delegation_watch(
-    project_dir: &Path,
-    child_sid: &str,
-    watch: &DelegationWatch,
-) -> Result<()> {
+/// Read one child's requests. A missing file is `None`; a file this build
+/// cannot read is logged and treated as `None` (fail-closed: an unparseable
+/// record delivers nothing rather than delivering it to the wrong parent).
+pub fn read_delegation_requests(project_dir: &Path, child_sid: &str) -> Option<DelegationRequests> {
     let path = delegation_path(project_dir, child_sid);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    parse_delegation_requests(&raw, &path)
+}
+
+fn parse_delegation_requests(raw: &str, path: &Path) -> Option<DelegationRequests> {
+    match serde_json::from_str::<DelegationRequests>(raw) {
+        Ok(store) if store.schema == DELEGATION_SCHEMA => Some(store),
+        Ok(store) => {
+            tracing::warn!(
+                path = %path.display(),
+                schema = store.schema,
+                want = DELEGATION_SCHEMA,
+                "delegation record has an unreadable schema; ignoring it"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "delegation record is unreadable; ignoring it"
+            );
+            None
+        }
+    }
+}
+
+/// Durably write one child's requests (tmp+fsync+rename — same discipline as
+/// `meta.json`). An empty store removes the file.
+pub fn persist_delegation_requests(
+    project_dir: &Path,
+    claim: &dyn DelegationStoreGuard,
+    store: &DelegationRequests,
+) -> Result<()> {
+    let path = delegation_path(project_dir, claim.child_sid());
+    if store.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
+    }
     std::fs::create_dir_all(path.parent().expect("path has parent"))?;
-    atomic_write_durable(&path, serde_json::to_string_pretty(watch)?.as_bytes())
+    atomic_write_durable(&path, serde_json::to_string_pretty(store)?.as_bytes())
 }
 
-/// Drop the watch for `child_sid` (best-effort — used when the parent session
-/// no longer exists so the watch can never fire).
-pub fn remove_delegation_watch(project_dir: &Path, child_sid: &str) {
-    let _ = std::fs::remove_file(delegation_path(project_dir, child_sid));
+/// Drop every request for `child_sid` (best-effort — used when the child is
+/// gone and nothing can ever fire).
+pub fn delete_delegation_requests(project_dir: &Path, claim: &dyn DelegationStoreGuard) {
+    let _ = std::fs::remove_file(delegation_path(project_dir, claim.child_sid()));
 }
 
-/// Scan `<project>/.ccteam/chat/*/delegation.json` and return every parseable
-/// `(child_sid, watch)` pair (child_sid = the chat dir name). Used by the
+/// Scan `<project>/.ccteam/chat/*/delegation.json` and return every readable
+/// `(child_sid, requests)` pair (child_sid = the chat dir name). Used by the
 /// daemon-startup reconcile.
-pub fn scan_delegation_watches(project_dir: &Path) -> Vec<(String, DelegationWatch)> {
+pub fn scan_delegation_requests(project_dir: &Path) -> Vec<(String, DelegationRequests)> {
     let chat_base = project_dir.join(".ccteam").join("chat");
     let Ok(entries) = std::fs::read_dir(&chat_base) else {
         return vec![];
@@ -208,8 +698,8 @@ pub fn scan_delegation_watches(project_dir: &Path) -> Vec<(String, DelegationWat
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if let Ok(watch) = serde_json::from_str::<DelegationWatch>(&raw) {
-            out.push((child_sid, watch));
+        if let Some(store) = parse_delegation_requests(&raw, &path) {
+            out.push((child_sid, store));
         }
     }
     out
@@ -220,20 +710,34 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The gateway's real claim wraps a lock; a unit test here has exclusive
+    /// use of its own tempdir, so the guard only satisfies the signature.
+    fn test_claim(child_sid: &str) -> DelegationWriteGuard {
+        DelegationWriteGuard::for_child(child_sid)
+    }
+
+    fn accepted(parent: &str, notify: NotifyMode, title: Option<&str>) -> DelegationRequest {
+        DelegationRequest::accepted(
+            parent,
+            notify,
+            title.map(str::to_string),
+            TurnRouting::Inject,
+            None,
+        )
+    }
+
     #[test]
     fn write_read_round_trip() {
         let tmp = TempDir::new().unwrap();
-        let watch = DelegationWatch::armed(
-            "s1",
-            NotifyMode::Final,
-            Some("research".into()),
-            Some("s2-3".into()),
-        );
-        write_delegation_watch(tmp.path(), "s2", &watch).unwrap();
-        let back = read_delegation_watch(tmp.path(), "s2").expect("watch reads back");
-        assert_eq!(back.parent_sid, "s1");
-        assert_eq!(back.notify, NotifyMode::Final);
-        assert_eq!(back.title.as_deref(), Some("research"));
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, Some("research")));
+        persist_delegation_requests(tmp.path(), &test_claim("s2"), &store).unwrap();
+        let back = read_delegation_requests(tmp.path(), "s2").expect("requests read back");
+        assert_eq!(back.requests.len(), 1);
+        assert_eq!(back.requests[0].parent_sid, "s1");
+        assert_eq!(back.requests[0].notify, NotifyMode::Final);
+        assert_eq!(back.requests[0].title.as_deref(), Some("research"));
+        assert_eq!(back.requests[0].state, RequestState::Accepted);
         assert!(back.notified_turns.is_empty());
     }
 
@@ -269,59 +773,166 @@ mod tests {
         }
     }
 
-    /// …but a watch persisted before the removal still LOADS: dropping it would
-    /// silently lose that child's completion notification across a restart.
+    /// A record from before the per-request shape is unreadable, not
+    /// half-understood: loading a single-watch file as "the" request would
+    /// hand one parent's answer to another. Fail-closed, no migration.
     #[test]
-    fn persisted_all_watch_degrades_to_final() {
+    fn a_pre_request_watch_file_is_ignored() {
         let tmp = TempDir::new().unwrap();
         let path = delegation_path(tmp.path(), "s2");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            r#"{"parent_sid":"s1","notify":"all","dispatched_at":"2026-01-01T00:00:00Z","notified_turns":[]}"#,
+            r#"{"parent_sid":"s1","notify":"final","dispatched_at":"2026-01-01T00:00:00Z","notified_turns":["s2-1"]}"#,
         )
         .unwrap();
-        let back = read_delegation_watch(tmp.path(), "s2").expect("retired mode still loads");
-        assert_eq!(back.notify, NotifyMode::Final);
+        assert!(read_delegation_requests(tmp.path(), "s2").is_none());
+        assert!(scan_delegation_requests(tmp.path()).is_empty());
+    }
+
+    /// A future shape is refused just as loudly as a past one.
+    #[test]
+    fn a_foreign_schema_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        let path = delegation_path(tmp.path(), "s2");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"schema":999,"requests":[],"notified_turns":[]}"#).unwrap();
+        assert!(read_delegation_requests(tmp.path(), "s2").is_none());
+    }
+
+    /// The regression this shape exists for: a second dispatch to a busy child
+    /// must not take over the first one's parent, notify mode or title.
+    #[test]
+    fn a_second_request_never_overwrites_the_first() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, Some("verdict")));
+        persist_delegation_requests(tmp.path(), &test_claim("s2"), &store).unwrap();
+
+        let mut store = read_delegation_requests(tmp.path(), "s2").unwrap();
+        store.accept(accepted("s9", NotifyMode::Off, Some("cleanup")));
+        persist_delegation_requests(tmp.path(), &test_claim("s2"), &store).unwrap();
+
+        let back = read_delegation_requests(tmp.path(), "s2").unwrap();
+        assert_eq!(back.requests.len(), 2);
+        assert_eq!(back.requests[0].parent_sid, "s1");
+        assert_eq!(back.requests[0].notify, NotifyMode::Final);
+        assert_eq!(back.requests[0].title.as_deref(), Some("verdict"));
+        assert_eq!(back.requests[1].parent_sid, "s9");
+        assert_eq!(back.requests[1].notify, NotifyMode::Off);
+        assert_ne!(back.requests[0].request_id, back.requests[1].request_id);
+    }
+
+    /// A boundary resolves the requests BOUND to that turn — never the newest
+    /// one, and never an unbound one.
+    #[test]
+    fn bound_to_selects_only_that_turns_requests() {
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, Some("A")));
+        store.accept(accepted("s1", NotifyMode::Brief, Some("B")));
+        store.accept(accepted("s7", NotifyMode::Final, Some("C")));
+        let ids: Vec<String> = store
+            .requests
+            .iter()
+            .map(|r| r.request_id.clone())
+            .collect();
+        store.get_mut(&ids[0]).unwrap().turn_id = Some("x-1".into());
+        store.get_mut(&ids[2]).unwrap().turn_id = Some("x-1".into());
+        store.get_mut(&ids[1]).unwrap().turn_id = Some("x-2".into());
+
+        let on_first: Vec<&str> = store
+            .bound_to("x-1")
+            .map(|r| r.title.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(on_first, ["A", "C"]);
+
+        // Resolved requests drop out even when the id still matches.
+        store.get_mut(&ids[0]).unwrap().state = RequestState::Answered;
+        let on_first: Vec<&str> = store
+            .bound_to("x-1")
+            .map(|r| r.title.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(on_first, ["C"]);
+        assert_eq!(store.bound_to("x-9").count(), 0);
+    }
+
+    /// An omitted `notify` inherits THIS parent's precedent, not the child's
+    /// last dispatch from somebody else.
+    #[test]
+    fn notify_precedent_is_per_parent_and_outstanding_only() {
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, None));
+        store.accept(accepted("s9", NotifyMode::Off, None));
+        assert_eq!(
+            store.latest_outstanding_for("s1").map(|r| r.notify),
+            Some(NotifyMode::Final)
+        );
+        assert_eq!(store.latest_outstanding_for("s4"), None);
+
+        // Once the precedent is resolved it is no longer outstanding.
+        let id = store.requests[0].request_id.clone();
+        store.get_mut(&id).unwrap().state = RequestState::Answered;
+        assert_eq!(store.latest_outstanding_for("s1"), None);
     }
 
     #[test]
-    fn overwrite_updates_watch() {
+    fn resolved_history_is_bounded_and_outstanding_is_never_pruned() {
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, Some("keep-me")));
+        for _ in 0..(RESOLVED_REQUEST_HISTORY + 5) {
+            let mut done = accepted("s1", NotifyMode::Final, None);
+            done.state = RequestState::Answered;
+            store.accept(done);
+        }
+        assert_eq!(store.outstanding().count(), 1);
+        assert_eq!(
+            store
+                .requests
+                .iter()
+                .filter(|r| r.state.is_terminal())
+                .count(),
+            RESOLVED_REQUEST_HISTORY
+        );
+        assert!(store
+            .requests
+            .iter()
+            .any(|r| r.title.as_deref() == Some("keep-me")));
+    }
+
+    /// GitHub #197 — the write path takes its child sid FROM the claim, so a
+    /// caller cannot write one child's store while holding another's. The
+    /// signature is the seal (a bare `&str` no longer compiles); this pins the
+    /// half a signature cannot state — that the path is derived from the guard
+    /// and from nothing else.
+    #[test]
+    fn a_write_goes_where_its_claim_says_and_nowhere_else() {
         let tmp = TempDir::new().unwrap();
-        write_delegation_watch(
-            tmp.path(),
-            "s2",
-            &DelegationWatch::armed("s1", NotifyMode::Final, None, None),
-        )
-        .unwrap();
-        // A later dispatch from a different parent overwrites (one pending parent).
-        write_delegation_watch(
-            tmp.path(),
-            "s2",
-            &DelegationWatch::armed("s9", NotifyMode::Off, None, None),
-        )
-        .unwrap();
-        let back = read_delegation_watch(tmp.path(), "s2").unwrap();
-        assert_eq!(back.parent_sid, "s9");
-        assert_eq!(back.notify, NotifyMode::Off);
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, None));
+        persist_delegation_requests(tmp.path(), &test_claim("s2"), &store).unwrap();
+
+        assert!(delegation_path(tmp.path(), "s2").exists());
+        assert!(
+            !delegation_path(tmp.path(), "s3").exists(),
+            "no other child's record is touched"
+        );
+        assert!(read_delegation_requests(tmp.path(), "s3").is_none());
+        delete_delegation_requests(tmp.path(), &test_claim("s3"));
+        assert!(
+            delegation_path(tmp.path(), "s2").exists(),
+            "removing s3 does not remove s2"
+        );
     }
 
     #[test]
-    fn scan_finds_all_watches() {
+    fn scan_finds_every_child() {
         let tmp = TempDir::new().unwrap();
-        write_delegation_watch(
-            tmp.path(),
-            "s2",
-            &DelegationWatch::armed("s1", NotifyMode::Final, None, None),
-        )
-        .unwrap();
-        write_delegation_watch(
-            tmp.path(),
-            "s3",
-            &DelegationWatch::armed("s1", NotifyMode::Final, None, None),
-        )
-        .unwrap();
-        let mut found = scan_delegation_watches(tmp.path());
+        for child in ["s2", "s3"] {
+            let mut store = DelegationRequests::default();
+            store.accept(accepted("s1", NotifyMode::Final, None));
+            persist_delegation_requests(tmp.path(), &test_claim(child), &store).unwrap();
+        }
+        let mut found = scan_delegation_requests(tmp.path());
         found.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].0, "s2");
@@ -331,35 +942,126 @@ mod tests {
     #[test]
     fn read_missing_is_none() {
         let tmp = TempDir::new().unwrap();
-        assert!(read_delegation_watch(tmp.path(), "nope").is_none());
+        assert!(read_delegation_requests(tmp.path(), "nope").is_none());
     }
 
     #[test]
-    fn remove_drops_watch() {
+    fn remove_drops_the_record() {
         let tmp = TempDir::new().unwrap();
-        write_delegation_watch(
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, None));
+        persist_delegation_requests(tmp.path(), &test_claim("s2"), &store).unwrap();
+        delete_delegation_requests(tmp.path(), &test_claim("s2"));
+        assert!(read_delegation_requests(tmp.path(), "s2").is_none());
+    }
+
+    /// Writing an empty store removes the file rather than leaving `{}` behind.
+    #[test]
+    fn an_empty_store_removes_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, None));
+        persist_delegation_requests(tmp.path(), &test_claim("s2"), &store).unwrap();
+        persist_delegation_requests(
             tmp.path(),
-            "s2",
-            &DelegationWatch::armed("s1", NotifyMode::Final, None, None),
+            &test_claim("s2"),
+            &DelegationRequests::default(),
         )
         .unwrap();
-        remove_delegation_watch(tmp.path(), "s2");
-        assert!(read_delegation_watch(tmp.path(), "s2").is_none());
+        assert!(!delegation_path(tmp.path(), "s2").exists());
     }
 
     #[test]
-    fn pre_v095_boolean_watch_still_parses() {
-        // An on-disk delegation.json written before NotifyMode existed.
-        let tmp = TempDir::new().unwrap();
-        let path = delegation_path(tmp.path(), "s2");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            r#"{"parent_sid":"s1","notify":true,"dispatched_at":"2026-01-01T00:00:00Z","notified_turns":["s2-1"]}"#,
-        )
-        .unwrap();
-        let back = read_delegation_watch(tmp.path(), "s2").expect("boolean watch parses");
-        assert_eq!(back.notify, NotifyMode::Final);
-        assert_eq!(back.notified_turns, vec!["s2-1".to_string()]);
+    fn notified_turns_dedupe() {
+        let mut store = DelegationRequests::default();
+        store.record_notified("s2-4#final");
+        store.record_notified("s2-4#final");
+        assert_eq!(store.notified_turns, vec!["s2-4#final".to_string()]);
+    }
+
+    #[test]
+    fn request_ids_are_unique() {
+        let a = mint_request_id();
+        let b = mint_request_id();
+        assert_ne!(a, b);
+        assert!(a.starts_with("req-"));
+    }
+
+    /// GitHub #198 — the vendor opened a turn of its own to carry on the work,
+    /// so the request follows it. By IDENTITY: a request bound to some other
+    /// turn is not swept along, which is the whole point of binding.
+    #[test]
+    fn a_continuation_moves_only_the_requests_that_were_on_that_turn() {
+        let mut store = DelegationRequests::default();
+        for (parent, turn) in [("p1", "x-a"), ("p2", "x-a"), ("p3", "x-other")] {
+            let mut request = accepted(parent, NotifyMode::Final, None);
+            request.turn_id = Some(turn.into());
+            request.state = RequestState::Executing;
+            store.accept(request);
+        }
+        // …and one already answered on x-a: terminal, so it stays put.
+        let mut done = accepted("p4", NotifyMode::Final, None);
+        done.turn_id = Some("x-a".into());
+        done.state = RequestState::Answered;
+        store.accept(done);
+
+        assert_eq!(store.rebind_continuation("x-a", "x-b"), 2);
+        let on = |turn: &str| store.bound_to(turn).count();
+        assert_eq!(on("x-b"), 2, "both outstanding requests moved");
+        assert_eq!(on("x-a"), 0, "nothing outstanding is left on the old turn");
+        assert_eq!(on("x-other"), 1, "an unrelated binding is untouched");
+        assert_eq!(
+            store
+                .requests
+                .iter()
+                .find(|r| r.parent_sid == "p4")
+                .and_then(|r| r.turn_id.clone()),
+            Some("x-a".into()),
+            "a resolved request keeps the turn that answered it"
+        );
+        assert_eq!(
+            store.rebind_continuation("x-b", "x-b"),
+            0,
+            "self-move is a no-op"
+        );
+    }
+
+    /// A boundary that settled nothing is recorded against the requests bound
+    /// to it and changes nothing else — the trail a reader sees instead of
+    /// silence. Idempotent per turn, because an at-least-once redelivery must
+    /// not lengthen it.
+    #[test]
+    fn a_non_terminal_boundary_is_recorded_without_touching_the_binding() {
+        let mut store = DelegationRequests::default();
+        let mut request = accepted("p1", NotifyMode::Final, None);
+        request.turn_id = Some("x-a".into());
+        request.state = RequestState::Executing;
+        store.accept(request);
+
+        assert_eq!(store.note_progress("x-a"), 1);
+        assert_eq!(store.note_progress("x-a"), 1, "still the same one request");
+        assert_eq!(store.note_progress("x-nobody"), 0);
+        let request = &store.requests[0];
+        assert_eq!(request.progress.len(), 1, "the same turn is recorded once");
+        assert_eq!(request.progress[0].exec_turn_id, "x-a");
+        assert_eq!(request.state, RequestState::Executing);
+        assert_eq!(request.turn_id.as_deref(), Some("x-a"));
+        assert!(!request.notified);
+    }
+
+    /// A chain of vendor continuations has no upper bound in the protocol; the
+    /// trail does, so one long-lived request cannot grow the file forever.
+    #[test]
+    fn the_progress_trail_is_bounded() {
+        let mut request = accepted("p1", NotifyMode::Final, None);
+        for n in 0..(REQUEST_PROGRESS_HISTORY * 2) {
+            request.note_progress(&format!("x-{n}"));
+        }
+        assert_eq!(request.progress.len(), REQUEST_PROGRESS_HISTORY);
+        assert_eq!(
+            request.progress.last().map(|p| p.exec_turn_id.as_str()),
+            Some(format!("x-{}", REQUEST_PROGRESS_HISTORY * 2 - 1).as_str()),
+            "the newest is kept"
+        );
     }
 }

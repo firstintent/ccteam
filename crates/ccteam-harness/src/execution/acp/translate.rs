@@ -33,7 +33,37 @@ const LIVENESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Default)]
 pub struct TurnBuffer {
     pub turn_id: String,
+    /// Every chunk of the turn, in order — this becomes the ANSWER, so it is
+    /// whole by definition and grows with the turn.
     pub text: String,
+    /// The bounded TAIL of the same text, kept incrementally.
+    ///
+    /// A read of a running turn used to render the tail by scanning and
+    /// copying `text` on demand, which is O(everything the turn has said) —
+    /// and the gateway asked for it while holding its own lock, so a talkative
+    /// child made every other route wait on a copy that grew all turn. The
+    /// accumulator trims on each chunk instead, so a read costs the cap and
+    /// nothing more (the same shape codex and claude stream-json already use).
+    narration: crate::NarrationAccumulator,
+}
+
+impl TurnBuffer {
+    fn new(turn_id: impl Into<String>) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            text: String::new(),
+            narration: crate::NarrationAccumulator::default(),
+        }
+    }
+
+    /// Append one `agent_message_chunk`. ACP's shape is DELTA and one message
+    /// streams at a time, so the accumulator keeps joining the open part; a
+    /// thought chunk never reaches here, so private reasoning is excluded one
+    /// layer below.
+    fn push_chunk(&mut self, chunk: &str) {
+        self.text.push_str(chunk);
+        self.narration.append_delta("", chunk);
+    }
 }
 
 #[derive(Debug)]
@@ -261,10 +291,7 @@ impl SessionTranslateState {
         done: Arc<Notify>,
         prompt_sent: Option<Arc<AcpWriteBarrier>>,
     ) {
-        self.buffer = Some(TurnBuffer {
-            turn_id: turn_id.into(),
-            text: String::new(),
-        });
+        self.buffer = Some(TurnBuffer::new(turn_id));
         self.turn_done = Some(done);
         self.prompt_sent = prompt_sent;
         self.injection_gate = Some(Arc::new(AcpInjectionGate::default()));
@@ -280,7 +307,7 @@ impl SessionTranslateState {
             self.buffer.as_mut()
         };
         if let Some(b) = target {
-            b.text.push_str(chunk);
+            b.push_chunk(chunk);
         }
     }
 
@@ -289,12 +316,17 @@ impl SessionTranslateState {
             return None;
         }
         let turn_id = super::turn_runner::next_acp_turn_id();
-        self.vendor_started_buffer = Some(TurnBuffer {
-            turn_id: turn_id.clone(),
-            text: String::new(),
-        });
+        self.vendor_started_buffer = Some(TurnBuffer::new(turn_id.clone()));
         self.last_liveness_at = None;
-        Some(ThreadEvent::TurnStarted { turn_id })
+        // `Submitted`, not a vendor continuation: what opens this turn is a
+        // line ccteam delivered (an interjection grok admitted while idle),
+        // simply without a matching `session/prompt` RPC. ACP has no way for
+        // the vendor to wake its own model, so no boundary here is ever a
+        // continuation of the one before it and nobody's binding moves.
+        Some(ThreadEvent::TurnStarted {
+            turn_id,
+            opening: crate::TurnOpening::Submitted,
+        })
     }
 
     /// Signal (once) that the turn boundary was reached.
@@ -310,6 +342,41 @@ impl SessionTranslateState {
         self.prompt_boundary_seen = false;
         self.buffer.take()
     }
+}
+
+/// What an ACP session's in-flight turn has said so far — ONE implementation
+/// for every ACP vendor (grok / opencode / kimi / dsh all reach it through
+/// `HarnessAdapter::in_flight_narration`), GitHub #197 (E/G).
+///
+/// ACP's shape is DELTA (`agent_message_chunk`), and the turn's own
+/// [`TurnBuffer`] folds each chunk into a bounded tail as it arrives —
+/// `agent_thought_chunk` never enters it, so private reasoning is excluded by
+/// construction, one layer below this. All that is left here is to hand that
+/// tail over: no scan, no copy of the whole turn.
+///
+/// `None` when no turn is open. A buffer whose boundary has already been seen
+/// (`prompt_boundary_seen`) is NOT in flight: its text is the answer, waiting
+/// only for the prompt response to carry usage, and handing an answer back as
+/// a partial is exactly the confusion a partial must never cause.
+///
+/// Synchronous and bounded, as the trait requires: the work is proportional to
+/// the cap, never to what the turn has said. Poisoning is recovered rather than
+/// propagated — a panicked writer must not make a stopped turn unreportable.
+pub fn in_flight_narration(
+    state: &std::sync::Mutex<SessionTranslateState>,
+) -> Option<crate::PartialNarration> {
+    let state = match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let buffer = match (&state.buffer, &state.vendor_started_buffer) {
+        (Some(buffer), _) if !state.prompt_boundary_seen => buffer,
+        // A turn the vendor opened itself is just as real, and it is the only
+        // one still running once the prompt turn has sealed.
+        (_, Some(buffer)) => buffer,
+        _ => return None,
+    };
+    Some(buffer.narration.partial(Some(buffer.turn_id.clone())))
 }
 
 /// Apply one notification. Client-started final messages wait for the prompt
@@ -622,6 +689,9 @@ fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<Thread
             usage: UnifiedTokenUsage::default(),
             model: state.model.clone(),
             conclusion: None,
+            // An ACP turn ends when the prompt it answers ends: the vendor
+            // holds nothing that would re-open it.
+            continuation: crate::TurnContinuation::Settled,
         },
     ]
 }
@@ -715,6 +785,7 @@ pub fn finalize_from_prompt_result(
         usage,
         model: terminal_model,
         conclusion: None,
+        continuation: crate::TurnContinuation::Settled,
     });
     out
 }
@@ -883,6 +954,126 @@ mod tests {
             Some(17_580),
             "a no-model-call turn must not blank the last real measurement"
         );
+    }
+
+    /// GitHub #197 (G) — ACP's own wire shape read back mid-turn: the
+    /// `agent_message_chunk` deltas accumulate (a chunk is never a snapshot),
+    /// `agent_thought_chunk` never appears, the excerpt names the execution
+    /// turn a request is bound to, and a boundary that has been SEEN is an
+    /// answer rather than a partial. Grok / kimi / opencode / dsh all read
+    /// through this one path.
+    #[test]
+    fn an_in_flight_acp_turn_reports_its_chunks_and_never_its_thoughts() {
+        let state = std::sync::Mutex::new(SessionTranslateState::default());
+        let chunk = |kind: &str, text: &str| Notification {
+            method: "session/update".into(),
+            params: json!({
+                "update": { "sessionUpdate": kind, "content": {"type": "text", "text": text} }
+            }),
+        };
+        let feed = |kind: &str, text: &str| {
+            let mut st = state.lock().unwrap();
+            apply_notification(&mut st, &chunk(kind, text));
+        };
+
+        // Nothing running: there is no partial to report, which is not the
+        // same as reporting an empty one.
+        assert_eq!(in_flight_narration(&state), None);
+
+        state
+            .lock()
+            .unwrap()
+            .begin_turn("t-9", Arc::new(Notify::new()));
+        let started = in_flight_narration(&state).expect("a begun turn is in flight");
+        assert_eq!(started.text, "", "it has not spoken yet — a FACT");
+        assert_eq!(started.exec_turn_id.as_deref(), Some("t-9"));
+
+        feed("agent_thought_chunk", "SECRET reasoning");
+        feed("agent_message_chunk", "reading ");
+        feed("agent_message_chunk", "the brief");
+        let partial = in_flight_narration(&state).expect("mid-turn");
+        assert_eq!(partial.text, "reading the brief");
+        assert!(!partial.truncated());
+        assert!(!partial.text.contains("SECRET"), "{partial:?}");
+
+        // Long narration keeps the TAIL and says how much it dropped.
+        feed(
+            "agent_message_chunk",
+            &"z".repeat(crate::IN_FLIGHT_NARRATION_MAX_CHARS),
+        );
+        let bounded = in_flight_narration(&state).expect("mid-turn");
+        assert_eq!(
+            bounded.text.chars().count(),
+            crate::IN_FLIGHT_NARRATION_MAX_CHARS
+        );
+        assert_eq!(bounded.omitted_chars, "reading the brief".chars().count());
+        assert!(bounded.text.ends_with('z'));
+
+        // The boundary landed: that text is the ANSWER now, and handing an
+        // answer back as a partial is what a partial must never do.
+        {
+            let mut st = state.lock().unwrap();
+            apply_notification(
+                &mut st,
+                &Notification {
+                    method: "session/update".into(),
+                    params: json!({"update": {"sessionUpdate": "turn_completed"}}),
+                },
+            );
+        }
+        assert_eq!(in_flight_narration(&state), None);
+    }
+
+    /// GitHub #197 (G), checker — the read is bounded BY CONSTRUCTION, not by
+    /// scanning what the turn has said.
+    ///
+    /// It used to render the tail with `bounded_tail(&buffer.text, cap)`, which
+    /// costs a pass over everything the turn had produced — and the gateway
+    /// asked for it while holding its own mutex, so a talkative child made
+    /// every other route in the daemon wait on a copy that grew all turn. The
+    /// bounded tail is now folded in as each chunk arrives.
+    ///
+    /// Pinned by planting text the accumulator never saw: if the read still
+    /// derived from `buffer.text`, this would move it.
+    #[test]
+    fn an_in_flight_read_never_scans_the_turns_full_text() {
+        let state = std::sync::Mutex::new(SessionTranslateState::default());
+        state
+            .lock()
+            .unwrap()
+            .begin_turn("t-1", Arc::new(Notify::new()));
+        let feed = |text: &str| {
+            let mut st = state.lock().unwrap();
+            apply_notification(
+                &mut st,
+                &Notification {
+                    method: "session/update".into(),
+                    params: json!({
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text},
+                        }
+                    }),
+                },
+            );
+        };
+        feed("reading ");
+        feed("the brief");
+
+        // The turn's own text keeps every chunk — it becomes the ANSWER — and
+        // it is the thing that grows without bound.
+        {
+            let mut st = state.lock().unwrap();
+            let buffer = st.buffer.as_mut().expect("a turn is open");
+            assert_eq!(buffer.text, "reading the brief");
+            buffer.text.push_str(&"q".repeat(1_000_000));
+        }
+        let partial = in_flight_narration(&state).expect("mid-turn");
+        assert_eq!(
+            partial.text, "reading the brief",
+            "the read comes from the incremental tail, not from the turn's text"
+        );
+        assert_eq!(partial.omitted_chars, 0, "{partial:?}");
     }
 
     #[test]
@@ -1219,7 +1410,7 @@ mod tests {
         let synthetic_id = opened
             .iter()
             .find_map(|event| match event {
-                ThreadEvent::TurnStarted { turn_id } => Some(turn_id.clone()),
+                ThreadEvent::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
                 _ => None,
             })
             .expect("content opens a synthetic turn");

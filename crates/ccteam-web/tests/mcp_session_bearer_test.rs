@@ -803,7 +803,7 @@ async fn session_bearer_denied_after_stop() {
     assert_eq!(ok.status(), 200);
 
     // Stop the session → the principal no longer resolves.
-    gw.lock().await.stop_session(&sid).await.unwrap();
+    gw.lock().await.stop_session_detached(&sid).await.unwrap();
 
     let denied = post_mcp(
         addr,
