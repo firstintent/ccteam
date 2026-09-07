@@ -185,6 +185,16 @@ pub struct ThreadLive {
     /// from the spawn ctx. `None` = a thread ccteam never started (a foreign
     /// notification on the shared connection): nothing to persist.
     persist: Option<StatusPersist>,
+    /// The per-thread `config.mcp_servers.ccteam` entry this thread was
+    /// started with — the ONLY carrier of its `(sid, secret)` principal on the
+    /// codex path. `GitHub #200` (`docs-local/issues/#204`): codex takes the
+    /// entry on `thread/start` / `thread/resume` params and nowhere else, so
+    /// every re-load of the thread onto a new app-server connection (config
+    /// reload re-spawn, transport death) must send it again or the thread
+    /// silently falls back to the GLOBAL `[mcp_servers.ccteam]` entry — the
+    /// machine's enrollment credential — and a managed s932 turns into a
+    /// hand-started, projectless caller mid-conversation.
+    mcp_config: Option<Value>,
 }
 
 /// `docs-local/issues/#203` — the `status.json` home of a codex thread.
@@ -609,8 +619,24 @@ impl CodexAppServerAdapter {
         // resident for the connection's life). Holding `loaded` across the RPC
         // makes the resume exactly-once per (thread, connection).
         let settings_revision = self.settings_revision(tid).await;
+        // GitHub #200 (`docs-local/issues/#204`) — the resume MUST carry the
+        // same per-thread `config.mcp_servers.ccteam` entry `start_thread`
+        // sent: codex applies MCP config from the start/resume params only,
+        // so a bare resume onto a fresh connection (the app-server was
+        // re-spawned after a `config.toml` change) left the thread on the
+        // GLOBAL ccteam entry — the machine's enrollment credential — and a
+        // managed session (s932/excore) became a hand-started, projectless
+        // caller mid-conversation, its own children unreadable.
+        let mut resume_params = json!({ "threadId": tid });
+        if let Some(cfg) = self
+            .tracker_snapshot(tid)
+            .await
+            .and_then(|live| live.mcp_config)
+        {
+            resume_params["config"] = cfg;
+        }
         let result = self
-            .call_or_drop_dead(&conn.client, "thread/resume", json!({ "threadId": tid }))
+            .call_or_drop_dead(&conn.client, "thread/resume", resume_params)
             .await
             .map_err(|e| {
                 HarnessError::SubmitFailed(format!(
@@ -2053,6 +2079,9 @@ impl HarnessAdapter for CodexAppServerAdapter {
                 sid: ctx.sid.clone(),
                 generation: ctx.generation_stamp(),
             });
+            // GitHub #200 — keep the per-thread principal so a re-load onto a
+            // later connection (`ensure_thread_loaded`) sends it again.
+            entry.mcp_config = mcp_config.clone();
             entry.pending_write()
         };
         persist_status(pending);

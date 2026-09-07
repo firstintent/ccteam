@@ -546,6 +546,99 @@ async fn submit_turn_resumes_unloaded_thread_before_turn_start() {
     restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
 }
 
+/// GitHub #200 (`docs-local/issues/#204`) — a thread re-loaded onto a NEW
+/// app-server connection (the shared child was re-spawned after a
+/// `config.toml` change) must be resumed WITH its per-thread
+/// `config.mcp_servers.ccteam` principal. Codex takes MCP config from the
+/// start/resume params only; a bare resume dropped s932/excore onto the
+/// global enrollment entry and it became a projectless caller mid-thread.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn ensure_loaded_resume_carries_the_per_thread_mcp_principal() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("ensure-loaded-principal");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let reqs: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let reqs_h = Arc::clone(&reqs);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        if req.get("id").is_some() {
+            reqs_h.lock().unwrap().push(req.clone());
+        }
+        match req["method"].as_str() {
+            Some("initialize") => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-princ" } } }),
+            Some("thread/resume") => json!({ "result": { "thread": { "thread_id": "t-princ" } } }),
+            Some("turn/start") => json!({ "result": { "turn": { "id": "turn-ok" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &SpawnCtx {
+                generation: 0,
+                mode: None,
+                slug: "excore".into(),
+                sid: "s932".into(),
+                owner: "user:rob".into(),
+                cwd: std::env::temp_dir(),
+                project_dir: std::env::temp_dir(),
+                extra_args: vec![],
+                model_id: None,
+                effort: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: "seKret".into(),
+                remote: None,
+            },
+        )
+        .await
+        .unwrap();
+    let start = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "thread/start")
+        .cloned()
+        .unwrap();
+    let principal =
+        start["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].clone();
+    assert_eq!(principal, "Bearer ccteam-sid:s932:seKret");
+
+    // The connection epoch turned over (config reload re-spawn / transport
+    // death): the next turn re-loads the thread. That resume is where the
+    // principal was lost.
+    adapter.forget_loaded_for_test().await;
+    adapter
+        .submit_turn(&h, TurnInput::UserText("continue".into()))
+        .await
+        .unwrap();
+    let seen = reqs.lock().unwrap().clone();
+    let resume = seen
+        .iter()
+        .find(|r| r["method"] == "thread/resume")
+        .unwrap_or_else(|| panic!("unloaded thread must be resumed: {seen:?}"));
+    assert_eq!(resume["params"]["threadId"], "t-princ");
+    assert_eq!(
+        resume["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"],
+        principal,
+        "a re-load must carry the SAME per-thread principal the thread was started with, \
+         or codex falls back to the global enrollment entry"
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
 /// F10 W3 step-0 GATE — real `codex` binary, DEFAULT (stdio) transport.
 /// Constructs a `CodexAppServerAdapter` with NO socket env, so it must
 /// spawn `codex app-server --listen stdio://` itself and complete the
