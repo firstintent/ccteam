@@ -572,7 +572,7 @@ pub(crate) async fn handle_delete_project(
         for sid in sids {
             // The project is being deregistered wholesale, so the stop's
             // own record of what it cut short has nowhere left to be read.
-            match guard.stop_session(&sid).await {
+            match guard.stop_session_detached(&sid).await {
                 Ok(_) => stopped.push(sid),
                 Err(err) => {
                     // Best-effort: a session that vanished mid-teardown

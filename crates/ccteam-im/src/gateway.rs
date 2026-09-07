@@ -1116,7 +1116,10 @@ struct DelegationDeliveryPlan {
 /// What `agent_read{sid}` publishes about one outstanding request. The four
 /// delivery facts are separate fields and anything ccteam cannot observe says
 /// `unknown` rather than guessing a `false` (issue #201).
-fn delegation_request_row(request: &ccteam_harness::DelegationRequest) -> serde_json::Value {
+fn delegation_request_row(
+    request: &ccteam_harness::DelegationRequest,
+    held: &RetainedLines,
+) -> serde_json::Value {
     use ccteam_harness::RequestState;
     let mut row = serde_json::Map::new();
     row.insert("request_id".into(), serde_json::json!(request.request_id));
@@ -1147,6 +1150,13 @@ fn delegation_request_row(request: &ccteam_harness::DelegationRequest) -> serde_
         row.insert("answered_turn".into(), serde_json::json!(answered));
     }
     row.insert("created_at".into(), serde_json::json!(request.created_at));
+    // The file still holding this task's line, when one provably is. A released
+    // session is NOT a stopped one: its queue files are on disk and replay on
+    // the next resume, so a reader must be able to see that its task is waiting
+    // rather than lost (issue #197 E).
+    if let Some(file) = held.holding(request) {
+        row.insert("retained_in".into(), serde_json::json!(file));
+    }
     let unknown = serde_json::json!("unknown");
     // accepted: ccteam has it durably. Always true — the row exists.
     // queued: ccteam/the adapter is still holding it back.
@@ -1189,6 +1199,104 @@ pub const RESUME_POLICY_REPLAY_AFTER_FIRST_RESULT: &str = "replay_after_first_re
 pub const DELIVERY_UNDELIVERED: &str = "undelivered";
 /// The bytes reached the harness and nothing was ever observed running them.
 pub const DELIVERY_UNCONFIRMED: &str = "unconfirmed";
+
+/// The resolved half of an IM `/stop`: who to stop, or why not.
+enum StopCommandPlan {
+    Stop { sid: String, was_detached: bool },
+    Refuse(String),
+}
+
+/// The IM reply for one `/stop`. It says what the stop cost, in the same
+/// vocabulary `agent_stop` answers in: a write that failed is never reported as
+/// a success, and a retained line is named rather than left to be guessed at
+/// (issue #197 E).
+fn stop_command_receipt(sid: &str, was_detached: bool, outcome: &StopOutcome) -> String {
+    let mut line = if was_detached {
+        format!("stopped session {sid} (its body from before the restart was ended)")
+    } else {
+        format!("stopped session {sid}")
+    };
+    if let Some(cut) = outcome.interrupted.as_ref() {
+        line.push_str(&format!(
+            "\n· cut a turn in flight ({}); it is in the transcript as {}",
+            cut.reason.as_str(),
+            cut.row_turn_id
+        ));
+    }
+    let retained = outcome
+        .undelivered
+        .iter()
+        .filter(|request| request.retained_in.is_some())
+        .count()
+        + outcome.retained_unattributed;
+    if retained > 0 {
+        line.push_str(&format!(
+            "\n· {retained} undelivered line(s) kept; they replay after the first answer of the \
+             next life of {sid}"
+        ));
+    }
+    if let Some(error) = outcome.settle_error.as_deref() {
+        line.push_str(&format!(
+            "\n· ⚠ the record of that could not be written: {error}"
+        ));
+    }
+    line
+}
+
+/// Every queue file that could still be holding one session's undelivered
+/// lines, read together so one answer serves the stop receipt and
+/// `agent_read`'s request rows alike.
+#[derive(Debug, Clone, Default)]
+struct RetainedLines {
+    /// The claude parked-input mirror, keyed by EXECUTION turn id.
+    mirror: ccteam_harness::execution::claude_stream_json::RetainedInput,
+    /// ccteam's own FIFO ahead of the vendor, keyed by REQUEST id.
+    pending: crate::pending_turns::RetainedPending,
+}
+
+impl RetainedLines {
+    /// The file still holding this request's line, or `None` when nothing
+    /// provably is. Two different keys, because the two queues name a line by
+    /// two different identities — and neither is ever guessed at.
+    fn holding(&self, request: &ccteam_harness::DelegationRequest) -> Option<&'static str> {
+        if self.pending.holds(&request.request_id) {
+            return Some(crate::pending_turns::PENDING_TURNS_FILE);
+        }
+        let turn = request.turn_id.as_deref()?;
+        (self.mirror.is_parked(turn) || self.mirror.is_in_flight(turn))
+            .then_some(ccteam_harness::execution::claude_stream_json::DEFERRED_INPUT_FILE)
+    }
+
+    /// Whether the bytes of this request's line ever left ccteam.
+    fn was_written(&self, request: &ccteam_harness::DelegationRequest) -> bool {
+        use ccteam_harness::RequestState;
+        if self.pending.holds(&request.request_id) {
+            // ccteam's own queue still has it: nothing was handed over.
+            return false;
+        }
+        match request.state {
+            RequestState::Accepted | RequestState::Queued => request
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn| self.mirror.is_in_flight(turn)),
+            _ => true,
+        }
+    }
+}
+
+/// "ccteam never handed it over" vs "the bytes went out and nothing was ever
+/// seen running them" — a stdin flush is not proof the model read anything, so
+/// the second one stays UNCONFIRMED forever.
+fn delivery_word(
+    request: &ccteam_harness::DelegationRequest,
+    held: &RetainedLines,
+) -> &'static str {
+    if held.was_written(request) {
+        DELIVERY_UNCONFIRMED
+    } else {
+        DELIVERY_UNDELIVERED
+    }
+}
 
 /// The turn an explicit stop is about to cut, captured while the adapter can
 /// still answer for it.
@@ -1236,9 +1344,32 @@ fn interrupted_note(sid: &str, narration: InterruptedNarration, truncated: bool)
     format!("{sid} was stopped while this turn was running.{tail}")
 }
 
+/// Why a turn stopped mid-flight. Both are cuts, and neither is a completion;
+/// they differ in who decided (issue #197 E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptedReason {
+    /// A person or an agent ran an explicit stop.
+    Stopped,
+    /// The body went away on its own — a crash, a vendor death, or a body that
+    /// outlived a daemon and exited before ccteam could observe its turn end.
+    BodyExited,
+}
+
+impl InterruptedReason {
+    /// Stable lowercase wire token, and the row's `error_kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InterruptedReason::Stopped => "stopped",
+            InterruptedReason::BodyExited => "body_exited",
+        }
+    }
+}
+
 /// The turn an explicit stop cut short, and the requests it was carrying.
 #[derive(Debug, Clone)]
 pub struct InterruptedTurn {
+    /// Who ended it.
+    pub reason: InterruptedReason,
     /// The adapter's execution turn that was cut.
     pub exec_turn_id: String,
     /// The `turns.jsonl` row id of the record — what
@@ -1275,14 +1406,59 @@ pub struct StopOutcome {
     /// Every request the child still owed, minus the ones the cut turn was
     /// carrying (those are named by [`InterruptedTurn::request_ids`]).
     pub undelivered: Vec<UndeliveredRequest>,
+    /// Queued lines ccteam is holding that carry NO request identity — a
+    /// human's message waiting behind a body, a row written before the
+    /// identity existed. Counted, never attributed: saying "your task is
+    /// retained" off a row that might be somebody else's is a claim ccteam
+    /// cannot prove (issue #197 E).
+    pub retained_unattributed: usize,
+    /// Why the settlement could not be made durable, when it could not. The
+    /// process still stopped; what is missing is the record of it, so a caller
+    /// reports `settled:false` rather than a success it did not get.
+    pub settle_error: Option<String>,
 }
 
 impl StopOutcome {
     /// Whether anything is still held for a resume to replay.
     pub fn has_retained(&self) -> bool {
-        self.undelivered
-            .iter()
-            .any(|request| request.retained_in.is_some())
+        self.retained_unattributed > 0
+            || self
+                .undelivered
+                .iter()
+                .any(|request| request.retained_in.is_some())
+    }
+
+    /// Record a settlement failure, keeping the FIRST one (the cause; anything
+    /// after it is a consequence).
+    fn note_settle_error(&mut self, error: String) {
+        if self.settle_error.is_none() {
+            self.settle_error = Some(error);
+        }
+    }
+}
+
+/// The durable half of a settlement: the in-memory mirror has been changed and
+/// the file has not.
+///
+/// `#[must_use]`, because a settlement that only ever reached memory is exactly
+/// the defect this type exists to prevent — the next daemon life would read a
+/// request as still `executing` on a session whose process is gone. Every stop
+/// path either persists it under a claim it holds
+/// ([`Gateway::persist_settlement_now`]) or hands it to the writer that can
+/// take one ([`Gateway::flush_settlement_detached`]); there is no third way to
+/// discharge it.
+#[must_use = "a settlement that never reaches disk is lost on the next daemon start"]
+pub struct PendingSettlement {
+    /// `None` when nothing was changed and there is nothing to write.
+    write: Option<(String, PathBuf, ccteam_harness::DelegationRequests)>,
+}
+
+impl PendingSettlement {
+    /// A settlement that changed nothing (a session with no requests, an
+    /// unresolvable project). Discharging it is a no-op — but it still has to
+    /// be discharged, so the shape of every stop path stays the same.
+    fn nothing() -> Self {
+        Self { write: None }
     }
 }
 
@@ -3714,10 +3890,14 @@ impl Gateway {
         reply_to: &ChatKey,
         literal: bool,
         internal: bool,
+        request_id: Option<&str>,
     ) -> Result<(String, String)> {
         let Some(detached) = self.detached.get(sid) else {
             return Err(anyhow!("session {sid} is not detached"));
         };
+        // The identity rides WITH the line: this is the only place a dispatched
+        // task outlives its submit call, and a stop that cannot say whose a
+        // retained line is can only ever give a count (issue #197 E).
         crate::pending_turns::enqueue_pending_turn(
             &detached.cwd,
             sid,
@@ -3725,6 +3905,7 @@ impl Gateway {
             Some(reply_to.channel.clone()),
             literal,
             internal,
+            request_id.map(str::to_string),
         )?;
         let queued = crate::pending_turns::pending_turn_count(&detached.cwd, sid);
         let since = detached.since.to_rfc3339();
@@ -4269,6 +4450,14 @@ impl Gateway {
         }
     }
 
+    /// Commands that MUST enter through [`Self::handle_message_shared`]: they
+    /// take a per-child claim, which is impossible from inside a
+    /// `&mut Gateway` (the claim is always taken before the gateway lock).
+    /// The daemon asks this so a `/stop` never reaches the inline path.
+    pub fn inbound_needs_shared_entry(text: &str) -> bool {
+        text.split_whitespace().next() == Some("/stop")
+    }
+
     /// True when `text` is one of the gateway-owned slash commands.
     pub fn is_gateway_command(text: &str) -> bool {
         match text.split_whitespace().next() {
@@ -4508,6 +4697,13 @@ impl Gateway {
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
         let chat = ChatKey::new(channel, chat_id, user_id);
+        // `/stop` before anything else: it is the one gateway command that has
+        // to take a per-child claim, which means it cannot run inside a
+        // `&mut Gateway` (issue #197 E). Handled here, where the lock can be
+        // dropped between resolving the target and stopping it.
+        if let Some(result) = Self::handle_stop_command_shared(&gateway, &chat, text).await {
+            return result;
+        }
         // Re-derive the "implicit spawn candidate" decision authoritatively
         // (the daemon's `inbound_may_spawn` call is only a hint to decide
         // inline-vs-background — this is the one that actually acts). Any
@@ -4575,6 +4771,70 @@ impl Gateway {
                 selection,
             )
             .await
+    }
+
+    /// Resolve and AUTHORIZE a `/stop <sid>` without stopping anything.
+    ///
+    /// v0.8.18 柱2 档0 — own-only: a chat can `/stop` only its own session.
+    /// Not-resident is not not-there: a detached body (alive from before a
+    /// restart) and a RELEASED session (ccteam holds no process, but the next
+    /// message would resume it) are both stoppable through the same gate,
+    /// resolved from their `meta.json` owner — otherwise "stop the thing I'm
+    /// talking to" would fail on exactly the sessions whose process was let go.
+    fn plan_stop_command(&self, chat: &ChatKey, sid: &str) -> StopCommandPlan {
+        let sid = sid.to_string();
+        let accessible = self
+            .sessions
+            .get(&sid)
+            .map(|s| self.chat_can_access(chat, s))
+            .unwrap_or_else(|| self.chat_can_access_sid(chat, &sid));
+        if !accessible {
+            return StopCommandPlan::Refuse(format!("unknown session for this chat: {sid}"));
+        }
+        let was_detached = self.is_session_detached(&sid);
+        StopCommandPlan::Stop { sid, was_detached }
+    }
+
+    /// The IM `/stop` leg of [`Self::handle_message_shared`]: plan under a short
+    /// lock, drop it, stop through the one door that takes the child's claim.
+    /// `None` = this message is not a `/stop` and belongs to the ordinary path.
+    async fn handle_stop_command_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        chat: &ChatKey,
+        text: &str,
+    ) -> Option<Result<Vec<String>>> {
+        let mut parts = text.split_whitespace();
+        if parts.next() != Some("/stop") {
+            return None;
+        }
+        let Some(sid) = parts.next() else {
+            return Some(Err(anyhow!(
+                "/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)"
+            )));
+        };
+        let plan = crate::latency::gateway_lock(gateway, "im.stop.plan")
+            .await
+            .plan_stop_command(chat, sid);
+        let (sid, was_detached) = match plan {
+            StopCommandPlan::Refuse(reason) => return Some(Ok(vec![reason])),
+            StopCommandPlan::Stop { sid, was_detached } => (sid, was_detached),
+        };
+        // No gateway lock held: the door below takes the child's delegation
+        // claim first, exactly as `agent_stop` does.
+        Some(match Self::stop_session_shared(gateway, &sid).await {
+            Err(error) => Err(error),
+            Ok(outcome) => {
+                let mut reply = stop_command_receipt(&sid, was_detached, &outcome);
+                // The same next-step footer every other IM command gets: this
+                // leg answers ahead of `handle_command`, so it appends its own.
+                if chat.channel != "web" {
+                    if let Some(hint) = command_next_hint("/stop") {
+                        append_next_hint(&mut reply, hint);
+                    }
+                }
+                Ok(vec![reply])
+            }
+        })
     }
 
     async fn handle_command(&mut self, chat: &ChatKey, text: &str) -> Result<Option<String>> {
@@ -4678,45 +4938,23 @@ impl Gateway {
                 self.use_session(chat, id).await.map(Some)
             }
             "/stop" => {
-                // v0.8.10 — stop (destroy) a session BY ID. Completes the session
-                // lifecycle: /new (create) · /clear (recycle) · /use (switch) ·
-                // /stop (destroy). Uses the SAME `stop_session` the web API's
-                // `POST /sessions/{sid}/stop` calls, so the verb is unified across
-                // IM and web. A session id is REQUIRED — a bare `/stop` is rejected
-                // because silently destroying the current session is too easy to
-                // fat-finger. `stop_session` aborts the pump, closes the vendor
-                // thread, drops the record, and clears any `current_session` route
-                // pointing at it (so stopping the current session leaves the next
-                // message to spawn a fresh default).
-                let sid = parts
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
-                    })?
-                    .to_string();
-                // v0.8.18 柱2 档0 — own-only: a chat can /stop only its own
-                // session. Not-resident is not not-there: a detached body
-                // (alive from before a restart) and a RELEASED session (ccteam
-                // holds no process, but the next message would resume it) are
-                // both stoppable through the same gate, resolved from their
-                // meta.json owner — otherwise "stop the thing I'm talking to"
-                // would fail on exactly the sessions whose process was let go.
-                let accessible = self
-                    .sessions
-                    .get(&sid)
-                    .map(|s| self.chat_can_access(chat, s))
-                    .unwrap_or_else(|| self.chat_can_access_sid(chat, &sid));
-                if !accessible {
-                    return Ok(Some(format!("unknown session for this chat: {sid}")));
-                }
-                let was_detached = self.is_session_detached(&sid);
-                self.stop_session(&sid).await?;
-                if was_detached {
-                    return Ok(Some(format!(
-                        "stopped session {sid} (its body from before the restart was ended)"
-                    )));
-                }
-                Ok(Some(format!("stopped session {sid}")))
+                // The COMMAND is resolved here; the stop itself is not. Settling
+                // a stopped session's delegation requests needs that child's
+                // single-flight claim, and a claim is always taken BEFORE the
+                // gateway lock — which `&mut self` is already holding, so this
+                // door cannot take one without inverting the order (issue #197
+                // E). [`Gateway::handle_message_shared`] runs the plan under a
+                // short lock, drops it, and stops through the one door that can.
+                let sid = parts.next().ok_or_else(|| {
+                    anyhow!("/stop 必须带 session id:/stop <sid>(安全起见不支持裸 /stop)")
+                })?;
+                Ok(Some(match self.plan_stop_command(chat, sid) {
+                    StopCommandPlan::Refuse(reason) => reason,
+                    StopCommandPlan::Stop { sid, .. } => format!(
+                        "/stop {sid} must be routed through the shared entry point \
+                         (it takes the session's delegation claim before the gateway lock)"
+                    ),
+                }))
             }
             "/interrupt" => {
                 // Interrupt the session's CURRENTLY-RUNNING turn WITHOUT
@@ -5520,7 +5758,7 @@ impl Gateway {
         let new_sid = outcome.id.clone();
         // Replacement is live + current; retire the old session. A stop failure
         // is non-fatal — the fresh session already serves the chat.
-        if let Err(err) = self.stop_session(old_sid).await {
+        if let Err(err) = self.stop_session_detached(old_sid).await {
             tracing::warn!(
                 old_sid,
                 new_sid = %new_sid,
@@ -9119,6 +9357,7 @@ impl Gateway {
                     chat,
                     literal_user_text,
                     origin == TurnOrigin::Internal,
+                    None,
                 )?;
                 return Ok(SubmitResult::Queued { receipt, id });
             }
@@ -9151,6 +9390,9 @@ impl Gateway {
                 .get(&project)
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown project for pending turn: {project}"))?;
+            // No request identity on this path by construction: it is the
+            // IM / web / notifier submit, and it drains within this same call —
+            // the line never outlives it the way a detached-body queue does.
             crate::pending_turns::enqueue_pending_turn(
                 &cwd,
                 session_id,
@@ -9158,6 +9400,7 @@ impl Gateway {
                 Some(channel),
                 literal_user_text,
                 origin == TurnOrigin::Internal,
+                None,
             )?;
             self.resume_dead_session(session_id).await?;
             let drained_ids = self.drain_and_dispatch_pending_turns(session_id).await;
@@ -14053,6 +14296,7 @@ impl Gateway {
         let Some(mirror) = self.delegations.get(child_sid) else {
             return Vec::new();
         };
+        let held = self.retained_lines(&mirror.project_dir, child_sid);
         let mut ordered: Vec<&ccteam_harness::DelegationRequest> =
             mirror.store.outstanding().collect();
         ordered.extend(
@@ -14066,7 +14310,7 @@ impl Gateway {
         ordered
             .into_iter()
             .take(limit)
-            .map(delegation_request_row)
+            .map(|request| delegation_request_row(request, &held))
             .collect()
     }
 
@@ -14678,6 +14922,7 @@ impl Gateway {
             sid,
             text,
             TurnIntent::from_origin(TurnOrigin::Internal),
+            None,
             deadline,
         )
         .await
@@ -14698,6 +14943,7 @@ impl Gateway {
         sid: &str,
         text: String,
         routing: TurnRouting,
+        request_id: Option<&str>,
         deadline: GatewayDeadline,
     ) -> Result<TurnReceipt> {
         Self::submit_to_sid_shared_with_intent(
@@ -14705,6 +14951,7 @@ impl Gateway {
             sid,
             text,
             TurnIntent::routed(TurnOrigin::Internal, routing),
+            request_id,
             deadline,
         )
         .await
@@ -14734,6 +14981,7 @@ impl Gateway {
             sid,
             text,
             TurnIntent::from_origin(TurnOrigin::User),
+            None,
             deadline,
         )
         .await
@@ -14745,6 +14993,7 @@ impl Gateway {
         sid: &str,
         text: String,
         intent: TurnIntent,
+        request_id: Option<&str>,
         deadline: GatewayDeadline,
     ) -> Result<TurnReceipt> {
         let origin = intent.origin;
@@ -14789,6 +15038,7 @@ impl Gateway {
                         &reply_to,
                         false,
                         origin == TurnOrigin::Internal,
+                        request_id,
                     )?;
                     guard.emit_sid_answer(sid, 0, receipt);
                     return Ok(TurnReceipt::opaque(id, true));
@@ -15417,22 +15667,81 @@ impl Gateway {
     /// Claim BEFORE the gateway lock — the claim-then-lock order every writer
     /// of `delegation.json` keeps, because a `&mut Gateway` awaiting a claim
     /// somebody else holds while they wait for the gateway lock is a deadlock.
-    /// Callers that only hold `&mut Gateway` (the IM `/stop` directive) use
-    /// [`Self::stop_session`] directly and get everything but the durable
-    /// half — see its doc for why that is safe.
+    /// Every stop entry point that can reach an `Arc` uses this one; the ones
+    /// that cannot still discharge their [`PendingSettlement`] through
+    /// [`Self::flush_settlement_detached`], so no path leaves a settlement in
+    /// memory only.
     pub async fn stop_session_shared(
         gateway: &Arc<tokio::sync::Mutex<Self>>,
         sid: &str,
     ) -> Result<StopOutcome> {
         let claim = Self::claim_delegation_store(gateway, sid).await;
-        let outcome = {
+        let stopped = {
             let mut guard = crate::latency::gateway_lock(gateway, "session.stop").await;
             guard.stop_session(sid).await
         };
-        if outcome.is_ok() {
-            let _ = Self::persist_delegation_store(gateway, &claim).await;
+        let (mut outcome, settlement) = stopped?;
+        // Synchronous on this door, so the caller is told the truth in the same
+        // breath as `stopped:true` (issue #197 E): a durable write that failed
+        // is never reported as a success.
+        if let Err(error) = Self::persist_settlement_now(&claim, settlement).await {
+            let error = format!("{error:#}");
+            tracing::warn!(session = %sid, %error,
+                "ccteam-im: a stop's settlement could not be made durable");
+            outcome.note_settle_error(error);
         }
-        outcome
+        Ok(outcome)
+    }
+
+    /// Stop and discharge the settlement in the BACKGROUND — the door for a
+    /// `&mut Gateway` caller that has nobody to report to (a session being
+    /// replaced, a project being deleted). Still durable, still under the
+    /// child's claim; what it gives up is being told synchronously whether the
+    /// write landed. A caller that owes somebody an answer uses
+    /// [`Self::stop_session_shared`].
+    pub async fn stop_session_detached(&mut self, sid: &str) -> Result<StopOutcome> {
+        let (outcome, settlement) = self.stop_session(sid).await?;
+        self.flush_settlement_detached(settlement);
+        Ok(outcome)
+    }
+
+    /// Write a settlement under a claim the caller already holds.
+    async fn persist_settlement_now(
+        claim: &DelegationStoreClaim,
+        settlement: PendingSettlement,
+    ) -> Result<()> {
+        let Some((sid, project_dir, store)) = settlement.write else {
+            return Ok(());
+        };
+        debug_assert_eq!(claim.child_sid(), sid);
+        delegation_store_io::write(&project_dir, claim, store).await
+    }
+
+    /// Discharge a settlement from a `&mut Gateway` context, which cannot await
+    /// the child's claim: a `&mut Gateway` holds the gateway lock, and the
+    /// claim is taken BEFORE that lock everywhere else — awaiting it here would
+    /// invert the order and deadlock against any dispatch already holding it.
+    ///
+    /// The spawned task takes the claim and NEVER takes the gateway lock, so
+    /// the order is not inverted, only deferred. The write is durable; what the
+    /// caller gives up is being told synchronously whether it landed, which is
+    /// why this is the flavour for a path with nobody to answer.
+    fn flush_settlement_detached(&self, settlement: PendingSettlement) {
+        let Some((sid, project_dir, store)) = settlement.write else {
+            return;
+        };
+        let claims = Arc::clone(&self.spawn_claims);
+        let key = Self::delegation_claim_key(&sid);
+        tokio::spawn(async move {
+            let _claim = claims.lock_for(&key).await;
+            let guard = ccteam_harness::DelegationWriteGuard::for_child(&sid);
+            if let Err(error) =
+                ccteam_harness::persist_delegation_requests(&project_dir, &guard, &store)
+            {
+                tracing::warn!(session = %sid, %error,
+                    "ccteam-im: a deferred settlement could not be made durable");
+            }
+        });
     }
 
     /// Stop the PROCESS. The session's identity, transcript and retained
@@ -15447,27 +15756,35 @@ impl Gateway {
     /// and project stops — because it happens here rather than in any one of
     /// them.
     ///
-    /// The durable half of the request marking is the CALLER's: mutating
-    /// `delegation.json` needs that child's single-flight claim, and claims are
-    /// taken BEFORE the gateway lock (a `&mut Gateway` awaiting one would
-    /// invert the order and deadlock). A caller holding the claim persists the
-    /// mirror afterwards; one that cannot leaves the in-memory mirror correct
-    /// for this daemon life, and the next life still cannot mis-deliver —
-    /// an `interrupted` row is never a completion.
-    pub async fn stop_session(&mut self, sid: &str) -> Result<StopOutcome> {
+    /// The durable half comes back as a [`PendingSettlement`] the caller must
+    /// discharge: mutating `delegation.json` needs that child's single-flight
+    /// claim, and claims are taken BEFORE the gateway lock, so a `&mut Gateway`
+    /// cannot await one without inverting the order. The token is
+    /// `#[must_use]`, so "settled in memory only" is a compile error rather
+    /// than a thing a new stop path can forget.
+    pub async fn stop_session(&mut self, sid: &str) -> Result<(StopOutcome, PendingSettlement)> {
         // A body that outlived the previous daemon is not in the live map but
         // IS this sid's body: an explicit stop ends it (the one case the daemon
         // signals such a process — on the user's word, never on its own).
         if self.stop_detached_body(sid).await? {
             self.record_explicit_stop(sid);
-            // ccteam never observed that body's turns, so it has nothing
-            // truthful to say about what they were doing.
-            return Ok(StopOutcome::default());
+            // ccteam held no adapter for that body, so it cannot say what the
+            // turn was SAYING — but the store says which turn was running, and
+            // a body that is gone will never end it. Settle it as a cut, never
+            // as a completion (issue #197 E).
+            return Ok(self.settle_exited_session(sid, InterruptedReason::BodyExited));
         }
         let Some(session) = self.sessions.get(sid) else {
-            return self
-                .stop_released_session(sid)
-                .map(|()| StopOutcome::default());
+            // Released / already stopped: ccteam holds no process and nothing
+            // was in flight, so this cuts no turn. The requests stay exactly as
+            // they are — their queue files are still on disk and still replay —
+            // and the caller is TOLD what is being held rather than having it
+            // silently settled (issue #197 E).
+            self.stop_released_session(sid)?;
+            return Ok((
+                self.report_retained_requests(sid),
+                PendingSettlement::nothing(),
+            ));
         };
         let slug = session.project.clone();
         let thread = session.thread.clone();
@@ -15495,10 +15812,79 @@ impl Gateway {
         self.record_explicit_stop(sid);
         // The process is gone and the queue mirrors are final: now the record
         // of what it was doing, and what it still owed.
-        let outcome = self.settle_stopped_session(sid, &slug, vendor, &role, cut);
+        let (outcome, settlement) =
+            self.settle_stopped_session(sid, &slug, vendor, &role, cut, InterruptedReason::Stopped);
         self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         self.persist_routing()?;
-        Ok(outcome)
+        Ok((outcome, settlement))
+    }
+
+    /// A session whose BODY is gone but which ccteam holds no adapter for: a
+    /// detached body an explicit stop just ended. The store is the only witness
+    /// of what it was running, so the cut turn comes from the request that was
+    /// observed executing.
+    fn settle_exited_session(
+        &mut self,
+        sid: &str,
+        reason: InterruptedReason,
+    ) -> (StopOutcome, PendingSettlement) {
+        let Some((slug, vendor, role)) = self.session_resolve_any(sid).and_then(|resolved| {
+            ccteam_harness::execution::session_meta::read_session_meta(&resolved.project_dir, sid)
+                .ok()
+                .map(|meta| (resolved.project, meta.vendor, meta.role))
+        }) else {
+            return (StopOutcome::default(), PendingSettlement::nothing());
+        };
+        let cut = self.cut_turn_from_store(sid);
+        self.settle_stopped_session(sid, &slug, vendor, &role, cut, reason)
+    }
+
+    /// The execution turn a session was OBSERVED running, read from its durable
+    /// requests. Used when no adapter can be asked — the narration is then
+    /// honestly `unknown` rather than an empty string that reads as silence.
+    fn cut_turn_from_store(&self, sid: &str) -> Option<CutTurn> {
+        let exec_turn_id = self
+            .delegations
+            .get(sid)?
+            .store
+            .requests
+            .iter()
+            .find(|request| {
+                request.state == ccteam_harness::RequestState::Executing
+                    && request.turn_id.is_some()
+            })
+            .and_then(|request| request.turn_id.clone())?;
+        Some(CutTurn {
+            exec_turn_id,
+            partial: None,
+        })
+    }
+
+    /// Say what a session is still holding WITHOUT settling anything.
+    ///
+    /// An idle release, a capacity eviction and a stop of an already-released
+    /// session all end no turn: the queue files are still on disk and still
+    /// replay on the next resume, so terminalising their requests would report
+    /// tasks as dead that are merely waiting (issue #197 E).
+    fn report_retained_requests(&self, sid: &str) -> StopOutcome {
+        let Some(mirror) = self.delegations.get(sid) else {
+            return StopOutcome::default();
+        };
+        let held = self.retained_lines(&mirror.project_dir, sid);
+        let mut outcome = StopOutcome {
+            retained_unattributed: held.pending.unattributed,
+            ..StopOutcome::default()
+        };
+        for request in mirror.store.outstanding() {
+            outcome.undelivered.push(UndeliveredRequest {
+                request_id: request.request_id.clone(),
+                title: request.title.clone(),
+                state: request.state.as_str(),
+                delivery: delivery_word(request, &held),
+                retained_in: held.holding(request),
+            });
+        }
+        outcome
     }
 
     /// Snapshot the turn a stop is about to cut, while the adapter can still
@@ -15531,6 +15917,16 @@ impl Gateway {
         })
     }
 
+    /// Every queue file that could still be holding one of `sid`'s lines. ONE
+    /// reader, so the stop receipt and `agent_read`'s request rows can never
+    /// disagree about whether a task is retained.
+    fn retained_lines(&self, project_dir: &Path, sid: &str) -> RetainedLines {
+        RetainedLines {
+            mirror: ccteam_harness::execution::claude_stream_json::retained_input(project_dir, sid),
+            pending: crate::pending_turns::retained_pending(project_dir, sid),
+        }
+    }
+
     /// Record what the stop cut short and settle every request the child still
     /// owed. Runs once the process is gone, so the queue mirrors it reads are
     /// final.
@@ -15541,10 +15937,12 @@ impl Gateway {
         vendor: AgentVendor,
         role: &str,
         cut: Option<CutTurn>,
-    ) -> StopOutcome {
+        reason: InterruptedReason,
+    ) -> (StopOutcome, PendingSettlement) {
         let Some(project_dir) = self.projects.get(slug).cloned() else {
-            return StopOutcome::default();
+            return (StopOutcome::default(), PendingSettlement::nothing());
         };
+        let mut record_error: Option<String> = None;
         let interrupted = cut.map(|cut| {
             let row_turn_id = format!("interrupted:{}", cut.exec_turn_id);
             let (narration, text) = match cut.partial.as_ref() {
@@ -15574,62 +15972,71 @@ impl Gateway {
                 // refuses to build a notification from it, and `agent_read`
                 // shows it as what it is.
                 outcome: Some(INTERRUPTED_OUTCOME.to_string()),
-                error_kind: Some("turn_interrupted".to_string()),
+                error_kind: Some(reason.as_str().to_string()),
                 error: Some(interrupted_note(sid, narration, truncated)),
                 conclusion: None,
             };
             if let Err(error) =
                 ccteam_harness::execution::turns_mirror::append_turn(&project_dir, sid, &record)
             {
+                // The transcript row IS the record of what was cut; losing it
+                // silently is how a stopped session came to read back as having
+                // said nothing. Report it, never swallow it (issue #197 E).
                 tracing::warn!(session = %sid, %error,
-                    "ccteam-im: failed to record the turn an explicit stop cut short");
+                    "ccteam-im: failed to record the turn a stop cut short");
+                record_error = Some(format!("interrupted record not written: {error:#}"));
             }
             InterruptedTurn {
+                reason,
                 exec_turn_id: cut.exec_turn_id,
                 row_turn_id,
                 narration,
                 request_ids: Vec::new(),
             }
         });
-        self.settle_stopped_requests(sid, &project_dir, interrupted)
+        let (mut outcome, settlement) =
+            self.settle_stopped_requests(sid, &project_dir, interrupted);
+        if let Some(error) = record_error {
+            outcome.note_settle_error(error);
+        }
+        (outcome, settlement)
     }
 
     /// Give every request the stopped child still owed its final reading.
     ///
     /// Four fates, and they are different things to tell a dispatcher: bound to
-    /// the turn that was cut (`interrupted`), still held by ccteam and due to
-    /// replay (left outstanding, named with the file holding it), written to a
-    /// harness that is now gone (`interrupted` — delivery was never confirmed
-    /// and never will be), or confirmed never handed over (`undelivered`).
+    /// the turn that was cut (`interrupted`), still held in a queue file that
+    /// names it and due to replay (left outstanding), written to a harness that
+    /// is now gone (`interrupted` — delivery was never confirmed and never will
+    /// be), or confirmed never handed over (`undelivered`).
+    ///
+    /// Retention is only ever claimed where it can be PROVED: the parked-input
+    /// mirror carries execution-turn ids and the pending queue carries request
+    /// ids, so a row that names neither is counted as `retained_unattributed`
+    /// and attributed to nobody.
     fn settle_stopped_requests(
         &mut self,
         sid: &str,
         project_dir: &Path,
         mut interrupted: Option<InterruptedTurn>,
-    ) -> StopOutcome {
+    ) -> (StopOutcome, PendingSettlement) {
         use ccteam_harness::RequestState;
-        let retained =
-            ccteam_harness::execution::claude_stream_json::retained_input(project_dir, sid);
-        // A pending queue is ccteam's own FIFO ahead of the vendor: whatever is
-        // in it replays on the next resume, so nothing behind it may be called
-        // undelivered. Its rows carry no request identity, so the honest answer
-        // is per-SESSION: while it is non-empty, an unbound request is still
-        // retained.
-        let pending_retained = crate::pending_turns::pending_turn_count(project_dir, sid) > 0;
+        let held = self.retained_lines(project_dir, sid);
         let cut_turn = interrupted.as_ref().map(|i| i.exec_turn_id.clone());
-        let mut undelivered = Vec::new();
+        let mut outcome = StopOutcome {
+            retained_unattributed: held.pending.unattributed,
+            ..StopOutcome::default()
+        };
         let Some(mirror) = self.delegations.get_mut(sid) else {
-            return StopOutcome {
-                interrupted,
-                undelivered,
-            };
+            outcome.interrupted = interrupted;
+            return (outcome, PendingSettlement::nothing());
         };
         for request in mirror.store.requests.iter_mut() {
             if request.state.is_terminal() {
                 continue;
             }
             let turn = request.turn_id.clone().unwrap_or_default();
-            if cut_turn.as_deref() == Some(turn.as_str()) && !turn.is_empty() {
+            if !turn.is_empty() && cut_turn.as_deref() == Some(turn.as_str()) {
                 request.state = RequestState::Interrupted;
                 request.queue_position = None;
                 if let Some(i) = interrupted.as_mut() {
@@ -15637,34 +16044,20 @@ impl Gateway {
                 }
                 continue;
             }
-            let retained_in = if retained.is_parked(&turn) || retained.is_in_flight(&turn) {
-                Some(ccteam_harness::execution::claude_stream_json::DEFERRED_INPUT_FILE)
-            } else if pending_retained {
-                Some(crate::pending_turns::PENDING_TURNS_FILE)
-            } else {
-                None
-            };
-            // "ccteam never handed it over" vs "the bytes went out and nothing
-            // was ever seen running them" — a stdin flush is not proof the
-            // model read anything, so the second one stays UNCONFIRMED forever.
-            let never_written =
-                matches!(request.state, RequestState::Accepted | RequestState::Queued)
-                    && !retained.is_in_flight(&turn);
-            let delivery = if never_written {
-                DELIVERY_UNDELIVERED
-            } else {
-                DELIVERY_UNCONFIRMED
-            };
+            let retained_in = held.holding(request);
+            let delivery = delivery_word(request, &held);
             if retained_in.is_none() {
-                // Nothing holds it and nothing will run it: it is over.
-                request.state = if never_written {
+                // Nothing holds it and nothing will run it: it is over. Which
+                // way it ended is exactly the `delivery` claim — ccteam never
+                // handed it over, or the bytes went out unwitnessed.
+                request.state = if delivery == DELIVERY_UNDELIVERED {
                     RequestState::Undelivered
                 } else {
                     RequestState::Interrupted
                 };
                 request.queue_position = None;
             }
-            undelivered.push(UndeliveredRequest {
+            outcome.undelivered.push(UndeliveredRequest {
                 request_id: request.request_id.clone(),
                 title: request.title.clone(),
                 state: request.state.as_str(),
@@ -15672,10 +16065,15 @@ impl Gateway {
                 retained_in,
             });
         }
-        StopOutcome {
-            interrupted,
-            undelivered,
-        }
+        outcome.interrupted = interrupted;
+        let settlement = PendingSettlement {
+            write: Some((
+                sid.to_string(),
+                mirror.project_dir.clone(),
+                mirror.store.clone(),
+            )),
+        };
+        (outcome, settlement)
     }
 
     /// [`Self::stop_session`] for a sid ccteam holds no process for. Nothing to
@@ -19065,7 +19463,7 @@ mod tests {
 
         let mut guard = gateway.lock().await;
         let mut events = guard.subscribe_events();
-        guard.stop_session("s1").await.unwrap();
+        guard.stop_session_detached("s1").await.unwrap();
         assert_eq!(guard.session_residency("s1"), Some("stopped"));
         assert!(
             read_session_meta(&alpha, "s1")
@@ -19086,19 +19484,31 @@ mod tests {
         ));
 
         // Idempotent; unknown sid still errors so the API can 404.
-        guard.stop_session("s1").await.unwrap();
-        assert!(guard.stop_session("s404").await.is_err());
+        guard.stop_session_detached("s1").await.unwrap();
+        assert!(guard.stop_session_detached("s404").await.is_err());
         // …and the IM verb reaches it too: `/stop` on a released sid used to
         // read as "unknown session for this chat" (its gate only knew resident
         // + detached), which failed on exactly the sessions whose process the
-        // idle sweeper had just let go.
+        // idle sweeper had just let go. It runs through the SHARED entry point:
+        // the stop has to take the child's delegation claim, which no
+        // `&mut Gateway` may await (issue #197 E).
+        drop(guard);
         assert_eq!(
-            guard
-                .handle_text("mock", "chat-1", "alice", "/stop s1")
-                .await
-                .unwrap(),
+            Gateway::handle_message_shared(
+                Arc::clone(&gateway),
+                "mock",
+                "chat-1",
+                "alice",
+                "",
+                "/stop s1",
+                &[],
+                None,
+            )
+            .await
+            .unwrap(),
             vec!["stopped session s1\n↓ 本项目会话 → /sessions"]
         );
+        let mut guard = gateway.lock().await;
 
         // A stopped session does not come back on its own: the next message
         // opens a NEW sid rather than resuming the one the user ended.
@@ -19118,7 +19528,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let mut gateway = Gateway::new(fake, "alpha", tmp.path());
         let sid = spawn_managed(&mut gateway).await;
-        gateway.stop_session(&sid).await.unwrap();
+        gateway.stop_session_detached(&sid).await.unwrap();
         assert_eq!(gateway.session_residency(&sid), Some("stopped"));
 
         gateway
@@ -19620,7 +20030,7 @@ mod tests {
         assert!(restarted.is_session_detached(&sid));
         let pid = child.id();
 
-        restarted.stop_session(&sid).await.unwrap();
+        restarted.stop_session_detached(&sid).await.unwrap();
         assert!(!restarted.is_session_detached(&sid));
         assert!(!restarted.is_session_live(&sid));
         // The process is gone (reap it so the assertion is about the kill,
@@ -20166,7 +20576,7 @@ mod tests {
         // Stop it, then resume by sid — the rebuild-from-meta path a daemon
         // restart, a capacity eviction and a web resume all share. The re-spawn
         // must carry BOTH axes, not just the model.
-        gateway.stop_session("s1").await.ok();
+        gateway.stop_session_detached("s1").await.ok();
         gateway
             .resume_stopped_session("s1", "user:web-api", Some("alpha"))
             .await
@@ -20270,7 +20680,7 @@ mod tests {
 
         // Rung 2 — the rebuild-from-meta core (daemon restart / `/use` cold
         // resume / external adopt all funnel through it).
-        gateway.stop_session("s1").await.ok();
+        gateway.stop_session_detached("s1").await.ok();
         gateway
             .resume_stopped_session("s1", "user:web-api", Some("alpha"))
             .await
@@ -21569,6 +21979,26 @@ mod tests {
             })
         }
 
+        /// Report the turn this identity has open, as a real stdio adapter
+        /// does — so a stop can be tested end to end on the execution id a
+        /// delegation request is actually bound to.
+        fn in_flight_narration(
+            &self,
+            h: &ThreadHandle,
+        ) -> Option<ccteam_harness::PartialNarration> {
+            let active = self
+                .turn_queues
+                .lock()
+                .unwrap()
+                .get(&h.identity)
+                .and_then(|queue| queue.active.clone())?;
+            Some(ccteam_harness::PartialNarration {
+                exec_turn_id: Some(active),
+                text: "fake: half a migration".to_string(),
+                truncated: false,
+            })
+        }
+
         async fn rebuild_tool_surface(
             &self,
             _h: &ThreadHandle,
@@ -21891,6 +22321,7 @@ mod tests {
             &sid,
             "the task".into(),
             TurnRouting::Inject,
+            None,
             GatewayDeadline::start(),
         )
         .await
@@ -22203,15 +22634,15 @@ mod tests {
         // the decision is durable (`meta.stopped_at`) so no resume path brings
         // it back. Idempotent: a second stop is `Ok` (the session IS stopped —
         // 404 is reserved for a sid that does not exist at all).
-        gateway.stop_session("s1").await.unwrap();
+        gateway.stop_session_detached("s1").await.unwrap();
         assert!(gateway.session_views().is_empty());
         assert_eq!(gateway.session_residency("s1"), Some("stopped"));
         assert!(
             gateway.released_session_views(None).is_empty(),
             "a stopped session is never listed as released"
         );
-        gateway.stop_session("s1").await.unwrap();
-        assert!(gateway.stop_session("s99").await.is_err());
+        gateway.stop_session_detached("s1").await.unwrap();
+        assert!(gateway.stop_session_detached("s99").await.is_err());
     }
 
     /// v0.8.23 review §1.3-D item 9 — `SessionView::waiting_approval` mirrors
@@ -22877,6 +23308,7 @@ mod tests {
             Some("web".into()),
             false,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -24498,7 +24930,7 @@ mod tests {
                 .handle_text("mock", "chat-1", "alice", "/new claude")
                 .await
                 .unwrap();
-            gateway.stop_session("s2").await.unwrap();
+            gateway.stop_session_detached("s2").await.unwrap();
         }
         let routing = crate::routing_state_path_in(tmp.path());
         let saved: RoutingState =
@@ -28506,10 +28938,7 @@ mod tests {
             gateway.session_views().iter().any(|v| v.sid == "s1"),
             "created s1"
         );
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/stop s1")
-            .await
-            .unwrap();
+        gateway.stop_session_detached("s1").await.unwrap();
         assert!(
             !gateway.session_views().iter().any(|v| v.sid == "s1"),
             "s1 is stopped (no longer live)"
@@ -28579,10 +29008,7 @@ mod tests {
             .await
             .unwrap();
         assert!(gateway.is_session_live("s1"), "created s1");
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/stop s1")
-            .await
-            .unwrap();
+        gateway.stop_session_detached("s1").await.unwrap();
         assert!(
             !gateway.is_session_live("s1"),
             "s1 stopped (left the live map)"
@@ -29788,7 +30214,7 @@ mod tests {
                 .unwrap();
             assert_eq!((s1.as_str(), s2.as_str()), ("s1", "s2"));
             // Free s1 (persists the removal from live_sids + the bumped counter).
-            gateway.stop_session("s1").await.unwrap();
+            gateway.stop_session_detached("s1").await.unwrap();
             assert!(gateway.session_resolve("s1").is_none());
             assert!(gateway.session_resolve("s2").is_some());
         }
@@ -30921,10 +31347,7 @@ mod tests {
             .handle_text("mock", "chat-1", "alice", "/new claude cto")
             .await
             .unwrap();
-        gateway
-            .handle_text("mock", "chat-1", "alice", "/stop s1")
-            .await
-            .unwrap();
+        gateway.stop_session_detached("s1").await.unwrap();
         assert!(!gateway.is_session_live("s1"));
 
         let reply = gateway
@@ -33710,6 +34133,307 @@ mod tests {
         );
     }
 
+    /// A gateway behind an `Arc` with one live session, a delegation request
+    /// bound to the turn it has in flight, and persistence on — the shape every
+    /// stop-settlement test needs.
+    async fn stoppable_session_with_a_bound_request(
+        project_dir: &std::path::Path,
+    ) -> (Arc<tokio::sync::Mutex<Gateway>>, String, String) {
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", project_dir);
+        gateway.enable_persistence(project_dir).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        // A turn in flight (no event sink here, so no pump clears it).
+        let exec_turn = gateway
+            .submit_to_sid("s1", "the migration".into())
+            .await
+            .unwrap();
+        let claim = DelegationStoreClaim::for_test("s1");
+        let request_id = gateway
+            .accept_delegation_request(
+                &claim,
+                "s9",
+                ccteam_harness::NotifyMode::Final,
+                Some("migration".into()),
+                TurnRouting::Inject,
+                None,
+            )
+            .expect("the child accepts a request");
+        gateway.bind_delegation_request_for_test(&claim, &request_id, &exec_turn);
+        // Observed running: the state the pump leaves a bound request in once
+        // the turn it belongs to has opened.
+        gateway
+            .delegations
+            .get_mut("s1")
+            .unwrap()
+            .store
+            .get_mut(&request_id)
+            .unwrap()
+            .state = ccteam_harness::RequestState::Executing;
+        let store = gateway.delegations.get("s1").unwrap().store.clone();
+        Gateway::seed_delegation_store_for_test(project_dir, &claim, &store).unwrap();
+        (
+            Arc::new(tokio::sync::Mutex::new(gateway)),
+            request_id,
+            exec_turn,
+        )
+    }
+
+    fn request_state_on_disk(
+        project_dir: &std::path::Path,
+        sid: &str,
+        request_id: &str,
+    ) -> Option<ccteam_harness::RequestState> {
+        ccteam_harness::read_delegation_requests(project_dir, sid)?
+            .get(request_id)
+            .map(|request| request.state)
+    }
+
+    /// GitHub #197 (E) — the IM `/stop` settles the child ON DISK, not only in
+    /// memory.
+    ///
+    /// It used to run inside `&mut Gateway`, which cannot take the child's
+    /// single-flight claim (claims are taken before the gateway lock), so its
+    /// settlement never reached `delegation.json`: after a restart the request
+    /// read `executing` on a session whose process had been gone for hours.
+    /// The command now resolves under a short lock and stops through the same
+    /// door `agent_stop` uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_im_stop_settles_the_child_on_disk_not_only_in_memory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gateway, request_id, exec_turn) =
+            stoppable_session_with_a_bound_request(&project_dir).await;
+        assert_eq!(
+            request_state_on_disk(&project_dir, "s1", &request_id),
+            Some(ccteam_harness::RequestState::Executing),
+            "the fixture starts from an executing request"
+        );
+
+        let replies = Gateway::handle_message_shared(
+            Arc::clone(&gateway),
+            "mock",
+            "chat-1",
+            "alice",
+            "",
+            "/stop s1",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(replies[0].starts_with("stopped session s1"), "{replies:?}");
+        assert!(
+            replies[0].contains("cut a turn in flight (stopped)"),
+            "the IM receipt says what the stop cost: {replies:?}"
+        );
+
+        // THE point: durable, under the child's claim, before the reply.
+        assert_eq!(
+            request_state_on_disk(&project_dir, "s1", &request_id),
+            Some(ccteam_harness::RequestState::Interrupted),
+            "an IM /stop must settle the child on disk"
+        );
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, "s1").unwrap();
+        let record = rows
+            .iter()
+            .find(|row| row.outcome.as_deref() == Some(INTERRUPTED_OUTCOME))
+            .expect("the cut turn leaves a record");
+        assert_eq!(record.exec_turn_id.as_deref(), Some(exec_turn.as_str()));
+        assert_eq!(record.error_kind.as_deref(), Some("stopped"));
+        assert_eq!(record.assistant, "fake: half a migration");
+    }
+
+    /// GitHub #197 (E) — a settlement that could not be written is REPORTED.
+    /// `stopped:true` for a write that failed is a receipt for something that
+    /// did not happen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_settlement_that_cannot_be_written_is_reported_not_swallowed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gateway, _request_id, _exec) =
+            stoppable_session_with_a_bound_request(&project_dir).await;
+        // A directory where the transcript's file belongs: every append fails,
+        // deterministically and without depending on file permissions.
+        let turns = ccteam_harness::execution::turns_mirror::turns_jsonl_path(&project_dir, "s1");
+        std::fs::remove_file(&turns).ok();
+        std::fs::create_dir_all(&turns).unwrap();
+
+        let outcome = Gateway::stop_session_shared(&gateway, "s1").await.unwrap();
+        assert!(
+            outcome
+                .settle_error
+                .as_deref()
+                .is_some_and(|error| error.contains("interrupted record not written")),
+            "{outcome:?}"
+        );
+        assert!(
+            !gateway.lock().await.is_session_live("s1"),
+            "the PROCESS still stopped; only the record of it failed"
+        );
+    }
+
+    /// GitHub #197 (E) — an idle release is NOT a stop. Nothing is settled, the
+    /// queue files stay on disk, and a reader can still see that its task is
+    /// waiting rather than lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_idle_release_keeps_every_request_and_says_where_its_line_is() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_persistence(&project_dir).unwrap();
+        gateway.set_sessions_config(ccteam_core::SessionsConfig {
+            idle_release_secs: 1,
+            ..Default::default()
+        });
+        gateway
+            .handle_text("mock", "chat-1", "alice", "hello")
+            .await
+            .unwrap();
+        let claim = DelegationStoreClaim::for_test("s1");
+        let request_id = gateway
+            .accept_delegation_request(
+                &claim,
+                "s9",
+                ccteam_harness::NotifyMode::Final,
+                Some("queued task".into()),
+                TurnRouting::Queue,
+                None,
+            )
+            .unwrap();
+        gateway.bind_delegation_request_for_test(&claim, &request_id, "parked-turn-1");
+        // Parked behind the vendor, which is what a `Queue` dispatch to a busy
+        // child leaves on disk.
+        gateway
+            .delegations
+            .get_mut("s1")
+            .unwrap()
+            .store
+            .get_mut(&request_id)
+            .unwrap()
+            .state = ccteam_harness::RequestState::Queued;
+        let store = gateway.delegations.get("s1").unwrap().store.clone();
+        Gateway::seed_delegation_store_for_test(&project_dir, &claim, &store).unwrap();
+        // The adapter's parked-input mirror: this is what makes the line
+        // provably retained.
+        let chat_dir = ccteam_harness::execution::turns_mirror::chat_dir(&project_dir, "s1");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+        std::fs::write(
+            chat_dir.join("deferred-input.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 2,
+                "parked": [{"turn_id": "parked-turn-1", "text": "do not open a public port"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        *gateway
+            .sessions
+            .get("s1")
+            .unwrap()
+            .turn_started_at
+            .lock()
+            .unwrap() = None;
+        gateway.backdate_residency_for_tests("s1", std::time::Duration::from_secs(600));
+        let gateway = Arc::new(tokio::sync::Mutex::new(gateway));
+        assert_eq!(Gateway::idle_release_tick(&gateway).await, vec!["s1"]);
+
+        let guard = gateway.lock().await;
+        assert_eq!(
+            request_state_on_disk(&project_dir, "s1", &request_id),
+            Some(ccteam_harness::RequestState::Queued),
+            "a release settles nothing: the request is still waiting"
+        );
+        let rows = guard.delegation_request_rows("s1", 10);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["state"], serde_json::json!("queued"), "{rows:?}");
+        assert_eq!(
+            rows[0]["retained_in"],
+            serde_json::json!("deferred-input.json"),
+            "a reader must be able to see WHERE its task is waiting: {rows:?}"
+        );
+        assert!(
+            chat_dir.join("deferred-input.json").exists(),
+            "the queue file is retained across a release"
+        );
+    }
+
+    /// GitHub #197 (E) — a body that is already gone settles its bound requests
+    /// as a CUT (`body_exited`), never as a completion. ccteam held no adapter
+    /// for it, so the narration is honestly `unknown` rather than an empty
+    /// string that reads as silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_body_that_exited_settles_as_interrupted_never_as_a_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake, "alpha", &project_dir);
+        gateway.enable_persistence(&project_dir).unwrap();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude cto")
+            .await
+            .unwrap();
+        let claim = DelegationStoreClaim::for_test("s1");
+        let request_id = gateway
+            .accept_delegation_request(
+                &claim,
+                "s9",
+                ccteam_harness::NotifyMode::Final,
+                Some("the long job".into()),
+                TurnRouting::Inject,
+                None,
+            )
+            .unwrap();
+        gateway.bind_delegation_request_for_test(&claim, &request_id, "exec-1");
+        {
+            // Observed executing, then the body went away — the state a
+            // detached body from before a daemon restart is found in.
+            let mirror = gateway.delegations.get_mut("s1").unwrap();
+            mirror.store.get_mut(&request_id).unwrap().state =
+                ccteam_harness::RequestState::Executing;
+        }
+        gateway.sessions.remove("s1");
+        gateway.detached.insert(
+            "s1".to_string(),
+            DetachedBody {
+                sid: "s1".to_string(),
+                slug: "alpha".to_string(),
+                cwd: project_dir.clone(),
+                body: ccteam_harness::execution::session_body::SessionBody {
+                    // pid 0 is nobody: `terminate` finds nothing to signal and
+                    // returns cleanly, which is the "already gone" case here.
+                    pid: 0,
+                    fingerprint: String::new(),
+                    adapter: "fake".to_string(),
+                    recorded_at: chrono::Utc::now().to_rfc3339(),
+                },
+                since: chrono::Utc::now(),
+                reason: "test",
+            },
+        );
+
+        let outcome = gateway.stop_session_detached("s1").await.unwrap();
+        let cut = outcome.interrupted.expect("the exited body cut a turn");
+        assert_eq!(cut.reason, InterruptedReason::BodyExited);
+        assert_eq!(cut.exec_turn_id, "exec-1");
+        assert_eq!(cut.narration, InterruptedNarration::Unknown);
+        assert_eq!(cut.request_ids, vec![request_id.clone()]);
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, "s1").unwrap();
+        let record = rows
+            .iter()
+            .find(|row| row.exec_turn_id.as_deref() == Some("exec-1"))
+            .expect("the exited body's turn leaves a record");
+        assert_eq!(record.outcome.as_deref(), Some(INTERRUPTED_OUTCOME));
+        assert_eq!(record.error_kind.as_deref(), Some("body_exited"));
+        assert!(record.assistant.is_empty(), "{record:?}");
+    }
+
     /// GitHub #197 (E) — a restart reconcile must NEVER promote the record of
     /// an interrupted turn into a completion notification.
     ///
@@ -33756,7 +34480,7 @@ mod tests {
                 tool_calls: vec![],
                 attachments: vec![],
                 outcome: Some(INTERRUPTED_OUTCOME.to_string()),
-                error_kind: Some("turn_interrupted".into()),
+                error_kind: Some("stopped".into()),
                 error: Some("s98 was stopped while this turn was running.".into()),
                 conclusion: None,
             },

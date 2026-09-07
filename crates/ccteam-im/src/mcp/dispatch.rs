@@ -3546,6 +3546,7 @@ async fn dispatch_task(
         sid,
         task,
         routing,
+        request_id.as_deref(),
         deadline,
     )
     .await
@@ -5173,6 +5174,10 @@ async fn run_agent_stop(
         let mut interrupted = serde_json::Map::new();
         interrupted.insert("turn".into(), serde_json::json!(cut.row_turn_id));
         interrupted.insert("exec_turn".into(), serde_json::json!(cut.exec_turn_id));
+        // WHO ended it. A body that died on its own and a deliberate stop are
+        // both cuts and neither is ever a completion, but they are different
+        // things for a parent to act on.
+        interrupted.insert("reason".into(), serde_json::json!(cut.reason.as_str()));
         interrupted.insert(
             "narration".into(),
             serde_json::json!(cut.narration.as_str()),
@@ -5202,6 +5207,15 @@ async fn run_agent_stop(
             .collect();
         body.insert("undelivered".into(), serde_json::json!(rows));
     }
+    if outcome.retained_unattributed > 0 {
+        // Lines ccteam is holding that name no request: counted, never
+        // attributed. Saying one of them is a given request's task is a claim
+        // ccteam cannot prove, and an unprovable receipt is worse than a count.
+        body.insert(
+            "retained_unattributed".into(),
+            serde_json::json!(outcome.retained_unattributed),
+        );
+    }
     if outcome.has_retained() {
         // Only when something is actually held: a policy nobody's task is
         // subject to is noise in every other stop response.
@@ -5209,6 +5223,13 @@ async fn run_agent_stop(
             "resume_policy".into(),
             serde_json::json!(crate::gateway::RESUME_POLICY_REPLAY_AFTER_FIRST_RESULT),
         );
+    }
+    if let Some(error) = outcome.settle_error.as_deref() {
+        // The process stopped; the RECORD of what that cut short did not reach
+        // disk. A plain `stopped:true` here would hand the caller a receipt for
+        // a write that failed (issue #197 E).
+        body.insert("settled".into(), serde_json::json!(false));
+        body.insert("error".into(), serde_json::json!(error));
     }
     Ok(
         serde_json::to_string(&serde_json::Value::Object(body))
@@ -7544,7 +7565,7 @@ mod session_tool_tests {
         let child_sid = child["sid"].as_str().unwrap().to_string();
         {
             let mut gw = gateway.lock().await;
-            gw.stop_session(&child_sid).await.unwrap();
+            gw.stop_session_detached(&child_sid).await.unwrap();
         }
         drop(gateway);
 
@@ -9405,6 +9426,19 @@ mod session_tool_tests {
         )
         .unwrap();
 
+        // …and one line ccteam is holding that names NOBODY: a human's message
+        // queued behind the same session.
+        crate::pending_turns::enqueue_pending_turn(
+            &project_dir,
+            &child,
+            "and how is it going?",
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+
         let stopped = parse(
             &run_agent_stop(
                 &ambient(&principal, "alpha", json!({ "sid": &child })),
@@ -9421,6 +9455,7 @@ mod session_tool_tests {
         // "it said nothing".
         let cut = &stopped["interrupted"];
         assert_eq!(cut["exec_turn"], running["turn_id"], "{stopped}");
+        assert_eq!(cut["reason"], json!("stopped"), "{stopped}");
         assert_eq!(cut["narration"], json!("unknown"), "{stopped}");
         assert_eq!(
             cut["requests"],
@@ -9443,6 +9478,18 @@ mod session_tool_tests {
             stopped["resume_policy"],
             json!("replay_after_first_result"),
             "{stopped}"
+        );
+        // A line ccteam holds that names no request is COUNTED, never spread
+        // over the requests that happen to be outstanding (issue #197 E).
+        assert_eq!(
+            stopped["retained_unattributed"],
+            json!(1),
+            "the human turn queued behind the body is counted, not attributed: {stopped}"
+        );
+        assert_eq!(
+            held.len(),
+            1,
+            "and it did not become a second undelivered row: {stopped}"
         );
 
         // The transcript keeps the record — this is what `agent_read` shows
@@ -10503,7 +10550,7 @@ mod session_tool_tests {
         assert!(collected.get("status").is_none());
 
         // An explicit stop flips the word — the difference the caller acts on.
-        gw.lock().await.stop_session(&child).await.unwrap();
+        gw.lock().await.stop_session_detached(&child).await.unwrap();
         let collected = parse(
             &run_agent_read_transcript(
                 &ambient(&principal, "alpha", json!({ "sid": child.clone() })),
