@@ -57,7 +57,7 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 - `delivery` 把四件不同的事分开:`accepted`(ccteam 已持久持有)、`queued`(还被 ccteam 留在 harness 前面)、`written`(字节已写进 harness)、`executing`(观察到承载它的 turn 开始了)。冲进 stdin 不等于模型读了,所以在 turn 真的开起来之前 `executing` 一律是 `"unknown"`;凡是 ccteam 观察不到的,都说 `"unknown"`,不给一个自信的 `false`。
 - 完成通知到不了你时带 `notify_deliverable:false` —— 那就用 `agent_read{sid,wait}`。
 
-内联(`wait`)→ `{sid, request_id, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`,其中 `turn_id` 就是回答**这一条请求**的那行 transcript;`result_text` 保留 2000 字符头尾节选(与推送通知的 `final` 同档),标记里写明读全文的精确调用 `agent_read{sid,turn:<turn_id>,max_chars}`。等待超时回 `{sid, request_id, turn_id, status, state, delivery, answered:false}` —— `state` 是这条请求当下的生命周期状态,所以「还排在第三位」和「正在跑」分得开。你阻塞期间这条请求被移出账本了(`agent_stop`、parent 已不可达),回的是同一个形状但 `state:"unknown"`:现在没人会再了结它,而一个 ccteam 说不出名字的答案只会报「没有」,绝不拿别人的顶上。用 `wait` 拿到答案的那**条请求**不会再推完成通知:答案已在你手上,绝不会再送第二遍。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
+内联(`wait`)→ `{sid, request_id, turn_id, turn, status:"completed"|"failed", context_pct?, cost_usd?, result_text, error_kind?, error?}`,其中 `turn_id` 就是回答**这一条请求**的那行 transcript;`result_text` 保留 2000 字符头尾节选(与推送通知的 `final` 同档),标记里写明读全文的精确调用 `agent_read{sid,turn:<turn_id>,max_chars}`。等待超时回 `{sid, request_id, turn_id, status, state, delivery, answered:false}` —— `state` 是这条请求当下的生命周期状态,所以「还排在第三位」和「正在跑」分得开。你阻塞期间这条请求被移出账本了(提交没能到达 vendor、parent 已不可达),回的是同一个形状但 `state:"unknown"`:现在没人会再了结它,而一个 ccteam 说不出名字的答案只会报「没有」,绝不拿别人的顶上。用 `wait` 拿到答案的那**条请求**不会再推完成通知:答案已在你手上,绝不会再送第二遍。查无此 sid 的错误会区分「这里从未有过」与「被用户显式 stop 过」。
 
 ### `agent_read` —— 名册,或一份 transcript
 
@@ -68,7 +68,7 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 - **`requests`** —— 这个会话还欠谁什么:未决的在前(按受理顺序),后面跟一段有界的已了结记录,至多十条。每行 `{request_id, parent_sid, state, notify, title?, queue_position?, turn_id?, answered_turn?, created_at, delivery}`,`delivery` 与派发响应里的四件事同义。派工方由此看见自己的队列,而不是靠猜。
 - **`turn:<turn_id>`** —— 精确取那一条 turn,此后这个会话再完成多少个 turn 都不影响。每条被截断的节选,配方指的就是它:`n:1` 的意思是「最新那条」,而那只是节选被写出的那一瞬间成立。transcript 里没有的 turn 会报错,绝不给你别的一页。
 - **`n:0` = 只要状态**:同一返回体但没有任何 turn 文本 —— `activity`、`context_pct`、`latest`,带 `since` 时还有未读条数 `remaining`。这是最便宜的「做完了吗?有新话吗?」读法。你很少需要它:自己雇的会话完成通知会自己到、以它为准;只轮询那些回了 `notify_deliverable:false` 的会话,而且优先用 `wait` 而不是循环。
-- `wait`(随 `sid`)—— 目标 turn 在飞时挂住这次读的秒数,0–240(默认 0)。到边界 → 含最终 turn 的正常返回体,外加 `resolved_requests`:这次读**答复**了你的哪几条任务,点名给出,答案就不会被误当成另一条任务的。没被答复就不再可解的那些 —— 被 `agent_stop` 丢掉、parent 已不可达、turn 被中途打断 —— 单独列进 `unknown_requests`:现在没人会再答它,你手上也没有它的答案。超时 → 正常返回体 + `activity:"working"`;没有在飞 turn → 立即返回。超时绝不动那个 turn。循环 `agent_read{sid,wait:240,since:<cursor>}` 就是等一个比内联 `agent{wait}` 更久的子会话的正解 —— 不要自己去 tail 它的 `turns.jsonl`。若等到边界的正是派任务的 parent,该任务的完成通知会被抑制:答案已经在你手上。
+- `wait`(随 `sid`)—— 目标 turn 在飞时挂住这次读的秒数,0–240(默认 0)。到边界 → 含最终 turn 的正常返回体,外加 `resolved_requests`:这次读**答复**了你的哪几条任务,点名给出,答案就不会被误当成另一条任务的。没被答复就不再可解的那些 —— turn 被 `agent_stop` 中途打断、parent 已不可达、提交从未到达 vendor —— 单独列进 `unknown_requests`:现在没人会再答它,你手上也没有它的答案。超时 → 正常返回体 + `activity:"working"`;没有在飞 turn → 立即返回。超时绝不动那个 turn。循环 `agent_read{sid,wait:240,since:<cursor>}` 就是等一个比内联 `agent{wait}` 更久的子会话的正解 —— 不要自己去 tail 它的 `turns.jsonl`。若等到边界的正是派任务的 parent,该任务的完成通知会被抑制:答案已经在你手上。
 - 退役的 `limit` 参数 = 硬错(已改名 `n`)。
 
 ### `agent_stop` —— 显式结束一个会话

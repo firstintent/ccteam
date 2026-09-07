@@ -1035,11 +1035,6 @@ mod delegation_store_io {
         ccteam_harness::persist_delegation_requests(project_dir, &ticket(claim), store)
     }
 
-    /// Delete the child's record.
-    pub(super) fn remove_blocking(project_dir: &Path, claim: &DelegationStoreClaim) {
-        ccteam_harness::delete_delegation_requests(project_dir, &ticket(claim));
-    }
-
     /// Delete it off the caller's thread.
     pub(super) async fn remove(project_dir: &Path, claim: &DelegationStoreClaim) {
         let (dir, guard) = (project_dir.to_path_buf(), ticket(claim));
@@ -14025,47 +14020,6 @@ impl Gateway {
             None => {
                 let _ = Self::persist_delegation_store(&gateway, claim).await;
             }
-        }
-    }
-
-    /// v0.9.0 W2 (F2) — drop EVERY request for a child (mirror + durable
-    /// `delegation.json`). Used by `agent_stop` and by the reconcile when the
-    /// parent is gone; a completion can then never fire for it.
-    pub fn drop_delegation_requests(&mut self, claim: &DelegationStoreClaim) {
-        let child_sid = claim.child_sid();
-        self.delegation_watch_set.write().unwrap().remove(child_sid);
-        if let Some(m) = self.delegations.remove(child_sid) {
-            delegation_store_io::remove_blocking(&m.project_dir, claim);
-        } else if let Some(resolved) = self.session_resolve(child_sid) {
-            delegation_store_io::remove_blocking(&resolved.project_dir, claim);
-        }
-    }
-
-    /// Remove every request without holding the gateway mutex across the IO.
-    pub async fn drop_delegation_requests_shared(
-        gateway: Arc<tokio::sync::Mutex<Self>>,
-        claim: &DelegationStoreClaim,
-    ) {
-        let child_sid = claim.child_sid();
-        let project_dir = {
-            let mut guard = gateway.lock().await;
-            guard
-                .delegation_watch_set
-                .write()
-                .unwrap()
-                .remove(child_sid);
-            guard
-                .delegations
-                .remove(child_sid)
-                .map(|mirror| mirror.project_dir)
-                .or_else(|| {
-                    guard
-                        .session_resolve(child_sid)
-                        .map(|resolved| resolved.project_dir)
-                })
-        };
-        if let Some(project_dir) = project_dir {
-            delegation_store_io::remove(&project_dir, claim).await;
         }
     }
 

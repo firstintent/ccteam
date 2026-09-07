@@ -3908,8 +3908,9 @@ async fn dispatch_wait_for_completion(
                 answered = true;
                 break;
             }
-            // The row has LEFT the store: an `agent_stop` dropped it, or the
-            // notifier could not reach its parent. Nothing will resolve it now,
+            // The row has LEFT the store: its dispatch never reached the
+            // vendor, or the notifier could not reach its parent. Nothing will
+            // resolve it now,
             // so the wait ends — but "gone" is not "answered" (issue #201).
             // Treating it as answered sent the caller to the transcript tail,
             // where the newest row is a SIBLING's answer. It reports unknown.
@@ -4494,9 +4495,10 @@ async fn settle_until_a_request_resolves(
                     Some(RequestState::Answered | RequestState::Failed) => {
                         outcome.resolved.push(id.clone())
                     }
-                    // Cut short, confirmed undelivered, or gone from the store
-                    // altogether (an `agent_stop`, an unreachable parent).
-                    // These stopped being resolvable WITHOUT being answered,
+                    // Cut short by an explicit stop, confirmed undelivered,
+                    // or gone from the store altogether (a dispatch that never
+                    // reached the vendor, an unreachable parent). These stopped
+                    // being resolvable WITHOUT being answered,
                     // and reporting them as resolved told a caller it was
                     // holding an answer that does not exist (issue #201).
                     Some(RequestState::Interrupted | RequestState::Undelivered) | None => {
@@ -11584,8 +11586,9 @@ mod session_tool_tests {
     /// GitHub #197 (B) — a request that LEFT the store while its dispatcher was
     /// blocked on it is `unknown`, never `answered`. The wait used to treat a
     /// missing row as done and then read the transcript tail, so a caller
-    /// waiting on B whose request was dropped (an `agent_stop`, an unreachable
-    /// parent) was handed sibling A's answer as if it were B's.
+    /// waiting on B whose request was dropped (a dispatch that never reached
+    /// the vendor, an unreachable parent) was handed sibling A's answer as if
+    /// it were B's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_wait_on_a_request_the_store_lost_reports_unknown_not_a_siblings_answer() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11802,7 +11805,7 @@ mod session_tool_tests {
 
     /// GitHub #197 — `agent_read{sid,wait}` names what it RESOLVED and what it
     /// merely lost track of, separately. `resolved_requests` used to mean "no
-    /// longer outstanding", which lumped a request an `agent_stop` dropped in
+    /// longer outstanding", which lumped a request that had been dropped in
     /// with one the boundary answered — telling the caller it was holding an
     /// answer that does not exist.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11861,8 +11864,8 @@ mod session_tool_tests {
             })
         };
         // Both requests are what the read is waiting on. B is then dropped out
-        // from under it — exactly what an `agent_stop` does — and A is answered
-        // by the boundary the read returns at.
+        // from under it — what a dispatch whose submit failed leaves behind —
+        // and A is answered by the boundary the read returns at.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let claim = Gateway::claim_delegation_store(&gw, &child).await;
         Gateway::drop_delegation_request_shared(std::sync::Arc::clone(&gw), &claim, &lost_id).await;
