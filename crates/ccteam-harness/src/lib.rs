@@ -71,7 +71,7 @@ pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::delegation::{
     mint_request_id, read_delegation_requests, remove_delegation_requests,
     scan_delegation_requests, write_delegation_requests, DelegationRequest, DelegationRequests,
-    NotifyMode, RequestState,
+    DelegationStoreGuard, NotifyMode, RequestState,
 };
 pub use execution::dsh_acp::{
     build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, identity_socket_path,

@@ -3526,14 +3526,17 @@ async fn dispatch_task(
             return Err(mcp_gateway_error(tool, &error));
         }
     };
-    let mut bind_failed = false;
+    let mut bind_error: Option<String> = None;
     if let Some(request_id) = request_id.as_deref() {
         // Bind BEFORE the caller is told anything, and DURABLY before the
         // adapter's completion fence is released below: a boundary that lands
         // in the next millisecond must already know whose answer it is, and one
         // that lands before the binding is on disk would leave an executed
         // request unbindable by every later life (issue #201).
-        bind_failed = crate::gateway::Gateway::bind_delegation_request_shared(
+        // The text goes with it: `state:"unknown"` says a correlation is not
+        // promised, and this says why — the same string the request carries
+        // into `agent_read`.
+        bind_error = crate::gateway::Gateway::bind_delegation_request_shared(
             Arc::clone(gateway),
             store_claim
                 .as_ref()
@@ -3542,7 +3545,8 @@ async fn dispatch_task(
             &receipt,
         )
         .await
-        .is_err();
+        .err()
+        .map(|error| format!("{error:#}"));
         let gw = gateway.lock().await;
         if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
             gw.emit_delegation_progress(
@@ -3610,11 +3614,12 @@ async fn dispatch_task(
             m.insert("request_id".to_string(), serde_json::json!(request_id));
         }
         insert_delivery_facts(&mut m, &receipt);
-        if bind_failed {
+        if let Some(error) = bind_error.as_deref() {
             // The task went out; the record of WHICH turn answers it did not.
             // This process may still resolve it, no later one can, and saying
             // `queued` would promise a correlation a restart cannot keep.
             m.insert("state".to_string(), serde_json::json!("unknown"));
+            m.insert("error".to_string(), serde_json::json!(error));
             m.remove("queue_position");
             m.insert(
                 "delivery".to_string(),

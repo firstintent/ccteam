@@ -330,7 +330,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet.",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
@@ -472,13 +472,18 @@ mod tests {
     /// omitted `notify` inherits. An orchestrator that could not see any of
     /// them re-sent one instruction three times and then stopped a
     /// 400k-context child it believed was ignoring it — ~190 B against that.
+    ///
+    /// 5200 → 5320 B for `unknown_requests`. A field the response can carry
+    /// but the face never mentions is a field callers do not act on: a read
+    /// that came back holding nothing looked identical to one whose task was
+    /// dropped, which is the confusion this whole issue is about. ~120 B.
     #[test]
     fn full_face_tools_list_fits_byte_budget() {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5200,
-            "full tools/list is {bytes} B; budget is 5200 B"
+            bytes <= 5320,
+            "full tools/list is {bytes} B; budget is 5320 B"
         );
     }
 
@@ -519,8 +524,10 @@ mod tests {
         };
         let ambient = compact_len(&tools_list_response(&face)) + instructions_for(&face).len();
         // 2200 → 2340 B with the read face's share of the same facts: what the
-        // session still owes (`requests`) and the exact `turn:<id>` re-read.
-        assert!(ambient <= 2340, "leaf ambient cost is {ambient} B");
+        // session still owes (`requests`) and the exact `turn:<id>` re-read;
+        // 2340 → 2460 B for `unknown_requests`, which lands entirely on this
+        // face — `agent_read` is the whole leaf tool face.
+        assert!(ambient <= 2460, "leaf ambient cost is {ambient} B");
     }
 
     #[test]

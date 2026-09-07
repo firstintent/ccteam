@@ -402,6 +402,23 @@ impl DelegationRequests {
     }
 }
 
+/// Proof that the caller holds the single-flight claim over one child's
+/// requests.
+///
+/// Every DURABLE write goes through one of these, so a read-modify-write on
+/// `delegation.json` cannot be interleaved by construction rather than by
+/// discipline — two `agent` calls on one busy child used to lose the loser's
+/// binding, and a completion the notifier had already claimed could be
+/// overwritten by an accept reading a stale snapshot (issue #201). Reads are
+/// unguarded: a stale read is a stale read, never a lost write.
+///
+/// The gateway's `DelegationStoreClaim` is the only implementor — it wraps the
+/// actual lock; this trait is how that lock reaches a write signature.
+pub trait DelegationStoreGuard {
+    /// The child whose requests the holder may write.
+    fn child_sid(&self) -> &str;
+}
+
 /// `<project>/.ccteam/chat/<child_sid>/delegation.json`.
 pub fn delegation_path(project_dir: &Path, child_sid: &str) -> PathBuf {
     chat_dir(project_dir, child_sid).join("delegation.json")
@@ -443,10 +460,10 @@ fn parse_delegation_requests(raw: &str, path: &Path) -> Option<DelegationRequest
 /// `meta.json`). An empty store removes the file.
 pub fn write_delegation_requests(
     project_dir: &Path,
-    child_sid: &str,
+    claim: &dyn DelegationStoreGuard,
     store: &DelegationRequests,
 ) -> Result<()> {
-    let path = delegation_path(project_dir, child_sid);
+    let path = delegation_path(project_dir, claim.child_sid());
     if store.is_empty() {
         return match std::fs::remove_file(&path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
@@ -459,8 +476,8 @@ pub fn write_delegation_requests(
 
 /// Drop every request for `child_sid` (best-effort — used when the child is
 /// gone and nothing can ever fire).
-pub fn remove_delegation_requests(project_dir: &Path, child_sid: &str) {
-    let _ = std::fs::remove_file(delegation_path(project_dir, child_sid));
+pub fn remove_delegation_requests(project_dir: &Path, claim: &dyn DelegationStoreGuard) {
+    let _ = std::fs::remove_file(delegation_path(project_dir, claim.child_sid()));
 }
 
 /// Scan `<project>/.ccteam/chat/*/delegation.json` and return every readable
@@ -492,6 +509,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The gateway's real claim wraps a lock; a unit test here has exclusive
+    /// use of its own tempdir, so this only satisfies the write signature.
+    struct TestClaim(&'static str);
+
+    impl DelegationStoreGuard for TestClaim {
+        fn child_sid(&self) -> &str {
+            self.0
+        }
+    }
+
     fn accepted(parent: &str, notify: NotifyMode, title: Option<&str>) -> DelegationRequest {
         DelegationRequest::accepted(
             parent,
@@ -507,7 +534,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = DelegationRequests::default();
         store.accept(accepted("s1", NotifyMode::Final, Some("research")));
-        write_delegation_requests(tmp.path(), "s2", &store).unwrap();
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &store).unwrap();
         let back = read_delegation_requests(tmp.path(), "s2").expect("requests read back");
         assert_eq!(back.requests.len(), 1);
         assert_eq!(back.requests[0].parent_sid, "s1");
@@ -583,11 +610,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = DelegationRequests::default();
         store.accept(accepted("s1", NotifyMode::Final, Some("verdict")));
-        write_delegation_requests(tmp.path(), "s2", &store).unwrap();
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &store).unwrap();
 
         let mut store = read_delegation_requests(tmp.path(), "s2").unwrap();
         store.accept(accepted("s9", NotifyMode::Off, Some("cleanup")));
-        write_delegation_requests(tmp.path(), "s2", &store).unwrap();
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &store).unwrap();
 
         let back = read_delegation_requests(tmp.path(), "s2").unwrap();
         assert_eq!(back.requests.len(), 2);
@@ -675,13 +702,38 @@ mod tests {
             .any(|r| r.title.as_deref() == Some("keep-me")));
     }
 
+    /// GitHub #197 — the write path takes its child sid FROM the claim, so a
+    /// caller cannot write one child's store while holding another's. The
+    /// signature is the seal (a bare `&str` no longer compiles); this pins the
+    /// half a signature cannot state — that the path is derived from the guard
+    /// and from nothing else.
+    #[test]
+    fn a_write_goes_where_its_claim_says_and_nowhere_else() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = DelegationRequests::default();
+        store.accept(accepted("s1", NotifyMode::Final, None));
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &store).unwrap();
+
+        assert!(delegation_path(tmp.path(), "s2").exists());
+        assert!(
+            !delegation_path(tmp.path(), "s3").exists(),
+            "no other child's record is touched"
+        );
+        assert!(read_delegation_requests(tmp.path(), "s3").is_none());
+        remove_delegation_requests(tmp.path(), &TestClaim("s3"));
+        assert!(
+            delegation_path(tmp.path(), "s2").exists(),
+            "removing s3 does not remove s2"
+        );
+    }
+
     #[test]
     fn scan_finds_every_child() {
         let tmp = TempDir::new().unwrap();
         for child in ["s2", "s3"] {
             let mut store = DelegationRequests::default();
             store.accept(accepted("s1", NotifyMode::Final, None));
-            write_delegation_requests(tmp.path(), child, &store).unwrap();
+            write_delegation_requests(tmp.path(), &TestClaim(child), &store).unwrap();
         }
         let mut found = scan_delegation_requests(tmp.path());
         found.sort_by(|a, b| a.0.cmp(&b.0));
@@ -701,8 +753,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = DelegationRequests::default();
         store.accept(accepted("s1", NotifyMode::Final, None));
-        write_delegation_requests(tmp.path(), "s2", &store).unwrap();
-        remove_delegation_requests(tmp.path(), "s2");
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &store).unwrap();
+        remove_delegation_requests(tmp.path(), &TestClaim("s2"));
         assert!(read_delegation_requests(tmp.path(), "s2").is_none());
     }
 
@@ -712,8 +764,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut store = DelegationRequests::default();
         store.accept(accepted("s1", NotifyMode::Final, None));
-        write_delegation_requests(tmp.path(), "s2", &store).unwrap();
-        write_delegation_requests(tmp.path(), "s2", &DelegationRequests::default()).unwrap();
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &store).unwrap();
+        write_delegation_requests(tmp.path(), &TestClaim("s2"), &DelegationRequests::default())
+            .unwrap();
         assert!(!delegation_path(tmp.path(), "s2").exists());
     }
 
