@@ -3503,7 +3503,7 @@ async fn dispatch_task(
     } else {
         None
     };
-    let receipt = match crate::gateway::Gateway::submit_to_sid_receipt_shared(
+    let mut receipt = match crate::gateway::Gateway::submit_to_sid_receipt_shared(
         Arc::clone(gateway),
         sid,
         task,
@@ -3526,10 +3526,14 @@ async fn dispatch_task(
             return Err(mcp_gateway_error(tool, &error));
         }
     };
+    let mut bind_failed = false;
     if let Some(request_id) = request_id.as_deref() {
-        // Bind BEFORE the caller is told anything: a boundary that arrives in
-        // the next millisecond must already know whose answer it is.
-        crate::gateway::Gateway::bind_delegation_request_shared(
+        // Bind BEFORE the caller is told anything, and DURABLY before the
+        // adapter's completion fence is released below: a boundary that lands
+        // in the next millisecond must already know whose answer it is, and one
+        // that lands before the binding is on disk would leave an executed
+        // request unbindable by every later life (issue #201).
+        bind_failed = crate::gateway::Gateway::bind_delegation_request_shared(
             Arc::clone(gateway),
             store_claim
                 .as_ref()
@@ -3537,7 +3541,8 @@ async fn dispatch_task(
             request_id,
             &receipt,
         )
-        .await;
+        .await
+        .is_err();
         let gw = gateway.lock().await;
         if let Some((vendor, host, slug)) = gw.session_vendor_host_slug(sid) {
             gw.emit_delegation_progress(
@@ -3554,8 +3559,10 @@ async fn dispatch_task(
         }
     }
     // The handover is complete: the request is bound, so the notifier may plan
-    // against it. Released BEFORE the inline wait below — a wait that held it
-    // would block the very boundary it is waiting for.
+    // against it and the vendor's own turn boundary may land. Both released
+    // BEFORE the inline wait below — a wait that held either would block the
+    // very boundary it is waiting for.
+    receipt.release_completion();
     drop(store_claim);
     let notification_route = CompletionNotificationRoute::resolve(
         caller_sid,
@@ -3603,6 +3610,22 @@ async fn dispatch_task(
             m.insert("request_id".to_string(), serde_json::json!(request_id));
         }
         insert_delivery_facts(&mut m, &receipt);
+        if bind_failed {
+            // The task went out; the record of WHICH turn answers it did not.
+            // This process may still resolve it, no later one can, and saying
+            // `queued` would promise a correlation a restart cannot keep.
+            m.insert("state".to_string(), serde_json::json!("unknown"));
+            m.remove("queue_position");
+            m.insert(
+                "delivery".to_string(),
+                serde_json::json!({
+                    "accepted": true,
+                    "queued": "unknown",
+                    "written": "unknown",
+                    "executing": "unknown",
+                }),
+            );
+        }
         if receipt.queued_behind_body {
             // One sid, one body: the child's process from before a ccteam
             // restart is still finishing its turn; the task is queued behind
@@ -4405,32 +4428,62 @@ fn last_mirrored_turn_id(resolved: &crate::gateway::SessionResolve) -> Option<St
 async fn settle_until_a_request_resolves(
     gateway: &GatewayHandle,
     sid: &str,
-    caller_sid: &str,
     waiting_on: &[String],
-) -> Vec<String> {
+) -> ReadResolution {
     const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+    let mut outcome = ReadResolution::default();
     if waiting_on.is_empty() {
-        return Vec::new();
+        return outcome;
     }
     let deadline = tokio::time::Instant::now() + SETTLE;
     loop {
-        let still: std::collections::HashSet<String> = gateway
-            .lock()
-            .await
-            .outstanding_request_ids(sid, caller_sid)
-            .into_iter()
-            .collect();
-        let resolved: Vec<String> = waiting_on
-            .iter()
-            .filter(|id| !still.contains(*id))
-            .cloned()
-            .collect();
-        if !resolved.is_empty() || tokio::time::Instant::now() >= deadline {
-            return resolved;
+        outcome = ReadResolution::default();
+        {
+            use ccteam_harness::RequestState;
+            let gw = gateway.lock().await;
+            for id in waiting_on {
+                match gw.delegation_request_state(sid, id) {
+                    // ANSWERED at an observed boundary — the only thing
+                    // "resolved" may mean. The caller acts on this: it is
+                    // holding the answer to exactly these tasks.
+                    Some(RequestState::Answered | RequestState::Failed) => {
+                        outcome.resolved.push(id.clone())
+                    }
+                    // Cut short, confirmed undelivered, or gone from the store
+                    // altogether (an `agent_stop`, an unreachable parent).
+                    // These stopped being resolvable WITHOUT being answered,
+                    // and reporting them as resolved told a caller it was
+                    // holding an answer that does not exist (issue #201).
+                    Some(RequestState::Interrupted | RequestState::Undelivered) | None => {
+                        outcome.unknown.push(id.clone())
+                    }
+                    Some(_) => outcome.still_waiting = true,
+                }
+            }
+        }
+        // An answer in hand is what this read came for, so it returns on the
+        // first one. An `unknown` alone is not worth cutting the wait short
+        // for: something else may still be about to answer.
+        let decided = !outcome.resolved.is_empty() || !outcome.still_waiting;
+        if decided || tokio::time::Instant::now() >= deadline {
+            return outcome;
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// What a long-poll read can honestly say about the requests it was waiting on.
+#[derive(Default)]
+struct ReadResolution {
+    /// Answered or failed at an OBSERVED boundary — the caller holds these.
+    resolved: Vec<String>,
+    /// No longer resolvable and never answered: dropped from the store, cut
+    /// short, or confirmed undelivered. Named separately because "I do not
+    /// know" and "here is your answer" are different things to act on.
+    unknown: Vec<String>,
+    /// At least one request is still outstanding — nothing to report for it.
+    still_waiting: bool,
 }
 
 /// Wait (briefly, bounded) for the boundary's own row to reach `turns.jsonl`.
@@ -4545,7 +4598,7 @@ async fn run_agent_read_transcript(
         Vec::new()
     };
     let reached = read_wait_for_turn_boundary(gateway, &sid, args).await;
-    let mut resolved_requests: Vec<String> = Vec::new();
+    let mut resolution = ReadResolution::default();
     if claimed {
         if reached {
             // The boundary landed. Give the notifier the moment it needs to
@@ -4554,8 +4607,7 @@ async fn run_agent_read_transcript(
             // reporting "resolved nothing" while the bookkeeping is still in
             // flight would be the vaguest possible answer to the one question
             // this field exists for.
-            resolved_requests =
-                settle_until_a_request_resolves(gateway, &sid, &caller_sid, &waiting_on).await;
+            resolution = settle_until_a_request_resolves(gateway, &sid, &waiting_on).await;
         }
         // The notifier suppressed this boundary in our favour (or we reached
         // it first); either way the caller now holds whatever it answered.
@@ -4674,10 +4726,19 @@ async fn run_agent_read_transcript(
     }
     // Which of the caller's own tasks this read resolved — the answer it is
     // now holding, named, so it is never mistaken for another one.
-    if !resolved_requests.is_empty() {
+    if !resolution.resolved.is_empty() {
         body.insert(
             "resolved_requests".into(),
-            serde_json::json!(resolved_requests),
+            serde_json::json!(resolution.resolved),
+        );
+    }
+    // …and which of them stopped being resolvable WITHOUT being answered.
+    // Listing those as resolved told a caller it was holding an answer that
+    // never existed (issue #201).
+    if !resolution.unknown.is_empty() {
+        body.insert(
+            "unknown_requests".into(),
+            serde_json::json!(resolution.unknown),
         );
     }
     // `status: "stopped"` used to mean nothing more than "not live", which
@@ -5020,7 +5081,7 @@ async fn run_agent_stop(
     // Dropping the child's requests is a store mutation like any other, so it
     // queues behind whatever dispatch or notification is mid-write. Taken
     // before the gateway lock (claim-then-lock order) and held across both.
-    let _store_claim = if caller_sid.is_empty() {
+    let store_claim = if caller_sid.is_empty() {
         None
     } else {
         Some(crate::gateway::Gateway::claim_delegation_store(gateway, &sid).await)
@@ -5038,8 +5099,8 @@ async fn run_agent_stop(
     // Capture the delegation event fields + drop the child's own watch BEFORE
     // the stop removes it from the live map.
     let stopped_meta = gw.session_vendor_host_slug(&sid);
-    if !caller_sid.is_empty() {
-        gw.drop_delegation_requests(&sid);
+    if let Some(claim) = store_claim.as_ref() {
+        gw.drop_delegation_requests(claim);
     }
     gw.stop_session(&sid)
         .await
@@ -5925,11 +5986,16 @@ mod session_tool_tests {
         )
         .await
         .unwrap();
-        assert!(
-            gw.lock()
-                .await
-                .parent_holds_delegation_request(&child, &principal),
-            "a third-party reader must not take the parent's notification away"
+        // The invariant is the NOTIFICATION, not the outstanding row: the
+        // boundary resolves the request either way (that is what a boundary
+        // does), and what a third party must not do is take the parent's copy
+        // of the answer. The parent read its FIRST task inline, so this is the
+        // only notification it can ever have been owed.
+        let notes = await_notifications(tmp.path(), &principal, 1).await;
+        assert_eq!(
+            notes.len(),
+            1,
+            "a third-party reader must not take the parent's notification away: {notes:?}"
         );
     }
 
@@ -11263,6 +11329,168 @@ mod session_tool_tests {
             ccteam_harness::NotifyMode::Brief,
             "{watch:?}"
         );
+    }
+
+    /// GitHub #197 — `agent_read{sid,wait}` names what it RESOLVED and what it
+    /// merely lost track of, separately. `resolved_requests` used to mean "no
+    /// longer outstanding", which lumped a request an `agent_stop` dropped in
+    /// with one the boundary answered — telling the caller it was holding an
+    /// answer that does not exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_wait_separates_the_requests_it_answered_from_the_ones_it_lost() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal, stub) = queueing_dispatch_gateway(&project_dir).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (task, title) in [("task A", "A"), ("task B", "B")] {
+            run_agent_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "task": task, "title": title }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap();
+        }
+        let outstanding = gw.lock().await.outstanding_request_ids(&child, &principal);
+        assert_eq!(outstanding.len(), 2, "{outstanding:?}");
+        let (answered_id, lost_id) = (outstanding[0].clone(), outstanding[1].clone());
+        let reader = {
+            let gw = std::sync::Arc::clone(&gw);
+            let principal = principal.clone();
+            let child = child.clone();
+            let paths = paths.clone();
+            tokio::spawn(async move {
+                parse(
+                    &run_agent_read(
+                        &ambient(&principal, "alpha", json!({ "sid": &child, "wait": 20 })),
+                        &gw,
+                        McpCaller::Ambient,
+                        &paths,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            })
+        };
+        // Both requests are what the read is waiting on. B is then dropped out
+        // from under it — exactly what an `agent_stop` does — and A is answered
+        // by the boundary the read returns at.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let claim = Gateway::claim_delegation_store(&gw, &child).await;
+        Gateway::drop_delegation_request_shared(std::sync::Arc::clone(&gw), &claim, &lost_id).await;
+        drop(claim);
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let read = tokio::time::timeout(std::time::Duration::from_secs(20), reader)
+            .await
+            .expect("the read returns at the boundary")
+            .expect("the reader finishes");
+        assert_eq!(
+            read["resolved_requests"],
+            json!([answered_id]),
+            "only the request an observed boundary answered: {read}"
+        );
+        assert_eq!(
+            read["unknown_requests"],
+            json!([lost_id]),
+            "a request that stopped being resolvable without being answered is \
+             named as unknown, never as resolved: {read}"
+        );
+    }
+
+    /// GitHub #197 — an `agent_stop` and a dispatch to the same child race for
+    /// its request store. Both go through that child's one claim, so the
+    /// durable record is never a half-written mixture of the two: either the
+    /// dispatch's request is there whole, or the stop removed everything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_racing_a_dispatch_leaves_a_whole_store_or_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(&project_dir).await;
+        for round in 0..6u32 {
+            let child = parse(
+                &run_agent_spawn(
+                    &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                    &gw,
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap(),
+            )["sid"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let dispatch = {
+                let gw = std::sync::Arc::clone(&gw);
+                let (principal, child) = (principal.clone(), child.clone());
+                tokio::spawn(async move {
+                    run_agent_dispatch(
+                        &ambient(
+                            &principal,
+                            "alpha",
+                            json!({ "sid": &child, "task": "work", "title": "T" }),
+                        ),
+                        &gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                })
+            };
+            let stop = {
+                let gw = std::sync::Arc::clone(&gw);
+                let (principal, child) = (principal.clone(), child.clone());
+                tokio::spawn(async move {
+                    run_agent_stop(
+                        &ambient(&principal, "alpha", json!({ "sid": &child })),
+                        &gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                })
+            };
+            let (dispatched, _stopped) = tokio::join!(dispatch, stop);
+            let dispatched = dispatched.expect("the dispatch task does not panic");
+            // Whatever survives on disk must be READABLE and complete: a
+            // half-written store is how one writer's request lost its parent.
+            if let Some(store) = ccteam_harness::read_delegation_requests(&project_dir, &child) {
+                for request in &store.requests {
+                    assert_eq!(request.parent_sid, principal, "round {round}: {store:?}");
+                    assert_eq!(
+                        request.title.as_deref(),
+                        Some("T"),
+                        "round {round}: {store:?}"
+                    );
+                }
+                if let Ok(body) = dispatched.as_ref() {
+                    let body = parse(body);
+                    if let Some(id) = body["request_id"].as_str() {
+                        assert!(
+                            store.get(id).is_some() || store.requests.is_empty(),
+                            "round {round}: the accepted request is neither recorded nor \
+                             removed: {store:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// GitHub #197 (F.1) — notify inheritance is decided in ONE place and holds

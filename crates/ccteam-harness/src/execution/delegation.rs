@@ -221,6 +221,13 @@ pub struct DelegationRequest {
     /// at-least-once redelivery after a restart cannot double-notify.
     #[serde(default)]
     pub notified: bool,
+    /// Why this request's binding could not be made durable, when that
+    /// happened. NEVER persisted — the whole point is that the write failed —
+    /// and never read back: it exists so the live surfaces report `unknown`
+    /// instead of a confident `queued` for a request whose correlation would
+    /// not survive a restart.
+    #[serde(skip)]
+    pub bind_error: Option<String>,
 }
 
 impl DelegationRequest {
@@ -246,6 +253,7 @@ impl DelegationRequest {
             turn_id: None,
             answered_turn: None,
             notified: false,
+            bind_error: None,
         }
     }
 }

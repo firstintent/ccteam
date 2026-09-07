@@ -568,7 +568,10 @@ pub struct TurnSubmission {
     /// (issue #201: a dispatcher told only "pending" re-sent the same
     /// instruction three times).
     pub queue_position: Option<usize>,
-    completion_guard: Option<Box<dyn Send + 'static>>,
+    /// `Sync` as well as `Send`: the receipt this moves to is held across
+    /// awaits by the dispatch path, and a future holding `&TurnReceipt` over an
+    /// await is only `Send` if everything in it is `Sync`.
+    completion_guard: Option<Box<dyn Send + Sync + 'static>>,
 }
 
 impl TurnSubmission {
@@ -621,7 +624,7 @@ impl TurnSubmission {
     /// Hold a vendor turn boundary until the caller records this accepted
     /// input. Used by adapters whose prompt can complete concurrently with the
     /// submission acknowledgement.
-    pub fn hold_completion(mut self, guard: impl Send + 'static) -> Self {
+    pub fn hold_completion(mut self, guard: impl Send + Sync + 'static) -> Self {
         self.completion_guard = Some(Box::new(guard));
         self
     }
@@ -630,6 +633,14 @@ impl TurnSubmission {
     /// registered. Safe and idempotent for unfenced submissions.
     pub fn release_completion(&mut self) {
         self.completion_guard.take();
+    }
+
+    /// Hand the fence to whoever still has recording to do. The gateway passes
+    /// it to the delegation bind: a turn that may complete concurrently with
+    /// its own acknowledgement must not be allowed to end before the request it
+    /// belongs to is durably bound to it (issue #201).
+    pub fn take_completion_guard(&mut self) -> Option<Box<dyn Send + Sync + 'static>> {
+        self.completion_guard.take()
     }
 
     /// Mint an opaque, process-unique receipt id before a vendor request is
