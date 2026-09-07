@@ -88,8 +88,8 @@ async fn real_codex_app_server_start_thread_smoke() {
     assert!(!handle.identity.trim().is_empty());
     tokio::time::timeout(Duration::from_secs(10), adapter.close_thread(&handle))
         .await
-        .expect("real codex app-server thread/archive timed out")
-        .expect("real codex app-server thread/archive should succeed");
+        .expect("real codex app-server close (thread/unsubscribe) timed out")
+        .expect("real codex app-server close (thread/unsubscribe) should succeed");
 }
 
 /// Real end-to-end round-trip proving the chat reply ccteam surfaces is
@@ -539,6 +539,99 @@ async fn submit_turn_resumes_unloaded_thread_before_turn_start() {
         seen.iter().filter(|m| *m == "turn/start").count(),
         2,
         "both turns must have reached turn/start: {seen:?}"
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
+/// GitHub #200 (`docs-local/issues/#204`) — a thread re-loaded onto a NEW
+/// app-server connection (the shared child was re-spawned after a
+/// `config.toml` change) must be resumed WITH its per-thread
+/// `config.mcp_servers.ccteam` principal. Codex takes MCP config from the
+/// start/resume params only; a bare resume dropped s932/excore onto the
+/// global enrollment entry and it became a projectless caller mid-thread.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn ensure_loaded_resume_carries_the_per_thread_mcp_principal() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("ensure-loaded-principal");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let reqs: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let reqs_h = Arc::clone(&reqs);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        if req.get("id").is_some() {
+            reqs_h.lock().unwrap().push(req.clone());
+        }
+        match req["method"].as_str() {
+            Some("initialize") => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-princ" } } }),
+            Some("thread/resume") => json!({ "result": { "thread": { "thread_id": "t-princ" } } }),
+            Some("turn/start") => json!({ "result": { "turn": { "id": "turn-ok" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &SpawnCtx {
+                generation: 0,
+                mode: None,
+                slug: "excore".into(),
+                sid: "s932".into(),
+                owner: "user:rob".into(),
+                cwd: std::env::temp_dir(),
+                project_dir: std::env::temp_dir(),
+                extra_args: vec![],
+                model_id: None,
+                effort: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: "seKret".into(),
+                remote: None,
+            },
+        )
+        .await
+        .unwrap();
+    let start = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "thread/start")
+        .cloned()
+        .unwrap();
+    let principal =
+        start["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].clone();
+    assert_eq!(principal, "Bearer ccteam-sid:s932:seKret");
+
+    // The connection epoch turned over (config reload re-spawn / transport
+    // death): the next turn re-loads the thread. That resume is where the
+    // principal was lost.
+    adapter.forget_loaded_for_test().await;
+    adapter
+        .submit_turn(&h, TurnInput::UserText("continue".into()))
+        .await
+        .unwrap();
+    let seen = reqs.lock().unwrap().clone();
+    let resume = seen
+        .iter()
+        .find(|r| r["method"] == "thread/resume")
+        .unwrap_or_else(|| panic!("unloaded thread must be resumed: {seen:?}"));
+    assert_eq!(resume["params"]["threadId"], "t-princ");
+    assert_eq!(
+        resume["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"],
+        principal,
+        "a re-load must carry the SAME per-thread principal the thread was started with, \
+         or codex falls back to the global enrollment entry"
     );
 
     drop(peer);
@@ -1308,6 +1401,7 @@ fn d2_response(req: &Value) -> Value {
         }}),
         Some("thread/rollback") => json!({ "result": { "thread": { "id": "tid-d2" } } }),
         Some("thread/name/set") => json!({ "result": {} }),
+        Some("thread/unsubscribe") => json!({ "result": {} }),
         Some("thread/settings/update") => json!({ "result": {} }),
         Some("thread/goal/set") => json!({ "result": { "goal": {
             "threadId": "tid-d2", "objective": "ship", "status": "active",
@@ -1398,6 +1492,25 @@ async fn d2_start_with_handler(
     tokio::sync::mpsc::Sender<Value>,
     PathBuf,
 ) {
+    d2_start_in(tag, handler, std::env::temp_dir(), 0).await
+}
+
+/// `d2_start_with_handler` with an explicit `project_dir` + thread
+/// generation, for tests that read what the adapter persists under
+/// `<project_dir>/.ccteam/chat/codex-1/` (#203).
+async fn d2_start_in(
+    tag: &str,
+    handler: impl Fn(&Value) -> Value + Send + 'static,
+    project_dir: PathBuf,
+    generation: u64,
+) -> (
+    CodexAppServerAdapter,
+    ccteam_harness::ThreadHandle,
+    Arc<StdMutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<Value>,
+    PathBuf,
+) {
     let sock = unique_socket_path(tag);
     std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
     let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
@@ -1415,13 +1528,13 @@ async fn d2_start_with_handler(
                 role: "demo".into(),
             },
             &SpawnCtx {
-                generation: 0,
+                generation,
                 mode: None,
                 slug: "test".into(),
                 sid: "codex-1".into(),
                 owner: "user:web-api".into(),
                 cwd: std::env::temp_dir(),
-                project_dir: std::env::temp_dir(),
+                project_dir,
                 extra_args: vec![],
                 model_id: None,
                 effort: None,
@@ -2341,6 +2454,87 @@ async fn model_settings_notification_updates_status_without_event_consumer() {
         })
         .await;
     }
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// `docs-local/issues/#203` — codex's settings snapshot is the only
+/// confirmation a `/model` pick gets, and until now it lived in the in-memory
+/// tracker alone. Like every other long-stdio adapter, codex must persist the
+/// statusline to `status.json` (stamped with the thread generation) so the
+/// gateway's re-spawn ladder can replay the model the session was RUNNING
+/// after a release + failed resume, instead of codex's global default.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn settings_snapshot_persists_status_json_with_generation() {
+    use ccteam_harness::execution::session_status::read_status_file;
+    let project = TempDir::new().unwrap();
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_in(
+        "status-persist",
+        d2_response,
+        project.path().to_path_buf(),
+        7,
+    )
+    .await;
+    // The thread/start response carries no model in this peer, so the start
+    // snapshot is model-less — but it already exists, stamped.
+    let at_start = read_status_file(project.path(), "codex-1").expect("status.json at start");
+    assert_eq!(at_start.generation, Some(7));
+    assert_eq!(at_start.model, None);
+
+    notif
+        .send(json!({
+            "method": "thread/settings/updated",
+            "params": { "threadId": h.identity,
+                "threadSettings": { "model": "gpt-6-astra", "effort": "xhigh" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let project = project.path().to_path_buf();
+        async move {
+            read_status_file(&project, "codex-1")
+                .and_then(|s| s.model)
+                .as_deref()
+                == Some("gpt-6-astra")
+        }
+    })
+    .await;
+    let persisted = read_status_file(project.path(), "codex-1").unwrap();
+    assert_eq!(persisted.effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        persisted.generation,
+        Some(7),
+        "stamped with the thread's generation"
+    );
+    // The live answer and the persisted file are one shape.
+    let live = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(live.model, persisted.model);
+    assert_eq!(live.generation, Some(7));
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// `docs-local/issues/#203` — a close is a residency release, not the end of
+/// the session. `thread/archive` made the next `thread/resume` fail for good
+/// ("session … is archived"), so every idle/capacity release silently became
+/// a fresh thread: context and the `/model` pick both gone (s932). Close
+/// unsubscribes only.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn close_thread_unsubscribes_without_archiving() {
+    let (adapter, h, seen, peer, sock) = d2_start("close-no-archive").await;
+    adapter.close_thread(&h).await.unwrap();
+    let frames = seen.lock().unwrap();
+    let unsub = find_frame(&frames, "thread/unsubscribe").expect("close unsubscribes");
+    assert_eq!(unsub["params"]["threadId"], h.identity);
+    assert!(
+        find_frame(&frames, "thread/archive").is_none(),
+        "a release must leave the thread resumable: no thread/archive"
+    );
+    drop(frames);
     peer.abort();
     let _ = std::fs::remove_file(sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
