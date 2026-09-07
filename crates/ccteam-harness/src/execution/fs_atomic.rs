@@ -145,10 +145,12 @@ impl Drop for TmpFile {
 /// treats it as a crash leftover. Comfortably longer than any single write.
 const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Remove crash leftovers for THIS target only: `<file>.<pid>.<seq>.tmp`
-/// siblings older than [`STALE_TMP_AGE`]. One `read_dir` of the directory the
-/// write is about to touch anyway, no recursion, and never another target's
-/// files — a sweep that guesses is worse than a leftover.
+/// Remove crash leftovers for THIS target only: siblings matching exactly this
+/// helper's own naming, `<file>.<pid>.<seq>.tmp` with both fields numeric,
+/// older than [`STALE_TMP_AGE`]. One `read_dir` of the directory the write is
+/// about to touch anyway, no recursion, and nothing this helper did not write —
+/// a sweep that guesses is worse than a leftover, and `meta.json.bak.tmp` or
+/// somebody's editor swap file is not ours to delete.
 fn sweep_stale_tmp_siblings(path: &Path) {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return;
@@ -161,7 +163,21 @@ fn sweep_stale_tmp_siblings(path: &Path) {
     for entry in entries.flatten() {
         let leaked = entry.file_name();
         let leaked = leaked.to_string_lossy();
-        if !leaked.starts_with(&prefix) || !leaked.ends_with(".tmp") {
+        let Some(middle) = leaked
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        // `<pid>.<seq>`, both hex-or-decimal digits and nothing else.
+        let mut fields = middle.split('.');
+        let ours = matches!((fields.next(), fields.next(), fields.next()),
+            (Some(pid), Some(seq), None)
+                if !pid.is_empty()
+                    && !seq.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && seq.bytes().all(|b| b.is_ascii_hexdigit()));
+        if !ours {
             continue;
         }
         let stale = entry
@@ -289,12 +305,14 @@ mod tests {
         let leaked = dir.path().join("delegation.json.999999.0.tmp");
         let fresh = dir.path().join("delegation.json.999999.1.tmp");
         let others = dir.path().join("meta.json.999999.0.tmp");
-        for path in [&leaked, &fresh, &others] {
+        // Same target, same age — but not this helper's naming.
+        let foreign = dir.path().join("delegation.json.swp.tmp");
+        for path in [&leaked, &fresh, &others, &foreign] {
             std::fs::write(path, b"leftover").unwrap();
         }
         // Only the leftover is old enough to be a crash remnant.
         let old = std::time::SystemTime::now() - STALE_TMP_AGE - std::time::Duration::from_secs(60);
-        for path in [&leaked, &others] {
+        for path in [&leaked, &others, &foreign] {
             let file = File::options().write(true).open(path).unwrap();
             file.set_times(std::fs::FileTimes::new().set_modified(old))
                 .unwrap();
@@ -305,6 +323,10 @@ mod tests {
         assert!(!leaked.exists(), "a stale sibling of this target is swept");
         assert!(fresh.exists(), "a staging file still in use is left alone");
         assert!(others.exists(), "another target's files are never touched");
+        assert!(
+            foreign.exists(),
+            "a sibling this helper did not write is never touched"
+        );
     }
 
     /// Staging files left behind in `dir`, by name.
