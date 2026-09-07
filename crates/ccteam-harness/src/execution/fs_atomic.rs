@@ -42,18 +42,27 @@ use anyhow::{Context, Result};
 ///
 /// Caller is responsible for ensuring `path`'s parent directory exists.
 pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = sibling_tmp_path(path);
+    // Anything left behind is swept next time this target is written: a crash
+    // between create and rename leaves a staging file nobody will ever rename,
+    // and with per-call names there is no second writer to reuse it.
+    sweep_stale_tmp_siblings(path);
+    // Removes the staging file on EVERY early return below — a full disk, a
+    // failed fsync, a rename onto a read-only directory — so an error path
+    // cannot litter the directory it just failed to write into.
+    let tmp = TmpFile::new(sibling_tmp_path(path));
 
     let mut file =
-        File::create(&tmp).with_context(|| format!("create tmp file {}", tmp.display()))?;
+        File::create(&tmp.path).with_context(|| format!("create tmp file {}", tmp.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("write tmp file {}", tmp.display()))?;
     file.sync_all()
         .with_context(|| format!("fsync tmp file {}", tmp.display()))?;
     drop(file);
 
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp.path, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    // Renamed away: there is nothing left to clean up.
+    tmp.keep();
 
     // Best-effort: make the rename's directory-entry update durable too.
     // Ignored on failure — not all platforms/filesystems support fsync on a
@@ -99,6 +108,72 @@ pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>>
         }
     }
     Ok(out)
+}
+
+/// A staging file that removes itself unless the rename claimed it.
+struct TmpFile {
+    path: std::path::PathBuf,
+    renamed: bool,
+}
+
+impl TmpFile {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            renamed: false,
+        }
+    }
+
+    fn display(&self) -> std::path::Display<'_> {
+        self.path.display()
+    }
+
+    fn keep(mut self) {
+        self.renamed = true;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if !self.renamed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// How long a staging sibling may sit before a later write of the same target
+/// treats it as a crash leftover. Comfortably longer than any single write.
+const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Remove crash leftovers for THIS target only: `<file>.<pid>.<seq>.tmp`
+/// siblings older than [`STALE_TMP_AGE`]. One `read_dir` of the directory the
+/// write is about to touch anyway, no recursion, and never another target's
+/// files — a sweep that guesses is worse than a leftover.
+fn sweep_stale_tmp_siblings(path: &Path) {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let leaked = entry.file_name();
+        let leaked = leaked.to_string_lossy();
+        if !leaked.starts_with(&prefix) || !leaked.ends_with(".tmp") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TMP_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Per-process tmp-name counter. Paired with the pid it makes every staging
@@ -183,6 +258,53 @@ mod tests {
             Vec::<String>::new(),
             "every staging file is cleaned up by its own rename"
         );
+    }
+
+    /// A write that fails leaves nothing behind: the staging file is removed on
+    /// every error path, not only the happy one. Here the target's directory
+    /// refuses the rename (the target itself is a non-empty directory), so the
+    /// write gets as far as an fsync'd staging file and then fails.
+    #[test]
+    fn a_failed_write_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("meta.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("occupant"), b"x").unwrap();
+
+        let error = atomic_write_durable(&target, b"{}").expect_err("renaming onto a dir fails");
+        assert!(format!("{error:#}").contains("rename"), "{error:#}");
+        assert_eq!(
+            tmp_files(dir.path()),
+            Vec::<String>::new(),
+            "an error path must not litter the directory it failed to write"
+        );
+    }
+
+    /// A staging file a crashed process left behind is swept by the next write
+    /// of the SAME target — same directory, nothing else touched.
+    #[test]
+    fn the_next_write_sweeps_a_crashed_writers_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("delegation.json");
+        let leaked = dir.path().join("delegation.json.999999.0.tmp");
+        let fresh = dir.path().join("delegation.json.999999.1.tmp");
+        let others = dir.path().join("meta.json.999999.0.tmp");
+        for path in [&leaked, &fresh, &others] {
+            std::fs::write(path, b"leftover").unwrap();
+        }
+        // Only the leftover is old enough to be a crash remnant.
+        let old = std::time::SystemTime::now() - STALE_TMP_AGE - std::time::Duration::from_secs(60);
+        for path in [&leaked, &others] {
+            let file = File::options().write(true).open(path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+
+        atomic_write_durable(&target, b"{}").unwrap();
+
+        assert!(!leaked.exists(), "a stale sibling of this target is swept");
+        assert!(fresh.exists(), "a staging file still in use is left alone");
+        assert!(others.exists(), "another target's files are never touched");
     }
 
     /// Staging files left behind in `dir`, by name.
