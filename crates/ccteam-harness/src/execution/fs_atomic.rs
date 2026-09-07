@@ -21,13 +21,24 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
-/// Write `bytes` to `path` durably: write to a sibling `.tmp` file, `fsync`
-/// that tmp file, `rename` it over `path`, then best-effort `fsync` the
+/// Write `bytes` to `path` durably: write to a private sibling tmp file,
+/// `fsync` that tmp file, `rename` it over `path`, then best-effort `fsync` the
 /// parent directory (ignoring errors — some platforms/filesystems reject a
 /// bare directory fsync).
+///
+/// **Two concurrent writers of the same target are safe.** The tmp name used to
+/// be `<file>.tmp` for everybody, so a second writer truncated the first one's
+/// tmp file and whichever renamed second failed with `ENOENT` — an error the
+/// caller reported as a failed write of a file that was, in fact, fine. Every
+/// call now mints its own tmp name (pid + a process-monotonic counter), so the
+/// only thing two writers can race over is which one's `rename` lands last,
+/// which is the semantics `rename` is chosen for. Serializing writers is still
+/// the caller's job when the CONTENT is a read-modify-write; this helper only
+/// guarantees no writer corrupts another's staging file.
 ///
 /// Caller is responsible for ensuring `path`'s parent directory exists.
 pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -90,15 +101,21 @@ pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>>
     Ok(out)
 }
 
-/// A `.tmp` sibling of `path` that doesn't collide with `with_extension`'s
-/// "replace the last extension" behavior on extensionless files (e.g.
-/// `state/sessions/next-sid`).
+/// Per-process tmp-name counter. Paired with the pid it makes every staging
+/// file unique across threads AND across processes sharing one directory.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A private tmp sibling of `path`, in the same directory (so the `rename` is
+/// same-filesystem and therefore atomic). Suffixed rather than
+/// `with_extension`-ed, which would eat the last extension of an
+/// extensionless-looking name (e.g. `state/sessions/next-sid`).
 fn sibling_tmp_path(path: &Path) -> std::path::PathBuf {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!("{file_name}.tmp"))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!("{file_name}.{}.{seq:x}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -116,8 +133,68 @@ mod tests {
         atomic_write_durable(&path, b"2").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "2");
 
-        // No leftover tmp file after a successful write.
-        assert!(!dir.path().join("next-sid.tmp").exists());
+        // No leftover staging file after a successful write.
+        assert_eq!(tmp_files(dir.path()), Vec::<String>::new());
+    }
+
+    /// Two writers of ONE target never share a staging file. Before this,
+    /// every call staged through `<file>.tmp`: the second writer truncated the
+    /// first one's tmp and whichever renamed second failed
+    /// `rename …tmp -> …: No such file or directory`, so a perfectly good
+    /// write was reported as a failure (seen on `delegation.json` under two
+    /// concurrent dispatches). Whichever content wins is the caller's problem
+    /// to serialize; NOT losing the write to a shared temp name is this
+    /// helper's.
+    #[test]
+    fn concurrent_writers_of_one_target_never_share_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delegation.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        std::thread::scope(|scope| {
+            for writer in 0..8u32 {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                let failures = std::sync::Arc::clone(&failures);
+                scope.spawn(move || {
+                    let body = format!("{{\"writer\":{writer}}}");
+                    barrier.wait();
+                    for _ in 0..40 {
+                        if let Err(error) = atomic_write_durable(&path, body.as_bytes()) {
+                            failures.lock().unwrap().push(format!("{error:#}"));
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            failures.lock().unwrap().as_slice(),
+            Vec::<String>::new(),
+            "no writer may fail because another was staging the same target"
+        );
+        // The target holds exactly one writer's body, whole — never a mix.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            (0..8).any(|writer| body == format!("{{\"writer\":{writer}}}")),
+            "torn content: {body}"
+        );
+        assert_eq!(
+            tmp_files(dir.path()),
+            Vec::<String>::new(),
+            "every staging file is cleaned up by its own rename"
+        );
+    }
+
+    /// Staging files left behind in `dir`, by name.
+    fn tmp_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
     }
 
     /// One torn append costs ONE line. The fixture is the real-world shape: a
