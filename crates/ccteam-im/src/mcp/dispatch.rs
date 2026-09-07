@@ -4665,13 +4665,17 @@ async fn run_agent_read_transcript(
     // a cheap in-memory peek — then DROP the guard before the fs read.
     // Residency comes from the SAME lock hold as the resolve: two acquisitions
     // could disagree about a session that was released in between.
-    let (resolved, live, projection, residency) = {
+    let (resolved, live, projection, residency, in_flight) = {
         let gw = gateway.lock().await;
         (
             gw.session_resolve_any(&sid),
             gw.live_turn_for(&sid),
             gw.progress_projection(),
             gw.session_residency(&sid),
+            // The turn in flight, from the SAME hold: a partial that named a
+            // turn the residency in this body contradicts would be worse than
+            // no partial at all.
+            gw.in_flight_turn(&sid),
         )
     };
     let resolved = resolved.ok_or_else(|| format!("agent_read: unknown session {sid}"))?;
@@ -4787,6 +4791,41 @@ async fn run_agent_read_transcript(
             "unknown_requests".into(),
             serde_json::json!(resolution.unknown),
         );
+    }
+    // What the turn RUNNING RIGHT NOW has said, for the caller whose question
+    // is "what is it doing" (issue #197 G). A child that had worked
+    // twenty-nine minutes and made sixty-nine tool calls read back as
+    // `turns:[]`, so its parent stopped it to find out — and lost the work.
+    //
+    // `partial:true` is the safety property and stands alone: what follows is
+    // NOT an answer, whatever else this body carries. It changes nothing —
+    // `activity` stays `working`, no request is resolved, and no completion
+    // notification is disarmed or triggered by reading it.
+    if let Some(in_flight) = in_flight {
+        body.insert("partial".into(), serde_json::json!(true));
+        // The excerpt obeys `max_chars`, which can only ever narrow the
+        // adapter's own cap, and its own budget: the page above answers "what
+        // did it say", and spending that budget on mid-turn chatter would drop
+        // a finished answer in favour of a running one.
+        let mut row = serde_json::Map::new();
+        row.insert("turn_id".into(), serde_json::json!(in_flight.exec_turn_id));
+        row.insert(
+            "narration".into(),
+            serde_json::json!(in_flight.narration.as_str()),
+        );
+        let (text, omitted) = ccteam_harness::bounded_tail(&in_flight.text, max_chars);
+        let omitted = in_flight.omitted_chars.saturating_add(omitted);
+        if !text.is_empty() {
+            row.insert("text".into(), serde_json::json!(text));
+        }
+        if omitted > 0 {
+            row.insert("truncated".into(), serde_json::json!(true));
+            row.insert("omitted_chars".into(), serde_json::json!(omitted));
+        }
+        if !in_flight.requests.is_empty() {
+            row.insert("requests".into(), serde_json::json!(in_flight.requests));
+        }
+        body.insert("in_flight".into(), serde_json::Value::Object(row));
     }
     // `status: "stopped"` used to mean nothing more than "not live", which
     // read as "this session is over" for a session that was merely between
@@ -6337,6 +6376,11 @@ mod session_tool_tests {
         }
     }
 
+    /// What a narrating [`StubAdapter`] says its running turn has said, and
+    /// how much head its cell had already dropped.
+    const STUB_NARRATION: &str = "migrating the schema, then the tests, then the docs, then the release note — and the handover paragraph last";
+    const STUB_NARRATION_OMITTED: usize = 8;
+
     /// A stub that owns a real turn FIFO: one turn runs, the rest wait, and a
     /// test releases them one at a time. What that buys the request tests
     /// (issue #201): three tasks are genuinely outstanding at once, each with
@@ -6439,6 +6483,10 @@ mod session_tool_tests {
         /// `queued` — the disposition is what the adapter DID, never an echo
         /// of what was asked for (issue #197 D).
         degrade_inject: bool,
+        /// What this stub reports as the in-flight turn's public narration.
+        /// `None` models a channel that CANNOT report one (the honest answer
+        /// is then `unknown`, never an empty string that reads as silence).
+        narration: Option<String>,
         /// Run a STARTED turn to its boundary from inside `submit_turn_routed`,
         /// then hold the call open long enough for the pump and the notifier to
         /// have processed it. The pathological ordering behind issue #197: a
@@ -6657,6 +6705,30 @@ mod session_tool_tests {
                 }
             })
         }
+        /// Report the turn this identity has open and what it has said, as a
+        /// real stdio adapter does — so an in-flight READ can be tested on the
+        /// execution id a delegation request is actually bound to.
+        fn in_flight_narration(
+            &self,
+            h: &ccteam_harness::ThreadHandle,
+        ) -> Option<ccteam_harness::PartialNarration> {
+            let text = self.narration.clone()?;
+            let active = self
+                .queue
+                .as_ref()?
+                .state
+                .lock()
+                .unwrap()
+                .get(&h.identity)
+                .and_then(|state| state.active.clone())?;
+            Some(ccteam_harness::PartialNarration {
+                exec_turn_id: Some(active),
+                text,
+                // As if the cell had already dropped this much head.
+                omitted_chars: STUB_NARRATION_OMITTED,
+            })
+        }
+
         async fn rebuild_tool_surface(
             &self,
             _h: &ccteam_harness::ThreadHandle,
@@ -9167,6 +9239,24 @@ mod session_tool_tests {
         (handle, principal, shared)
     }
 
+    /// [`queueing_dispatch_gateway`] whose stub CAN report what its running
+    /// turn has said (a real stdio adapter; the plain one models a channel
+    /// that cannot).
+    async fn queueing_dispatch_gateway_narrating(
+        project_dir: &std::path::Path,
+    ) -> (GatewayHandle, String, StubAdapter) {
+        queueing_dispatch_gateway_built(
+            project_dir,
+            StubAdapter {
+                answer: true,
+                queue: Some(std::sync::Arc::new(StubTurnQueue::default())),
+                narration: Some(STUB_NARRATION.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// [`queueing_dispatch_gateway`] whose stub has no injection channel.
     async fn queueing_dispatch_gateway_without_inject(
         project_dir: &std::path::Path,
@@ -9363,6 +9453,194 @@ mod session_tool_tests {
         assert_eq!(a["delivery"]["executing"], json!("unknown"), "{a}");
         assert_eq!(b["delivery"]["queued"], json!(true), "{b}");
         assert_eq!(b["delivery"]["written"], json!(false), "{b}");
+    }
+
+    /// GitHub #197 (G) — a read of a child that is WORKING returns what its
+    /// running turn has said so far, the execution turn it belongs to, and
+    /// whose tasks that turn is answering.
+    ///
+    /// The parent of a twenty-nine-minute child read `turns:[]` and stopped it
+    /// to find out what it was doing (s932→s936). The excerpt is bounded, says
+    /// how much it dropped, and is never an answer: `activity` stays
+    /// `working`, nothing is resolved, and the completion still arrives when
+    /// the turn really ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_read_of_a_working_child_returns_the_narration_so_far() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal, stub) = queueing_dispatch_gateway_narrating(&project_dir).await;
+        // The activity resolver is the one the web list uses, and it needs the
+        // daemon's progress projection to answer anything but "idle".
+        gw.lock().await.enable_project_creation(paths.clone());
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let running = parse(
+            &run_agent_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "task": "the migration", "title": "migration" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(running["status"], json!("started"), "{running}");
+
+        let read = |args: serde_json::Value| {
+            let gw = &gw;
+            let paths = &paths;
+            let principal = principal.clone();
+            async move {
+                parse(
+                    &run_agent_read(
+                        &ambient(&principal, "alpha", args),
+                        gw,
+                        McpCaller::Ambient,
+                        paths,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            }
+        };
+
+        // The status-only read is the natural pairing: no page, one partial.
+        let body = read(json!({ "sid": &child, "n": 0 })).await;
+        assert_eq!(body["activity"], json!("working"), "{body}");
+        assert_eq!(
+            body["partial"],
+            json!(true),
+            "a partial is never an answer, and says so: {body}"
+        );
+        let in_flight = &body["in_flight"];
+        assert_eq!(in_flight["turn_id"], running["turn_id"], "{body}");
+        assert_eq!(in_flight["narration"], json!("recorded"), "{body}");
+        assert_eq!(in_flight["text"], json!(STUB_NARRATION), "{body}");
+        assert_eq!(
+            in_flight["requests"],
+            json!([running["request_id"].as_str().unwrap()]),
+            "whose task this turn is answering, and only theirs: {body}"
+        );
+        assert_eq!(
+            in_flight["omitted_chars"],
+            json!(STUB_NARRATION_OMITTED),
+            "the cell's own dropped head is reported: {body}"
+        );
+        assert!(
+            body["turns"].as_array().is_some_and(|rows| rows.is_empty()),
+            "no completed turn exists yet: {body}"
+        );
+        assert!(body.get("done").is_none(), "{body}");
+
+        // `max_chars` narrows the excerpt to its TAIL and adds what that drops
+        // to the same count. (The tool clamps the budget to its own floor.)
+        let budget = AGENT_READ_MIN_MAX_CHARS;
+        let narrowed = read(json!({ "sid": &child, "n": 0, "max_chars": 1 })).await;
+        let tail: String = STUB_NARRATION
+            .chars()
+            .skip(STUB_NARRATION.chars().count() - budget)
+            .collect();
+        assert_eq!(narrowed["in_flight"]["text"], json!(tail), "{narrowed}");
+        assert_eq!(
+            narrowed["in_flight"]["truncated"],
+            json!(true),
+            "{narrowed}"
+        );
+        assert_eq!(
+            narrowed["in_flight"]["omitted_chars"],
+            json!(STUB_NARRATION_OMITTED + STUB_NARRATION.chars().count() - budget),
+            "{narrowed}"
+        );
+
+        // Reading a partial resolves nothing and disarms nothing: the real
+        // boundary still reports to the parent that dispatched the task.
+        assert!(
+            gw.lock()
+                .await
+                .parent_holds_delegation_request(&child, &principal),
+            "a partial read must not resolve the request it describes"
+        );
+        stub.run_next_turn(&stub_identity(&child)).await;
+        let notes = await_notifications(&project_dir, &principal, 1).await;
+        assert_eq!(notes.len(), 1, "the completion still arrives: {notes:?}");
+        assert!(notes[0].contains("migration"), "{notes:?}");
+
+        // …and once the turn is over there is no partial to report.
+        let after = read(json!({ "sid": &child, "n": 1 })).await;
+        assert!(after.get("partial").is_none(), "{after}");
+        assert!(after.get("in_flight").is_none(), "{after}");
+    }
+
+    /// A channel that cannot report an in-flight turn's narration still says a
+    /// turn IS in flight. `unknown` is a different fact from silence, and the
+    /// caller's next move (wait vs. re-dispatch) turns on the difference.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_unreportable_narration_still_names_the_turn_in_flight() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gw, principal, _stub) = queueing_dispatch_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let running = parse(
+            &run_agent_dispatch(
+                &ambient(
+                    &principal,
+                    "alpha",
+                    json!({ "sid": &child, "task": "the migration" }),
+                ),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        let body = parse(
+            &run_agent_read(
+                &ambient(&principal, "alpha", json!({ "sid": &child, "n": 0 })),
+                &gw,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["partial"], json!(true), "{body}");
+        assert_eq!(body["in_flight"]["turn_id"], running["turn_id"], "{body}");
+        assert_eq!(body["in_flight"]["narration"], json!("unknown"), "{body}");
+        assert!(
+            body["in_flight"].get("text").is_none(),
+            "an empty string would read as silence: {body}"
+        );
     }
 
     /// GitHub #197 (E) — an explicit stop ends a PROCESS, and says what that

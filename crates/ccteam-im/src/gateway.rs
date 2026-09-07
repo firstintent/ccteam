@@ -1305,6 +1305,29 @@ struct CutTurn {
     partial: Option<ccteam_harness::PartialNarration>,
 }
 
+/// A turn IN FLIGHT, as a read surface reports it (GitHub #197 G).
+///
+/// The same capture an explicit stop makes, minus the stop: `agent_read{sid}`
+/// answers with it so a parent can see what a working child is doing without
+/// stopping it to find out, and without tailing its private `turns.jsonl`.
+/// A partial is never a completion — it settles nothing, resolves no request
+/// and disarms no notification.
+#[derive(Debug, Clone)]
+pub struct InFlightTurn {
+    /// The EXECUTION turn id, which is what a request is bound to.
+    pub exec_turn_id: String,
+    /// How much of the narration the adapter could report.
+    pub narration: InterruptedNarration,
+    /// The narration tail (empty unless `narration` is `Recorded`).
+    pub text: String,
+    /// Characters dropped from the head to keep the excerpt bounded.
+    pub omitted_chars: usize,
+    /// The outstanding requests bound to THIS turn, in acceptance order —
+    /// whose tasks the turn is answering. Never "the newest request": a turn
+    /// answers what is bound to it or nothing (issue #201).
+    pub requests: Vec<String>,
+}
+
 /// How much of a cut turn's narration the record could carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptedNarration {
@@ -15914,6 +15937,49 @@ impl Gateway {
         Some(CutTurn {
             exec_turn_id,
             partial,
+        })
+    }
+
+    /// What `sid`'s in-flight turn has said so far, for a READ — `None` when
+    /// no turn is running or the session holds no process (GitHub #197 G).
+    ///
+    /// Reuses the stop path's capture ([`Self::capture_cut_turn`]), so the two
+    /// surfaces can never disagree about which turn is open or what it said,
+    /// and adds the requests bound to that turn. Read-only and lock-only: it
+    /// settles nothing, so a parent may look at a working child as often as it
+    /// likes without changing what happens when the turn ends.
+    pub fn in_flight_turn(&self, sid: &str) -> Option<InFlightTurn> {
+        let cut = self.capture_cut_turn(self.sessions.get(sid)?)?;
+        let (narration, text, omitted_chars) = match cut.partial.as_ref() {
+            // The adapter could not be asked: the narration is UNKNOWN, which
+            // is not the same fact as a turn that has said nothing.
+            None => (InterruptedNarration::Unknown, String::new(), 0),
+            Some(partial) if partial.text.trim().is_empty() => {
+                (InterruptedNarration::Empty, String::new(), 0)
+            }
+            Some(partial) => (
+                InterruptedNarration::Recorded,
+                partial.text.clone(),
+                partial.omitted_chars,
+            ),
+        };
+        let requests = self
+            .delegations
+            .get(sid)
+            .map(|mirror| {
+                mirror
+                    .store
+                    .bound_to(&cut.exec_turn_id)
+                    .map(|request| request.request_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(InFlightTurn {
+            exec_turn_id: cut.exec_turn_id,
+            narration,
+            text,
+            omitted_chars,
+            requests,
         })
     }
 

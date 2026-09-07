@@ -335,7 +335,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. A turn still running answers `partial:true` + `in_flight{turn_id,narration,text?,requests}` — a bounded excerpt of what it has said, never an answer and never a reason to stop it. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
@@ -520,13 +520,20 @@ mod tests {
     /// queuing behind it — and a caller that cannot see the axis cannot ask
     /// for the other one, nor know that the turn which answers a steer is the
     /// one it joined. ~155 B for the parameter and its consequence.
+    ///
+    /// 5900 → 6100 B for the in-flight read (issue #197 G). A parent whose
+    /// child read back as `turns:[]` for twenty-nine minutes stopped it to
+    /// find out what it was doing and lost the work; a field the face never
+    /// mentions is a field callers do not reach for, and the whole point of
+    /// this one is that it is reached for INSTEAD of a stop. ~165 B, which
+    /// also has to say the excerpt is not an answer.
     #[test]
     fn full_face_tools_list_fits_byte_budget() {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5900,
-            "full tools/list is {bytes} B; budget is 5900 B"
+            bytes <= 6100,
+            "full tools/list is {bytes} B; budget is 6100 B"
         );
     }
 
@@ -569,8 +576,10 @@ mod tests {
         // 2200 → 2340 B with the read face's share of the same facts: what the
         // session still owes (`requests`) and the exact `turn:<id>` re-read;
         // 2340 → 2460 B for `unknown_requests`, which lands entirely on this
-        // face — `agent_read` is the whole leaf tool face.
-        assert!(ambient <= 2460, "leaf ambient cost is {ambient} B");
+        // face — `agent_read` is the whole leaf tool face; 2460 → 2600 B for
+        // the in-flight read (issue #197 G), which lands here for the same
+        // reason and is what a leaf's own watcher reads instead of stopping it.
+        assert!(ambient <= 2600, "leaf ambient cost is {ambient} B");
     }
 
     #[test]
