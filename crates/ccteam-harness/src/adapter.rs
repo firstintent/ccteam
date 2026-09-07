@@ -550,12 +550,16 @@ pub enum TurnDisposition {
     Queued,
 }
 
-/// The fixed cap on the narration excerpt an interrupted turn leaves behind.
+/// The fixed cap on the narration excerpt a RUNNING turn can report — to the
+/// record an interrupted turn leaves behind, and to a read of a turn still in
+/// flight (GitHub #197 E/G).
 ///
-/// A turn cut short can have been talking for half an hour; the record exists
-/// so `agent_read` shows what it was doing, not so it can carry the whole
+/// A turn can have been talking for half an hour; the excerpt exists so
+/// `agent_read` shows what it is doing, not so it can carry the whole
 /// transcript into whoever reads it next. The TAIL is what is kept — the last
-/// thing a stopped session said is the part that explains why it was stopped.
+/// thing a session said is the part that explains what it is doing now (and,
+/// for a stop, why it was stopped). A reader's own `max_chars` can narrow it
+/// further; nothing can widen it.
 pub const IN_FLIGHT_NARRATION_MAX_CHARS: usize = 2000;
 
 /// What a vendor turn that is still running has said so far.
@@ -585,16 +589,6 @@ impl PartialNarration {
     /// Was any narration dropped to fit the cap?
     pub fn truncated(&self) -> bool {
         self.omitted_chars > 0
-    }
-
-    /// Re-bound this excerpt to a smaller budget, keeping the TAIL and adding
-    /// what that drops to `omitted_chars`. Used by the read surfaces, whose
-    /// own `max_chars` can only ever be stricter than the adapter's cap.
-    pub fn bounded_to(mut self, max_chars: usize) -> Self {
-        let (text, dropped) = bounded_tail(&self.text, max_chars);
-        self.text = text;
-        self.omitted_chars = self.omitted_chars.saturating_add(dropped);
-        self
     }
 }
 
@@ -2306,27 +2300,17 @@ mod tests {
         assert_eq!(acc.omitted_chars(), 12, "10 chars + the 2-char separator");
     }
 
-    /// A read surface's own budget can only be stricter, and what it drops is
-    /// added to the same count.
+    /// The primitive every excerpt is narrowed with — a read surface's own
+    /// `max_chars` can only ever be stricter than the adapter's cap, and what
+    /// it drops has to be countable so the two can be added.
     #[test]
-    fn a_read_budget_narrows_the_excerpt_and_adds_to_the_omitted_count() {
-        let partial = PartialNarration {
-            exec_turn_id: Some("t".into()),
-            text: "0123456789".into(),
-            omitted_chars: 5,
-        }
-        .bounded_to(4);
-        assert_eq!(partial.text, "6789");
-        assert_eq!(partial.omitted_chars, 11);
-        // A budget nothing was dropped for leaves the excerpt alone.
-        let partial = PartialNarration {
-            exec_turn_id: None,
-            text: "short".into(),
-            omitted_chars: 0,
-        }
-        .bounded_to(1000);
-        assert_eq!(partial.text, "short");
-        assert!(!partial.truncated());
+    fn a_bounded_tail_keeps_the_end_and_counts_the_head_it_dropped() {
+        assert_eq!(bounded_tail("0123456789", 4), ("6789".to_string(), 6));
+        // A budget nothing overflows leaves the text alone.
+        assert_eq!(bounded_tail("short", 1000), ("short".to_string(), 0));
+        assert_eq!(bounded_tail("", 10), (String::new(), 0));
+        // Characters, not bytes: a multi-byte tail must not be split.
+        assert_eq!(bounded_tail("阿依莲", 2), ("依莲".to_string(), 1));
     }
 
     #[test]

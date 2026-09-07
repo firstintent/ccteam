@@ -2399,6 +2399,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
+        // The narration cell belongs to a LIVE turn on a live thread; a closed
+        // thread has neither, and its entry would otherwise outlive it for the
+        // whole daemon's life.
+        if let Ok(mut cells) = self.narration.lock() {
+            cells.remove(&h.identity);
+        }
         // Best-effort archive — codex's `thread/archive` is the
         // "release server-side state" hook. Failure is logged but
         // never escalated (idempotent close semantics).
