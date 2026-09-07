@@ -33,6 +33,13 @@ pub enum DelegationPulse {
         child_sid: String,
         /// The adapter's execution-turn id for it.
         exec_turn_id: String,
+        /// Set when the VENDOR opened this turn by itself to carry on the work
+        /// of `continues_from` (claude answering its own `<task-notification>`,
+        /// or re-running a line ccteam injected mid-turn). Every outstanding
+        /// request bound to that turn moves onto this one — otherwise the
+        /// request is resolved by a boundary that answered nothing and the real
+        /// receipt, turns later, reaches nobody (GitHub #198/#199).
+        continues_from: Option<String>,
     },
     /// A mirrored assistant message, or the turn boundary that ends a task.
     Signal(DelegationSignal),
@@ -70,6 +77,13 @@ pub struct DelegationSignal {
     pub host: String,
     /// True = the vendor turn boundary (child idle); false = interim message.
     pub boundary: bool,
+    /// Whether that boundary ENDED the work bound to it. `false` when the
+    /// vendor still holds something that will wake its own model again (see
+    /// [`ccteam_harness::TurnContinuation`]): the boundary is recorded against
+    /// every bound request and billed like any other, but it resolves nobody
+    /// and wakes no parent. Always `true` for an interim signal, which resolves
+    /// nothing regardless.
+    pub terminal: bool,
     /// True when the boundary came from the vendor's structured fatal-turn
     /// outcome (`TurnFailed` / terminal `Error`), rather than normal completion.
     pub vendor_error: bool,

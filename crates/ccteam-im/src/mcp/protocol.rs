@@ -291,7 +291,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "agent",
-            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. Answers `request_id` + `status` started|injected|queued (+queue_position). `wait` returns that request's answer; 0 (default) is async and its completion names it, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. Answer tersely.",
+            "description": "Hire an agent (claude, codex, grok, opencode, kimi, pi, dsh) or task one you have. No `sid` → spawn and give it `task`; with `sid` → follow up there. Answers `request_id` + `status` started|injected|queued (+queue_position). `wait` returns that request's answer; 0 (default) is async and its completion names it, so never poll; `agent_read{sid,wait}` only when the reply says notify_deliverable:false. A child doing background work answers over several turns; the completion is its last one. Answer tersely.",
             "inputSchema": schema(json!({
                 "task": { "type": "string", "description": "Task text, forwarded verbatim as a user turn." },
                 "task_file": { "type": "string", "description": "Absolute path holding it — keeps a long brief out of your context." },
@@ -310,12 +310,12 @@ pub fn session_tool_definitions() -> Vec<Value> {
                 "notify": {
                     "type": "string",
                     "enum": ["final", "brief", "off"],
-                    "description": "Turn-end wake: brief (500-char excerpt), final (2000), off. Omitted keeps your last choice here."
+                    "description": "Task-end wake: brief (500-char excerpt), final (2000), off. Omitted keeps your last choice here."
                 },
                 "routing": {
                     "type": "string",
                     "enum": ["inject", "queue"],
-                    "description": "Busy child: inject (default) steers its running turn, which then answers both; queue gives your task its own turn."
+                    "description": "Busy child: inject (default) steers its running turn; the CLI re-runs your line as the next turn, and THAT one answers it. queue gives your task its own turn."
                 },
                 "tools": {
                     "type": "string",
@@ -335,7 +335,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. A turn still running answers `partial:true` + `in_flight{turn_id,narration,text?,requests}` — a bounded excerpt of what it has said, never an answer and never a reason to stop it. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
+            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes; `progress` = boundaries it rode through while its own background work ran). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. A turn still running answers `partial:true` + `in_flight{turn_id,narration,text?,requests}` — a bounded excerpt of what it has said, never an answer and never a reason to stop it. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
@@ -521,6 +521,17 @@ mod tests {
     /// for the other one, nor know that the turn which answers a steer is the
     /// one it joined. ~155 B for the parameter and its consequence.
     ///
+    /// 6100 → 6300 B for the vendor-continuation contract (GitHub #198/#199).
+    /// Three facts a caller cannot infer and is harmed by not knowing: a child
+    /// running background work answers over SEVERAL turns and the completion
+    /// is the last of them (measured: seven turns over 47 minutes, and the
+    /// pre-fix face said "turn end", so a parent read a checkpoint as the
+    /// answer); an INJECTED line is re-run by the CLI as the next turn, so
+    /// that turn answers it and not the one it joined — the face used to state
+    /// the opposite outright; and `progress` on a request row is what a reader
+    /// sees while it happens. ~170 B, most of it correcting a claim that was
+    /// wrong rather than adding one.
+    ///
     /// 5900 → 6100 B for the in-flight read (issue #197 G). A parent whose
     /// child read back as `turns:[]` for twenty-nine minutes stopped it to
     /// find out what it was doing and lost the work; a field the face never
@@ -532,8 +543,8 @@ mod tests {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 6100,
-            "full tools/list is {bytes} B; budget is 6100 B"
+            bytes <= 6300,
+            "full tools/list is {bytes} B; budget is 6300 B"
         );
     }
 
@@ -578,8 +589,11 @@ mod tests {
         // 2340 → 2460 B for `unknown_requests`, which lands entirely on this
         // face — `agent_read` is the whole leaf tool face; 2460 → 2600 B for
         // the in-flight read (issue #197 G), which lands here for the same
-        // reason and is what a leaf's own watcher reads instead of stopping it.
-        assert!(ambient <= 2600, "leaf ambient cost is {ambient} B");
+        // reason and is what a leaf's own watcher reads instead of stopping it;
+        // 2600 → 2700 B for the `progress` rows a request collects while the
+        // child's own background work runs (GitHub #198) — a leaf watching a
+        // busy sibling reads exactly this instead of concluding it is idle.
+        assert!(ambient <= 2700, "leaf ambient cost is {ambient} B");
     }
 
     #[test]

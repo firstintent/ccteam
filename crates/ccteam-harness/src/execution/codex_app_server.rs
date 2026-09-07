@@ -4995,7 +4995,18 @@ mod tests {
             }),
         };
         match translate_notification(&n, "t-1").expect("a completed turn must surface") {
-            ThreadEvent::TurnCompleted { turn_id, .. } => assert_eq!(turn_id, "u-4"),
+            ThreadEvent::TurnCompleted {
+                turn_id,
+                continuation,
+                ..
+            } => {
+                assert_eq!(turn_id, "u-4");
+                // GitHub #198 is a no-op here: the protocol has no notification
+                // that means "the thread woke itself", so `turn/completed` is
+                // always the end of the work and no request is ever carried
+                // past it.
+                assert_eq!(continuation, crate::TurnContinuation::Settled);
+            }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
     }

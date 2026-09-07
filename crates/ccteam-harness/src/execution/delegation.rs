@@ -986,4 +986,82 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("req-"));
     }
+
+    /// GitHub #198 — the vendor opened a turn of its own to carry on the work,
+    /// so the request follows it. By IDENTITY: a request bound to some other
+    /// turn is not swept along, which is the whole point of binding.
+    #[test]
+    fn a_continuation_moves_only_the_requests_that_were_on_that_turn() {
+        let mut store = DelegationRequests::default();
+        for (parent, turn) in [("p1", "x-a"), ("p2", "x-a"), ("p3", "x-other")] {
+            let mut request = accepted(parent, NotifyMode::Final, None);
+            request.turn_id = Some(turn.into());
+            request.state = RequestState::Executing;
+            store.accept(request);
+        }
+        // …and one already answered on x-a: terminal, so it stays put.
+        let mut done = accepted("p4", NotifyMode::Final, None);
+        done.turn_id = Some("x-a".into());
+        done.state = RequestState::Answered;
+        store.accept(done);
+
+        assert_eq!(store.rebind_continuation("x-a", "x-b"), 2);
+        let on = |turn: &str| store.bound_to(turn).count();
+        assert_eq!(on("x-b"), 2, "both outstanding requests moved");
+        assert_eq!(on("x-a"), 0, "nothing outstanding is left on the old turn");
+        assert_eq!(on("x-other"), 1, "an unrelated binding is untouched");
+        assert_eq!(
+            store
+                .requests
+                .iter()
+                .find(|r| r.parent_sid == "p4")
+                .and_then(|r| r.turn_id.clone()),
+            Some("x-a".into()),
+            "a resolved request keeps the turn that answered it"
+        );
+        assert_eq!(
+            store.rebind_continuation("x-b", "x-b"),
+            0,
+            "self-move is a no-op"
+        );
+    }
+
+    /// A boundary that settled nothing is recorded against the requests bound
+    /// to it and changes nothing else — the trail a reader sees instead of
+    /// silence. Idempotent per turn, because an at-least-once redelivery must
+    /// not lengthen it.
+    #[test]
+    fn a_non_terminal_boundary_is_recorded_without_touching_the_binding() {
+        let mut store = DelegationRequests::default();
+        let mut request = accepted("p1", NotifyMode::Final, None);
+        request.turn_id = Some("x-a".into());
+        request.state = RequestState::Executing;
+        store.accept(request);
+
+        assert_eq!(store.note_progress("x-a"), 1);
+        assert_eq!(store.note_progress("x-a"), 1, "still the same one request");
+        assert_eq!(store.note_progress("x-nobody"), 0);
+        let request = &store.requests[0];
+        assert_eq!(request.progress.len(), 1, "the same turn is recorded once");
+        assert_eq!(request.progress[0].exec_turn_id, "x-a");
+        assert_eq!(request.state, RequestState::Executing);
+        assert_eq!(request.turn_id.as_deref(), Some("x-a"));
+        assert!(!request.notified);
+    }
+
+    /// A chain of vendor continuations has no upper bound in the protocol; the
+    /// trail does, so one long-lived request cannot grow the file forever.
+    #[test]
+    fn the_progress_trail_is_bounded() {
+        let mut request = accepted("p1", NotifyMode::Final, None);
+        for n in 0..(REQUEST_PROGRESS_HISTORY * 2) {
+            request.note_progress(&format!("x-{n}"));
+        }
+        assert_eq!(request.progress.len(), REQUEST_PROGRESS_HISTORY);
+        assert_eq!(
+            request.progress.last().map(|p| p.exec_turn_id.as_str()),
+            Some(format!("x-{}", REQUEST_PROGRESS_HISTORY * 2 - 1).as_str()),
+            "the newest is kept"
+        );
+    }
 }

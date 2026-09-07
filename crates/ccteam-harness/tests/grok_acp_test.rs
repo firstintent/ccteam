@@ -313,13 +313,34 @@ async fn completion_edge_interject_surfaces_vendor_self_started_turn() {
         let mut completed = Vec::new();
         while let Some(event) = stream.next().await {
             match event {
-                ThreadEvent::TurnStarted { turn_id, .. } => started.push(turn_id),
+                ThreadEvent::TurnStarted {
+                    turn_id, opening, ..
+                } => {
+                    // GitHub #198/#199 — ACP has no way for a vendor to wake
+                    // its own model. This turn has no matching `session/prompt`
+                    // only because grok admits an interjection while idle: the
+                    // content is still a line CCTEAM sent, so it opens a turn
+                    // of its own rather than continuing the previous one's
+                    // work, and no request's binding moves onto it.
+                    assert_eq!(opening, ccteam_harness::TurnOpening::Submitted);
+                    started.push(turn_id);
+                }
                 ThreadEvent::ItemCompleted { item } => {
                     if let ThreadItemDetails::AgentMessage(text) = item.details {
                         finals.push((item.id, text));
                     }
                 }
-                ThreadEvent::TurnCompleted { turn_id, .. } => {
+                ThreadEvent::TurnCompleted {
+                    turn_id,
+                    continuation,
+                    ..
+                } => {
+                    // …and every ACP boundary is the end of what it answered.
+                    assert_eq!(
+                        continuation,
+                        ccteam_harness::TurnContinuation::Settled,
+                        "an ACP boundary is always terminal"
+                    );
                     completed.push(turn_id);
                     if completed.len() == 2 {
                         break;

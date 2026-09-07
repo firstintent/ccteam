@@ -1149,6 +1149,23 @@ fn delegation_request_row(
     if let Some(answered) = request.answered_turn.as_deref() {
         row.insert("answered_turn".into(), serde_json::json!(answered));
     }
+    // Boundaries this request rode through without being settled — a vendor
+    // that wakes its own model ends several turns on one task. Present only
+    // when it happened, so an ordinary one-turn request reads exactly as before
+    // (GitHub #198/#199).
+    if !request.progress.is_empty() {
+        row.insert(
+            "progress".into(),
+            serde_json::json!(request
+                .progress
+                .iter()
+                .map(|step| serde_json::json!({
+                    "turn_id": step.exec_turn_id,
+                    "at": step.at,
+                }))
+                .collect::<Vec<_>>()),
+        );
+    }
     row.insert("created_at".into(), serde_json::json!(request.created_at));
     // The file still holding this task's line, when one provably is. A released
     // session is NOT a stopped one: its queue files are on disk and replay on
@@ -4221,6 +4238,9 @@ impl Gateway {
                     vendor: meta.vendor,
                     host: meta.host.clone(),
                     boundary: true,
+                    // A body that exited holds nothing that can wake it: this
+                    // is the end of whatever it was doing.
+                    terminal: true,
                     vendor_error,
                     interim_notes: 0,
                     covered_turns: vec![turn_id],
@@ -6767,6 +6787,11 @@ impl Gateway {
             // events carry no id of their own, so the open turn is what they
             // end; a delegation request bound to it resolves on that boundary.
             let mut open_exec_turn: Option<String> = None;
+            // The last execution turn this pump SAW, open or already ended.
+            // Unlike `open_exec_turn` it survives the boundary, because the
+            // turn a vendor opens to continue its own work arrives after it
+            // and has to name what it is continuing (GitHub #198/#199).
+            let mut last_exec_turn: Option<String> = None;
             // Completed vendor turns, for the ordinal a completion report
             // shows. Counted from EXECUTION boundaries, never from accepted
             // inputs: `turn 2` used to name the second message delivered while
@@ -6971,7 +6996,7 @@ impl Gateway {
                         // previous TurnCompleted already cleared it. Native
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
-                        if let ThreadEvent::TurnStarted { turn_id, .. } = &evt {
+                        if let ThreadEvent::TurnStarted { turn_id, opening } = &evt {
                             structured_turn_open = true;
                             // The execution turn a delegation request is bound
                             // to. Recording it here is what lets a boundary
@@ -6979,11 +7004,25 @@ impl Gateway {
                             // turn, and what turns "written to the harness"
                             // into the stronger "observed executing" (#201).
                             open_exec_turn = Some(turn_id.clone());
+                            // A turn the VENDOR opened carries on the previous
+                            // one's work, so that turn's outstanding requests
+                            // move onto this one. `last_exec_turn` outlives the
+                            // boundary precisely for this: `open_exec_turn` is
+                            // cleared when a turn ends, and the continuation
+                            // arrives afterwards (GitHub #198/#199).
+                            let continues_from = match opening {
+                                ccteam_harness::TurnOpening::VendorContinuation => {
+                                    last_exec_turn.clone()
+                                }
+                                ccteam_harness::TurnOpening::Submitted => None,
+                            };
+                            last_exec_turn = Some(turn_id.clone());
                             if let Some(dtx) = delegation_tx.as_ref() {
                                 let _ = dtx.send(
                                     crate::delegation::DelegationPulse::TurnOpened {
                                         child_sid: session_id.clone(),
                                         exec_turn_id: turn_id.clone(),
+                                        continues_from,
                                     },
                                 );
                             }
@@ -7344,6 +7383,35 @@ impl Gateway {
                                         "stream-json pump: failed to mirror chat_turn_completed"
                                     );
                                 }
+                                // …and when the vendor still holds work that
+                                // will wake its own model, say so AFTER that
+                                // row. `chat_turn_completed` is an idle tail to
+                                // the activity classifier, so a child three
+                                // turns into one dispatched task would read
+                                // `idle` to every parent polling it while it
+                                // was hard at work (GitHub #198). Deliberately
+                                // one row per boundary and not a heartbeat: a
+                                // session that goes genuinely silent still ages
+                                // into `stale` rather than being pinned to
+                                // `working` forever.
+                                if !turn_boundary_is_terminal(&evt) {
+                                    let ev =
+                                        ccteam_core::progress::build_chat_turn_continues_event(
+                                            &session.role,
+                                            &session_id,
+                                            &session.project,
+                                            turn_id,
+                                        );
+                                    if let Err(err) =
+                                        ccteam_core::progress::append_event(ppath, &ev)
+                                    {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "stream-json pump: failed to mirror chat_turn_continues"
+                                        );
+                                    }
+                                }
                                 // Fold the row just appended into meta.json NOW.
                                 // The other refresh rides the ANSWER mirror, which
                                 // precedes this event — so a one-turn session has
@@ -7699,6 +7767,10 @@ impl Gateway {
                                                     vendor: pump_vendor,
                                                     host: pump_host.clone(),
                                                     boundary: true,
+                                                    // A failure ends the work
+                                                    // bound to it whatever the
+                                                    // vendor still holds.
+                                                    terminal: true,
                                                     vendor_error: true,
                                                     interim_notes: notes,
                                                     covered_turns: covered,
@@ -7876,6 +7948,7 @@ impl Gateway {
                                     vendor: pump_vendor,
                                     host: pump_host.clone(),
                                     boundary: true,
+                                    terminal: turn_boundary_is_terminal(&evt),
                                     vendor_error: false,
                                     interim_notes: notes.saturating_sub(1),
                                     covered_turns: covered,
@@ -14253,6 +14326,52 @@ impl Gateway {
         Err(GatewayRequestError::StorageWriteFailed(failure).into())
     }
 
+    /// The vendor opened `to` by itself to carry on the work of `from`, so
+    /// every outstanding request bound to `from` moves onto `to`.
+    ///
+    /// This is what makes a dispatched task survive a vendor that wakes its own
+    /// model: claude answers a `<task-notification>` in a brand-new turn every
+    /// time a background task, a `Monitor` or an `Agent` it launched finishes,
+    /// and the receipt is on the LAST of those turns. Binding by identity, so a
+    /// continuation adopts only what it is actually continuing — a request
+    /// bound to some other turn (a line still parked, another dispatch already
+    /// running) is untouched (GitHub #198/#199).
+    fn rebind_delegation_continuation(
+        &mut self,
+        claim: &DelegationStoreClaim,
+        from: &str,
+        to: &str,
+    ) -> bool {
+        let Some(mirror) = self.delegations.get_mut(claim.child_sid()) else {
+            return false;
+        };
+        let moved = mirror.store.rebind_continuation(from, to);
+        if moved > 0 {
+            tracing::debug!(
+                child = %claim.child_sid(),
+                %from,
+                %to,
+                moved,
+                "ccteam-im: requests followed their work onto a vendor continuation turn"
+            );
+        }
+        moved > 0
+    }
+
+    /// A boundary that settled nothing: record it against every request bound
+    /// to it and leave the bindings alone. The trail is what a reader sees
+    /// instead of silence while the vendor keeps working (GitHub #198).
+    fn note_delegation_progress(
+        &mut self,
+        claim: &DelegationStoreClaim,
+        exec_turn_id: &str,
+    ) -> bool {
+        let Some(mirror) = self.delegations.get_mut(claim.child_sid()) else {
+            return false;
+        };
+        mirror.store.note_progress(exec_turn_id) > 0
+    }
+
     /// A turn opened on `child_sid`: every request bound to it is now OBSERVED
     /// executing — the fourth of the four delivery facts, and the one a stdin
     /// flush never proves.
@@ -14588,6 +14707,29 @@ impl Gateway {
         gateway: Arc<tokio::sync::Mutex<Self>>,
         signal: crate::delegation::DelegationSignal,
     ) {
+        // A boundary the vendor will wake itself out of resolves nobody: it is
+        // recorded against the requests bound to it — which keep their binding,
+        // and follow the work onto the continuation turn — and no parent hears
+        // anything. Before the plan, because planning CLAIMS the boundary for
+        // delivery, and a claim on a boundary nobody is being told about would
+        // make a restart owe a notification for a turn that answered nothing
+        // (GitHub #198/#199).
+        if !signal.terminal {
+            let claim = Self::claim_delegation_store(&gateway, &signal.child_sid).await;
+            let Some(exec_turn_id) = signal.exec_turn_id.as_deref() else {
+                return;
+            };
+            let noted = crate::latency::gateway_lock(&gateway, "notifier.progress")
+                .await
+                .note_delegation_progress(&claim, exec_turn_id);
+            if noted {
+                // Best effort: the trail is a reader's fact, and every later
+                // write of this store carries it. What must NOT happen — a
+                // request resolved by this boundary — has already not happened.
+                let _ = Self::persist_delegation_store(&gateway, &claim).await;
+            }
+            return;
+        }
         // Planning reads the bindings, so it queues behind whatever dispatch
         // is still making them: a child that answers in the microsecond after
         // its line was written must not be planned against a request the
@@ -14781,6 +14923,7 @@ impl Gateway {
                 crate::delegation::DelegationPulse::TurnOpened {
                     child_sid,
                     exec_turn_id,
+                    continues_from,
                 } => {
                     if !watch_set.read().unwrap().contains(&child_sid) {
                         continue;
@@ -14788,13 +14931,42 @@ impl Gateway {
                     // A store mutation: claimed like every other one, so it
                     // cannot interleave with a dispatch's accept/bind pair.
                     let claim = Self::claim_delegation_store(&gateway, &child_sid).await;
-                    let changed = crate::latency::gateway_lock(&gateway, "notifier.executing")
-                        .await
-                        .mark_delegation_requests_executing(&claim, &exec_turn_id);
+                    let (moved, changed) = {
+                        let mut guard =
+                            crate::latency::gateway_lock(&gateway, "notifier.executing").await;
+                        // Move the bindings FIRST, so the executing mark that
+                        // follows finds the requests already on this turn. Both
+                        // under one lock hold: a reader must never catch a
+                        // request bound to a turn that has ended while the one
+                        // continuing it is already running.
+                        let moved = match continues_from.as_deref() {
+                            Some(from) => {
+                                guard.rebind_delegation_continuation(&claim, from, &exec_turn_id)
+                            }
+                            None => false,
+                        };
+                        (
+                            moved,
+                            moved | guard.mark_delegation_requests_executing(&claim, &exec_turn_id),
+                        )
+                    };
                     if changed {
-                        // Best effort: the executing flag is a display fact, and
-                        // the next write of this store carries it anyway.
-                        let _ = Self::persist_delegation_store(&gateway, &claim).await;
+                        // The executing flag alone is a display fact the next
+                        // write carries anyway; a REBINDING is not. A move that
+                        // never reaches disk leaves the request pointing at a
+                        // turn that has already ended, and a restart would then
+                        // read that turn's row as this request's answer.
+                        if let Err(error) = Self::persist_delegation_store(&gateway, &claim).await {
+                            if moved {
+                                tracing::warn!(
+                                    child = %child_sid,
+                                    turn = %exec_turn_id,
+                                    %error,
+                                    "ccteam-im: a continuation rebinding could not be made \
+                                     durable; a restart may resolve it off the turn it left"
+                                );
+                            }
+                        }
                     }
                 }
                 crate::delegation::DelegationPulse::Signal(signal) => {
@@ -14918,6 +15090,12 @@ impl Gateway {
                         vendor,
                         host: host.clone(),
                         boundary: true,
+                        // Terminal by construction: the child's process died
+                        // with the previous daemon, so whatever background work
+                        // it was holding died too and nothing will wake it. The
+                        // request's own `progress` trail still says which of
+                        // its boundaries settled nothing while the daemon lived.
+                        terminal: true,
                         // Reconcile may race the live notifier at startup. A
                         // durable failed turn must retain the same explicit
                         // vendor-error outcome as its live boundary signal;
@@ -17687,6 +17865,23 @@ fn thread_event_turn_id(evt: &ThreadEvent) -> Option<&str> {
         | ThreadEvent::TurnCompleted { turn_id, .. }
         | ThreadEvent::TurnFailed { turn_id, .. } => Some(turn_id.as_str()),
         _ => None,
+    }
+}
+
+/// Does this boundary END the work bound to it?
+///
+/// `false` only for a success boundary the adapter marked
+/// [`ccteam_harness::TurnContinuation::Pending`] — the vendor still holds work
+/// that will wake its own model, so the turn was real and billed but answered
+/// nobody. Everything else is terminal, including a failure: a later
+/// continuation turn does not repair a failed one, and leaving a parent waiting
+/// on a request that already failed is the worse error (GitHub #198/#199).
+fn turn_boundary_is_terminal(evt: &ThreadEvent) -> bool {
+    match evt {
+        ThreadEvent::TurnCompleted { continuation, .. } => {
+            *continuation == ccteam_harness::TurnContinuation::Settled
+        }
+        _ => true,
     }
 }
 
@@ -24980,6 +25175,7 @@ mod tests {
                 turn: 1,
                 error_kind: None,
                 conclusion: None,
+                terminal: true,
             },
         ))
         .unwrap();
@@ -31972,8 +32168,22 @@ mod tests {
         project_dir: &std::path::Path,
         factory: crate::daemon::AdapterFactory,
     ) -> Arc<tokio::sync::Mutex<Gateway>> {
+        delegation_gateway_with_setup(project_dir, factory, None).await
+    }
+
+    /// The delegation fixture, optionally with a `CcteamPaths` so the pump has
+    /// a progress journal to write to (a test that reads the activity a parent
+    /// would see needs one; the signal-level tests do not).
+    async fn delegation_gateway_with_setup(
+        project_dir: &std::path::Path,
+        factory: crate::daemon::AdapterFactory,
+        paths: Option<ccteam_core::CcteamPaths>,
+    ) -> Arc<tokio::sync::Mutex<Gateway>> {
         let mut gw = Gateway::new_with_factory(factory, "alpha", project_dir);
         gw.register_project("alpha", project_dir);
+        if let Some(paths) = paths {
+            gw.enable_project_creation(paths);
+        }
         let (dtx, drx) = tokio::sync::mpsc::unbounded_channel();
         gw.set_delegation_notifier_tx(dtx);
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
@@ -32514,6 +32724,7 @@ mod tests {
             turn: n as u64,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         Gateway::deliver_delegation_signal_shared(
             Arc::clone(&gateway),
@@ -32541,6 +32752,504 @@ mod tests {
             1,
             "the first parent is not told twice"
         );
+    }
+
+    // ====================================================================
+    // GitHub #198/#199 (H) — a vendor that wakes its own model answers one
+    // dispatched task across SEVERAL turns; the receipt is the last of them.
+    // ====================================================================
+
+    /// Measured on excore's s889 (2026-09-06): one `agent{notify:"final"}` call
+    /// produced seven consecutive claude turns over 47 minutes, each opened by
+    /// the CLI itself when a background task finished, and the real answer was
+    /// turn seven. Pre-fix the request was consumed by turn ONE — the parent
+    /// was woken with a checkpoint, and the answer reached nobody.
+    ///
+    /// End to end through the pump and the notifier: two non-terminal
+    /// boundaries followed by the settled one. Exactly one notification, and it
+    /// carries the last turn's words, the request id and its own title.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_task_spanning_vendor_continuations_notifies_once_at_the_turn_that_answered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let paths = ccteam_core::CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        // ONE fake for both sessions: its event queue and its wakeups are keyed
+        // by thread identity, so the test can script the child's turns by hand.
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let shared = Arc::clone(&fake);
+        let factory: crate::daemon::AdapterFactory = Arc::new(move |_vendor, _protocol| {
+            Arc::clone(&shared) as Arc<dyn HarnessAdapter + Send + Sync>
+        });
+        let gateway =
+            delegation_gateway_with_setup(&project_dir, factory, Some(paths.clone())).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+
+        let (request_id, identity, exec_a) = {
+            let mut gw = gateway.lock().await;
+            let request_id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Final,
+                    Some("the long task".into()),
+                    TurnRouting::Queue,
+                    None,
+                )
+                .expect("the child accepts the request");
+            let exec_a = gw
+                .submit_to_sid(&child, "run the long task".into())
+                .await
+                .expect("the task is submitted");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &request_id,
+                &exec_a,
+            );
+            let identity = gw
+                .sessions
+                .get(&child)
+                .expect("the child is live")
+                .thread
+                .identity
+                .clone();
+            (request_id, identity, exec_a)
+        };
+
+        play_turn(
+            &fake,
+            &identity,
+            &exec_a,
+            ccteam_harness::TurnOpening::Submitted,
+            "started the build in the background",
+            ccteam_harness::TurnContinuation::Pending,
+        )
+        .await;
+        let rows = await_request_progress(&gateway, &child, 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0]["state"],
+            serde_json::json!("executing"),
+            "a boundary the vendor will wake itself out of resolves nothing: {rows:?}"
+        );
+        assert_eq!(
+            rows[0]["progress"][0]["turn_id"],
+            serde_json::json!(exec_a),
+            "the boundary it rode through is on the record: {rows:?}"
+        );
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "the parent is not woken by a checkpoint"
+        );
+        // …and the turn was still BILLED. Every boundary accounts.
+        let journal = std::fs::read_to_string(paths.progress_jsonl("alpha")).unwrap_or_default();
+        assert!(
+            journal.contains(ccteam_core::progress::CHAT_TURN_COMPLETED)
+                && journal.contains(&exec_a),
+            "a non-terminal boundary still pays for its tokens: {journal}"
+        );
+        // …and the child reads `working`, not `idle`: `chat_turn_completed` is
+        // an idle tail, so the row that says the vendor is still holding work
+        // has to land after it.
+        assert_eq!(activity_of(&paths, &child), "working", "{journal}");
+        assert!(
+            gateway.lock().await.live_turn_for(&child).is_none(),
+            "no turn is in flight between continuations, so nothing can call it stuck"
+        );
+
+        // The background task finishes; claude wakes its own model.
+        play_turn(
+            &fake,
+            &identity,
+            "x-continuation",
+            ccteam_harness::TurnOpening::VendorContinuation,
+            "the build failed, retrying",
+            ccteam_harness::TurnContinuation::Pending,
+        )
+        .await;
+        let rows = await_request_progress(&gateway, &child, 2).await;
+        assert_eq!(
+            rows[0]["turn_id"],
+            serde_json::json!("x-continuation"),
+            "the request followed its work onto the turn the vendor opened: {rows:?}"
+        );
+        assert_eq!(
+            rows[0]["progress"].as_array().map(Vec::len),
+            Some(2),
+            "{rows:?}"
+        );
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "still nothing pushed at the second checkpoint"
+        );
+
+        // The receipt.
+        play_turn(
+            &fake,
+            &identity,
+            "x-receipt",
+            ccteam_harness::TurnOpening::VendorContinuation,
+            "DONE · the build is green",
+            ccteam_harness::TurnContinuation::Settled,
+        )
+        .await;
+        let notes = await_notifications(&project_dir, &parent, 1).await;
+        assert_eq!(
+            notes.len(),
+            1,
+            "exactly one wake-up for one task: {notes:?}"
+        );
+        assert!(
+            notes[0].user.contains("DONE · the build is green"),
+            "{}",
+            notes[0].user
+        );
+        assert!(notes[0].user.contains(&request_id), "{}", notes[0].user);
+        assert!(
+            notes[0].user.contains("«the long task»"),
+            "{}",
+            notes[0].user
+        );
+        // The parent's turn is appended BEFORE the request is committed
+        // answered (append-then-notify-then-commit), so the receipt landing is
+        // not yet proof the request is resolved — wait for the commit itself.
+        let rows = await_request_state(&gateway, &child, "answered").await;
+        assert!(
+            rows[0]["answered_turn"].as_str().is_some(),
+            "the answering ledger row is named: {rows:?}"
+        );
+    }
+
+    /// GitHub #199 — a line injected into a running turn is re-run by the CLI
+    /// as the next prompt, so the turn it JOINED cannot be where it is
+    /// answered. The joined turn's boundary is non-terminal, the request moves
+    /// onto the replay turn, and that turn's boundary is the receipt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_injected_request_is_answered_by_the_replay_turn_not_the_one_it_joined() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+        let request_id = {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Final,
+                    Some("the steer".into()),
+                    TurnRouting::Inject,
+                    None,
+                )
+                .expect("the child accepts the request");
+            // Injected: bound to the turn already running.
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                "x-joined",
+            );
+            id
+        };
+        let boundary =
+            |n: u32, exec: &str, text: &str, terminal: bool| crate::delegation::DelegationSignal {
+                child_sid: child.clone(),
+                turn_id: format!("{child}-{n}"),
+                exec_turn_id: Some(exec.to_string()),
+                tail: text.to_string(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                terminal,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child}-{n}")],
+                context_pct: None,
+                turn: n as u64,
+                error_kind: None,
+                conclusion: None,
+            };
+
+        // The turn the line joined ends — with the line still waiting to run.
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(1, "x-joined", "answering what I was already doing", false),
+        )
+        .await;
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "the joined turn did not answer the steer"
+        );
+
+        // The CLI re-runs the injected line as the next prompt.
+        {
+            let mut gw = gateway.lock().await;
+            assert!(gw.rebind_delegation_continuation(
+                &DelegationStoreClaim::for_test(&child),
+                "x-joined",
+                "x-replay",
+            ));
+        }
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            boundary(2, "x-replay", "and here is the answer to your steer", true),
+        )
+        .await;
+        let notes = ccteam_notification_turns(&project_dir, &parent);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0]
+                .user
+                .contains("and here is the answer to your steer"),
+            "{}",
+            notes[0].user
+        );
+        assert!(notes[0].user.contains(&request_id), "{}", notes[0].user);
+    }
+
+    /// A non-terminal boundary claims nothing for delivery: a restart must not
+    /// find a completion owed for a turn nobody was told about. It also never
+    /// enters the dedup set, so the turn that DOES answer is still deliverable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_non_terminal_boundary_leaves_no_delivery_claim_behind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+        {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Brief,
+                    None,
+                    TurnRouting::Queue,
+                    None,
+                )
+                .expect("the child accepts the request");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                "x-a",
+            );
+        }
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child.clone(),
+                turn_id: format!("{child}-1"),
+                exec_turn_id: Some("x-a".into()),
+                tail: "a checkpoint".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                terminal: false,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child}-1")],
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
+                conclusion: None,
+            },
+        )
+        .await;
+        let store = ccteam_harness::read_delegation_requests(&project_dir, &child)
+            .expect("the child's record is on disk");
+        assert!(
+            store.owed_deliveries().next().is_none(),
+            "nothing was claimed for delivery: {store:?}"
+        );
+        assert!(
+            store.notified_turns.is_empty(),
+            "and nothing was recorded as delivered: {store:?}"
+        );
+        assert!(
+            !store.requests[0].notified,
+            "the parent has not been told: {store:?}"
+        );
+    }
+
+    /// `brief` and `final` share the wake-up POINT, so neither may be woken by
+    /// a boundary the vendor will wake itself out of.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn neither_notify_mode_wakes_on_a_non_terminal_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let (parent, child) = delegation_pair(&gateway).await;
+        for mode in [
+            ccteam_harness::NotifyMode::Final,
+            ccteam_harness::NotifyMode::Brief,
+        ] {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    mode,
+                    None,
+                    TurnRouting::Queue,
+                    None,
+                )
+                .expect("the child accepts the request");
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                "x-a",
+            );
+        }
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child.clone(),
+                turn_id: format!("{child}-1"),
+                exec_turn_id: Some("x-a".into()),
+                tail: "a checkpoint both parents would love to be spared".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                terminal: false,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child}-1")],
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
+                conclusion: None,
+            },
+        )
+        .await;
+        assert!(
+            ccteam_notification_turns(&project_dir, &parent).is_empty(),
+            "no mode wakes on a boundary that answered nothing"
+        );
+        let rows = gateway.lock().await.delegation_request_rows(&child, 10);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row["progress"].as_array().map(Vec::len) == Some(1)),
+            "both requests recorded the boundary they rode through: {rows:?}"
+        );
+    }
+
+    /// Script one vendor turn onto the fake: start, one answer, boundary.
+    async fn play_turn(
+        fake: &FakeAdapter,
+        identity: &str,
+        turn_id: &str,
+        opening: ccteam_harness::TurnOpening,
+        text: &str,
+        continuation: ccteam_harness::TurnContinuation,
+    ) {
+        {
+            let mut queue = fake.events.lock().await;
+            queue.push_back((
+                identity.to_string(),
+                ThreadEvent::TurnStarted {
+                    turn_id: turn_id.to_string(),
+                    opening,
+                },
+            ));
+            queue.push_back((
+                identity.to_string(),
+                ThreadEvent::ItemCompleted {
+                    item: ccteam_harness::ThreadItem {
+                        id: format!("{turn_id}-msg"),
+                        details: ThreadItemDetails::AgentMessage(text.to_string()),
+                    },
+                },
+            ));
+            queue.push_back((
+                identity.to_string(),
+                ThreadEvent::TurnCompleted {
+                    turn_id: turn_id.to_string(),
+                    usage: ccteam_harness::UnifiedTokenUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 500,
+                        ..Default::default()
+                    },
+                    model: Some("claude-sonnet-4-6".into()),
+                    conclusion: None,
+                    continuation,
+                },
+            ));
+        }
+        fake.wake(identity);
+    }
+
+    /// Wait until the child's first request has ridden through `n` non-terminal
+    /// boundaries, then answer its rows.
+    ///
+    /// The notifier is a task of its own, so nothing about the pump's write
+    /// says it has run yet. The progress trail is the notifier's OWN output and
+    /// therefore the honest cue — and because `TurnOpened` precedes the
+    /// boundary signal on the same channel, seeing it also means the executing
+    /// mark has landed.
+    async fn await_request_progress(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        child: &str,
+        n: usize,
+    ) -> Vec<serde_json::Value> {
+        for _ in 0..400 {
+            let rows = gateway.lock().await.delegation_request_rows(child, 10);
+            if rows
+                .first()
+                .and_then(|row| row["progress"].as_array().map(Vec::len))
+                == Some(n)
+            {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the request never recorded {n} non-terminal boundaries");
+    }
+
+    /// Wait until the child's first request reaches `state`.
+    async fn await_request_state(
+        gateway: &Arc<tokio::sync::Mutex<Gateway>>,
+        child: &str,
+        state: &str,
+    ) -> Vec<serde_json::Value> {
+        for _ in 0..400 {
+            let rows = gateway.lock().await.delegation_request_rows(child, 10);
+            if rows.first().map(|row| &row["state"]) == Some(&serde_json::json!(state)) {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the request never reached {state}");
+    }
+
+    async fn await_notifications(
+        project_dir: &std::path::Path,
+        parent: &str,
+        n: usize,
+    ) -> Vec<ccteam_harness::execution::turns_mirror::TurnRecord> {
+        for _ in 0..200 {
+            let notes = ccteam_notification_turns(project_dir, parent);
+            if notes.len() >= n {
+                return notes;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the parent never received {n} notifications");
+    }
+
+    /// The activity word every parent-facing surface resolves for a session —
+    /// the shared `ccteam_core::stall` resolver, off the same journal.
+    fn activity_of(paths: &ccteam_core::CcteamPaths, sid: &str) -> String {
+        let body = std::fs::read_to_string(paths.progress_jsonl("alpha")).unwrap_or_default();
+        let events: Vec<serde_json::Value> = body
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        ccteam_core::stall::classify_progress_activity_for_sid(&events, sid, 0, chrono::Utc::now())
+            .status
+            .activity
+            .to_string()
     }
 
     /// GitHub #197 (B) — a boundary NO request is bound to answers nobody.
@@ -32591,6 +33300,7 @@ mod tests {
             turn: n as u64,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
 
         // Somebody else's turn ends on this child.
@@ -32772,6 +33482,7 @@ mod tests {
             turn: 1,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         // Both deliveries in flight at once, exactly as a startup reconcile and
         // the live pump would be.
@@ -32846,6 +33557,7 @@ mod tests {
             turn: 1,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         // A follow-up dispatch lands while the boundary is being delivered.
         let accepting = {
@@ -33069,6 +33781,7 @@ mod tests {
                         turn: 1,
                         error_kind: None,
                         conclusion: None,
+                        terminal: true,
                     },
                 )
                 .await
@@ -33164,6 +33877,7 @@ mod tests {
                 turn: 1,
                 error_kind: None,
                 conclusion: None,
+                terminal: true,
             },
         )
         .await;
@@ -33524,6 +34238,7 @@ mod tests {
             turn: n as u64,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         // Three interim narration messages inside the running turn → silence.
         for n in 1..=3 {
@@ -33550,6 +34265,7 @@ mod tests {
             turn: 4,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), boundary.clone()).await;
         let notes = ccteam_notification_turns(&project_dir, &parent_sid);
@@ -33635,6 +34351,7 @@ mod tests {
             turn: n as u64,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         Gateway::deliver_delegation_signal_shared(
             Arc::clone(&gateway),
@@ -33816,6 +34533,7 @@ mod tests {
                 turn: 1,
                 error_kind: None,
                 conclusion: None,
+                terminal: true,
             },
         )
         .await;
@@ -33946,6 +34664,7 @@ mod tests {
             turn: n as u64,
             error_kind: None,
             conclusion: None,
+            terminal: true,
         };
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(1, false)).await;
         Gateway::deliver_delegation_signal_shared(Arc::clone(&gateway), signal(2, false)).await;
@@ -34024,6 +34743,7 @@ mod tests {
                 turn: 1,
                 error_kind: None,
                 conclusion: None,
+                terminal: true,
             },
         )
         .await;
@@ -34380,6 +35100,61 @@ mod tests {
         ccteam_harness::read_delegation_requests(project_dir, sid)?
             .get(request_id)
             .map(|request| request.state)
+    }
+
+    /// GitHub #198 — a chain of vendor continuations is not a way to become
+    /// unstoppable. A request that has already ridden two boundaries the vendor
+    /// woke itself out of settles like any other when the user says stop: the
+    /// cut turn leaves its `interrupted` record, the request goes terminal on
+    /// disk, and the trail of what it lived through is still readable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_stop_settles_a_request_that_is_mid_vendor_continuation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gateway, request_id, exec_turn) =
+            stoppable_session_with_a_bound_request(&project_dir).await;
+        // Two boundaries the vendor said it would be back from.
+        {
+            let mut gw = gateway.lock().await;
+            let claim = DelegationStoreClaim::for_test("s1");
+            // The first one is on a turn the request has since moved off, so
+            // it is written straight onto the record; the second is the one it
+            // is bound to now, through the production path.
+            gw.delegations
+                .get_mut("s1")
+                .unwrap()
+                .store
+                .get_mut(&request_id)
+                .unwrap()
+                .note_progress("x-earlier-continuation");
+            assert!(gw.note_delegation_progress(&claim, &exec_turn));
+            let store = gw.delegations.get("s1").unwrap().store.clone();
+            Gateway::seed_delegation_store_for_test(&project_dir, &claim, &store).unwrap();
+        }
+
+        let outcome = Gateway::stop_session_shared(&gateway, "s1")
+            .await
+            .expect("the child stops");
+        assert_eq!(outcome.settle_error, None, "{outcome:?}");
+        assert_eq!(
+            request_state_on_disk(&project_dir, "s1", &request_id),
+            Some(ccteam_harness::RequestState::Interrupted),
+            "a stop settles a mid-continuation request like any other"
+        );
+        let store = ccteam_harness::read_delegation_requests(&project_dir, "s1").unwrap();
+        let request = store.get(&request_id).expect("the request record survives");
+        assert_eq!(
+            request.progress.len(),
+            2,
+            "what it lived through is still readable: {request:?}"
+        );
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, "s1").unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.outcome.as_deref() == Some(INTERRUPTED_OUTCOME)),
+            "the cut turn still leaves its record: {rows:?}"
+        );
     }
 
     /// GitHub #197 (E) — the IM `/stop` settles the child ON DISK, not only in
