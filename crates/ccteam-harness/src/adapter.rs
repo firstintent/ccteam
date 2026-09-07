@@ -550,6 +550,33 @@ pub enum TurnDisposition {
     Queued,
 }
 
+/// The fixed cap on the narration excerpt an interrupted turn leaves behind.
+///
+/// A turn cut short can have been talking for half an hour; the record exists
+/// so `agent_read` shows what it was doing, not so it can carry the whole
+/// transcript into whoever reads it next. The TAIL is what is kept — the last
+/// thing a stopped session said is the part that explains why it was stopped.
+pub const IN_FLIGHT_NARRATION_MAX_CHARS: usize = 2000;
+
+/// What a vendor turn that is still running has said so far.
+///
+/// PUBLIC narration only — the assistant text blocks a transcript would show —
+/// never private reasoning, and never an answer: a partial is a bounded
+/// excerpt of what was said before the turn was cut off, and no consumer may
+/// treat it as a completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialNarration {
+    /// The execution turn it belongs to, when the adapter has one. `None` for
+    /// a channel with no turn identity of its own.
+    pub exec_turn_id: Option<String>,
+    /// The narration tail, at most [`IN_FLIGHT_NARRATION_MAX_CHARS`] chars.
+    /// Empty when the turn had not said anything yet — which is a FACT
+    /// ("nothing was said"), distinct from the adapter being unable to answer.
+    pub text: String,
+    /// Whether older narration was dropped to fit the cap.
+    pub truncated: bool,
+}
+
 /// Result of a routed user-message submission.
 ///
 /// `disposition` is the path the adapter actually used. It can differ from the
@@ -1561,6 +1588,23 @@ pub trait HarnessAdapter: Send + Sync {
     /// `/status` lists these under the current working session.
     async fn running_tasks(&self, _h: &ThreadHandle) -> Vec<RunningTask> {
         Vec::new()
+    }
+
+    /// What the turn currently in flight has said so far, for the bounded
+    /// `interrupted` record an explicit stop writes to `turns.jsonl`
+    /// (issue #197 E).
+    ///
+    /// A turn killed mid-flight used to leave NOTHING behind: a child that had
+    /// worked for twenty-nine minutes and made sixty-nine tool calls read back
+    /// through `agent_read` as having said nothing at all, so the parent could
+    /// not tell a stopped session from an idle one. `None` means "a turn is
+    /// not running, or this adapter cannot report one" — the record then says
+    /// the narration is UNKNOWN rather than implying the turn was silent.
+    ///
+    /// Must NOT block or do IO: it is called on the stop path with the gateway
+    /// lock held.
+    fn in_flight_narration(&self, _h: &ThreadHandle) -> Option<PartialNarration> {
+        None
     }
 
     /// Cheap liveness probe: is this thread's underlying process / channel

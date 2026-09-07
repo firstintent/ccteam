@@ -394,6 +394,15 @@ fn push_paragraph(acc: &mut String, text: &str) {
     acc.push_str(text);
 }
 
+/// The PUBLIC text of one Anthropic `Message` — the text blocks a transcript
+/// would show, and nothing else. One definition of "what this session said",
+/// shared by the turn accumulator above and by the status tap's in-flight
+/// narration cell, so an interrupted turn's record can never widen to
+/// something the transcript would not show.
+pub(super) fn public_text(message: &Value) -> String {
+    extract_blocks(message).0
+}
+
 /// One non-text content block worth surfacing as a progress item.
 enum BlockItem {
     Tool { name: String, args: Value },

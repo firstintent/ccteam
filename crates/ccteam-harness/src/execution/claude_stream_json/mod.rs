@@ -140,6 +140,60 @@ struct LiveSession {
     /// with the event translator so a submission receipt names the turn that
     /// will report the answer.
     turn_ids: Arc<StdMutex<TurnIdentity>>,
+    /// The PUBLIC narration of the turn in flight, kept current by the status
+    /// tap and read by [`HarnessAdapter::in_flight_narration`] when an explicit
+    /// stop needs to record what it cut short (issue #197 E). Bounded to the
+    /// tail (see [`InFlightNarration`]) — the cell must not grow with a turn
+    /// that talks for half an hour.
+    narration: Arc<StdMutex<InFlightNarration>>,
+}
+
+/// The tail of what the turn in flight has said, and whether anything older
+/// was dropped to keep it bounded.
+///
+/// Fed from the same `assistant` messages the event translator accumulates:
+/// TOP-LEVEL text blocks only, so a subagent's chatter and the model's private
+/// reasoning are both out by construction — the record an explicit stop writes
+/// may show only what the transcript would show. Cleared at every turn
+/// boundary, so it never carries the previous turn's words into this one.
+#[derive(Debug, Default)]
+struct InFlightNarration {
+    text: String,
+    truncated: bool,
+}
+
+impl InFlightNarration {
+    /// Append one top-level text block, dropping the oldest characters when
+    /// the cap is reached.
+    fn push(&mut self, block: &str) {
+        if block.is_empty() {
+            return;
+        }
+        if !self.text.is_empty() {
+            self.text.push_str("\n\n");
+        }
+        self.text.push_str(block);
+        let over = self
+            .text
+            .chars()
+            .count()
+            .saturating_sub(crate::IN_FLIGHT_NARRATION_MAX_CHARS);
+        if over > 0 {
+            self.text = self
+                .text
+                .chars()
+                .skip(over)
+                .collect::<String>()
+                .trim_start()
+                .to_string();
+            self.truncated = true;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.truncated = false;
+    }
 }
 
 /// One line parked behind the in-flight turn, with the identity of the turn it
@@ -301,6 +355,7 @@ struct StatusTapCells {
     active_turn: Arc<AtomicBool>,
     deferred_input: Arc<StdMutex<DeferredQueue>>,
     turn_ids: Arc<StdMutex<TurnIdentity>>,
+    narration: Arc<StdMutex<InFlightNarration>>,
 }
 
 /// Spawn the per-session status tap: keep the shared [`ThreadStatus`] current
@@ -322,6 +377,7 @@ fn spawn_status_tap(
         active_turn,
         deferred_input,
         turn_ids,
+        narration,
     } = cells;
     let mut sub = transport.subscribe();
     tokio::spawn(async move {
@@ -348,6 +404,19 @@ fn spawn_status_tap(
                 _ = transport.wait_closed() => return,
                 msg = sub.recv() => match msg {
                     Ok(Outbound::Assistant(env)) => {
+                        // Keep the turn's public narration current, for the
+                        // record an explicit stop leaves behind (issue #197 E).
+                        // TOP-LEVEL blocks only, and text only: a subagent's
+                        // messages and the model's thinking are not narration
+                        // this session may show anyone.
+                        if env.parent_tool_use_id.is_none() {
+                            let block = translate::public_text(&env.message);
+                            if !block.is_empty() {
+                                if let Ok(mut n) = narration.lock() {
+                                    n.push(&block);
+                                }
+                            }
+                        }
                         // Keep the live model id current from the API `model` field,
                         // carrying over a user-set `[1m]` tag (the API omits it).
                         let api_model = env
@@ -425,6 +494,11 @@ fn spawn_status_tap(
                         }
                     }
                     Ok(Outbound::TurnResult(_)) => {
+                        // The turn is over: its narration belongs to the
+                        // transcript now, not to the next turn's record.
+                        if let Ok(mut n) = narration.lock() {
+                            n.clear();
+                        }
                         // Clear occupancy and claim the next deferred input
                         // line (a slash command, issue #193; a queued turn,
                         // issue #194) under ONE lock, so a submission racing
@@ -604,33 +678,7 @@ fn persist_deferred_input(
 /// child's stdin buffer and is replayed at the FRONT, in order, exactly once; a
 /// row means it ran, and replaying it would ask the child to do the work twice.
 fn load_deferred_input(project_dir: &Path, sid: &str) -> DeferredQueue {
-    let path = deferred_input_path(project_dir, sid);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return DeferredQueue::default();
-    };
-    let mirror = match serde_json::from_slice::<DeferredMirror>(&bytes) {
-        Ok(mirror) if mirror.schema == DEFERRED_INPUT_SCHEMA => mirror,
-        Ok(mirror) => {
-            tracing::warn!(
-                session = %sid,
-                path = %path.display(),
-                schema = mirror.schema,
-                want = DEFERRED_INPUT_SCHEMA,
-                "stream-json: parked input mirror has an unreadable schema; discarding it"
-            );
-            return DeferredQueue::default();
-        }
-        Err(error) => {
-            tracing::warn!(
-                session = %sid,
-                path = %path.display(),
-                %error,
-                "stream-json: parked input mirror is unreadable; discarding it"
-            );
-            return DeferredQueue::default();
-        }
-    };
-    let mut queue = mirror.queue;
+    let mut queue = read_deferred_mirror(project_dir, sid);
     if let Some(in_flight) = queue.in_flight.take() {
         if turn_left_a_transcript_row(project_dir, sid, &in_flight.turn_id) {
             tracing::info!(
@@ -648,6 +696,84 @@ fn load_deferred_input(project_dir: &Path, sid: &str) -> DeferredQueue {
         }
     }
     queue
+}
+
+/// The mirror exactly as it sits on disk — no replay decision applied.
+///
+/// Two readers want different things from the same file. A resume wants to
+/// know what to REPLAY ([`load_deferred_input`]); an explicit stop wants to
+/// know what is still RETAINED and, of that, which lines were handed to the
+/// CLI and which never were — "confirmed undelivered" and "delivery
+/// unconfirmed" are different things to tell a dispatcher (issue #197 E).
+fn read_deferred_mirror(project_dir: &Path, sid: &str) -> DeferredQueue {
+    let path = deferred_input_path(project_dir, sid);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return DeferredQueue::default();
+    };
+    match serde_json::from_slice::<DeferredMirror>(&bytes) {
+        Ok(mirror) if mirror.schema == DEFERRED_INPUT_SCHEMA => mirror.queue,
+        Ok(mirror) => {
+            tracing::warn!(
+                session = %sid,
+                path = %path.display(),
+                schema = mirror.schema,
+                want = DEFERRED_INPUT_SCHEMA,
+                "stream-json: parked input mirror has an unreadable schema; discarding it"
+            );
+            DeferredQueue::default()
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %sid,
+                path = %path.display(),
+                %error,
+                "stream-json: parked input mirror is unreadable; discarding it"
+            );
+            DeferredQueue::default()
+        }
+    }
+}
+
+/// The basename of the parked-input mirror, for a caller that must name the
+/// file a retained line is sitting in.
+pub const DEFERRED_INPUT_FILE: &str = "deferred-input.json";
+
+/// The execution-turn ids one session's parked-input mirror still holds.
+///
+/// The unit is the EXECUTION TURN id, not the text: that is the identity a
+/// delegation request is bound to, so a caller can say which of ITS tasks is
+/// retained without ever reading anybody's prompt back out of the mirror.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedInput {
+    /// Written to the CLI, no boundary observed: delivery is UNCONFIRMED. The
+    /// line is still retained — the next life replays it unless the transcript
+    /// shows the turn ran.
+    pub in_flight: Option<String>,
+    /// Never handed to the vendor, oldest first: confirmed UNDELIVERED, and
+    /// retained.
+    pub parked: Vec<String>,
+}
+
+impl RetainedInput {
+    /// Whether `exec_turn_id` is the one line that was written out.
+    pub fn is_in_flight(&self, exec_turn_id: &str) -> bool {
+        self.in_flight.as_deref() == Some(exec_turn_id)
+    }
+
+    /// Whether `exec_turn_id` is still waiting behind the harness.
+    pub fn is_parked(&self, exec_turn_id: &str) -> bool {
+        self.parked.iter().any(|id| id == exec_turn_id)
+    }
+}
+
+/// Read what a stopped (or merely released) sid still has parked — see
+/// [`RetainedInput`]. A missing or unreadable mirror is "nothing retained".
+pub fn retained_input(project_dir: &Path, sid: &str) -> RetainedInput {
+    let queue = read_deferred_mirror(project_dir, sid);
+    RetainedInput {
+        in_flight: queue.in_flight.map(|line| line.turn_id),
+        parked: queue.parked.into_iter().map(|line| line.turn_id).collect(),
+    }
 }
 
 /// Did any mirrored turn row run under `exec_turn_id`? The transcript is the
@@ -1872,6 +1998,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         ));
         let turn_ids: Arc<StdMutex<TurnIdentity>> =
             Arc::new(StdMutex::new(TurnIdentity::default()));
+        let narration: Arc<StdMutex<InFlightNarration>> =
+            Arc::new(StdMutex::new(InFlightNarration::default()));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
@@ -1888,6 +2016,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                 active_turn: Arc::clone(&active_turn),
                 deferred_input: Arc::clone(&deferred_input),
                 turn_ids: Arc::clone(&turn_ids),
+                narration: Arc::clone(&narration),
             },
             ctx.project_dir.clone(),
             ctx.sid.clone(),
@@ -1960,6 +2089,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             active_turn,
             deferred_input,
             turn_ids,
+            narration,
         };
         let live = Arc::new(live);
         // Body record lifecycle: the record written at spawn is cleared the
@@ -2142,6 +2272,31 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         } else {
             Ok(TurnSubmission::started(turn_id))
         }
+    }
+
+    /// What this session's in-flight turn has said so far — `None` when no
+    /// turn is open. The execution id comes from [`TurnIdentity::current`], so
+    /// a turn that has been submitted but has not produced its first message
+    /// yet still names the turn it reserved (an explicit stop in that window
+    /// records a turn that ran and said nothing, not a turn that never was).
+    fn in_flight_narration(&self, h: &ThreadHandle) -> Option<crate::PartialNarration> {
+        let live = self.lookup(&h.identity)?;
+        if !live.active_turn.load(Ordering::Acquire) {
+            return None;
+        }
+        let exec_turn_id = lock_turn_ids(&live.turn_ids).current();
+        let (text, truncated) = match live.narration.lock() {
+            Ok(n) => (n.text.clone(), n.truncated),
+            Err(poisoned) => {
+                let n = poisoned.into_inner();
+                (n.text.clone(), n.truncated)
+            }
+        };
+        Some(crate::PartialNarration {
+            exec_turn_id,
+            text,
+            truncated,
+        })
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -3588,5 +3743,38 @@ mod effort_shape_tests {
             extract_effort_from_settings(&json!({"effective": {"effortLevel": "  "}})),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod in_flight_narration_tests {
+    /// GitHub #197 (E) — the in-flight cell keeps the TAIL and says so. A turn
+    /// that talks for half an hour must not grow the cell without bound, and
+    /// the last thing a stopped session said is the part that explains why it
+    /// was stopped.
+    #[test]
+    fn in_flight_narration_keeps_a_bounded_tail() {
+        let mut n = super::InFlightNarration::default();
+        n.push("first");
+        n.push("second");
+        assert_eq!(n.text, "first\n\nsecond");
+        assert!(!n.truncated);
+
+        let long = "x".repeat(crate::IN_FLIGHT_NARRATION_MAX_CHARS);
+        n.push(&long);
+        assert_eq!(n.text.chars().count(), crate::IN_FLIGHT_NARRATION_MAX_CHARS);
+        assert!(n.truncated, "dropping the head is reported, never silent");
+        assert!(n.text.ends_with('x'), "the TAIL is what survives");
+        assert!(!n.text.contains("first"));
+
+        // A boundary hands the narration to the transcript; the next turn
+        // starts from nothing.
+        n.clear();
+        assert_eq!(n.text, "");
+        assert!(!n.truncated);
+
+        // An empty block is not a paragraph break.
+        n.push("");
+        assert_eq!(n.text, "");
     }
 }

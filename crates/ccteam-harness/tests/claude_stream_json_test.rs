@@ -1531,6 +1531,135 @@ async fn thread_status_refreshes_context_mid_turn_before_result() {
     std::env::remove_var("FAKE_SJ_NO_RESULT");
 }
 
+/// GitHub #197 (E) — a turn that is still running can say what it has said so
+/// far, so an explicit stop leaves a record instead of a hole.
+///
+/// A child stopped mid-turn used to leave NOTHING in `turns.jsonl`: measured on
+/// s932→s936, twenty-nine minutes and sixty-nine tool calls read back through
+/// `agent_read` as `turns:[]`. The fake emits an assistant step and never a
+/// result, so the narration can only come from the in-flight cell.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn in_flight_narration_reports_the_running_turns_public_text() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    std::env::set_var("FAKE_SJ_NO_RESULT", "1");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+
+    // Nothing is running: there is no partial to report, and saying so is not
+    // the same as reporting an empty one.
+    assert_eq!(adapter.in_flight_narration(&handle), None);
+
+    let turn = adapter
+        .submit_turn(&handle, TurnInput::UserText("do the long thing".into()))
+        .await
+        .expect("submit_turn");
+    let mut partial = None;
+    for _ in 0..200 {
+        match adapter.in_flight_narration(&handle) {
+            Some(p) if !p.text.is_empty() => {
+                partial = Some(p);
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    let partial = partial.expect("the running turn's narration is readable");
+    assert_eq!(partial.text, "working...");
+    assert!(!partial.truncated, "{partial:?}");
+    assert_eq!(
+        partial.exec_turn_id.as_deref(),
+        Some(turn.0.as_str()),
+        "the partial names the EXECUTION turn a request is bound to: {partial:?}"
+    );
+
+    adapter.close_thread(&handle).await.unwrap();
+    std::env::remove_var("FAKE_SJ_NO_RESULT");
+}
+
+/// The window before the child has said anything: an explicit stop there must
+/// record a turn that ran and said nothing, which is a different fact from a
+/// turn nobody can report on. `FAKE_SJ_SWALLOW_AFTER_TURNS=0` models a CLI that
+/// takes the line and produces neither an assistant block nor a result.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn in_flight_narration_before_the_first_output_is_empty_not_absent() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    std::env::set_var("FAKE_SJ_SWALLOW_AFTER_TURNS", "0");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s1"),
+        )
+        .await
+        .expect("start_thread");
+    let turn = adapter
+        .submit_turn(&handle, TurnInput::UserText("say nothing".into()))
+        .await
+        .expect("submit_turn");
+    let partial = adapter
+        .in_flight_narration(&handle)
+        .expect("a submitted turn is in flight even before its first message");
+    assert_eq!(partial.text, "", "{partial:?}");
+    assert_eq!(partial.exec_turn_id.as_deref(), Some(turn.0.as_str()));
+
+    adapter.close_thread(&handle).await.unwrap();
+    std::env::remove_var("FAKE_SJ_SWALLOW_AFTER_TURNS");
+}
+
+/// GitHub #197 (E) — what a stopped session still HOLDS, split by whether the
+/// bytes ever left ccteam. The parked line was never handed to the vendor
+/// (confirmed undelivered); the in-flight one was written and no boundary was
+/// observed (delivery unconfirmed). Both are retained and both replay.
+#[test]
+fn retained_input_separates_what_was_written_from_what_was_not() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Nothing on disk = nothing retained.
+    assert_eq!(
+        ccteam_harness::execution::claude_stream_json::retained_input(tmp.path(), "s9"),
+        Default::default()
+    );
+    write_deferred_mirror(
+        tmp.path(),
+        "s9",
+        serde_json::json!({
+            "schema": 2,
+            "in_flight": {"turn_id": "sj-a", "text": "written, unobserved"},
+            "parked": [{"turn_id": "sj-b", "text": "still ours"}],
+        }),
+    );
+    let retained = ccteam_harness::execution::claude_stream_json::retained_input(tmp.path(), "s9");
+    assert_eq!(retained.in_flight.as_deref(), Some("sj-a"));
+    assert_eq!(retained.parked, vec!["sj-b".to_string()]);
+    assert!(retained.is_in_flight("sj-a") && !retained.is_parked("sj-a"));
+    assert!(retained.is_parked("sj-b") && !retained.is_in_flight("sj-b"));
+
+    // A shape this build cannot read holds nothing: fail-closed, never a
+    // half-understood claim about somebody's task (pre-1.0, no migration).
+    write_deferred_mirror(
+        tmp.path(),
+        "s9",
+        serde_json::json!({ "schema": 1, "parked": [{"turn_id": "sj-c", "text": "old"}] }),
+    );
+    assert_eq!(
+        ccteam_harness::execution::claude_stream_json::retained_input(tmp.path(), "s9"),
+        Default::default()
+    );
+}
+
 /// Task 1 (durability) — stream-json status is in-memory only, so without
 /// persistence it would vanish on idle-release / daemon restart (the TUI gets
 /// durability free from its on-disk transcript). The tap mirrors each turn's
