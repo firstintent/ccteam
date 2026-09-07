@@ -375,6 +375,73 @@ async fn completion_edge_interject_surfaces_vendor_self_started_turn() {
     clear_fake();
 }
 
+/// GitHub #197 (G) — an ACP turn still running can say what it has said. The
+/// fake speaks one `agent_message_chunk` and finishes a second later, so the
+/// narration can only come from the in-flight buffer, and the thought it emits
+/// first must never join it.
+///
+/// End to end over the real ACP transport, so the live-handle → session-state
+/// lookup is proved and not just the fold. grok / kimi / opencode / dsh all
+/// answer through the one shared `acp::in_flight_narration`.
+#[tokio::test]
+#[serial]
+async fn in_flight_narration_reports_a_running_acp_turn() {
+    install_fake();
+    let tmp = TempDir::new().unwrap();
+    let adapter = GrokAcpAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &spawn_ctx(&tmp, "s-narrate"),
+        )
+        .await
+        .expect("start ok");
+
+    // Nothing running: no partial at all, which is a different answer from an
+    // empty one.
+    assert_eq!(adapter.in_flight_narration(&handle), None);
+
+    let turn = adapter
+        .submit_turn(&handle, TurnInput::UserText("__narrate__".into()))
+        .await
+        .expect("submit");
+    let mut partial = None;
+    for _ in 0..80 {
+        match adapter.in_flight_narration(&handle) {
+            Some(p) if !p.text.is_empty() => {
+                partial = Some(p);
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    let partial = partial.expect("the running turn's narration is readable");
+    assert_eq!(partial.text, "half a migration");
+    assert!(!partial.text.contains("thinking"), "thoughts are private");
+    assert!(!partial.truncated(), "{partial:?}");
+    assert_eq!(
+        partial.exec_turn_id.as_deref(),
+        Some(turn.0.as_str()),
+        "the partial names the EXECUTION turn a request is bound to: {partial:?}"
+    );
+
+    // Once the turn ends, that text is the ANSWER — never a partial.
+    let mut settled = false;
+    for _ in 0..200 {
+        if adapter.in_flight_narration(&handle).is_none() {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(settled, "a finished turn reports no partial");
+
+    adapter.close_thread(&handle).await.unwrap();
+    clear_fake();
+}
+
 /// The lower layer retains a distinct FIFO route for a future composer toggle.
 /// Unlike Inject, Queue returns a new id and produces a second turn boundary.
 #[tokio::test]

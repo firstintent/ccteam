@@ -2212,6 +2212,104 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
 }
 
+/// GitHub #197 (G) — a codex turn still running can say what it has said, on
+/// its OWN wire shape: `item/agentMessage/delta` fragments, then the
+/// `item/completed` that carries the whole message. Private reasoning is never
+/// part of it, and the boundary hands the narration to the transcript.
+///
+/// End to end over the scripted peer, so the live-handle → cell lookup is
+/// proved and not just the fold: a stopped child that reads back as silent is
+/// the failure this exists to prevent (measured on s932→s936).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn in_flight_narration_reports_a_running_codex_turn() {
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_with_notif("narration").await;
+
+    // Nothing running: "this adapter cannot report a turn" is not the same
+    // answer as "the turn said nothing".
+    assert_eq!(adapter.in_flight_narration(&h), None);
+
+    notif
+        .send(json!({
+            "method": "turn/started",
+            "params": { "threadId": "tid-d2", "turn": { "id": "turn-1" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        let h = h.clone();
+        async move { a.in_flight_narration(&h).is_some() }
+    })
+    .await;
+    let started = adapter.in_flight_narration(&h).expect("in flight");
+    assert_eq!(started.exec_turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(started.text, "", "it has not spoken yet");
+
+    for delta in ["half a ", "migration"] {
+        notif
+            .send(json!({
+                "method": "item/agentMessage/delta",
+                "params": { "threadId": "tid-d2", "turnId": "turn-1",
+                            "itemId": "item-1", "delta": delta }
+            }))
+            .await
+            .unwrap();
+    }
+    // Thinking is not narration on any channel.
+    notif
+        .send(json!({
+            "method": "item/reasoning/textDelta",
+            "params": { "threadId": "tid-d2", "turnId": "turn-1",
+                        "itemId": "r-1", "delta": "SECRET" }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        let h = h.clone();
+        async move {
+            a.in_flight_narration(&h)
+                .is_some_and(|p| p.text == "half a migration")
+        }
+    })
+    .await;
+
+    // The completed item's own text replaces the fragments it streamed as —
+    // never a second copy of the same message.
+    notif
+        .send(json!({
+            "method": "item/completed",
+            "params": { "threadId": "tid-d2",
+                        "item": { "id": "item-1", "type": "agent_message",
+                                  "text": "half a migration" } }
+        }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let partial = adapter.in_flight_narration(&h).expect("still in flight");
+    assert_eq!(partial.text, "half a migration", "{partial:?}");
+    assert!(!partial.truncated());
+
+    notif
+        .send(json!({
+            "method": "turn/completed",
+            "params": { "threadId": "tid-d2", "turn": { "id": "turn-1", "status": "completed" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        let h = h.clone();
+        async move { a.in_flight_narration(&h).is_none() }
+    })
+    .await;
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
 /// #200: official settings snapshots, including unseen model ids and a
 /// cleared effort, must update status without any events() consumer.
 #[tokio::test(flavor = "current_thread")]

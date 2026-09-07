@@ -141,59 +141,16 @@ struct LiveSession {
     /// will report the answer.
     turn_ids: Arc<StdMutex<TurnIdentity>>,
     /// The PUBLIC narration of the turn in flight, kept current by the status
-    /// tap and read by [`HarnessAdapter::in_flight_narration`] when an explicit
-    /// stop needs to record what it cut short (issue #197 E). Bounded to the
-    /// tail (see [`InFlightNarration`]) — the cell must not grow with a turn
+    /// tap and read by [`HarnessAdapter::in_flight_narration`] — by an explicit
+    /// stop, to record what it cut short, and by `agent_read{sid}`, to show a
+    /// working child's own words (issue #197 E/G). Bounded to the tail (see
+    /// [`crate::NarrationAccumulator`]) — the cell must not grow with a turn
     /// that talks for half an hour.
-    narration: Arc<StdMutex<InFlightNarration>>,
-}
-
-/// The tail of what the turn in flight has said, and whether anything older
-/// was dropped to keep it bounded.
-///
-/// Fed from the same `assistant` messages the event translator accumulates:
-/// TOP-LEVEL text blocks only, so a subagent's chatter and the model's private
-/// reasoning are both out by construction — the record an explicit stop writes
-/// may show only what the transcript would show. Cleared at every turn
-/// boundary, so it never carries the previous turn's words into this one.
-#[derive(Debug, Default)]
-struct InFlightNarration {
-    text: String,
-    truncated: bool,
-}
-
-impl InFlightNarration {
-    /// Append one top-level text block, dropping the oldest characters when
-    /// the cap is reached.
-    fn push(&mut self, block: &str) {
-        if block.is_empty() {
-            return;
-        }
-        if !self.text.is_empty() {
-            self.text.push_str("\n\n");
-        }
-        self.text.push_str(block);
-        let over = self
-            .text
-            .chars()
-            .count()
-            .saturating_sub(crate::IN_FLIGHT_NARRATION_MAX_CHARS);
-        if over > 0 {
-            self.text = self
-                .text
-                .chars()
-                .skip(over)
-                .collect::<String>()
-                .trim_start()
-                .to_string();
-            self.truncated = true;
-        }
-    }
-
-    fn clear(&mut self) {
-        self.text.clear();
-        self.truncated = false;
-    }
+    ///
+    /// stream-json's shape is CUMULATIVE: each `assistant` message carries the
+    /// complete set of its own text blocks, so a message is folded in as a
+    /// SNAPSHOT keyed by its `message.id` and never appended twice.
+    narration: Arc<StdMutex<crate::NarrationAccumulator>>,
 }
 
 /// One line parked behind the in-flight turn, with the identity of the turn it
@@ -355,7 +312,7 @@ struct StatusTapCells {
     active_turn: Arc<AtomicBool>,
     deferred_input: Arc<StdMutex<DeferredQueue>>,
     turn_ids: Arc<StdMutex<TurnIdentity>>,
-    narration: Arc<StdMutex<InFlightNarration>>,
+    narration: Arc<StdMutex<crate::NarrationAccumulator>>,
 }
 
 /// Spawn the per-session status tap: keep the shared [`ThreadStatus`] current
@@ -412,8 +369,17 @@ fn spawn_status_tap(
                         if env.parent_tool_use_id.is_none() {
                             let block = translate::public_text(&env.message);
                             if !block.is_empty() {
+                                // Keyed by the vendor's own message id: this
+                                // wire re-states a message's whole text, so a
+                                // restated step must replace its paragraph
+                                // rather than duplicate it.
+                                let id = env
+                                    .message
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
                                 if let Ok(mut n) = narration.lock() {
-                                    n.push(&block);
+                                    n.set_snapshot(id, &block);
                                 }
                             }
                         }
@@ -1998,8 +1964,8 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         ));
         let turn_ids: Arc<StdMutex<TurnIdentity>> =
             Arc::new(StdMutex::new(TurnIdentity::default()));
-        let narration: Arc<StdMutex<InFlightNarration>> =
-            Arc::new(StdMutex::new(InFlightNarration::default()));
+        let narration: Arc<StdMutex<crate::NarrationAccumulator>> =
+            Arc::new(StdMutex::new(crate::NarrationAccumulator::default()));
         // Status tap (every session, not just hitl): watch the transport for
         // `assistant`/`result` messages and fold each one's `usage` (+ live
         // `message.model`) into `status`, so /sessions + the web statusline
@@ -2285,18 +2251,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             return None;
         }
         let exec_turn_id = lock_turn_ids(&live.turn_ids).current();
-        let (text, truncated) = match live.narration.lock() {
-            Ok(n) => (n.text.clone(), n.truncated),
-            Err(poisoned) => {
-                let n = poisoned.into_inner();
-                (n.text.clone(), n.truncated)
-            }
+        let partial = match live.narration.lock() {
+            Ok(n) => n.partial(exec_turn_id),
+            Err(poisoned) => poisoned.into_inner().partial(exec_turn_id),
         };
-        Some(crate::PartialNarration {
-            exec_turn_id,
-            text,
-            truncated,
-        })
+        Some(partial)
     }
 
     fn events(&self, h: &ThreadHandle) -> BoxStream<'static, ThreadEvent> {
@@ -3748,33 +3707,39 @@ mod effort_shape_tests {
 
 #[cfg(test)]
 mod in_flight_narration_tests {
-    /// GitHub #197 (E) — the in-flight cell keeps the TAIL and says so. A turn
-    /// that talks for half an hour must not grow the cell without bound, and
-    /// the last thing a stopped session said is the part that explains why it
-    /// was stopped.
+    /// GitHub #197 (E/G) — stream-json's shape is a CUMULATIVE snapshot per
+    /// message: claude re-states a step's whole text block set as the step
+    /// grows, so folding one in twice used to duplicate the paragraph. The
+    /// bounded-tail contract itself is proved on the shared accumulator
+    /// (`adapter.rs`); this pins the KEY this adapter folds with.
     #[test]
-    fn in_flight_narration_keeps_a_bounded_tail() {
-        let mut n = super::InFlightNarration::default();
-        n.push("first");
-        n.push("second");
-        assert_eq!(n.text, "first\n\nsecond");
-        assert!(!n.truncated);
+    fn a_restated_assistant_message_stays_one_paragraph() {
+        let mut n = crate::NarrationAccumulator::default();
+        let msg = |id: &str, text: &str| serde_json::json!({ "id": id, "content": [{ "type": "text", "text": text }] });
+        let first = msg("msg_01", "reading the brief");
+        n.set_snapshot(
+            first["id"].as_str().unwrap_or_default(),
+            &super::translate::public_text(&first),
+        );
+        let restated = msg("msg_01", "reading the brief, then the tests");
+        n.set_snapshot(
+            restated["id"].as_str().unwrap_or_default(),
+            &super::translate::public_text(&restated),
+        );
+        assert_eq!(n.text(), "reading the brief, then the tests");
 
-        let long = "x".repeat(crate::IN_FLIGHT_NARRATION_MAX_CHARS);
-        n.push(&long);
-        assert_eq!(n.text.chars().count(), crate::IN_FLIGHT_NARRATION_MAX_CHARS);
-        assert!(n.truncated, "dropping the head is reported, never silent");
-        assert!(n.text.ends_with('x'), "the TAIL is what survives");
-        assert!(!n.text.contains("first"));
+        let next = msg("msg_02", "patching now");
+        n.set_snapshot(
+            next["id"].as_str().unwrap_or_default(),
+            &super::translate::public_text(&next),
+        );
+        assert_eq!(
+            n.text(),
+            "reading the brief, then the tests\n\npatching now"
+        );
 
-        // A boundary hands the narration to the transcript; the next turn
-        // starts from nothing.
+        // A boundary hands the narration to the transcript.
         n.clear();
-        assert_eq!(n.text, "");
-        assert!(!n.truncated);
-
-        // An empty block is not a paragraph break.
-        n.push("");
-        assert_eq!(n.text, "");
+        assert_eq!(n.text(), "");
     }
 }

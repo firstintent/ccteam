@@ -312,6 +312,46 @@ impl SessionTranslateState {
     }
 }
 
+/// What an ACP session's in-flight turn has said so far — ONE implementation
+/// for every ACP vendor (grok / opencode / kimi / dsh all reach it through
+/// `HarnessAdapter::in_flight_narration`), GitHub #197 (E/G).
+///
+/// ACP's shape is DELTA (`agent_message_chunk`), and the turn's own
+/// [`TurnBuffer`] already holds every chunk in order — `agent_thought_chunk`
+/// never enters it, so private reasoning is excluded by construction, one
+/// layer below this. All that is left is to render the bounded TAIL.
+///
+/// `None` when no turn is open. A buffer whose boundary has already been seen
+/// (`prompt_boundary_seen`) is NOT in flight: its text is the answer, waiting
+/// only for the prompt response to carry usage, and handing an answer back as
+/// a partial is exactly the confusion a partial must never cause.
+///
+/// Synchronous and lock-only, as the trait requires: it runs with the gateway
+/// lock held. Poisoning is recovered rather than propagated — a panicked
+/// writer must not make a stopped turn unreportable.
+pub fn in_flight_narration(
+    state: &std::sync::Mutex<SessionTranslateState>,
+) -> Option<crate::PartialNarration> {
+    let state = match state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let buffer = match (&state.buffer, &state.vendor_started_buffer) {
+        (Some(buffer), _) if !state.prompt_boundary_seen => buffer,
+        // A turn the vendor opened itself is just as real, and it is the only
+        // one still running once the prompt turn has sealed.
+        (_, Some(buffer)) => buffer,
+        _ => return None,
+    };
+    let (text, omitted_chars) =
+        crate::bounded_tail(&buffer.text, crate::IN_FLIGHT_NARRATION_MAX_CHARS);
+    Some(crate::PartialNarration {
+        exec_turn_id: Some(buffer.turn_id.clone()),
+        text,
+        omitted_chars,
+    })
+}
+
 /// Apply one notification. Client-started final messages wait for the prompt
 /// response; an opted-in vendor-started turn finalizes on its own boundary.
 pub fn apply_notification(state: &mut SessionTranslateState, n: &Notification) -> Vec<ThreadEvent> {
@@ -883,6 +923,74 @@ mod tests {
             Some(17_580),
             "a no-model-call turn must not blank the last real measurement"
         );
+    }
+
+    /// GitHub #197 (G) — ACP's own wire shape read back mid-turn: the
+    /// `agent_message_chunk` deltas accumulate (a chunk is never a snapshot),
+    /// `agent_thought_chunk` never appears, the excerpt names the execution
+    /// turn a request is bound to, and a boundary that has been SEEN is an
+    /// answer rather than a partial. Grok / kimi / opencode / dsh all read
+    /// through this one path.
+    #[test]
+    fn an_in_flight_acp_turn_reports_its_chunks_and_never_its_thoughts() {
+        let state = std::sync::Mutex::new(SessionTranslateState::default());
+        let chunk = |kind: &str, text: &str| Notification {
+            method: "session/update".into(),
+            params: json!({
+                "update": { "sessionUpdate": kind, "content": {"type": "text", "text": text} }
+            }),
+        };
+        let feed = |kind: &str, text: &str| {
+            let mut st = state.lock().unwrap();
+            apply_notification(&mut st, &chunk(kind, text));
+        };
+
+        // Nothing running: there is no partial to report, which is not the
+        // same as reporting an empty one.
+        assert_eq!(in_flight_narration(&state), None);
+
+        state
+            .lock()
+            .unwrap()
+            .begin_turn("t-9", Arc::new(Notify::new()));
+        let started = in_flight_narration(&state).expect("a begun turn is in flight");
+        assert_eq!(started.text, "", "it has not spoken yet — a FACT");
+        assert_eq!(started.exec_turn_id.as_deref(), Some("t-9"));
+
+        feed("agent_thought_chunk", "SECRET reasoning");
+        feed("agent_message_chunk", "reading ");
+        feed("agent_message_chunk", "the brief");
+        let partial = in_flight_narration(&state).expect("mid-turn");
+        assert_eq!(partial.text, "reading the brief");
+        assert!(!partial.truncated());
+        assert!(!partial.text.contains("SECRET"), "{partial:?}");
+
+        // Long narration keeps the TAIL and says how much it dropped.
+        feed(
+            "agent_message_chunk",
+            &"z".repeat(crate::IN_FLIGHT_NARRATION_MAX_CHARS),
+        );
+        let bounded = in_flight_narration(&state).expect("mid-turn");
+        assert_eq!(
+            bounded.text.chars().count(),
+            crate::IN_FLIGHT_NARRATION_MAX_CHARS
+        );
+        assert_eq!(bounded.omitted_chars, "reading the brief".chars().count());
+        assert!(bounded.text.ends_with('z'));
+
+        // The boundary landed: that text is the ANSWER now, and handing an
+        // answer back as a partial is what a partial must never do.
+        {
+            let mut st = state.lock().unwrap();
+            apply_notification(
+                &mut st,
+                &Notification {
+                    method: "session/update".into(),
+                    params: json!({"update": {"sessionUpdate": "turn_completed"}}),
+                },
+            );
+        }
+        assert_eq!(in_flight_narration(&state), None);
     }
 
     #[test]

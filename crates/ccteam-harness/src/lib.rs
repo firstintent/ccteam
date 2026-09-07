@@ -47,19 +47,20 @@ pub mod usage_catalog;
 pub mod vendor_compat;
 
 pub use adapter::{
-    ccteam_root_from_env, format_tokens, parse_backgrounded_short_id, parse_cc_state_json,
-    parse_pid_from_state, pluck, pluck_f64, pluck_pct, pluck_str, sigkill_pid, sigterm_pid,
-    state_json_path, AccountUsage, AgentSpecBrief, AgentVendor, ApprovalIR, ApprovalKind,
-    ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt, ChoiceSelection,
-    ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome, EventAttachment,
-    ExecutionMode, GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot, HostExecutionScope,
-    ModelWindow, PartialNarration, PermissionMode, RecoveredTurn, RunningTask, SessionHandle,
-    SessionProtocol, SessionTitleTarget, SpawnCtx, SpawnOpts, SubagentState, ThreadErrorEvent,
-    ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, ThreadStatus, TitleSync,
-    ToolSurfaceRebuild, TurnDisposition, TurnId, TurnInput, TurnRouting, TurnSubmission,
-    UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
-    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
-    IN_FLIGHT_NARRATION_MAX_CHARS, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+    bounded_tail, ccteam_root_from_env, format_tokens, parse_backgrounded_short_id,
+    parse_cc_state_json, parse_pid_from_state, pluck, pluck_f64, pluck_pct, pluck_str, sigkill_pid,
+    sigterm_pid, state_json_path, AccountUsage, AgentSpecBrief, AgentVendor, ApprovalIR,
+    ApprovalKind, ApprovalRisk, ApprovalScope, CanonicalEvent, ChoiceOption, ChoicePrompt,
+    ChoiceSelection, ContextSource, ContextUsage, DetachOutcome, Directive, DirectiveOutcome,
+    EventAttachment, ExecutionMode, GoalStatus, HarnessAdapter, HarnessError, HarnessSnapshot,
+    HostExecutionScope, ModelWindow, NarrationAccumulator, PartialNarration, PermissionMode,
+    RecoveredTurn, RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx,
+    SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
+    ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId,
+    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV,
+    CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
+    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, IN_FLIGHT_NARRATION_MAX_CHARS,
+    KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,

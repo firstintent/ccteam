@@ -1575,7 +1575,7 @@ async fn in_flight_narration_reports_the_running_turns_public_text() {
     }
     let partial = partial.expect("the running turn's narration is readable");
     assert_eq!(partial.text, "working...");
-    assert!(!partial.truncated, "{partial:?}");
+    assert!(!partial.truncated(), "{partial:?}");
     assert_eq!(
         partial.exec_turn_id.as_deref(),
         Some(turn.0.as_str()),

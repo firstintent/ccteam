@@ -180,6 +180,22 @@ pub struct ThreadLive {
     settings_revision: u64,
 }
 
+/// One thread's in-flight turn and what it has said so far (GitHub #197 G).
+///
+/// Codex's shape is DELTA: `item/agentMessage/delta` ships fragments of one
+/// agent message, and the `item/completed` that closes the item carries its
+/// whole text. So a delta is appended (a fragment is not a snapshot) and the
+/// completed item replaces the fragments it was assembled from — see
+/// [`crate::NarrationAccumulator`]. Reasoning deltas
+/// (`item/reasoning/textDelta`) are never fed in: private thinking is not
+/// narration ccteam may show anyone.
+#[derive(Debug, Default)]
+pub struct ThreadNarration {
+    /// The open turn's id, or `None` when nothing is running.
+    turn_id: Option<String>,
+    text: crate::NarrationAccumulator,
+}
+
 /// v0.8.5 D2.4 — the harness-level, vendor-scoped runtime state cache.
 /// Keyed by codex `thread_id`. One per adapter instance (which is itself a
 /// per-vendor singleton, arch §1.1), fed by ONE dispatcher task per cached
@@ -268,6 +284,15 @@ pub struct CodexAppServerAdapter {
     /// v0.8.5 D2.4 — harness-owned per-thread live state (usage /
     /// active-turn / model). Fed by ONE dispatcher per cached client.
     tracker: Arc<Mutex<CodexThreadTracker>>,
+    /// GitHub #197 (G) — the PUBLIC narration of each thread's in-flight turn,
+    /// fed by the same sole dispatcher as `tracker`.
+    ///
+    /// A SEPARATE cell, behind a std mutex, because
+    /// [`HarnessAdapter::in_flight_narration`] is synchronous and is called
+    /// with the gateway lock held: it may not await, so it cannot read
+    /// `tracker`. It therefore carries the in-flight turn id itself —
+    /// `Some(turn_id)` IS "a turn is open on this thread".
+    narration: Arc<std::sync::Mutex<HashMap<String, ThreadNarration>>>,
     /// v0.8.5 D2.1 — per-session command overrides applied on `turn/start`.
     overrides: Arc<Mutex<HashMap<String, SessionOverride>>>,
     /// v0.8.5 D2 — cached `skills/list` result (flattened `(name, path)`),
@@ -336,6 +361,7 @@ impl Default for CodexAppServerAdapter {
             inner: Arc::new(Mutex::new(None)),
             bridges: Arc::new(Mutex::new(HashMap::new())),
             tracker: Arc::new(Mutex::new(CodexThreadTracker::default())),
+            narration: Arc::new(std::sync::Mutex::new(HashMap::new())),
             overrides: Arc::new(Mutex::new(HashMap::new())),
             skills_cache: Arc::new(Mutex::new(None)),
             rate_limits: Arc::new(Mutex::new(None)),
@@ -639,6 +665,7 @@ impl CodexAppServerAdapter {
         let (notifications, _) = broadcast::channel(256);
         let tx = notifications.clone();
         let tracker = Arc::clone(&self.tracker);
+        let narration = Arc::clone(&self.narration);
         let skills_cache = Arc::clone(&self.skills_cache);
         let rate_limits = Arc::clone(&self.rate_limits);
         tokio::spawn(async move {
@@ -646,6 +673,7 @@ impl CodexAppServerAdapter {
                 match rx.recv().await {
                     Ok(notif) => {
                         apply_notification_to_tracker(&tracker, &notif).await;
+                        apply_notification_to_narration(&narration, &notif);
                         if notif.method == "skills/changed" {
                             *skills_cache.lock().await = None;
                         }
@@ -2110,6 +2138,18 @@ impl HarnessAdapter for CodexAppServerAdapter {
         let turn_id = pluck_turn_id(&result).ok_or_else(|| {
             HarnessError::SubmitFailed(format!("{method} response missing turn.id: {result}"))
         })?;
+        // Open the narration cell on the id the RPC just confirmed. Without
+        // this, a turn stopped before its first `agent_message` reported no
+        // in-flight turn at all — "this adapter cannot say" rather than "it
+        // had not spoken yet", which are different facts (issue #197 E/G). A
+        // steer joins the turn already open and keeps its narration.
+        {
+            let mut cells = match self.narration.lock() {
+                Ok(cells) => cells,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            begin_narration_locked(&mut cells, &h.identity, &turn_id);
+        }
         let turn_id = TurnId(turn_id);
         if was_active {
             Ok(TurnSubmission::injected_with_input_id(turn_id, input_id))
@@ -2483,6 +2523,21 @@ impl HarnessAdapter for CodexAppServerAdapter {
             // tracker read), so there is no observation to stamp.
             generation: None,
         })
+    }
+
+    /// What this thread's in-flight turn has said so far — `None` when no turn
+    /// is open (GitHub #197 E/G).
+    ///
+    /// Reads the sync narration cell, never the async tracker: this runs with
+    /// the gateway lock held and may not await.
+    fn in_flight_narration(&self, h: &ThreadHandle) -> Option<crate::PartialNarration> {
+        let cells = match self.narration.lock() {
+            Ok(cells) => cells,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let cell = cells.get(&h.identity)?;
+        let turn_id = cell.turn_id.clone()?;
+        Some(cell.text.partial(Some(turn_id)))
     }
 
     /// Interrupt the in-flight turn via codex's `turn/interrupt` RPC (the same
@@ -3988,6 +4043,94 @@ async fn apply_notification_to_tracker(
     }
 }
 
+/// GitHub #197 (G) — fold one codex notification into the in-flight narration
+/// cell. Called by the SAME sole dispatcher as
+/// [`apply_notification_to_tracker`], so ordering between the two can never
+/// disagree, and synchronous, so the cell can be read without awaiting.
+///
+/// Only PUBLIC agent messages are folded in. Reasoning items and their deltas
+/// are deliberately absent: an in-flight read must show exactly what the
+/// transcript would show, and nothing a `/status` reader could not already see.
+fn apply_notification_to_narration(
+    narration: &Arc<std::sync::Mutex<HashMap<String, ThreadNarration>>>,
+    notif: &Notification,
+) {
+    let Some(tid) = pluck_str(&notif.params, "thread_id", "threadId") else {
+        return;
+    };
+    let mut cells = match narration.lock() {
+        Ok(cells) => cells,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match notif.method.as_str() {
+        "turn/started" => {
+            let turn_id = pluck_turn_id_from_params(&notif.params);
+            begin_narration_locked(&mut cells, tid, &turn_id);
+        }
+        // A boundary hands the narration to the transcript; a retryable error
+        // leaves the turn alive, exactly as it leaves `active_turn` set.
+        "turn/completed" => {
+            cells.remove(tid);
+        }
+        "error" => {
+            if !pluck_bool(&notif.params, "will_retry", "willRetry").unwrap_or(false) {
+                cells.remove(tid);
+            }
+        }
+        "item/agentMessage/delta" => {
+            let delta = notif
+                .params
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let id = pluck_str(&notif.params, "item_id", "itemId").unwrap_or("");
+            cells
+                .entry(tid.to_string())
+                .or_default()
+                .text
+                .append_delta(id, delta);
+        }
+        "item/completed" => {
+            // The item's own final text, which replaces the fragments it was
+            // streamed as. Any other item type (a tool call, a reasoning
+            // block) is not narration and is skipped.
+            let item = notif.params.get("item").unwrap_or(&notif.params);
+            let is_message = matches!(
+                item.get("type").and_then(|v| v.as_str()),
+                Some("agent_message") | Some("agentMessage")
+            );
+            if !is_message {
+                return;
+            }
+            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| pluck_str(&notif.params, "item_id", "itemId"))
+                .unwrap_or("");
+            cells
+                .entry(tid.to_string())
+                .or_default()
+                .text
+                .set_snapshot(id, text);
+        }
+        _ => {}
+    }
+}
+
+/// Open `turn_id` on `tid`'s cell. IDEMPOTENT in the turn id: the submission
+/// that started the turn and the `turn/started` notification that reports it
+/// race (the notification can arrive before the RPC response), and whichever
+/// lands second must not wipe what the turn has already said.
+fn begin_narration_locked(cells: &mut HashMap<String, ThreadNarration>, tid: &str, turn_id: &str) {
+    let cell = cells.entry(tid.to_string()).or_default();
+    if cell.turn_id.as_deref() == Some(turn_id) {
+        return;
+    }
+    cell.turn_id = Some(turn_id.to_string());
+    cell.text.clear();
+}
+
 /// V0.8 rmux W4-fu — fold a camelCase identifier to snake_case so the
 /// emitted `progress.jsonl` `status` / `active_flags` values read in
 /// ccteam's snake_case house style regardless of the Codex wire casing
@@ -4378,6 +4521,145 @@ mod tests {
         // An in-flight turn does.
         tracker.entry("t-2").active_turn = Some("turn-9".into());
         assert!(tracker.any_active_turn());
+    }
+
+    /// GitHub #197 (G) — codex's own wire shape, folded into the in-flight
+    /// narration cell: `item/agentMessage/delta` fragments accumulate, the
+    /// `item/completed` that closes the item replaces them (never appends a
+    /// second copy of the same message), reasoning never enters, and the
+    /// boundary hands the narration to the transcript.
+    #[test]
+    fn narration_folds_codex_deltas_and_never_leaks_reasoning() {
+        let cells: Arc<std::sync::Mutex<HashMap<String, ThreadNarration>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let notif = |method: &str, params: Value| Notification {
+            method: method.to_string(),
+            params,
+        };
+        let read = |turn_expected: Option<&str>| {
+            let cells = cells.lock().unwrap();
+            match cells.get("t-1") {
+                None => None,
+                Some(cell) => {
+                    let partial = cell.text.partial(cell.turn_id.clone());
+                    assert_eq!(partial.exec_turn_id.as_deref(), turn_expected);
+                    Some(partial)
+                }
+            }
+        };
+
+        // No turn: the cell says nothing at all.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/agentMessage/delta",
+                json!({"threadId": "t-other", "itemId": "i-1", "delta": "elsewhere"}),
+            ),
+        );
+        assert!(read(None).is_none(), "another thread's message is not ours");
+
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "turn/started",
+                json!({"threadId": "t-1", "turn": {"id": "turn-7"}}),
+            ),
+        );
+        let empty = read(Some("turn-7")).expect("a started turn is in flight");
+        assert_eq!(
+            empty.text, "",
+            "it has not spoken yet — a FACT, not silence"
+        );
+
+        // Fragments of one item concatenate. Treating one as a snapshot would
+        // throw away everything said before it.
+        for delta in ["reading ", "the ", "brief"] {
+            apply_notification_to_narration(
+                &cells,
+                &notif(
+                    "item/agentMessage/delta",
+                    json!({"threadId": "t-1", "itemId": "i-1", "delta": delta}),
+                ),
+            );
+        }
+        assert_eq!(read(Some("turn-7")).unwrap().text, "reading the brief");
+
+        // Private reasoning is not narration, on either channel.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/reasoning/textDelta",
+                json!({"threadId": "t-1", "itemId": "r-1", "delta": "SECRET"}),
+            ),
+        );
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/completed",
+                json!({"threadId": "t-1", "item": {"id": "r-1", "type": "reasoning", "text": "SECRET"}}),
+            ),
+        );
+        assert_eq!(read(Some("turn-7")).unwrap().text, "reading the brief");
+
+        // The completed item's own text REPLACES its fragments.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/completed",
+                json!({"threadId": "t-1", "item": {"id": "i-1", "type": "agent_message", "text": "reading the brief"}}),
+            ),
+        );
+        assert_eq!(read(Some("turn-7")).unwrap().text, "reading the brief");
+
+        // A second message is its own paragraph.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "item/agentMessage/delta",
+                json!({"threadId": "t-1", "itemId": "i-2", "delta": "patching"}),
+            ),
+        );
+        assert_eq!(
+            read(Some("turn-7")).unwrap().text,
+            "reading the brief\n\npatching"
+        );
+
+        // A retryable error leaves the turn alive, exactly as it leaves
+        // `active_turn` set.
+        apply_notification_to_narration(
+            &cells,
+            &notif("error", json!({"threadId": "t-1", "willRetry": true})),
+        );
+        assert!(read(Some("turn-7")).is_some(), "a retry is not a boundary");
+
+        // The boundary does hand it over.
+        apply_notification_to_narration(
+            &cells,
+            &notif(
+                "turn/completed",
+                json!({"threadId": "t-1", "turnId": "turn-7"}),
+            ),
+        );
+        assert!(read(None).is_none(), "no turn, nothing to report");
+    }
+
+    /// The submission and the `turn/started` notification race — the
+    /// notification can land first. Whichever is second must not wipe what the
+    /// turn has already said.
+    #[test]
+    fn opening_the_same_turn_twice_keeps_what_it_said() {
+        let mut cells: HashMap<String, ThreadNarration> = HashMap::new();
+        begin_narration_locked(&mut cells, "t-1", "turn-7");
+        cells
+            .get_mut("t-1")
+            .unwrap()
+            .text
+            .append_delta("i-1", "half a migration");
+        begin_narration_locked(&mut cells, "t-1", "turn-7");
+        assert_eq!(cells["t-1"].text.text(), "half a migration");
+        // A DIFFERENT turn is a different narration.
+        begin_narration_locked(&mut cells, "t-1", "turn-8");
+        assert_eq!(cells["t-1"].text.text(), "");
     }
 
     /// Keep the settings contract in the CI lib-test baseline as well as

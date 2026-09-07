@@ -15954,7 +15954,7 @@ impl Gateway {
                 }
                 Some(partial) => (InterruptedNarration::Recorded, partial.text.clone()),
             };
-            let truncated = cut.partial.as_ref().is_some_and(|p| p.truncated);
+            let truncated = cut.partial.as_ref().is_some_and(|p| p.truncated());
             let record = ccteam_harness::execution::turns_mirror::TurnRecord {
                 exec_turn_id: Some(cut.exec_turn_id.clone()),
                 turn_id: row_turn_id.clone(),
@@ -21995,7 +21995,7 @@ mod tests {
             Some(ccteam_harness::PartialNarration {
                 exec_turn_id: Some(active),
                 text: "fake: half a migration".to_string(),
-                truncated: false,
+                omitted_chars: 0,
             })
         }
 

@@ -1036,6 +1036,13 @@ impl HarnessAdapter for GrokAcpAdapter {
         Ok(self.thread_status_inner(&live))
     }
 
+    /// What this session's in-flight turn has said so far (GitHub #197 E/G).
+    /// One shared ACP implementation — see [`crate::execution::acp::in_flight_narration`].
+    fn in_flight_narration(&self, h: &ThreadHandle) -> Option<crate::PartialNarration> {
+        let live = self.get_live(&h.identity)?;
+        crate::execution::acp::in_flight_narration(&live.state)
+    }
+
     async fn account_usage(&self, h: &ThreadHandle) -> Option<crate::AccountUsage> {
         // Grok's account state is a CONTRACT surface: `x.ai/billing` is an
         // agent-level ACP extension method its own first-party client calls
