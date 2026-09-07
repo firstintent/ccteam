@@ -25,7 +25,9 @@
 //!   needing to wire a separate poller (the V0.6.0 Wave 3 D9 retained
 //!   risk).
 //! - `resume_thread`: `thread/resume` with the persistent id.
-//! - `close_thread`: `thread/archive` + `thread/unsubscribe` (best-effort).
+//! - `close_thread`: `thread/unsubscribe` only (best-effort). Never
+//!   `thread/archive`: a release must leave the thread resumable by sid
+//!   (`docs-local/issues/#203`).
 //!
 //! ## Socket discovery
 //!
@@ -62,6 +64,7 @@ use crate::execution::progress_bridge::{
     CODEX_PLAN_UPDATED, CODEX_RATE_LIMIT, CODEX_THREAD_STATUS, CODEX_TOKEN_USAGE,
 };
 use crate::execution::session_meta::read_session_meta;
+use crate::execution::session_status::write_status_file;
 use crate::{
     AgentSpecBrief, AgentVendor, ExecutionMode, HarnessAdapter, HarnessError, PermissionMode,
     SpawnCtx, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem, ThreadItemDetails, TurnId,
@@ -178,6 +181,59 @@ pub struct ThreadLive {
     pub effort: Option<String>,
     /// A resume response must not overwrite a newer settings notification.
     settings_revision: u64,
+    /// Where this thread's observations are persisted, set by `start_thread`
+    /// from the spawn ctx. `None` = a thread ccteam never started (a foreign
+    /// notification on the shared connection): nothing to persist.
+    persist: Option<StatusPersist>,
+}
+
+/// `docs-local/issues/#203` — the `status.json` home of a codex thread.
+///
+/// Every long-stdio adapter persists its statusline snapshot next to the
+/// turns mirror (see `session_status.rs`); codex kept it only in the
+/// in-memory tracker, so the gateway's re-spawn ladder (`respawn_tuning`,
+/// which trusts the vendor's OWN report in `status.json` first) had nothing
+/// to read for codex. A `/model` pick — which codex confirms with a
+/// `thread/settings/updated` snapshot and nothing else — therefore died with
+/// the thread it was made on: an idle release followed by a failed resume
+/// came back on codex's global default model.
+#[derive(Debug, Clone)]
+struct StatusPersist {
+    project_dir: PathBuf,
+    sid: String,
+    /// [`SpawnCtx::generation_stamp`] of the thread — readers ignore an
+    /// observation stamped by a retired thread (issue #14②).
+    generation: Option<u64>,
+}
+
+impl ThreadLive {
+    /// The [`ThreadStatus`] a reader sees for this thread — one shape for the
+    /// live `thread_status` answer and the persisted `status.json`.
+    fn status(&self) -> ThreadStatus {
+        ThreadStatus {
+            model: self.model.clone(),
+            context: self.usage,
+            effort: self.effort.clone(),
+            // Codex has a native `/goal` (thread/goal/*); surfacing it in the
+            // statusline is a follow-up — None for now.
+            goal: None,
+            generation: self.persist.as_ref().and_then(|p| p.generation),
+        }
+    }
+
+    /// The `(where, what)` to write when an observation changed, or `None`
+    /// for a thread with no persistence home. The write itself happens
+    /// outside the tracker lock — see [`persist_status`].
+    fn pending_write(&self) -> Option<(StatusPersist, ThreadStatus)> {
+        self.persist.clone().map(|p| (p, self.status()))
+    }
+}
+
+/// Best-effort `status.json` write, always outside the tracker lock.
+fn persist_status(pending: Option<(StatusPersist, ThreadStatus)>) {
+    if let Some((persist, status)) = pending {
+        write_status_file(&persist.project_dir, &persist.sid, &status);
+    }
 }
 
 /// v0.8.5 D2.4 — the harness-level, vendor-scoped runtime state cache.
@@ -1985,6 +2041,21 @@ impl HarnessAdapter for CodexAppServerAdapter {
             )
             .await;
         }
+        // `docs-local/issues/#203` — give the thread its `status.json` home and
+        // write the first snapshot now, so a session that is released before
+        // codex sends a settings snapshot still leaves the model it resolved
+        // at start (the vendor's own report) for the re-spawn ladder.
+        let pending = {
+            let mut tracker = self.tracker.lock().await;
+            let entry = tracker.entry(&thread_id);
+            entry.persist = Some(StatusPersist {
+                project_dir: ctx.project_dir.clone(),
+                sid: ctx.sid.clone(),
+                generation: ctx.generation_stamp(),
+            });
+            entry.pending_write()
+        };
+        persist_status(pending);
         // V0.6.1 F122 — register a progress bridge so the events()
         // stream can mirror turn boundaries into progress.jsonl.
         // progress path resolution honours CCTEAM_HOME so test runs land
@@ -2359,25 +2430,28 @@ impl HarnessAdapter for CodexAppServerAdapter {
     }
 
     async fn close_thread(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
-        // Best-effort archive — codex's `thread/archive` is the
-        // "release server-side state" hook. Failure is logged but
-        // never escalated (idempotent close semantics).
+        // `docs-local/issues/#203` — a close is a RESIDENCY release (idle /
+        // capacity / explicit stop / a discarded twin), never the end of the
+        // session: the sid stays resumable, and the next message must
+        // `thread/resume` this exact thread with its context and settings.
+        // Codex's `thread/archive` makes that resume fail for good ("session
+        // … is archived"), which forced every release onto the fresh
+        // `thread/start` fallback — context gone, `/model` pick gone. So only
+        // unsubscribe this connection; the rollout stays where codex left it.
+        // Best-effort and idempotent: failure is logged, never escalated.
         let Ok(client) = self.client().await else {
             // No socket = nothing to close; matches V0.5.x missing-tmux
             // semantics for close_thread.
             return Ok(());
         };
-        let archive = client
-            .call("thread/archive", json!({ "threadId": h.identity }))
-            .await;
-        if let Err(err) = archive {
-            tracing::warn!(thread_id = %h.identity, error = %err, "thread/archive failed (best-effort)");
-        }
-        let _ = client
+        if let Err(err) = client
             .call("thread/unsubscribe", json!({ "threadId": h.identity }))
-            .await;
-        // Archived + unsubscribed → codex unloads it; drop it from the
-        // loaded set so a stale entry never suppresses a future resume.
+            .await
+        {
+            tracing::warn!(thread_id = %h.identity, error = %err, "thread/unsubscribe failed (best-effort)");
+        }
+        // Unsubscribed → drop it from the loaded set so a stale entry never
+        // suppresses the resume the next turn needs.
         if let Some(conn) = self.inner.lock().await.as_ref() {
             conn.loaded.lock().await.remove(&h.identity);
         }
@@ -2467,22 +2541,12 @@ impl HarnessAdapter for CodexAppServerAdapter {
         // P3 (D2.4) — read the harness-owned tracker, fed by the single
         // dispatcher from `thread/tokenUsage/updated` (usage) and
         // `thread/settings/updated` (model/effort). No RPC or model-id table.
+        // Model + effort are codex's RESOLVED values (v0.8.19), captured from
+        // `thread/start` / `thread/resume` and subsequent settings snapshots;
+        // the generation stamp is the thread's own (#203), the same shape the
+        // persisted `status.json` carries.
         let live = self.tracker_snapshot(&h.identity).await.unwrap_or_default();
-        Ok(ThreadStatus {
-            model: live.model,
-            context: live.usage,
-            // v0.8.19 — codex's RESOLVED reasoning effort, captured
-            // from `thread/start` / `thread/resume` and subsequent settings
-            // snapshots. `None` when codex reports
-            // none (keeps the Codex suffix unchanged in that case).
-            effort: live.effort,
-            // Codex has a native `/goal` (thread/goal/*); surfacing it in the
-            // statusline is a follow-up — None for now.
-            goal: None,
-            // Codex persists no `status.json` (its status is a pure in-memory
-            // tracker read), so there is no observation to stamp.
-            generation: None,
-        })
+        Ok(live.status())
     }
 
     /// Interrupt the in-flight turn via codex's `turn/interrupt` RPC (the same
@@ -3938,11 +4002,18 @@ async fn apply_notification_to_tracker(
     match notif.method.as_str() {
         "thread/settings/updated" => {
             if let Some(model) = pluck_model(&notif.params) {
-                let mut tracker = tracker.lock().await;
-                let entry = tracker.entry(&tid);
-                entry.model = Some(model);
-                entry.effort = pluck_effort(&notif.params);
-                entry.settings_revision = entry.settings_revision.saturating_add(1);
+                let pending = {
+                    let mut tracker = tracker.lock().await;
+                    let entry = tracker.entry(&tid);
+                    entry.model = Some(model);
+                    entry.effort = pluck_effort(&notif.params);
+                    entry.settings_revision = entry.settings_revision.saturating_add(1);
+                    entry.pending_write()
+                };
+                // #203 — the settings snapshot is the ONLY confirmation a
+                // `/model` pick gets from codex; persist it so a re-spawn
+                // after release can replay it.
+                persist_status(pending);
             }
         }
         "turn/started" => {
@@ -3950,7 +4021,15 @@ async fn apply_notification_to_tracker(
             tracker.lock().await.entry(&tid).active_turn = Some(turn_id);
         }
         "turn/completed" => {
-            tracker.lock().await.entry(&tid).active_turn = None;
+            let pending = {
+                let mut tracker = tracker.lock().await;
+                let entry = tracker.entry(&tid);
+                entry.active_turn = None;
+                entry.pending_write()
+            };
+            // Turn boundary: the same moment every other adapter's status tap
+            // writes, so context usage lands with the model it ran under.
+            persist_status(pending);
         }
         "error" => {
             // Terminal failures (willRetry=false) clear the active turn;

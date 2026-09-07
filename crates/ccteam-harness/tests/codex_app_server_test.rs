@@ -88,8 +88,8 @@ async fn real_codex_app_server_start_thread_smoke() {
     assert!(!handle.identity.trim().is_empty());
     tokio::time::timeout(Duration::from_secs(10), adapter.close_thread(&handle))
         .await
-        .expect("real codex app-server thread/archive timed out")
-        .expect("real codex app-server thread/archive should succeed");
+        .expect("real codex app-server close (thread/unsubscribe) timed out")
+        .expect("real codex app-server close (thread/unsubscribe) should succeed");
 }
 
 /// Real end-to-end round-trip proving the chat reply ccteam surfaces is
@@ -1308,6 +1308,7 @@ fn d2_response(req: &Value) -> Value {
         }}),
         Some("thread/rollback") => json!({ "result": { "thread": { "id": "tid-d2" } } }),
         Some("thread/name/set") => json!({ "result": {} }),
+        Some("thread/unsubscribe") => json!({ "result": {} }),
         Some("thread/settings/update") => json!({ "result": {} }),
         Some("thread/goal/set") => json!({ "result": { "goal": {
             "threadId": "tid-d2", "objective": "ship", "status": "active",
@@ -1398,6 +1399,25 @@ async fn d2_start_with_handler(
     tokio::sync::mpsc::Sender<Value>,
     PathBuf,
 ) {
+    d2_start_in(tag, handler, std::env::temp_dir(), 0).await
+}
+
+/// `d2_start_with_handler` with an explicit `project_dir` + thread
+/// generation, for tests that read what the adapter persists under
+/// `<project_dir>/.ccteam/chat/codex-1/` (#203).
+async fn d2_start_in(
+    tag: &str,
+    handler: impl Fn(&Value) -> Value + Send + 'static,
+    project_dir: PathBuf,
+    generation: u64,
+) -> (
+    CodexAppServerAdapter,
+    ccteam_harness::ThreadHandle,
+    Arc<StdMutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<Value>,
+    PathBuf,
+) {
     let sock = unique_socket_path(tag);
     std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
     let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
@@ -1415,13 +1435,13 @@ async fn d2_start_with_handler(
                 role: "demo".into(),
             },
             &SpawnCtx {
-                generation: 0,
+                generation,
                 mode: None,
                 slug: "test".into(),
                 sid: "codex-1".into(),
                 owner: "user:web-api".into(),
                 cwd: std::env::temp_dir(),
-                project_dir: std::env::temp_dir(),
+                project_dir,
                 extra_args: vec![],
                 model_id: None,
                 effort: None,
@@ -2243,6 +2263,87 @@ async fn model_settings_notification_updates_status_without_event_consumer() {
         })
         .await;
     }
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// `docs-local/issues/#203` — codex's settings snapshot is the only
+/// confirmation a `/model` pick gets, and until now it lived in the in-memory
+/// tracker alone. Like every other long-stdio adapter, codex must persist the
+/// statusline to `status.json` (stamped with the thread generation) so the
+/// gateway's re-spawn ladder can replay the model the session was RUNNING
+/// after a release + failed resume, instead of codex's global default.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn settings_snapshot_persists_status_json_with_generation() {
+    use ccteam_harness::execution::session_status::read_status_file;
+    let project = TempDir::new().unwrap();
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_in(
+        "status-persist",
+        d2_response,
+        project.path().to_path_buf(),
+        7,
+    )
+    .await;
+    // The thread/start response carries no model in this peer, so the start
+    // snapshot is model-less — but it already exists, stamped.
+    let at_start = read_status_file(project.path(), "codex-1").expect("status.json at start");
+    assert_eq!(at_start.generation, Some(7));
+    assert_eq!(at_start.model, None);
+
+    notif
+        .send(json!({
+            "method": "thread/settings/updated",
+            "params": { "threadId": h.identity,
+                "threadSettings": { "model": "gpt-6-astra", "effort": "xhigh" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let project = project.path().to_path_buf();
+        async move {
+            read_status_file(&project, "codex-1")
+                .and_then(|s| s.model)
+                .as_deref()
+                == Some("gpt-6-astra")
+        }
+    })
+    .await;
+    let persisted = read_status_file(project.path(), "codex-1").unwrap();
+    assert_eq!(persisted.effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        persisted.generation,
+        Some(7),
+        "stamped with the thread's generation"
+    );
+    // The live answer and the persisted file are one shape.
+    let live = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(live.model, persisted.model);
+    assert_eq!(live.generation, Some(7));
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// `docs-local/issues/#203` — a close is a residency release, not the end of
+/// the session. `thread/archive` made the next `thread/resume` fail for good
+/// ("session … is archived"), so every idle/capacity release silently became
+/// a fresh thread: context and the `/model` pick both gone (s932). Close
+/// unsubscribes only.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn close_thread_unsubscribes_without_archiving() {
+    let (adapter, h, seen, peer, sock) = d2_start("close-no-archive").await;
+    adapter.close_thread(&h).await.unwrap();
+    let frames = seen.lock().unwrap();
+    let unsub = find_frame(&frames, "thread/unsubscribe").expect("close unsubscribes");
+    assert_eq!(unsub["params"]["threadId"], h.identity);
+    assert!(
+        find_frame(&frames, "thread/archive").is_none(),
+        "a release must leave the thread resumable: no thread/archive"
+    );
+    drop(frames);
     peer.abort();
     let _ = std::fs::remove_file(sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);

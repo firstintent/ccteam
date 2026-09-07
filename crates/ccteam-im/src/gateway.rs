@@ -2798,6 +2798,7 @@ impl Gateway {
             },
         );
         let generation = plan.generation;
+        self.rekey_vendor_uuid(&sid, &plan.cwd, &thread);
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -8380,7 +8381,7 @@ impl Gateway {
             wire_slug: _,
             permission_mode: _,
             secret: _,
-            cwd: _,
+            cwd,
             model_id: _,
             effort: _,
             mode: _,
@@ -8420,6 +8421,7 @@ impl Gateway {
         // thread was spawned with, so `GatewaySession.generation` and the
         // stamps in this session's `status.json` agree (issue #14②). Minting a
         // second one here is what made them disagree.
+        self.rekey_vendor_uuid(&session_id, &cwd, &thread);
         if let Some(s) = self.sessions.get_mut(&session_id) {
             s.thread = thread;
             s.adapter = adapter;
@@ -10926,6 +10928,41 @@ impl Gateway {
         meta: &SessionMeta,
     ) -> Result<()> {
         self.session_catalog.write(project_dir, meta)
+    }
+
+    /// `docs-local/issues/#203` — a re-spawn may come back on a DIFFERENT
+    /// vendor thread than `meta.vendor_uuid` names: the adapter's resume-first
+    /// ladder fell back to a fresh thread (codex: the old one was archived or
+    /// its rollout is gone). `meta.json` is the resume key the next rebuild
+    /// reads, so the new id has to land there — otherwise every later cold
+    /// resume retries the dead thread, falls back again, and loses the
+    /// context a second time. Both re-spawn applies (dead-child resume and
+    /// rebuild-from-meta) call this, so no path can drift. Best-effort: a
+    /// meta write failure never fails the resume that already succeeded.
+    fn rekey_vendor_uuid(&self, sid: &str, project_dir: &Path, thread: &ThreadHandle) {
+        let Some(uuid) = thread_vendor_uuid(thread) else {
+            return;
+        };
+        let Some(mut meta) = self
+            .session_catalog
+            .find_or_load(sid, &self.projects)
+            .map(|entry| entry.meta)
+        else {
+            return;
+        };
+        if meta.vendor_uuid == uuid {
+            return;
+        }
+        tracing::info!(
+            %sid,
+            from = %meta.vendor_uuid,
+            to = %uuid,
+            "ccteam-im: re-spawn came back on a new vendor thread; re-keying meta.vendor_uuid"
+        );
+        meta.vendor_uuid = uuid;
+        if let Err(error) = self.persist_session_meta(project_dir, &meta) {
+            tracing::warn!(%sid, %error, "ccteam-im: failed to persist re-keyed vendor_uuid");
+        }
     }
 
     // ── external ledger nodes (hand-started clients) ──────────────────────────
@@ -18779,6 +18816,74 @@ mod tests {
         );
     }
 
+    /// `docs-local/issues/#203` — a re-spawn that came back on a NEW vendor
+    /// thread (the adapter's resume-first ladder fell back to a fresh start:
+    /// codex `thread/resume` on an archived thread) must re-key
+    /// `meta.vendor_uuid`, or the next cold resume retries the dead thread,
+    /// falls back again and loses the context a second time (s932). Covers
+    /// both applies: dead-child resume and rebuild-from-meta.
+    #[tokio::test]
+    async fn a_respawn_on_a_new_vendor_thread_rekeys_the_resume_id_in_meta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_role_with_model(tmp.path(), "reviewer", None);
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        *fake.next_vendor_uuid.lock().unwrap() = Some("thread-a".into());
+        gateway
+            .create_session_api_tuned(
+                "alpha".into(),
+                "reviewer".into(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+                SessionProtocol::StreamJson,
+                "web-api".into(),
+                SpawnTuning {
+                    mode: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .await
+            .unwrap();
+        let meta = read_session_meta(tmp.path(), "s1").expect("meta written");
+        assert_eq!(
+            meta.vendor_uuid, "thread-a",
+            "spawn records the vendor's id"
+        );
+
+        // Rung 1 — the dead-child resume comes back on a fresh thread.
+        *fake.next_vendor_uuid.lock().unwrap() = Some("thread-b".into());
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            read_session_meta(tmp.path(), "s1").unwrap().vendor_uuid,
+            "thread-b",
+            "a dead-child resume re-keys meta to the thread it actually came back on"
+        );
+
+        // Rung 2 — the rebuild-from-meta core (daemon restart / `/use` cold
+        // resume / external adopt all funnel through it).
+        *fake.next_vendor_uuid.lock().unwrap() = Some("thread-c".into());
+        gateway.stop_session("s1").await.ok();
+        gateway
+            .resume_stopped_session("s1", "user:web-api", Some("alpha"))
+            .await
+            .expect("resume");
+        assert_eq!(
+            read_session_meta(tmp.path(), "s1").unwrap().vendor_uuid,
+            "thread-c",
+            "…and so does the rebuild-from-meta path"
+        );
+
+        // Same thread back = nothing to re-key (no spurious meta rewrite).
+        fake.live.store(false, Ordering::SeqCst);
+        gateway.resume_dead_session("s1").await.expect("resume");
+        assert_eq!(
+            read_session_meta(tmp.path(), "s1").unwrap().vendor_uuid,
+            "thread-c"
+        );
+    }
+
     /// The other half of the precedence: with no observation to honour, a
     /// re-spawn replays what the spawn ASKED for. A session that never ran a
     /// turn has no `status.json` at all, and one whose vendor has no effort
@@ -19563,6 +19668,10 @@ mod tests {
         /// `SpawnCtx::generation` captured per start_thread, so a test can assert
         /// the thread was stamped with the generation the live map installs.
         spawn_generations: Arc<Mutex<Vec<u64>>>,
+        /// #203 — when set, every `start_thread` reports this id as
+        /// `raw_extras.vendor_uuid` (a vendor whose resume ladder fell back to
+        /// a fresh thread). `None` = no vendor id (the default `{}` extras).
+        next_vendor_uuid: Arc<std::sync::Mutex<Option<String>>>,
         /// v0.8.11 E4 — when set, `submit_turn` ALSO enqueues a `TurnCompleted`
         /// after the `AgentMessage` (mirrors a real adapter's turn boundary).
         /// Off by default so the sync-drain tests (which only take the first
@@ -19657,6 +19766,7 @@ mod tests {
                 spawn_secrets: Arc::new(Mutex::new(Vec::new())),
                 spawn_tunings: Arc::new(Mutex::new(Vec::new())),
                 spawn_generations: Arc::new(Mutex::new(Vec::new())),
+                next_vendor_uuid: Arc::new(std::sync::Mutex::new(None)),
                 emit_turn_boundary: false,
                 assistant_messages: 1,
                 emit_turn_started: false,
@@ -19812,12 +19922,16 @@ mod tests {
             self.spawn_generations.lock().await.push(ctx.generation);
             // A fresh/resumed child is alive.
             self.live.store(true, Ordering::SeqCst);
+            let raw_extras = match self.next_vendor_uuid.lock().unwrap().as_deref() {
+                Some(uuid) => serde_json::json!({ "vendor_uuid": uuid }),
+                None => serde_json::json!({}),
+            };
             Ok(ThreadHandle {
                 vendor: self.vendor,
                 mode: ExecutionMode::Chat,
                 identity: format!("{}-{}-{}", ctx.slug, spec.role, ctx.sid),
                 started_at: chrono::Utc::now(),
-                raw_extras: serde_json::json!({}),
+                raw_extras,
             })
         }
 
