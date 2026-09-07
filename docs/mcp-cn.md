@@ -73,7 +73,11 @@ enrollment 凭据只说明「这份配置是谁的」。进程级身份在 `init
 
 ### `agent_stop` —— 显式结束一个会话
 
-`{sid}` → `{sid, stopped:true}`。显式命令,绝非主动 kill:transcript 留在盘上,`agent_read{sid}` 照读。agent 只能 stop 自己的后代 —— 手起 client 一旦重连就是**新**账本节点,先前雇的会话不再是它的后代:那些去 web 控制台或 `POST /api/v1/sessions/{sid}/stop` 停,拒绝体里就这么写。(ccteam 自身只有两个自动刹车:vendor 日预算触顶拒**新**活;live 容量满时优雅释放最久未活跃的空闲会话 —— 创建永不因容量失败。)
+`{sid}` → `{sid, stopped:true, interrupted?, undelivered?, resume_policy?}`。显式命令,绝非主动 kill;它结束的是**进程**,不是会话:sid、transcript、以及 ccteam 手上一切未送达的指令全部留存,`agent_read{sid}` 照读。
+
+- `interrupted` —— 有 turn 在飞时给 `{turn, exec_turn, narration, requests?}`。ccteam 会为它在 transcript 追加一条有界记录(`outcome:"interrupted"`),干了半小时被停的子会话不再读回「什么都没说」;`turn` 就是那行的 id,一次精确的 `agent_read{sid,turn:<id>}` 即可读全。`narration` 说明能捕到多少:`recorded`(它当时说到哪儿的尾段,≤2000 字符)、`empty`(确实还没开口)、`unknown`(这条 harness 报不出在飞 turn 的叙述 —— **不等于**沉默)。绑在那个 turn 上的请求被标为 `interrupted`;重启后的 reconcile 绝不会把这条记录提升成完成通知。
+- `undelivered` —— 你那些它没跑的任务,每条 `{request_id, title?, state, delivery, retained_in?}`。`delivery` 把 stop 必须分清的两件事分开:`undelivered`(确认从未交给 vendor)与 `unconfirmed`(字节已写出,但从未观察到有人在执行 —— stdin 冲刷不等于模型读过)。`retained_in` 点名仍持有这行的文件 —— `deferred-input.json` 或 `pending_turns.jsonl` —— 它在,就意味着这条请求**仍未决**;没有它的行则已了结,`state` 说明是哪一种。
+- `resume_policy: "replay_after_first_result"` —— 只有确有保留时才出现。该 sid 若被 resume,保留的指令会被重新载入,并在新生命的**首个** `result` 之后按序放出:触发 resume 的那条消息先跑,作为它自己的 turn,保留的排在后面。不自动取消,也不自动重发。agent 只能 stop 自己的后代 —— 手起 client 一旦重连就是**新**账本节点,先前雇的会话不再是它的后代:那些去 web 控制台或 `POST /api/v1/sessions/{sid}/stop` 停,拒绝体里就这么写。(ccteam 自身只有两个自动刹车:vendor 日预算触顶拒**新**活;live 容量满时优雅释放最久未活跃的空闲会话 —— 创建永不因容量失败。)
 
 ### `status` —— 能雇谁、花了多少;分级
 

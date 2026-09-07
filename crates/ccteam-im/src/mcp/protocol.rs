@@ -356,7 +356,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_stop",
-            "description": "Stop a session you delegated; `agent_read{sid}` still reads its transcript.",
+            "description": "Stop a session you delegated; it ends the process, not the session — `agent_read{sid}` still reads its transcript, including a record of the turn this cut short. Answers `undelivered` (your tasks it never ran: `retained_in` = ccteam still holds that line and replays it, `delivery:unconfirmed` = written out, never seen running) and `interrupted{turn}`.",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Session to stop." }
             }), &["sid"]),
@@ -483,6 +483,13 @@ mod tests {
     /// that came back holding nothing looked identical to one whose task was
     /// dropped, which is the confusion this whole issue is about. ~120 B.
     ///
+    /// 5480 → 5800 B for `agent_stop`'s receipt (issue #197 E). The tool
+    /// stopped dropping the child's requests, so it now answers with what it
+    /// cut short and what is still held — and a response field the face never
+    /// mentions is a field callers do not read: the instruction that sat
+    /// undelivered in a queue until the child was stopped is exactly the fact
+    /// nobody could learn. ~300 B.
+    ///
     /// 5320 → 5480 B for `agent{routing}` (issue #197 D). The default changed
     /// — a follow-up on a busy child now STEERS its running turn instead of
     /// queuing behind it — and a caller that cannot see the axis cannot ask
@@ -493,8 +500,8 @@ mod tests {
         let body = tools_list_response(&ToolFace::full());
         let bytes = compact_len(&body);
         assert!(
-            bytes <= 5480,
-            "full tools/list is {bytes} B; budget is 5480 B"
+            bytes <= 5800,
+            "full tools/list is {bytes} B; budget is 5800 B"
         );
     }
 

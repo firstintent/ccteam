@@ -570,8 +570,10 @@ pub(crate) async fn handle_delete_project(
             .map(|v| v.sid)
             .collect();
         for sid in sids {
+            // The project is being deregistered wholesale, so the stop's
+            // own record of what it cut short has nowhere left to be read.
             match guard.stop_session(&sid).await {
-                Ok(()) => stopped.push(sid),
+                Ok(_) => stopped.push(sid),
                 Err(err) => {
                     // Best-effort: a session that vanished mid-teardown
                     // shouldn't fail the deregister (already removed from

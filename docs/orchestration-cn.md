@@ -146,6 +146,7 @@ steer 有一处代价值得知道:被 steer 的那个 turn 仍然是**一个** t
 | 「它半天没动静」 | 它在**干活(working)**,不是卡住。去干别的,一会儿回来看结论。 |
 | 「找不到项目」 | 你不在已注册项目目录里。`cd` 进去,或把项目名说出来让会话带上 `project:"<slug>"`。 |
 | 「grok 用不了」 | 这台机器没装 grok CLI。`ccteam status` / capabilities 看这台机器实际有哪些 vendor。 |
+| 「我把它停了 —— 我最后那条指令到底送到没有?」 | stop 自己的回包就写着。`agent_stop` 会答 `undelivered`(它没跑的那些任务,以及每条指令现在被哪个文件持有)与 `interrupted`(被打断的那个 turn,已写进 transcript,`agent_read` 看得到)。被保留的指令在该会话被 resume 时回放;不自动取消,也不自动重发。 |
 | 「派活翻车 / 想确认没重复派」 | `agent` 支持 `idempotency_key`,同键重试重放原来那次调用而不是再派一次(雇人按项目、续派按子会话各自计域);链路不稳时要求带上,或重试前先 `agent_read` 看一眼。 |
 
 ---

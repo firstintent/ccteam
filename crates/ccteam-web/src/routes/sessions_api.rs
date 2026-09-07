@@ -1718,12 +1718,11 @@ pub(crate) async fn handle_session_stop(
     let Some(gw) = app.gateway.as_ref() else {
         return no_gateway();
     };
-    let result = {
-        let mut guard = gw.lock().await;
-        guard.stop_session(&sid).await
-    };
+    // The shared door: it takes the child's delegation claim in the right
+    // order and makes the stop's record of what it cut short durable.
+    let result = ccteam_im::gateway::Gateway::stop_session_shared(gw, &sid).await;
     match result {
-        Ok(()) => Json(json!({"stopped": true})).into_response(),
+        Ok(_) => Json(json!({"stopped": true})).into_response(),
         Err(err) => {
             tracing::warn!(%sid, %err, "stop_session failed");
             unknown_session(&sid)

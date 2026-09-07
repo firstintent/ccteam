@@ -37,12 +37,17 @@ pub struct PendingTurn {
     pub internal: bool,
 }
 
+/// The basename of this queue's file. One literal, named, because a caller
+/// that must tell a dispatcher WHERE its undelivered task is being held
+/// (`agent_stop`'s receipt) should not spell the path a second time.
+pub const PENDING_TURNS_FILE: &str = "pending_turns.jsonl";
+
 fn pending_path(project_dir: &Path, sid: &str) -> PathBuf {
     project_dir
         .join(".ccteam")
         .join("chat")
         .join(sid)
-        .join("pending_turns.jsonl")
+        .join(PENDING_TURNS_FILE)
 }
 
 /// Append one pending turn (FIFO). Creates parent dirs as needed.

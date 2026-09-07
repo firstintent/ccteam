@@ -154,6 +154,7 @@ grok mcp doctor                  # the Grok axis: handshake OK, 6 tools discover
 | "it's been silent forever" | it's **working**, not stuck. Go do something else and come back for the report. |
 | "project not found" | you're not in a registered project directory. `cd` into one, or say the project name so the session passes `project:"<slug>"`. |
 | "grok doesn't work" | that machine doesn't have the grok CLI. `ccteam status` / capabilities shows which vendors this machine actually has. |
+| "I stopped it — did my last instruction ever land?" | the stop's own reply says so. `agent_stop` answers `undelivered` (the tasks it never ran, and which file still holds each line) and `interrupted` (the turn it cut, recorded in the transcript so `agent_read` shows it). A retained line replays if that session is ever resumed; nothing is auto-cancelled and nothing is auto-resent. |
 | "did the delegation double-fire?" | `agent` takes an `idempotency_key` — a retry with the same key replays the original call instead of doubling it (scoped per project for a hire, per child for a follow-up). Ask for one on flaky links, or check `agent_read` before retrying. |
 
 ---

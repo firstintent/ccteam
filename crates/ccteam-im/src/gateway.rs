@@ -1177,6 +1177,120 @@ fn delegation_request_row(request: &ccteam_harness::DelegationRequest) -> serde_
     serde_json::Value::Object(row)
 }
 
+/// The `outcome` word an interrupted turn's row carries. One constant, because
+/// the writer and every reader that must NOT treat it as a completion (the
+/// restart reconcile above all) have to agree on it exactly.
+pub const INTERRUPTED_OUTCOME: &str = "interrupted";
+
+/// The resume contract an explicit stop reports, verbatim: the retained lines
+/// are reloaded by the next `start_thread` of this sid and flushed after that
+/// life's FIRST `result` — the message that triggered the resume runs first, as
+/// its own turn, and what was parked follows in order. Stated rather than
+/// implied, because a parent that does not know it will either re-send the
+/// instruction or assume it was dropped (issue #197 E).
+pub const RESUME_POLICY_REPLAY_AFTER_FIRST_RESULT: &str = "replay_after_first_result";
+
+/// ccteam is holding the bytes: the vendor was never given them.
+pub const DELIVERY_UNDELIVERED: &str = "undelivered";
+/// The bytes reached the harness and nothing was ever observed running them.
+pub const DELIVERY_UNCONFIRMED: &str = "unconfirmed";
+
+/// The turn an explicit stop is about to cut, captured while the adapter can
+/// still answer for it.
+struct CutTurn {
+    exec_turn_id: String,
+    partial: Option<ccteam_harness::PartialNarration>,
+}
+
+/// How much of a cut turn's narration the record could carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptedNarration {
+    /// The adapter reported text, and the record holds it (a bounded tail).
+    Recorded,
+    /// The turn genuinely had not said anything yet.
+    Empty,
+    /// This channel cannot report an in-flight turn's narration. NOT the same
+    /// as silence, and never rendered as such.
+    Unknown,
+}
+
+impl InterruptedNarration {
+    /// Stable lowercase wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InterruptedNarration::Recorded => "recorded",
+            InterruptedNarration::Empty => "empty",
+            InterruptedNarration::Unknown => "unknown",
+        }
+    }
+}
+
+/// The human-readable half of an interrupted row, in the same place the
+/// `unobserved` recovery row puts its note.
+fn interrupted_note(sid: &str, narration: InterruptedNarration, truncated: bool) -> String {
+    let tail = match narration {
+        InterruptedNarration::Recorded if truncated => {
+            " The narration above is the tail of what it had said; earlier output is in the ledger."
+        }
+        InterruptedNarration::Recorded => "",
+        InterruptedNarration::Empty => " It had not said anything yet.",
+        InterruptedNarration::Unknown => {
+            " What it had said is unknown: this channel cannot report an in-flight turn's narration."
+        }
+    };
+    format!("{sid} was stopped while this turn was running.{tail}")
+}
+
+/// The turn an explicit stop cut short, and the requests it was carrying.
+#[derive(Debug, Clone)]
+pub struct InterruptedTurn {
+    /// The adapter's execution turn that was cut.
+    pub exec_turn_id: String,
+    /// The `turns.jsonl` row id of the record — what
+    /// `agent_read{sid,turn:<id>}` reads back.
+    pub row_turn_id: String,
+    /// How much of what it was saying the record could carry.
+    pub narration: InterruptedNarration,
+    /// The requests bound to that turn, now `interrupted`.
+    pub request_ids: Vec<String>,
+}
+
+/// One request the child still owed when it was stopped.
+#[derive(Debug, Clone)]
+pub struct UndeliveredRequest {
+    /// The request identity a completion would have named.
+    pub request_id: String,
+    /// Its own label, when the dispatcher gave it one.
+    pub title: Option<String>,
+    /// The request's lifecycle state AFTER the stop settled it.
+    pub state: &'static str,
+    /// [`DELIVERY_UNDELIVERED`] or [`DELIVERY_UNCONFIRMED`].
+    pub delivery: &'static str,
+    /// The file still holding this task's line, when one does — the request is
+    /// then still outstanding and replays on the next resume. `None` = nothing
+    /// is holding it and nothing will run it.
+    pub retained_in: Option<&'static str>,
+}
+
+/// Everything an explicit stop cut short.
+#[derive(Debug, Clone, Default)]
+pub struct StopOutcome {
+    /// The turn that was running, when one was.
+    pub interrupted: Option<InterruptedTurn>,
+    /// Every request the child still owed, minus the ones the cut turn was
+    /// carrying (those are named by [`InterruptedTurn::request_ids`]).
+    pub undelivered: Vec<UndeliveredRequest>,
+}
+
+impl StopOutcome {
+    /// Whether anything is still held for a resume to replay.
+    pub fn has_retained(&self) -> bool {
+        self.undelivered
+            .iter()
+            .any(|request| request.retained_in.is_some())
+    }
+}
+
 /// What a submit actually did with one message — the facts a dispatcher needs
 /// and could not see before (issue #201: every dispatch answered `pending`,
 /// whether it had started running or was third in a queue).
@@ -14477,7 +14591,15 @@ impl Gateway {
                 let missed: Vec<_> = all_turns
                     .iter()
                     .filter(|t| {
-                        !t.assistant.is_empty()
+                        // A turn an explicit stop cut short is NOT a completion,
+                        // however much narration its record carries: nobody
+                        // answered anything, and promoting the record into a
+                        // `done` notification would report a task as finished
+                        // because it was killed (issue #197 E). The request
+                        // bound to it is already terminal, so this is the second
+                        // of two independent guards — the row itself says no.
+                        t.outcome.as_deref() != Some(INTERRUPTED_OUTCOME)
+                            && !t.assistant.is_empty()
                             && !store.notified_turns.iter().any(|n| n == &t.turn_id)
                     })
                     .cloned()
@@ -15335,20 +15457,72 @@ impl Gateway {
     /// already-stopped sid is `Ok`. Only a genuinely unknown sid (no live
     /// entry, no detached body, no `meta.json`) is an error, so the API can
     /// still 404.
-    pub async fn stop_session(&mut self, sid: &str) -> Result<()> {
+    /// The one public door for an explicit stop: take the child's claim, stop
+    /// the process, and make the record of what that cut short DURABLE.
+    ///
+    /// Claim BEFORE the gateway lock — the claim-then-lock order every writer
+    /// of `delegation.json` keeps, because a `&mut Gateway` awaiting a claim
+    /// somebody else holds while they wait for the gateway lock is a deadlock.
+    /// Callers that only hold `&mut Gateway` (the IM `/stop` directive) use
+    /// [`Self::stop_session`] directly and get everything but the durable
+    /// half — see its doc for why that is safe.
+    pub async fn stop_session_shared(
+        gateway: &Arc<tokio::sync::Mutex<Self>>,
+        sid: &str,
+    ) -> Result<StopOutcome> {
+        let claim = Self::claim_delegation_store(gateway, sid).await;
+        let outcome = {
+            let mut guard = crate::latency::gateway_lock(gateway, "session.stop").await;
+            guard.stop_session(sid).await
+        };
+        if outcome.is_ok() {
+            let _ = Self::persist_delegation_store(gateway, &claim).await;
+        }
+        outcome
+    }
+
+    /// Stop the PROCESS. The session's identity, transcript and retained
+    /// undelivered lines all survive — the stop ends a body, not a session
+    /// (issue #197 E).
+    ///
+    /// Returns what the stop cut short: the turn that was running (recorded in
+    /// `turns.jsonl` as `outcome:"interrupted"`, so `agent_read` shows a
+    /// stopped session's last half-hour instead of nothing) and every request
+    /// that was still outstanding, each with what became of it. EVERY stop
+    /// entry point gets this — `agent_stop`, the IM `/stop`, the web session
+    /// and project stops — because it happens here rather than in any one of
+    /// them.
+    ///
+    /// The durable half of the request marking is the CALLER's: mutating
+    /// `delegation.json` needs that child's single-flight claim, and claims are
+    /// taken BEFORE the gateway lock (a `&mut Gateway` awaiting one would
+    /// invert the order and deadlock). A caller holding the claim persists the
+    /// mirror afterwards; one that cannot leaves the in-memory mirror correct
+    /// for this daemon life, and the next life still cannot mis-deliver —
+    /// an `interrupted` row is never a completion.
+    pub async fn stop_session(&mut self, sid: &str) -> Result<StopOutcome> {
         // A body that outlived the previous daemon is not in the live map but
         // IS this sid's body: an explicit stop ends it (the one case the daemon
         // signals such a process — on the user's word, never on its own).
         if self.stop_detached_body(sid).await? {
             self.record_explicit_stop(sid);
-            return Ok(());
+            // ccteam never observed that body's turns, so it has nothing
+            // truthful to say about what they were doing.
+            return Ok(StopOutcome::default());
         }
         let Some(session) = self.sessions.get(sid) else {
-            return self.stop_released_session(sid);
+            return self
+                .stop_released_session(sid)
+                .map(|()| StopOutcome::default());
         };
         let slug = session.project.clone();
         let thread = session.thread.clone();
         let adapter = Arc::clone(&session.adapter);
+        let vendor = session.vendor;
+        let role = session.role.clone();
+        // Read the in-flight turn BEFORE the process is closed: after
+        // `close_thread` the adapter has no live session to answer from.
+        let cut = self.capture_cut_turn(session);
         // The secret dies with the session — before the close, so a racing
         // `/mcp` call from the dying child cannot slip through behind it.
         self.principals.forget(sid);
@@ -15365,9 +15539,189 @@ impl Gateway {
         // the next message resumes the SAME sid.)
         self.current_session.retain_values(|v| v != sid);
         self.record_explicit_stop(sid);
+        // The process is gone and the queue mirrors are final: now the record
+        // of what it was doing, and what it still owed.
+        let outcome = self.settle_stopped_session(sid, &slug, vendor, &role, cut);
         self.emit_session_lifecycle(sid, &slug, "stopped", "user");
         self.persist_routing()?;
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Snapshot the turn a stop is about to cut, while the adapter can still
+    /// answer for it. `None` = nothing was running.
+    fn capture_cut_turn(&self, session: &GatewaySession) -> Option<CutTurn> {
+        let running = session
+            .turn_started_at
+            .lock()
+            .map(|started| started.is_some())
+            .unwrap_or(false);
+        if !running {
+            return None;
+        }
+        let partial = session.adapter.in_flight_narration(&session.thread);
+        // The adapter's own id first (it knows which turn is OPEN); the
+        // watchdog arm is the fallback for a channel that reports no partial.
+        let exec_turn_id = partial
+            .as_ref()
+            .and_then(|p| p.exec_turn_id.clone())
+            .or_else(|| {
+                session
+                    .watched_turn
+                    .lock()
+                    .ok()
+                    .and_then(|armed| armed.as_ref().map(|(turn_id, _)| turn_id.clone()))
+            })?;
+        Some(CutTurn {
+            exec_turn_id,
+            partial,
+        })
+    }
+
+    /// Record what the stop cut short and settle every request the child still
+    /// owed. Runs once the process is gone, so the queue mirrors it reads are
+    /// final.
+    fn settle_stopped_session(
+        &mut self,
+        sid: &str,
+        slug: &str,
+        vendor: AgentVendor,
+        role: &str,
+        cut: Option<CutTurn>,
+    ) -> StopOutcome {
+        let Some(project_dir) = self.projects.get(slug).cloned() else {
+            return StopOutcome::default();
+        };
+        let interrupted = cut.map(|cut| {
+            let row_turn_id = format!("interrupted:{}", cut.exec_turn_id);
+            let (narration, text) = match cut.partial.as_ref() {
+                // The vendor could not be asked: say the narration is UNKNOWN
+                // rather than write an empty `assistant` that reads as silence.
+                None => (InterruptedNarration::Unknown, String::new()),
+                Some(partial) if partial.text.trim().is_empty() => {
+                    (InterruptedNarration::Empty, String::new())
+                }
+                Some(partial) => (InterruptedNarration::Recorded, partial.text.clone()),
+            };
+            let truncated = cut.partial.as_ref().is_some_and(|p| p.truncated);
+            let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+                exec_turn_id: Some(cut.exec_turn_id.clone()),
+                turn_id: row_turn_id.clone(),
+                ts: chrono::Utc::now(),
+                vendor: vendor_str(vendor).to_string(),
+                role: role.to_string(),
+                user: String::new(),
+                assistant: text,
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: Vec::new(),
+                attachments: Vec::new(),
+                // The one word every reader branches on. A row carrying
+                // `interrupted` is NOT a completion: the restart reconcile
+                // refuses to build a notification from it, and `agent_read`
+                // shows it as what it is.
+                outcome: Some(INTERRUPTED_OUTCOME.to_string()),
+                error_kind: Some("turn_interrupted".to_string()),
+                error: Some(interrupted_note(sid, narration, truncated)),
+                conclusion: None,
+            };
+            if let Err(error) =
+                ccteam_harness::execution::turns_mirror::append_turn(&project_dir, sid, &record)
+            {
+                tracing::warn!(session = %sid, %error,
+                    "ccteam-im: failed to record the turn an explicit stop cut short");
+            }
+            InterruptedTurn {
+                exec_turn_id: cut.exec_turn_id,
+                row_turn_id,
+                narration,
+                request_ids: Vec::new(),
+            }
+        });
+        self.settle_stopped_requests(sid, &project_dir, interrupted)
+    }
+
+    /// Give every request the stopped child still owed its final reading.
+    ///
+    /// Four fates, and they are different things to tell a dispatcher: bound to
+    /// the turn that was cut (`interrupted`), still held by ccteam and due to
+    /// replay (left outstanding, named with the file holding it), written to a
+    /// harness that is now gone (`interrupted` — delivery was never confirmed
+    /// and never will be), or confirmed never handed over (`undelivered`).
+    fn settle_stopped_requests(
+        &mut self,
+        sid: &str,
+        project_dir: &Path,
+        mut interrupted: Option<InterruptedTurn>,
+    ) -> StopOutcome {
+        use ccteam_harness::RequestState;
+        let retained =
+            ccteam_harness::execution::claude_stream_json::retained_input(project_dir, sid);
+        // A pending queue is ccteam's own FIFO ahead of the vendor: whatever is
+        // in it replays on the next resume, so nothing behind it may be called
+        // undelivered. Its rows carry no request identity, so the honest answer
+        // is per-SESSION: while it is non-empty, an unbound request is still
+        // retained.
+        let pending_retained = crate::pending_turns::pending_turn_count(project_dir, sid) > 0;
+        let cut_turn = interrupted.as_ref().map(|i| i.exec_turn_id.clone());
+        let mut undelivered = Vec::new();
+        let Some(mirror) = self.delegations.get_mut(sid) else {
+            return StopOutcome {
+                interrupted,
+                undelivered,
+            };
+        };
+        for request in mirror.store.requests.iter_mut() {
+            if request.state.is_terminal() {
+                continue;
+            }
+            let turn = request.turn_id.clone().unwrap_or_default();
+            if cut_turn.as_deref() == Some(turn.as_str()) && !turn.is_empty() {
+                request.state = RequestState::Interrupted;
+                request.queue_position = None;
+                if let Some(i) = interrupted.as_mut() {
+                    i.request_ids.push(request.request_id.clone());
+                }
+                continue;
+            }
+            let retained_in = if retained.is_parked(&turn) || retained.is_in_flight(&turn) {
+                Some(ccteam_harness::execution::claude_stream_json::DEFERRED_INPUT_FILE)
+            } else if pending_retained {
+                Some(crate::pending_turns::PENDING_TURNS_FILE)
+            } else {
+                None
+            };
+            // "ccteam never handed it over" vs "the bytes went out and nothing
+            // was ever seen running them" — a stdin flush is not proof the
+            // model read anything, so the second one stays UNCONFIRMED forever.
+            let never_written =
+                matches!(request.state, RequestState::Accepted | RequestState::Queued)
+                    && !retained.is_in_flight(&turn);
+            let delivery = if never_written {
+                DELIVERY_UNDELIVERED
+            } else {
+                DELIVERY_UNCONFIRMED
+            };
+            if retained_in.is_none() {
+                // Nothing holds it and nothing will run it: it is over.
+                request.state = if never_written {
+                    RequestState::Undelivered
+                } else {
+                    RequestState::Interrupted
+                };
+                request.queue_position = None;
+            }
+            undelivered.push(UndeliveredRequest {
+                request_id: request.request_id.clone(),
+                title: request.title.clone(),
+                state: request.state.as_str(),
+                delivery,
+                retained_in,
+            });
+        }
+        StopOutcome {
+            interrupted,
+            undelivered,
+        }
     }
 
     /// [`Self::stop_session`] for a sid ccteam holds no process for. Nothing to
@@ -33350,6 +33704,89 @@ mod tests {
                     "agent_read{{sid:{child_sid},turn:{child_sid}-1,max_chars:"
                 )),
             "{excerpt}"
+        );
+    }
+
+    /// GitHub #197 (E) — a restart reconcile must NEVER promote the record of
+    /// an interrupted turn into a completion notification.
+    ///
+    /// The record an explicit stop writes carries narration, so on disk it
+    /// looks exactly like a turn that answered something. Reporting it as
+    /// `done` would tell a parent its task finished BECAUSE the child was
+    /// killed. Two guards, both proved here: the row says `interrupted`, and
+    /// the request bound to it is terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn an_interrupted_turn_is_never_reconciled_into_a_completion() {
+        use ccteam_harness::execution::turns_mirror::{append_turn, read_all_turns, TurnRecord};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let gateway = delegation_gateway(&project_dir).await;
+        let parent_sid = {
+            let mut gw = gateway.lock().await;
+            gw.create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid
+        };
+        let child_sid = "s98";
+        let exec = format!("{child_sid}-1");
+        append_turn(
+            &project_dir,
+            child_sid,
+            &TurnRecord {
+                exec_turn_id: Some(exec.clone()),
+                turn_id: format!("interrupted:{exec}"),
+                ts: chrono::Utc::now(),
+                vendor: "claude".into(),
+                role: String::new(),
+                user: String::new(),
+                // Narration, exactly as a stop records it — this is what a
+                // reconcile that only checked `assistant` would have shipped.
+                assistant: "I was halfway through the migration".into(),
+                usage: serde_json::Value::Null,
+                status: None,
+                tool_calls: vec![],
+                attachments: vec![],
+                outcome: Some(INTERRUPTED_OUTCOME.to_string()),
+                error_kind: Some("turn_interrupted".into()),
+                error: Some("s98 was stopped while this turn was running.".into()),
+                conclusion: None,
+            },
+        )
+        .unwrap();
+        // The request is still OUTSTANDING and bound to that turn — the state
+        // in which the row is the only thing standing between the parent and a
+        // false completion.
+        Gateway::seed_delegation_store_for_test(
+            &project_dir,
+            &DelegationStoreClaim::for_test(child_sid),
+            &test_delegation_store(
+                &parent_sid,
+                ccteam_harness::NotifyMode::Final,
+                Some("migration".into()),
+                Some(exec.clone()),
+            ),
+        )
+        .unwrap();
+
+        Gateway::reconcile_delegations(Arc::clone(&gateway)).await;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let woken: Vec<String> = read_all_turns(&project_dir, &parent_sid)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|turn| turn.user)
+            .filter(|user| user.contains(child_sid))
+            .collect();
+        assert!(
+            woken.is_empty(),
+            "an interrupted turn woke the parent as if it had answered: {woken:?}"
         );
     }
 

@@ -5122,15 +5122,7 @@ async fn run_agent_stop(
             .to_string(),
         McpCaller::Admin | McpCaller::User { .. } => String::new(),
     };
-    // Dropping the child's requests is a store mutation like any other, so it
-    // queues behind whatever dispatch or notification is mid-write. Taken
-    // before the gateway lock (claim-then-lock order) and held across both.
-    let store_claim = if caller_sid.is_empty() {
-        None
-    } else {
-        Some(crate::gateway::Gateway::claim_delegation_store(gateway, &sid).await)
-    };
-    let mut gw = gateway.lock().await;
+    let gw = gateway.lock().await;
     if !caller_sid.is_empty() && !gw.ancestor_chain(&sid).contains(&caller_sid) {
         // The rule is right and stays; what was missing is the way out. A
         // hand-started client that reconnects is a NEW ledger node, so the
@@ -5140,18 +5132,23 @@ async fn run_agent_stop(
             "agent_stop: permission denied — session {sid} is not a descendant of the caller {caller_sid} (an agent may only stop the sessions it delegated). A reconnected client is a new ledger node, so its earlier hires are not its descendants: stop it from the web console, or POST /api/v1/sessions/{sid}/stop with a web token"
         ));
     }
-    // Capture the delegation event fields + drop the child's own watch BEFORE
-    // the stop removes it from the live map.
+    // Capture the delegation event fields BEFORE the stop removes the session
+    // from the live map.
     let stopped_meta = gw.session_vendor_host_slug(&sid);
-    if let Some(claim) = store_claim.as_ref() {
-        gw.drop_delegation_requests(claim);
-    }
-    gw.stop_session(&sid)
+    drop(gw);
+    // The stop itself goes through the shared door: it takes the child's
+    // delegation claim in the right order, records the turn it cut short in
+    // `turns.jsonl`, settles every request the child still owed, and makes
+    // that durable. The child's requests are NOT dropped — a stop ends a
+    // process, and a task ccteam is still holding replays on the next resume
+    // (issue #197 E; dropping them left a parent with no way to learn that its
+    // instruction had never been delivered).
+    let outcome = crate::gateway::Gateway::stop_session_shared(gateway, &sid)
         .await
         .map_err(|e| format!("agent_stop failed: {e}"))?;
     if !caller_sid.is_empty() {
         if let Some((vendor, host, slug)) = stopped_meta {
-            gw.emit_delegation_progress(
+            gateway.lock().await.emit_delegation_progress(
                 &slug,
                 ccteam_harness::execution::progress_bridge::DELEGATION_STOPPED,
                 &caller_sid,
@@ -5164,12 +5161,57 @@ async fn run_agent_stop(
             );
         }
     }
-    drop(gw);
-    Ok(serde_json::to_string(&serde_json::json!({
-        "sid": sid,
-        "stopped": true,
-    }))
-    .unwrap_or_else(|_| "{}".to_string()))
+    let mut body = serde_json::Map::new();
+    body.insert("sid".into(), serde_json::json!(sid));
+    body.insert("stopped".into(), serde_json::json!(true));
+    if let Some(cut) = outcome.interrupted.as_ref() {
+        // What the stop actually ended. `turn` is the transcript row the
+        // narration is in, so the caller reads it with one exact call instead
+        // of paying for it in every stop response.
+        let mut interrupted = serde_json::Map::new();
+        interrupted.insert("turn".into(), serde_json::json!(cut.row_turn_id));
+        interrupted.insert("exec_turn".into(), serde_json::json!(cut.exec_turn_id));
+        interrupted.insert(
+            "narration".into(),
+            serde_json::json!(cut.narration.as_str()),
+        );
+        if !cut.request_ids.is_empty() {
+            interrupted.insert("requests".into(), serde_json::json!(cut.request_ids));
+        }
+        body.insert("interrupted".into(), serde_json::Value::Object(interrupted));
+    }
+    if !outcome.undelivered.is_empty() {
+        let rows: Vec<serde_json::Value> = outcome
+            .undelivered
+            .iter()
+            .map(|request| {
+                let mut row = serde_json::Map::new();
+                row.insert("request_id".into(), serde_json::json!(request.request_id));
+                if let Some(title) = request.title.as_deref() {
+                    row.insert("title".into(), serde_json::json!(title));
+                }
+                row.insert("state".into(), serde_json::json!(request.state));
+                row.insert("delivery".into(), serde_json::json!(request.delivery));
+                if let Some(file) = request.retained_in {
+                    row.insert("retained_in".into(), serde_json::json!(file));
+                }
+                serde_json::Value::Object(row)
+            })
+            .collect();
+        body.insert("undelivered".into(), serde_json::json!(rows));
+    }
+    if outcome.has_retained() {
+        // Only when something is actually held: a policy nobody's task is
+        // subject to is noise in every other stop response.
+        body.insert(
+            "resume_policy".into(),
+            serde_json::json!(crate::gateway::RESUME_POLICY_REPLAY_AFTER_FIRST_RESULT),
+        );
+    }
+    Ok(
+        serde_json::to_string(&serde_json::Value::Object(body))
+            .unwrap_or_else(|_| "{}".to_string()),
+    )
 }
 
 /// Pull a required `sid` arg (the gateway `s{n}` id).
@@ -9298,6 +9340,174 @@ mod session_tool_tests {
         assert_eq!(a["delivery"]["executing"], json!("unknown"), "{a}");
         assert_eq!(b["delivery"]["queued"], json!(true), "{b}");
         assert_eq!(b["delivery"]["written"], json!(false), "{b}");
+    }
+
+    /// GitHub #197 (E) — an explicit stop ends a PROCESS, and says what that
+    /// cost: the turn it cut (recorded in the transcript), the tasks ccteam is
+    /// still holding and where, and the policy that decides their fate.
+    ///
+    /// It used to answer `{stopped:true}` and DROP the child's requests, so a
+    /// parked instruction — measured on s932→s936, a "do not open a public
+    /// port" constraint that sat in the queue and was never delivered — left
+    /// no trace anywhere and nobody could learn it had not arrived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_stop_records_the_turn_it_cut_and_names_what_is_still_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_dir = tmp.path().to_path_buf();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(&project_dir).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dispatch = |args: serde_json::Value| {
+            let gw = &gw;
+            let principal = principal.clone();
+            async move {
+                parse(
+                    &run_agent_dispatch(
+                        &ambient(&principal, "alpha", args),
+                        gw,
+                        McpCaller::Ambient,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            }
+        };
+        let running = dispatch(json!({ "sid": &child, "task": "the migration" })).await;
+        let queued = dispatch(
+            json!({ "sid": &child, "task": "do not open a public port", "routing": "queue" }),
+        )
+        .await;
+        assert_eq!(queued["status"], json!("queued"), "{queued}");
+        // The adapter's own mirror is what makes a queued line RETAINED. The
+        // stub has no such file, so the test writes what the stream-json
+        // adapter writes: the parked line under the turn it will open.
+        let chat_dir = project_dir.join(".ccteam").join("chat").join(&child);
+        std::fs::create_dir_all(&chat_dir).unwrap();
+        std::fs::write(
+            chat_dir.join("deferred-input.json"),
+            serde_json::to_vec(&json!({
+                "schema": 2,
+                "parked": [{"turn_id": queued["turn_id"], "text": "do not open a public port"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stopped = parse(
+            &run_agent_stop(
+                &ambient(&principal, "alpha", json!({ "sid": &child })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(stopped["stopped"], json!(true), "{stopped}");
+
+        // What it cut. The stub cannot report an in-flight turn's narration, so
+        // the honest word is `unknown` — never an empty string that reads as
+        // "it said nothing".
+        let cut = &stopped["interrupted"];
+        assert_eq!(cut["exec_turn"], running["turn_id"], "{stopped}");
+        assert_eq!(cut["narration"], json!("unknown"), "{stopped}");
+        assert_eq!(
+            cut["requests"],
+            json!([running["request_id"].as_str().unwrap()]),
+            "the request bound to the cut turn, and only it: {stopped}"
+        );
+
+        // What is still held, and under which policy.
+        let held = stopped["undelivered"].as_array().expect("{stopped}");
+        assert_eq!(held.len(), 1, "{stopped}");
+        assert_eq!(held[0]["request_id"], queued["request_id"], "{stopped}");
+        assert_eq!(held[0]["delivery"], json!("undelivered"), "{stopped}");
+        assert_eq!(held[0]["retained_in"], json!("deferred-input.json"));
+        assert_eq!(
+            held[0]["state"],
+            json!("queued"),
+            "still outstanding: it replays: {stopped}"
+        );
+        assert_eq!(
+            stopped["resume_policy"],
+            json!("replay_after_first_result"),
+            "{stopped}"
+        );
+
+        // The transcript keeps the record — this is what `agent_read` shows
+        // instead of the `turns:[]` a stopped child used to read back as.
+        let rows = ccteam_harness::execution::turns_mirror::read_all_turns(&project_dir, &child)
+            .unwrap_or_default();
+        let record = rows
+            .iter()
+            .find(|row| row.outcome.as_deref() == Some("interrupted"))
+            .expect("the cut turn leaves a record");
+        assert_eq!(
+            record.exec_turn_id.as_deref(),
+            running["turn_id"].as_str(),
+            "{record:?}"
+        );
+        assert!(record.error.as_deref().unwrap_or_default().contains(&child));
+
+        // …and the durable store agrees with the response.
+        let store = ccteam_harness::read_delegation_requests(&project_dir, &child)
+            .expect("the stop keeps the child's requests");
+        let by_id = |id: &str| {
+            store
+                .get(id)
+                .unwrap_or_else(|| panic!("request {id} survives the stop"))
+                .state
+        };
+        assert_eq!(
+            by_id(running["request_id"].as_str().unwrap()),
+            ccteam_harness::RequestState::Interrupted
+        );
+        assert_eq!(
+            by_id(queued["request_id"].as_str().unwrap()),
+            ccteam_harness::RequestState::Queued
+        );
+    }
+
+    /// A stop with nothing running and nothing owed says exactly that: no
+    /// `interrupted`, no `undelivered`, no policy nobody is subject to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_of_an_idle_child_reports_nothing_cut_short() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gw, principal, _stub) = queueing_dispatch_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&principal, "alpha", json!({ "vendor": "claude" })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stopped = parse(
+            &run_agent_stop(
+                &ambient(&principal, "alpha", json!({ "sid": &child })),
+                &gw,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(stopped["stopped"], json!(true), "{stopped}");
+        assert!(stopped.get("interrupted").is_none(), "{stopped}");
+        assert!(stopped.get("undelivered").is_none(), "{stopped}");
+        assert!(stopped.get("resume_policy").is_none(), "{stopped}");
     }
 
     /// GitHub #197 (D) — a parent tasking a BUSY child steers the turn it is
