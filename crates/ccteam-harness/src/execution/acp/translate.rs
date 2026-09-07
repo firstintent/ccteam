@@ -294,7 +294,15 @@ impl SessionTranslateState {
             text: String::new(),
         });
         self.last_liveness_at = None;
-        Some(ThreadEvent::TurnStarted { turn_id })
+        // `Submitted`, not a vendor continuation: what opens this turn is a
+        // line ccteam delivered (an interjection grok admitted while idle),
+        // simply without a matching `session/prompt` RPC. ACP has no way for
+        // the vendor to wake its own model, so no boundary here is ever a
+        // continuation of the one before it and nobody's binding moves.
+        Some(ThreadEvent::TurnStarted {
+            turn_id,
+            opening: crate::TurnOpening::Submitted,
+        })
     }
 
     /// Signal (once) that the turn boundary was reached.
@@ -662,6 +670,9 @@ fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<Thread
             usage: UnifiedTokenUsage::default(),
             model: state.model.clone(),
             conclusion: None,
+            // An ACP turn ends when the prompt it answers ends: the vendor
+            // holds nothing that would re-open it.
+            continuation: crate::TurnContinuation::Settled,
         },
     ]
 }
@@ -755,6 +766,7 @@ pub fn finalize_from_prompt_result(
         usage,
         model: terminal_model,
         conclusion: None,
+        continuation: crate::TurnContinuation::Settled,
     });
     out
 }
@@ -1327,7 +1339,7 @@ mod tests {
         let synthetic_id = opened
             .iter()
             .find_map(|event| match event {
-                ThreadEvent::TurnStarted { turn_id } => Some(turn_id.clone()),
+                ThreadEvent::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
                 _ => None,
             })
             .expect("content opens a synthetic turn");

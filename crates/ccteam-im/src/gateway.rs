@@ -6971,7 +6971,7 @@ impl Gateway {
                         // previous TurnCompleted already cleared it. Native
                         // same-turn Inject emits no second TurnStarted and thus
                         // preserves the original elapsed time.
-                        if let ThreadEvent::TurnStarted { turn_id } = &evt {
+                        if let ThreadEvent::TurnStarted { turn_id, .. } = &evt {
                             structured_turn_open = true;
                             // The execution turn a delegation request is bound
                             // to. Recording it here is what lets a boundary
@@ -7085,7 +7085,7 @@ impl Gateway {
                         // vendor, so a new paneless harness inherits it.
                         if !session.protocol.is_terminal() {
                             match &evt {
-                                ThreadEvent::TurnStarted { turn_id } => {
+                                ThreadEvent::TurnStarted { turn_id, .. } => {
                                     // A structured turn start is the first
                                     // authoritative proof that work is underway.
                                     // Persist it immediately: capacity eviction
@@ -17683,7 +17683,7 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
 /// `Error` carries none — the pump pairs it with the turn it knows is open.
 fn thread_event_turn_id(evt: &ThreadEvent) -> Option<&str> {
     match evt {
-        ThreadEvent::TurnStarted { turn_id }
+        ThreadEvent::TurnStarted { turn_id, .. }
         | ThreadEvent::TurnCompleted { turn_id, .. }
         | ThreadEvent::TurnFailed { turn_id, .. } => Some(turn_id.as_str()),
         _ => None,
@@ -17759,6 +17759,7 @@ mod turn_terminal_accounting_tests {
                 usage: usage(),
                 model: Some("claude-sonnet-4-6".into()),
                 conclusion: conclusion.clone(),
+                continuation: ccteam_harness::TurnContinuation::Settled,
             };
             let (turn_id, usage, model) = turn_terminal_accounting(&evt).unwrap_or_else(|| {
                 panic!("a completed turn is accounted whatever it concluded: {conclusion:?}")
@@ -17793,7 +17794,8 @@ mod turn_terminal_accounting_tests {
     #[test]
     fn accounting_ignores_non_terminal_events() {
         assert!(turn_terminal_accounting(&ThreadEvent::TurnStarted {
-            turn_id: "t3".into()
+            turn_id: "t3".into(),
+            opening: ccteam_harness::TurnOpening::Submitted,
         })
         .is_none());
         assert!(turn_terminal_accounting(&ThreadEvent::ItemCompleted {
@@ -17925,6 +17927,7 @@ mod open_work_items_tests {
                 usage: UnifiedTokenUsage::default(),
                 model: None,
                 conclusion: None,
+                continuation: ccteam_harness::TurnContinuation::Settled,
             },
         );
         assert!(
@@ -21847,6 +21850,7 @@ mod tests {
                     h.identity.clone(),
                     ThreadEvent::TurnStarted {
                         turn_id: turn_id.clone(),
+                        opening: ccteam_harness::TurnOpening::Submitted,
                     },
                 ));
             }
@@ -21909,6 +21913,7 @@ mod tests {
                             // the per-turn model path.
                             model: Some("claude-sonnet-4-6".to_string()),
                             conclusion: self.turn_conclusion.clone(),
+                            continuation: ccteam_harness::TurnContinuation::Settled,
                         },
                     ));
                 }
@@ -22670,6 +22675,7 @@ mod tests {
             identity.clone(),
             ThreadEvent::TurnStarted {
                 turn_id: "queued-2".into(),
+                opening: ccteam_harness::TurnOpening::Submitted,
             },
         ));
         fake.wake(&identity);
@@ -22746,6 +22752,7 @@ mod tests {
             identity.clone(),
             ThreadEvent::TurnStarted {
                 turn_id: "queued-2".into(),
+                opening: ccteam_harness::TurnOpening::Submitted,
             },
         ));
         fake.wake(&identity);
@@ -24623,6 +24630,7 @@ mod tests {
             for event in [
                 ThreadEvent::TurnStarted {
                     turn_id: "prior-turn".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
                 },
                 ThreadEvent::ItemCompleted {
                     item: ccteam_harness::ThreadItem {
@@ -24637,6 +24645,7 @@ mod tests {
                     usage: Default::default(),
                     model: Some("unlisted-model-for-this-turn".into()),
                     conclusion: None,
+                    continuation: ccteam_harness::TurnContinuation::Settled,
                 },
             ] {
                 events.push_back((identity.clone(), event));
@@ -25258,6 +25267,7 @@ mod tests {
                     usage: Default::default(),
                     model: None,
                     conclusion: None,
+                    continuation: ccteam_harness::TurnContinuation::Settled,
                 },
             ));
         }

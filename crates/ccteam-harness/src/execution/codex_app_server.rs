@@ -3475,6 +3475,10 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // fixtures use.
         "turn/started" => Some(ThreadEvent::TurnStarted {
             turn_id: pluck_turn_id_from_params(&notif.params),
+            // A codex thread runs a turn only because a `sendUserMessage`
+            // asked for one: there is no notification that means "the model
+            // woke itself", so no turn here continues another one's work.
+            opening: crate::TurnOpening::Submitted,
         }),
         // The turn's VERDICT lives in `turn.status` (+ `turn.error`), not in
         // the method name: codex reports a failed or interrupted turn through
@@ -3501,6 +3505,9 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
                 usage: pluck_usage(&notif.params).unwrap_or_default(),
                 model: None,
                 conclusion: None,
+                // `turn/completed` IS the end of the work: codex holds nothing
+                // that will re-open it (see `opening` above).
+                continuation: crate::TurnContinuation::Settled,
             },
             CodexTurnOutcome::Failed { kind, message } => ThreadEvent::TurnFailed {
                 turn_id: pluck_turn_id_from_params(&notif.params),
@@ -5456,6 +5463,7 @@ mod tests {
             usage: UnifiedTokenUsage::default(),
             model: None,
             conclusion: None,
+            continuation: crate::TurnContinuation::Settled,
         };
         enrich_codex_turn_completed(&mut event, Some(tracker_last));
         let ThreadEvent::TurnCompleted { usage, .. } = &event else {
@@ -5473,6 +5481,7 @@ mod tests {
             },
             model: None,
             conclusion: None,
+            continuation: crate::TurnContinuation::Settled,
         };
         enrich_codex_turn_completed(&mut inlined, Some(tracker_last));
         let ThreadEvent::TurnCompleted { usage, .. } = &inlined else {
@@ -5646,7 +5655,12 @@ mod tests {
         };
         let e = translate_notification(&n, "t-1").unwrap();
         match e {
-            ThreadEvent::TurnStarted { turn_id } => assert_eq!(turn_id, "u-7"),
+            ThreadEvent::TurnStarted { turn_id, opening } => {
+                assert_eq!(turn_id, "u-7");
+                // codex never wakes its own model: every turn is one ccteam
+                // asked for, so no boundary here continues another one.
+                assert_eq!(opening, crate::TurnOpening::Submitted);
+            }
             other => panic!("expected TurnStarted, got {other:?}"),
         }
     }

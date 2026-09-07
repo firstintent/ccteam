@@ -2207,6 +2207,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     ids.reserve(&id);
                     id
                 });
+                // …and claude will re-run this line as the prompt of the NEXT
+                // turn, so the turn it joined does not end this dispatch. The
+                // binding rides the joined turn's id and moves onto the replay
+                // turn when that opens (GitHub #199).
+                ids.note_injected();
                 (id, true)
             } else {
                 let id = ids.mint();

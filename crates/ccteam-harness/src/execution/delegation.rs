@@ -169,6 +169,29 @@ impl RequestState {
     }
 }
 
+/// One non-terminal turn boundary a request has already ridden through.
+///
+/// A vendor that wakes its own model ends several turns on one dispatched
+/// task: claude answers a `<task-notification>` in a brand-new turn every time
+/// a background task, a `Monitor` or an `Agent` it launched finishes. Those
+/// boundaries are real (they are billed, and their text is in the ledger) but
+/// they answer nothing, so the request keeps its binding and the parent is not
+/// woken. This is the trail that says so — what a reader sees instead of
+/// silence while a long task runs (GitHub #198/#199).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestProgress {
+    /// The adapter's execution turn that ended without settling anything.
+    pub exec_turn_id: String,
+    /// ISO-8601 observation time (diagnostic; never a matching key).
+    pub at: String,
+}
+
+/// How many non-terminal boundaries one request remembers. A chain of vendor
+/// continuations has no upper bound in the protocol, and this record is
+/// rewritten on every dispatch — so the oldest are dropped and the count of
+/// what was dropped is not kept: the trail is for a reader, never a key.
+pub const REQUEST_PROGRESS_HISTORY: usize = 10;
+
 /// One accepted dispatch, with the identity everything else keys off.
 ///
 /// Minted and written to disk BEFORE the vendor submit, so a crash in the
@@ -221,6 +244,11 @@ pub struct DelegationRequest {
     /// at-least-once redelivery after a restart cannot double-notify.
     #[serde(default)]
     pub notified: bool,
+    /// Non-terminal boundaries this request has already passed — see
+    /// [`RequestProgress`]. Newest last, bounded by
+    /// [`REQUEST_PROGRESS_HISTORY`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<RequestProgress>,
     /// Why this request's binding could not be made durable, when that
     /// happened. NEVER persisted — the whole point is that the write failed —
     /// and never read back: it exists so the live surfaces report `unknown`
@@ -253,7 +281,29 @@ impl DelegationRequest {
             turn_id: None,
             answered_turn: None,
             notified: false,
+            progress: Vec::new(),
             bind_error: None,
+        }
+    }
+
+    /// Record a boundary that ended without settling this request, dropping the
+    /// oldest once the trail is full. Idempotent per execution turn: a boundary
+    /// re-delivered after a crash must not lengthen the trail.
+    pub fn note_progress(&mut self, exec_turn_id: &str) {
+        if self
+            .progress
+            .iter()
+            .any(|seen| seen.exec_turn_id == exec_turn_id)
+        {
+            return;
+        }
+        self.progress.push(RequestProgress {
+            exec_turn_id: exec_turn_id.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+        let over = self.progress.len().saturating_sub(REQUEST_PROGRESS_HISTORY);
+        if over > 0 {
+            self.progress.drain(..over);
         }
     }
 }
@@ -374,6 +424,42 @@ impl DelegationRequests {
         self.requests
             .iter()
             .filter(move |r| !r.state.is_terminal() && r.turn_id.as_deref() == Some(turn_id))
+    }
+
+    /// Record a non-terminal boundary against every outstanding request bound
+    /// to `exec_turn_id`, returning how many were touched. The bindings stay:
+    /// the vendor is still working on those tasks.
+    pub fn note_progress(&mut self, exec_turn_id: &str) -> usize {
+        let mut touched = 0;
+        for request in self.requests.iter_mut() {
+            if request.state.is_terminal() || request.turn_id.as_deref() != Some(exec_turn_id) {
+                continue;
+            }
+            request.note_progress(exec_turn_id);
+            touched += 1;
+        }
+        touched
+    }
+
+    /// Move every outstanding request bound to `from` onto `to` — the turn the
+    /// vendor opened by itself to continue that work. Returns how many moved.
+    ///
+    /// Identity, not recency: a request bound to some other turn (a line still
+    /// parked, a second dispatch already running elsewhere) is untouched, so a
+    /// continuation can never adopt work it is not continuing.
+    pub fn rebind_continuation(&mut self, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
+        }
+        let mut moved = 0;
+        for request in self.requests.iter_mut() {
+            if request.state.is_terminal() || request.turn_id.as_deref() != Some(from) {
+                continue;
+            }
+            request.turn_id = Some(to.to_string());
+            moved += 1;
+        }
+        moved
     }
 
     /// This parent's most recent outstanding request on this child — the

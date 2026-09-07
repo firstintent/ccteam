@@ -229,6 +229,9 @@ impl AcpTurnRunner {
                 if probing.is_none() {
                     let _ = event_tx.send(ThreadEvent::TurnStarted {
                         turn_id: turn_id.clone(),
+                        // This turn exists because ccteam called
+                        // `session/prompt`; ACP has no vendor-driven wake-up.
+                        opening: crate::TurnOpening::Submitted,
                     });
                 }
                 let result = transport

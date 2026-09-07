@@ -70,6 +70,8 @@ impl PiTurnTranslator {
                 TranslateOutput {
                     events: vec![ThreadEvent::TurnStarted {
                         turn_id: active.turn_id.clone(),
+                        // pi runs a turn per request it is given.
+                        opening: crate::TurnOpening::Submitted,
                     }],
                     settled: false,
                 }
@@ -172,6 +174,7 @@ impl PiTurnTranslator {
                             usage: active.usage,
                             model: active.model,
                             conclusion: None,
+                            continuation: crate::TurnContinuation::Settled,
                         },
                     ],
                     settled: true,
@@ -195,6 +198,7 @@ impl PiTurnTranslator {
                     usage: active.usage,
                     model: active.model,
                     conclusion: None,
+                    continuation: crate::TurnContinuation::Settled,
                 });
                 TranslateOutput {
                     events,

@@ -898,6 +898,58 @@ fn next_turn_input_id() -> String {
     format!("input-{nanos:x}-{seq:x}")
 }
 
+/// Who opened an execution turn.
+///
+/// A vendor can wake its OWN model. Claude Code does: when a background Bash
+/// task, a `Monitor` or an `Agent` task the child launched finishes, the CLI
+/// writes a user line of its own and the model answers in a brand-new turn —
+/// ccteam submitted nothing. The same happens to a line ccteam injects into a
+/// running turn: the CLI shows it as a queued command and then RE-RUNS it as
+/// the next prompt.
+///
+/// Such a turn continues the work of the one before it, so the delegation
+/// requests bound to that turn move onto it — otherwise the request is
+/// resolved by the first boundary and the answer, several turns later, reaches
+/// nobody (GitHub #198/#199).
+///
+/// Reported from HARNESS STATE — whether the id the turn opened under was one
+/// a delivered line reserved — never from the text of the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOpening {
+    /// ccteam delivered the line that opened this turn. The safe default: a
+    /// harness that cannot tell must not move anyone's binding.
+    #[default]
+    Submitted,
+    /// The vendor opened this turn on its own account, continuing the previous
+    /// one's work.
+    VendorContinuation,
+}
+
+/// Whether a turn boundary is the END of the work bound to it.
+///
+/// The counterpart of [`TurnOpening`]: a `result` that arrives while the
+/// vendor still holds work which will wake it again answers nothing yet. It is
+/// recorded and billed like any boundary, but it resolves no request and wakes
+/// no parent — the receipt belongs to the turn that ends with the vendor
+/// holding nothing.
+///
+/// Harness state only. For claude stream-json it is the `background_tasks_changed`
+/// snapshot plus the adapter's own record of an injected line awaiting replay;
+/// nothing here looks at what the model wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnContinuation {
+    /// The vendor holds nothing that will re-open this work: the boundary is
+    /// the answer to every request bound to the turn. The default, because a
+    /// harness with no vendor-driven continuation (codex, every ACP vendor)
+    /// ends its turns exactly when it is told to.
+    #[default]
+    Settled,
+    /// The vendor will wake its own model again on account of this turn.
+    Pending,
+}
+
 /// Vendor-agnostic event flowing out of [`HarnessAdapter::events`].
 /// Schema mirrors Codex `ThreadEvent` (`exec_events.rs:11-37`) so the
 /// orchestrator's translation layer maps 1:1 against Codex emitters.
@@ -909,6 +961,10 @@ pub enum ThreadEvent {
     },
     TurnStarted {
         turn_id: String,
+        /// Who opened it — see [`TurnOpening`]. A vendor continuation inherits
+        /// the bindings of this session's previous execution turn.
+        #[serde(default)]
+        opening: TurnOpening,
     },
     TurnCompleted {
         turn_id: String,
@@ -929,6 +985,16 @@ pub enum ThreadEvent {
         /// bounded excerpt of it prefers to show (issue #196).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conclusion: Option<String>,
+        /// Whether the vendor still holds work that will wake it again — see
+        /// [`TurnContinuation`]. `Pending` makes this boundary non-terminal:
+        /// it is recorded and billed, and it resolves nobody's request.
+        ///
+        /// Only the SUCCESS boundary carries it. A `TurnFailed` is terminal
+        /// whatever the vendor still holds: a later continuation turn does not
+        /// repair a failed one, and a parent left waiting on a request that
+        /// already failed is the worse error.
+        #[serde(default)]
+        continuation: TurnContinuation,
     },
     TurnFailed {
         turn_id: String,

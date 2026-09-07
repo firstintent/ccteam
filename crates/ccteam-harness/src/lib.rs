@@ -56,11 +56,11 @@ pub use adapter::{
     HostExecutionScope, ModelWindow, NarrationAccumulator, PartialNarration, PermissionMode,
     RecoveredTurn, RunningTask, SessionHandle, SessionProtocol, SessionTitleTarget, SpawnCtx,
     SpawnOpts, SubagentState, ThreadErrorEvent, ThreadEvent, ThreadHandle, ThreadItem,
-    ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnDisposition, TurnId,
-    TurnInput, TurnRouting, TurnSubmission, UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV,
-    CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV, CODEX_BIN_ENV, CODEX_STATUS_MARKER,
-    CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV, IN_FLIGHT_NARRATION_MAX_CHARS,
-    KIMI_BIN_ENV, OPENCODE_BIN_ENV,
+    ThreadItemDetails, ThreadStatus, TitleSync, ToolSurfaceRebuild, TurnContinuation,
+    TurnDisposition, TurnId, TurnInput, TurnOpening, TurnRouting, TurnSubmission,
+    UnifiedTokenUsage, UnobservedTurnCtx, CCTEAM_HOME_ENV, CLAUDE_BIN_ENV, CLAUDE_JOBS_DIR_ENV,
+    CODEX_BIN_ENV, CODEX_STATUS_MARKER, CODEX_STATUS_TAIL_LINES, DEFAULT_CLAUDE_SID, GROK_BIN_ENV,
+    IN_FLIGHT_NARRATION_MAX_CHARS, KIMI_BIN_ENV, OPENCODE_BIN_ENV,
 };
 pub use enriched_event::{
     enrichment_source, BaseEvent, BasePayload, EnrichedEvent, EnrichmentEvent, EnrichmentPayload,
@@ -72,7 +72,8 @@ pub use execution::codex_exec::codex_chat_session_name;
 pub use execution::delegation::{
     delete_delegation_requests, mint_request_id, persist_delegation_requests,
     read_delegation_requests, scan_delegation_requests, DelegationRequest, DelegationRequests,
-    DelegationStoreGuard, DelegationWriteGuard, DeliveringBoundary, NotifyMode, RequestState,
+    DelegationStoreGuard, DelegationWriteGuard, DeliveringBoundary, NotifyMode, RequestProgress,
+    RequestState,
 };
 pub use execution::dsh_acp::{
     build_web_spawn_spec, dsh_config_source, find_cached_dsh_bin, identity_socket_path,

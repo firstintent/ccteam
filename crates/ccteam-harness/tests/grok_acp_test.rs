@@ -313,7 +313,7 @@ async fn completion_edge_interject_surfaces_vendor_self_started_turn() {
         let mut completed = Vec::new();
         while let Some(event) = stream.next().await {
             match event {
-                ThreadEvent::TurnStarted { turn_id } => started.push(turn_id),
+                ThreadEvent::TurnStarted { turn_id, .. } => started.push(turn_id),
                 ThreadEvent::ItemCompleted { item } => {
                     if let ThreadItemDetails::AgentMessage(text) = item.details {
                         finals.push((item.id, text));

@@ -6575,6 +6575,7 @@ mod session_tool_tests {
                     h.identity.clone(),
                     ccteam_harness::ThreadEvent::TurnStarted {
                         turn_id: format!("turn-{}", h.identity),
+                        opening: ccteam_harness::TurnOpening::Submitted,
                     },
                 ));
                 if self.narrate {
@@ -6622,6 +6623,7 @@ mod session_tool_tests {
                             usage: Default::default(),
                             model: None,
                             conclusion: None,
+                            continuation: ccteam_harness::TurnContinuation::Settled,
                         },
                     ));
                 }
@@ -6662,6 +6664,7 @@ mod session_tool_tests {
                     vec![
                         ccteam_harness::ThreadEvent::TurnStarted {
                             turn_id: turn_id.clone(),
+                            opening: ccteam_harness::TurnOpening::Submitted,
                         },
                         ccteam_harness::ThreadEvent::ItemCompleted {
                             item: ccteam_harness::ThreadItem {
@@ -6676,6 +6679,7 @@ mod session_tool_tests {
                             usage: Default::default(),
                             model: None,
                             conclusion: None,
+                            continuation: ccteam_harness::TurnContinuation::Settled,
                         },
                     ],
                 );
