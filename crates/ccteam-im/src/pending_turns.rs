@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 /// queue so a dispatched task never comes back as a batchable notification.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingIntent {
+    /// Whether this line came from ccteam rather than a human chat.
     pub internal: bool,
+    /// The requested vendor channel, including notification batch eligibility.
     pub routing: ccteam_harness::TurnRouting,
 }
 

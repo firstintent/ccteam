@@ -4129,7 +4129,7 @@ fn page_collected_turns(
     let mut rows: Vec<serde_json::Value> = all[start..]
         .iter()
         .filter(|t| is_transcript_row(t))
-        .map(|t| collected_turn_row(t))
+        .map(collected_turn_row)
         .collect();
     let remaining = rows.len().saturating_sub(n);
     if tail {
@@ -10048,7 +10048,10 @@ mod session_tool_tests {
             "and how is it going?",
             None,
             false,
-            false,
+            crate::pending_turns::PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
             None,
         )
         .unwrap();

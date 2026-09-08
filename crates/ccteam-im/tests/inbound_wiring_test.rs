@@ -159,23 +159,37 @@ impl HarnessAdapter for GatewayAdapter {
         h: &ThreadHandle,
         input: TurnInput,
     ) -> Result<TurnId, HarnessError> {
-        self.submits.fetch_add(1, Ordering::SeqCst);
+        let ordinal = self.submits.fetch_add(1, Ordering::SeqCst) + 1;
+        let turn_id = format!("gateway-turn-{ordinal}");
         let text = match input {
             TurnInput::UserText(s) => s,
             other => format!("{other:?}"),
         };
         self.submitted_threads.lock().await.push(h.identity.clone());
         self.submitted_payloads.lock().await.push(text.clone());
-        self.events
-            .lock()
-            .await
-            .push_back(ThreadEvent::ItemCompleted {
+        // The gateway renders final status only at a canonical turn boundary.
+        // A lone ItemCompleted is narration, so this integration fixture must
+        // supply the same lifecycle as a real adapter (GitHub #205 gate).
+        self.events.lock().await.extend([
+            ThreadEvent::TurnStarted {
+                turn_id: turn_id.clone(),
+                opening: ccteam_harness::TurnOpening::Submitted,
+            },
+            ThreadEvent::ItemCompleted {
                 item: ThreadItem {
-                    id: "gateway-msg-1".to_string(),
+                    id: format!("gateway-msg-{ordinal}"),
                     details: ThreadItemDetails::AgentMessage(format!("gateway echo: {text}")),
                 },
-            });
-        Ok(TurnId::new("gateway-turn"))
+            },
+            ThreadEvent::TurnCompleted {
+                turn_id: turn_id.clone(),
+                usage: Default::default(),
+                model: None,
+                conclusion: None,
+                continuation: Default::default(),
+            },
+        ]);
+        Ok(TurnId::new(turn_id))
     }
 
     async fn submit_turn_routed(
@@ -637,7 +651,7 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
         .count();
     assert_eq!(echo_matches, 1, "got {content_counts:?}");
     assert_eq!(
-        content_counts.get("submitted s1 turn gateway-turn"),
+        content_counts.get("submitted s1 turn gateway-turn-1"),
         None,
         "machine-ish ack must be folded away"
     );
