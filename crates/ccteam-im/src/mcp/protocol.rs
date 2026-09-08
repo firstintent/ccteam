@@ -335,14 +335,15 @@ pub fn session_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "agent_read",
-            "description": "Read the team. No `sid` → roster of sessions you can reach, latest first; reuse a `released` row via `agent{sid}` instead of hiring a twin. With `sid` → its transcript newest first + `requests` (what it still owes; `progress` = boundaries it rode through while its own background work ran). `turn:<id>` → exactly that turn; `since:<cursor>` → unread oldest first, `remaining` = still unread; `n:0` → status only; empty = no answer yet. A turn still running answers `partial:true` + `in_flight{turn_id,narration,text?,requests}` — a bounded excerpt of what it has said, never an answer and never a reason to stop it. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (dropped — no answer exists).",
+            "description": "Read the team. No `sid` → reachable sessions; reuse `released` via `agent{sid}`. With `sid` → latest transcript + outstanding `requests` (`progress` = interim boundaries). `n:1` may repeat; `since:<cursor>` returns unread turns, oldest first; `remaining` counts withheld turns. `turn:<id>` reads exactly that turn; `n:0` omits turns. Running work reports `partial:true` + `in_flight`: narration, never an answer. `wait` reports `resolved_requests` (answered) vs `unknown_requests` (no answer).",
             "inputSchema": schema(json!({
                 "sid": { "type": "string", "description": "Read this session's transcript instead of the roster." },
                 "n": { "type": "integer", "description": "Max rows: roster 5, transcript 1 (max 500)." },
                 "tail": { "type": "boolean", "description": "With `sid`: newest first (default true unless `since`)." },
-                "since": { "type": "string", "description": "With `sid`: only turns after this turn_id cursor." },
+                "since": { "type": "string", "description": "With `sid`: only turns after this cursor; unknown cursor errors. Reads never acknowledge consumption." },
                 "turn": { "type": "string", "description": "With `sid`: exactly this turn_id." },
-                "max_chars": { "type": "integer", "description": "With `sid`: char budget across returned turns (default 1000)." },
+                "max_chars": { "type": "integer", "description": "With `sid`: shared serialized-char budget for turns + requests + in_flight; control fields excluded (100–50000, default 1000)." },
+                "history": { "type": "boolean", "description": "With `sid`: include terminal request history (default false)." },
                 "wait": { "type": "integer", "description": "With `sid`: seconds to wait for an in-flight turn to end (0-240)." },
                 "project": { "type": "string", "description": "Roster filter: this project slug only." },
                 "activity": {
@@ -989,6 +990,7 @@ mod tests {
             "since",
             "turn",
             "max_chars",
+            "history",
             "wait",
             "project",
             "activity",

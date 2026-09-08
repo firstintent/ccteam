@@ -437,7 +437,7 @@ const AGENT_READ_REQUEST_ROWS: usize = 10;
 /// drops whole rows (counted in `remaining`) instead of shredding every one.
 const MIN_USEFUL_ROW_CHARS: usize = 200;
 use crate::delegation::{DelegationOutcome, DelegationSummary};
-/// Default character budget across the turns one `agent_read{sid}` returns.
+/// Shared serialized payload budget for one `agent_read{sid}` response.
 use crate::delegation::{
     AGENT_READ_DEFAULT_MAX_CHARS, AGENT_READ_MAX_MAX_CHARS, AGENT_READ_MIN_MAX_CHARS,
 };
@@ -4107,8 +4107,8 @@ fn exact_collected_turn(
 /// or filesystem. Given ALL mirrored turns, an optional `since` turn-id
 /// cursor, a page size `n` and the direction, it:
 ///
-/// - keeps only transcript rows AFTER `since` (or all when `since` is `None` /
-///   not found — never silently lose turns on a stale cursor),
+/// - keeps only transcript rows AFTER `since` (all when absent); an unknown
+///   cursor errors instead of replaying already-held answers (#205),
 /// - returns the OLDEST `n` of those (so repeated polls page forward in
 ///   order), or the NEWEST `n` when `tail` is set,
 /// - counts what it withheld in `remaining` and names the newest turn in
@@ -4119,22 +4119,14 @@ fn page_collected_turns(
     since: Option<&str>,
     n: usize,
     tail: bool,
-) -> TranscriptPage {
+) -> Result<TranscriptPage, String> {
     let latest = all
         .iter()
         .rev()
         .find(|turn| is_transcript_row(turn))
         .map(|turn| turn.turn_id.clone());
-    let after: Vec<&ccteam_harness::execution::turns_mirror::TurnRecord> = match since {
-        Some(cursor) => match all.iter().position(|t| t.turn_id == cursor) {
-            Some(idx) => all.iter().skip(idx + 1).collect(),
-            // Cursor not found (rotated / typo) → return everything so the
-            // caller never silently loses turns.
-            None => all.iter().collect(),
-        },
-        None => all.iter().collect(),
-    };
-    let mut rows: Vec<serde_json::Value> = after
+    let start = collected_since_offset(all, since)?;
+    let mut rows: Vec<serde_json::Value> = all[start..]
         .iter()
         .filter(|t| is_transcript_row(t))
         .map(|t| collected_turn_row(t))
@@ -4152,12 +4144,23 @@ fn page_collected_turns(
         .and_then(|r| r.get("turn_id"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    TranscriptPage {
+    Ok(TranscriptPage {
         rows,
         cursor,
         remaining,
         latest,
-    }
+    })
+}
+
+fn collected_since_offset(
+    all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+    since: Option<&str>,
+) -> Result<usize, String> {
+    let Some(cursor) = since else {
+        return Ok(0);
+    };
+    all.iter().position(|turn| turn.turn_id == cursor).map(|index| index + 1)
+        .ok_or_else(|| format!("agent_read: unknown since cursor `{cursor}`; omit since to select a new starting point"))
 }
 
 /// One transcript row as `agent_read{sid}` publishes it.
@@ -4193,8 +4196,11 @@ fn collected_turn_row(
 /// answer and took it for the verdict it had asked for (issue #201). A cursor
 /// (`since:<previous>`) has the same defect one row further back: it depends
 /// on nothing being appended in between.
-fn whole_turn_recipe(sid: &str, turn_id: &str, total_chars: usize) -> String {
-    let budget = crate::delegation::read_budget_for(total_chars);
+fn whole_turn_recipe(sid: &str, turn_id: &str, _total_chars: usize) -> String {
+    // The budget includes JSON escaping and metadata now. Raw text length
+    // cannot promise a whole read; ask for the ceiling, charging only what is
+    // actually returned. An oversized turn still reports truncation (#205).
+    let budget = AGENT_READ_MAX_MAX_CHARS;
     format!("agent_read{{sid:{sid},turn:{turn_id},max_chars:{budget}}}")
 }
 
@@ -4332,16 +4338,18 @@ fn bound_collected_turns(
             .unwrap_or_default();
         let mark =
             |omitted: usize| format!("…[+{omitted} chars: {}]…", recipe(turn_id, original_chars));
-        // A pointer that costs more than the text it withholds makes the answer
-        // both bigger and worse — return the turn whole instead. The overspend
-        // is bounded by one marker per row (issue #195: turns of 131-197 chars
-        // were cut to save 40-94 while paying 86 to say where the rest was).
-        if original_chars <= budget + mark(original_chars - budget).chars().count() {
-            continue;
-        }
+        // A pointer may not widen the caller's budget (#205). Tiny excerpts
+        // use a short marker; the unchanged turn_id still names the exact read.
+        let marker_fits = mark(original_chars).chars().count() < budget;
         // The same excerpt rule as a completion notification: a cut row shows
         // the turn's conclusion, not the head of its narration (issue #196).
-        let bounded = crate::delegation::answer_excerpt(content, conclusion, budget, mark);
+        let bounded = crate::delegation::answer_excerpt(content, conclusion, budget, |omitted| {
+            if marker_fits {
+                mark(omitted)
+            } else {
+                "…".into()
+            }
+        });
         row["content"] = serde_json::json!(bounded.text);
         truncated |= bounded.truncated;
     }
@@ -4355,6 +4363,134 @@ fn strip_bounding_fields(rows: &mut [serde_json::Value]) {
     for row in rows.iter_mut() {
         if let Some(object) = row.as_object_mut() {
             object.remove("conclusion");
+        }
+    }
+}
+
+fn serialized_chars(value: &serde_json::Value) -> usize {
+    value.to_string().chars().count()
+}
+
+/// Serialize the same values the MCP client receives: metadata, punctuation
+/// and escaping are paid for, not just prose. Control fields (status, cursors,
+/// omission counts and wait resolution) remain outside this payload budget.
+struct ReadContent {
+    turns: Vec<serde_json::Value>,
+    requests: Vec<serde_json::Value>,
+    in_flight: Option<serde_json::Value>,
+    truncated: bool,
+}
+
+fn bound_read_content(
+    turns: Vec<serde_json::Value>,
+    requests: Vec<serde_json::Value>,
+    in_flight: Option<serde_json::Value>,
+    max_chars: usize,
+    tail: bool,
+    recipe: &dyn Fn(&str, usize) -> String,
+) -> ReadContent {
+    let mut wire_turns = turns.clone();
+    strip_bounding_fields(&mut wire_turns);
+    // `turns:[]` is mandatory and costs two characters even on an empty page.
+    let turn_chars = serialized_chars(&serde_json::json!(wire_turns)).saturating_sub(2);
+    let request_chars = if requests.is_empty() {
+        0
+    } else {
+        serialized_chars(&serde_json::json!(requests))
+    };
+    let flight_chars = in_flight.as_ref().map(serialized_chars).unwrap_or(0);
+    let shares = collected_turn_budgets(&[turn_chars, request_chars, flight_chars], max_chars - 2);
+
+    // Request rows stay whole: cutting an id, delivery fact or progress entry
+    // would fabricate a different receipt. Count every withheld row instead.
+    let mut kept_requests = Vec::new();
+    let mut request_used = 0;
+    for request in requests {
+        let extra = serialized_chars(&request) + if kept_requests.is_empty() { 2 } else { 1 };
+        if request_used + extra > shares[1] {
+            break;
+        }
+        request_used += extra;
+        kept_requests.push(request);
+    }
+    let available = max_chars - 2 - request_used;
+    let shares = collected_turn_budgets(&[turn_chars, flight_chars], available);
+    let in_flight = in_flight.and_then(|row| bound_in_flight(row, shares[1]));
+    let flight_used = in_flight.as_ref().map(serialized_chars).unwrap_or(0);
+    let (turns, truncated) =
+        bound_serialized_turns(turns, available - flight_used + 2, tail, recipe);
+    ReadContent {
+        turns,
+        requests: kept_requests,
+        in_flight,
+        truncated,
+    }
+}
+
+fn bound_in_flight(mut row: serde_json::Value, max_chars: usize) -> Option<serde_json::Value> {
+    if serialized_chars(&row) <= max_chars {
+        return Some(row);
+    }
+    let text = row
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let original_omitted = row
+        .get("omitted_chars")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let mut keep = text.chars().count();
+    loop {
+        let excess = serialized_chars(&row).saturating_sub(max_chars);
+        if excess == 0 {
+            return Some(row);
+        }
+        if keep == 0 {
+            return None;
+        }
+        keep = keep.saturating_sub(excess);
+        let (bounded, omitted) = ccteam_harness::bounded_tail(&text, keep);
+        row.as_object_mut().expect("in-flight row").remove("text");
+        if !bounded.is_empty() {
+            row["text"] = serde_json::json!(bounded);
+        }
+        row["truncated"] = serde_json::json!(true);
+        row["omitted_chars"] = serde_json::json!(original_omitted.saturating_add(omitted as u64));
+    }
+}
+
+fn bound_serialized_turns(
+    mut rows: Vec<serde_json::Value>,
+    max_chars: usize,
+    tail: bool,
+    recipe: &dyn Fn(&str, usize) -> String,
+) -> (Vec<serde_json::Value>, bool) {
+    drop_unaffordable_rows(&mut rows, max_chars, tail);
+    loop {
+        let mut skeleton = rows.clone();
+        strip_bounding_fields(&mut skeleton);
+        for row in &mut skeleton {
+            row["content"] = serde_json::json!("");
+        }
+        let overhead = serialized_chars(&serde_json::json!(skeleton));
+        if overhead > max_chars && !rows.is_empty() {
+            let victim = if tail { 0 } else { rows.len() - 1 };
+            rows.remove(victim);
+            continue;
+        }
+        let mut content_budget = max_chars.saturating_sub(overhead);
+        loop {
+            let mut bounded = rows.clone();
+            let (_, truncated) = bound_collected_turns(&mut bounded, content_budget, recipe);
+            let used = serialized_chars(&serde_json::json!(bounded));
+            if used <= max_chars {
+                return (bounded, truncated);
+            }
+            // Escaping may cost several serialized characters per source
+            // character. Rebudget from the original text, preserving the
+            // conclusion and avoiding a second truncation marker (#205).
+            content_budget = content_budget.saturating_sub(used - max_chars);
         }
     }
 }
@@ -4589,6 +4725,16 @@ async fn run_agent_read_transcript(
     // answer and says nothing about it (issue #201). `turn:<turn_id>` names
     // the one row, forever.
     let exact_turn = args.get("turn").and_then(|v| v.as_str()).map(String::from);
+    if exact_turn.is_some() && since.is_some() {
+        return Err(
+            "agent_read: `turn` and `since` select different reads; provide only one".into(),
+        );
+    }
+    if exact_turn.is_some() && read_wait_seconds(args) > 0 {
+        return Err(
+            "agent_read: `turn` selects an existing answer; omit `wait` for an exact read".into(),
+        );
+    }
     // `n:0` is legal here (status only); the roster keeps its floor of 1.
     let n = args
         .get("n")
@@ -4605,6 +4751,29 @@ async fn run_agent_read_transcript(
     // External nodes have no ccteam-held thread OR transcript mirror to read;
     // after the scope gate so the wording cannot probe foreign sids.
     assert_target_not_external("agent_read", gateway, &sid, None).await?;
+    // Reject invalid selectors BEFORE a wait claims the completion route.
+    // Otherwise an unknown cursor could suppress an answer, then return only
+    // an error. Selector validation is read-only and off the gateway lock.
+    if read_wait_seconds(args) > 0 && (since.is_some() || exact_turn.is_some()) {
+        let resolved = gateway
+            .lock()
+            .await
+            .session_resolve_any(&sid)
+            .ok_or_else(|| format!("agent_read: unknown session {sid}"))?;
+        let turns = ccteam_harness::execution::turns_mirror::read_all_turns(
+            &resolved.project_dir,
+            &resolved.sid,
+        )
+        .map_err(|error| format!("agent_read: read turns.jsonl for {sid}: {error}"))?;
+        if let Some(cursor) = since.as_deref() {
+            collected_since_offset(&turns, Some(cursor))?;
+        }
+        if let Some(turn_id) = exact_turn.as_deref() {
+            if !turns.iter().any(|turn| turn.turn_id == turn_id) {
+                return Err(format!("agent_read: {sid} has no turn {turn_id}"));
+            }
+        }
+    }
     // ---- the long poll (off the gateway lock, after every gate) ----
     //
     // The missing primitive was "wait for the turn that is in flight". Without
@@ -4680,7 +4849,11 @@ async fn run_agent_read_transcript(
     // (GitHub #197 G, checker). It takes and releases the lock itself; a
     // partial can only come from a session that was live, so it can never
     // contradict the residency read above in the direction that would matter.
-    let in_flight = Gateway::in_flight_turn_shared(gateway, &sid).await;
+    let in_flight = if exact_turn.is_none() {
+        Gateway::in_flight_turn_shared(gateway, &sid).await
+    } else {
+        None
+    };
     let resolved = resolved.ok_or_else(|| format!("agent_read: unknown session {sid}"))?;
 
     // Tail the ccteam-owned transcript mirror.
@@ -4710,30 +4883,63 @@ async fn run_agent_read_transcript(
     let page = match exact_turn.as_deref() {
         Some(turn_id) => exact_collected_turn(&all, turn_id)
             .ok_or_else(|| format!("agent_read: {sid} has no turn {turn_id}"))?,
-        None => page_collected_turns(&all, since.as_deref(), n, tail),
+        None => page_collected_turns(&all, since.as_deref(), n, tail)?,
     };
     let TranscriptPage {
-        mut rows,
+        rows,
         mut cursor,
         mut remaining,
         latest,
     } = page;
-    // Fewer whole turns beat a page of stubs: while the page cannot fit and a
-    // row's share has fallen under what a turn needs to say anything, drop the
-    // OLDEST row and count it as unread rather than shredding every row down to
-    // its pointer (issue #195).
-    let dropped = drop_unaffordable_rows(&mut rows, max_chars, tail);
-    if dropped > 0 {
-        remaining += dropped;
+    let selected_turns = rows.len();
+    let (requests, total_requests) = if exact_turn.is_none() {
+        gateway.lock().await.delegation_request_page(
+            &sid,
+            AGENT_READ_REQUEST_ROWS,
+            args.get("history")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        )
+    } else {
+        (Vec::new(), 0)
+    };
+    let partial = in_flight.is_some();
+    let in_flight = in_flight.map(|in_flight| {
+        let mut row = serde_json::json!({
+            "turn_id": in_flight.exec_turn_id,
+            "narration": in_flight.narration.as_str(),
+        });
+        if !in_flight.text.is_empty() {
+            row["text"] = serde_json::json!(in_flight.text);
+        }
+        if in_flight.omitted_chars > 0 {
+            row["truncated"] = serde_json::json!(true);
+            row["omitted_chars"] = serde_json::json!(in_flight.omitted_chars);
+        }
+        if !in_flight.requests.is_empty() {
+            row["requests"] = serde_json::json!(in_flight.requests);
+        }
+        row
+    });
+    let recipe =
+        |turn_id: &str, total_chars: usize| whole_turn_recipe(&resolved.sid, turn_id, total_chars);
+    let ReadContent {
+        turns: rows,
+        requests,
+        in_flight,
+        truncated: content_truncated,
+    } = bound_read_content(rows, requests, in_flight, max_chars, tail, &recipe);
+    remaining += selected_turns - rows.len();
+    // Never advance past a withheld forward row, including a page too small
+    // to carry even its metadata. An empty incremental read keeps its cursor.
+    if selected_turns != rows.len() {
         cursor = rows
             .last()
             .and_then(|row| row.get("turn_id"))
             .and_then(|value| value.as_str())
             .map(String::from);
     }
-    let recipe =
-        |turn_id: &str, total_chars: usize| whole_turn_recipe(&resolved.sid, turn_id, total_chars);
-    let (_total_chars, content_truncated) = bound_collected_turns(&mut rows, max_chars, &recipe);
+    let cursor = cursor.or(since);
 
     let activity = classify_session_activity(
         projection.as_deref(),
@@ -4767,16 +4973,14 @@ async fn run_agent_read_transcript(
     if content_truncated {
         body.insert("truncated".into(), serde_json::json!(true));
     }
-    // What this child OWES, and to whom. A dispatcher could not see its own
-    // queue at all: told only `pending`, it re-sent the same instruction three
-    // times and then stopped a child it believed was ignoring it (issue #201).
-    // Outstanding rows first, then the most recent resolved ones, bounded.
-    let requests = gateway
-        .lock()
-        .await
-        .delegation_request_rows(&sid, AGENT_READ_REQUEST_ROWS);
     if !requests.is_empty() {
         body.insert("requests".into(), serde_json::json!(requests));
+    }
+    if total_requests > requests.len() {
+        body.insert(
+            "requests_remaining".into(),
+            serde_json::json!(total_requests - requests.len()),
+        );
     }
     // Which of the caller's own tasks this read resolved — the answer it is
     // now holding, named, so it is never mistaken for another one.
@@ -4804,31 +5008,13 @@ async fn run_agent_read_transcript(
     // NOT an answer, whatever else this body carries. It changes nothing —
     // `activity` stays `working`, no request is resolved, and no completion
     // notification is disarmed or triggered by reading it.
-    if let Some(in_flight) = in_flight {
+    if partial {
         body.insert("partial".into(), serde_json::json!(true));
-        // The excerpt obeys `max_chars`, which can only ever narrow the
-        // adapter's own cap, and its own budget: the page above answers "what
-        // did it say", and spending that budget on mid-turn chatter would drop
-        // a finished answer in favour of a running one.
-        let mut row = serde_json::Map::new();
-        row.insert("turn_id".into(), serde_json::json!(in_flight.exec_turn_id));
-        row.insert(
-            "narration".into(),
-            serde_json::json!(in_flight.narration.as_str()),
-        );
-        let (text, omitted) = ccteam_harness::bounded_tail(&in_flight.text, max_chars);
-        let omitted = in_flight.omitted_chars.saturating_add(omitted);
-        if !text.is_empty() {
-            row.insert("text".into(), serde_json::json!(text));
+        if let Some(in_flight) = in_flight {
+            body.insert("in_flight".into(), in_flight);
+        } else {
+            body.insert("in_flight_omitted".into(), serde_json::json!(true));
         }
-        if omitted > 0 {
-            row.insert("truncated".into(), serde_json::json!(true));
-            row.insert("omitted_chars".into(), serde_json::json!(omitted));
-        }
-        if !in_flight.requests.is_empty() {
-            row.insert("requests".into(), serde_json::json!(in_flight.requests));
-        }
-        body.insert("in_flight".into(), serde_json::Value::Object(row));
     }
     // `status: "stopped"` used to mean nothing more than "not live", which
     // read as "this session is over" for a session that was merely between
@@ -8678,7 +8864,7 @@ mod session_tool_tests {
     fn page_collected_turns_pages_a_burst_without_loss() {
         let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
         // First poll, no cursor, page size 10.
-        let page = page_collected_turns(&all, None, 10, false);
+        let page = page_collected_turns(&all, None, 10, false).unwrap();
         assert_eq!(page.rows.len(), 10);
         assert_eq!(page.remaining, 15, "25 − 10 still to read");
         assert_eq!(
@@ -8694,7 +8880,7 @@ mod session_tool_tests {
         );
 
         // Second poll from the boundary.
-        let page2 = page_collected_turns(&all, Some("t9"), 10, false);
+        let page2 = page_collected_turns(&all, Some("t9"), 10, false).unwrap();
         assert_eq!(page2.rows.len(), 10);
         assert_eq!(page2.remaining, 5);
         assert_eq!(
@@ -8704,7 +8890,7 @@ mod session_tool_tests {
         assert_eq!(page2.cursor.as_deref(), Some("t19"));
 
         // Third poll drains the remainder.
-        let page3 = page_collected_turns(&all, Some("t19"), 10, false);
+        let page3 = page_collected_turns(&all, Some("t19"), 10, false).unwrap();
         assert_eq!(page3.rows.len(), 5);
         assert_eq!(page3.remaining, 0, "final page withholds nothing");
         assert_eq!(page3.rows[0]["turn_id"], "t20");
@@ -8726,18 +8912,17 @@ mod session_tool_tests {
     }
 
     /// A short backlog (≤ `n`) returns everything, nothing remaining, cursor =
-    /// last turn. An unknown cursor returns everything (never silently lose).
+    /// last turn. An unknown cursor errors without silently replaying history.
     #[test]
     fn page_collected_turns_short_and_unknown_cursor() {
         let all: Vec<_> = (0..3).map(|i| turn(&format!("t{i}"))).collect();
-        let page = page_collected_turns(&all, None, 20, false);
+        let page = page_collected_turns(&all, None, 20, false).unwrap();
         assert_eq!(page.rows.len(), 3);
         assert_eq!(page.remaining, 0);
         assert_eq!(page.cursor.as_deref(), Some("t2"));
-        // Unknown cursor → all turns (defensive, no loss).
+        // Unknown cursor cannot establish which turns the caller has held.
         let unknown = page_collected_turns(&all, Some("ghost"), 20, false);
-        assert_eq!(unknown.rows.len(), 3);
-        assert_eq!(unknown.remaining, 0);
+        assert!(unknown.is_err());
     }
 
     /// v0.9.1 — `tail:true` returns the NEWEST `n` (chronological inside the
@@ -8745,7 +8930,7 @@ mod session_tool_tests {
     #[test]
     fn page_collected_turns_tail_returns_newest() {
         let all: Vec<_> = (0..25).map(|i| turn(&format!("t{i}"))).collect();
-        let page = page_collected_turns(&all, None, 3, true);
+        let page = page_collected_turns(&all, None, 3, true).unwrap();
         assert_eq!(page.rows.len(), 3);
         assert_eq!(page.remaining, 22, "the older 22 are off the page");
         assert_eq!(
@@ -8759,7 +8944,7 @@ mod session_tool_tests {
             "a tail page always ends at the newest turn"
         );
         // `since` still applies before the tail cut.
-        let page2 = page_collected_turns(&all, Some("t22"), 5, true);
+        let page2 = page_collected_turns(&all, Some("t22"), 5, true).unwrap();
         assert_eq!(page2.rows.len(), 2, "only t23/t24 exist after t22");
         assert_eq!(page2.remaining, 0);
         assert_eq!(page2.rows[0]["turn_id"], "t23");
@@ -8772,20 +8957,20 @@ mod session_tool_tests {
     #[test]
     fn page_collected_turns_says_what_it_withheld() {
         let all: Vec<_> = (7..10).map(|i| turn(&format!("s1587-{i}"))).collect();
-        let page = page_collected_turns(&all, Some("s1587-7"), 1, false);
+        let page = page_collected_turns(&all, Some("s1587-7"), 1, false).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0]["turn_id"], "s1587-8", "oldest unread first");
         assert_eq!(page.cursor.as_deref(), Some("s1587-8"));
         assert_eq!(page.remaining, 1, "one newer turn was withheld");
         assert_eq!(page.latest.as_deref(), Some("s1587-9"));
 
-        let status = page_collected_turns(&all, Some("s1587-7"), 0, false);
+        let status = page_collected_turns(&all, Some("s1587-7"), 0, false).unwrap();
         assert!(status.rows.is_empty(), "n:0 carries no text");
         assert_eq!(status.cursor, None);
         assert_eq!(status.remaining, 2, "unread count since the cursor");
         assert_eq!(status.latest.as_deref(), Some("s1587-9"));
 
-        let caught_up = page_collected_turns(&all, Some("s1587-9"), 0, false);
+        let caught_up = page_collected_turns(&all, Some("s1587-9"), 0, false).unwrap();
         assert_eq!(caught_up.remaining, 0);
         assert_eq!(caught_up.latest.as_deref(), Some("s1587-9"));
     }
@@ -8804,7 +8989,7 @@ mod session_tool_tests {
         failed.error = Some("Selected model is at capacity.".into());
         let all = vec![turn("t1"), failed];
 
-        let page = page_collected_turns(&all, None, 10, true);
+        let page = page_collected_turns(&all, None, 10, true).unwrap();
         let (rows, cursor) = (page.rows, page.cursor);
         assert_eq!(rows.len(), 2, "the failure is a row, not a gap: {rows:?}");
         assert_eq!(rows[1]["turn_id"], "t2");
@@ -8822,7 +9007,9 @@ mod session_tool_tests {
         // user-side half of an exchange has no business in an answer page.
         let mut silent = turn("t3");
         silent.assistant = String::new();
-        let quiet = page_collected_turns(&[silent], None, 10, true).rows;
+        let quiet = page_collected_turns(&[silent], None, 10, true)
+            .unwrap()
+            .rows;
         assert!(quiet.is_empty(), "{quiet:?}");
     }
 
@@ -8966,12 +9153,13 @@ mod session_tool_tests {
     fn whole_turn_recipe_names_the_exact_read() {
         assert_eq!(
             whole_turn_recipe("s5", "t1", 908),
-            "agent_read{sid:s5,turn:t1,max_chars:908}"
+            "agent_read{sid:s5,turn:t1,max_chars:50000}"
         );
-        // The budget is clamped to what the parameter accepts, never 7.
+        // Serialized metadata and escaping count too, so raw text length is
+        // not a sufficient budget even for a short answer.
         assert_eq!(
             whole_turn_recipe("s5", "t0", 7),
-            "agent_read{sid:s5,turn:t0,max_chars:100}"
+            "agent_read{sid:s5,turn:t0,max_chars:50000}"
         );
     }
 
@@ -8989,20 +9177,17 @@ mod session_tool_tests {
         assert!(exact_collected_turn(&all, "ghost").is_none());
     }
 
-    /// issue #195 — a pointer that costs more than the text it withholds makes
-    /// the answer bigger AND worse, so the turn comes back whole.
+    /// GitHub #205 — a pointer may not widen the budget. The returned turn id
+    /// can name a whole read even when a full pointer cannot fit.
     #[test]
-    fn a_pointer_that_costs_more_than_it_saves_is_not_emitted() {
+    fn a_pointer_never_widens_the_requested_budget() {
         // 131 chars whole, 103 of budget: the pointer would withhold 28 chars
         // and cost 51 to say so — the exact shape measured in the field.
         let recipe = |_: &str, _: usize| "agent_read{sid:s5,n:1,max_chars:131}".to_string();
         let mut rows = vec![json!({ "turn_id": "t1", "content": "x".repeat(131) })];
         let (_total, truncated) = bound_collected_turns(&mut rows, 103, &recipe);
-        assert!(
-            !truncated,
-            "131 chars whole beats 103 chars of mostly marker"
-        );
-        assert_eq!(rows[0]["content"].as_str().unwrap().chars().count(), 131);
+        assert!(truncated);
+        assert_eq!(rows[0]["content"].as_str().unwrap().chars().count(), 103);
 
         // Far past the marker's own cost, truncation is the smaller answer again.
         let mut long = vec![json!({ "turn_id": "t1", "content": "x".repeat(4_000) })];
@@ -9043,6 +9228,31 @@ mod session_tool_tests {
             .collect();
         assert_eq!(drop_unaffordable_rows(&mut short, 1_000, true), 0);
         assert_eq!(short.len(), 10);
+    }
+
+    #[test]
+    fn shared_read_budget_counts_metadata_and_never_skips_a_forward_turn() {
+        let rows = vec![
+            json!({"turn_id":"t0", "content":"done", "error":"\\\"\n界".repeat(500)}),
+            json!({"turn_id":"t1", "content":"newer"}),
+        ];
+        let requests = vec![json!({
+            "request_id":"req0", "parent_sid":"s2", "state":"executing",
+            "progress": (0..100).map(|i| json!({"turn_id":format!("exec{i}"),"at":"timestamp"})).collect::<Vec<_>>()
+        })];
+        let bounded = bound_read_content(rows, requests, None, 300, false, &|_, _| "read".into());
+        assert!(bounded.turns.is_empty(), "cannot skip t0 to show t1");
+        assert!(
+            bounded.requests.is_empty(),
+            "large request metadata is budgeted"
+        );
+
+        let flight = json!({"turn_id":"exec1", "narration":"recorded", "text":"\\\"\n界".repeat(500), "requests":["req0"]});
+        let bounded = bound_in_flight(flight, 180).unwrap();
+        assert!(serialized_chars(&bounded) <= 180);
+        assert_eq!(bounded["requests"], json!(["req0"]));
+        assert_eq!(bounded["turn_id"], "exec1");
+        assert!(bounded["omitted_chars"].as_u64().unwrap() > 0);
     }
 
     /// The transcript branch answers "what did it say" with ONE turn; the
@@ -9464,6 +9674,127 @@ mod session_tool_tests {
         assert_eq!(b["delivery"]["written"], json!(false), "{b}");
     }
 
+    /// GitHub #205 — one response budget includes completed answers, request
+    /// metadata and running narration, including the JSON that carries them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn agent_read_budget_covers_requests_and_in_flight() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, parent, _stub) = queueing_dispatch_gateway_narrating(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&parent, "alpha", json!({ "vendor": "claude" })),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        run_agent_dispatch(
+            &ambient(
+                &parent,
+                "alpha",
+                json!({ "sid": child, "task": "keep working" }),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        let mut completed = turn("completed");
+        completed.assistant = "answer\\\"\n界".repeat(300);
+        ccteam_harness::execution::turns_mirror::append_turn(tmp.path(), &child, &completed)
+            .unwrap();
+        for max_chars in [100, 300, 1_000, 50_000] {
+            let body = parse(
+                &run_agent_read_transcript(
+                    &ambient(
+                        &parent,
+                        "alpha",
+                        json!({ "sid": child, "max_chars": max_chars }),
+                    ),
+                    &gateway,
+                    McpCaller::Ambient,
+                )
+                .await
+                .unwrap(),
+            );
+            let payload_chars: usize = ["turns", "requests", "in_flight"]
+                .iter()
+                .filter_map(|key| body.get(key))
+                .map(|value| value.to_string().chars().count())
+                .sum();
+            assert!(
+                payload_chars <= max_chars,
+                "{payload_chars} > {max_chars}: {body}"
+            );
+            assert_eq!(body["partial"], true, "running remains observable: {body}");
+            assert!(gateway
+                .lock()
+                .await
+                .parent_holds_delegation_request(&child, &parent));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn invalid_read_selectors_cannot_claim_a_completion_notification() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (gateway, parent, stub) = queueing_dispatch_gateway_narrating(tmp.path()).await;
+        let child = parse(
+            &run_agent_spawn(
+                &ambient(&parent, "alpha", json!({"vendor":"claude"})),
+                &gateway,
+                McpCaller::Ambient,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        run_agent_dispatch(
+            &ambient(
+                &parent,
+                "alpha",
+                json!({"sid":child,"task":"keep the receipt"}),
+            ),
+            &gateway,
+            McpCaller::Ambient,
+        )
+        .await
+        .unwrap();
+        for selector in ["since", "turn"] {
+            let args = ambient(
+                &parent,
+                "alpha",
+                json!({"sid":child,"wait":240,(selector):"missing"}),
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                run_agent_read_transcript(&args, &gateway, McpCaller::Ambient),
+            )
+            .await
+            .expect("invalid selector must fail before waiting");
+            assert!(result.is_err(), "{selector} accepted");
+        }
+        let previous = turn("previous");
+        ccteam_harness::execution::turns_mirror::append_turn(tmp.path(), &child, &previous)
+            .unwrap();
+        let args = ambient(
+            &parent,
+            "alpha",
+            json!({"sid":child,"turn":"previous","wait":240}),
+        );
+        let rejected = run_agent_read_transcript(&args, &gateway, McpCaller::Ambient)
+            .await
+            .unwrap_err();
+        assert!(rejected.contains("omit `wait`"));
+        stub.run_next_turn(&stub_identity(&child)).await;
+        assert_eq!(await_notifications(tmp.path(), &parent, 1).await.len(), 1);
+    }
+
     /// GitHub #197 (G) — a read of a child that is WORKING returns what its
     /// running turn has said so far, the execution turn it belongs to, and
     /// whose tasks that turn is answering.
@@ -9558,25 +9889,12 @@ mod session_tool_tests {
         );
         assert!(body.get("done").is_none(), "{body}");
 
-        // `max_chars` narrows the excerpt to its TAIL and adds what that drops
-        // to the same count. (The tool clamps the budget to its own floor.)
-        let budget = AGENT_READ_MIN_MAX_CHARS;
+        // At the minimum budget even the running turn's metadata cannot fit.
+        // It remains observable, and both omitted sections are counted.
         let narrowed = read(json!({ "sid": &child, "n": 0, "max_chars": 1 })).await;
-        let tail: String = STUB_NARRATION
-            .chars()
-            .skip(STUB_NARRATION.chars().count() - budget)
-            .collect();
-        assert_eq!(narrowed["in_flight"]["text"], json!(tail), "{narrowed}");
-        assert_eq!(
-            narrowed["in_flight"]["truncated"],
-            json!(true),
-            "{narrowed}"
-        );
-        assert_eq!(
-            narrowed["in_flight"]["omitted_chars"],
-            json!(STUB_NARRATION_OMITTED + STUB_NARRATION.chars().count() - budget),
-            "{narrowed}"
-        );
+        assert_eq!(narrowed["partial"], true, "{narrowed}");
+        assert_eq!(narrowed["in_flight_omitted"], true, "{narrowed}");
+        assert_eq!(narrowed["requests_remaining"], 1, "{narrowed}");
 
         // Reading a partial resolves nothing and disarms nothing: the real
         // boundary still reports to the parent that dispatched the task.
@@ -9595,6 +9913,15 @@ mod session_tool_tests {
         let after = read(json!({ "sid": &child, "n": 1 })).await;
         assert!(after.get("partial").is_none(), "{after}");
         assert!(after.get("in_flight").is_none(), "{after}");
+        assert!(
+            after.get("requests").is_none(),
+            "terminal history is opt-in: {after}"
+        );
+        let history = read(json!({ "sid": &child, "n": 0, "history": true })).await;
+        assert_eq!(
+            history["requests"][0]["request_id"], running["request_id"],
+            "{history}"
+        );
     }
 
     /// A channel that cannot report an in-flight turn's narration still says a
@@ -9706,7 +10033,7 @@ mod session_tool_tests {
         std::fs::write(
             chat_dir.join("deferred-input.json"),
             serde_json::to_vec(&json!({
-                "schema": 2,
+                "schema": 3,
                 "parked": [{"turn_id": queued["turn_id"], "text": "do not open a public port"}],
             }))
             .unwrap(),
@@ -11230,7 +11557,7 @@ mod session_tool_tests {
         assert_eq!(response["truncated"], true);
         assert!(response.get("model").is_none());
         let content = response["turns"][0]["content"].as_str().unwrap();
-        assert_eq!(content.chars().count(), 500);
+        assert_eq!(serialized_chars(&response["turns"]), 500);
         assert!(content.starts_with("HEAD"));
         assert!(content.ends_with("TAIL"));
     }
@@ -13648,6 +13975,39 @@ mod tool_face_tests {
         assert_eq!(
             tailed["turns"].as_array().unwrap().last().unwrap()["turn_id"],
             "t14"
+        );
+        let repeated = read(json!({"sid":child,"n":1})).await;
+        assert_eq!(
+            repeated["turns"], newest["turns"],
+            "n:1 is a latest read, not an acknowledgement"
+        );
+        let caught_up = read(json!({"sid":child,"since":"t14"})).await;
+        assert_eq!(caught_up["turns"], json!([]));
+        assert_eq!(
+            caught_up["cursor"], "t14",
+            "an empty delta keeps the cursor"
+        );
+        assert!(caught_up.get("remaining").is_none());
+        let mut cursor = "t1".to_string();
+        let mut unread = Vec::new();
+        loop {
+            let page = read(json!({"sid":child,"since":cursor,"n":500,"max_chars":100})).await;
+            let rows = page["turns"].as_array().unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            unread.extend(
+                rows.iter()
+                    .map(|row| row["turn_id"].as_str().unwrap().to_string()),
+            );
+            let next = page["cursor"].as_str().unwrap();
+            assert_ne!(next, cursor, "a returned forward page advances its cursor");
+            cursor = next.to_string();
+        }
+        assert_eq!(
+            unread,
+            (2..15).map(|i| format!("t{i}")).collect::<Vec<_>>(),
+            "budgeted pages never skip unread turns"
         );
     }
 
