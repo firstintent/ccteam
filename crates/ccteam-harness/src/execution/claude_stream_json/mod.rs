@@ -234,6 +234,19 @@ fn take_deferred_batch(queue: &mut DeferredQueue) -> Option<DeferredLine> {
         &texts.iter().map(String::as_str).collect::<Vec<_>>(),
         remaining,
     );
+    // A notification is an indivisible receipt: dropping bytes would alter
+    // its header/outcome/reference. Producers normally cap excerpts at 2000
+    // chars, but an unbounded vendor error kind can still exceed this budget.
+    // Deliver that item alone and say so instead of silently truncating it or
+    // permanently blocking all following receipts.
+    if first.text.chars().count() + first.repeat_marker().chars().count()
+        > NOTIFICATION_BATCH_MAX_CHARS
+    {
+        first.text = format!(
+            "[Oversized indivisible notification: delivered alone; batch budget {NOTIFICATION_BATCH_MAX_CHARS} chars]\n{}",
+            first.text
+        );
+    }
     Some(first)
 }
 
@@ -3073,6 +3086,46 @@ mod deferred_queue_tests {
         assert!(advance_deferred_queue(&queue, &ids, &active, dir.path(), "s99").is_none());
         assert_eq!(*queue.lock().unwrap(), original);
         assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn batch_budget_reserves_replay_overhead_and_reports_indivisible_overflow() {
+        let mut first = notification_line(0);
+        let mut second = notification_line(1);
+        first.text = "a".repeat(25_000);
+        let overhead = notification_batch_text(&first.turn_id, &[&first.text, ""], 0)
+            .chars()
+            .count();
+        second.text = "b".repeat(NOTIFICATION_BATCH_MAX_CHARS - overhead);
+        let mut queue = DeferredQueue {
+            in_flight: None,
+            parked: vec![first, second].into(),
+        };
+        let mut batch = take_deferred_batch(&mut queue).unwrap();
+        assert_eq!(
+            batch.members.len(),
+            1,
+            "reserve room for a crash replay marker"
+        );
+        batch.replayed = true;
+        assert!(batch.outbound_text().chars().count() <= NOTIFICATION_BATCH_MAX_CHARS);
+
+        let mut oversized = notification_line(2);
+        oversized
+            .text
+            .push_str(&"大".repeat(NOTIFICATION_BATCH_MAX_CHARS));
+        queue.parked.push_front(oversized.clone());
+        let batch = take_deferred_batch(&mut queue).unwrap();
+        assert!(batch
+            .text
+            .starts_with("[Oversized indivisible notification:"));
+        assert!(batch.text.contains(&oversized.text));
+        assert_eq!(batch.members, vec![oversized.turn_id]);
+        assert_eq!(
+            queue.parked.len(),
+            1,
+            "the following item is still deliverable"
+        );
     }
 
     /// GitHub #197 — the queue mutex is this session's ONE writer of

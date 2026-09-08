@@ -14,6 +14,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Delivery origin and vendor routing are independent. Both survive a cold
+/// queue so a dispatched task never comes back as a batchable notification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingIntent {
+    pub internal: bool,
+    pub routing: ccteam_harness::TurnRouting,
+}
+
 /// One queued user turn waiting for the session to become live.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingTurn {
@@ -33,8 +41,8 @@ pub struct PendingTurn {
     /// place a turn survives its submit call, so without carrying this the
     /// drain has to guess — and it guessed "internal" for everything, which
     /// makes a human's queued question look like nobody asked it.
-    #[serde(default)]
-    pub internal: bool,
+    #[serde(flatten)]
+    pub intent: PendingIntent,
     /// The delegation request this line belongs to, when the submit that
     /// enqueued it had one (issue #197 E). The queue is the only place a
     /// dispatched task survives its submit call, so without the identity here
@@ -90,7 +98,7 @@ pub fn enqueue_pending_turn(
     text: impl Into<String>,
     origin: Option<String>,
     literal: bool,
-    internal: bool,
+    intent: PendingIntent,
     request_id: Option<String>,
 ) -> Result<()> {
     let path = pending_path(project_dir, sid);
@@ -102,7 +110,7 @@ pub fn enqueue_pending_turn(
         enqueued_at: chrono::Utc::now().to_rfc3339(),
         origin,
         literal,
-        internal,
+        intent,
         request_id,
     };
     let mut f = OpenOptions::new()
@@ -201,12 +209,27 @@ mod tests {
             "the delegated task",
             None,
             false,
-            true,
+            PendingIntent {
+                internal: true,
+                routing: ccteam_harness::TurnRouting::Queue,
+            },
             Some("req-1".into()),
         )
         .unwrap();
         // A human's message queued behind the same body names nobody.
-        enqueue_pending_turn(tmp.path(), "s1", "hey", None, false, false, None).unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "hey",
+            None,
+            false,
+            PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
+            None,
+        )
+        .unwrap();
 
         let held = retained_pending(tmp.path(), "s1");
         assert_eq!(held.request_ids, vec!["req-1".to_string()]);
@@ -250,7 +273,10 @@ mod tests {
             "first",
             Some("web".into()),
             false,
-            false,
+            PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
             None,
         )
         .unwrap();
@@ -260,7 +286,10 @@ mod tests {
             "second",
             Some("web".into()),
             true,
-            true,
+            PendingIntent {
+                internal: true,
+                routing: ccteam_harness::TurnRouting::Notification,
+            },
             None,
         )
         .unwrap();

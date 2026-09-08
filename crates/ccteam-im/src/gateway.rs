@@ -322,6 +322,13 @@ struct TurnIntent {
 }
 
 impl TurnIntent {
+    fn pending(self) -> crate::pending_turns::PendingIntent {
+        crate::pending_turns::PendingIntent {
+            internal: self.origin == TurnOrigin::Internal,
+            routing: self.routing,
+        }
+    }
+
     /// The default: the origin picks the channel.
     fn from_origin(origin: TurnOrigin) -> Self {
         Self {
@@ -4068,7 +4075,7 @@ impl Gateway {
         text: &str,
         reply_to: &ChatKey,
         literal: bool,
-        internal: bool,
+        intent: TurnIntent,
         request_id: Option<&str>,
     ) -> Result<(String, String)> {
         let Some(detached) = self.detached.get(sid) else {
@@ -4083,7 +4090,7 @@ impl Gateway {
             text,
             Some(reply_to.channel.clone()),
             literal,
-            internal,
+            intent.pending(),
             request_id.map(str::to_string),
         )?;
         let queued = crate::pending_turns::pending_turn_count(&detached.cwd, sid);
@@ -6725,7 +6732,7 @@ impl Gateway {
             // v0.10.1 — the queue carries who asked (`internal`); the drain used
             // to relabel every row internal, which made a human's queued
             // question look unasked-for on the delivery side.
-            let origin = if turn.internal {
+            let origin = if turn.intent.internal {
                 TurnOrigin::Internal
             } else {
                 TurnOrigin::User
@@ -6733,15 +6740,15 @@ impl Gateway {
             // Box::pin: drain ↔ submit_resolved are mutually recursive when
             // a not-live submit enqueues then drains (async recursion needs
             // indirection for a finite future type).
-            // A drained pending turn opens its own turn (the session has just
-            // been revived, so nothing is in flight to steer): the origin's own
-            // channel is the right one.
+            // The first line may open a turn while later lines queue or steer.
+            // Origin alone cannot distinguish tasks from notifications: even
+            // a caller with no delegation principal can explicitly queue work.
             match Box::pin(self.submit_resolved(
                 &chat,
                 session_id,
                 "",
                 turn.text,
-                TurnIntent::from_origin(origin),
+                TurnIntent::routed(origin, turn.intent.routing),
                 turn.literal,
             ))
             .await
@@ -9608,7 +9615,7 @@ impl Gateway {
                     &payload,
                     chat,
                     literal_user_text,
-                    origin == TurnOrigin::Internal,
+                    intent,
                     None,
                 )?;
                 return Ok(SubmitResult::Queued { receipt, id });
@@ -9651,7 +9658,7 @@ impl Gateway {
                 payload.clone(),
                 Some(channel),
                 literal_user_text,
-                origin == TurnOrigin::Internal,
+                intent.pending(),
                 None,
             )?;
             self.resume_dead_session(session_id).await?;
@@ -15446,12 +15453,7 @@ impl Gateway {
                     let guard = deadline.lock(&gateway).await?;
                     let reply_to = ChatKey::from_identity(&identity).unwrap_or_else(web_api_chat);
                     let (receipt, id) = guard.queue_behind_detached_body(
-                        sid,
-                        &text,
-                        &reply_to,
-                        false,
-                        origin == TurnOrigin::Internal,
-                        request_id,
+                        sid, &text, &reply_to, false, intent, request_id,
                     )?;
                     guard.emit_sid_answer(sid, 0, receipt);
                     return Ok(TurnReceipt::opaque(id, true));
@@ -23941,7 +23943,7 @@ mod tests {
             "queued-first",
             Some("web".into()),
             false,
-            false,
+            TurnIntent::from_origin(TurnOrigin::User).pending(),
             None,
         )
         .unwrap();
@@ -32831,6 +32833,55 @@ mod tests {
         origins.record("steer".into(), TurnOrigin::Internal);
         assert_eq!(origins.take(Some("steer")), TurnOrigin::Internal);
         assert!(origins.by_turn.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cold_pending_tasks_keep_their_routing_even_without_request_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeAdapter::default());
+        let mut gateway = Gateway::new(fake.clone(), "alpha", tmp.path());
+        let sid = gateway
+            .create_session_api(
+                "alpha".into(),
+                String::new(),
+                AgentVendor::Claude,
+                PermissionMode::Skip,
+            )
+            .await
+            .unwrap()
+            .sid;
+        for routing in [
+            TurnRouting::Queue,
+            TurnRouting::Queue,
+            TurnRouting::Queue,
+            TurnRouting::Notification,
+            TurnRouting::Inject,
+        ] {
+            crate::pending_turns::enqueue_pending_turn(
+                tmp.path(),
+                &sid,
+                "queued content",
+                None,
+                false,
+                TurnIntent::routed(TurnOrigin::Internal, routing).pending(),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            gateway.drain_and_dispatch_pending_turns(&sid).await.len(),
+            5
+        );
+        assert_eq!(
+            *fake.routings.lock().await,
+            vec![
+                TurnRouting::Queue,
+                TurnRouting::Queue,
+                TurnRouting::Queue,
+                TurnRouting::Notification,
+                TurnRouting::Inject
+            ]
+        );
     }
 
     // ====================================================================
