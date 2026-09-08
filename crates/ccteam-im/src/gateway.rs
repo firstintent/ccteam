@@ -358,17 +358,12 @@ impl TurnOrigins {
         self.latest = origin;
     }
 
-    /// Consume the origin of `turn_id` (or of the single in-flight turn when
-    /// the event carries no id). An untracked harness wake-up defaults to
-    /// internal — nobody in this chat asked for it.
+    /// Consume the origin of a known execution id. Missing identity is never
+    /// inferred from the remaining user-only entries: internal notification
+    /// ids are intentionally absent from that map (GitHub #205).
     fn take(&mut self, turn_id: Option<&str>) -> TurnOrigin {
         match turn_id {
             Some(id) => self.by_turn.remove(id).unwrap_or(TurnOrigin::Internal),
-            None if self.by_turn.len() == 1 => {
-                let id = self.by_turn.keys().next().cloned();
-                id.and_then(|id| self.by_turn.remove(&id))
-                    .unwrap_or(TurnOrigin::Internal)
-            }
             None => TurnOrigin::Internal,
         }
     }
@@ -6721,6 +6716,9 @@ impl Gateway {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(sid = %session_id, error = %e, "drain pending_turns failed");
+                self.emit_sid_answer(session_id, 0, format!(
+                    "Pending input could not be resumed: {e:#}. The queue file was retained; repair it before retrying."
+                ));
                 return Vec::new();
             }
         };
@@ -7724,7 +7722,7 @@ impl Gateway {
                                 ThreadEvent::TurnFailed { turn_id, .. } => {
                                     Some(take_turn_origin(&session, Some(turn_id)))
                                 }
-                                ThreadEvent::Error(_) => Some(take_turn_origin(&session, None)),
+                                ThreadEvent::Error(_) => Some(take_turn_origin(&session, open_exec_turn.as_deref())),
                                 _ => None,
                             };
                             // ----- ANSWER (or error) -----
@@ -32827,6 +32825,16 @@ mod tests {
             origins.record(format!("note-{n}"), TurnOrigin::Internal);
         }
         assert_eq!(origins.by_turn.len(), 1);
+        assert_eq!(
+            origins.take(None),
+            TurnOrigin::Internal,
+            "an id-less failure cannot claim the only user row while internal work is pending"
+        );
+        assert_eq!(
+            origins.by_turn.len(),
+            1,
+            "unknown failures consume no identity"
+        );
         assert_eq!(origins.take(Some("note-0")), TurnOrigin::Internal);
         assert_eq!(origins.take(Some("human")), TurnOrigin::User);
         origins.record("steer".into(), TurnOrigin::User);

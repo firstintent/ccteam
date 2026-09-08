@@ -191,8 +191,9 @@ impl DeferredLine {
 const NOTIFICATION_BATCH_MAX_CHARS: usize = 50_000;
 
 fn notification_batch_text(id: &str, texts: &[&str], remaining: usize) -> String {
+    let noun = if texts.len() == 1 { "item" } else { "items" };
     format!(
-        "[Notification batch {id}: {} items]\n{}\n[Notifications still undelivered: {remaining}]",
+        "[Notification batch {id}: {} {noun}]\n{}\n[Notifications still undelivered: {remaining}]",
         texts.len(),
         texts.join("\n\n")
     )

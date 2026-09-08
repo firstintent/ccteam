@@ -126,29 +126,36 @@ pub fn enqueue_pending_turn(
     Ok(())
 }
 
-/// Drain all pending turns (FIFO order) and remove the file.
+/// Drain all pending turns (FIFO order) and remove the file. An unreadable row
+/// fails the whole drain and preserves the original bytes; missing routing is
+/// not guessed from text or caller identity (GitHub #205).
 pub fn drain_pending_turns(project_dir: &Path, sid: &str) -> Result<VecDeque<PendingTurn>> {
     let path = pending_path(project_dir, sid);
-    if !path.exists() {
-        return Ok(VecDeque::new());
-    }
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("read pending_turns {}", path.display()))?;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VecDeque::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read pending_turns {}", path.display()))
+        }
+    };
     let mut out = VecDeque::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("read pending input row {}", index + 1))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<PendingTurn>(line) {
-            Ok(t) => out.push_back(t),
-            Err(e) => {
-                tracing::warn!(error = %e, %line, "skip corrupt pending_turns row");
-            }
-        }
+        let turn = serde_json::from_str::<PendingTurn>(line).with_context(|| {
+            format!(
+                "pending input row {} is unreadable; queue retained at {}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        out.push_back(turn);
     }
-    let _ = std::fs::remove_file(&path);
+    std::fs::remove_file(&path)
+        .with_context(|| format!("retire pending input {}", path.display()))?;
     Ok(out)
 }
 
@@ -195,6 +202,36 @@ pub fn retained_pending(project_dir: &Path, sid: &str) -> RetainedPending {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn unreadable_pending_rows_block_the_drain_without_losing_any_bytes() {
+        let tmp = TempDir::new().unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "first",
+            None,
+            false,
+            PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
+            None,
+        )
+        .unwrap();
+        let path = pending_path(tmp.path(), "s1");
+        let valid = std::fs::read_to_string(&path).unwrap();
+        for invalid in [
+            "{\"text\":\"old task\",\"enqueued_at\":\"now\",\"internal\":true}\n",
+            "{torn\n",
+        ] {
+            let contents = format!("{valid}{invalid}{valid}");
+            std::fs::write(&path, &contents).unwrap();
+            assert!(drain_pending_turns(tmp.path(), "s1").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(retained_pending(tmp.path(), "s1").unattributed, 3);
+        }
+    }
 
     /// GitHub #197 (E) — a queued line is attributed to a request only when it
     /// SAYS which one, and rows that say nothing are counted, never spread over
