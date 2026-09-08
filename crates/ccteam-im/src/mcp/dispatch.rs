@@ -4286,14 +4286,21 @@ fn drop_unaffordable_rows(
             .map(|text| text.chars().count())
             .unwrap_or(0)
     };
-    let mut total: usize = rows.iter().map(row_chars).sum();
-    let mut dropped = 0;
-    while rows.len() > 1 && total > max_chars && max_chars / rows.len() < MIN_USEFUL_ROW_CHARS {
-        let victim = if tail { 0 } else { rows.len() - 1 };
-        total -= row_chars(&rows[victim]);
-        rows.remove(victim);
-        dropped += 1;
+    let sizes: Vec<_> = rows.iter().map(row_chars).collect();
+    let mut total: usize = sizes.iter().sum();
+    let (mut start, mut end) = (0, rows.len());
+    while end - start > 1 && total > max_chars && max_chars / (end - start) < MIN_USEFUL_ROW_CHARS {
+        let victim = if tail { start } else { end - 1 };
+        total -= sizes[victim];
+        if tail {
+            start += 1;
+        } else {
+            end -= 1;
+        }
     }
+    let dropped = rows.len() - (end - start);
+    rows.truncate(end);
+    rows.drain(..start);
     dropped
 }
 
@@ -4388,7 +4395,19 @@ fn bound_read_content(
     max_chars: usize,
     tail: bool,
     recipe: &dyn Fn(&str, usize) -> String,
-) -> ReadContent {
+) -> Result<ReadContent, String> {
+    // Reserve the next cursor's immutable identity before sharing with request
+    // history or narration. Otherwise either can starve forward paging (#205).
+    let next = if tail { turns.last() } else { turns.first() };
+    let turn_floor = next
+        .map(|row| serialized_chars(&turn_identity_row(row)))
+        .unwrap_or(0);
+    if turn_floor + 2 > max_chars {
+        return Err(format!(
+            "agent_read: turn identity requires at least {} chars; increase max_chars (maximum {AGENT_READ_MAX_MAX_CHARS})",
+            turn_floor + 2
+        ));
+    }
     let mut wire_turns = turns.clone();
     strip_bounding_fields(&mut wire_turns);
     // `turns:[]` is mandatory and costs two characters even on an empty page.
@@ -4399,7 +4418,14 @@ fn bound_read_content(
         serialized_chars(&serde_json::json!(requests))
     };
     let flight_chars = in_flight.as_ref().map(serialized_chars).unwrap_or(0);
-    let shares = collected_turn_budgets(&[turn_chars, request_chars, flight_chars], max_chars - 2);
+    let shares = collected_turn_budgets(
+        &[
+            turn_chars.saturating_sub(turn_floor),
+            request_chars,
+            flight_chars,
+        ],
+        max_chars - 2 - turn_floor,
+    );
 
     // Request rows stay whole: cutting an id, delivery fact or progress entry
     // would fabricate a different receipt. Count every withheld row instead.
@@ -4414,17 +4440,20 @@ fn bound_read_content(
         kept_requests.push(request);
     }
     let available = max_chars - 2 - request_used;
-    let shares = collected_turn_budgets(&[turn_chars, flight_chars], available);
+    let shares = collected_turn_budgets(
+        &[turn_chars.saturating_sub(turn_floor), flight_chars],
+        available - turn_floor,
+    );
     let in_flight = in_flight.and_then(|row| bound_in_flight(row, shares[1]));
     let flight_used = in_flight.as_ref().map(serialized_chars).unwrap_or(0);
     let (turns, truncated) =
         bound_serialized_turns(turns, available - flight_used + 2, tail, recipe);
-    ReadContent {
+    Ok(ReadContent {
         turns,
         requests: kept_requests,
         in_flight,
         truncated,
-    }
+    })
 }
 
 fn bound_in_flight(mut row: serde_json::Value, max_chars: usize) -> Option<serde_json::Value> {
@@ -4460,39 +4489,146 @@ fn bound_in_flight(mut row: serde_json::Value, max_chars: usize) -> Option<serde
     }
 }
 
+/// Immutable row identity. Diagnostic text is budgeted just like content;
+/// duplicating a vendor error in `error` must never make its turn unreadable.
+fn turn_identity_row(row: &serde_json::Value) -> serde_json::Value {
+    let mut identity: serde_json::Map<String, serde_json::Value> = row
+        .as_object()
+        .expect("transcript row")
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "content" | "conclusion" | "error" | "error_kind"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    identity.insert("content".into(), serde_json::json!(""));
+    serde_json::Value::Object(identity)
+}
+
+fn bound_turn_row(
+    mut row: serde_json::Value,
+    max_chars: usize,
+    recipe: &dyn Fn(&str, usize) -> String,
+) -> (serde_json::Value, bool) {
+    let conclusion = row
+        .as_object_mut()
+        .expect("transcript row")
+        .remove("conclusion");
+    if serialized_chars(&row) <= max_chars {
+        return (row, false);
+    }
+    let turn_id = row["turn_id"].clone();
+    let mut identity = turn_identity_row(&row);
+    let fields: Vec<_> = ["content", "error_kind", "error"]
+        .into_iter()
+        .filter_map(|key| row.get(key).map(|value| (key, value)))
+        .collect();
+    // A new string field costs its quoted key, colon, quotes and a comma.
+    // `content` already occupies an empty string in the immutable skeleton.
+    let overhead = |key: &str| if key == "content" { 0 } else { key.len() + 6 };
+    let lengths: Vec<_> = fields
+        .iter()
+        .map(|(key, value)| serialized_chars(value) - 2 + overhead(key))
+        .collect();
+    let budgets = collected_turn_budgets(&lengths, max_chars - serialized_chars(&identity));
+    let mut truncated = false;
+    for ((key, value), budget) in fields.into_iter().zip(budgets) {
+        if budget < overhead(key) {
+            truncated = true;
+            continue;
+        }
+        let limit = budget - overhead(key);
+        let mut source = serde_json::json!({"turn_id":turn_id, "content":value});
+        if key == "content" {
+            if let Some(conclusion) = &conclusion {
+                source["conclusion"] = conclusion.clone();
+            }
+        }
+        let mut cap = limit;
+        loop {
+            let mut excerpt = vec![source.clone()];
+            let (_, cut) = bound_collected_turns(&mut excerpt, cap, recipe);
+            let text = excerpt[0]["content"].take();
+            let used = serialized_chars(&text) - 2;
+            if used <= limit {
+                identity[key] = text;
+                truncated |= cut;
+                break;
+            }
+            cap = cap.saturating_sub(used - limit);
+        }
+    }
+    (identity, truncated)
+}
+
 fn bound_serialized_turns(
     mut rows: Vec<serde_json::Value>,
     max_chars: usize,
     tail: bool,
     recipe: &dyn Fn(&str, usize) -> String,
 ) -> (Vec<serde_json::Value>, bool) {
-    drop_unaffordable_rows(&mut rows, max_chars, tail);
-    loop {
-        let mut skeleton = rows.clone();
-        strip_bounding_fields(&mut skeleton);
-        for row in &mut skeleton {
-            row["content"] = serde_json::json!("");
+    if rows.is_empty() {
+        return (rows, false);
+    }
+    let dropped = drop_unaffordable_rows(&mut rows, max_chars, tail);
+    // Size each row once, then trim indices. Repeatedly cloning/serializing the
+    // whole shrinking page was quadratic in long failure metadata (#205).
+    let costs: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let mut wire = row.clone();
+            wire.as_object_mut()
+                .expect("transcript row")
+                .remove("conclusion");
+            (
+                serialized_chars(&wire),
+                serialized_chars(&turn_identity_row(row)),
+            )
+        })
+        .collect();
+    let mut full: usize = costs.iter().map(|(full, _)| full).sum();
+    let mut minimum: usize = costs.iter().map(|(_, minimum)| minimum).sum();
+    let (mut start, mut end) = (0, rows.len());
+    while end - start > 1 {
+        let count = end - start;
+        let punctuation = count + 1;
+        if minimum + punctuation <= max_chars
+            && (full + punctuation <= max_chars || max_chars / count >= MIN_USEFUL_ROW_CHARS)
+        {
+            break;
         }
-        let overhead = serialized_chars(&serde_json::json!(skeleton));
-        if overhead > max_chars && !rows.is_empty() {
-            let victim = if tail { 0 } else { rows.len() - 1 };
-            rows.remove(victim);
-            continue;
-        }
-        let mut content_budget = max_chars.saturating_sub(overhead);
-        loop {
-            let mut bounded = rows.clone();
-            let (_, truncated) = bound_collected_turns(&mut bounded, content_budget, recipe);
-            let used = serialized_chars(&serde_json::json!(bounded));
-            if used <= max_chars {
-                return (bounded, truncated);
-            }
-            // Escaping may cost several serialized characters per source
-            // character. Rebudget from the original text, preserving the
-            // conclusion and avoiding a second truncation marker (#205).
-            content_budget = content_budget.saturating_sub(used - max_chars);
+        let victim = if tail { start } else { end - 1 };
+        full -= costs[victim].0;
+        minimum -= costs[victim].1;
+        if tail {
+            start += 1;
+        } else {
+            end -= 1;
         }
     }
+    let punctuation = end - start + 1;
+    let lengths: Vec<_> = costs[start..end]
+        .iter()
+        .map(|(full, min)| full - min)
+        .collect();
+    let budgets = collected_turn_budgets(&lengths, max_chars - punctuation - minimum);
+    let mut truncated = dropped > 0 || start != 0 || end != rows.len();
+    let bounded = rows
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .zip(&costs[start..end])
+        .zip(budgets)
+        .map(|((row, (_, min)), budget)| {
+            let (row, cut) = bound_turn_row(row, min + budget, recipe);
+            truncated |= cut;
+            row
+        })
+        .collect();
+    (bounded, truncated)
 }
 
 /// v0.9.1 — honest per-sid activity for the MCP surfaces: the SAME resolver the
@@ -4928,7 +5064,7 @@ async fn run_agent_read_transcript(
         requests,
         in_flight,
         truncated: content_truncated,
-    } = bound_read_content(rows, requests, in_flight, max_chars, tail, &recipe);
+    } = bound_read_content(rows, requests, in_flight, max_chars, tail, &recipe)?;
     remaining += selected_turns - rows.len();
     // Never advance past a withheld forward row, including a page too small
     // to carry even its metadata. An empty incremental read keeps its cursor.
@@ -4968,8 +5104,9 @@ async fn run_agent_read_transcript(
     if let Some(latest) = latest.filter(|latest| Some(latest.as_str()) != cursor.as_deref()) {
         body.insert("latest".into(), serde_json::json!(latest));
     }
-    // `truncated` is about TEXT: a returned turn was cut to fit `max_chars`
-    // (its marker carries the exact read of the whole turn).
+    // A turn's content/diagnostics were cut, or whole rows were withheld by
+    // the budget. `remaining` still counts unread rows; it is not the only
+    // indication that the response hit its budget.
     if content_truncated {
         body.insert("truncated".into(), serde_json::json!(true));
     }
@@ -9240,8 +9377,14 @@ mod session_tool_tests {
             "request_id":"req0", "parent_sid":"s2", "state":"executing",
             "progress": (0..100).map(|i| json!({"turn_id":format!("exec{i}"),"at":"timestamp"})).collect::<Vec<_>>()
         })];
-        let bounded = bound_read_content(rows, requests, None, 300, false, &|_, _| "read".into());
-        assert!(bounded.turns.is_empty(), "cannot skip t0 to show t1");
+        let bounded =
+            bound_read_content(rows, requests, None, 300, false, &|_, _| "read".into()).unwrap();
+        assert_eq!(
+            bounded.turns[0]["turn_id"], "t0",
+            "cannot skip t0 to show t1"
+        );
+        assert!(bounded.truncated);
+        assert!(serialized_chars(&json!(bounded.turns)) <= 300);
         assert!(
             bounded.requests.is_empty(),
             "large request metadata is budgeted"
@@ -9253,6 +9396,61 @@ mod session_tool_tests {
         assert_eq!(bounded["requests"], json!(["req0"]));
         assert_eq!(bounded["turn_id"], "exec1");
         assert!(bounded["omitted_chars"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn oversized_failure_text_cannot_hide_an_exact_turn_or_block_a_cursor() {
+        let error = "vendor \"failure\"\n界".repeat(10_000);
+        let row = json!({"turn_id":"s12-1", "content":error,
+            "outcome":"failed", "error_kind":"vendor_error", "error":error});
+        for budget in [100, 1_000, 50_000] {
+            let (rows, truncated) =
+                bound_serialized_turns(vec![row.clone()], budget, false, &|_, _| {
+                    "agent_read{turn:s12-1}".into()
+                });
+            assert_eq!(rows.len(), 1, "budget {budget} hid the exact answer");
+            assert_eq!(rows[0]["turn_id"], "s12-1");
+            assert_eq!(rows[0]["outcome"], "failed");
+            assert!(truncated, "cuts to error metadata must be visible");
+            assert!(serialized_chars(&json!(rows)) <= budget);
+        }
+    }
+
+    #[test]
+    fn a_cursor_identity_reserves_budget_before_requests_and_running_narration() {
+        for budget in [100, 300, 1_000] {
+            let bounded = bound_read_content(
+                vec![json!({"turn_id":"s123456789-100", "outcome":"failed", "content":"error".repeat(500), "error":"error".repeat(500)})],
+                vec![json!({"request_id":"request-1", "state":"executing"})],
+                Some(json!({"turn_id":"current-exec", "narration":"recorded", "text":"still running".repeat(500)})),
+                budget, false, &|_, _| "read".into(),
+            ).unwrap();
+            assert_eq!(bounded.turns[0]["turn_id"], "s123456789-100");
+            let used = serialized_chars(&json!(bounded.turns))
+                + if bounded.requests.is_empty() {
+                    0
+                } else {
+                    serialized_chars(&json!(bounded.requests))
+                }
+                + bounded
+                    .in_flight
+                    .as_ref()
+                    .map(serialized_chars)
+                    .unwrap_or(0);
+            assert!(used <= budget, "{used} > {budget}");
+        }
+        let too_large = bound_read_content(
+            vec![json!({"turn_id":"x".repeat(200), "content":"ok"})],
+            vec![],
+            None,
+            100,
+            false,
+            &|_, _| "read".into(),
+        );
+        assert!(too_large
+            .err()
+            .unwrap()
+            .contains("turn identity requires at least"));
     }
 
     /// The transcript branch answers "what did it say" with ONE turn; the
@@ -9908,6 +10106,22 @@ mod session_tool_tests {
         let notes = await_notifications(&project_dir, &principal, 1).await;
         assert_eq!(notes.len(), 1, "the completion still arrives: {notes:?}");
         assert!(notes[0].contains("migration"), "{notes:?}");
+
+        // The parent's notification becomes visible before the notifier commits
+        // its child's terminal request state. Wait for that fact before asserting
+        // that terminal-history filtering removes it; a live request is valid.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while gw
+                .lock()
+                .await
+                .delegation_request_state(&child, running["request_id"].as_str().unwrap())
+                .is_some_and(|state| !state.is_terminal())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("notifier commits the terminal request state");
 
         // …and once the turn is over there is no partial to report.
         let after = read(json!({ "sid": &child, "n": 1 })).await;
@@ -14012,6 +14226,62 @@ mod tool_face_tests {
             (2..15).map(|i| format!("t{i}")).collect::<Vec<_>>(),
             "budgeted pages never skip unread turns"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_and_incremental_reads_survive_a_failure_larger_than_the_maximum_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("home"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let (gateway, root, _secrets) = face_gateway(tmp.path()).await;
+        let child = parse(
+            &run_agent(
+                &ambient(&root, "alpha", json!({"task":"x", "notify":"off"})),
+                &gateway,
+                McpCaller::Ambient,
+                &paths,
+            )
+            .await
+            .unwrap(),
+        )["sid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut failed = turn("t1");
+        failed.assistant = "vendor \"failure\"\n界".repeat(10_000);
+        failed.error = Some(failed.assistant.clone());
+        failed.error_kind = Some("vendor_error".into());
+        failed.outcome = Some("failed".into());
+        for row in [turn("t0"), failed, turn("t2")] {
+            ccteam_harness::execution::turns_mirror::append_turn(tmp.path(), &child, &row).unwrap();
+        }
+        let read = |args: serde_json::Value| {
+            let gateway = Arc::clone(&gateway);
+            let paths = paths.clone();
+            let args = ambient(&root, "alpha", args);
+            async move {
+                parse(
+                    &run_agent_read(&args, &gateway, McpCaller::Ambient, &paths)
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+        for budget in [100, 1_000, 50_000] {
+            let exact = read(json!({"sid":child,"turn":"t1","max_chars":budget})).await;
+            assert_eq!(exact["turns"][0]["turn_id"], "t1", "{exact}");
+            assert_eq!(exact["turns"][0]["outcome"], "failed");
+            assert_eq!(exact["truncated"], true);
+            assert!(serialized_chars(&exact["turns"]) <= budget);
+            let forward = read(json!({"sid":child,"since":"t0","max_chars":budget})).await;
+            assert_eq!(forward["turns"][0]["turn_id"], "t1", "{forward}");
+            assert_eq!(forward["cursor"], "t1");
+            let next =
+                read(json!({"sid":child,"since":forward["cursor"],"max_chars":budget})).await;
+            assert_eq!(next["turns"][0]["turn_id"], "t2", "{next}");
+        }
     }
 
     /// "Never seen here" and "you stopped it" are the same absence from the
