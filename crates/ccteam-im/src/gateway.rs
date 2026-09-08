@@ -290,7 +290,8 @@ impl Default for TurnOrigin {
 /// The vendor channel a turn's origin asks for. A human's message joins the
 /// running turn (`Inject`: they are steering work they can see). A
 /// ccteam-authored turn — a delegation completion notification — is a distinct
-/// follow-up (`Queue`): nobody is steering with it, and on claude a mid-turn
+/// follow-up (`Notification`, batchable at a boundary): nobody is steering
+/// with it, and on claude a mid-turn
 /// stdin line is shown to the model twice, as a queued-command preview and then
 /// as the next prompt (issue #194: every completion report charged the
 /// orchestrator double). A vendor without a queued-turn channel takes its
@@ -298,7 +299,7 @@ impl Default for TurnOrigin {
 fn routing_for_origin(origin: TurnOrigin) -> TurnRouting {
     match origin {
         TurnOrigin::User => TurnRouting::Inject,
-        TurnOrigin::Internal => TurnRouting::Queue,
+        TurnOrigin::Internal => TurnRouting::Notification,
     }
 }
 
@@ -339,7 +340,14 @@ impl TurnIntent {
 
 impl TurnOrigins {
     fn record(&mut self, turn_id: String, origin: TurnOrigin) {
-        self.by_turn.insert(turn_id, origin);
+        // Internal is already the lookup default. Notification batches execute
+        // under one of several accepted ids; storing every internal id would
+        // leave the other members here forever (GitHub #205).
+        if origin == TurnOrigin::Internal {
+            self.by_turn.remove(&turn_id);
+        } else {
+            self.by_turn.insert(turn_id, origin);
+        }
         self.latest = origin;
     }
 
@@ -14618,8 +14626,19 @@ impl Gateway {
     /// acceptance order), then the most recent resolved ones. Each row says
     /// what ccteam actually knows and marks the rest `unknown`.
     pub fn delegation_request_rows(&self, child_sid: &str, limit: usize) -> Vec<serde_json::Value> {
+        self.delegation_request_page(child_sid, limit, true).0
+    }
+
+    /// GitHub #205: completed request history is opt-in. Count before limiting
+    /// so a budgeted read can report omitted rows without serializing them all.
+    pub fn delegation_request_page(
+        &self,
+        child_sid: &str,
+        limit: usize,
+        include_history: bool,
+    ) -> (Vec<serde_json::Value>, usize) {
         let Some(mirror) = self.delegations.get(child_sid) else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
         let held = self.retained_lines(&mirror.project_dir, child_sid);
         let mut ordered: Vec<&ccteam_harness::DelegationRequest> =
@@ -14629,14 +14648,16 @@ impl Gateway {
                 .store
                 .requests
                 .iter()
-                .filter(|request| request.state.is_terminal())
+                .filter(|request| include_history && request.state.is_terminal())
                 .rev(),
         );
-        ordered
+        let total = ordered.len();
+        let rows = ordered
             .into_iter()
             .take(limit)
             .map(|request| delegation_request_row(request, &held))
-            .collect()
+            .collect();
+        (rows, total)
     }
 
     /// `parent_sid`'s outstanding request ids on `child_sid`, in acceptance
@@ -22340,7 +22361,7 @@ mod tests {
         ) -> (String, TurnDisposition, Option<usize>) {
             let mut queues = self.turn_queues.lock().unwrap();
             let queue = queues.entry(identity.to_string()).or_default();
-            let queued = routing == TurnRouting::Queue
+            let queued = matches!(routing, TurnRouting::Queue | TurnRouting::Notification)
                 || (self.degrade_inject_to_queue && routing == TurnRouting::Inject);
             match queue.active.clone() {
                 None => {
@@ -22949,7 +22970,7 @@ mod tests {
 
         assert_eq!(
             fake.routings.lock().await.as_slice(),
-            &[TurnRouting::Inject, TurnRouting::Queue],
+            &[TurnRouting::Inject, TurnRouting::Notification],
             "a dispatch may steer; a completion notification never does"
         );
     }
@@ -22993,7 +23014,7 @@ mod tests {
 
         assert_eq!(
             fake.routings.lock().await.as_slice(),
-            &[TurnRouting::Inject, TurnRouting::Queue],
+            &[TurnRouting::Inject, TurnRouting::Notification],
             "human = Inject, ccteam-authored = Queue"
         );
         assert!(
@@ -32701,6 +32722,117 @@ mod tests {
         (parent, child)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn thirteen_collected_completions_are_still_notified_independently() {
+        use ccteam_harness::execution::progress_bridge::{
+            DELEGATION_COLLECTED, DELEGATION_NOTIFIED,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CcteamPaths {
+            root: tmp.path().join("engine"),
+            projects_root: tmp.path().join("projects"),
+        };
+        let gateway = delegation_gateway(tmp.path()).await;
+        gateway.lock().await.enable_project_creation(paths.clone());
+        let (parent, child) = delegation_pair(&gateway).await;
+        let mut requests = Vec::new();
+        for n in 0..13 {
+            let mut gw = gateway.lock().await;
+            let id = gw
+                .accept_delegation_request(
+                    &DelegationStoreClaim::for_test(&child),
+                    &parent,
+                    ccteam_harness::NotifyMode::Final,
+                    Some(format!("task {n}")),
+                    TurnRouting::Queue,
+                    None,
+                )
+                .unwrap();
+            gw.bind_delegation_request_for_test(
+                &DelegationStoreClaim::for_test(&child),
+                &id,
+                "answer-exec",
+            );
+            let emitter = gw.delegation_progress_emitter();
+            drop(gw);
+            // Collected is only a ledger observation, never a delivery ack.
+            emitter
+                .emit(DelegationProgressRecord {
+                    slug: "alpha".into(),
+                    event: DELEGATION_COLLECTED.into(),
+                    parent_sid: parent.clone(),
+                    child_sid: child.clone(),
+                    vendor: AgentVendor::Claude,
+                    host: "local".into(),
+                    turn: Some(format!("{child}-1")),
+                    title: Some(format!("task {n}")),
+                    reason: None,
+                })
+                .await;
+            requests.push(id);
+        }
+        Gateway::deliver_delegation_signal_shared(
+            Arc::clone(&gateway),
+            crate::delegation::DelegationSignal {
+                child_sid: child.clone(),
+                turn_id: format!("{child}-1"),
+                exec_turn_id: Some("answer-exec".into()),
+                tail: "the answer".into(),
+                vendor: AgentVendor::Claude,
+                host: "local".into(),
+                boundary: true,
+                vendor_error: false,
+                interim_notes: 0,
+                covered_turns: vec![format!("{child}-1")],
+                context_pct: None,
+                turn: 1,
+                error_kind: None,
+                conclusion: None,
+                terminal: true,
+            },
+        )
+        .await;
+        let store = ccteam_harness::read_delegation_requests(tmp.path(), &child).unwrap();
+        for id in &requests {
+            let request = store.get(id).unwrap();
+            assert!(request.notified, "{request:?}");
+            assert_eq!(
+                request.answered_turn.as_deref(),
+                Some(format!("{child}-1").as_str())
+            );
+        }
+        let events =
+            ccteam_core::progress::read_all_events(&paths.progress_jsonl("alpha")).unwrap();
+        let notified: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == DELEGATION_NOTIFIED)
+            .collect();
+        assert_eq!(notified.len(), 13, "{notified:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == DELEGATION_COLLECTED)
+                .count(),
+            13
+        );
+    }
+
+    #[test]
+    fn notification_batch_origins_do_not_retain_unused_member_ids() {
+        let mut origins = TurnOrigins::default();
+        origins.record("human".into(), TurnOrigin::User);
+        for n in 0..13 {
+            origins.record(format!("note-{n}"), TurnOrigin::Internal);
+        }
+        assert_eq!(origins.by_turn.len(), 1);
+        assert_eq!(origins.take(Some("note-0")), TurnOrigin::Internal);
+        assert_eq!(origins.take(Some("human")), TurnOrigin::User);
+        origins.record("steer".into(), TurnOrigin::User);
+        origins.record("steer".into(), TurnOrigin::Internal);
+        assert_eq!(origins.take(Some("steer")), TurnOrigin::Internal);
+        assert!(origins.by_turn.is_empty());
+    }
+
     // ====================================================================
     // GitHub #197 (B) — restart reconcile rebinds by IDENTITY, and two
     // parents on one child each get their own answer.
@@ -35818,7 +35950,7 @@ mod tests {
         std::fs::write(
             chat_dir.join("deferred-input.json"),
             serde_json::to_vec(&serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "parked": [{"turn_id": "parked-turn-1", "text": "do not open a public port"}],
             }))
             .unwrap(),

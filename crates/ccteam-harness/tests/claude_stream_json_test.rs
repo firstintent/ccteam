@@ -777,6 +777,70 @@ async fn queued_text_during_turn_is_delivered_once_after_the_turn() {
     std::env::remove_var("FAKE_SJ_USER_LOG");
 }
 
+/// GitHub #205: real adapter transport, 13 independently accepted completion
+/// lines, exactly one boundary wakeup. Their text and identities stay verbatim.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn thirteen_completion_notifications_open_one_vendor_turn() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    setup(tmp.path());
+    let user_log = tmp.path().join("user.log");
+    std::env::set_var("FAKE_SJ_USER_LOG", &user_log);
+    std::env::set_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS", "2");
+    let adapter = ClaudeStreamJsonAdapter::new();
+    let handle = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: "alice".into(),
+            },
+            &ctx(tmp.path(), "demo", "s9"),
+        )
+        .await
+        .unwrap();
+    let mut events = adapter.events(&handle);
+    adapter
+        .submit_turn(&handle, TurnInput::UserText("long task".into()))
+        .await
+        .unwrap();
+    let lines: Vec<_> = (0..13).map(|n| {
+        format!("s{n} done · claude · turn {n} req-{n}\nanswer {n} agent_read{{sid:s{n},turn:t{n}}}")
+    }).collect();
+    for (n, line) in lines.iter().enumerate() {
+        let receipt = adapter
+            .submit_turn_routed(
+                &handle,
+                TurnInput::UserText(line.clone()),
+                TurnRouting::Notification,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.disposition, TurnDisposition::Queued);
+        assert_eq!(receipt.queue_position, Some(n + 1));
+    }
+    assert_eq!(
+        read_deferred_mirror(tmp.path(), "s9").unwrap()["parked"]
+            .as_array()
+            .unwrap()
+            .len(),
+        13
+    );
+    await_completed_turns(&mut events, 2).await;
+    await_no_deferred_mirror(tmp.path(), "s9").await;
+    let logged = std::fs::read_to_string(&user_log).unwrap();
+    assert_eq!(
+        logged.matches("[Notification batch ").count(),
+        1,
+        "{logged}"
+    );
+    assert!(logged.contains("13 items]"), "{logged}");
+    for line in &lines {
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+    }
+    assert!(logged.contains("[Notifications still undelivered: 0]"));
+    std::env::remove_var("FAKE_SJ_SLOW_FIRST_RESULT_SECS");
+    std::env::remove_var("FAKE_SJ_USER_LOG");
+}
+
 /// A `Queue` request on an IDLE session starts a turn at once — the routing is
 /// a preference about the running turn, not a delay.
 #[tokio::test(flavor = "current_thread")]
@@ -835,7 +899,7 @@ async fn parked_input_left_by_a_previous_daemon_is_flushed_after_the_first_turn(
         tmp.path(),
         "s9",
         serde_json::json!({
-            "schema": 2,
+            "schema": 3,
             "parked": [
                 {"turn_id": "sj-prev-1", "text": "s7 done · claude · turn 1"},
                 {"turn_id": "sj-prev-2", "text": "s8 done · codex · turn 2"},
@@ -1148,7 +1212,7 @@ async fn an_in_flight_line_whose_turn_already_answered_is_not_replayed() {
         tmp.path(),
         "s9",
         serde_json::json!({
-            "schema": 2,
+            "schema": 3,
             "in_flight": {"turn_id": "sj-prev-1", "text": "s7 done · claude · turn 1"},
             "parked": [],
         }),
@@ -1637,7 +1701,7 @@ fn retained_input_separates_what_was_written_from_what_was_not() {
         tmp.path(),
         "s9",
         serde_json::json!({
-            "schema": 2,
+            "schema": 3,
             "in_flight": {"turn_id": "sj-a", "text": "written, unobserved"},
             "parked": [{"turn_id": "sj-b", "text": "still ours"}],
         }),

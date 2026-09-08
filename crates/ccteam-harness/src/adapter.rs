@@ -536,6 +536,10 @@ pub enum TurnRouting {
     /// shown to the model twice, once as a queued-command preview and once as
     /// the next prompt; a distinct turn is charged once).
     Queue,
+    /// Internal completion delivery. Like Queue, but adjacent notifications
+    /// already parked at a boundary may share a turn (GitHub #205). Explicit
+    /// dispatched tasks keep Queue and their independent execution identities.
+    Notification,
 }
 
 /// What the adapter actually did with one accepted message.
