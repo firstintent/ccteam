@@ -34,7 +34,22 @@ use crate::execution::dsh_acp::{
 
 const DEFAULT_ATTACH_URL: &str = "http://127.0.0.1:3080";
 const ATTACH_URL_ENV: &str = "CCTEAM_DSH_WEB_ATTACH_URL";
-const READINESS_PREFIX: &str = "dsh web: http://127.0.0.1:";
+/// Everything `dsh web` prints after this prefix is ONE whitespace-delimited
+/// URL, taken verbatim — see [`parse_readiness`]. The port used to be scraped
+/// out of a longer hardcoded prefix, which is why 0.1.5 adding `?token=` to
+/// that same line broke startup: the port survived and the credential beside
+/// it was thrown away.
+const READINESS_PREFIX: &str = "dsh web: ";
+/// What ccteam tells an operator whose OWN `dsh web` challenges it.
+///
+/// That instance's browser credential exists only in the terminal that printed
+/// its URL, so there is nothing for ccteam to hold and nothing to forge. Both
+/// ways out are the operator's, and attaching anyway is still right: a second
+/// process over the same DSH home and ACP socket is the worse outcome.
+const ATTACHED_AUTH_REQUIRED: &str = "This `dsh web` was started outside ccteam and asks for its own \
+     browser credential, which exists only in the terminal that printed its URL. ccteam attached to \
+     it instead of starting a second process over the same DSH home, but cannot authenticate to it. \
+     Open that printed URL directly, or stop that instance and press Start so ccteam manages one.";
 const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -165,10 +180,69 @@ impl DshRuntimeStatus {
     }
 }
 
+/// Where an identity's `dsh web` listens, plus whatever ccteam must send to be
+/// let in.
+///
+/// The credential is a ready-to-send `Cookie` header value and is OPAQUE to
+/// ccteam: it is whatever the vendor set on the readiness exchange, kept
+/// name=value and never parsed, assumed or logged. `None` is a first-class
+/// answer — a DSH without browser auth, or an instance ccteam did not start.
+#[derive(Debug, Clone)]
+pub struct DshEndpoint {
+    pub port: u16,
+    pub credential: Option<String>,
+}
+
+/// What answered when ccteam probed a `dsh web` address.
+///
+/// The distinction the 0.1.5 breakage turned on: **liveness is not
+/// authorization**. Since that release every unauthenticated request is
+/// answered 401, so a status code says nothing about whether the server
+/// started — only a transport error does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebProbe {
+    /// Nothing answered: no listener at that address.
+    Absent,
+    /// A listener answered and served this request.
+    Serving,
+    /// A listener answered its browser-auth challenge: alive, and this request
+    /// carried no credential it accepts.
+    NeedsCredential,
+}
+
+impl WebProbe {
+    fn alive(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+/// Classify one HTTP answer. Only the transport layer can say `Absent`, which
+/// is why that arm is not reachable from a status code.
+fn classify_probe(status: reqwest::StatusCode) -> WebProbe {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            WebProbe::NeedsCredential
+        }
+        _ => WebProbe::Serving,
+    }
+}
+
+/// What one `dsh web` output line says about where the server is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DshReadiness {
+    port: u16,
+    /// Path + query of the printed URL, to be replayed ONCE against loopback.
+    /// `None` when the line carried no query: an older `dsh web`, or a future
+    /// one that drops browser auth, and then there is nothing to exchange.
+    exchange: Option<String>,
+}
+
 #[derive(Debug)]
 struct DshInstance {
     child: Option<Child>,
     port: Option<u16>,
+    /// Opaque vendor credential for THIS instance; see [`DshEndpoint`].
+    credential: Option<String>,
     _home: PathBuf,
     _started_at: DateTime<Utc>,
     last_activity: DateTime<Utc>,
@@ -264,7 +338,7 @@ impl DshRuntimeManager {
                 config: OnceLock::new(),
                 instances: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
-                client: reqwest::Client::new(),
+                client: probe_client(),
             }),
         }
     }
@@ -314,9 +388,13 @@ impl DshRuntimeManager {
         self.inner.stop(identity).await
     }
 
-    /// Loopback port of this identity's serving runtime, starting it first.
-    pub async fn port_for(&self, identity: &DshRuntimeIdentity) -> Result<u16> {
-        Arc::clone(&self.inner).port_for(identity).await
+    /// Loopback endpoint of this identity's serving runtime, starting it first.
+    ///
+    /// The port alone is not enough to reach a `dsh web` since 0.1.5: the
+    /// credential minted at startup belongs to the same answer, so callers
+    /// cannot forget to ask for it.
+    pub async fn endpoint_for(&self, identity: &DshRuntimeIdentity) -> Result<DshEndpoint> {
+        Arc::clone(&self.inner).endpoint_for(identity).await
     }
 
     /// Terminate every instance this manager owns (daemon shutdown).
@@ -554,6 +632,7 @@ impl Inner {
             DshInstance {
                 child: None,
                 port: None,
+                credential: None,
                 _home: home,
                 _started_at: Utc::now(),
                 last_activity: Utc::now(),
@@ -628,7 +707,7 @@ impl Inner {
         self.status(identity).await
     }
 
-    async fn port_for(self: Arc<Self>, identity: &DshRuntimeIdentity) -> Result<u16> {
+    async fn endpoint_for(self: Arc<Self>, identity: &DshRuntimeIdentity) -> Result<DshEndpoint> {
         if !self.enabled() {
             return Err(anyhow!("DSH web runtime is disabled"));
         }
@@ -639,9 +718,13 @@ impl Inner {
             .get_mut(&key)
             .ok_or_else(|| anyhow!("DSH web instance is stopped"))?;
         instance.last_activity = Utc::now();
-        instance
+        let port = instance
             .port
-            .ok_or_else(|| anyhow!("DSH web instance is starting"))
+            .ok_or_else(|| anyhow!("DSH web instance is starting"))?;
+        Ok(DshEndpoint {
+            port,
+            credential: instance.credential.clone(),
+        })
     }
 
     async fn shutdown_all(&self) {
@@ -669,6 +752,7 @@ impl Inner {
             DshInstance {
                 child: None,
                 port: None,
+                credential: None,
                 _home: home,
                 _started_at: Utc::now(),
                 last_activity: Utc::now(),
@@ -692,11 +776,22 @@ impl Inner {
             .and_then(|config| config.attach_url.clone())
             .or_else(|| std::env::var(ATTACH_URL_ENV).ok())
             .unwrap_or_else(|| DEFAULT_ATTACH_URL.to_string());
-        if self.probe_attached_dsh(&attach_url).await {
+        // ANYTHING that answers HTTP there is present. Requiring a 2xx here is
+        // what made an operator's own 0.1.5 instance read as absent, and ccteam
+        // then started a SECOND `dsh web` over the same home and ACP socket.
+        let probe = self.probe_attached_dsh(&attach_url).await;
+        if probe.alive() {
             let port = port_from_url(&attach_url).unwrap_or(3080);
+            if probe == WebProbe::NeedsCredential {
+                // ccteam holds no credential for a process it did not start,
+                // and will not invent one; say so instead of proxying a bare
+                // 401 the panel cannot explain.
+                push_tail(&tail, ATTACHED_AUTH_REQUIRED.to_string()).await;
+            }
             return Ok(DshInstance {
                 child: None,
                 port: Some(port),
+                credential: None,
                 _home: home,
                 _started_at: Utc::now(),
                 last_activity: Utc::now(),
@@ -733,10 +828,12 @@ impl Inner {
             rest_token: rest_token.as_deref(),
         })
         .map_err(|e| anyhow!("{e}"))?;
-        let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
+        let started = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
+        let port = started.port;
         Ok(DshInstance {
-            child: Some(child),
+            child: Some(started.child),
             port: Some(port),
+            credential: started.credential,
             _home: home,
             _started_at: Utc::now(),
             last_activity: Utc::now(),
@@ -791,10 +888,11 @@ impl Inner {
             rest_token: rest_token.as_deref(),
         })
         .map_err(|e| anyhow!("{e}"))?;
-        let (child, port) = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
+        let started = spawn_until_ready(spawn, tail.clone(), &self.client).await?;
         Ok(DshInstance {
-            child: Some(child),
-            port: Some(port),
+            child: Some(started.child),
+            port: Some(started.port),
+            credential: started.credential,
             _home: home,
             _started_at: Utc::now(),
             last_activity: Utc::now(),
@@ -806,24 +904,34 @@ impl Inner {
         })
     }
 
-    async fn probe_attached_dsh(&self, attach_url: &str) -> bool {
+    /// Is an operator's own `dsh web` already there — and will it talk to us?
+    ///
+    /// The "is this really dsh" sniff still decides `Absent`, because some
+    /// other server on 3080 must not become ccteam's DSH panel. The status
+    /// code only says whether a credential is missing: 0.1.5's own challenge
+    /// body names dsh, so an authenticating instance still identifies itself.
+    async fn probe_attached_dsh(&self, attach_url: &str) -> WebProbe {
         let url = normalize_url(attach_url);
         let Ok(resp) = self.client.get(&url).timeout(HEALTH_TIMEOUT).send().await else {
-            return false;
+            return WebProbe::Absent;
         };
-        if !resp.status().is_success() {
-            return false;
-        }
+        let probe = classify_probe(resp.status());
         if resp.headers().contains_key("x-dsh-web") {
-            return true;
+            return probe;
         }
-        resp.text()
+        let identified = resp
+            .text()
             .await
             .map(|body| {
                 let lower = body.to_ascii_lowercase();
                 lower.contains("dsh") || lower.contains("deepseek")
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if identified {
+            probe
+        } else {
+            WebProbe::Absent
+        }
     }
 }
 
@@ -975,11 +1083,19 @@ fn legacy_dsh_process(pid: i32) -> Option<LegacyDshProcess> {
     })
 }
 
+/// A `dsh web` this manager started: the child, where it listens, and the
+/// credential ccteam exchanged for at startup.
+struct StartedDsh {
+    child: Child,
+    port: u16,
+    credential: Option<String>,
+}
+
 async fn spawn_until_ready(
     spawn: DshSpawnSpec,
     tail: ErrorTail,
     client: &reqwest::Client,
-) -> Result<(Child, u16)> {
+) -> Result<StartedDsh> {
     let mut command = Command::new(&spawn.bin);
     command
         .args(&spawn.args)
@@ -1018,20 +1134,24 @@ async fn spawn_until_ready(
         .spawn()
         .with_context(|| format!("spawn DSH web `{}` {:?}", spawn.bin, spawn.args))?;
     let stdout = child.stdout.take().context("DSH web stdout unavailable")?;
+    // BOTH pipes are scanned for the readiness line: which one a vendor writes
+    // it to is the vendor's choice, not a contract, and stderr keeps feeding
+    // the error tail either way.
+    let (lines_tx, mut lines) = tokio::sync::mpsc::unbounded_channel();
+    spawn_line_reader(stdout, None, lines_tx.clone());
     if let Some(stderr) = child.stderr.take() {
-        spawn_tail_reader(stderr, tail.clone());
+        spawn_line_reader(stderr, Some(tail.clone()), lines_tx.clone());
     }
-    let mut lines = BufReader::new(stdout).lines();
-    let port = tokio::time::timeout(READINESS_TIMEOUT, async {
+    drop(lines_tx);
+    let readiness = tokio::time::timeout(READINESS_TIMEOUT, async {
         loop {
             tokio::select! {
-                line = lines.next_line() => {
-                    let line = line.context("read DSH web stdout")?;
+                line = lines.recv() => {
                     let Some(line) = line else {
                         return Err(anyhow!("DSH web exited before readiness"));
                     };
-                    if let Some(port) = parse_readiness_port(&line) {
-                        return Ok(port);
+                    if let Some(readiness) = parse_readiness(&line) {
+                        return Ok(readiness);
                     }
                 }
                 status = child.wait() => {
@@ -1047,41 +1167,154 @@ async fn spawn_until_ready(
             READINESS_TIMEOUT
         )
     })??;
-    health_probe(client, port).await?;
-    Ok((child, port))
+    probe_listener(client, readiness.port).await?;
+    let credential = match &readiness.exchange {
+        Some(path_and_query) => exchange_credential(client, readiness.port, path_and_query).await,
+        None => None,
+    };
+    Ok(StartedDsh {
+        child,
+        port: readiness.port,
+        credential,
+    })
 }
 
-async fn health_probe(client: &reqwest::Client, port: u16) -> Result<()> {
-    let url = format!("http://127.0.0.1:{port}/");
+/// Assert the listener answers — LIVENESS ONLY.
+///
+/// This gate used to demand a 2xx, which is the whole 0.1.5 breakage: a
+/// perfectly healthy `dsh web` answers 401 to a request without its browser
+/// cookie, and ccteam reported "DSH web health probe returned 401
+/// Unauthorized" for a server that had started fine. Only a transport error
+/// means "did not start".
+async fn probe_listener(client: &reqwest::Client, port: u16) -> Result<WebProbe> {
     let resp = client
-        .get(url)
+        .get(format!("http://127.0.0.1:{port}/"))
         .timeout(HEALTH_TIMEOUT)
         .send()
         .await
         .context("probe DSH web readiness")?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(anyhow!("DSH web health probe returned {}", resp.status()))
+    Ok(classify_probe(resp.status()))
+}
+
+/// Trade the readiness URL's query for whatever the vendor mints, exactly once.
+///
+/// Opaque on purpose: ccteam replays the printed query without reading it,
+/// keeps every returned cookie as `name=value`, and never parses, interprets
+/// or logs either. That is what survives the next release — a renamed cookie,
+/// a second one, a different token format all pass straight through.
+///
+/// The request is rebuilt against `127.0.0.1:<port>` rather than the printed
+/// authority because the cookie is bound to the Host of THIS exchange, and
+/// `127.0.0.1:<port>` is exactly what the companion proxy rewrites Host to. A
+/// cookie minted for any other name is one the proxy can never present.
+///
+/// A failure here is not fatal: the instance is up, and the panel says 401
+/// instead of nothing.
+async fn exchange_credential(
+    client: &reqwest::Client,
+    port: u16,
+    path_and_query: &str,
+) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}{path_and_query}");
+    match client.get(&url).timeout(HEALTH_TIMEOUT).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let credential = credential_from_set_cookie(
+                resp.headers()
+                    .get_all(reqwest::header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|value| value.to_str().ok()),
+            );
+            if credential.is_none() {
+                tracing::warn!(
+                    %status,
+                    "DSH web readiness URL returned no cookie; the panel will not be able to reach it"
+                );
+            }
+            credential
+        }
+        Err(err) => {
+            // `without_url` matters: the URL IS the credential here, and a
+            // reqwest error prints the URL it failed on.
+            tracing::warn!(
+                "DSH web credential exchange failed: {:#}",
+                err.without_url()
+            );
+            None
+        }
     }
 }
 
-fn spawn_tail_reader(stderr: impl tokio::io::AsyncRead + Unpin + Send + 'static, tail: ErrorTail) {
+/// Every `Set-Cookie` reduced to the `Cookie` header value that replays them:
+/// the leading `name=value` of each, joined. Attributes (`Path`, `HttpOnly`,
+/// `Max-Age`, …) are the browser's business and are dropped.
+fn credential_from_set_cookie<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    let pairs: Vec<&str> = values
+        .filter_map(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|pair| pair.contains('=') && !pair.starts_with('='))
+        .collect();
+    (!pairs.is_empty()).then(|| pairs.join("; "))
+}
+
+/// Drain one child pipe for the life of the process: every line is offered to
+/// the readiness scan, and stderr additionally feeds the error tail.
+///
+/// Draining past readiness matters — a reader dropped the moment the URL
+/// appears closes the pipe, and the next thing `dsh web` prints kills it.
+fn spawn_line_reader(
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    tail: Option<ErrorTail>,
+    lines: tokio::sync::mpsc::UnboundedSender<String>,
+) {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            push_tail(&tail, line).await;
+        let mut reader = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            if let Some(tail) = &tail {
+                push_tail(tail, line.clone()).await;
+            }
+            // The receiver is gone once readiness is decided; keep draining.
+            let _ = lines.send(line);
         }
     });
 }
 
-fn parse_readiness_port(line: &str) -> Option<u16> {
-    let start = line.find(READINESS_PREFIX)? + READINESS_PREFIX.len();
-    let digits: String = line[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
+/// The readiness line, read as the URL `dsh web` actually printed.
+///
+/// Whatever follows the prefix is ONE whitespace-delimited URL and is parsed
+/// as such — never scraped. A LAN URL may follow it in parentheses, and other
+/// `dsh web:` lines (the browser-handoff notice) are not URLs at all and are
+/// simply skipped, not fatal.
+fn parse_readiness(line: &str) -> Option<DshReadiness> {
+    let printed = line
+        .split_once(READINESS_PREFIX)?
+        .1
+        .split_whitespace()
+        .next()?;
+    let url = reqwest::Url::parse(printed).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    let exchange = url
+        .query()
+        .filter(|query| !query.is_empty())
+        .map(|query| format!("{}?{query}", url.path()));
+    Some(DshReadiness { port, exchange })
+}
+
+/// The client every DSH probe and the credential exchange share.
+///
+/// Redirects are NEVER followed: the credential exchange answers 303 to a
+/// clean `/`, and following it would land on an unauthenticated page and throw
+/// the `Set-Cookie` away. Nothing else here wants a redirect followed either.
+/// A builder that cannot start (TLS init; nothing here is TLS) degrades to a
+/// default client, which costs the credential and logs it, never a wrong one.
+fn probe_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 async fn terminate_instance(mut instance: DshInstance) {
@@ -1152,14 +1385,99 @@ mod tests {
         )
     }
 
+    /// The readiness line is a URL, so ccteam reads it as one: the port AND
+    /// the credential beside it come out of the same parse. Scraping digits
+    /// off a hardcoded prefix is what silently dropped `?token=` when dsh
+    /// 0.1.5 added it.
     #[test]
-    fn readiness_line_parser_extracts_port() {
+    fn readiness_line_is_read_as_the_url_dsh_printed() {
         assert_eq!(
-            parse_readiness_port("noise dsh web: http://127.0.0.1:35479"),
-            Some(35479)
+            parse_readiness("noise dsh web: http://127.0.0.1:35479/?token=abc"),
+            Some(DshReadiness {
+                port: 35479,
+                exchange: Some("/?token=abc".to_string()),
+            })
+        );
+        // No query = nothing to exchange, and that is not an error: an older
+        // dsh, or a future one that drops browser auth.
+        assert_eq!(
+            parse_readiness("dsh web: http://127.0.0.1:35479/"),
+            Some(DshReadiness {
+                port: 35479,
+                exchange: None,
+            })
+        );
+        // A LAN URL follows in parentheses; the first token is the loopback one.
+        assert_eq!(
+            parse_readiness(
+                "dsh web: http://127.0.0.1:4567/?token=t (LAN: http://192.168.1.5:4567/?token=t)"
+            ),
+            Some(DshReadiness {
+                port: 4567,
+                exchange: Some("/?token=t".to_string()),
+            })
+        );
+        // A host other than loopback still yields a port: the printed line is
+        // the authority on where dsh listens, not ccteam's assumptions.
+        assert_eq!(
+            parse_readiness("dsh web: http://localhost:35479/"),
+            Some(DshReadiness {
+                port: 35479,
+                exchange: None,
+            })
+        );
+        // Same prefix, not a URL: skipped, never fatal.
+        assert_eq!(
+            parse_readiness("dsh web: opening the default browser; pass --no-open to disable"),
+            None
+        );
+        assert_eq!(parse_readiness("dsh listening on 3080"), None);
+    }
+
+    /// Liveness is not authorization. A 401 is a running server saying "not
+    /// you", which is exactly what every unauthenticated dsh 0.1.5 request
+    /// gets — treating it as "did not start" is the bug this fixes.
+    #[test]
+    fn an_authentication_challenge_still_proves_the_listener_is_alive() {
+        assert_eq!(
+            classify_probe(reqwest::StatusCode::UNAUTHORIZED),
+            WebProbe::NeedsCredential
         );
         assert_eq!(
-            parse_readiness_port("dsh web: http://localhost:35479"),
+            classify_probe(reqwest::StatusCode::FORBIDDEN),
+            WebProbe::NeedsCredential
+        );
+        assert_eq!(classify_probe(reqwest::StatusCode::OK), WebProbe::Serving);
+        assert_eq!(
+            classify_probe(reqwest::StatusCode::SEE_OTHER),
+            WebProbe::Serving
+        );
+        for probe in [WebProbe::Serving, WebProbe::NeedsCredential] {
+            assert!(probe.alive(), "{probe:?} answered, so it is up");
+        }
+        assert!(!WebProbe::Absent.alive());
+    }
+
+    /// The credential stays opaque: every cookie the vendor sets is replayed
+    /// as `name=value`, whatever it is called and however many there are.
+    #[test]
+    fn set_cookie_headers_become_one_replayable_cookie_value() {
+        assert_eq!(
+            credential_from_set_cookie(
+                ["dsh-auth-avJ5=v1.body.sig; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict"]
+                    .into_iter()
+            ),
+            Some("dsh-auth-avJ5=v1.body.sig".to_string())
+        );
+        assert_eq!(
+            credential_from_set_cookie(
+                ["first=one; Path=/", " second=two; HttpOnly", "third=three"].into_iter()
+            ),
+            Some("first=one; second=two; third=three".to_string())
+        );
+        assert_eq!(credential_from_set_cookie(std::iter::empty()), None);
+        assert_eq!(
+            credential_from_set_cookie(["", "=novalue", "novalue"].into_iter()),
             None
         );
     }
@@ -1279,7 +1597,7 @@ mod tests {
             manager.status(&identity).await.state,
             DshRuntimeState::Disabled
         );
-        assert!(manager.port_for(&identity).await.is_err());
+        assert!(manager.endpoint_for(&identity).await.is_err());
     }
 
     #[tokio::test]
@@ -1301,6 +1619,7 @@ mod tests {
                 DshInstance {
                     child: None,
                     port: None,
+                    credential: None,
                     _home: PathBuf::new(),
                     _started_at: Utc::now(),
                     last_activity: Utc::now(),

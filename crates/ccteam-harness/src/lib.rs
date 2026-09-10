@@ -82,7 +82,7 @@ pub use execution::dsh_acp::{
     DSH_SOCKET_ENV, DSH_WEB_PROFILE,
 };
 pub use execution::dsh_runtime::{
-    is_ccteam_managed_dsh_orphan, sweep_legacy_dsh_orphans, DshEnrollmentResolver,
+    is_ccteam_managed_dsh_orphan, sweep_legacy_dsh_orphans, DshEndpoint, DshEnrollmentResolver,
     DshRestTokenResolver, DshRuntimeConfig, DshRuntimeIdentity, DshRuntimeManager, DshRuntimeState,
     DshRuntimeStatus,
 };
