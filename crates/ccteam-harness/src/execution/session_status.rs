@@ -90,6 +90,7 @@ mod tests {
             context: Some(ContextUsage::known(17_580, 500_000, ContextSource::Derived)),
             effort: Some("high".into()),
             goal: None,
+            stop_hook_blocks: None,
         };
         write_status_file(dir.path(), "s7", &status);
         assert_eq!(read_status_file(dir.path(), "s7"), Some(status));
@@ -136,6 +137,7 @@ mod tests {
             context: None,
             effort: Some("max".into()),
             goal: None,
+            stop_hook_blocks: None,
         };
         write_status_file(dir.path(), "s9", &status);
         assert_eq!(

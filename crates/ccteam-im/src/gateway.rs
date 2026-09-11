@@ -6872,7 +6872,17 @@ impl Gateway {
             let mut turn_last_answer: Option<(String, String)> = None;
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
+            // Assistant messages a turn-bounded protocol produced that are
+            // still waiting for the turn's boundary, and when the oldest of
+            // them started waiting. The wait buys ONE thing — the boundary
+            // knows which message is the turn's LAST, so that row carries the
+            // turn's status/usage/conclusion — and `held_since` is what keeps
+            // it from being paid for with unbounded silence (GitHub #206).
             let mut pending_answers: Vec<String> = Vec::new();
+            let mut held_since: Option<Instant> = None;
+            // This turn already handed the chat text ahead of its boundary, so
+            // the boundary owes the closing status line instead of an answer.
+            let mut released_mid_turn = false;
             let mut turn_last_context_pct: Option<u64> = None;
             // Immediate-flush protocols can deliver one or more assistant
             // messages before their terminal boundary arrives. Remember that
@@ -7581,12 +7591,15 @@ impl Gateway {
                                 }
                             }
                         }
-                        let answer_texts = match &evt {
+                        let mut answer_texts = match &evt {
                             ThreadEvent::ItemCompleted { item } => match &item.details {
                                 ThreadItemDetails::AgentMessage(text) if !text.is_empty() => {
                                     if session.protocol.is_terminal() || !structured_turn_open {
                                         vec![text.clone()]
                                     } else {
+                                        if pending_answers.is_empty() {
+                                            held_since = Some(Instant::now());
+                                        }
                                         pending_answers.push(text.clone());
                                         Vec::new()
                                     }
@@ -7602,6 +7615,37 @@ impl Gateway {
                             }
                             _ => Vec::new(),
                         };
+                        // A turn boundary is an accounting fact, never a
+                        // DELIVERY schedule. Waiting for one is what left a
+                        // chat in total silence for 11.7 hours while its
+                        // session answered in 57 seconds: the answer sat in
+                        // `pending_answers` because a Stop hook kept refusing
+                        // to end the turn (GitHub #206). Release what is held
+                        // the moment waiting can no longer buy the status
+                        // stamp cheaply:
+                        //   - the chat is WAITING ON THIS TURN — a message the
+                        //     vendor absorbed mid-turn is being answered by it,
+                        //     so its text is a reply to a human, not narration;
+                        //   - or the hold has outlived one liveness heartbeat,
+                        //     the same window that says a working turn may not
+                        //     go silent to the outside longer than that.
+                        // Cost of releasing: this turn's rows carry no status
+                        // (`is_final_answer` needs the boundary), so the
+                        // boundary pays it back as a closing status line. The
+                        // total number of chat messages is unchanged — the
+                        // hold only ever delayed them.
+                        if answer_texts.is_empty()
+                            && !pending_answers.is_empty()
+                            && (session.steered_this_turn.load(Ordering::SeqCst)
+                                || held_since
+                                    .is_some_and(|held| held.elapsed() >= heartbeat_interval))
+                        {
+                            answer_texts = std::mem::take(&mut pending_answers);
+                            released_mid_turn = true;
+                        }
+                        if pending_answers.is_empty() {
+                            held_since = None;
+                        }
                         let is_turn_boundary = matches!(
                             &evt,
                             ThreadEvent::TurnCompleted { .. }
@@ -7686,13 +7730,45 @@ impl Gateway {
                                 .lock()
                                 .map(|key| key.clone())
                                 .unwrap_or_else(|_| session.owner.clone());
-                            if chat_key.channel == "web" && !turn_had_answer {
+                            // A turn whose text went out mid-turn (GitHub #206)
+                            // still owes the chat its CLOSING receipt: the
+                            // status line an in-boundary answer carries along.
+                            // Without it a chat that has been reading live
+                            // narration for hours never learns the turn ended,
+                            // and never sees the turn's model / ctx / cost.
+                            // Text surface only — the web console renders the
+                            // same facts from the status frame's own fields —
+                            // and only for someone who is actually addressed
+                            // here, the same rule the answer path applies.
+                            let has_addressee = chat_key.channel == "web"
+                                || current_session.is_focused(&chat_key, &session_id)
+                                || latest_turn_origin(&session) == TurnOrigin::User;
+                            let closing_line = (released_mid_turn
+                                && chat_key.channel != "web"
+                                && has_addressee)
+                                .then(|| {
+                                    ccteam_harness::render_status_line(
+                                        &ccteam_harness::StatusIdentity {
+                                            slug: &session.project,
+                                            sid: &session_id,
+                                            vendor: vendor_str(session.vendor),
+                                            role: &session.role,
+                                            title: meta_status
+                                                .as_ref()
+                                                .and_then(|meta| meta.title.as_deref()),
+                                        },
+                                        &status,
+                                    )
+                                });
+                            let owes_closing = released_mid_turn || !turn_had_answer;
+                            let web_status_frame = chat_key.channel == "web" && owes_closing;
+                            if web_status_frame || closing_line.is_some() {
                                 let status_only = GatewayEvent {
                                     id: format!("gateway-event-{session_id}-status-{vendor_turn}"),
                                     channel: chat_key.channel,
                                     chat_id: chat_key.chat_id,
                                     thread_ts: None,
-                                    content: String::new(),
+                                    content: closing_line.unwrap_or_default(),
                                     kind: GatewayEventKind::Answer,
                                     attachments: Vec::new(),
                                     options: Vec::new(),
@@ -8137,6 +8213,8 @@ impl Gateway {
                           }
                           if is_turn_boundary {
                             turn_had_answer = false;
+                            released_mid_turn = false;
+                            held_since = None;
                           }
                         } else if progress_on {
                             // ----- PROGRESS (IM, unchanged) -----
@@ -11547,12 +11625,16 @@ impl Gateway {
         // display a Claude account's) and come from the one interface that
         // answers for a resident and a released focus alike.
         let status = self.row_thread_status(focus).await;
-        let (run_state, running) = match focus {
+        let (run_state, running, narration) = match focus {
             SessionRowSource::Resident(s) => {
                 let running = s.adapter.running_tasks(&s.thread).await;
-                (self.status_run_state(s, &running), running)
+                // What the running turn has said so far — the adapter holds a
+                // bounded tail already (no scan, no IO), which is exactly why
+                // `/status` can afford to show it (GitHub #206 P1).
+                let narration = s.adapter.in_flight_narration(&s.thread);
+                (self.status_run_state(s, &running), running, narration)
             }
-            SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new()),
+            SessionRowSource::Released(..) => (StatusRunState::Released, Vec::new(), None),
         };
         let account = self.account_usage_for(vendor, visible).await;
 
@@ -11580,6 +11662,7 @@ impl Gateway {
             .or_else(|| meta.as_ref().and_then(|m| m.effort.clone()))
             .filter(|e| !e.is_empty());
         let goal = status.as_ref().and_then(|st| st.goal.clone());
+        let stop_hook_blocks = status.as_ref().and_then(|st| st.stop_hook_blocks);
 
         // Direct delegated children belong on the root's deep status card:
         // their work explains why an otherwise-idle parent is still waiting.
@@ -11651,7 +11734,9 @@ impl Gateway {
             vendor,
             effort,
             running,
+            narration,
             goal,
+            stop_hook_blocks,
             account,
             children,
             deeper_descendants,
@@ -18458,7 +18543,17 @@ struct StatusCard {
     /// The real vendor `--resume` id; `None` renders `resume —`.
     resume: Option<String>,
     running: Vec<RunningTask>,
+    /// What the turn in flight has SAID so far, straight from the adapter's
+    /// bounded narration tail. `None` when no turn is running or the channel
+    /// cannot report one. The card used to describe a working session in
+    /// counters only ("🤖 在跑 …"), never in its own words — so a long turn
+    /// read as inexplicable silence (GitHub #206).
+    narration: Option<ccteam_harness::PartialNarration>,
     goal: Option<ccteam_harness::GoalStatus>,
+    /// Recent Stop-hook refusals to end the turn (the harness-reported
+    /// `ThreadStatus::stop_hook_blocks`) — why a goal-bound session cannot
+    /// finish. `None` when the channel cannot report it.
+    stop_hook_blocks: Option<u32>,
     account: Option<AccountUsage>,
     children: Vec<StatusChild>,
     /// Descendants below the direct children, collapsed to a count.
@@ -18531,7 +18626,18 @@ impl StatusCard {
         // show its running workflows here.
         out.push_str(&format_running_tasks(&self.running));
 
-        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline uses.
+        // What the running turn last SAID (💬) — the one fact that answers
+        // "why is it quiet": counters describe the work, the words describe
+        // the session (GitHub #206).
+        if let Some(latest) = self.narration.as_ref().and_then(format_latest_narration) {
+            out.push_str(&format!("\n   💬 {latest}"));
+        }
+
+        // Goal (🎯 open / ✅ met) — from the same thread_status the statusline
+        // uses — plus WHY a goal-bound turn cannot end: each Stop-hook refusal
+        // is recorded, and without this the user has no way to tell a stuck
+        // session from a hook that will never let go (GitHub #206).
+        let refusals = self.stop_hook_blocks.filter(|blocks| *blocks > 0);
         if let Some(g) = &self.goal {
             let cond = g.condition.trim();
             if !cond.is_empty() {
@@ -18542,7 +18648,19 @@ impl StatusCard {
                     cond.to_string()
                 };
                 out.push_str(&format!("\n   {marker} {shown}"));
+                if let Some(blocks) = refusals {
+                    out.push_str(&format!(
+                        " · Stop hook 近 1h 拒停 {blocks} 次,turn 无法结束 → /goal clear"
+                    ));
+                }
             }
+        } else if let Some(blocks) = refusals {
+            // A Stop hook with no goal behind it is the user's own hook —
+            // report it, but never advertise a `/goal clear` that would fix
+            // nothing.
+            out.push_str(&format!(
+                "\n   🛑 Stop hook 近 1h 拒停 {blocks} 次,turn 无法结束"
+            ));
         }
 
         // Account usage (5h / weekly / credits) — the vendor rate-limit windows.
@@ -18587,13 +18705,42 @@ impl StatusCard {
     }
 }
 
+/// The one-line `💬` excerpt of what the turn in flight has said so far.
+/// `None` when it has said nothing yet (a fact the card simply omits).
+///
+/// The narration tail is up to [`ccteam_harness::IN_FLIGHT_NARRATION_MAX_CHARS`]
+/// and can be many paragraphs; a phone card gets its END (the part that says
+/// what the session is doing NOW) flattened onto one line, with a leading `…`
+/// whenever anything was dropped — from the adapter's own cap or from this one.
+fn format_latest_narration(narration: &ccteam_harness::PartialNarration) -> Option<String> {
+    const CARD_NARRATION_CHARS: usize = 140;
+    let flat = narration
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    let (tail, dropped) = ccteam_harness::bounded_tail(&flat, CARD_NARRATION_CHARS);
+    let elided = dropped > 0 || narration.truncated();
+    Some(if elided { format!("…{tail}") } else { tail })
+}
+
 /// Render the `/status` running-task block — claude's own task lifecycle
 /// mirrored verbatim (NOT a fold), oldest first (longest-running on top).
-/// Empty string when nothing runs. Three buckets by `task_type`: subagents
-/// (`local_agent`, turn-scoped), workflows (`local_workflow`) and background
-/// shells (`local_bash` = Bash run_in_background + Monitor watches) — the
+/// Empty string when nothing runs. Buckets: subagents (`local_agent`,
+/// turn-scoped), workflows (`local_workflow`) and shells (`local_bash`) — the
 /// latter two outlive the spawning turn, so an idle session still shows its
 /// in-flight `make test` here instead of a bare `🟢 idle`.
+///
+/// BACKGROUND-NESS IS THE VENDOR'S ANSWER, not a `task_type` guess: claude
+/// lists what it actually backgrounded (`RunningTask::backgrounded`, from its
+/// `background_tasks_changed` snapshot), and a plain foreground `Bash` call is
+/// a `local_bash` task too. Labelling every `local_bash` as `后台任务` told a
+/// user debugging an 11-hour silence that a background script was in flight
+/// when the turn was simply running a command — and sent them looking in the
+/// wrong place (GitHub #206 P4).
 fn format_running_tasks(running: &[RunningTask]) -> String {
     if running.is_empty() {
         return String::new();
@@ -18602,11 +18749,16 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
         .iter()
         .filter(|t| t.task_type == "local_workflow")
         .count();
-    let bg_shells = running
+    let shells = running
         .iter()
         .filter(|t| t.task_type == "local_bash")
         .count();
-    let subagents = running.len() - workflows - bg_shells;
+    let backgrounded = running
+        .iter()
+        .filter(|t| t.task_type == "local_bash" && t.backgrounded)
+        .count();
+    let fg_shells = shells.saturating_sub(backgrounded);
+    let subagents = running.len() - workflows - shells;
     let mut kinds: Vec<String> = Vec::new();
     if subagents > 0 {
         kinds.push(format!("subagent ({subagents})"));
@@ -18614,8 +18766,11 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     if workflows > 0 {
         kinds.push(format!("workflow ({workflows})"));
     }
-    if bg_shells > 0 {
-        kinds.push(format!("后台任务 ({bg_shells})"));
+    if backgrounded > 0 {
+        kinds.push(format!("后台任务 ({backgrounded})"));
+    }
+    if fg_shells > 0 {
+        kinds.push(format!("命令 ({fg_shells})"));
     }
     let mut out = format!("\n   🤖 在跑 {}:", kinds.join(" + "));
     let mut tasks: Vec<&RunningTask> = running.iter().collect();
@@ -18623,7 +18778,8 @@ fn format_running_tasks(running: &[RunningTask]) -> String {
     for t in tasks {
         let kind = match t.task_type.as_str() {
             "local_workflow" => "workflow",
-            "local_bash" => "后台",
+            "local_bash" if t.backgrounded => "后台",
+            "local_bash" => "命令",
             _ if t.kind.is_empty() => "subagent",
             _ => t.kind.as_str(),
         };
@@ -19871,10 +20027,16 @@ mod tests {
             dir: Some(PathBuf::from("/tmp/excore")),
             resume: Some("03b8d60b-5dc6-45d0-a15d-be03bb713d0e".into()),
             running: Vec::new(),
+            narration: Some(ccteam_harness::PartialNarration {
+                exec_turn_id: Some("turn-7".into()),
+                text: "进度:三处已修\n两处待裁".into(),
+                omitted_chars: 1_800,
+            }),
             goal: Some(ccteam_harness::GoalStatus {
                 condition: "all green".into(),
                 met: false,
             }),
+            stop_hook_blocks: Some(46),
             account: Some(AccountUsage {
                 subscription: Some("team".into()),
                 five_hour_pct: Some(0),
@@ -19899,7 +20061,8 @@ mod tests {
              claude claude-sonnet-5 · xhigh\n   \
              📁 /tmp/excore\n   \
              resume 03b8d60b-5dc6-45d0-a15d-be03bb713d0e\n   \
-             🎯 all green\n   \
+             💬 …进度:三处已修 两处待裁\n   \
+             🎯 all green · Stop hook 近 1h 拒停 46 次,turn 无法结束 → /goal clear\n   \
              ⚡ 用量: 5h 0% · 周 50% (→09/03) · team\n   \
              👥 直接子会话:\n      \
              · s8 · codex · 🟡 working · grep the tree\n      \
@@ -19922,7 +20085,9 @@ mod tests {
             effort: None,
             dir: None,
             resume: None,
+            narration: None,
             goal: None,
+            stop_hook_blocks: None,
             account: None,
             children: Vec::new(),
             deeper_descendants: 0,
@@ -21129,6 +21294,7 @@ mod tests {
                 context: None,
                 effort: Some(effort.to_string()),
                 goal: None,
+                stop_hook_blocks: None,
                 generation,
             },
         );
@@ -21332,6 +21498,7 @@ mod tests {
                 context: None,
                 effort: Some("   ".into()),
                 goal: None,
+                stop_hook_blocks: None,
             },
         );
         fake.live.store(false, Ordering::SeqCst);
@@ -26970,6 +27137,200 @@ mod tests {
         assert!(!ccteam_core::progress::is_idle(Some(&beat)));
     }
 
+    /// Wait until the pump has observed `count` events for `sid` — the
+    /// liveness counter it bumps before any branch, so this is "the pump has
+    /// SEEN the scripted events", not "it delivered them". Lets a delivery
+    /// assertion be about the delivery decision instead of about timing.
+    async fn wait_for_observed_events(gateway: &Gateway, sid: &str, count: u64) {
+        for _ in 0..200 {
+            if gateway.sessions[sid].activity_events.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the pump never observed {count} events on {sid}");
+    }
+
+    /// Drain whatever the broadcast tee holds right now and report whether an
+    /// `Answer` was among it. A lag is not evidence of no answer — the frames
+    /// it skipped are unknown — so it fails loudly rather than reading as a
+    /// quiet channel.
+    fn answered_yet(events: &mut tokio::sync::broadcast::Receiver<GatewayEvent>) -> bool {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let mut answered = false;
+        loop {
+            match events.try_recv() {
+                Ok(event) => answered |= matches!(event.kind, GatewayEventKind::Answer),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return answered,
+                Err(TryRecvError::Lagged(n)) => panic!("the tee dropped {n} frames unread"),
+            }
+        }
+    }
+
+    /// GitHub #206 — THE REPORTED BUG (excore/s1072, 2026-09-11): a session
+    /// whose turn could not end (a `/goal` Stop hook refused to stop it for
+    /// 11.7 hours) answered a question in 57 seconds, and the chat got
+    /// NOTHING: the pump holds a turn-bounded protocol's assistant messages
+    /// until the turn's boundary, so a turn that never ends never delivers.
+    ///
+    /// A message the vendor absorbed INTO the running turn is what makes the
+    /// difference between narration and a reply someone is waiting for, so
+    /// text produced after it goes out at once — no boundary required.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_message_absorbed_mid_turn_is_answered_before_the_boundary() {
+        // No `with_turn_boundary`: this turn NEVER ends, exactly as reported.
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_started());
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "long job")
+            .await
+            .unwrap();
+        // TurnStarted + one assistant message: narration inside a turn nobody
+        // is waiting on stays held (it is batched so the boundary can stamp
+        // the turn's final row).
+        wait_for_observed_events(&gateway, "s1", 2).await;
+        assert!(
+            !answered_yet(&mut events),
+            "narration with nobody waiting is still batched for the boundary"
+        );
+
+        // The human asks something while the turn runs. The adapter absorbs it
+        // into that turn (Injected), so the turn is now answering a question.
+        gateway
+            .handle_text("mock", "chat-1", "alice", "汇报进度")
+            .await
+            .unwrap();
+        let first = recv_answer(&mut events).await;
+        let second = recv_answer(&mut events).await;
+        assert!(
+            first.content.contains("echo: long job"),
+            "the held narration goes out with the release: {first:?}"
+        );
+        assert!(
+            second.content.contains("echo: 汇报进度"),
+            "and so does the answer to the absorbed question: {second:?}"
+        );
+        assert!(
+            first.status.is_none() && second.status.is_none(),
+            "no boundary happened, so no row claims the turn's status"
+        );
+        assert!(
+            gateway.session_turn_in_flight("s1"),
+            "sanity: the turn is still running — delivery did not wait for it"
+        );
+        let turns =
+            ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
+        let said: Vec<&str> = turns
+            .iter()
+            .filter(|turn| !turn.assistant.is_empty())
+            .map(|turn| turn.assistant.as_str())
+            .collect();
+        assert_eq!(
+            said.len(),
+            2,
+            "both rows are durable when delivered: {said:?}"
+        );
+    }
+
+    /// GitHub #206 (P1) — nobody has to ask: a turn that keeps its text longer
+    /// than one liveness heartbeat has stopped batching and started hiding, so
+    /// the hold expires and the text goes to the chat on its own. Cadence is
+    /// injected (0 = expire immediately) so the assertion does not wait out
+    /// the production minute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_narration_goes_out_once_the_hold_outlives_a_heartbeat() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_started());
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "long job")
+            .await
+            .unwrap();
+
+        let answer = recv_answer(&mut events).await;
+        assert!(
+            answer.content.contains("echo: long job"),
+            "an expired hold delivers without a boundary: {answer:?}"
+        );
+        assert!(answer.status.is_none(), "a mid-turn row carries no status");
+    }
+
+    /// GitHub #206 — text released mid-turn leaves the boundary with nothing
+    /// to attach the turn's status line to, so the boundary owes the chat its
+    /// CLOSING receipt: a chat that read live narration for hours must still
+    /// learn the turn ended, with the model / ctx / turn / cost it ended on.
+    /// The receipt is the status line ALONE — never a second copy of text the
+    /// chat already has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_released_mid_flight_closes_with_its_status_line() {
+        let fake = Arc::new(
+            FakeAdapter::new(AgentVendor::Claude)
+                .with_turn_started()
+                .with_turn_boundary()
+                .with_turn_boundary_status(ThreadStatus {
+                    model: Some("claude-sonnet-4-6".into()),
+                    context: Some(ccteam_harness::ContextUsage::known(
+                        19,
+                        100,
+                        ccteam_harness::ContextSource::Reported,
+                    )),
+                    ..Default::default()
+                }),
+        );
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "long job")
+            .await
+            .unwrap();
+
+        let answer = recv_answer(&mut events).await;
+        assert!(answer.content.contains("echo: long job"));
+        let closing = recv_answer(&mut events).await;
+        assert!(
+            closing
+                .content
+                .starts_with("→ alpha/s1 (reviewer) · claude · claude-sonnet-4-6"),
+            "the boundary pays back the status line: {closing:?}"
+        );
+        assert!(
+            !closing.content.contains("echo: long job"),
+            "and never re-sends text the chat already has: {closing:?}"
+        );
+        assert_eq!(
+            closing.status.as_ref().map(|status| status.turn),
+            Some(1),
+            "the receipt carries the ended turn's own status"
+        );
+    }
+
     /// A turn that DIES must close its busy window on disk, not just in memory.
     /// The pump clears its in-process markers on a canonical failure; now that
     /// submit opens a DURABLE busy window, the file-backed boundary has to land
@@ -28264,6 +28625,7 @@ mod tests {
             )),
             effort: Some("max".into()),
             goal: None,
+            stop_hook_blocks: None,
         })
         .await;
         let with_status = gateway
@@ -28286,6 +28648,7 @@ mod tests {
                 ContextSource::Derived,
             )),
             goal: None,
+            stop_hook_blocks: None,
         })
         .await;
         let baseline = gateway
@@ -28449,6 +28812,7 @@ mod tests {
             )),
             effort: Some("max".into()),
             goal: None,
+            stop_hook_blocks: None,
         })
         .await;
 
@@ -28539,6 +28903,53 @@ mod tests {
         assert!(
             fresh[0].contains("📍 🔵 working "),
             "a just-submitted turn with a pre-turn stale event is working, not stuck: {fresh:?}"
+        );
+    }
+
+    /// GitHub #206 (P1/P2) — the card of a working session said what it RAN
+    /// and never what it SAID, and a session whose Stop hook refuses to end
+    /// the turn looked identical to one that had simply gone quiet. Both facts
+    /// are already in ccteam's hands: the adapter's bounded narration tail and
+    /// the transcript's recorded refusals.
+    #[tokio::test]
+    async fn gateway_status_reports_what_a_running_turn_said_and_why_it_cannot_stop() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        fake.set_status(ThreadStatus {
+            generation: None,
+            model: Some("claude-opus-4-8".into()),
+            context: None,
+            effort: None,
+            goal: Some(ccteam_harness::GoalStatus {
+                condition: "all green".into(),
+                met: false,
+            }),
+            stop_hook_blocks: Some(46),
+        })
+        .await;
+        gateway
+            .handle_text("mock", "chat-1", "alice", "long job")
+            .await
+            .unwrap();
+
+        let card = gateway
+            .handle_text("mock", "chat-1", "alice", "/status")
+            .await
+            .unwrap();
+        assert!(
+            card[0].contains("\n   💬 fake: half a migration"),
+            "the card carries the running turn's own words: {card:?}"
+        );
+        assert!(
+            card[0].contains(
+                "\n   🎯 all green · Stop hook 近 1h 拒停 46 次,turn 无法结束 → /goal clear"
+            ),
+            "…and why the turn cannot end, with the way out: {card:?}"
         );
     }
 
@@ -28851,18 +29262,41 @@ mod tests {
         let wf = [task("w1", "", "migrate call sites", "local_workflow")];
         let s = format_running_tasks(&wf);
         assert!(s.contains("在跑 workflow (1):"), "{s}");
-        // Background shells (`local_bash` — Bash run_in_background / Monitor)
-        // get their own bucket + row label; an idle session with an in-flight
-        // `make test` renders it instead of a bare `🟢 idle`.
+        // Shells (`local_bash`) get their own bucket + row label; an idle
+        // session with an in-flight `make test` renders it instead of a bare
+        // `🟢 idle`. BACKGROUND-NESS is the vendor's own answer
+        // (`background_tasks_changed`), so only what claude actually
+        // backgrounded is called 后台任务 — a plain foreground `Bash` call is
+        // a `local_bash` task too, and calling it a background task sent a
+        // user debugging an 11-hour silence looking for a script that did not
+        // exist (GitHub #206 P4).
+        let backgrounded = |mut t: RunningTask| {
+            t.backgrounded = true;
+            t
+        };
         let bg = [
-            task("b1", "", "make test full suite", "local_bash"),
-            task("b2", "", "watch /tmp/maketest.log", "local_bash"),
+            backgrounded(task("b1", "", "make test full suite", "local_bash")),
+            backgrounded(task("b2", "", "watch /tmp/maketest.log", "local_bash")),
             task("a1", "code-reviewer", "review auth", "local_agent"),
         ];
         let s = format_running_tasks(&bg);
         assert!(s.contains("在跑 subagent (1) + 后台任务 (2):"), "{s}");
         assert!(s.contains("后台「make test full suite」"), "{s}");
         assert!(s.contains("后台「watch /tmp/maketest.log」"), "{s}");
+        // A foreground `Bash` the vendor did NOT background is a command, and
+        // says so — in the header count and on its own row.
+        let fg = [task("b3", "", "cargo test --workspace", "local_bash")];
+        let s = format_running_tasks(&fg);
+        assert!(s.contains("在跑 命令 (1):"), "{s}");
+        assert!(!s.contains("后台"), "a foreground command is not 后台: {s}");
+        assert!(s.contains("命令「cargo test --workspace」"), "{s}");
+        // Mixed shells count in their own buckets.
+        let both = [
+            backgrounded(task("b1", "", "make test", "local_bash")),
+            task("b3", "", "git status", "local_bash"),
+        ];
+        let s = format_running_tasks(&both);
+        assert!(s.contains("在跑 后台任务 (1) + 命令 (1):"), "{s}");
     }
 
     /// The outlives-turn vocabulary the working-signal check shares with the

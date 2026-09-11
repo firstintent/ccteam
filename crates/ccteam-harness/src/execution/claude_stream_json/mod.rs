@@ -1577,23 +1577,91 @@ fn read_transcript_tail(path: &Path, max_bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// The session's current `/goal`, read from the Claude transcript. Claude
-/// writes the active goal as a `{type:"attachment", attachment:{type:
-/// "goal_status", condition, met}}` record on the user turn — it is NOT on the
-/// stream-json stdout stream and has no control_request (both verified by live
-/// probe), so the only read path is the transcript jsonl (the same file the TUI
-/// adapter tails — reading it is the blessed path, not terminal scraping).
-/// Returns the LAST such record (the current goal); `None` when no goal is set,
-/// it was cleared (empty condition), or the transcript is absent.
-fn read_latest_goal_status(cwd: &Path, uuid: &str) -> Option<crate::GoalStatus> {
+/// What the transcript says about the session's turn GATING: the goal it is
+/// working toward, and how often a Stop hook has refused to let its turn end.
+/// Read together because they come from ONE file read of the same tail — and
+/// because they are one answer: a goal whose condition is not met yet is
+/// exactly what keeps refusing (GitHub #206).
+struct TurnGating {
+    goal: Option<crate::GoalStatus>,
+    /// Refusals inside [`STOP_HOOK_RECENT_WINDOW`].
+    stop_hook_blocks: u32,
+}
+
+/// How far back a Stop-hook refusal still counts as describing the session's
+/// state NOW. The transcript has no turn-boundary marker to bound the scan
+/// with, and an all-time count would keep accusing a session whose hook was
+/// removed hours ago — a wall-clock window is the honest bound a reader can
+/// also state out loud ("N times in the last hour").
+const STOP_HOOK_RECENT_WINDOW: chrono::Duration = chrono::Duration::hours(1);
+
+/// The marker Claude writes for a Stop hook that denied a stop. Verified
+/// against a real transcript (2026-09-11, `excore`): one record per refusal,
+/// `{"type":"user","isMeta":true,"message":{"role":"user","content":"Stop hook
+/// feedback:…"}}`.
+const STOP_HOOK_MARKER: &str = "Stop hook feedback";
+
+/// The session's current `/goal` + Stop-hook refusals, read from the Claude
+/// transcript. Claude writes the active goal as a `{type:"attachment",
+/// attachment:{type: "goal_status", condition, met}}` record on the user turn —
+/// it is NOT on the stream-json stdout stream and has no control_request (both
+/// verified by live probe), so the only read path is the transcript jsonl (the
+/// same file the TUI adapter tails — reading it is the blessed path, not
+/// terminal scraping). `None` when the transcript is absent or unreadable,
+/// which is what makes "cannot tell" distinguishable from "nothing refused".
+fn read_turn_gating(cwd: &Path, uuid: &str) -> Option<TurnGating> {
     let path = anthropic_project_dir(cwd)?.join(format!("{uuid}.jsonl"));
     let body = read_transcript_tail(&path, 8 * 1024 * 1024)?;
-    parse_latest_goal_status(&body)
+    Some(TurnGating {
+        goal: parse_latest_goal_status(&body),
+        stop_hook_blocks: count_recent_stop_hook_blocks(&body, chrono::Utc::now()),
+    })
+}
+
+/// Count the Stop-hook refusals in the last [`STOP_HOOK_RECENT_WINDOW`].
+///
+/// Same cost discipline as [`parse_latest_goal_status`]: scan from the END,
+/// `contains` pre-filter before any parse, and stop at the first refusal older
+/// than the window (the transcript is append-ordered, so everything before it
+/// is older still). A refusal with no readable timestamp is counted — it is a
+/// refusal that happened; only a DATED one can be ruled out of the window.
+fn count_recent_stop_hook_blocks(body: &str, now: chrono::DateTime<chrono::Utc>) -> u32 {
+    let floor = now - STOP_HOOK_RECENT_WINDOW;
+    let mut blocks = 0u32;
+    for line in body.lines().rev() {
+        if !line.contains(STOP_HOOK_MARKER) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        // The marker has to be the message's OWN text, not a quotation of it
+        // inside some other record (an assistant explaining the hook, a tool
+        // result echoing the transcript).
+        let text = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+        if !text.trim_start().starts_with(STOP_HOOK_MARKER) {
+            continue;
+        }
+        let dated = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+        if dated.is_some_and(|at| at < floor) {
+            break;
+        }
+        blocks = blocks.saturating_add(1);
+    }
+    blocks
 }
 
 /// Scan transcript jsonl lines for the LAST `goal_status` attachment. A later
 /// `/goal clear` (or an empty condition) resets it to `None`. Pure (no fs) so
-/// it is unit-testable; `read_latest_goal_status` wraps it with the file read.
+/// it is unit-testable; `read_turn_gating` wraps it with the file read.
 ///
 /// COST DISCIPLINE (2026-08-02): the tail handed here is up to 8 MB and this
 /// runs on every statusline read — per live session on the team graph, so a
@@ -2069,6 +2137,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
             effort: None,
             // Goal is read from the transcript on `thread_status`, not the tap.
             goal: None,
+            stop_hook_blocks: None,
             // Stamp this THREAD, so every observation the tap persists says
             // which one made it (`docs-local/issues/#14②`). Seeded once here:
             // the tap and the `/model` handler both clone this shared status,
@@ -2876,6 +2945,7 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
                     context: p.context,
                     effort: l.effort.or(p.effort),
                     goal: None,
+                    stop_hook_blocks: None,
                     // The LIVE thread is the one being described here.
                     generation: l.generation.or(p.generation),
                 },
@@ -2897,9 +2967,11 @@ impl HarnessAdapter for ClaudeStreamJsonAdapter {
         // it belongs.
         if let Some(cwd) = h.raw_extras.get("cwd").and_then(|v| v.as_str()) {
             let (cwd, uuid) = (PathBuf::from(cwd), h.identity.clone());
-            status.goal = tokio::task::spawn_blocking(move || read_latest_goal_status(&cwd, &uuid))
+            let gating = tokio::task::spawn_blocking(move || read_turn_gating(&cwd, &uuid))
                 .await
                 .unwrap_or(None);
+            status.goal = gating.as_ref().and_then(|gating| gating.goal.clone());
+            status.stop_hook_blocks = gating.map(|gating| gating.stop_hook_blocks);
         }
         Ok(status)
     }
@@ -3437,10 +3509,10 @@ mod account_usage_tests {
 mod effort_tests {
     use super::protocol::{McpServerStatus, SystemMsg};
     use super::{
-        claude_model_options, dead_ccteam_tool_face, is_model_placeholder, normalize_effort,
-        parse_latest_goal_status, persisted_session_model, preserve_1m_tag, reflect_task_event,
-        set_effort_level, split_model_effort, task_outlives_turn, write_status_file,
-        ClaudeModelOption, TaskTracker, EFFORT_LEVELS,
+        claude_model_options, count_recent_stop_hook_blocks, dead_ccteam_tool_face,
+        is_model_placeholder, normalize_effort, parse_latest_goal_status, persisted_session_model,
+        preserve_1m_tag, reflect_task_event, set_effort_level, split_model_effort,
+        task_outlives_turn, write_status_file, ClaudeModelOption, TaskTracker, EFFORT_LEVELS,
     };
     use crate::ThreadStatus;
     use std::sync::Mutex;
@@ -3475,6 +3547,7 @@ mod effort_tests {
                 context: None,
                 effort: None,
                 goal: None,
+                stop_hook_blocks: None,
             },
         );
         assert_eq!(persisted_session_model(dir.path(), "s1"), None);
@@ -3489,6 +3562,7 @@ mod effort_tests {
                 context: None,
                 effort: None,
                 goal: None,
+                stop_hook_blocks: None,
             },
         );
         assert_eq!(
@@ -3803,6 +3877,47 @@ mod effort_tests {
         assert!(parse_latest_goal_status(&cleared).is_none());
         // Half-flushed / non-JSON lines are skipped, not fatal.
         assert!(parse_latest_goal_status("{partial\n{\"x\":1}").is_none());
+    }
+
+    /// GitHub #206 (P2) — a `/goal` Stop hook that refuses every stop is why a
+    /// session can be silent for hours, and the transcript records each
+    /// refusal. Count the recent ones so `/status` can say so; a refusal from
+    /// a hook that is long gone must not keep accusing the session.
+    #[test]
+    fn stop_hook_refusals_are_counted_within_the_recent_window() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-11T05:08:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let refusal = |ts: &str| {
+            format!(
+                r#"{{"type":"user","isMeta":true,"timestamp":"{ts}","message":{{"role":"user","content":"Stop hook feedback:\n[keep going]"}}}}"#
+            )
+        };
+        // Nothing to count.
+        assert_eq!(count_recent_stop_hook_blocks("", now), 0);
+        assert_eq!(
+            count_recent_stop_hook_blocks(r#"{"type":"assistant"}"#, now),
+            0
+        );
+        // Two refusals inside the window, one hours old → the old one stops
+        // the scan instead of inflating the count.
+        let body = [
+            refusal("2026-09-10T17:29:00Z"),
+            r#"{"type":"assistant"}"#.to_string(),
+            refusal("2026-09-11T04:24:00Z"),
+            // The millisecond form a real transcript writes (probed
+            // 2026-09-11: 123 refusals in `excore`'s live session).
+            refusal("2026-09-11T05:07:30.470Z"),
+        ]
+        .join("\n");
+        assert_eq!(count_recent_stop_hook_blocks(&body, now), 2);
+        // A quotation of the marker is not a refusal — only a message whose
+        // OWN text is the hook's feedback counts.
+        let quoted = r#"{"type":"assistant","timestamp":"2026-09-11T05:07:40Z","message":{"role":"assistant","content":"the Stop hook feedback says to keep going"}}"#;
+        assert_eq!(count_recent_stop_hook_blocks(quoted, now), 0);
+        // An undated refusal happened; only a DATED one can be ruled out.
+        let undated = r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\nnot yet"}}"#;
+        assert_eq!(count_recent_stop_hook_blocks(undated, now), 1);
     }
 
     #[test]

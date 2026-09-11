@@ -227,6 +227,7 @@ impl ThreadLive {
             // Codex has a native `/goal` (thread/goal/*); surfacing it in the
             // statusline is a follow-up — None for now.
             goal: None,
+            stop_hook_blocks: None,
             generation: self.persist.as_ref().and_then(|p| p.generation),
         }
     }

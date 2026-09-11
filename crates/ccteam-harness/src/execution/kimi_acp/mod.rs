@@ -371,6 +371,7 @@ impl KimiAcpAdapter {
             context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
+            stop_hook_blocks: None,
             generation: st.generation,
         }
     }

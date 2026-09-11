@@ -249,6 +249,7 @@ impl SessionTranslateState {
             context: self.context_usage(),
             effort: self.effort.clone(),
             goal: None,
+            stop_hook_blocks: None,
             generation: self.generation,
         }
     }

@@ -1357,6 +1357,21 @@ pub struct ThreadStatus {
     /// back-compat with older persisted `status.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalStatus>,
+    /// How many times a **Stop hook** has recently REFUSED to let the session's
+    /// turn end (Claude writes each refusal into the session transcript as a
+    /// `Stop hook feedback:` meta message).
+    ///
+    /// This is the answer to "why has this session been silent for hours": a
+    /// `/goal` whose condition cannot be met yet installs a Stop hook that
+    /// denies every stop, so the turn can neither finish nor be finished
+    /// (GitHub #206 — 46 refusals in 44 minutes, ~14M tokens spent re-reading
+    /// the context each time, and nothing said in the chat about it).
+    ///
+    /// `None` = this channel cannot report it (every vendor but Claude
+    /// stream-json, or an unreadable transcript) — deliberately distinct from
+    /// `Some(0)`, "nothing has refused".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_hook_blocks: Option<u32>,
 }
 
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
@@ -2550,6 +2565,7 @@ mod tests {
             )),
             effort: None,
             goal: None,
+            stop_hook_blocks: None,
         };
         assert_eq!(
             full.status_suffix().as_deref(),
@@ -2593,6 +2609,7 @@ mod tests {
             context: None,
             effort: None,
             goal: None,
+            stop_hook_blocks: None,
             generation: None,
         };
         assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));
