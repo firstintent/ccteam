@@ -294,8 +294,14 @@ impl DshWebSupervisor {
         if !self.runtime.enabled() {
             return Err(anyhow!("DSH web companion listener is disabled"));
         }
-        let port = self.runtime.port_for(&runtime_identity(identity)).await?;
-        Ok(ProxyTarget { port })
+        let endpoint = self
+            .runtime
+            .endpoint_for(&runtime_identity(identity))
+            .await?;
+        Ok(ProxyTarget {
+            port: endpoint.port,
+            credential: endpoint.credential,
+        })
     }
 
     pub async fn shutdown_all(&self) {
@@ -338,9 +344,20 @@ fn home_kind(identity: &Identity) -> DshHomeKind {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// The upstream hop of one proxied request: where this identity's `dsh web`
+/// listens, and the vendor credential ccteam exchanged for at startup.
+///
+/// The credential rides the upstream hop ONLY. The browser never receives it
+/// and its own `Cookie` never reaches upstream (see
+/// [`should_strip_request_header`]): ccteam's auth boundary stays the
+/// companion port, and DSH's own browser auth is satisfied on ccteam's side of
+/// it. `None` means ccteam holds none — an attached instance the operator
+/// started, or a DSH without browser auth — and the hop simply carries no
+/// cookie.
+#[derive(Debug, Clone)]
 pub struct ProxyTarget {
     pub port: u16,
+    pub credential: Option<String>,
 }
 
 pub fn companion_router() -> Router<AppState> {
@@ -386,16 +403,21 @@ async fn handle_companion_request(
     if is_ws_upgrade(req.headers()) {
         if let Ok(ws) = ws {
             let uri = req.uri().clone();
-            return ws.on_upgrade(move |socket| proxy_websocket(socket, target.port, uri));
+            return ws.on_upgrade(move |socket| proxy_websocket(socket, target, uri));
         }
     }
-    proxy_http(req, target.port, &app.dsh_proxy_client).await
+    proxy_http(req, &target, &app.dsh_proxy_client).await
 }
 
-async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> Response {
+async fn proxy_http(
+    req: Request<Body>,
+    target: &ProxyTarget,
+    client: &reqwest::Client,
+) -> Response {
     let (parts, body) = req.into_parts();
+    let port = target.port;
     let plugin_bundle = is_plugin_bundle_path(parts.uri.path());
-    let target = format!(
+    let upstream = format!(
         "http://127.0.0.1:{port}{}",
         parts
             .uri
@@ -403,8 +425,8 @@ async fn proxy_http(req: Request<Body>, port: u16, client: &reqwest::Client) -> 
             .map(|pq| pq.as_str())
             .unwrap_or("/")
     );
-    let mut builder = client.request(parts.method, target);
-    let headers = proxy_request_headers(&parts.headers, port);
+    let mut builder = client.request(parts.method, upstream);
+    let headers = proxy_request_headers(&parts.headers, port, target.credential.as_deref());
     builder = builder.headers(headers);
     builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     match builder.send().await {
@@ -621,7 +643,13 @@ async fn response_from_reqwest(resp: reqwest::Response, plugin_bundle: bool) -> 
         .unwrap_or_else(|err| (StatusCode::BAD_GATEWAY, err.to_string()).into_response())
 }
 
-fn proxy_request_headers(headers: &HeaderMap, port: u16) -> HeaderMap {
+/// The upstream header set: the browser's request minus everything that is
+/// ccteam's side of the boundary, plus DSH's own browser credential.
+///
+/// `Host` is rewritten to the loopback authority the credential was minted
+/// for — the two must agree, because DSH binds its cookie to the Host of the
+/// exchange and re-checks it on every request.
+fn proxy_request_headers(headers: &HeaderMap, port: u16, credential: Option<&str>) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
         if should_strip_request_header(name) {
@@ -639,11 +667,21 @@ fn proxy_request_headers(headers: &HeaderMap, port: u16) -> HeaderMap {
         header::HOST,
         HeaderValue::from_str(&format!("127.0.0.1:{port}")).expect("loopback host header"),
     );
+    // Added AFTER the loop, so it can never be a browser cookie that survived:
+    // this is the value ccteam exchanged for at startup and nothing else.
+    if let Some(credential) = credential {
+        if let Ok(value) = HeaderValue::from_str(credential) {
+            out.insert(header::COOKIE, value);
+        }
+    }
     out
 }
 
 fn should_strip_request_header(name: &HeaderName) -> bool {
     is_hop_by_hop(name)
+        // The browser's own cookies are ccteam's auth boundary and stop here.
+        // The vendor credential the upstream hop does carry is INSERTED by
+        // `proxy_request_headers`, never forwarded from the browser.
         || name == header::COOKIE
         || name == header::AUTHORIZATION
         // This hop is loopback, so compression buys nothing — and dropping it
@@ -682,15 +720,32 @@ fn is_ws_upgrade(headers: &HeaderMap) -> bool {
             })
 }
 
-async fn proxy_websocket(socket: axum::extract::ws::WebSocket, port: u16, uri: axum::http::Uri) {
+async fn proxy_websocket(
+    socket: axum::extract::ws::WebSocket,
+    target: ProxyTarget,
+    uri: axum::http::Uri,
+) {
     use axum::extract::ws::Message as AxMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as TMessage;
 
-    let target = format!(
+    let port = target.port;
+    let upstream_url = format!(
         "ws://127.0.0.1:{port}{}",
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
     );
-    let Ok((upstream, _)) = tokio_tungstenite::connect_async(target).await else {
+    // The stream carries the whole DSH session, and DSH rejects an
+    // unauthenticated upgrade with the same 401 it gives an HTTP request — so
+    // the credential rides the handshake exactly as it rides the HTTP hop.
+    let Ok(mut request) = upstream_url.into_client_request() else {
+        return;
+    };
+    if let Some(credential) = target.credential.as_deref() {
+        if let Ok(value) = HeaderValue::from_str(credential) {
+            request.headers_mut().insert(header::COOKIE, value);
+        }
+    }
+    let Ok((upstream, _)) = tokio_tungstenite::connect_async(request).await else {
         return;
     };
     let (mut down_tx, mut down_rx) = socket.split();
@@ -802,6 +857,36 @@ mod tests {
             first,
             "every operator-ish tag resolves to the one admin token"
         );
+    }
+
+    /// The two halves of the DSH browser-auth handoff, in one place: the
+    /// browser's own cookies stop at the companion port (ccteam's boundary),
+    /// and the vendor credential ccteam exchanged for at startup is what the
+    /// upstream hop presents instead. Without the injection every proxied
+    /// page, `/api` call and WebSocket gets DSH's 401.
+    #[test]
+    fn upstream_hop_carries_the_vendor_credential_and_never_the_browser_cookie() {
+        let mut browser = HeaderMap::new();
+        browser.insert(header::COOKIE, HeaderValue::from_static("ccteam_web=mine"));
+        browser.insert(header::HOST, HeaderValue::from_static("box.lan:7331"));
+
+        let with = proxy_request_headers(&browser, 4567, Some("dsh-auth-avJ5=v1.body.sig"));
+        assert_eq!(
+            with.get(header::COOKIE).unwrap(),
+            "dsh-auth-avJ5=v1.body.sig",
+            "the browser's cookie must not survive, and the vendor's must arrive"
+        );
+        assert_eq!(with.get_all(header::COOKIE).iter().count(), 1);
+        assert_eq!(
+            with.get(header::HOST).unwrap(),
+            "127.0.0.1:4567",
+            "the credential is bound to this authority, so the hop must send it"
+        );
+
+        // No credential (an attached instance, or a DSH without browser auth):
+        // the hop stays cookie-free rather than forwarding the browser's.
+        let without = proxy_request_headers(&browser, 4567, None);
+        assert!(without.get(header::COOKIE).is_none());
     }
 
     #[test]

@@ -14,6 +14,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// Delivery origin and vendor routing are independent. Both survive a cold
+/// queue so a dispatched task never comes back as a batchable notification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingIntent {
+    /// Whether this line came from ccteam rather than a human chat.
+    pub internal: bool,
+    /// The requested vendor channel, including notification batch eligibility.
+    pub routing: ccteam_harness::TurnRouting,
+}
+
 /// One queued user turn waiting for the session to become live.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingTurn {
@@ -33,16 +43,54 @@ pub struct PendingTurn {
     /// place a turn survives its submit call, so without carrying this the
     /// drain has to guess — and it guessed "internal" for everything, which
     /// makes a human's queued question look like nobody asked it.
-    #[serde(default)]
-    pub internal: bool,
+    #[serde(flatten)]
+    pub intent: PendingIntent,
+    /// The delegation request this line belongs to, when the submit that
+    /// enqueued it had one (issue #197 E). The queue is the only place a
+    /// dispatched task survives its submit call, so without the identity here
+    /// an explicit stop could only say "N lines are retained for this session"
+    /// and never "YOUR task is retained" — and attributing an id-less row to
+    /// every unbound request is a claim ccteam cannot prove. Absent on human
+    /// turns and on rows written before this field existed: those are counted,
+    /// never attributed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
+
+/// What one session's queue is holding, split by whether ccteam can say WHOSE
+/// each line is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedPending {
+    /// Delegation requests whose task line is still in the queue.
+    pub request_ids: Vec<String>,
+    /// Rows carrying no request identity (a human's queued message, a row from
+    /// before the field existed). Reported as a count, never attributed.
+    pub unattributed: usize,
+}
+
+impl RetainedPending {
+    /// Whether the queue still holds this request's line.
+    pub fn holds(&self, request_id: &str) -> bool {
+        self.request_ids.iter().any(|id| id == request_id)
+    }
+
+    /// Nothing queued at all.
+    pub fn is_empty(&self) -> bool {
+        self.request_ids.is_empty() && self.unattributed == 0
+    }
+}
+
+/// The basename of this queue's file. One literal, named, because a caller
+/// that must tell a dispatcher WHERE its undelivered task is being held
+/// (`agent_stop`'s receipt) should not spell the path a second time.
+pub const PENDING_TURNS_FILE: &str = "pending_turns.jsonl";
 
 fn pending_path(project_dir: &Path, sid: &str) -> PathBuf {
     project_dir
         .join(".ccteam")
         .join("chat")
         .join(sid)
-        .join("pending_turns.jsonl")
+        .join(PENDING_TURNS_FILE)
 }
 
 /// Append one pending turn (FIFO). Creates parent dirs as needed.
@@ -52,7 +100,8 @@ pub fn enqueue_pending_turn(
     text: impl Into<String>,
     origin: Option<String>,
     literal: bool,
-    internal: bool,
+    intent: PendingIntent,
+    request_id: Option<String>,
 ) -> Result<()> {
     let path = pending_path(project_dir, sid);
     if let Some(parent) = path.parent() {
@@ -63,7 +112,8 @@ pub fn enqueue_pending_turn(
         enqueued_at: chrono::Utc::now().to_rfc3339(),
         origin,
         literal,
-        internal,
+        intent,
+        request_id,
     };
     let mut f = OpenOptions::new()
         .create(true)
@@ -76,29 +126,36 @@ pub fn enqueue_pending_turn(
     Ok(())
 }
 
-/// Drain all pending turns (FIFO order) and remove the file.
+/// Drain all pending turns (FIFO order) and remove the file. An unreadable row
+/// fails the whole drain and preserves the original bytes; missing routing is
+/// not guessed from text or caller identity (GitHub #205).
 pub fn drain_pending_turns(project_dir: &Path, sid: &str) -> Result<VecDeque<PendingTurn>> {
     let path = pending_path(project_dir, sid);
-    if !path.exists() {
-        return Ok(VecDeque::new());
-    }
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("read pending_turns {}", path.display()))?;
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VecDeque::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read pending_turns {}", path.display()))
+        }
+    };
     let mut out = VecDeque::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| format!("read pending input row {}", index + 1))?;
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<PendingTurn>(line) {
-            Ok(t) => out.push_back(t),
-            Err(e) => {
-                tracing::warn!(error = %e, %line, "skip corrupt pending_turns row");
-            }
-        }
+        let turn = serde_json::from_str::<PendingTurn>(line).with_context(|| {
+            format!(
+                "pending input row {} is unreadable; queue retained at {}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        out.push_back(turn);
     }
-    let _ = std::fs::remove_file(&path);
+    std::fs::remove_file(&path)
+        .with_context(|| format!("retire pending input {}", path.display()))?;
     Ok(out)
 }
 
@@ -115,16 +172,166 @@ pub fn pending_turn_count(project_dir: &Path, sid: &str) -> usize {
         .count()
 }
 
+/// What the queue holds right now, WITHOUT draining it — the read an explicit
+/// stop makes to answer "is my task still retained, and can you prove it".
+pub fn retained_pending(project_dir: &Path, sid: &str) -> RetainedPending {
+    let path = pending_path(project_dir, sid);
+    let Ok(file) = std::fs::File::open(path) else {
+        return RetainedPending::default();
+    };
+    let mut out = RetainedPending::default();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // A row this build cannot parse is still a row the queue will try to
+        // replay: count it rather than pretend the queue is emptier than it is.
+        match serde_json::from_str::<PendingTurn>(line) {
+            Ok(row) => match row.request_id {
+                Some(id) => out.request_ids.push(id),
+                None => out.unattributed += 1,
+            },
+            Err(_) => out.unattributed += 1,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     #[test]
+    fn unreadable_pending_rows_block_the_drain_without_losing_any_bytes() {
+        let tmp = TempDir::new().unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "first",
+            None,
+            false,
+            PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
+            None,
+        )
+        .unwrap();
+        let path = pending_path(tmp.path(), "s1");
+        let valid = std::fs::read_to_string(&path).unwrap();
+        for invalid in [
+            "{\"text\":\"old task\",\"enqueued_at\":\"now\",\"internal\":true}\n",
+            "{torn\n",
+        ] {
+            let contents = format!("{valid}{invalid}{valid}");
+            std::fs::write(&path, &contents).unwrap();
+            assert!(drain_pending_turns(tmp.path(), "s1").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(retained_pending(tmp.path(), "s1").unattributed, 3);
+        }
+    }
+
+    /// GitHub #197 (E) — a queued line is attributed to a request only when it
+    /// SAYS which one, and rows that say nothing are counted, never spread over
+    /// every unbound request. The queue used to carry no identity at all, so a
+    /// stop could either claim per-request retention it could not prove or say
+    /// nothing at all.
+    #[test]
+    fn retention_is_attributed_only_where_the_row_names_its_request() {
+        let tmp = TempDir::new().unwrap();
+        assert!(retained_pending(tmp.path(), "s1").is_empty());
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "the delegated task",
+            None,
+            false,
+            PendingIntent {
+                internal: true,
+                routing: ccteam_harness::TurnRouting::Queue,
+            },
+            Some("req-1".into()),
+        )
+        .unwrap();
+        // A human's message queued behind the same body names nobody.
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "hey",
+            None,
+            false,
+            PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
+            None,
+        )
+        .unwrap();
+
+        let held = retained_pending(tmp.path(), "s1");
+        assert_eq!(held.request_ids, vec!["req-1".to_string()]);
+        assert_eq!(held.unattributed, 1);
+        assert!(held.holds("req-1"));
+        assert!(
+            !held.holds("req-2"),
+            "a request whose line is not in the queue is never claimed as retained"
+        );
+
+        // The identity survives the round trip the drain makes.
+        let drained = drain_pending_turns(tmp.path(), "s1").unwrap();
+        assert_eq!(drained[0].request_id.as_deref(), Some("req-1"));
+        assert_eq!(drained[1].request_id, None);
+        assert!(retained_pending(tmp.path(), "s1").is_empty());
+    }
+
+    /// A row from before the identity existed is unreadable as an attribution,
+    /// and is counted rather than dropped: the queue will still replay it.
+    #[test]
+    fn a_row_without_an_identity_is_counted_not_attributed() {
+        let tmp = TempDir::new().unwrap();
+        let path = pending_path(tmp.path(), "s1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"text\":\"old shape\",\"enqueued_at\":\"2026-01-01T00:00:00Z\"}\n{ torn\n",
+        )
+        .unwrap();
+        let held = retained_pending(tmp.path(), "s1");
+        assert!(held.request_ids.is_empty());
+        assert_eq!(held.unattributed, 2, "a torn row is still a row to replay");
+    }
+
+    #[test]
     fn enqueue_drain_fifo() {
         let tmp = TempDir::new().unwrap();
-        enqueue_pending_turn(tmp.path(), "s1", "first", Some("web".into()), false, false).unwrap();
-        enqueue_pending_turn(tmp.path(), "s1", "second", Some("web".into()), true, true).unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "first",
+            Some("web".into()),
+            false,
+            PendingIntent {
+                internal: false,
+                routing: ccteam_harness::TurnRouting::Inject,
+            },
+            None,
+        )
+        .unwrap();
+        enqueue_pending_turn(
+            tmp.path(),
+            "s1",
+            "second",
+            Some("web".into()),
+            true,
+            PendingIntent {
+                internal: true,
+                routing: ccteam_harness::TurnRouting::Notification,
+            },
+            None,
+        )
+        .unwrap();
         assert_eq!(pending_turn_count(tmp.path(), "s1"), 2);
         let drained = drain_pending_turns(tmp.path(), "s1").unwrap();
         assert_eq!(drained.len(), 2);

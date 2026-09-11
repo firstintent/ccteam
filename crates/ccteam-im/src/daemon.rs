@@ -1528,7 +1528,11 @@ fn spawn_inbound_consumer(
                     msg.selection.is_some(),
                 )
             };
-            if may_spawn {
+            // `/stop` joins the same off-loop entry point for a different
+            // reason: it has to take the stopped child's delegation claim, and
+            // a claim is never taken while the gateway lock is held (issue #197
+            // E). `handle_message_shared` is where the lock can be dropped.
+            if may_spawn || Gateway::inbound_needs_shared_entry(&clean_payload) {
                 let gateway = Arc::clone(&gateway);
                 let channel = Arc::clone(&channel);
                 let msg = msg.clone();

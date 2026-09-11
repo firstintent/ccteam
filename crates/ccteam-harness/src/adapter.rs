@@ -445,6 +445,12 @@ pub struct RecoveredTurn {
     pub usage: serde_json::Value,
     /// Vendor timestamp of the last recovered message.
     pub ended_at: DateTime<Utc>,
+    /// The conclusion of the last recovered turn (the text of the message
+    /// that ended it) — the same field a live `TurnCompleted` carries, so a
+    /// notification built from a recovered turn selects the same excerpt
+    /// the live path would have. `None` when the recovered text is its own
+    /// conclusion.
+    pub conclusion: Option<String>,
 }
 
 /// Cross-vendor thread handle, returned from
@@ -530,6 +536,10 @@ pub enum TurnRouting {
     /// shown to the model twice, once as a queued-command preview and once as
     /// the next prompt; a distinct turn is charged once).
     Queue,
+    /// Internal completion delivery. Like Queue, but adjacent notifications
+    /// already parked at a boundary may share a turn (GitHub #205). Explicit
+    /// dispatched tasks keep Queue and their independent execution identities.
+    Notification,
 }
 
 /// What the adapter actually did with one accepted message.
@@ -544,6 +554,231 @@ pub enum TurnDisposition {
     Queued,
 }
 
+/// The fixed cap on the narration excerpt a RUNNING turn can report — to the
+/// record an interrupted turn leaves behind, and to a read of a turn still in
+/// flight (GitHub #197 E/G).
+///
+/// A turn can have been talking for half an hour; the excerpt exists so
+/// `agent_read` shows what it is doing, not so it can carry the whole
+/// transcript into whoever reads it next. The TAIL is what is kept — the last
+/// thing a session said is the part that explains what it is doing now (and,
+/// for a stop, why it was stopped). A reader's own `max_chars` can narrow it
+/// further; nothing can widen it.
+pub const IN_FLIGHT_NARRATION_MAX_CHARS: usize = 2000;
+
+/// What a vendor turn that is still running has said so far.
+///
+/// PUBLIC narration only — the assistant text blocks a transcript would show —
+/// never private reasoning, and never an answer: a partial is a bounded
+/// excerpt of what was said before the turn was cut off, and no consumer may
+/// treat it as a completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialNarration {
+    /// The execution turn it belongs to, when the adapter has one. `None` for
+    /// a channel with no turn identity of its own.
+    pub exec_turn_id: Option<String>,
+    /// The narration tail, at most [`IN_FLIGHT_NARRATION_MAX_CHARS`] chars.
+    /// Empty when the turn had not said anything yet — which is a FACT
+    /// ("nothing was said"), distinct from the adapter being unable to answer.
+    pub text: String,
+    /// How many characters of this turn's narration are NOT in `text` —
+    /// dropped from the HEAD to keep the tail inside the cap. A count, not a
+    /// flag: a reader that sees 40 characters plus "1600 omitted" knows it is
+    /// holding the end of a long turn, which is exactly the judgement
+    /// `truncated: true` alone left it unable to make.
+    pub omitted_chars: usize,
+}
+
+impl PartialNarration {
+    /// Was any narration dropped to fit the cap?
+    pub fn truncated(&self) -> bool {
+        self.omitted_chars > 0
+    }
+}
+
+/// Keep at most `max_chars` characters of `text`, dropping from the HEAD.
+/// Returns the tail and how many characters were dropped.
+///
+/// The tail, everywhere: the last thing a session said is the part that
+/// explains what it is doing now (and, for a stop, why it was stopped).
+pub fn bounded_tail(text: &str, max_chars: usize) -> (String, usize) {
+    let total = text.chars().count();
+    let over = total.saturating_sub(max_chars);
+    if over == 0 {
+        return (text.to_string(), 0);
+    }
+    (text.chars().skip(over).collect(), over)
+}
+
+/// The public narration of ONE running turn, accumulated from vendor events
+/// and bounded to [`IN_FLIGHT_NARRATION_MAX_CHARS`].
+///
+/// The three stdio protocols report a turn's text in three different shapes,
+/// and folding them with one verb is how a narration gets doubled or lost:
+///
+/// - **Claude stream-json** emits one `assistant` message per step, each
+///   carrying the COMPLETE set of text blocks of that message — a cumulative
+///   snapshot keyed by the message id. Appending one twice duplicates a
+///   paragraph, so a snapshot REPLACES the part it belongs to.
+/// - **Codex app-server** emits `item/agentMessage/delta` fragments and then
+///   an `item/completed` carrying that item's full text. A delta must be
+///   appended (treating one as a snapshot throws away everything said before
+///   it), and the completed item's text then replaces the fragments it was
+///   assembled from rather than being appended after them.
+/// - **ACP** (`agent_message_chunk`) is deltas only, and the turn's own buffer
+///   already holds them; those adapters render a tail straight off it.
+///
+/// So: two verbs, [`Self::append_delta`] and [`Self::set_snapshot`], both
+/// keyed by the vendor's own message/item identity. Reasoning and thinking
+/// events are never fed in at all — the exclusion is structural, at the call
+/// site, not a filter here.
+#[derive(Debug, Default, Clone)]
+pub struct NarrationAccumulator {
+    /// One entry per public message/item, in the order it first appeared.
+    parts: Vec<NarrationPart>,
+    /// Characters of fully-dropped parts (their separator included).
+    dropped: usize,
+}
+
+/// One public message of the turn, and how much of its head is gone.
+#[derive(Debug, Default, Clone)]
+struct NarrationPart {
+    /// The vendor's identity for this message / item. Empty = the channel
+    /// gave none.
+    key: String,
+    /// The retained text (a suffix of what the part has produced).
+    text: String,
+    /// Characters trimmed off this part's head, so a later snapshot that
+    /// restores the whole part can un-count them.
+    dropped: usize,
+}
+
+/// Paragraph separator between two public messages — the way a transcript
+/// shows consecutive assistant messages.
+const NARRATION_SEP: &str = "\n\n";
+
+impl NarrationAccumulator {
+    /// Append a streamed fragment of the message identified by `key`.
+    ///
+    /// Consecutive deltas of one message concatenate with no separator. A
+    /// channel that gives no item identity (`key` empty) still streams ONE
+    /// message at a time in order, so its deltas keep joining the open part.
+    pub fn append_delta(&mut self, key: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match self.parts.last_mut() {
+            Some(part) if part.key == key => part.text.push_str(delta),
+            _ => self.parts.push(NarrationPart {
+                key: key.to_string(),
+                text: delta.to_string(),
+                dropped: 0,
+            }),
+        }
+        self.trim();
+    }
+
+    /// Record the COMPLETE text of the message identified by `key`.
+    ///
+    /// Replaces that message's accumulated text when it is the one still open
+    /// — the same snapshot arriving twice, or a final item text following its
+    /// own deltas, must not read as two messages. An empty `key` cannot be
+    /// recognised as a repeat, so it is appended: guessing that two anonymous
+    /// snapshots are the same message is how narration gets swallowed.
+    pub fn set_snapshot(&mut self, key: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.parts.last_mut() {
+            Some(part) if !key.is_empty() && part.key == key => {
+                part.text = text.to_string();
+                // Its head is back: whatever was trimmed off this part is no
+                // longer omitted (a re-trim below re-counts what still is).
+                part.dropped = 0;
+            }
+            _ => self.parts.push(NarrationPart {
+                key: key.to_string(),
+                text: text.to_string(),
+                dropped: 0,
+            }),
+        }
+        self.trim();
+    }
+
+    /// The turn is over: its narration belongs to the transcript now, never to
+    /// the next turn's record.
+    pub fn clear(&mut self) {
+        self.parts.clear();
+        self.dropped = 0;
+    }
+
+    /// The retained narration, as a transcript would show it.
+    pub fn text(&self) -> String {
+        self.parts
+            .iter()
+            .filter(|part| !part.text.is_empty())
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join(NARRATION_SEP)
+    }
+
+    /// How many characters were dropped to keep the tail inside the cap.
+    pub fn omitted_chars(&self) -> usize {
+        self.dropped + self.parts.iter().map(|part| part.dropped).sum::<usize>()
+    }
+
+    /// Characters the retained narration renders to, without building it: the
+    /// trim runs on every streamed fragment, so it must not allocate a string
+    /// per delta.
+    fn retained_chars(&self) -> usize {
+        let rendered = self.parts.iter().filter(|part| !part.text.is_empty());
+        let chars: usize = rendered.clone().map(|part| part.text.chars().count()).sum();
+        let separators = rendered.count().saturating_sub(1) * NARRATION_SEP.chars().count();
+        chars + separators
+    }
+
+    /// This turn's narration as an adapter reports it.
+    pub fn partial(&self, exec_turn_id: Option<String>) -> PartialNarration {
+        PartialNarration {
+            exec_turn_id,
+            text: self.text(),
+            omitted_chars: self.omitted_chars(),
+        }
+    }
+
+    /// Drop from the head until the retained text fits the cap. Whole parts go
+    /// first; the oldest surviving one is trimmed only when it is what still
+    /// overflows.
+    fn trim(&mut self) {
+        loop {
+            let retained = self.retained_chars();
+            let over = retained.saturating_sub(IN_FLIGHT_NARRATION_MAX_CHARS);
+            if over == 0 {
+                return;
+            }
+            let Some(first) = self.parts.first() else {
+                return;
+            };
+            let first_len = first.text.chars().count();
+            if first_len <= over && self.parts.len() > 1 {
+                // The whole part goes, and with it the separator that followed
+                // it — both were characters this narration had produced.
+                let gone = self.parts.remove(0);
+                self.dropped += gone.dropped + first_len + NARRATION_SEP.chars().count();
+                continue;
+            }
+            let part = &mut self.parts[0];
+            let (kept, cut) = bounded_tail(&part.text, first_len.saturating_sub(over));
+            part.text = kept;
+            part.dropped += cut;
+            if cut == 0 {
+                // Cannot shrink further (a single part already at the cap).
+                return;
+            }
+        }
+    }
+}
+
 /// Result of a routed user-message submission.
 ///
 /// `disposition` is the path the adapter actually used. It can differ from the
@@ -556,7 +791,16 @@ pub struct TurnSubmission {
     pub turn_id: TurnId,
     pub input_id: String,
     pub disposition: TurnDisposition,
-    completion_guard: Option<Box<dyn Send + 'static>>,
+    /// 1-based waiting position when the adapter owns the FIFO this message
+    /// was parked in. `None` = this message was not queued, or the adapter
+    /// cannot observe a position — a caller reports `unknown`, never 0
+    /// (issue #201: a dispatcher told only "pending" re-sent the same
+    /// instruction three times).
+    pub queue_position: Option<usize>,
+    /// `Sync` as well as `Send`: the receipt this moves to is held across
+    /// awaits by the dispatch path, and a future holding `&TurnReceipt` over an
+    /// await is only `Send` if everything in it is `Sync`.
+    completion_guard: Option<Box<dyn Send + Sync + 'static>>,
 }
 
 impl TurnSubmission {
@@ -580,6 +824,14 @@ impl TurnSubmission {
         Self::with_disposition(turn_id, TurnDisposition::Queued)
     }
 
+    /// A queued message whose adapter knows where in its own FIFO it sits.
+    pub fn queued_at(turn_id: TurnId, position: usize) -> Self {
+        debug_assert!(position > 0, "queue positions are 1-based");
+        let mut submission = Self::queued(turn_id);
+        submission.queue_position = Some(position);
+        submission
+    }
+
     fn with_disposition(turn_id: TurnId, disposition: TurnDisposition) -> Self {
         Self::with_input_id(turn_id, next_turn_input_id(), disposition)
     }
@@ -593,6 +845,7 @@ impl TurnSubmission {
             input_id: input_id.into(),
             turn_id,
             disposition,
+            queue_position: None,
             completion_guard: None,
         }
     }
@@ -600,7 +853,7 @@ impl TurnSubmission {
     /// Hold a vendor turn boundary until the caller records this accepted
     /// input. Used by adapters whose prompt can complete concurrently with the
     /// submission acknowledgement.
-    pub fn hold_completion(mut self, guard: impl Send + 'static) -> Self {
+    pub fn hold_completion(mut self, guard: impl Send + Sync + 'static) -> Self {
         self.completion_guard = Some(Box::new(guard));
         self
     }
@@ -609,6 +862,14 @@ impl TurnSubmission {
     /// registered. Safe and idempotent for unfenced submissions.
     pub fn release_completion(&mut self) {
         self.completion_guard.take();
+    }
+
+    /// Hand the fence to whoever still has recording to do. The gateway passes
+    /// it to the delegation bind: a turn that may complete concurrently with
+    /// its own acknowledgement must not be allowed to end before the request it
+    /// belongs to is durably bound to it (issue #201).
+    pub fn take_completion_guard(&mut self) -> Option<Box<dyn Send + Sync + 'static>> {
+        self.completion_guard.take()
     }
 
     /// Mint an opaque, process-unique receipt id before a vendor request is
@@ -624,6 +885,7 @@ impl std::fmt::Debug for TurnSubmission {
             .field("turn_id", &self.turn_id)
             .field("input_id", &self.input_id)
             .field("disposition", &self.disposition)
+            .field("queue_position", &self.queue_position)
             .field("completion_fenced", &self.completion_guard.is_some())
             .finish()
     }
@@ -640,6 +902,58 @@ fn next_turn_input_id() -> String {
     format!("input-{nanos:x}-{seq:x}")
 }
 
+/// Who opened an execution turn.
+///
+/// A vendor can wake its OWN model. Claude Code does: when a background Bash
+/// task, a `Monitor` or an `Agent` task the child launched finishes, the CLI
+/// writes a user line of its own and the model answers in a brand-new turn —
+/// ccteam submitted nothing. The same happens to a line ccteam injects into a
+/// running turn: the CLI shows it as a queued command and then RE-RUNS it as
+/// the next prompt.
+///
+/// Such a turn continues the work of the one before it, so the delegation
+/// requests bound to that turn move onto it — otherwise the request is
+/// resolved by the first boundary and the answer, several turns later, reaches
+/// nobody (GitHub #198/#199).
+///
+/// Reported from HARNESS STATE — whether the id the turn opened under was one
+/// a delivered line reserved — never from the text of the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOpening {
+    /// ccteam delivered the line that opened this turn. The safe default: a
+    /// harness that cannot tell must not move anyone's binding.
+    #[default]
+    Submitted,
+    /// The vendor opened this turn on its own account, continuing the previous
+    /// one's work.
+    VendorContinuation,
+}
+
+/// Whether a turn boundary is the END of the work bound to it.
+///
+/// The counterpart of [`TurnOpening`]: a `result` that arrives while the
+/// vendor still holds work which will wake it again answers nothing yet. It is
+/// recorded and billed like any boundary, but it resolves no request and wakes
+/// no parent — the receipt belongs to the turn that ends with the vendor
+/// holding nothing.
+///
+/// Harness state only. For claude stream-json it is the `background_tasks_changed`
+/// snapshot plus the adapter's own record of an injected line awaiting replay;
+/// nothing here looks at what the model wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnContinuation {
+    /// The vendor holds nothing that will re-open this work: the boundary is
+    /// the answer to every request bound to the turn. The default, because a
+    /// harness with no vendor-driven continuation (codex, every ACP vendor)
+    /// ends its turns exactly when it is told to.
+    #[default]
+    Settled,
+    /// The vendor will wake its own model again on account of this turn.
+    Pending,
+}
+
 /// Vendor-agnostic event flowing out of [`HarnessAdapter::events`].
 /// Schema mirrors Codex `ThreadEvent` (`exec_events.rs:11-37`) so the
 /// orchestrator's translation layer maps 1:1 against Codex emitters.
@@ -651,6 +965,10 @@ pub enum ThreadEvent {
     },
     TurnStarted {
         turn_id: String,
+        /// Who opened it — see [`TurnOpening`]. A vendor continuation inherits
+        /// the bindings of this session's previous execution turn.
+        #[serde(default)]
+        opening: TurnOpening,
     },
     TurnCompleted {
         turn_id: String,
@@ -662,6 +980,25 @@ pub enum ThreadEvent {
         /// is unpriced (exposed, never billed at a fallback rate).
         #[serde(default)]
         model: Option<String>,
+        /// The turn's CONCLUSION: the text the model wrote after its last
+        /// tool call — Claude's `result.result`, the block a disciplined
+        /// worker puts its completion receipt in. `None` when the vendor
+        /// draws no such boundary, or when the whole answer IS the
+        /// conclusion (a single text block). The answer itself still rides
+        /// `ItemCompleted{AgentMessage}` whole (issue #192); this is what a
+        /// bounded excerpt of it prefers to show (issue #196).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conclusion: Option<String>,
+        /// Whether the vendor still holds work that will wake it again — see
+        /// [`TurnContinuation`]. `Pending` makes this boundary non-terminal:
+        /// it is recorded and billed, and it resolves nobody's request.
+        ///
+        /// Only the SUCCESS boundary carries it. A `TurnFailed` is terminal
+        /// whatever the vendor still holds: a later continuation turn does not
+        /// repair a failed one, and a parent left waiting on a request that
+        /// already failed is the worse error.
+        #[serde(default)]
+        continuation: TurnContinuation,
     },
     TurnFailed {
         turn_id: String,
@@ -1020,6 +1357,21 @@ pub struct ThreadStatus {
     /// back-compat with older persisted `status.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<GoalStatus>,
+    /// How many times a **Stop hook** has recently REFUSED to let the session's
+    /// turn end (Claude writes each refusal into the session transcript as a
+    /// `Stop hook feedback:` meta message).
+    ///
+    /// This is the answer to "why has this session been silent for hours": a
+    /// `/goal` whose condition cannot be met yet installs a Stop hook that
+    /// denies every stop, so the turn can neither finish nor be finished
+    /// (GitHub #206 — 46 refusals in 44 minutes, ~14M tokens spent re-reading
+    /// the context each time, and nothing said in the chat about it).
+    ///
+    /// `None` = this channel cannot report it (every vendor but Claude
+    /// stream-json, or an unreadable transcript) — deliberately distinct from
+    /// `Some(0)`, "nothing has refused".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_hook_blocks: Option<u32>,
 }
 
 /// Account-level usage / rate-limits (Claude `get_usage` control_request; Codex
@@ -1521,6 +1873,28 @@ pub trait HarnessAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// What the turn currently in flight has said so far, for the bounded
+    /// `interrupted` record an explicit stop writes to `turns.jsonl`
+    /// (issue #197 E).
+    ///
+    /// A turn killed mid-flight used to leave NOTHING behind: a child that had
+    /// worked for twenty-nine minutes and made sixty-nine tool calls read back
+    /// through `agent_read` as having said nothing at all, so the parent could
+    /// not tell a stopped session from an idle one. `None` means "a turn is
+    /// not running, or this adapter cannot report one" — the record then says
+    /// the narration is UNKNOWN rather than implying the turn was silent.
+    ///
+    /// Must NOT block, do IO, or cost more than the cap: the stop path calls it
+    /// with the gateway lock held. An implementation that rendered the tail by
+    /// scanning the turn's whole accumulated text made that hold grow with
+    /// however long the child had been talking — keep the bounded tail as the
+    /// chunks arrive ([`NarrationAccumulator`]) and hand it over here. The READ
+    /// path does not rely on this alone: it resolves the handle under the lock
+    /// and calls this after releasing it.
+    fn in_flight_narration(&self, _h: &ThreadHandle) -> Option<PartialNarration> {
+        None
+    }
+
     /// Cheap liveness probe: is this thread's underlying process / channel
     /// still alive and able to accept a turn RIGHT NOW? Default `true`.
     ///
@@ -1959,6 +2333,76 @@ pub fn pluck_pct(value: &serde_json::Value, path: &[&str]) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// GitHub #197 (G) — the three adapter shapes, normalized. A cumulative
+    /// snapshot must never be appended twice; a delta must never replace what
+    /// it continues. Both were live hazards: claude re-states a message's whole
+    /// text block set on every step, codex ships that same text as fragments.
+    #[test]
+    fn a_snapshot_replaces_its_own_part_and_a_delta_extends_it() {
+        let mut acc = NarrationAccumulator::default();
+        // Claude: the same message id, restated as it grows.
+        acc.set_snapshot("msg_1", "reading the brief");
+        acc.set_snapshot("msg_1", "reading the brief and the tests");
+        assert_eq!(acc.text(), "reading the brief and the tests");
+        // A new message is its own paragraph, the way a transcript shows it.
+        acc.set_snapshot("msg_2", "now patching");
+        assert_eq!(
+            acc.text(),
+            "reading the brief and the tests\n\nnow patching"
+        );
+        // Codex: fragments of one item concatenate, with no separator.
+        let mut acc = NarrationAccumulator::default();
+        acc.append_delta("item_1", "wri");
+        acc.append_delta("item_1", "ting ");
+        acc.append_delta("item_1", "the fix");
+        assert_eq!(acc.text(), "writing the fix");
+        // …and the completed item's own text replaces the fragments rather
+        // than being appended after them.
+        acc.set_snapshot("item_1", "writing the fix");
+        assert_eq!(acc.text(), "writing the fix");
+        assert_eq!(acc.omitted_chars(), 0);
+        // A boundary hands the narration to the transcript.
+        acc.clear();
+        assert_eq!(acc.text(), "");
+    }
+
+    /// The cell is bounded, and says by how much: a turn that talks for half
+    /// an hour must not grow it, and a reader must be able to tell a short
+    /// narration from the tail of a long one.
+    #[test]
+    fn the_accumulator_keeps_a_tail_and_counts_what_it_dropped() {
+        let mut acc = NarrationAccumulator::default();
+        acc.append_delta("i1", &"a".repeat(IN_FLIGHT_NARRATION_MAX_CHARS));
+        assert_eq!(acc.omitted_chars(), 0);
+        acc.append_delta("i1", "bbbb");
+        let partial = acc.partial(Some("turn-1".into()));
+        assert_eq!(partial.text.chars().count(), IN_FLIGHT_NARRATION_MAX_CHARS);
+        assert!(partial.text.ends_with("bbbb"), "the TAIL is what is kept");
+        assert_eq!(partial.omitted_chars, 4);
+        assert!(partial.truncated());
+        assert_eq!(partial.exec_turn_id.as_deref(), Some("turn-1"));
+        // A whole older message goes before the newest one is shredded, and
+        // its separator goes with it.
+        let mut acc = NarrationAccumulator::default();
+        acc.set_snapshot("i1", &"x".repeat(10));
+        acc.set_snapshot("i2", &"y".repeat(IN_FLIGHT_NARRATION_MAX_CHARS));
+        assert_eq!(acc.text(), "y".repeat(IN_FLIGHT_NARRATION_MAX_CHARS));
+        assert_eq!(acc.omitted_chars(), 12, "10 chars + the 2-char separator");
+    }
+
+    /// The primitive every excerpt is narrowed with — a read surface's own
+    /// `max_chars` can only ever be stricter than the adapter's cap, and what
+    /// it drops has to be countable so the two can be added.
+    #[test]
+    fn a_bounded_tail_keeps_the_end_and_counts_the_head_it_dropped() {
+        assert_eq!(bounded_tail("0123456789", 4), ("6789".to_string(), 6));
+        // A budget nothing overflows leaves the text alone.
+        assert_eq!(bounded_tail("short", 1000), ("short".to_string(), 0));
+        assert_eq!(bounded_tail("", 10), (String::new(), 0));
+        // Characters, not bytes: a multi-byte tail must not be split.
+        assert_eq!(bounded_tail("阿依莲", 2), ("依莲".to_string(), 1));
+    }
+
     #[test]
     fn permission_mode_default_is_skip() {
         // The default everywhere is skip (preserves today's behavior).
@@ -2121,6 +2565,7 @@ mod tests {
             )),
             effort: None,
             goal: None,
+            stop_hook_blocks: None,
         };
         assert_eq!(
             full.status_suffix().as_deref(),
@@ -2164,6 +2609,7 @@ mod tests {
             context: None,
             effort: None,
             goal: None,
+            stop_hook_blocks: None,
             generation: None,
         };
         assert_eq!(model_only.status_suffix().as_deref(), Some("gpt-5"));

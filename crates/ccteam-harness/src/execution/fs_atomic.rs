@@ -21,28 +21,48 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 
-/// Write `bytes` to `path` durably: write to a sibling `.tmp` file, `fsync`
-/// that tmp file, `rename` it over `path`, then best-effort `fsync` the
+/// Write `bytes` to `path` durably: write to a private sibling tmp file,
+/// `fsync` that tmp file, `rename` it over `path`, then best-effort `fsync` the
 /// parent directory (ignoring errors — some platforms/filesystems reject a
 /// bare directory fsync).
 ///
+/// **Two concurrent writers of the same target are safe.** The tmp name used to
+/// be `<file>.tmp` for everybody, so a second writer truncated the first one's
+/// tmp file and whichever renamed second failed with `ENOENT` — an error the
+/// caller reported as a failed write of a file that was, in fact, fine. Every
+/// call now mints its own tmp name (pid + a process-monotonic counter), so the
+/// only thing two writers can race over is which one's `rename` lands last,
+/// which is the semantics `rename` is chosen for. Serializing writers is still
+/// the caller's job when the CONTENT is a read-modify-write; this helper only
+/// guarantees no writer corrupts another's staging file.
+///
 /// Caller is responsible for ensuring `path`'s parent directory exists.
 pub fn atomic_write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = sibling_tmp_path(path);
+    // Anything left behind is swept next time this target is written: a crash
+    // between create and rename leaves a staging file nobody will ever rename,
+    // and with per-call names there is no second writer to reuse it.
+    sweep_stale_tmp_siblings(path);
+    // Removes the staging file on EVERY early return below — a full disk, a
+    // failed fsync, a rename onto a read-only directory — so an error path
+    // cannot litter the directory it just failed to write into.
+    let tmp = TmpFile::new(sibling_tmp_path(path));
 
     let mut file =
-        File::create(&tmp).with_context(|| format!("create tmp file {}", tmp.display()))?;
+        File::create(&tmp.path).with_context(|| format!("create tmp file {}", tmp.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("write tmp file {}", tmp.display()))?;
     file.sync_all()
         .with_context(|| format!("fsync tmp file {}", tmp.display()))?;
     drop(file);
 
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp.path, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    // Renamed away: there is nothing left to clean up.
+    tmp.keep();
 
     // Best-effort: make the rename's directory-entry update durable too.
     // Ignored on failure — not all platforms/filesystems support fsync on a
@@ -90,15 +110,103 @@ pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>>
     Ok(out)
 }
 
-/// A `.tmp` sibling of `path` that doesn't collide with `with_extension`'s
-/// "replace the last extension" behavior on extensionless files (e.g.
-/// `state/sessions/next-sid`).
+/// A staging file that removes itself unless the rename claimed it.
+struct TmpFile {
+    path: std::path::PathBuf,
+    renamed: bool,
+}
+
+impl TmpFile {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            renamed: false,
+        }
+    }
+
+    fn display(&self) -> std::path::Display<'_> {
+        self.path.display()
+    }
+
+    fn keep(mut self) {
+        self.renamed = true;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if !self.renamed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// How long a staging sibling may sit before a later write of the same target
+/// treats it as a crash leftover. Comfortably longer than any single write.
+const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Remove crash leftovers for THIS target only: siblings matching exactly this
+/// helper's own naming, `<file>.<pid>.<seq>.tmp` with both fields numeric,
+/// older than [`STALE_TMP_AGE`]. One `read_dir` of the directory the write is
+/// about to touch anyway, no recursion, and nothing this helper did not write —
+/// a sweep that guesses is worse than a leftover, and `meta.json.bak.tmp` or
+/// somebody's editor swap file is not ours to delete.
+fn sweep_stale_tmp_siblings(path: &Path) {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let leaked = entry.file_name();
+        let leaked = leaked.to_string_lossy();
+        let Some(middle) = leaked
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        // `<pid>.<seq>`, both hex-or-decimal digits and nothing else.
+        let mut fields = middle.split('.');
+        let ours = matches!((fields.next(), fields.next(), fields.next()),
+            (Some(pid), Some(seq), None)
+                if !pid.is_empty()
+                    && !seq.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && seq.bytes().all(|b| b.is_ascii_hexdigit()));
+        if !ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TMP_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Per-process tmp-name counter. Paired with the pid it makes every staging
+/// file unique across threads AND across processes sharing one directory.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A private tmp sibling of `path`, in the same directory (so the `rename` is
+/// same-filesystem and therefore atomic). Suffixed rather than
+/// `with_extension`-ed, which would eat the last extension of an
+/// extensionless-looking name (e.g. `state/sessions/next-sid`).
 fn sibling_tmp_path(path: &Path) -> std::path::PathBuf {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    path.with_file_name(format!("{file_name}.tmp"))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!("{file_name}.{}.{seq:x}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -116,8 +224,121 @@ mod tests {
         atomic_write_durable(&path, b"2").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "2");
 
-        // No leftover tmp file after a successful write.
-        assert!(!dir.path().join("next-sid.tmp").exists());
+        // No leftover staging file after a successful write.
+        assert_eq!(tmp_files(dir.path()), Vec::<String>::new());
+    }
+
+    /// Two writers of ONE target never share a staging file. Before this,
+    /// every call staged through `<file>.tmp`: the second writer truncated the
+    /// first one's tmp and whichever renamed second failed
+    /// `rename …tmp -> …: No such file or directory`, so a perfectly good
+    /// write was reported as a failure (seen on `delegation.json` under two
+    /// concurrent dispatches). Whichever content wins is the caller's problem
+    /// to serialize; NOT losing the write to a shared temp name is this
+    /// helper's.
+    #[test]
+    fn concurrent_writers_of_one_target_never_share_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delegation.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        std::thread::scope(|scope| {
+            for writer in 0..8u32 {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                let failures = std::sync::Arc::clone(&failures);
+                scope.spawn(move || {
+                    let body = format!("{{\"writer\":{writer}}}");
+                    barrier.wait();
+                    for _ in 0..40 {
+                        if let Err(error) = atomic_write_durable(&path, body.as_bytes()) {
+                            failures.lock().unwrap().push(format!("{error:#}"));
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            failures.lock().unwrap().as_slice(),
+            Vec::<String>::new(),
+            "no writer may fail because another was staging the same target"
+        );
+        // The target holds exactly one writer's body, whole — never a mix.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            (0..8).any(|writer| body == format!("{{\"writer\":{writer}}}")),
+            "torn content: {body}"
+        );
+        assert_eq!(
+            tmp_files(dir.path()),
+            Vec::<String>::new(),
+            "every staging file is cleaned up by its own rename"
+        );
+    }
+
+    /// A write that fails leaves nothing behind: the staging file is removed on
+    /// every error path, not only the happy one. Here the target's directory
+    /// refuses the rename (the target itself is a non-empty directory), so the
+    /// write gets as far as an fsync'd staging file and then fails.
+    #[test]
+    fn a_failed_write_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("meta.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("occupant"), b"x").unwrap();
+
+        let error = atomic_write_durable(&target, b"{}").expect_err("renaming onto a dir fails");
+        assert!(format!("{error:#}").contains("rename"), "{error:#}");
+        assert_eq!(
+            tmp_files(dir.path()),
+            Vec::<String>::new(),
+            "an error path must not litter the directory it failed to write"
+        );
+    }
+
+    /// A staging file a crashed process left behind is swept by the next write
+    /// of the SAME target — same directory, nothing else touched.
+    #[test]
+    fn the_next_write_sweeps_a_crashed_writers_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("delegation.json");
+        let leaked = dir.path().join("delegation.json.999999.0.tmp");
+        let fresh = dir.path().join("delegation.json.999999.1.tmp");
+        let others = dir.path().join("meta.json.999999.0.tmp");
+        // Same target, same age — but not this helper's naming.
+        let foreign = dir.path().join("delegation.json.swp.tmp");
+        for path in [&leaked, &fresh, &others, &foreign] {
+            std::fs::write(path, b"leftover").unwrap();
+        }
+        // Only the leftover is old enough to be a crash remnant.
+        let old = std::time::SystemTime::now() - STALE_TMP_AGE - std::time::Duration::from_secs(60);
+        for path in [&leaked, &others, &foreign] {
+            let file = File::options().write(true).open(path).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+
+        atomic_write_durable(&target, b"{}").unwrap();
+
+        assert!(!leaked.exists(), "a stale sibling of this target is swept");
+        assert!(fresh.exists(), "a staging file still in use is left alone");
+        assert!(others.exists(), "another target's files are never touched");
+        assert!(
+            foreign.exists(),
+            "a sibling this helper did not write is never touched"
+        );
+    }
+
+    /// Staging files left behind in `dir`, by name.
+    fn tmp_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
     }
 
     /// One torn append costs ONE line. The fixture is the real-world shape: a

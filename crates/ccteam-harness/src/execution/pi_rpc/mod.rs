@@ -598,6 +598,7 @@ impl PiRpcAdapter {
             effort: effective_effort,
             context: None,
             goal: None,
+            stop_hook_blocks: None,
             // Seeded once at spawn; the event task clones this cached status,
             // so every persisted observation carries the stamp.
             generation: ctx.generation_stamp(),
@@ -1557,6 +1558,7 @@ impl HarnessAdapter for PiRpcAdapter {
             effort: Some(state.thinking_level),
             context: stats.context_usage.map(context_from_pi),
             goal: None,
+            stop_hook_blocks: None,
             // Carry the spawn-seeded stamp: this refresh describes the SAME
             // thread (`docs-local/issues/#14②`).
             generation: live.cached_status.lock().unwrap().generation,

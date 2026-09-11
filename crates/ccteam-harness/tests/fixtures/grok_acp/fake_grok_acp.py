@@ -373,9 +373,23 @@ def main() -> None:
                     },
                 },
             )
+            # `__narrate__` speaks mid-turn and finishes late, so a test can
+            # read the turn WHILE it runs (GitHub #197 G). The message chunk
+            # is public narration; the thought above must never join it.
+            if text == "__narrate__":
+                notif(
+                    "session/update",
+                    {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "half a migration"},
+                        },
+                    },
+                )
             # Keep stdin draining while the prompt is active so the fake can
             # receive `_x.ai/interject`, just like the real Grok ACP process.
-            delay = 1.0 if text == "__late_base__" else 0.15
+            delay = 1.0 if text in ("__late_base__", "__narrate__") else 0.15
             timer = threading.Timer(delay, finish_prompt, args=(prompt,))
             timer.daemon = True
             timer.start()

@@ -629,7 +629,8 @@ mod tests {
         assert!(activity_for(&err).is_none());
         // Non-item lifecycle events (turn boundaries) are not activity.
         assert!(activity_for(&ThreadEvent::TurnStarted {
-            turn_id: "turn-1".into()
+            turn_id: "turn-1".into(),
+            opening: ccteam_harness::TurnOpening::Submitted,
         })
         .is_none());
     }

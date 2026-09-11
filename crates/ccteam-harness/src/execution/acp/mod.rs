@@ -20,7 +20,7 @@ pub use protocol::{
 };
 pub use translate::{
     apply_notification, apply_notification_shared, fail_turn, finalize_from_prompt_result,
-    SessionTranslateState, TurnBuffer,
+    in_flight_narration, SessionTranslateState, TurnBuffer,
 };
 pub use transport::{AcpTransport, InboundPolicy, JsonRpcError, Notification};
 pub use turn_runner::{route_acp_turn, AcpTurnRoute, AcpTurnRunner, AcpTurnTuning};

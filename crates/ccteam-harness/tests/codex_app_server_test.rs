@@ -88,8 +88,8 @@ async fn real_codex_app_server_start_thread_smoke() {
     assert!(!handle.identity.trim().is_empty());
     tokio::time::timeout(Duration::from_secs(10), adapter.close_thread(&handle))
         .await
-        .expect("real codex app-server thread/archive timed out")
-        .expect("real codex app-server thread/archive should succeed");
+        .expect("real codex app-server close (thread/unsubscribe) timed out")
+        .expect("real codex app-server close (thread/unsubscribe) should succeed");
 }
 
 /// Real end-to-end round-trip proving the chat reply ccteam surfaces is
@@ -546,6 +546,99 @@ async fn submit_turn_resumes_unloaded_thread_before_turn_start() {
     restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
 }
 
+/// GitHub #200 (`docs-local/issues/#204`) — a thread re-loaded onto a NEW
+/// app-server connection (the shared child was re-spawned after a
+/// `config.toml` change) must be resumed WITH its per-thread
+/// `config.mcp_servers.ccteam` principal. Codex takes MCP config from the
+/// start/resume params only; a bare resume dropped s932/excore onto the
+/// global enrollment entry and it became a projectless caller mid-thread.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn ensure_loaded_resume_carries_the_per_thread_mcp_principal() {
+    let prior_sock = std::env::var_os(APP_SERVER_SOCKET_ENV);
+    let sock = unique_socket_path("ensure-loaded-principal");
+    std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
+
+    let reqs: Arc<StdMutex<Vec<Value>>> = Arc::new(StdMutex::new(Vec::new()));
+    let reqs_h = Arc::clone(&reqs);
+    let (peer, _notif) = spawn_scripted_peer(sock.clone(), move |req| {
+        if req.get("id").is_some() {
+            reqs_h.lock().unwrap().push(req.clone());
+        }
+        match req["method"].as_str() {
+            Some("initialize") => json!({ "result": {
+                "user_agent": "t/0", "codex_home": "/tmp/.codex",
+                "platform_family": "unix", "platform_os": "linux" } }),
+            Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-princ" } } }),
+            Some("thread/resume") => json!({ "result": { "thread": { "thread_id": "t-princ" } } }),
+            Some("turn/start") => json!({ "result": { "turn": { "id": "turn-ok" } } }),
+            _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let adapter = CodexAppServerAdapter::new();
+    let h = adapter
+        .start_thread(
+            &AgentSpecBrief {
+                role: String::new(),
+            },
+            &SpawnCtx {
+                generation: 0,
+                mode: None,
+                slug: "excore".into(),
+                sid: "s932".into(),
+                owner: "user:rob".into(),
+                cwd: std::env::temp_dir(),
+                project_dir: std::env::temp_dir(),
+                extra_args: vec![],
+                model_id: None,
+                effort: None,
+                permission_mode: ccteam_harness::PermissionMode::Skip,
+                secret: "seKret".into(),
+                remote: None,
+            },
+        )
+        .await
+        .unwrap();
+    let start = reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "thread/start")
+        .cloned()
+        .unwrap();
+    let principal =
+        start["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"].clone();
+    assert_eq!(principal, "Bearer ccteam-sid:s932:seKret");
+
+    // The connection epoch turned over (config reload re-spawn / transport
+    // death): the next turn re-loads the thread. That resume is where the
+    // principal was lost.
+    adapter.forget_loaded_for_test().await;
+    adapter
+        .submit_turn(&h, TurnInput::UserText("continue".into()))
+        .await
+        .unwrap();
+    let seen = reqs.lock().unwrap().clone();
+    let resume = seen
+        .iter()
+        .find(|r| r["method"] == "thread/resume")
+        .unwrap_or_else(|| panic!("unloaded thread must be resumed: {seen:?}"));
+    assert_eq!(resume["params"]["threadId"], "t-princ");
+    assert_eq!(
+        resume["params"]["config"]["mcp_servers"]["ccteam"]["http_headers"]["Authorization"],
+        principal,
+        "a re-load must carry the SAME per-thread principal the thread was started with, \
+         or codex falls back to the global enrollment entry"
+    );
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    restore_env(APP_SERVER_SOCKET_ENV, prior_sock);
+}
+
 /// F10 W3 step-0 GATE — real `codex` binary, DEFAULT (stdio) transport.
 /// Constructs a `CodexAppServerAdapter` with NO socket env, so it must
 /// spawn `codex app-server --listen stdio://` itself and complete the
@@ -647,10 +740,25 @@ async fn spawn_scripted_peer(
                             if let Some(id) = id {
                                 resp["id"] = id;
                             }
+                            // A handler may script server notifications that
+                            // follow its response (`notify: [..]`), the way
+                            // codex answers `thread/settings/update` with `{}`
+                            // and then a `thread/settings/updated` snapshot.
+                            let follow_ups = resp
+                                .as_object_mut()
+                                .and_then(|o| o.remove("notify"))
+                                .and_then(|v| v.as_array().cloned())
+                                .unwrap_or_default();
                             let mut bytes = serde_json::to_vec(&resp).unwrap();
                             bytes.push(b'\n');
                             let _ = w.write_all(&bytes).await;
                             let _ = w.flush().await;
+                            for n in follow_ups {
+                                let mut bytes = serde_json::to_vec(&n).unwrap();
+                                bytes.push(b'\n');
+                                let _ = w.write_all(&bytes).await;
+                                let _ = w.flush().await;
+                            }
                         }
                     }
                 }
@@ -1293,6 +1401,8 @@ fn d2_response(req: &Value) -> Value {
         }}),
         Some("thread/rollback") => json!({ "result": { "thread": { "id": "tid-d2" } } }),
         Some("thread/name/set") => json!({ "result": {} }),
+        Some("thread/unsubscribe") => json!({ "result": {} }),
+        Some("thread/settings/update") => json!({ "result": {} }),
         Some("thread/goal/set") => json!({ "result": { "goal": {
             "threadId": "tid-d2", "objective": "ship", "status": "active",
             "tokenBudget": null, "tokensUsed": 0, "timeUsedSeconds": 0,
@@ -1368,13 +1478,46 @@ async fn d2_start_with_notif(
     tokio::sync::mpsc::Sender<Value>,
     PathBuf,
 ) {
+    d2_start_with_handler(tag, d2_response).await
+}
+
+async fn d2_start_with_handler(
+    tag: &str,
+    handler: impl Fn(&Value) -> Value + Send + 'static,
+) -> (
+    CodexAppServerAdapter,
+    ccteam_harness::ThreadHandle,
+    Arc<StdMutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<Value>,
+    PathBuf,
+) {
+    d2_start_in(tag, handler, std::env::temp_dir(), 0).await
+}
+
+/// `d2_start_with_handler` with an explicit `project_dir` + thread
+/// generation, for tests that read what the adapter persists under
+/// `<project_dir>/.ccteam/chat/codex-1/` (#203).
+async fn d2_start_in(
+    tag: &str,
+    handler: impl Fn(&Value) -> Value + Send + 'static,
+    project_dir: PathBuf,
+    generation: u64,
+) -> (
+    CodexAppServerAdapter,
+    ccteam_harness::ThreadHandle,
+    Arc<StdMutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<Value>,
+    PathBuf,
+) {
     let sock = unique_socket_path(tag);
     std::env::set_var(APP_SERVER_SOCKET_ENV, &sock);
     let seen = Arc::new(StdMutex::new(Vec::<Value>::new()));
     let seen_for_peer = Arc::clone(&seen);
     let (peer, notif) = spawn_scripted_peer(sock.clone(), move |req| {
         seen_for_peer.lock().unwrap().push(req.clone());
-        d2_response(req)
+        handler(req)
     })
     .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1385,13 +1528,13 @@ async fn d2_start_with_notif(
                 role: "demo".into(),
             },
             &SpawnCtx {
-                generation: 0,
+                generation,
                 mode: None,
                 slug: "test".into(),
                 sid: "codex-1".into(),
                 owner: "user:web-api".into(),
                 cwd: std::env::temp_dir(),
-                project_dir: std::env::temp_dir(),
+                project_dir,
                 extra_args: vec![],
                 model_id: None,
                 effort: None,
@@ -1755,12 +1898,22 @@ async fn d2_query_synth_class() {
 async fn d2_override_class_applies_on_next_turn() {
     let (adapter, h, seen, peer, sock) = d2_start("d2-override").await;
 
-    // /model gpt-5 high → override (no RPC yet).
+    // /model gpt-5 high → override + an immediate thread/settings/update
+    // (the thread is idle), never a turn.
     let out = adapter
         .handle_directive(&h, dir("model", "gpt-5 high"))
         .await
         .unwrap();
     assert!(matches!(out, DirectiveOutcome::Done { .. }));
+    {
+        let frames = seen.lock().unwrap();
+        let update = find_frame(&frames, "thread/settings/update")
+            .expect("idle /model pushes thread/settings/update");
+        assert_eq!(
+            update["params"],
+            json!({ "threadId": "tid-d2", "model": "gpt-5", "effort": "high" })
+        );
+    }
     // /personality friendly, /collab plan, /permissions read-only.
     let _ = adapter
         .handle_directive(&h, dir("personality", "friendly"))
@@ -2169,6 +2322,612 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
 
     drop(peer);
     let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// GitHub #197 (G) — a codex turn still running can say what it has said, on
+/// its OWN wire shape: `item/agentMessage/delta` fragments, then the
+/// `item/completed` that carries the whole message. Private reasoning is never
+/// part of it, and the boundary hands the narration to the transcript.
+///
+/// End to end over the scripted peer, so the live-handle → cell lookup is
+/// proved and not just the fold: a stopped child that reads back as silent is
+/// the failure this exists to prevent (measured on s932→s936).
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn in_flight_narration_reports_a_running_codex_turn() {
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_with_notif("narration").await;
+
+    // Nothing running: "this adapter cannot report a turn" is not the same
+    // answer as "the turn said nothing".
+    assert_eq!(adapter.in_flight_narration(&h), None);
+
+    notif
+        .send(json!({
+            "method": "turn/started",
+            "params": { "threadId": "tid-d2", "turn": { "id": "turn-1" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        let h = h.clone();
+        async move { a.in_flight_narration(&h).is_some() }
+    })
+    .await;
+    let started = adapter.in_flight_narration(&h).expect("in flight");
+    assert_eq!(started.exec_turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(started.text, "", "it has not spoken yet");
+
+    for delta in ["half a ", "migration"] {
+        notif
+            .send(json!({
+                "method": "item/agentMessage/delta",
+                "params": { "threadId": "tid-d2", "turnId": "turn-1",
+                            "itemId": "item-1", "delta": delta }
+            }))
+            .await
+            .unwrap();
+    }
+    // Thinking is not narration on any channel.
+    notif
+        .send(json!({
+            "method": "item/reasoning/textDelta",
+            "params": { "threadId": "tid-d2", "turnId": "turn-1",
+                        "itemId": "r-1", "delta": "SECRET" }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        let h = h.clone();
+        async move {
+            a.in_flight_narration(&h)
+                .is_some_and(|p| p.text == "half a migration")
+        }
+    })
+    .await;
+
+    // The completed item's own text replaces the fragments it streamed as —
+    // never a second copy of the same message.
+    notif
+        .send(json!({
+            "method": "item/completed",
+            "params": { "threadId": "tid-d2",
+                        "item": { "id": "item-1", "type": "agent_message",
+                                  "text": "half a migration" } }
+        }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let partial = adapter.in_flight_narration(&h).expect("still in flight");
+    assert_eq!(partial.text, "half a migration", "{partial:?}");
+    assert!(!partial.truncated());
+
+    notif
+        .send(json!({
+            "method": "turn/completed",
+            "params": { "threadId": "tid-d2", "turn": { "id": "turn-1", "status": "completed" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        let h = h.clone();
+        async move { a.in_flight_narration(&h).is_none() }
+    })
+    .await;
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// #200: official settings snapshots, including unseen model ids and a
+/// cleared effort, must update status without any events() consumer.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_settings_notification_updates_status_without_event_consumer() {
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_with_notif("model-settings").await;
+    adapter
+        .tracker_seed_model_for_test(&h.identity, Some("initial-model".into()))
+        .await;
+    for (model, effort) in [
+        ("future-model-2099", Some("xhigh")),
+        ("another-unlisted-model", None),
+    ] {
+        notif
+            .send(json!({
+                "method": "thread/settings/updated",
+                "params": { "threadId": h.identity,
+                    "threadSettings": { "model": model, "effort": effort } }
+            }))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let adapter = adapter.clone();
+            let h = h.clone();
+            async move {
+                let status = adapter.thread_status(&h).await.unwrap();
+                status.model.as_deref() == Some(model) && status.effort.as_deref() == effort
+            }
+        })
+        .await;
+    }
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// `docs-local/issues/#203` — codex's settings snapshot is the only
+/// confirmation a `/model` pick gets, and until now it lived in the in-memory
+/// tracker alone. Like every other long-stdio adapter, codex must persist the
+/// statusline to `status.json` (stamped with the thread generation) so the
+/// gateway's re-spawn ladder can replay the model the session was RUNNING
+/// after a release + failed resume, instead of codex's global default.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn settings_snapshot_persists_status_json_with_generation() {
+    use ccteam_harness::execution::session_status::read_status_file;
+    let project = TempDir::new().unwrap();
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_in(
+        "status-persist",
+        d2_response,
+        project.path().to_path_buf(),
+        7,
+    )
+    .await;
+    // The thread/start response carries no model in this peer, so the start
+    // snapshot is model-less — but it already exists, stamped.
+    let at_start = read_status_file(project.path(), "codex-1").expect("status.json at start");
+    assert_eq!(at_start.generation, Some(7));
+    assert_eq!(at_start.model, None);
+
+    notif
+        .send(json!({
+            "method": "thread/settings/updated",
+            "params": { "threadId": h.identity,
+                "threadSettings": { "model": "gpt-6-astra", "effort": "xhigh" } }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let project = project.path().to_path_buf();
+        async move {
+            read_status_file(&project, "codex-1")
+                .and_then(|s| s.model)
+                .as_deref()
+                == Some("gpt-6-astra")
+        }
+    })
+    .await;
+    let persisted = read_status_file(project.path(), "codex-1").unwrap();
+    assert_eq!(persisted.effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        persisted.generation,
+        Some(7),
+        "stamped with the thread's generation"
+    );
+    // The live answer and the persisted file are one shape.
+    let live = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(live.model, persisted.model);
+    assert_eq!(live.generation, Some(7));
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// `docs-local/issues/#203` — a close is a residency release, not the end of
+/// the session. `thread/archive` made the next `thread/resume` fail for good
+/// ("session … is archived"), so every idle/capacity release silently became
+/// a fresh thread: context and the `/model` pick both gone (s932). Close
+/// unsubscribes only.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn close_thread_unsubscribes_without_archiving() {
+    let (adapter, h, seen, peer, sock) = d2_start("close-no-archive").await;
+    adapter.close_thread(&h).await.unwrap();
+    let frames = seen.lock().unwrap();
+    let unsub = find_frame(&frames, "thread/unsubscribe").expect("close unsubscribes");
+    assert_eq!(unsub["params"]["threadId"], h.identity);
+    assert!(
+        find_frame(&frames, "thread/archive").is_none(),
+        "a release must leave the thread resumable: no thread/archive"
+    );
+    drop(frames);
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// Pending intent cannot relabel an active turn, a steer, or a rejected
+/// turn/start. Only the vendor's effective settings update the live display.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_settings_pending_and_rejected_changes_do_not_relabel_turn() {
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_handler("settings-pending", |req| {
+        if req["method"] == "turn/start" {
+            json!({ "error": { "code": -32602, "message": "model unavailable" } })
+        } else {
+            d2_response(req)
+        }
+    })
+    .await;
+    notif
+        .send(json!({ "method": "thread/settings/updated", "params": {
+            "threadId": h.identity, "threadSettings": { "model": "original", "effort": "high" }
+        }}))
+        .await
+        .unwrap();
+    notif
+        .send(json!({ "method": "turn/started", "params": {
+            "threadId": h.identity, "turn": { "id": "active" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        async move {
+            adapter
+                .tracker_snapshot("tid-d2")
+                .await
+                .unwrap()
+                .active_turn
+                .is_some()
+        }
+    })
+    .await;
+    let out = adapter
+        .handle_directive(&h, dir("model", "unlisted-next-model xhigh"))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => assert_eq!(
+            receipt, "model → unlisted-next-model (effort xhigh); applies next turn.",
+            "a busy thread keeps the pick queued and the receipt says so"
+        ),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(
+        find_frame(&seen.lock().unwrap(), "thread/settings/update").is_none(),
+        "no settings RPC while a turn is running: codex would snapshot the new model \
+         under a turn still running on the old one"
+    );
+    adapter
+        .submit_turn(&h, TurnInput::UserText("steer".into()))
+        .await
+        .unwrap();
+    assert!(find_frame(&seen.lock().unwrap(), "turn/steer").is_some());
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("original"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+
+    notif
+        .send(json!({ "method": "turn/completed", "params": {
+            "threadId": h.identity, "turn": { "id": "active", "status": "completed" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        async move {
+            adapter
+                .tracker_snapshot("tid-d2")
+                .await
+                .unwrap()
+                .active_turn
+                .is_none()
+        }
+    })
+    .await;
+    assert!(adapter
+        .submit_turn(&h, TurnInput::UserText("rejected".into()))
+        .await
+        .is_err());
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("original"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// #200 follow-up (s930): a `/model` pick on an IDLE thread must reach codex
+/// at once over `thread/settings/update`, and `/status` must follow through
+/// codex's own `thread/settings/updated` snapshot — a fresh session (turn 0)
+/// showed the spawn-resolved model right after the pick. The peer emulates
+/// codex 0.153.4 as probed: `{}` then a snapshot; an omitted `effort` keeps
+/// the thread's current one. Both entry points (direct args and the picker)
+/// are covered, and the next `turn/start` still carries the override.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_pick_on_idle_thread_reaches_codex_and_status_follows() {
+    let settings = Arc::new(StdMutex::new((
+        "gpt-5.6-sol".to_string(),
+        Some("xhigh".to_string()),
+    )));
+    let peer_settings = Arc::clone(&settings);
+    let (adapter, h, seen, peer, notif, sock) =
+        d2_start_with_handler("model-idle-push", move |req| {
+            if req["method"] != "thread/settings/update" {
+                return d2_response(req);
+            }
+            let mut current = peer_settings.lock().unwrap();
+            if let Some(model) = req["params"]["model"].as_str() {
+                current.0 = model.to_string();
+            }
+            if let Some(effort) = req["params"]["effort"].as_str() {
+                current.1 = Some(effort.to_string());
+            }
+            json!({ "result": {}, "notify": [{
+                "method": "thread/settings/updated",
+                "params": { "threadId": req["params"]["threadId"],
+                    "threadSettings": { "model": current.0, "effort": current.1 } }
+            }]})
+        })
+        .await;
+    // What codex resolved at thread/start.
+    notif
+        .send(json!({ "method": "thread/settings/updated", "params": {
+            "threadId": h.identity,
+            "threadSettings": { "model": "gpt-5.6-sol", "effort": "xhigh" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            adapter.thread_status(&h).await.unwrap().model.as_deref() == Some("gpt-5.6-sol")
+        }
+    })
+    .await;
+
+    // Direct args: model + effort.
+    let out = adapter
+        .handle_directive(&h, dir("model", "gpt-6-astra xhigh"))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => assert_eq!(
+            receipt, "model → gpt-6-astra (effort xhigh).",
+            "an applied pick does not promise a later turn"
+        ),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    {
+        let frames = seen.lock().unwrap();
+        let update = find_frame(&frames, "thread/settings/update").expect("settings RPC");
+        assert_eq!(
+            update["params"],
+            json!({ "threadId": h.identity, "model": "gpt-6-astra", "effort": "xhigh" })
+        );
+        assert!(
+            find_frame(&frames, "turn/start").is_none(),
+            "a pick is not a turn"
+        );
+    }
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            let status = adapter.thread_status(&h).await.unwrap();
+            status.model.as_deref() == Some("gpt-6-astra")
+                && status.effort.as_deref() == Some("xhigh")
+        }
+    })
+    .await;
+
+    // Picker re-entry with a model only: codex keeps the effort.
+    seen.lock().unwrap().clear();
+    let out = adapter
+        .handle_directive(&h, dir_choice("model", "tok", &["future-model-picker"]))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => {
+            assert_eq!(receipt, "model → future-model-picker.")
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    {
+        let frames = seen.lock().unwrap();
+        let update = find_frame(&frames, "thread/settings/update").expect("settings RPC");
+        assert_eq!(
+            update["params"],
+            json!({ "threadId": h.identity, "model": "future-model-picker" }),
+            "no effort given → none sent, so codex keeps the thread's own"
+        );
+    }
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            let status = adapter.thread_status(&h).await.unwrap();
+            status.model.as_deref() == Some("future-model-picker")
+                && status.effort.as_deref() == Some("xhigh")
+        }
+    })
+    .await;
+
+    // The override still rides the next turn/start (idempotent carriage).
+    seen.lock().unwrap().clear();
+    adapter
+        .submit_turn(&h, TurnInput::UserText("go".into()))
+        .await
+        .unwrap();
+    let frames = seen.lock().unwrap().clone();
+    let ts = find_frame(&frames, "turn/start").expect("turn/start");
+    assert_eq!(ts["params"]["model"], "future-model-picker");
+    assert_eq!(ts["params"]["effort"], "xhigh");
+
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// A codex without `thread/settings/update` (or a failing RPC) falls back to
+/// the queued override: the receipt promises the next turn, status stays on
+/// the observed model, and the next `turn/start` carries the pick.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_pick_falls_back_to_next_turn_when_settings_rpc_fails() {
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_handler("model-rpc-missing", |req| {
+        if req["method"] == "thread/settings/update" {
+            json!({ "error": { "code": -32601, "message": "method not found" } })
+        } else {
+            d2_response(req)
+        }
+    })
+    .await;
+    notif
+        .send(json!({ "method": "thread/settings/updated", "params": {
+            "threadId": h.identity,
+            "threadSettings": { "model": "gpt-5.6-sol", "effort": "high" }
+        }}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let adapter = adapter.clone();
+        let h = h.clone();
+        async move {
+            adapter.thread_status(&h).await.unwrap().model.as_deref() == Some("gpt-5.6-sol")
+        }
+    })
+    .await;
+
+    let out = adapter
+        .handle_directive(&h, dir("model", "gpt-6-astra xhigh"))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => {
+            assert_eq!(
+                receipt,
+                "model → gpt-6-astra (effort xhigh); applies next turn."
+            )
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(find_frame(&seen.lock().unwrap(), "thread/settings/update").is_some());
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(status.effort.as_deref(), Some("high"));
+    let ov = adapter.override_for_test(&h.identity).await;
+    assert_eq!(ov.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(ov.effort.as_deref(), Some("xhigh"));
+
+    seen.lock().unwrap().clear();
+    adapter
+        .submit_turn(&h, TurnInput::UserText("go".into()))
+        .await
+        .unwrap();
+    let frames = seen.lock().unwrap().clone();
+    let ts = find_frame(&frames, "turn/start").expect("turn/start");
+    assert_eq!(ts["params"]["model"], "gpt-6-astra");
+    assert_eq!(ts["params"]["effort"], "xhigh");
+
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
+/// A slow event consumer sees the model at each terminal boundary, while
+/// status keeps the latest snapshot. Foreign threads cannot contaminate
+/// either model attribution or turn-local usage.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn model_settings_ordered_before_events_and_pinned_to_terminal_boundary() {
+    use futures::StreamExt;
+    let (adapter, h, seen, peer, notif, sock) = d2_start_with_notif("settings-ordered").await;
+    let mut events = adapter.events(&h);
+    // Poll once to attach the stream before sending notifications.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), events.next())
+            .await
+            .is_err()
+    );
+    for (index, directive, expected) in [
+        (
+            1,
+            dir("model", "future-model-direct ultra"),
+            "future-model-direct",
+        ),
+        (
+            2,
+            dir_choice("model", "test", &["future-model-picker low"]),
+            "future-model-picker",
+        ),
+    ] {
+        adapter.handle_directive(&h, directive).await.unwrap();
+        adapter
+            .submit_turn(&h, TurnInput::UserText("go".into()))
+            .await
+            .unwrap();
+        let effort = {
+            let frames = seen.lock().unwrap();
+            let request = frames
+                .iter()
+                .rev()
+                .find(|f| f["method"] == "turn/start")
+                .unwrap();
+            assert_eq!(request["params"]["model"], expected);
+            request["params"]["effort"].clone()
+        };
+        let turn = format!("settings-turn-{index}");
+        for frame in [
+            json!({ "method": "thread/settings/updated", "params": { "threadId": h.identity,
+                "threadSettings": { "model": expected, "effort": effort } } }),
+            json!({ "method": "turn/started", "params": { "threadId": h.identity,
+                "turn": { "id": turn } } }),
+            json!({ "method": "thread/settings/updated", "params": { "threadId": "foreign",
+                "threadSettings": { "model": "foreign-model", "effort": "high" } } }),
+            json!({ "method": "thread/tokenUsage/updated", "params": { "threadId": "foreign",
+                "tokenUsage": { "last": { "inputTokens": 9000, "outputTokens": 10 } } } }),
+            json!({ "method": "turn/completed", "params": { "threadId": h.identity,
+                "turn": { "id": turn, "status": "completed" } } }),
+            json!({ "method": "thread/settings/updated", "params": { "threadId": h.identity,
+                "threadSettings": { "model": "later-settings", "effort": null } } }),
+        ] {
+            notif.send(frame).await.unwrap();
+        }
+        wait_until(|| {
+            let adapter = adapter.clone();
+            async move {
+                adapter
+                    .tracker_snapshot("tid-d2")
+                    .await
+                    .unwrap()
+                    .model
+                    .as_deref()
+                    == Some("later-settings")
+            }
+        })
+        .await;
+        assert!(matches!(
+            events.next().await,
+            Some(ThreadEvent::TurnStarted { .. })
+        ));
+        match events.next().await.unwrap() {
+            ThreadEvent::TurnCompleted { model, usage, .. } => {
+                assert_eq!(model.as_deref(), Some(expected));
+                assert_eq!(
+                    usage.input_tokens, 0,
+                    "foreign usage cannot leak into this turn"
+                );
+            }
+            event => panic!("expected terminal event, got {event:?}"),
+        }
+        let status = adapter.thread_status(&h).await.unwrap();
+        assert_eq!(
+            status.model.as_deref(),
+            Some("later-settings"),
+            "slow consumers must not replay old state"
+        );
+        assert_eq!(status.effort, None);
+    }
+    peer.abort();
+    let _ = std::fs::remove_file(sock);
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
 }
 
@@ -3062,8 +3821,12 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
             Some("initialize") => json!({ "result": {
                 "user_agent": "t/0", "codex_home": "/tmp/.codex",
                 "platform_family": "unix", "platform_os": "linux" } }),
-            Some("thread/resume") => json!({ "result": { "thread": { "thread_id": "t-prior" } } }),
+            Some("thread/resume") => json!({ "result": {
+                "thread": { "thread_id": "t-prior" },
+                "model": "future-resolved-model", "reasoningEffort": "xhigh"
+            } }),
             Some("thread/start") => json!({ "result": { "thread": { "thread_id": "t-fresh" } } }),
+            Some("turn/start") => json!({ "result": { "turn": { "id": "resumed-turn" } } }),
             _ => json!({ "error": { "code": -32601, "message": "unexpected" } }),
         }
     })
@@ -3124,8 +3887,8 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
                 cwd: tmp.path().to_path_buf(),
                 project_dir: tmp.path().to_path_buf(),
                 extra_args: vec![],
-                model_id: None,
-                effort: None,
+                model_id: Some("stale-spawn-model".into()),
+                effort: Some("low".into()),
                 permission_mode: ccteam_harness::PermissionMode::Skip,
                 secret: "seKret".into(),
                 remote: None,
@@ -3134,8 +3897,24 @@ async fn start_thread_resumes_persisted_vendor_uuid_after_restart() {
         .await
         .unwrap();
     assert_eq!(h.identity, "t-prior", "must resume the persisted thread id");
+    let status = adapter.thread_status(&h).await.unwrap();
+    assert_eq!(status.model.as_deref(), Some("future-resolved-model"));
+    assert_eq!(status.effort.as_deref(), Some("xhigh"));
+    adapter
+        .submit_turn(&h, TurnInput::UserText("continue".into()))
+        .await
+        .unwrap();
 
     let seen = reqs.lock().unwrap().clone();
+    let turn = seen.iter().find(|r| r["method"] == "turn/start").unwrap();
+    assert!(
+        turn["params"].get("model").is_none(),
+        "resume must not reapply the spawn model"
+    );
+    assert!(
+        turn["params"].get("effort").is_none(),
+        "resume must not reapply the spawn effort"
+    );
     let resume = seen
         .iter()
         .find(|r| r["method"] == "thread/resume")

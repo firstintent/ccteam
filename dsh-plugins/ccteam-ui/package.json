@@ -1,6 +1,6 @@
 {
   "name": "@ccteam/ccteam-ui",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "ccteam inside the DeepSeek Harness: the workbench in DSH web (cross-harness session tree, native-grade chat, one-click spawn), the six ccteam MCP tools for DSH agents, and the ACP transport ccteam hires DSH sessions through",
   "type": "module",
   "main": "lib/index.js",
@@ -19,7 +19,7 @@
     "README.md"
   ],
   "ccteam": {
-    "engine": "0.11.0"
+    "engine": "0.11.1"
   },
   "dsh": {
     "bundle": {
@@ -49,10 +49,10 @@
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "optionalDependencies": {
-    "@ccteam/engine-darwin-arm64": "0.11.0",
-    "@ccteam/engine-darwin-x64": "0.11.0",
-    "@ccteam/engine-linux-arm64": "0.11.0",
-    "@ccteam/engine-linux-x64": "0.11.0"
+    "@ccteam/engine-darwin-arm64": "0.11.1",
+    "@ccteam/engine-darwin-x64": "0.11.1",
+    "@ccteam/engine-linux-arm64": "0.11.1",
+    "@ccteam/engine-linux-x64": "0.11.1"
   },
   "bundledDependencies": [
     "@deepseek-ai/schemastery"

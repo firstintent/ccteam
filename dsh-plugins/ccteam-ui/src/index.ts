@@ -102,7 +102,7 @@ export const Config: Schema<Config> = Schema.object({
  * Rust side gates the handshake on it (`MIN_DSH_CLIENT_VERSION`), so it must
  * stay in step with package.json — asserted by tests/host-exports.test.ts.
  */
-export const PACKAGE_VERSION = '0.11.0'
+export const PACKAGE_VERSION = '0.11.1'
 
 /**
  * The engine version this plugin is published against — package.json
@@ -114,7 +114,7 @@ export const PACKAGE_VERSION = '0.11.0'
  * repairs — the engine is older, so update the engine; the plugin is older, so
  * update the plugin.
  */
-export const ENGINE_VERSION = '0.11.0'
+export const ENGINE_VERSION = '0.11.1'
 
 export interface ApplyContext extends BffContext {
   /**

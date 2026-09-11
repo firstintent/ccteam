@@ -213,7 +213,7 @@ One daemon can serve multiple users on one machine. This is **soft isolation** u
 ### Status and Cost
 
 - **Status** shows daemon health, live/idle session counts, per-session cost, and today's total cost / budget. The top-bar cost pill uses the same data.
-- **Per-reply status line.** Every reply a session produces carries a compact status line built once by the daemon from the same data — `→ cct/s42 (reviewer) · codex · gpt-5.6-sol · turn 7 · ctx 19% · $0.42` (project/sid, role, vendor + observed model, context-window usage with `⚠` from 85%, completed turns, cumulative cost — or `12.3k tok` when the vendor has no price table; a field the vendor does not report is simply omitted, never shown as a placeholder). It is attached once per vendor turn, on the turn's final message only (a Codex turn that streams several messages gets exactly one), so it never repeats. IM chats get it as the last line of the reply; the web console shows it as a muted footer under the turn's last assistant message and keeps the header model/ctx chips in sync from it. Agent-facing surfaces get numbers, not prose: `agent_read` transcripts and roster rows, and inline `agent` results, carry `context_pct` (plus the existing `cost_usd` / `tokens_total` / `model`), and each child→parent completion notification opens with one header line — `s12 done · codex · turn 7 · ctx 19%` — so a parent can decide between reusing a child and spawning a fresh one without another call; interim notes carry nothing extra.
+- **Per-reply status line.** Every reply a session produces carries a compact status line built once by the daemon from the same data — `→ cct/s42 (reviewer) · codex · gpt-5.6-sol · turn 7 · ctx 19% · $0.42` (project/sid, role, vendor + observed model, context-window usage with `⚠` from 85%, completed turns, cumulative cost — or `12.3k tok` when the vendor has no price table; a field the vendor does not report is simply omitted, never shown as a placeholder). It is attached once per vendor turn, on the turn's final message only (a Codex turn that streams several messages gets exactly one), so it never repeats — and when a long turn's text was already delivered mid-turn, that one status line arrives on its own as the turn's closing receipt. IM chats get it as the last line of the reply; the web console shows it as a muted footer under the turn's last assistant message and keeps the header model/ctx chips in sync from it. Agent-facing surfaces get numbers, not prose: `agent_read` transcripts and roster rows, and inline `agent` results, carry `context_pct` (plus the existing `cost_usd` / `tokens_total` / `model`), and each child→parent completion notification opens with one header line — `s12 done · codex · turn 7 · ctx 19%` — so a parent can decide between reusing a child and spawning a fresh one without another call; interim notes carry nothing extra.
 - Cost is tracked separately by vendor. Claude / Codex / Grok use embedded tables when the model is known; **OpenCode and Pi use only vendor-reported USD** (or "—" when missing/zero — never another vendor's price table); **DSH reports raw tokens but has no USD price table yet**; **Kimi always shows "—"** (its ACP wire carries no usage/cost). A turn that fails part-way is still billed by the vendor, so its tokens and cost land on the ledger like any other turn — a failure never reads as free.
 
 ### Standard Resource API
@@ -322,8 +322,13 @@ Send these commands in chat. The gateway handles them directly. Use `/help` anyt
                            time passes rather than shown stale), the session's own background
                            work (subagents and background shells stay listed for as long as
                            the vendor reports them running, not just during the turn that
-                           launched them), its delegates, and a footer pointing at the rest
-                           of the fleet (/sessions, /projects).
+                           launched them — only what the harness reports as BACKGROUNDED is
+                           labelled 后台任务; a plain foreground command says 命令),
+                           what a running turn has said so far (💬 — the tail of its own
+                           words, so a long turn is never unexplained silence), how often a
+                           Stop hook has refused to end the turn in the last hour (with
+                           /goal clear when a goal installed it), its delegates, and a
+                           footer pointing at the rest of the fleet (/sessions, /projects).
                            Context occupancy is only shown when it was actually
                            measured — a session whose vendor has not reported yet reads as
                            unknown rather than 0%, and survives daemon restarts.
@@ -364,6 +369,7 @@ List lines look like `d3 · s12 · 2026-07-26 09:00 · preview…` (failed rows 
 - **Non-gateway slash commands** (`/compact`, `/clear`, `/goal`, `/model`, etc.) pass through to the current agent. Picker commands such as `/model` become option buttons. Claude executes a slash command only when idle, so one sent while a turn is running is queued and delivered right after that turn ends (you get a receipt); plain text sent mid-turn is still steered into the running turn.
 - **Images or files plus a note** are read by the agent automatically (screenshots and logs work well). Agents can send files back to chat.
 - **During an in-flight turn,** ccteam keeps a live progress message such as `working... · bash x3`. The final answer arrives separately and long answers are chunked. If the agent asks a question, it appears as option buttons; tap one and the agent continues.
+- **A long turn is never silent.** A turn's messages are normally batched to its end so the last one can carry the status line, but that wait is bounded: text a session produces after it absorbed your mid-turn message goes to the chat at once (you asked, it answered — nothing waits for a boundary that may be hours away, or that a Stop hook may refuse entirely), and anything held longer than a minute while the turn runs on is delivered on its own. When a turn's text went out that way, the turn's end arrives as the status line alone, never as a second copy of what you already read.
 
 ### Human-in-the-Loop (HITL)
 

@@ -1213,6 +1213,7 @@ impl HarnessAdapter for ClaudeTuiAdapter {
             context,
             effort: None,
             goal: None,
+            stop_hook_blocks: None,
             // The frozen terminal protocol persists no `status.json`, so it
             // has no observation to stamp.
             generation: None,

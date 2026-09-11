@@ -16,7 +16,10 @@
 //! with `stop_reason: end_turn` (the transcript's equivalent of a `result`
 //! record). Tool-use-only messages contribute usage, not text. Usage is
 //! summed over every assistant message after the cut, which is what a
-//! turn's `result.usage` adds up to.
+//! turn's `result.usage` adds up to. The last recovered turn's CONCLUSION
+//! (the text of its last text-bearing message — what the live translator
+//! takes from `result.result`) rides along, so a notification built from a
+//! recovered turn cuts the same way a live one does (issue #196).
 //!
 //! Same sanctioned path as the terminal protocol's transcript track (read the
 //! vendor's file; never a pane scrape, never a prompt). Anything that does not
@@ -47,6 +50,10 @@ pub fn recover_after(
     let mut texts: Vec<String> = Vec::new();
     // Text blocks of the turn currently being folded (flushed at end_turn).
     let mut turn_text = String::new();
+    // The last text-bearing message of the turn being folded — its conclusion.
+    let mut turn_conclusion: Option<String> = None;
+    // The conclusion of the last turn flushed into `texts`.
+    let mut conclusion: Option<String> = None;
     let mut ended_at: Option<DateTime<Utc>> = None;
     let mut input: u64 = 0;
     let mut output: u64 = 0;
@@ -101,6 +108,7 @@ pub fn recover_after(
                 turn_text.push_str("\n\n");
             }
             turn_text.push_str(text);
+            turn_conclusion = Some(text.to_string());
         }
         if let Some(usage) = message.and_then(|m| m.get("usage")) {
             usage_seen = true;
@@ -132,6 +140,7 @@ pub fn recover_after(
             continue;
         }
         let text = std::mem::take(&mut turn_text);
+        let ended_with = turn_conclusion.take();
         if text.is_empty() {
             continue;
         }
@@ -141,6 +150,7 @@ pub fn recover_after(
             continue;
         }
         texts.push(text);
+        conclusion = ended_with;
     }
 
     if texts.is_empty() {
@@ -156,10 +166,14 @@ pub fn recover_after(
     } else {
         Value::Null
     };
+    let assistant = texts.join("\n\n");
+    // Same rule as the live translator: no conclusion when it IS the answer.
+    let conclusion = conclusion.filter(|conclusion| conclusion.trim() != assistant.trim());
     Some(RecoveredTurn {
-        assistant: texts.join("\n\n"),
+        assistant,
         usage,
         ended_at: ended_at.unwrap_or(observed_until),
+        conclusion,
     })
 }
 
@@ -255,6 +269,9 @@ mod tests {
             recovered.assistant,
             "Let me check the file first.\n\nfirst unobserved\n\nDONE"
         );
+        // issue #196 — the conclusion is what the LAST recovered turn ended
+        // with, never the folded narration.
+        assert_eq!(recovered.conclusion.as_deref(), Some("DONE"));
         assert_eq!(recovered.usage["input_tokens"], 16);
         assert_eq!(recovered.usage["output_tokens"], 29);
         assert_eq!(recovered.usage["cache_read_input_tokens"], 100);
@@ -287,6 +304,10 @@ mod tests {
         let cut = Utc.with_ymd_and_hms(2026, 8, 19, 2, 9, 0).unwrap();
         let recovered = recover_after(&path, cut, Some("same answer")).unwrap();
         assert_eq!(recovered.assistant, "later");
+        assert_eq!(
+            recovered.conclusion, None,
+            "a single-block answer is its own conclusion"
+        );
         assert_eq!(
             recovered.usage,
             Value::Null,

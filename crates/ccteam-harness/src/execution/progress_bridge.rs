@@ -42,6 +42,20 @@ pub const CHAT_TOOL_CALL_STARTED: &str = "chat_tool_call_started";
 pub const CHAT_BOT_PERMANENT_FAILURE: &str = "chat_bot_permanent_failure";
 pub const CHAT_MARKER_SELF_HEAL_ATTEMPT: &str = "chat_marker_self_heal_attempt";
 pub const CHAT_TURN_RUNNING_LONG: &str = "chat_turn_running_long";
+/// 2026-09-07 (GitHub #198) — a vendor turn ended while the vendor still held
+/// work that will wake its own model again (claude's background-task snapshot
+/// is not empty, or a line ccteam injected is waiting to be re-run). The task
+/// is NOT finished: the boundary is billed and recorded, no parent is woken,
+/// and the requests bound to it keep their binding.
+///
+/// It exists because the row that closes the accounting —
+/// [`CHAT_TURN_COMPLETED`] — is an IDLE tail to the activity classifier, and a
+/// child that is still working must not read `idle` to every parent polling
+/// it. This row lands after it and is not idle, so the session reads `working`
+/// again. It is deliberately NOT a heartbeat: after five silent minutes the
+/// session ages into `stale` like any other quiet one, because pinning a
+/// vendor-continued session to `working` forever would hide a hung child.
+pub const CHAT_TURN_CONTINUES: &str = "chat_turn_continues";
 pub const CHAT_TURN_TIMEOUT: &str = "chat_turn_timeout";
 pub const AGENT_DONE: &str = "agent_done";
 /// v0.9.2 — a live session was gracefully stopped to admit another session
@@ -130,6 +144,7 @@ pub enum EventKind {
     ChatMarkerSelfHealAttempt,
     ChatTurnRunningLong,
     ChatTurnTimeout,
+    ChatTurnContinues,
     AgentDone,
     SessionEvicted,
     SessionStreamDetached,
@@ -174,6 +189,7 @@ impl EventKind {
         EventKind::ChatMarkerSelfHealAttempt,
         EventKind::ChatTurnRunningLong,
         EventKind::ChatTurnTimeout,
+        EventKind::ChatTurnContinues,
         EventKind::AgentDone,
         EventKind::SessionEvicted,
         EventKind::SessionStreamDetached,
@@ -218,6 +234,7 @@ impl EventKind {
             EventKind::ChatMarkerSelfHealAttempt => CHAT_MARKER_SELF_HEAL_ATTEMPT,
             EventKind::ChatTurnRunningLong => CHAT_TURN_RUNNING_LONG,
             EventKind::ChatTurnTimeout => CHAT_TURN_TIMEOUT,
+            EventKind::ChatTurnContinues => CHAT_TURN_CONTINUES,
             EventKind::AgentDone => AGENT_DONE,
             EventKind::SessionEvicted => SESSION_EVICTED,
             EventKind::SessionStreamDetached => SESSION_STREAM_DETACHED,
@@ -263,6 +280,7 @@ impl EventKind {
             CHAT_MARKER_SELF_HEAL_ATTEMPT => EventKind::ChatMarkerSelfHealAttempt,
             CHAT_TURN_RUNNING_LONG => EventKind::ChatTurnRunningLong,
             CHAT_TURN_TIMEOUT => EventKind::ChatTurnTimeout,
+            CHAT_TURN_CONTINUES => EventKind::ChatTurnContinues,
             AGENT_DONE => EventKind::AgentDone,
             SESSION_EVICTED => EventKind::SessionEvicted,
             SESSION_STREAM_DETACHED => EventKind::SessionStreamDetached,
@@ -320,6 +338,10 @@ pub const fn class(kind: EventKind) -> EventClass {
         | EventKind::ChatSessionStarted
         | EventKind::ChatTurnUserPrompt
         | EventKind::ChatTurnCompleted
+        // A Fact, not a LatestState: each one is a distinct vendor boundary
+        // that was billed, and folding them would lose the count of how many
+        // turns one dispatched task actually took.
+        | EventKind::ChatTurnContinues
         | EventKind::ChatSessionResetWithRecovery
         | EventKind::ChatCompactDone
         | EventKind::ChatHopEscalate
@@ -1520,6 +1542,25 @@ pub fn build_chat_turn_running_long_event(
         "slug": slug,
         "turn_id": turn_id,
         "elapsed_sec": elapsed_sec,
+        "ts": Utc::now().to_rfc3339(),
+    })
+}
+
+/// The row that says a boundary settled nothing — see [`CHAT_TURN_CONTINUES`].
+/// `exec_turn_id` is the execution turn that just ended, so a reader can line
+/// this up with the request rows that kept their binding.
+pub fn build_chat_turn_continues_event(
+    role: &str,
+    sid: &str,
+    slug: &str,
+    exec_turn_id: &str,
+) -> Value {
+    json!({
+        "event": CHAT_TURN_CONTINUES,
+        "role": role,
+        "sid": sid,
+        "slug": slug,
+        "turn_id": exec_turn_id,
         "ts": Utc::now().to_rfc3339(),
     })
 }

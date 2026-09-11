@@ -300,6 +300,7 @@ impl OpencodeAcpAdapter {
             context: st.context_usage(),
             effort: st.effort.clone(),
             goal: None,
+            stop_hook_blocks: None,
             generation: st.generation,
         }
     }
@@ -360,6 +361,7 @@ impl OpencodeAcpAdapter {
             AcpTurnRoute::Queue {
                 turn_id,
                 degraded_from_inject,
+                position,
             } => {
                 if degraded_from_inject {
                     tracing::debug!(
@@ -367,7 +369,7 @@ impl OpencodeAcpAdapter {
                         "opencode ACP has no correlatable native interject method; queued active-turn message"
                     );
                 }
-                Ok(TurnSubmission::queued(TurnId(turn_id)))
+                Ok(TurnSubmission::queued_at(TurnId(turn_id), position))
             }
             AcpTurnRoute::Inject { .. } => Err(HarnessError::Io(
                 "opencode ACP routing selected unsupported native inject".into(),
@@ -872,6 +874,13 @@ impl HarnessAdapter for OpencodeAcpAdapter {
             return Ok(released_thread_status(h));
         };
         Ok(self.thread_status_inner(&live))
+    }
+
+    /// What this session's in-flight turn has said so far (GitHub #197 E/G).
+    /// One shared ACP implementation — see [`crate::execution::acp::in_flight_narration`].
+    fn in_flight_narration(&self, h: &ThreadHandle) -> Option<crate::PartialNarration> {
+        let live = self.get_live(&h.identity)?;
+        crate::execution::acp::in_flight_narration(&live.state)
     }
 
     async fn interrupt_turn(&self, h: &ThreadHandle) -> Result<(), HarnessError> {
