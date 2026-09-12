@@ -1698,7 +1698,13 @@ fn parse_latest_goal_status(body: &str) -> Option<crate::GoalStatus> {
         return if condition.trim().is_empty() {
             None
         } else {
-            Some(crate::GoalStatus { condition, met })
+            // Claude's goal has no state axis beyond `met` — its "why is this
+            // goal not advancing" fact is `stop_hook_blocks`.
+            Some(crate::GoalStatus {
+                condition,
+                met,
+                state: None,
+            })
         };
     }
     None

@@ -1494,11 +1494,23 @@ impl RunningTask {
 /// `met` flips true when the agent reports it achieved. For Claude stream-json
 /// this is sourced from the session transcript's `goal_status` attachment —
 /// the bridge exposes no control_request or stream message for it (verified by
-/// live probe), so it is read from the transcript like the TUI does.
+/// live probe), so it is read from the transcript like the TUI does. Codex
+/// reports the same two facts over `thread/goal/updated` (its own snapshot,
+/// re-sent on resume), so both vendors' goals render identically.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GoalStatus {
     pub condition: String,
     pub met: bool,
+    /// The vendor's own word for a goal that is NEITHER being pursued nor met
+    /// — codex `paused` / `blocked` / `usageLimited` / `budgetLimited`
+    /// (`protocol.rs::ThreadGoalStatus`). This is the answer to "the goal is
+    /// set, so why is the session quiet": codex stops advancing a blocked or
+    /// usage-limited goal and says nothing in the chat about it. `None` =
+    /// being pursued (or met), and always `None` for Claude, whose goal has no
+    /// state axis beyond `met`. Default-skipped for back-compat with an older
+    /// persisted `status.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 impl ThreadStatus {
@@ -2585,6 +2597,7 @@ mod tests {
             goal: Some(GoalStatus {
                 condition: "ship the payment module".into(),
                 met: false,
+                state: None,
             }),
             ..full.clone()
         };
@@ -2596,6 +2609,7 @@ mod tests {
             goal: Some(GoalStatus {
                 condition: "ship the payment module".into(),
                 met: true,
+                state: None,
             }),
             ..full.clone()
         };

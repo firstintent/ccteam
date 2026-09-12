@@ -18648,6 +18648,13 @@ impl StatusCard {
                     cond.to_string()
                 };
                 out.push_str(&format!("\n   {marker} {shown}"));
+                // A goal the vendor has STOPPED advancing (codex
+                // blocked/paused/usage-limited) looks identical to a live one
+                // without this — and "the goal is set but nothing is
+                // happening" is exactly what the card exists to answer.
+                if let Some(state) = g.state.as_deref().filter(|s| !s.is_empty()) {
+                    out.push_str(&format!(" · {state}(已停止推进)"));
+                }
                 if let Some(blocks) = refusals {
                     out.push_str(&format!(
                         " · Stop hook 近 1h 拒停 {blocks} 次,turn 无法结束 → /goal clear"
@@ -20035,6 +20042,7 @@ mod tests {
             goal: Some(ccteam_harness::GoalStatus {
                 condition: "all green".into(),
                 met: false,
+                state: None,
             }),
             stop_hook_blocks: Some(46),
             account: Some(AccountUsage {
@@ -20070,6 +20078,27 @@ mod tests {
              ↓ 本项目其他 3 个会话 → /sessions\n   \
              ↓ 所有 8 个项目 → /projects"
         );
+        // A goal the vendor has STOPPED advancing says so, or "set but quiet"
+        // is indistinguishable from "being worked on" (codex reports
+        // blocked/paused/usage-limited; claude's equivalent is the Stop-hook
+        // counter above).
+        let stalled = StatusCard {
+            goal: Some(ccteam_harness::GoalStatus {
+                condition: "all green".into(),
+                met: false,
+                state: Some("usage_limited".into()),
+            }),
+            stop_hook_blocks: None,
+            ..card.clone()
+        };
+        assert!(
+            stalled
+                .render()
+                .contains("\n   🎯 all green · usage_limited(已停止推进)"),
+            "{}",
+            stalled.render()
+        );
+
         // A bare card (roleless, no effort, nothing mapped, nothing running)
         // still ends with the footer — the one line every reader gets.
         let bare = StatusCard {
@@ -28928,6 +28957,7 @@ mod tests {
             goal: Some(ccteam_harness::GoalStatus {
                 condition: "all green".into(),
                 met: false,
+                state: None,
             }),
             stop_hook_blocks: Some(46),
         })

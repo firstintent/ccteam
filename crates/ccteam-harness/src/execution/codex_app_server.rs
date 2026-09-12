@@ -72,7 +72,7 @@ use crate::{
 };
 use crate::{
     ChoiceOption, ChoicePrompt, ChoiceSelection, ContextSource, ContextUsage, Directive,
-    DirectiveOutcome, ThreadStatus,
+    DirectiveOutcome, GoalStatus, ThreadStatus,
 };
 
 /// Env override for the UDS path the adapter dials. Setting it is the
@@ -179,6 +179,11 @@ pub struct ThreadLive {
     /// it waits in the override map for the next `turn/start`. `None`
     /// when codex reports no effort. Surfaced in the `/sessions` statusline.
     pub effort: Option<String>,
+    /// The thread's native goal (`/goal` → `thread/goal/*`), in the same shape
+    /// claude's transcript-read goal takes so `/status` renders both vendors
+    /// identically. Fed by codex's own `thread/goal/updated` snapshot (also
+    /// re-sent when a thread is resumed) and ended by `thread/goal/cleared`.
+    pub goal: Option<GoalStatus>,
     /// A resume response must not overwrite a newer settings notification.
     settings_revision: u64,
     /// Where this thread's observations are persisted, set by `start_thread`
@@ -224,9 +229,9 @@ impl ThreadLive {
             model: self.model.clone(),
             context: self.usage,
             effort: self.effort.clone(),
-            // Codex has a native `/goal` (thread/goal/*); surfacing it in the
-            // statusline is a follow-up — None for now.
-            goal: None,
+            goal: self.goal.clone(),
+            // Claude-only diagnostic (Stop-hook refusals); codex's equivalent
+            // "why is this goal not advancing" fact is `GoalStatus::state`.
             stop_hook_blocks: None,
             generation: self.persist.as_ref().and_then(|p| p.generation),
         }
@@ -814,6 +819,24 @@ impl CodexAppServerAdapter {
             .map_or(0, |live| live.settings_revision)
     }
 
+    /// Fold a goal the adapter itself just learned (a `/goal` RPC response)
+    /// into the tracker + `status.json`. Same write discipline as the
+    /// notification path: only when the rendered goal actually changed, and
+    /// the file write happens outside the tracker lock.
+    async fn seed_thread_goal(&self, thread_id: &str, goal: Option<GoalStatus>) {
+        let pending = {
+            let mut tracker = self.tracker.lock().await;
+            let entry = tracker.entry(thread_id);
+            if entry.goal == goal {
+                None
+            } else {
+                entry.goal = goal;
+                entry.pending_write()
+            }
+        };
+        persist_status(pending);
+    }
+
     async fn seed_thread_settings(
         &self,
         thread_id: &str,
@@ -1113,6 +1136,10 @@ impl CodexAppServerAdapter {
             }
             // thread/goal/{set,get,clear} — common.rs:497/502/507.
             // no args → get; "clear" → clear; else → set objective.
+            // Every arm folds the goal codex just reported into the tracker so
+            // `/status` is right at acknowledgement time, not one notification
+            // later; the `thread/goal/updated` snapshot that follows carries
+            // the same fact and is idempotent.
             "goal" => {
                 let client = self.client().await?;
                 if args.is_empty() {
@@ -1122,13 +1149,11 @@ impl CodexAppServerAdapter {
                         .map_err(|e| {
                             HarnessError::SubmitFailed(format!("thread/goal/get: {e:#}"))
                         })?;
-                    let objective = result
-                        .get("goal")
-                        .and_then(|g| g.get("objective"))
-                        .and_then(|v| v.as_str());
+                    let goal = result.get("goal").and_then(goal_status);
+                    self.seed_thread_goal(tid, goal.clone()).await;
                     DirectiveOutcome::Done {
-                        receipt: match objective {
-                            Some(o) => format!("goal: {o}"),
+                        receipt: match goal {
+                            Some(g) => format!("goal: {}", render_goal(&g)),
                             None => "no goal set.".to_string(),
                         },
                     }
@@ -1139,11 +1164,12 @@ impl CodexAppServerAdapter {
                         .map_err(|e| {
                             HarnessError::SubmitFailed(format!("thread/goal/clear: {e:#}"))
                         })?;
+                    self.seed_thread_goal(tid, None).await;
                     DirectiveOutcome::Done {
                         receipt: "goal cleared.".to_string(),
                     }
                 } else {
-                    client
+                    let result = client
                         .call(
                             "thread/goal/set",
                             json!({ "threadId": tid, "objective": args }),
@@ -1152,8 +1178,19 @@ impl CodexAppServerAdapter {
                         .map_err(|e| {
                             HarnessError::SubmitFailed(format!("thread/goal/set: {e:#}"))
                         })?;
+                    self.seed_thread_goal(tid, result.get("goal").and_then(goal_status))
+                        .await;
+                    // Say what actually happens next: codex's goal runtime
+                    // opens a turn immediately and keeps opening one whenever
+                    // the thread falls idle, so the session starts working
+                    // (and spending) on its own — verified against a live
+                    // `codex app-server`. Without this the first autonomous
+                    // answer reads as if the command had been taken as prose.
                     DirectiveOutcome::Done {
-                        receipt: format!("goal set: {args}"),
+                        receipt: format!(
+                            "goal set: {args} · codex starts working toward it now and keeps \
+                             going until it reports the goal met (/goal clear stops it)."
+                        ),
                     }
                 }
             }
@@ -3610,8 +3647,13 @@ pub fn translate_notification(notif: &Notification, wanted: &str) -> Option<Thre
         // v0.8.5 D2 — `skills/changed` is consumed by the tracker dispatcher
         // (it invalidates the skills/list cache, arch §1.3). It carries no
         // ThreadEvent and no progress.jsonl row; skip it silently here so it
-        // doesn't hit the unknown-method warn path.
-        "skills/changed" | "thread/settings/updated" => None,
+        // doesn't hit the unknown-method warn path. The goal snapshots are the
+        // same shape of fact: the tracker folds them into the statusline, and
+        // codex re-sends `updated` every turn, so warning would be pure noise.
+        "skills/changed"
+        | "thread/settings/updated"
+        | "thread/goal/updated"
+        | "thread/goal/cleared" => None,
         // V0.6.3 F144 — forward-compat: a `codex app-server` notification
         // `method` we don't yet propagate is **skipped** (`None`) so the
         // event stream is never broken — the orchestrator's
@@ -4066,6 +4108,44 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
     }
 }
 
+/// Codex's `ThreadGoal` → the vendor-neutral [`GoalStatus`] `/status` renders
+/// for every harness. `ThreadGoalStatus` (protocol.rs:4053) is
+/// `active | paused | blocked | usageLimited | budgetLimited | complete`:
+/// `complete` is the goal being MET, `active` is it being pursued, and the
+/// rest are codex having stopped advancing it — kept verbatim in `state` so
+/// the reader is told why rather than shown a goal that looks live. An empty
+/// objective is no goal at all, the same rule the claude transcript read
+/// applies to a cleared goal.
+fn goal_status(goal: &Value) -> Option<GoalStatus> {
+    let condition = goal.get("objective")?.as_str()?.trim().to_string();
+    if condition.is_empty() {
+        return None;
+    }
+    let state = pluck_str(goal, "status", "status").unwrap_or_default();
+    Some(GoalStatus {
+        condition,
+        met: state.eq_ignore_ascii_case("complete"),
+        state: match state {
+            "" | "active" | "complete" => None,
+            other => Some(camel_to_snake(other)),
+        },
+    })
+}
+
+/// A goal as a `/goal` receipt states it: the objective, plus why it is not
+/// being pursued when codex says so (`met` / `blocked` / …).
+fn render_goal(goal: &GoalStatus) -> String {
+    let suffix = if goal.met {
+        " · met".to_string()
+    } else {
+        match &goal.state {
+            Some(state) => format!(" · {state}"),
+            None => String::new(),
+        }
+    };
+    format!("{}{suffix}", goal.condition)
+}
+
 /// v0.8.5 D2.4 — fold a single codex notification into the
 /// [`CodexThreadTracker`]. This is the SOLE writer of the tracker (the
 /// dispatcher calls it); `events()` never touches the tracker.
@@ -4082,6 +4162,8 @@ pub fn build_codex_notification_progress_line(notif: &Notification, wanted: &str
 ///   NOT `tokenUsage.total` (the cumulative session sum, which over-counts the
 ///   re-sent context every turn). This is the ONLY source of usage — the real
 ///   `turn/completed` wire carries none.
+/// - `thread/goal/updated` / `thread/goal/cleared` → set/clear the thread's
+///   goal, so `/status` reports it for codex as it does for claude.
 async fn apply_notification_to_tracker(
     tracker: &Arc<Mutex<CodexThreadTracker>>,
     notif: &Notification,
@@ -4113,6 +4195,40 @@ async fn apply_notification_to_tracker(
                 // after release can replay it.
                 persist_status(pending);
             }
+        }
+        // The thread's goal, from codex's own snapshots: `thread/goal/updated`
+        // carries the whole goal (and is re-sent on resume, so a cold-resumed
+        // thread re-learns it without an RPC), `thread/goal/cleared` ends it.
+        // Persisted like the settings snapshot so a RELEASED session still
+        // shows its goal on `/status` — only when the rendered goal actually
+        // changed, because codex re-sends this notification on every turn to
+        // report the goal's token accounting.
+        "thread/goal/updated" => {
+            let goal = pluck_val(&notif.params, "goal", "goal").and_then(|g| goal_status(&g));
+            let pending = {
+                let mut tracker = tracker.lock().await;
+                let entry = tracker.entry(&tid);
+                if entry.goal == goal {
+                    None
+                } else {
+                    entry.goal = goal;
+                    entry.pending_write()
+                }
+            };
+            persist_status(pending);
+        }
+        "thread/goal/cleared" => {
+            let pending = {
+                let mut tracker = tracker.lock().await;
+                let entry = tracker.entry(&tid);
+                if entry.goal.is_none() {
+                    None
+                } else {
+                    entry.goal = None;
+                    entry.pending_write()
+                }
+            };
+            persist_status(pending);
         }
         "turn/started" => {
             let turn_id = pluck_turn_id_from_params(&notif.params);
@@ -4782,6 +4898,79 @@ mod tests {
         // A DIFFERENT turn is a different narration.
         begin_narration_locked(&mut cells, "t-1", "turn-8");
         assert_eq!(cells["t-1"].text.text(), "");
+    }
+
+    /// Codex's goal states (protocol.rs:4053) collapse into the two facts the
+    /// card renders — is it met, and is it being pursued — with the vendor's
+    /// own word kept for the states where it is not.
+    #[test]
+    fn goal_status_maps_codex_states() {
+        let goal = |status: &str| goal_status(&json!({ "objective": "ship v1", "status": status }));
+        let active = goal("active").expect("active goal");
+        assert_eq!(active.condition, "ship v1");
+        assert!(!active.met);
+        assert_eq!(active.state, None);
+        let complete = goal("complete").expect("complete goal");
+        assert!(complete.met, "codex `complete` is claude's `met`");
+        assert_eq!(complete.state, None);
+        assert_eq!(
+            goal("usageLimited").expect("stalled goal").state.as_deref(),
+            Some("usage_limited"),
+            "a goal codex stopped advancing keeps its reason"
+        );
+        assert_eq!(
+            goal("blocked").expect("blocked goal").state.as_deref(),
+            Some("blocked")
+        );
+        // An empty / absent objective is no goal at all — the same rule the
+        // claude transcript read applies to a cleared goal.
+        assert!(goal_status(&json!({ "objective": "  ", "status": "active" })).is_none());
+        assert!(goal_status(&json!({ "status": "active" })).is_none());
+    }
+
+    /// The tracker is the statusline's home for the codex goal: `updated`
+    /// snapshots set it (codex re-sends one on resume and on every turn),
+    /// `cleared` ends it, and a foreign thread's goal never leaks in.
+    #[tokio::test]
+    async fn tracker_folds_codex_goal_snapshots() {
+        let tracker = Arc::new(Mutex::new(CodexThreadTracker::default()));
+        let updated = |tid: &str, status: &str| Notification {
+            method: "thread/goal/updated".into(),
+            params: json!({ "threadId": tid, "goal": {
+                "threadId": tid, "objective": "ship v1", "status": status
+            }}),
+        };
+        apply_notification_to_tracker(&tracker, &updated("t-1", "active")).await;
+        let live = tracker.lock().await.snapshot("t-1").unwrap();
+        assert_eq!(live.status().goal.unwrap().condition, "ship v1");
+
+        apply_notification_to_tracker(&tracker, &updated("t-2", "blocked")).await;
+        assert_eq!(
+            tracker
+                .lock()
+                .await
+                .snapshot("t-1")
+                .unwrap()
+                .goal
+                .unwrap()
+                .state,
+            None,
+            "another thread's goal must not land here"
+        );
+
+        apply_notification_to_tracker(
+            &tracker,
+            &Notification {
+                method: "thread/goal/cleared".into(),
+                params: json!({ "threadId": "t-1" }),
+            },
+        )
+        .await;
+        assert!(tracker.lock().await.snapshot("t-1").unwrap().goal.is_none());
+        assert!(
+            tracker.lock().await.snapshot("t-2").unwrap().goal.is_some(),
+            "clearing one thread's goal leaves the others'"
+        );
     }
 
     /// Keep the settings contract in the CI lib-test baseline as well as

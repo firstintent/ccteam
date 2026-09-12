@@ -2325,6 +2325,115 @@ async fn tracker_usage_from_token_usage_and_active_turn_lifecycle() {
     std::env::remove_var(APP_SERVER_SOCKET_ENV);
 }
 
+/// A codex `/goal` must reach `/status` exactly as claude's does: the
+/// directive's own RPC answer seeds the statusline immediately, codex's
+/// `thread/goal/updated` snapshot keeps it current (including the states where
+/// codex has STOPPED advancing the goal), and `thread/goal/cleared` ends it.
+/// Before this the card showed nothing for codex while claude showed 🎯, and
+/// the set receipt never said that codex starts working on its own.
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn goal_is_reported_on_the_codex_statusline() {
+    let (adapter, h, _seen, peer, notif, sock) = d2_start_with_notif("goal-status").await;
+
+    // No goal yet → nothing on the card.
+    assert!(adapter.thread_status(&h).await.unwrap().goal.is_none());
+
+    // `/goal <objective>` → the set response seeds the goal at acknowledgement
+    // time, and the receipt says what codex does next (it opens a turn on its
+    // own — verified against a live app-server).
+    let out = adapter
+        .handle_directive(&h, dir("goal", "ship v1"))
+        .await
+        .unwrap();
+    match out {
+        DirectiveOutcome::Done { receipt } => {
+            assert!(
+                receipt.contains("ship v1"),
+                "receipt names the goal: {receipt}"
+            );
+            assert!(
+                receipt.contains("/goal clear"),
+                "receipt says how to stop the autonomous work: {receipt}"
+            );
+        }
+        other => panic!("expected Done for /goal set, got {other:?}"),
+    }
+    let goal = adapter.thread_status(&h).await.unwrap().goal.expect("goal");
+    assert_eq!(goal.condition, "ship");
+    assert!(!goal.met);
+    assert_eq!(goal.state, None, "an active goal carries no stalled state");
+
+    // A goal codex stopped advancing must SAY so — a blocked goal that renders
+    // like a live one is the "set, but why is it quiet" trap.
+    notif
+        .send(json!({
+            "method": "thread/goal/updated",
+            "params": { "threadId": "tid-d2", "turnId": "turn-1", "goal": {
+                "threadId": "tid-d2", "objective": "ship", "status": "usageLimited",
+                "tokenBudget": null, "tokensUsed": 12, "timeUsedSeconds": 3,
+                "createdAt": 0, "updatedAt": 1
+            }}
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        async move {
+            a.tracker_snapshot("tid-d2")
+                .await
+                .and_then(|t| t.goal)
+                .and_then(|g| g.state)
+                == Some("usage_limited".to_string())
+        }
+    })
+    .await;
+
+    // Met: codex's terminal `complete` is the same fact claude's `met` carries.
+    notif
+        .send(json!({
+            "method": "thread/goal/updated",
+            "params": { "threadId": "tid-d2", "goal": {
+                "threadId": "tid-d2", "objective": "ship", "status": "complete",
+                "tokenBudget": null, "tokensUsed": 20, "timeUsedSeconds": 5,
+                "createdAt": 0, "updatedAt": 2
+            }}
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        async move {
+            a.tracker_snapshot("tid-d2")
+                .await
+                .and_then(|t| t.goal)
+                .map(|g| g.met && g.state.is_none())
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    // `thread/goal/cleared` ends it — and so does `/goal clear`, whose own
+    // answer must not wait for the notification.
+    notif
+        .send(json!({
+            "method": "thread/goal/cleared",
+            "params": { "threadId": "tid-d2" }
+        }))
+        .await
+        .unwrap();
+    wait_until(|| {
+        let a = adapter.clone();
+        async move { a.tracker_snapshot("tid-d2").await.unwrap().goal.is_none() }
+    })
+    .await;
+    assert!(adapter.thread_status(&h).await.unwrap().goal.is_none());
+
+    drop(peer);
+    let _ = std::fs::remove_file(&sock);
+    std::env::remove_var(APP_SERVER_SOCKET_ENV);
+}
+
 /// GitHub #197 (G) — a codex turn still running can say what it has said, on
 /// its OWN wire shape: `item/agentMessage/delta` fragments, then the
 /// `item/completed` that carries the whole message. Private reasoning is never
