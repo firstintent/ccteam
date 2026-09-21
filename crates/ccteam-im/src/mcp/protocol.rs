@@ -315,7 +315,7 @@ pub fn session_tool_definitions() -> Vec<Value> {
                 "routing": {
                     "type": "string",
                     "enum": ["inject", "queue"],
-                    "description": "Busy child: inject (default) steers its running turn; the model usually answers your line inside that turn, else the CLI re-runs it as the next one (ccteam waits 30s for that before treating the joined turn's boundary as the answer). queue gives your task its own turn."
+                    "description": "Busy child: inject (default) steers its running turn, which usually answers your line itself (else a replay turn does; ccteam waits 30s for one). queue gives your task its own turn."
                 },
                 "tools": {
                     "type": "string",
