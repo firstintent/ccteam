@@ -234,10 +234,15 @@ impl StreamTranslator {
             Ok(identity) => identity.has_pending_replay(),
             Err(poisoned) => poisoned.into_inner().has_pending_replay(),
         };
-        if self.background_tasks.is_empty() && !replay_pending {
-            TurnContinuation::Settled
-        } else {
+        // Background work first: it is the stronger hold (unbounded), and a
+        // line injected while something runs in the background is answered
+        // — if at all — after that something wakes the model.
+        if !self.background_tasks.is_empty() {
             TurnContinuation::Pending
+        } else if replay_pending {
+            TurnContinuation::Replay
+        } else {
+            TurnContinuation::Settled
         }
     }
 
@@ -990,9 +995,10 @@ mod tests {
     }
 
     /// GitHub #199 — a line ccteam injects mid-turn is shown to the model as a
-    /// queued command and then RE-RUN as the next prompt, so the turn it joined
-    /// is not where it is answered. The joined turn's boundary therefore
-    /// settles nothing, and the replay turn's does.
+    /// queued command and MAY be re-run as the next prompt, so the turn it
+    /// joined is not certainly where it is answered. The joined turn's boundary
+    /// is therefore `Replay` (provisional, the consumer waits briefly for a
+    /// continuation), and the replay turn's, when one opens, settles.
     #[test]
     fn an_injected_line_is_answered_by_the_replay_turn_not_the_one_it_joined() {
         let identity = Arc::new(Mutex::new(TurnIdentity::default()));
@@ -1004,8 +1010,8 @@ mod tests {
         let joined = t.ingest(result_ok("working"));
         assert_eq!(
             continuation_of(&joined),
-            Some(TurnContinuation::Pending),
-            "the injected line has not been read as a prompt yet"
+            Some(TurnContinuation::Replay),
+            "the injected line may still be re-run as a prompt"
         );
 
         let replay = t.ingest(assistant(json!([{"type": "text", "text": "done"}])));
@@ -1030,7 +1036,7 @@ mod tests {
         identity.lock().unwrap().note_injected();
         assert_eq!(
             continuation_of(&t.ingest(result_ok("a"))),
-            Some(TurnContinuation::Pending)
+            Some(TurnContinuation::Replay)
         );
 
         let mut t = StreamTranslator::new();
@@ -1038,6 +1044,18 @@ mod tests {
         t.ingest(assistant(json!([{"type": "text", "text": "b"}])));
         assert_eq!(
             continuation_of(&t.ingest(result_ok("b"))),
+            Some(TurnContinuation::Pending)
+        );
+
+        // Both held at once: the background hold wins, because the injected
+        // line is answered (if ever) only after that work wakes the model.
+        let identity = Arc::new(Mutex::new(TurnIdentity::default()));
+        let mut t = StreamTranslator::attached(Arc::clone(&identity));
+        t.ingest(background(&["bg-1"]));
+        t.ingest(assistant(json!([{"type": "text", "text": "c"}])));
+        identity.lock().unwrap().note_injected();
+        assert_eq!(
+            continuation_of(&t.ingest(result_ok("c"))),
             Some(TurnContinuation::Pending)
         );
     }

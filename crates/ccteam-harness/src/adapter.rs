@@ -950,8 +950,29 @@ pub enum TurnContinuation {
     /// ends its turns exactly when it is told to.
     #[default]
     Settled,
-    /// The vendor will wake its own model again on account of this turn.
+    /// The vendor will wake its own model again on account of this turn — a
+    /// background task, `Monitor` or async `Agent` it still lists as running
+    /// — and nothing bounds how long that takes.
     Pending,
+    /// A line ccteam injected into this turn MAY still be re-run as the
+    /// vendor's next prompt. Weaker than [`Self::Pending`], on purpose: claude
+    /// shows an injected line to the model as a queued-command preview inside
+    /// the running turn, and the transcript of a real incident shows the model
+    /// answering it there with no replay turn ever opening (excore s1190,
+    /// 2026-09-20: the boundary sat non-terminal for hours, both requests
+    /// stranded, the parent never woken). Whether the CLI replays is not
+    /// observable on the stream, so the consumer treats this boundary as the
+    /// answer unless the vendor opens a continuation turn promptly.
+    Replay,
+}
+
+impl TurnContinuation {
+    /// Does this boundary end the work bound to the turn outright? Only
+    /// [`Self::Settled`] does; the two held facts differ in how long a
+    /// consumer waits before deciding nothing is coming.
+    pub fn is_settled(self) -> bool {
+        matches!(self, TurnContinuation::Settled)
+    }
 }
 
 /// Vendor-agnostic event flowing out of [`HarnessAdapter::events`].
