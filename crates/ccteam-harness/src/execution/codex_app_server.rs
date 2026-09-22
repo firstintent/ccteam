@@ -4689,7 +4689,18 @@ mod tests {
             .stdin(std::fs::File::open(&lock).unwrap())
             .spawn()
             .expect("spawn sleep");
-        let holder = writer_lock_holder(&lock).expect("child holds the lock file open");
+        // `spawn()` returns once exec has closed the CLOEXEC pipe, but the
+        // kernel fills the new image's argv (`/proc/<pid>/cmdline`) a beat
+        // later, so an immediate probe can see the right pid with an empty
+        // cmdline (`pid N: ?`). Production holders are long-lived; poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let holder = loop {
+            let holder = writer_lock_holder(&lock).expect("child holds the lock file open");
+            if holder.contains("sleep") || std::time::Instant::now() >= deadline {
+                break holder;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(holder.contains(&format!("pid {}", child.id())), "{holder}");
         assert!(holder.contains("sleep"), "{holder}");
         assert!(!holder.contains("orphaned"), "{holder}");
