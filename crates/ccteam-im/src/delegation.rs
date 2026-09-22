@@ -77,13 +77,16 @@ pub struct DelegationSignal {
     pub host: String,
     /// True = the vendor turn boundary (child idle); false = interim message.
     pub boundary: bool,
-    /// Whether that boundary ENDED the work bound to it. `false` when the
-    /// vendor still holds something that will wake its own model again (see
-    /// [`ccteam_harness::TurnContinuation`]): the boundary is recorded against
-    /// every bound request and billed like any other, but it resolves nobody
-    /// and wakes no parent. Always `true` for an interim signal, which resolves
-    /// nothing regardless.
-    pub terminal: bool,
+    /// What the vendor still held at this boundary — see
+    /// [`ccteam_harness::TurnContinuation`]. `Settled` ENDS the work bound to
+    /// the turn. `Pending` (background work, unbounded) is recorded against
+    /// every bound request and billed like any other, but resolves nobody and
+    /// wakes no parent. `Replay` (an injected line that MAY be re-run) is
+    /// recorded the same way and then held provisionally: if the vendor opens
+    /// no continuation turn within the replay grace, this boundary IS the
+    /// answer and is delivered as such. Always `Settled` for an interim
+    /// signal, which resolves nothing regardless.
+    pub continuation: ccteam_harness::TurnContinuation,
     /// True when the boundary came from the vendor's structured fatal-turn
     /// outcome (`TurnFailed` / terminal `Error`), rather than normal completion.
     pub vendor_error: bool,
@@ -100,6 +103,13 @@ pub struct DelegationSignal {
     pub turn: u64,
     /// Stable failure kind when the boundary is a vendor error.
     pub error_kind: Option<String>,
+}
+
+impl DelegationSignal {
+    /// Does this boundary end the work bound to its turn right now?
+    pub fn terminal(&self) -> bool {
+        self.continuation.is_settled()
+    }
 }
 
 /// One source of truth for completion notifications and inline wait results.
