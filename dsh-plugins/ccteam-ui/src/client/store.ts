@@ -133,6 +133,14 @@ export interface ChatState {
   activity: Activity | undefined
   /** A choice prompt is pending (the working indicator yields to it). */
   waiting: boolean
+  /**
+   * Step ids of the turn that just ended, kept until a new turn is under way
+   * (a send, an interim answer or prompt, tool activity never seen before).
+   * Between turns a late event for one of them, a liveness pulse, or the
+   * card such a pulse folds into belongs to the ended turn and must not
+   * reopen a working turn. null before any turn ended in view.
+   */
+  ended: string[] | null
   loading: boolean
   loadingOlder: boolean
   error: string | null
@@ -348,6 +356,7 @@ const EMPTY_CHAT: ChatState = {
   live: null,
   activity: undefined,
   waiting: false,
+  ended: null,
   loading: false,
   loadingOlder: false,
   error: null,
@@ -543,6 +552,15 @@ function answerRow(event: AnswerEvent, steps: Step[]): AssistantRow {
   }
 }
 
+/**
+ * ACP's throttled liveness pulse (`{turn}-live-{kind}`, `pending-live-…` when
+ * no turn buffer is open): proof that bytes streamed, never that a new turn
+ * began.
+ */
+function isLivenessPulse(itemId: string): boolean {
+  return itemId.includes('-live-')
+}
+
 /** Index of the newest assistant row holding a step; -1 when none. */
 function stepRow(rows: ChatRow[], itemId: string): number {
   for (let i = rows.length - 1; i >= 0; i -= 1) {
@@ -575,7 +593,7 @@ function settleInterim(chat: ChatState, event: AnswerEvent): ChatState {
         steps: chat.live.steps.filter(s => s.status !== 'completed'),
         settled: [...(chat.live.settled ?? []), ...done.map(s => s.itemId)],
       }
-  return { ...chat, rows: [...chat.rows, row], live, activity: 'working' }
+  return { ...chat, rows: [...chat.rows, row], live, activity: 'working', ended: null }
 }
 
 /**
@@ -587,7 +605,8 @@ function settleInterim(chat: ChatState, event: AnswerEvent): ChatState {
  */
 function closeTurn(chat: ChatState, event: AnswerEvent): ChatState {
   const notices = chat.notices.filter(notice => notice.kind !== 'queued')
-  const ended: ChatState = { ...chat, live: null, activity: 'idle', waiting: false, notices }
+  const steps = chat.live === null ? [] : [...(chat.live.settled ?? []), ...chat.live.steps.map(s => s.itemId)]
+  const ended: ChatState = { ...chat, live: null, activity: 'idle', waiting: false, notices, ended: steps }
   const id = `answer-${event.id}`
   if (chat.rows.some(r => r.id === id)) return ended
   const row = answerRow(event, chat.live === null ? [] : completeSteps(chat.live.steps))
@@ -605,29 +624,38 @@ function applySessionEvent(chat: ChatState, action: Extract<Action, { type: 'ses
         if (chat.live === null || event.content === '' || event.content === chat.live.content) return chat
         return { ...chat, live: { ...chat.live, content: event.content } }
       }
+      // Between turns a card is what a stray pulse folded into, not a turn.
+      if (chat.live === null && chat.ended !== null) return chat
       const live: LiveTurn = chat.live ?? { id: `live-${action.now}`, content: '', steps: [], startedAt: action.now }
       const nextLive: LiveTurn = { ...live, content: event.content !== '' ? event.content : live.content }
       return { ...chat, live: nextLive, activity: 'working', waiting: false }
     }
     case 'activity': {
-      // A step this turn already settled into a row is final: a late
-      // completion may refresh it there, but nothing turns it back into a
-      // spinner or copies it into the live turn.
-      if (chat.live?.settled?.includes(event.step.itemId) === true
-        && !chat.live.steps.some(s => s.itemId === event.step.itemId)) {
-        const at = stepRow(chat.rows, event.step.itemId)
+      // A step already settled into a row — by an interim answer this turn,
+      // or by the turn that just ended — is final: a late completion may
+      // refresh it there, but nothing turns it back into a spinner, copies it
+      // into the live turn, or reopens a working turn for it.
+      const itemId = event.step.itemId
+      const settled = chat.live === null
+        ? chat.ended?.includes(itemId) === true
+        : chat.live.settled?.includes(itemId) === true && !chat.live.steps.some(s => s.itemId === itemId)
+      if (settled) {
+        const at = stepRow(chat.rows, itemId)
         const row = at === -1 ? undefined : chat.rows[at]
         if (event.step.status !== 'completed' || row?.kind !== 'assistant') return chat
         const rows = chat.rows.slice()
         rows[at] = { ...row, steps: upsertStep(row.steps, event.step) }
         return { ...chat, rows }
       }
+      // Between turns a liveness pulse is the ended turn's stray, not a new one.
+      if (chat.live === null && chat.ended !== null && isLivenessPulse(itemId)) return chat
       const live: LiveTurn = chat.live ?? { id: `live-${action.now}`, content: '', steps: [], startedAt: action.now }
       return {
         ...chat,
         live: { ...live, steps: upsertStep(live.steps, event.step) },
         activity: 'working',
         waiting: false,
+        ended: null,
       }
     }
     case 'answer': {
@@ -641,7 +669,7 @@ function applySessionEvent(chat: ChatState, action: Extract<Action, { type: 'ses
         }
         if (chat.rows.some(r => r.id === row.id)) return chat
         const notices = chat.notices.filter(notice => notice.kind !== 'queued')
-        return { ...chat, rows: [...chat.rows, row], notices, activity: 'idle', waiting: true }
+        return { ...chat, rows: [...chat.rows, row], notices, activity: 'idle', waiting: true, ended: null }
       }
       return isTurnBoundary(event) ? closeTurn(chat, event) : settleInterim(chat, event)
     }
@@ -845,7 +873,7 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
         ...(action.attachments === undefined || action.attachments.length === 0 ? {} : { attachments: action.attachments }),
       }
       return {
-        ...withChat(state, action.sid, { ...chat, rows: [...chat.rows, row], notices: [], waiting: false }),
+        ...withChat(state, action.sid, { ...chat, rows: [...chat.rows, row], notices: [], waiting: false, ended: null }),
         nextLocalId: state.nextLocalId + 1,
       }
     }
@@ -886,7 +914,7 @@ export function reduce(state: ConsoleState, action: Action): ConsoleState {
       return withChat(state, action.sid, {
         ...chat,
         rows,
-        ...(action.type === 'choice_resolved' ? { waiting: false, activity: 'working' as Activity } : {}),
+        ...(action.type === 'choice_resolved' ? { waiting: false, activity: 'working' as Activity, ended: null } : {}),
       })
     }
     case 'delegation': {

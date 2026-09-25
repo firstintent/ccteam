@@ -316,11 +316,12 @@ describe('chat: mid-turn answers', () => {
     expect(chat.rows[2]).toMatchObject({ content: '', steps: [{ itemId: 'T7-live-msg', status: 'completed' }] })
   })
 
-  it('a step id reused by a later turn shows live in that turn, not on the old row', () => {
+  it('a step id reused by the next turn shows live in that turn, not on the old row', () => {
     const state = run([
       activity('call:0', 'completed'),
       interim('a1', 'listed it'),
       boundary('b1', 'done'),
+      { type: 'send_started', sid: 's1', text: 'again' },
       activity('call:0', 'started'),
     ])
     const chat = chatOf(state, 's1')
@@ -456,6 +457,70 @@ describe('chat: mid-turn answers', () => {
     expect(stepsOf('q1:assistant')).toEqual(['t1'])
     expect(stepsOf('q2:assistant')).toEqual(['t2'])
     expect(stepsOf('q3:assistant')).toEqual(['t3'])
+  })
+})
+
+describe('chat: after a turn ends', () => {
+  const pulse = (itemId: string): Action => on({ kind: 'activity', step: { itemId, kind: 'thinking', name: '', summary: '…', status: 'update' } })
+  const idle = (state: ConsoleState): void => {
+    const chat = chatOf(state, 's1')
+    expect(chat.activity).toBe('idle')
+    expect(chat.live).toBeNull()
+  }
+
+  it('a late completion of the ended turn\'s step refreshes its row and reopens nothing', () => {
+    let state = run([
+      { type: 'send_started', sid: 's1', text: 'build it' },
+      activity('t1', 'started'),
+      boundary('b1', 'kicked off the build'),
+      on({ kind: 'activity', step: { ...step('t1', 'completed'), summary: 'build finished in 3m' } }),
+    ])
+    idle(state)
+    expect(chatOf(state, 's1').rows[1]).toMatchObject({ id: 'answer-b1', steps: [{ itemId: 't1', status: 'completed', summary: 'build finished in 3m' }] })
+    // Anything but a completion for it is dropped — even once the row is canonical.
+    state = run([
+      { type: 'history_loaded', sid: 's1', rows: [
+        { turnId: 'q1:user', role: 'user', content: 'build it' },
+        { turnId: 'q1:assistant', role: 'assistant', content: 'kicked off the build' },
+      ], hasMore: false },
+      activity('t1', 'started'),
+    ], state)
+    idle(state)
+    expect(chatOf(state, 's1').rows[1]).toMatchObject({ id: 'q1:assistant', steps: [{ itemId: 't1', status: 'completed' }] })
+  })
+
+  it('a stray liveness pulse (and the card it folds into) after the turn ends opens no working turn', () => {
+    const state = run([
+      pulse('T7-live-thought'),
+      boundary('b1', 'done'),
+      pulse('pending-live-thought'),
+      on({ kind: 'progress', content: '💭', done: false }),
+      pulse('T7-live-thought'),
+    ])
+    idle(state)
+    expect(chatOf(state, 's1').rows.map(r => r.id)).toEqual(['answer-b1'])
+  })
+
+  it('a genuinely new turn still shows working: a send, unseen tool activity, an interim answer', () => {
+    const ended: Action[] = [activity('t1', 'started'), boundary('b1', 'done'), pulse('pending-live-thought')]
+    const afterSend = chatOf(run([
+      ...ended,
+      { type: 'send_started', sid: 's1', text: 'next' },
+      on({ kind: 'progress', content: '💭', done: false }),
+    ]), 's1')
+    expect(afterSend.activity).toBe('working')
+    expect(afterSend.live?.content).toBe('💭')
+
+    const fromElsewhere = chatOf(run([
+      ...ended,
+      activity('t2', 'started'),
+      on({ kind: 'progress', content: 'Bash(t2)', done: false }),
+    ]), 's1')
+    expect(fromElsewhere.activity).toBe('working')
+    expect(fromElsewhere.live).toMatchObject({ content: 'Bash(t2)', steps: [{ itemId: 't2', status: 'started' }] })
+
+    const spoke = chatOf(run([...ended, interim('a2', 'picking this up from IM')]), 's1')
+    expect(spoke.activity).toBe('working')
   })
 })
 
