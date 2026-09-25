@@ -462,6 +462,75 @@ pub(crate) fn read_budget_for(total_chars: usize) -> usize {
     total_chars.clamp(AGENT_READ_MIN_MAX_CHARS, AGENT_READ_MAX_MAX_CHARS)
 }
 
+/// The answer of one execution turn, from the rows it reached its reader as.
+///
+/// A long turn is delivered as it goes (#209), so one turn can be several
+/// ledger rows. The turn's answer is still EVERY one of them, in order (issue
+/// #192) — a parent told only the last row would lose the reply its child gave
+/// to a mid-turn steer. The conclusion is the vendor's own marker, else — when
+/// there is more than one row — the last row: the text after the turn's last
+/// tool call, which an excerpt leads with (issue #196). Never a copy of the
+/// whole answer.
+pub(crate) fn fold_turn_answer(
+    parts: &[&str],
+    conclusion: Option<&str>,
+) -> (String, Option<String>) {
+    let answer = match parts {
+        [single] => (*single).to_string(),
+        _ => parts
+            .iter()
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+    let conclusion = conclusion
+        .map(str::to_string)
+        .or_else(|| match parts {
+            [_, .., last] => Some(last.trim().to_string()),
+            _ => None,
+        })
+        .filter(|conclusion| !conclusion.is_empty() && conclusion.trim() != answer.trim());
+    (answer, conclusion)
+}
+
+/// `answered` widened to its whole execution turn: every row of the same turn
+/// up to and including it, folded by [`fold_turn_answer`]. A row with no
+/// execution identity, or a failed one, is its own answer.
+pub(crate) fn turn_answer_record(
+    all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+    answered: &ccteam_harness::execution::turns_mirror::TurnRecord,
+) -> ccteam_harness::execution::turns_mirror::TurnRecord {
+    let Some(exec) = answered
+        .exec_turn_id
+        .as_deref()
+        .filter(|_| !answered.failed())
+    else {
+        return answered.clone();
+    };
+    let Some(at) = all.iter().position(|row| row.turn_id == answered.turn_id) else {
+        return answered.clone();
+    };
+    let parts: Vec<&str> = all[..=at]
+        .iter()
+        .filter(|row| {
+            row.exec_turn_id.as_deref() == Some(exec)
+                && !row.assistant.trim().is_empty()
+                && row.outcome.is_none()
+        })
+        .map(|row| row.assistant.as_str())
+        .collect();
+    if parts.len() < 2 {
+        return answered.clone();
+    }
+    let (assistant, conclusion) = fold_turn_answer(&parts, answered.conclusion.as_deref());
+    ccteam_harness::execution::turns_mirror::TurnRecord {
+        assistant,
+        conclusion,
+        ..answered.clone()
+    }
+}
+
 /// The pointer a truncated answer carries: the exact one-call recipe for the
 /// whole text, so the reader never has to guess a budget or page through
 /// history (issue #194: the frugal, correct read was discoverable only by
@@ -689,6 +758,61 @@ mod tests {
         assert!(!t.contains("--- final answer ---"));
         assert!(!t.contains("child is idle"));
         assert!(!t.contains("interim note(s)"));
+    }
+
+    #[test]
+    fn a_turn_delivered_in_pieces_answers_with_every_piece() {
+        // #209 — a long turn reaches its reader as several rows; its answer is
+        // all of them, and the last one leads an excerpt.
+        let (answer, conclusion) =
+            fold_turn_answer(&["replied to the steer", "  ", "all green\n"], None);
+        assert_eq!(answer, "replied to the steer\n\nall green");
+        assert_eq!(conclusion.as_deref(), Some("all green"));
+        // The vendor's own marker wins; a single row is its own answer.
+        let (_, marked) = fold_turn_answer(&["a", "b"], Some("the receipt"));
+        assert_eq!(marked.as_deref(), Some("the receipt"));
+        assert_eq!(
+            fold_turn_answer(&["only"], None),
+            ("only".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn an_answered_row_widens_to_its_whole_turn() {
+        use ccteam_harness::execution::turns_mirror::TurnRecord;
+        let row = |id: &str, exec: &str, text: &str| TurnRecord {
+            exec_turn_id: Some(exec.into()),
+            continues_exec_turn: None,
+            turn_id: id.into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: text.into(),
+            usage: serde_json::Value::Null,
+            status: None,
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
+            conclusion: None,
+        };
+        let all = vec![
+            row("s9-1", "x-0", "an older turn"),
+            row("s9-2", "x-1", "started the build"),
+            row("s9-3", "x-1", ""),
+            row("s9-4", "x-1", "build green"),
+            row("s9-5", "x-2", "a later turn"),
+        ];
+        let answer = turn_answer_record(&all, &all[3]);
+        assert_eq!(
+            answer.turn_id, "s9-4",
+            "still names the row it answered with"
+        );
+        assert_eq!(answer.assistant, "started the build\n\nbuild green");
+        assert_eq!(answer.conclusion.as_deref(), Some("build green"));
+        assert_eq!(turn_answer_record(&all, &all[4]).assistant, "a later turn");
     }
 
     #[test]

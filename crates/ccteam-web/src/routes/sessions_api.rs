@@ -1501,6 +1501,7 @@ pub(crate) fn parse_last_event_id(headers: &HeaderMap, query: &SessionEventsQuer
 fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
     use ccteam_im::gateway::GatewayEventKind;
     GatewayEvent {
+        interim: false,
         id: format!("permission-{}", prompt.token),
         channel: String::new(),
         chat_id: String::new(),
@@ -2110,6 +2111,11 @@ pub(crate) fn session_event_payload(ev: &GatewayEvent) -> serde_json::Value {
     if done {
         payload["done"] = serde_json::Value::Bool(true);
     }
+    // #209 — said only when true: an answer the turn delivered on its way,
+    // with the turn still running. Every other answer ends the exchange.
+    if ev.interim {
+        payload["interim"] = serde_json::Value::Bool(true);
+    }
     if let Some(status) = &ev.status {
         payload["status"] = serde_json::to_value(status).unwrap_or(json!(null));
     }
@@ -2492,6 +2498,7 @@ mod tests {
     fn gw_event(sid: Option<&str>) -> GatewayEvent {
         use ccteam_im::gateway::GatewayEventKind;
         GatewayEvent {
+            interim: false,
             id: "e1".into(),
             channel: "web".into(),
             chat_id: "web-api".into(),
@@ -2564,6 +2571,18 @@ mod tests {
         let prog = session_event_payload(&prog);
         assert_eq!(prog["kind"], "progress");
         assert_eq!(prog["done"], true);
+    }
+
+    /// #209 — `interim` is said only when true: an answer a running turn
+    /// delivered on its way. Every other answer (no field) ends the exchange,
+    /// whether or not it carries a status.
+    #[test]
+    fn session_event_marks_only_an_interim_answer() {
+        let mut interim = gw_event(Some("s1"));
+        interim.interim = true;
+        assert_eq!(session_event_payload(&interim)["interim"], true);
+        let plain = session_event_payload(&gw_event(Some("s1")));
+        assert!(plain.get("interim").is_none(), "{plain}");
     }
 
     /// WEB-TS-1 — every frame carries a server-side `ts` in the same RFC 3339
@@ -3396,6 +3415,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let app = test_app_with_gateway(tmp.path());
         let ans = |id: &str, sid: &str| GatewayEvent {
+            interim: false,
             id: id.to_string(),
             channel: "web".into(),
             chat_id: "web-api".into(),

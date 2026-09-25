@@ -908,6 +908,7 @@ fn build_send_file_event(
         )
     })?;
     Ok(crate::gateway::GatewayEvent {
+        interim: false,
         id: format!("chat-send-file-{slug}-{role}-{seq}"),
         channel,
         chat_id,
@@ -1100,6 +1101,7 @@ async fn execute_interaction_ask(
     // Render the buttons in IM.
     if sink
         .send(GatewayEvent {
+            interim: false,
             id: format!("interaction-{token}"),
             channel,
             chat_id,
@@ -1330,6 +1332,7 @@ async fn execute_permission_ask(
     // Render the approve/deny buttons in IM.
     if sink
         .send(GatewayEvent {
+            interim: false,
             id: format!("permission-{token}"),
             channel,
             chat_id,
@@ -3991,13 +3994,15 @@ async fn finish_dispatch_wait(
             // we cannot name is reported as absent, not as somebody else's.
             // Without one — an admin caller waiting on the child's next
             // boundary — the newest row is what was waited for.
+            // …widened to the whole execution turn it closed: a long turn
+            // reaches the ledger in pieces (#209), and its answer is all of
+            // them (issue #192), not the piece that happened to be last.
             let last = match answered_turn.as_deref() {
-                Some(turn_id) => all.into_iter().find(|t| t.turn_id == turn_id),
-                None if request_id.is_none() => {
-                    all.into_iter().rev().find(|t| !t.assistant.is_empty())
-                }
+                Some(turn_id) => all.iter().find(|t| t.turn_id == turn_id),
+                None if request_id.is_none() => all.iter().rev().find(|t| !t.assistant.is_empty()),
                 None => None,
-            };
+            }
+            .map(|answered| crate::delegation::turn_answer_record(&all, answered));
             // Session-ledger telemetry (MCP-DX-1): cumulative cost + raw
             // tokens, same semantics as agent_read/collect (tokens present
             // even for vendors with no USD price table).

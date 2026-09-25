@@ -379,9 +379,14 @@ impl StreamTranslator {
             }
         }
         let (text, items) = extract_blocks(&env.message);
+        // The CLI's own `<synthetic>` message (an API error, a usage limit)
+        // is not something the model said: the turn's `result` reports it —
+        // as the failure, or as result text the stream never showed — so
+        // emitting it here too would put it in the chat twice.
+        let synthetic = env.message.get("model").and_then(|v| v.as_str()) == Some("<synthetic>");
         // Subagent narration (`parent_tool_use_id` set) belongs to the
         // Task tool's private thread, never to this session's reply.
-        if !text.is_empty() && env.parent_tool_use_id.is_none() {
+        if !text.trim().is_empty() && env.parent_tool_use_id.is_none() && !synthetic {
             push_paragraph(&mut self.acc_text, &text);
             self.last_text = Some(text.clone());
             let id = self.next_item_id();
@@ -783,6 +788,40 @@ mod tests {
         assert!(boundary
             .iter()
             .any(|e| matches!(e, ThreadEvent::TurnCompleted { .. })));
+    }
+
+    #[test]
+    fn the_clis_synthetic_message_is_left_to_the_result() {
+        // A usage limit / API error arrives as a `<synthetic>` assistant line
+        // AND as the failing `result`; only the result may report it, or the
+        // chat shows it twice.
+        let mut t = StreamTranslator::new();
+        let evs = run(
+            &mut t,
+            vec![
+                Outbound::Assistant(MessageEnvelope {
+                    message: json!({"role": "assistant", "model": "<synthetic>",
+                        "content": [{"type": "text", "text": "You've hit your session limit"}]}),
+                    session_id: "u-1".into(),
+                    parent_tool_use_id: None,
+                }),
+                assistant(json!([{"type": "text", "text": "   \n"}])),
+                Outbound::TurnResult(ResultMsg {
+                    subtype: "success".into(),
+                    result: Some("You've hit your session limit".into()),
+                    is_error: true,
+                    total_cost_usd: None,
+                    usage: None,
+                    session_id: "u-1".into(),
+                }),
+            ],
+        );
+        assert!(messages(&evs).is_empty(), "{evs:?}");
+        let failed = evs.iter().find_map(|e| match e {
+            ThreadEvent::TurnFailed { err, .. } => Some(err.message.clone()),
+            _ => None,
+        });
+        assert_eq!(failed.as_deref(), Some("You've hit your session limit"));
     }
 
     #[test]

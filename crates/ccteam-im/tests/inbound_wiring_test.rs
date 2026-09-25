@@ -2918,6 +2918,7 @@ async fn daemon_delivers_gateway_event_attachment_to_channel() {
     // a file-bearing event before the daemon's consumer drains it.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
     tx.send(GatewayEvent {
+        interim: false,
         id: "csf-1".into(),
         channel: "telegram".into(),
         chat_id: "chat-77".into(),

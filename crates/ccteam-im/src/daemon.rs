@@ -2217,6 +2217,7 @@ mod tests {
         let consumer = spawn_gateway_event_consumer(outbox_root.path().to_path_buf(), rx, channels);
 
         let reaction_event = |on: bool| GatewayEvent {
+            interim: false,
             id: format!("gateway-reaction-{on}"),
             channel: "telegram".to_string(),
             chat_id: "chat-7".to_string(),
@@ -2284,6 +2285,7 @@ mod tests {
         let consumer = spawn_gateway_event_consumer(outbox_root.path().to_path_buf(), rx, channels);
 
         let ev = |on: bool| GatewayEvent {
+            interim: false,
             id: format!("r-{on}"),
             channel: "telegram".to_string(),
             chat_id: "chat-7".to_string(),

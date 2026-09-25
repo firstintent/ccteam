@@ -1395,8 +1395,9 @@ fn stranded_boundary_signals(
     // inventing a resolution off them is the mis-attribution this
     // design removes.
     //
-    // Within one execution turn the rows still fold (latest text
-    // wins, earlier ones counted as interim notes): after a
+    // Within one execution turn the rows still fold into ONE answer
+    // (every row, in order — #192/#209; earlier ones also counted as
+    // interim notes): after a
     // restart the child is idle by construction — its process died
     // with the daemon — so the "task finished / child idle" shape
     // is the honest one, and a chatty child cannot flood its
@@ -1421,11 +1422,20 @@ fn stranded_boundary_signals(
     }
     for (exec_turn_id, rows) in groups {
         let last = rows.last().expect("a group holds at least one row");
+        // The turn's answer is every row it wrote, not its last piece (#209)
+        // — unless it failed, when the failure row is what it ended on (the
+        // live boundary reports the same).
+        let (tail, conclusion) = if last.failed() {
+            (last.assistant.clone(), last.conclusion.clone())
+        } else {
+            let parts: Vec<&str> = rows.iter().map(|row| row.assistant.as_str()).collect();
+            crate::delegation::fold_turn_answer(&parts, last.conclusion.as_deref())
+        };
         pending.push(crate::delegation::DelegationSignal {
             child_sid: child_sid.to_string(),
             turn_id: last.turn_id.clone(),
             exec_turn_id: Some(exec_turn_id),
-            tail: last.assistant.clone(),
+            tail,
             vendor,
             host: host.to_string(),
             boundary: true,
@@ -1453,7 +1463,7 @@ fn stranded_boundary_signals(
                 .map(|status| status.turn)
                 .unwrap_or_default(),
             error_kind: last.error_kind.clone(),
-            conclusion: last.conclusion.clone(),
+            conclusion,
         });
     }
     pending
@@ -1890,6 +1900,7 @@ impl DelegationProgressEmitter {
             .strip_prefix("delegation_")
             .unwrap_or(&record.event);
         let event = GatewayEvent {
+            interim: false,
             id: format!(
                 "delegation-{relation}-{}-{}-{}",
                 record.parent_sid,
@@ -2082,6 +2093,13 @@ pub struct GatewayEvent {
     pub content: String,
     /// Per-turn status snapshot carried by answer events.
     pub status: Option<ccteam_harness::TurnStatus>,
+    /// An answer a structured turn delivered on its way, with that turn
+    /// still running (#209). Said positively, never inferred: plenty of
+    /// answers carry no `status` and end their exchange all the same (the
+    /// terminal protocol's replies, slash-command replies, recovered
+    /// answers), and a reader that took "no status" for "still running"
+    /// kept those sessions busy forever.
+    pub interim: bool,
     /// Answer (new message) vs. live progress (edited status message).
     pub kind: GatewayEventKind,
     /// Outbound file attachments (V0.8.4 P2b — `chat_send_file`). Empty
@@ -4058,6 +4076,7 @@ impl Gateway {
     /// delivery). The durable twin is the progress event the caller appends.
     fn emit_session_lifecycle(&self, sid: &str, slug: &str, state: &str, reason: &str) {
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!(
                 "session-{state}-{sid}-{}",
                 chrono::Utc::now().timestamp_millis()
@@ -4480,6 +4499,7 @@ impl Gateway {
                 ),
             );
             g.emit_user_signal(GatewayEvent {
+                interim: false,
                 id: format!("gateway-recovered-{turn_id}"),
                 channel: reply_to.channel.clone(),
                 chat_id: reply_to.chat_id.clone(),
@@ -5820,6 +5840,7 @@ impl Gateway {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("gateway-picker-{}-{nanos}", chat.chat_id),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
@@ -6963,13 +6984,8 @@ impl Gateway {
                 .and_then(|dir| {
                     ccteam_harness::execution::turns_mirror::read_all_turns(dir, &session_id).ok()
                 })
-                .map(|turns| {
-                    turns
-                        .iter()
-                        .filter(|turn| !turn.assistant.is_empty())
-                        .count() as u64
-                })
-                .unwrap_or(0); // assistant-row count → monotonic turn number
+                .map(|turns| last_answer_seq(&session_id, &turns))
+                .unwrap_or(0);
             let mut vendor_turn: u64 = project_dir
                 .as_ref()
                 .and_then(|dir| {
@@ -6999,6 +7015,9 @@ impl Gateway {
             // boundary's final answer — plus every mirrored turn id (batch
             // dedup bookkeeping) and the interim count.
             let mut turn_last_answer: Option<(String, String)> = None;
+            // Every text row the open turn has written, in order — its answer
+            // when it closes (a long turn is written in pieces, #209).
+            let mut turn_said: Vec<String> = Vec::new();
             let mut turn_covered: Vec<String> = Vec::new();
             let mut turn_notes: usize = 0;
             // Assistant messages a turn-bounded protocol produced that are
@@ -7384,6 +7403,7 @@ impl Gateway {
                                 .map(|k| k.clone())
                                 .unwrap_or_else(|_| session.owner.clone());
                             if !tx.send(GatewayEvent {
+                                interim: false,
                                 id: format!("gateway-reaction-clear-{session_id}-{ack_msg_id}"),
                                 channel: ack_target.channel.clone(),
                                 chat_id: ack_target.chat_id.clone(),
@@ -7746,7 +7766,9 @@ impl Gateway {
                         let mut held_last: Option<String> = None;
                         let mut answer_texts = match &evt {
                             ThreadEvent::ItemCompleted { item } => match &item.details {
-                                ThreadItemDetails::AgentMessage(text) if !text.is_empty() => {
+                                // A message of nothing but whitespace says
+                                // nothing: never a blank chat message or row.
+                                ThreadItemDetails::AgentMessage(text) if !text.trim().is_empty() => {
                                     if session.protocol.is_terminal() || !structured_turn_open {
                                         vec![text.clone()]
                                     } else {
@@ -7998,6 +8020,7 @@ impl Gateway {
                             // bubble holding nothing but a status line.
                             if let Some(line) = closing_line {
                                 let receipt = GatewayEvent {
+                                    interim: false,
                                     id: status_id.clone(),
                                     channel: chat_key.channel.clone(),
                                     chat_id: chat_key.chat_id.clone(),
@@ -8022,6 +8045,7 @@ impl Gateway {
                             // receipt; published to every other reader.
                             let owes_closing = released_mid_turn || !turn_had_answer;
                             let frame = GatewayEvent {
+                                interim: false,
                                 id: status_id,
                                 channel: chat_key.channel.clone(),
                                 chat_id: chat_key.chat_id.clone(),
@@ -8067,6 +8091,12 @@ impl Gateway {
                           for (answer_index, text) in answer_texts.into_iter().enumerate() {
                             let is_final_answer = is_turn_boundary
                                 && answer_index.saturating_add(1) == answer_count;
+                            // Only a structured turn that goes on after this
+                            // message makes it interim (#209); every other
+                            // answer ends what its reader is waiting on.
+                            let interim = !is_final_answer
+                                && structured_turn_open
+                                && !session.protocol.is_terminal();
                             // A failure batch leads with what the turn said before
                             // it failed: that row is ordinary narration. Only the
                             // failure row itself closes the turn.
@@ -8110,7 +8140,13 @@ impl Gateway {
                             last_sent = None;
 
                             seq = seq.saturating_add(1);
-                            session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            // The turn watchdog reads a move here as "the turn
+                            // answered" and disarms: a message the turn says on
+                            // its way is not that, or its first line would
+                            // silence the stall warning for the rest of the turn.
+                            if !interim {
+                                session.visible_events.fetch_add(1, Ordering::SeqCst);
+                            }
                             let (status, meta_status) = if is_final_answer {
                                 let live_status = resolved_thread_status(
                                     Arc::clone(&session.adapter),
@@ -8281,6 +8317,7 @@ impl Gateway {
                                             let notes = turn_notes;
                                             turn_notes = 0;
                                             turn_last_answer = None;
+                                            turn_said.clear();
                                             let covered = std::mem::take(&mut turn_covered);
                                             if let Some(dtx) = delegation_tx.as_ref() {
                                                 let _ = dtx.send(crate::delegation::DelegationPulse::Signal(crate::delegation::DelegationSignal {
@@ -8321,6 +8358,7 @@ impl Gateway {
                                                 record.turn_id.clone(),
                                                 text.clone(),
                                             ));
+                                            turn_said.push(text.clone());
                                         }
                                     }
                                     Err(err) => {
@@ -8419,6 +8457,7 @@ impl Gateway {
                                 || channel == "web"
                                 || latest_turn_origin(&session) == TurnOrigin::User;
                             let answer = GatewayEvent {
+                                interim,
                                 id: format!("gateway-event-{session_id}-{seq}"),
                                 channel,
                                 chat_id,
@@ -8458,17 +8497,26 @@ impl Gateway {
                             let completed_origin = take_turn_origin(&session, Some(turn_id));
                             let mirror_answer = mirror_last_answer.take();
                             let finished = turn_last_answer.take();
+                            let said = std::mem::take(&mut turn_said);
                             let covered = std::mem::take(&mut turn_covered);
                             let notes = turn_notes;
                             turn_notes = 0;
-                            if let (Some(dtx), Some((final_turn, final_text))) =
+                            if let (Some(dtx), Some((final_turn, _))) =
                                 (delegation_tx.as_ref(), finished.as_ref())
                             {
+                                // The parent is told the whole turn — every row
+                                // it wrote, in order — not the last piece a long
+                                // turn happened to end on (#209, issue #192).
+                                let parts: Vec<&str> = said.iter().map(String::as_str).collect();
+                                let (tail, conclusion) = crate::delegation::fold_turn_answer(
+                                    &parts,
+                                    turn_conclusion.as_deref(),
+                                );
                                 let _ = dtx.send(crate::delegation::DelegationPulse::Signal(crate::delegation::DelegationSignal {
                                     child_sid: session_id.clone(),
                                     turn_id: final_turn.clone(),
                                     exec_turn_id: Some(turn_id.clone()),
-                                    tail: final_text.clone(),
+                                    tail,
                                     vendor: pump_vendor,
                                     host: pump_host.clone(),
                                     boundary: true,
@@ -8479,7 +8527,7 @@ impl Gateway {
                                     context_pct: turn_last_context_pct.take(),
                                     turn: vendor_turn,
                                     error_kind: None,
-                                    conclusion: turn_conclusion.clone(),
+                                    conclusion,
                                 }));
                             }
                             if let Some((final_text, reply_to)) = mirror_answer {
@@ -9227,6 +9275,7 @@ impl Gateway {
 
     fn emit_scheduled_changed(&self, item: &crate::scheduled::ScheduledItem) {
         let _ = self.events_broadcast.send(GatewayEvent {
+            interim: false,
             id: format!("scheduled-changed-{}-{}", item.sid, item.id),
             channel: "web".to_string(),
             chat_id: "web-api".to_string(),
@@ -9357,6 +9406,7 @@ impl Gateway {
             (&entry.item.reply_channel, &entry.item.reply_chat_id)
         {
             self.emit_user_signal(GatewayEvent {
+                interim: false,
                 id: format!("scheduled-failed-{}", entry.item.id),
                 channel: channel.clone(),
                 chat_id: chat_id.clone(),
@@ -10089,6 +10139,7 @@ impl Gateway {
                 *pending = Some(message_id.to_string());
             }
             self.emit_user_signal(GatewayEvent {
+                interim: false,
                 id: format!("gateway-reaction-add-{session_id}-{message_id}"),
                 channel: chat.channel.clone(),
                 chat_id: chat.chat_id.clone(),
@@ -10413,6 +10464,7 @@ impl Gateway {
         let body = render_choice_text(&prompt);
         if let Some(tx) = self.event_sink.clone() {
             let _ = tx.send(GatewayEvent {
+                interim: false,
                 id: format!("gateway-choice-{session_id}-{}", prompt.token),
                 channel: chat.channel.clone(),
                 chat_id: chat.chat_id.clone(),
@@ -10579,6 +10631,7 @@ impl Gateway {
             "ccteam-im: session never authenticated with its own principal — its ccteam tools are riding another identity (children will mount as roots and its project scope is not its own); neither the credential ccteam handed this session nor `/mcp` process provenance ever reached it (vendor kept a same-named `ccteam` entry AND the peer could not be resolved to this session's process tree — non-linux daemon host, or its MCP client never dialed in)"
         );
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("principal-unused-{sid}"),
             channel: String::new(),
             chat_id: String::new(),
@@ -13327,6 +13380,7 @@ impl Gateway {
             });
         }
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("session-evicted-{sid}"),
             channel: String::new(),
             chat_id: String::new(),
@@ -16143,6 +16197,7 @@ impl Gateway {
                 let body = render_choice_text(&prompt);
                 if let Some(tx) = event_sink {
                     let _ = tx.send(GatewayEvent {
+                        interim: false,
                         id: format!("gateway-choice-{sid}-{}", prompt.token),
                         channel: chat.channel,
                         chat_id: chat.chat_id,
@@ -16449,6 +16504,7 @@ impl Gateway {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("gateway-directive-{sid}-{nanos}-{i}"),
             channel: chat.channel.clone(),
             chat_id: chat.chat_id.clone(),
@@ -17210,6 +17266,7 @@ impl Gateway {
     /// `session_lifecycle` listener refreshes the rail with no client change.
     fn emit_session_renamed(&self, sid: &str, slug: &str) {
         self.emit_user_signal(GatewayEvent {
+            interim: false,
             id: format!("session-renamed-{sid}"),
             channel: String::new(),
             chat_id: String::new(),
@@ -17949,6 +18006,7 @@ fn emit_turn_stall_warning(
          tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
     );
     let _ = tx.send(GatewayEvent {
+        interim: false,
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
         channel,
         chat_id,
@@ -18369,6 +18427,7 @@ fn mirror_internal_web_answer(
         return;
     };
     let _ = tx.send_delivery_only(GatewayEvent {
+        interim: false,
         id: format!("gateway-mirror-{session_id}-{seq}"),
         channel,
         chat_id,
@@ -18405,6 +18464,7 @@ fn emit_progress(
     // `send` returns false only when the mpsc consumer is gone; surface that as
     // emit_progress's "sink closed → pump should stop" signal.
     tx.send(GatewayEvent {
+        interim: false,
         id: format!("gateway-progress-{status_key}"),
         channel,
         chat_id,
@@ -18435,6 +18495,7 @@ fn emit_activity(
     let status_key = format!("{session_id}-{epoch}");
     let content = activity.summary.clone();
     tx.send(GatewayEvent {
+        interim: false,
         id: format!("gateway-activity-{status_key}-{}", activity.item_id),
         channel,
         chat_id,
@@ -18528,6 +18589,23 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     }
 }
 
+/// The highest `<sid>-<N>` row id this pump family has written — where a new
+/// pump resumes numbering. COUNTING rows was a proxy that held only while
+/// every such row had text: a closing row (empty `assistant`, #209) is not
+/// counted, so the next pump re-issued its id — and a turn id already in
+/// `notified_turns` silently swallows the completion that reuses it.
+fn last_answer_seq(
+    session_id: &str,
+    turns: &[ccteam_harness::execution::turns_mirror::TurnRecord],
+) -> u64 {
+    let prefix = format!("{session_id}-");
+    turns
+        .iter()
+        .filter_map(|turn| turn.turn_id.strip_prefix(&prefix)?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
 /// What woke the event pump's stream branch: the vendor, or the deadline of
 /// text it is holding (#209).
 enum PumpWake {
@@ -18573,6 +18651,10 @@ fn hold_due_marker() -> ThreadEvent {
 /// which is what its boundary names as the conclusion when the vendor names
 /// none (issue #196).
 fn fold_held(held: Vec<String>) -> (Option<String>, Option<String>) {
+    let held: Vec<String> = held
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect();
     match held.len() {
         0 => (None, None),
         1 => (held.into_iter().next(), None),
@@ -18581,7 +18663,6 @@ fn fold_held(held: Vec<String>) -> (Option<String>, Option<String>) {
             let text = held
                 .iter()
                 .map(|part| part.trim())
-                .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n\n");
             (Some(text), last)
@@ -21493,6 +21574,7 @@ mod tests {
 
     fn fake_event(sid: Option<&str>) -> GatewayEvent {
         GatewayEvent {
+            interim: false,
             id: "e1".into(),
             channel: "web".into(),
             chat_id: "web-api".into(),
@@ -26347,6 +26429,10 @@ mod tests {
         assert_eq!(web[0].chat_id, "web-api");
         assert_eq!(web[0].content, "background checkpoint");
         assert_eq!(web[1].content, "background final");
+        assert!(
+            web.iter().all(|event| !event.interim),
+            "no structured turn is open, so nothing says the turn goes on: {web:?}"
+        );
         let mirror = answers
             .iter()
             .find(|event| event.channel == "telegram")
@@ -27729,6 +27815,103 @@ mod tests {
         assert!(answer.status.is_none(), "a mid-turn row carries no status");
     }
 
+    /// #209 — a new pump numbers rows after the highest one on disk. Counting
+    /// text rows re-issued a closing row's id after every resume, and a turn id
+    /// already in `notified_turns` silently swallowed the completion reusing it.
+    #[test]
+    fn a_new_pump_numbers_past_every_row_it_wrote() {
+        let row = |id: &str, text: &str| ccteam_harness::execution::turns_mirror::TurnRecord {
+            exec_turn_id: None,
+            continues_exec_turn: None,
+            turn_id: id.into(),
+            ts: chrono::Utc::now(),
+            vendor: "claude".into(),
+            role: String::new(),
+            user: String::new(),
+            assistant: text.into(),
+            usage: serde_json::Value::Null,
+            status: None,
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+            outcome: None,
+            error_kind: None,
+            error: None,
+            conclusion: None,
+        };
+        let rows = vec![
+            row("s7-1", "released mid-turn"),
+            row("s7-2", "released mid-turn"),
+            row("s7-3", ""),
+            row("input-18d8", ""),
+            row("s7-recovered-1790000000000", "recovered"),
+            row("interrupted:sj-1", "cut"),
+            row("s70-9", "another session's prefix"),
+        ];
+        assert_eq!(last_answer_seq("s7", &rows), 3);
+        assert_eq!(last_answer_seq("s7", &[]), 0);
+    }
+
+    /// #209 — the parent hears the WHOLE turn: a long turn reaches the ledger
+    /// in pieces, and telling the parent only the last piece dropped the reply
+    /// its child gave to a mid-turn steer (issue #192).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_written_in_pieces_reports_every_piece_to_its_parent() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel();
+        gateway.set_delegation_notifier_tx(dtx);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let identity = "alpha-reviewer-s1".to_string();
+        {
+            let mut queued = fake.events.lock().await;
+            for event in [
+                ThreadEvent::TurnStarted {
+                    turn_id: "t-pieces".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
+                },
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "replied to the steer",
+                ),
+                agent_msg(|item| ThreadEvent::ItemCompleted { item }, "all green"),
+                ThreadEvent::TurnCompleted {
+                    turn_id: "t-pieces".into(),
+                    usage: Default::default(),
+                    model: None,
+                    conclusion: None,
+                    continuation: ccteam_harness::TurnContinuation::Settled,
+                },
+            ] {
+                queued.push_back((identity.clone(), event));
+            }
+        }
+        fake.wake(&identity);
+
+        let signal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(crate::delegation::DelegationPulse::Signal(signal)) = drx.recv().await {
+                    if signal.boundary {
+                        return signal;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the boundary signals the parent");
+        assert_eq!(signal.tail, "replied to the steer\n\nall green");
+        assert_eq!(signal.conclusion.as_deref(), Some("all green"));
+        // The watchdog was never told the turn answered by its interim lines.
+        let visible = gateway.sessions["s1"].visible_events.load(Ordering::SeqCst);
+        assert_eq!(visible, 0, "interim lines never disarm the stall watchdog");
+    }
+
     /// #209 — the hold is bounded by a CLOCK, not by the vendor's next event.
     /// A session that says "running the suite now" and then sits in a silent
     /// twenty-minute tool produces no event at all; waiting for one to notice
@@ -27761,6 +27944,7 @@ mod tests {
             answer.status.is_none(),
             "the turn is still running: {answer:?}"
         );
+        assert!(answer.interim, "and it says so: {answer:?}");
         assert!(
             asked.elapsed() >= heartbeat,
             "it was held for one heartbeat first, to fold what follows"
@@ -27907,12 +28091,13 @@ mod tests {
 
         let said = recv_answer(&mut events).await;
         assert_eq!(said.content, "checking the logs", "{said:?}");
-        assert!(said.status.is_none(), "{said:?}");
+        assert!(said.status.is_none() && said.interim, "{said:?}");
         let failed = recv_answer(&mut events).await;
         assert!(
             failed.content.contains("the provider fell over"),
             "{failed:?}"
         );
+        assert!(!failed.interim, "{failed:?}");
         assert!(
             failed.status.is_some(),
             "the failure is the boundary: {failed:?}"
@@ -28004,6 +28189,10 @@ mod tests {
             "no status-line bubble on the web: {closing:?}"
         );
         assert_eq!(closing.status.as_ref().map(|status| status.turn), Some(1));
+        assert!(
+            answer.interim && !closing.interim,
+            "{answer:?} / {closing:?}"
+        );
 
         // …and the ledger says the turn ended: a status-bearing closing row.
         let rows =
