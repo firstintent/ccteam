@@ -12048,13 +12048,18 @@ mod session_tool_tests {
         );
         assert_eq!(r["status"], json!("completed"), "narrated: {r}");
         let result = r["result_text"].as_str().unwrap();
+        // #209 — a short turn's messages reach the boundary folded into ONE
+        // answer (every line, in order), so the wait returns the whole turn —
+        // ending on its final message, never cut off at the interim note.
         assert!(
-            result.contains("echo: do the wave"),
-            "wait returns the FINAL answer, not the interim note: {result}"
+            result.trim_end().ends_with("echo: do the wave"),
+            "wait returns the turn's answer through its FINAL message: {result}"
         );
         assert!(
-            !result.contains("interim narration checkpoint"),
-            "the interim note must not be mistaken for the result: {result}"
+            result
+                .find("interim narration checkpoint")
+                .is_none_or(|at| at < result.find("echo: do the wave").unwrap()),
+            "the interim note is folded ahead of the result, never mistaken for it: {result}"
         );
 
         // Async leg (notify path) on a FRESH narrating child: exactly ONE

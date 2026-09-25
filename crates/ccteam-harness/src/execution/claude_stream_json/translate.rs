@@ -6,16 +6,20 @@
 //!
 //! ## The contract this honors (gateway `async_event_text`)
 //!
-//! - The turn's **answer** is emitted exactly once as
+//! - Every top-level assistant **text block** is emitted as its own
 //!   [`ThreadEvent::ItemCompleted`] carrying
-//!   [`ThreadItemDetails::AgentMessage`] — the only event the pump
-//!   forwards to IM as a reply. The answer is EVERY top-level assistant
-//!   text block of the turn, in order — not just the last one. Claude's
-//!   `result.result` carries only the final text block, so a reply the
-//!   model wrote before its next tool call (typically an answer to a
-//!   human who spoke mid-turn) would otherwise vanish from turns.jsonl,
-//!   the IM reply and the delegation notification (issue #192).
-//!   Subagent blocks (`parent_tool_use_id` set) are never the answer.
+//!   [`ThreadItemDetails::AgentMessage`] the moment it arrives — the only
+//!   event the pump delivers to a chat. The wire hands over each block
+//!   COMPLETE (one content block per `assistant` line, several lines per
+//!   message id; probed on claude 2.1.280), so a block is final when it is
+//!   read. WHEN it reaches the chat is the gateway's decision, not this
+//!   translator's: holding every block until `result` is what left a
+//!   ten-minute turn silent in the chat while `/status` could already quote
+//!   it (#209) — the gateway's mid-turn release had nothing to release. The
+//!   turn's answer is still EVERY block, in order (issue #192): the gateway
+//!   folds what it holds into one delivery. `result.result` is emitted as
+//!   one more message only when the stream never showed it. Subagent blocks
+//!   (`parent_tool_use_id` set) are never the answer.
 //! - The turn's **conclusion** — the text after the last tool call, which
 //!   is what `result.result` carries — rides [`ThreadEvent::TurnCompleted`]
 //!   separately, so a bounded excerpt of the answer (the completion
@@ -172,8 +176,9 @@ pub struct StreamTranslator {
     /// correlatable without holding the lock.
     active_turn: Option<String>,
     /// Every top-level assistant text block of the active turn, in stream
-    /// order — this IS the turn's answer (`result.result` only repeats the
-    /// last block; see the module doc / issue #192).
+    /// order — already emitted block by block, kept to recognise a
+    /// `result.result` the stream never showed and to decide whether the
+    /// conclusion differs from the whole answer (issue #192/#196).
     acc_text: String,
     /// The last top-level text block of the active turn — the conclusion's
     /// fallback when `result.result` is empty (see the module doc).
@@ -378,7 +383,14 @@ impl StreamTranslator {
         // Task tool's private thread, never to this session's reply.
         if !text.is_empty() && env.parent_tool_use_id.is_none() {
             push_paragraph(&mut self.acc_text, &text);
-            self.last_text = Some(text);
+            self.last_text = Some(text.clone());
+            let id = self.next_item_id();
+            out.push(ThreadEvent::ItemCompleted {
+                item: ThreadItem {
+                    id,
+                    details: ThreadItemDetails::AgentMessage(text),
+                },
+            });
         }
         for ev in items {
             // Re-id with the translator's counter so item ids are stable
@@ -454,19 +466,24 @@ impl StreamTranslator {
             return out;
         }
 
-        // Success: the answer = every top-level text block seen this turn
-        // (issue #192 — `result.result` is only the LAST block, so a reply
-        // written before a further tool call would be dropped). `result`
-        // is still honoured as the source of truth for text the stream
-        // never showed us (empty stream, or a tail the blocks lack). Emit
-        // the answer FIRST (so the pump finalizes the turn's progress epoch
-        // before the boundary event), then TurnCompleted with usage.
+        // Success: every top-level text block already went out as it
+        // arrived. `result` is still honoured as the source of truth for
+        // text the stream never showed us (empty stream, or a tail the
+        // blocks lack) — that one is emitted here, BEFORE the boundary, so
+        // the pump finalizes it as the turn's last message.
         let mut final_text = std::mem::take(&mut self.acc_text);
         let last_text = self.last_text.take();
         let result_text = r.result.as_deref().filter(|s| !s.is_empty());
         if let Some(tail) = result_text {
             if !final_text.trim_end().ends_with(tail.trim_end()) {
                 push_paragraph(&mut final_text, tail);
+                let id = self.next_item_id();
+                out.push(ThreadEvent::ItemCompleted {
+                    item: ThreadItem {
+                        id,
+                        details: ThreadItemDetails::AgentMessage(tail.to_string()),
+                    },
+                });
             }
         }
         // The conclusion = the vendor's `result.result` (measured: the LAST
@@ -476,15 +493,6 @@ impl StreamTranslator {
             .map(str::to_string)
             .or(last_text)
             .filter(|conclusion| conclusion.trim() != final_text.trim());
-        if !final_text.is_empty() {
-            let id = self.next_item_id();
-            out.push(ThreadEvent::ItemCompleted {
-                item: ThreadItem {
-                    id,
-                    details: ThreadItemDetails::AgentMessage(final_text),
-                },
-            });
-        }
         out.push(ThreadEvent::TurnCompleted {
             turn_id,
             usage,
@@ -591,13 +599,25 @@ mod tests {
     }
 
     fn answer_text(evs: &[ThreadEvent]) -> Option<String> {
-        evs.iter().find_map(|e| match e {
-            ThreadEvent::ItemCompleted { item } => match &item.details {
-                ThreadItemDetails::AgentMessage(t) => Some(t.clone()),
+        messages(evs).into_iter().next()
+    }
+
+    /// Every `AgentMessage` these events carry, in order.
+    fn messages(evs: &[ThreadEvent]) -> Vec<String> {
+        evs.iter()
+            .filter_map(|e| match e {
+                ThreadEvent::ItemCompleted { item } => match &item.details {
+                    ThreadItemDetails::AgentMessage(t) => Some(t.clone()),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
-        })
+            })
+            .collect()
+    }
+
+    /// Ingest `lines` in order, returning every event they produced.
+    fn run(t: &mut StreamTranslator, lines: Vec<Outbound>) -> Vec<ThreadEvent> {
+        lines.into_iter().flat_map(|line| t.ingest(line)).collect()
     }
 
     /// A `system:background_tasks_changed` snapshot carrying `ids`.
@@ -724,32 +744,66 @@ mod tests {
             {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}, "id": "tu-1"},
             {"type": "text", "text": "running ls"}
         ])));
-        // The tool_use surfaces as ItemStarted{ToolCall}; the text is
-        // accumulated (not yet an answer until result).
+        // The tool_use surfaces as ItemStarted{ToolCall}; only the text is a
+        // message — and it is one NOW, not at `result` (#209).
         assert!(evs.iter().any(|e| matches!(
             e,
             ThreadEvent::ItemStarted { item }
                 if matches!(&item.details, ThreadItemDetails::ToolCall { name, .. } if name == "Bash")
         )));
-        assert!(answer_text(&evs).is_none());
+        assert_eq!(messages(&evs), vec!["running ls".to_string()]);
+    }
+
+    #[test]
+    fn a_text_block_is_a_message_the_moment_it_arrives() {
+        // #209 — the gateway can only release what it has been given. A block
+        // held back until `result` made every mid-turn release a no-op: a
+        // ten-minute turn reached the chat as one message at its very end.
+        let mut t = StreamTranslator::new();
+        let first = t.ingest(assistant(
+            json!([{"type": "text", "text": "checking the two children"}]),
+        ));
+        assert_eq!(
+            messages(&first),
+            vec!["checking the two children".to_string()]
+        );
+        let tool = t.ingest(assistant(json!([
+            {"type": "tool_use", "name": "Bash", "input": {"command": "make test"}, "id": "tu-1"}
+        ])));
+        assert!(messages(&tool).is_empty(), "a tool call says nothing");
+        let second = t.ingest(assistant(
+            json!([{"type": "text", "text": "tests are green"}]),
+        ));
+        assert_eq!(messages(&second), vec!["tests are green".to_string()]);
+        let boundary = t.ingest(result_ok("tests are green"));
+        assert!(
+            messages(&boundary).is_empty(),
+            "a result the stream already showed is not repeated: {boundary:?}"
+        );
+        assert!(boundary
+            .iter()
+            .any(|e| matches!(e, ThreadEvent::TurnCompleted { .. })));
     }
 
     #[test]
     fn result_falls_back_to_accumulated_text() {
         let mut t = StreamTranslator::new();
-        t.ingest(assistant(
-            json!([{"type": "text", "text": "accumulated answer"}]),
-        ));
-        // result with empty `result` → fall back to accumulated.
-        let evs = t.ingest(Outbound::TurnResult(ResultMsg {
-            subtype: "success".into(),
-            result: None,
-            is_error: false,
-            total_cost_usd: None,
-            usage: None,
-            session_id: "u-1".into(),
-        }));
-        assert_eq!(answer_text(&evs).as_deref(), Some("accumulated answer"));
+        // result with empty `result` → the streamed block is the answer.
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!([{"type": "text", "text": "accumulated answer"}])),
+                Outbound::TurnResult(ResultMsg {
+                    subtype: "success".into(),
+                    result: None,
+                    is_error: false,
+                    total_cost_usd: None,
+                    usage: None,
+                    session_id: "u-1".into(),
+                }),
+            ],
+        );
+        assert_eq!(messages(&evs), vec!["accumulated answer".to_string()]);
     }
 
     #[test]
@@ -758,17 +812,20 @@ mod tests {
         // event per content block; `result.result` = the LAST text block
         // only. A reply written before a further tool call must survive.
         let mut t = StreamTranslator::new();
-        t.ingest(assistant(
-            json!([{"type": "text", "text": "ALPHA report here."}]),
-        ));
-        t.ingest(assistant(json!([
-            {"type": "tool_use", "name": "Bash", "input": {"command": "echo hi"}, "id": "tu-1"}
-        ])));
-        t.ingest(assistant(json!([{"type": "text", "text": "BETA done."}])));
-        let evs = t.ingest(result_ok("BETA done."));
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!([{"type": "text", "text": "ALPHA report here."}])),
+                assistant(json!([
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "echo hi"}, "id": "tu-1"}
+                ])),
+                assistant(json!([{"type": "text", "text": "BETA done."}])),
+                result_ok("BETA done."),
+            ],
+        );
         assert_eq!(
-            answer_text(&evs).as_deref(),
-            Some("ALPHA report here.\n\nBETA done.")
+            messages(&evs),
+            vec!["ALPHA report here.".to_string(), "BETA done.".to_string()]
         );
         // issue #196 — the boundary names the block after the last tool call
         // as the turn's conclusion, so an excerpt can prefer it.
@@ -778,15 +835,20 @@ mod tests {
     #[test]
     fn conclusion_falls_back_to_the_last_stream_block_without_result_text() {
         let mut t = StreamTranslator::new();
-        t.ingest(assistant(json!([{"type": "text", "text": "narration"}])));
-        t.ingest(assistant(json!([
-            {"type": "tool_use", "name": "Bash", "input": {"command": "true"}, "id": "tu-1"}
-        ])));
-        t.ingest(assistant(json!([{"type": "text", "text": "the receipt"}])));
-        let evs = t.ingest(result_ok(""));
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!([{"type": "text", "text": "narration"}])),
+                assistant(json!([
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "true"}, "id": "tu-1"}
+                ])),
+                assistant(json!([{"type": "text", "text": "the receipt"}])),
+                result_ok(""),
+            ],
+        );
         assert_eq!(
-            answer_text(&evs).as_deref(),
-            Some("narration\n\nthe receipt")
+            messages(&evs),
+            vec!["narration".to_string(), "the receipt".to_string()]
         );
         assert_eq!(conclusion_of(&evs).as_deref(), Some("the receipt"));
     }
@@ -796,9 +858,14 @@ mod tests {
         // The answer IS the conclusion: carrying it twice would only cost the
         // ledger a copy and the excerpt nothing.
         let mut t = StreamTranslator::new();
-        t.ingest(assistant(json!([{"type": "text", "text": "hi there"}])));
-        let evs = t.ingest(result_ok("hi there"));
-        assert_eq!(answer_text(&evs).as_deref(), Some("hi there"));
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!([{"type": "text", "text": "hi there"}])),
+                result_ok("hi there"),
+            ],
+        );
+        assert_eq!(messages(&evs), vec!["hi there".to_string()]);
         assert_eq!(conclusion_of(&evs), None);
     }
 
@@ -807,11 +874,19 @@ mod tests {
         // `result.result` stays authoritative for anything the blocks never
         // carried (never dropped, never duplicated).
         let mut t = StreamTranslator::new();
-        t.ingest(assistant(json!([{"type": "text", "text": "narration"}])));
-        let evs = t.ingest(result_ok("final from result only"));
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!([{"type": "text", "text": "narration"}])),
+                result_ok("final from result only"),
+            ],
+        );
         assert_eq!(
-            answer_text(&evs).as_deref(),
-            Some("narration\n\nfinal from result only")
+            messages(&evs),
+            vec![
+                "narration".to_string(),
+                "final from result only".to_string()
+            ]
         );
         assert_eq!(
             conclusion_of(&evs).as_deref(),
@@ -828,9 +903,14 @@ mod tests {
             session_id: "u-1".into(),
             parent_tool_use_id: Some("tu-9".into()),
         }));
-        t.ingest(assistant(json!([{"type": "text", "text": "top-level"}])));
-        let evs = t.ingest(result_ok("top-level"));
-        assert_eq!(answer_text(&evs).as_deref(), Some("top-level"));
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!([{"type": "text", "text": "top-level"}])),
+                result_ok("top-level"),
+            ],
+        );
+        assert_eq!(messages(&evs), vec!["top-level".to_string()]);
         assert_eq!(
             conclusion_of(&evs),
             None,
@@ -875,16 +955,21 @@ mod tests {
     #[test]
     fn string_form_content_collapses_to_text() {
         let mut t = StreamTranslator::new();
-        t.ingest(assistant(json!("just a string")));
-        let evs = t.ingest(Outbound::TurnResult(ResultMsg {
-            subtype: "success".into(),
-            result: None,
-            is_error: false,
-            total_cost_usd: None,
-            usage: None,
-            session_id: "u-1".into(),
-        }));
-        assert_eq!(answer_text(&evs).as_deref(), Some("just a string"));
+        let evs = run(
+            &mut t,
+            vec![
+                assistant(json!("just a string")),
+                Outbound::TurnResult(ResultMsg {
+                    subtype: "success".into(),
+                    result: None,
+                    is_error: false,
+                    total_cost_usd: None,
+                    usage: None,
+                    session_id: "u-1".into(),
+                }),
+            ],
+        );
+        assert_eq!(messages(&evs), vec!["just a string".to_string()]);
     }
 
     #[test]

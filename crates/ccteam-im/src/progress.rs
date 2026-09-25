@@ -217,6 +217,9 @@ pub struct ProgressFold {
     /// reply) — shown as a head state, never sent as its own answer.
     drafting: bool,
     done: bool,
+    /// Finalized by a message the turn said on its way, not by the turn's end
+    /// (see [`Self::seal`]).
+    sealed: bool,
     tool_total: usize,
     file_total: usize,
 }
@@ -241,6 +244,15 @@ impl ProgressFold {
     /// Mark the epoch finished (renders the `✅ done · …` summary).
     pub fn mark_done(&mut self) {
         self.done = true;
+    }
+
+    /// Finalize the epoch because the turn said something mid-way: the card
+    /// is final (no further edits) but the turn is still running, so it must
+    /// not read `done` — `↳ N tools · M files`, the work that led to the
+    /// message below it (#209).
+    pub fn seal(&mut self) {
+        self.done = true;
+        self.sealed = true;
     }
 
     fn bump(&mut self, cat: Category, raw_name: &str) {
@@ -376,6 +388,9 @@ impl ProgressFold {
 
     /// Render the current status text (≤ [`MAX_LINES`] lines).
     pub fn render(&self) -> String {
+        if self.sealed {
+            return format!("↳ {} tools · {} files", self.tool_total, self.file_total);
+        }
         if self.done {
             return format!(
                 "✅ done · {} tools · {} files",
@@ -517,6 +532,15 @@ mod tests {
         let r = f.render();
         assert!(r.contains("🔧 bash ×1"), "got: {r}");
         assert!(r.contains("✏️ edit ×1"), "got: {r}");
+    }
+
+    #[test]
+    fn a_sealed_segment_never_reads_done() {
+        let mut f = ProgressFold::new();
+        f.apply(&started_tool("t1", "Bash", json!({"command": "ls"})));
+        f.seal();
+        assert!(f.done(), "a sealed card is final: nothing edits it again");
+        assert_eq!(f.render(), "↳ 1 tools · 0 files");
     }
 
     #[test]

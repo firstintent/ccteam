@@ -417,11 +417,32 @@ async fn settled_terminal_routing_usage_context_and_directives() {
             (event, kind) => panic!("{message}: unexpected {event:?} / {kind:?}"),
         }
         if message == "tool-preamble" {
-            assert!(!events.iter().any(|event| matches!(
-                event,
-                ThreadEvent::ItemCompleted { item }
-                    if matches!(item.details, ThreadItemDetails::AgentMessage(_))
-            )));
+            // What the agent said before handing over to a tool is part of
+            // what it said (#209): reported once, ahead of the boundary —
+            // never dropped because a later message would overwrite it.
+            let said: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(at, event)| match event {
+                    ThreadEvent::ItemCompleted { item } => match &item.details {
+                        ThreadItemDetails::AgentMessage(text) => Some((at, text.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            let boundary = events
+                .iter()
+                .position(|event| matches!(event, ThreadEvent::TurnCompleted { .. }))
+                .expect("tool-preamble completes");
+            assert_eq!(
+                said.iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["I will run a tool"],
+                "{events:?}"
+            );
+            assert!(said[0].0 < boundary, "{events:?}");
         }
     }
 

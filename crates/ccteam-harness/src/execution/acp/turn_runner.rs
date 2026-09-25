@@ -354,6 +354,7 @@ impl AcpTurnRunner {
                                 Arc::clone(&done),
                                 Some(Arc::clone(&sent)),
                             );
+                            st.quiet_current_turn();
                             NextTurn::Probe { probe, done, sent }
                         } else {
                             NextTurn::Stop

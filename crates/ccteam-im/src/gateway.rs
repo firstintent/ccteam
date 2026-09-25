@@ -7125,9 +7125,27 @@ impl Gateway {
                     }
                 };
 
+                // Held-text release timer, armed only while a structured turn
+                // holds something it has said. The hold may delay a message by
+                // one heartbeat, never longer: waiting for the NEXT vendor event
+                // to notice the deadline left a line said just before a silent
+                // twenty-minute tool call unsent until the tool returned (#209).
+                let hold_deadline = held_since
+                    .filter(|_| structured_turn_open && !pending_answers.is_empty())
+                    .map(|held| held + heartbeat_interval);
+
                 tokio::select! {
                     biased;
-                    maybe = events.next(), if streaming => {
+                    wake = next_pump_wake(&mut events, hold_deadline), if streaming => {
+                        // A due hold enters the SAME delivery path a vendor
+                        // event does, as an inert marker that skips everything
+                        // a vendor event means (liveness, heartbeat rows,
+                        // accounting): the clock ran out, the vendor did
+                        // nothing.
+                        let (maybe, vendor_event) = match wake {
+                            PumpWake::Vendor(maybe) => (maybe, true),
+                            PumpWake::HoldDue => (Some(hold_due_marker()), false),
+                        };
                         let Some(evt) = maybe else {
                             streaming = false;
                             if reporting {
@@ -7212,6 +7230,7 @@ impl Gateway {
                             }
                             continue;
                         };
+                        if vendor_event {
                         // First event on a rebuilt attachment — but only a
                         // non-`Error` one proves it. A failed re-dial surfaces as
                         // a single `Error` followed by the stream ending again,
@@ -7720,6 +7739,11 @@ impl Gateway {
                                 }
                             }
                         }
+                        }
+                        // What the turn's boundary may name as its conclusion
+                        // when the vendor names none: the last message of a
+                        // folded batch (see `fold_held`).
+                        let mut held_last: Option<String> = None;
                         let mut answer_texts = match &evt {
                             ThreadEvent::ItemCompleted { item } => match &item.details {
                                 ThreadItemDetails::AgentMessage(text) if !text.is_empty() => {
@@ -7736,11 +7760,19 @@ impl Gateway {
                                 _ => Vec::new(),
                             },
                             ThreadEvent::TurnCompleted { .. } => {
-                                std::mem::take(&mut pending_answers)
+                                let (text, last) = fold_held(std::mem::take(&mut pending_answers));
+                                held_last = last;
+                                text.into_iter().collect()
                             }
+                            // What the turn said before it failed is still
+                            // what it said — output that was produced and paid
+                            // for. It goes out as an ordinary message AHEAD of
+                            // the failure instead of being discarded with it.
                             ThreadEvent::TurnFailed { err, .. } | ThreadEvent::Error(err) => {
-                                pending_answers.clear();
-                                vec![err.message.clone()]
+                                let (text, _) = fold_held(std::mem::take(&mut pending_answers));
+                                text.into_iter()
+                                    .chain(std::iter::once(err.message.clone()))
+                                    .collect()
                             }
                             _ => Vec::new(),
                         };
@@ -7757,19 +7789,25 @@ impl Gateway {
                         //     so its text is a reply to a human, not narration;
                         //   - or the hold has outlived one liveness heartbeat,
                         //     the same window that says a working turn may not
-                        //     go silent to the outside longer than that.
+                        //     go silent to the outside longer than that —
+                        //     noticed by the next vendor event or, when the
+                        //     vendor is silent, by the hold timer itself.
+                        // What is released goes out FOLDED into one message:
+                        // a working session narrates in short lines, and a
+                        // chat that gets one message per heartbeat can follow
+                        // it without being buzzed once per line.
                         // Cost of releasing: this turn's rows carry no status
                         // (`is_final_answer` needs the boundary), so the
-                        // boundary pays it back as a closing status line. The
-                        // total number of chat messages is unchanged — the
-                        // hold only ever delayed them.
+                        // boundary pays it back as a closing status line.
                         if answer_texts.is_empty()
                             && !pending_answers.is_empty()
-                            && (session.steered_this_turn.load(Ordering::SeqCst)
+                            && (!vendor_event
+                                || session.steered_this_turn.load(Ordering::SeqCst)
                                 || held_since
                                     .is_some_and(|held| held.elapsed() >= heartbeat_interval))
                         {
-                            answer_texts = std::mem::take(&mut pending_answers);
+                            let (text, _) = fold_held(std::mem::take(&mut pending_answers));
+                            answer_texts = text.into_iter().collect();
                             released_mid_turn = true;
                         }
                         if pending_answers.is_empty() {
@@ -7819,6 +7857,23 @@ impl Gateway {
                             turn_had_answer = true;
                         }
                         if is_turn_boundary && answer_texts.is_empty() {
+                            // The boundary closes the turn's last progress card
+                            // even when no answer rides it — otherwise the card
+                            // stays open, and the NEXT turn's steps edit it.
+                            if progress_on && fold.has_activity() && !fold.done() {
+                                fold.mark_done();
+                                if !flush_progress(
+                                    &tx, &session, &session_id, epoch, &fold,
+                                    &mut last_sent, &mut last_emit, &mut dirty,
+                                ) {
+                                    break;
+                                }
+                                epoch = epoch.saturating_add(1);
+                            }
+                            fold = crate::progress::ProgressFold::new();
+                            dirty = false;
+                            last_emit = None;
+                            last_sent = None;
                             let live_status = resolved_thread_status(
                                 Arc::clone(&session.adapter),
                                 session.thread.clone(),
@@ -7889,25 +7944,103 @@ impl Gateway {
                                         &status,
                                     )
                                 });
-                            let owes_closing = released_mid_turn || !turn_had_answer;
-                            let web_status_frame = chat_key.channel == "web" && owes_closing;
-                            if web_status_frame || closing_line.is_some() {
-                                let status_only = GatewayEvent {
-                                    id: format!("gateway-event-{session_id}-status-{vendor_turn}"),
-                                    channel: chat_key.channel,
-                                    chat_id: chat_key.chat_id,
+                            // The durable half of the same receipt: every row this
+                            // turn wrote went out mid-turn without a status, so
+                            // without a closing row nothing on disk says the turn
+                            // ended — a reload showed no footer, and the completed
+                            // turn count (status-bearing rows) came up short.
+                            // Empty `assistant`: it says nothing new, and every
+                            // reader of answers already skips such a row.
+                            if released_mid_turn {
+                                if let Some(dir) = project_dir.as_ref() {
+                                    seq = seq.saturating_add(1);
+                                    let record = ccteam_harness::execution::turns_mirror::TurnRecord {
+                                        exec_turn_id: thread_event_turn_id(&evt)
+                                            .map(str::to_string)
+                                            .or_else(|| open_exec_turn.clone()),
+                                        continues_exec_turn: open_continues_from.clone(),
+                                        turn_id: format!("{session_id}-{seq}"),
+                                        ts: chrono::Utc::now(),
+                                        vendor: vendor_str(session.vendor).to_string(),
+                                        role: session.role.clone(),
+                                        user: String::new(),
+                                        assistant: String::new(),
+                                        usage: turn_terminal_accounting(&evt)
+                                            .map(|(_, usage, _)| ccteam_harness::execution::turn_status::usage_value(usage))
+                                            .unwrap_or(serde_json::Value::Null),
+                                        status: Some(status.clone()),
+                                        tool_calls: Vec::new(),
+                                        attachments: Vec::new(),
+                                        outcome: None,
+                                        error_kind: None,
+                                        error: None,
+                                        conclusion: match &evt {
+                                            ThreadEvent::TurnCompleted { conclusion, .. } => conclusion.clone(),
+                                            _ => None,
+                                        },
+                                    };
+                                    if let Err(err) = ccteam_harness::execution::turns_mirror::append_turn(
+                                        dir,
+                                        &session_id,
+                                        &record,
+                                    ) {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            error = %err,
+                                            "ccteam-im: failed to mirror a turn's closing row to turns.jsonl"
+                                        );
+                                    }
+                                }
+                            }
+                            let status_id = format!("gateway-event-{session_id}-status-{vendor_turn}");
+                            // The IM status line is text for a phone, and ONLY
+                            // for the phone: on the web stream it rendered as a
+                            // bubble holding nothing but a status line.
+                            if let Some(line) = closing_line {
+                                let receipt = GatewayEvent {
+                                    id: status_id.clone(),
+                                    channel: chat_key.channel.clone(),
+                                    chat_id: chat_key.chat_id.clone(),
                                     thread_ts: None,
-                                    content: closing_line.unwrap_or_default(),
+                                    content: line,
                                     kind: GatewayEventKind::Answer,
                                     attachments: Vec::new(),
                                     options: Vec::new(),
-                                    status: Some(status),
+                                    status: Some(status.clone()),
                                     sid: Some(session_id.clone()),
                                     slug: Some(session.project.clone()),
                                 };
-                                if !tx.send(status_only) {
+                                if !tx.send_delivery_only(receipt) {
                                     break;
                                 }
+                            }
+                            // Every boundary publishes exactly ONE status-bearing
+                            // Answer: here, a content-less frame — the one signal
+                            // a reader has that the turn is over, since an Answer
+                            // without a status is a message the turn said on its
+                            // way (#209). Delivered to a web chat that is owed a
+                            // receipt; published to every other reader.
+                            let owes_closing = released_mid_turn || !turn_had_answer;
+                            let frame = GatewayEvent {
+                                id: status_id,
+                                channel: chat_key.channel.clone(),
+                                chat_id: chat_key.chat_id.clone(),
+                                thread_ts: None,
+                                content: String::new(),
+                                kind: GatewayEventKind::Answer,
+                                attachments: Vec::new(),
+                                options: Vec::new(),
+                                status: Some(status),
+                                sid: Some(session_id.clone()),
+                                slug: Some(session.project.clone()),
+                            };
+                            let published = if chat_key.channel == "web" && owes_closing {
+                                tx.send(frame)
+                            } else {
+                                tx.send_broadcast_only(frame)
+                            };
+                            if !published {
+                                break;
                             }
                         }
                         if !answer_texts.is_empty()
@@ -7916,24 +8049,47 @@ impl Gateway {
                           let answer_count = answer_texts.len();
                           // The turn's conclusion rides its boundary event and belongs
                           // to the FINAL answer row of the turn only (issue #196).
+                          // The vendor's own marker first; else the last message of
+                          // the batch this boundary folded — the text after the
+                          // last tool call, which is what a bounded excerpt should
+                          // lead with (issue #196). Never a copy of the row itself.
                           let turn_conclusion = match &evt {
-                              ThreadEvent::TurnCompleted { conclusion, .. } => conclusion.clone(),
+                              ThreadEvent::TurnCompleted { conclusion, .. } => {
+                                  conclusion.clone().or_else(|| held_last.clone())
+                              }
                               _ => None,
-                          };
+                          }
+                          .filter(|conclusion| {
+                              answer_texts
+                                  .last()
+                                  .is_none_or(|text| conclusion.trim() != text.trim())
+                          });
                           for (answer_index, text) in answer_texts.into_iter().enumerate() {
                             let is_final_answer = is_turn_boundary
                                 && answer_index.saturating_add(1) == answer_count;
+                            // A failure batch leads with what the turn said before
+                            // it failed: that row is ordinary narration. Only the
+                            // failure row itself closes the turn.
                             let boundary_origin = match &evt {
-                                ThreadEvent::TurnFailed { turn_id, .. } => {
+                                ThreadEvent::TurnFailed { turn_id, .. } if is_final_answer => {
                                     Some(take_turn_origin(&session, Some(turn_id)))
                                 }
-                                ThreadEvent::Error(_) => Some(take_turn_origin(&session, open_exec_turn.as_deref())),
+                                ThreadEvent::Error(_) if is_final_answer => {
+                                    Some(take_turn_origin(&session, open_exec_turn.as_deref()))
+                                }
                                 _ => None,
                             };
                             // ----- ANSWER (or error) -----
-                            // Finalize this turn's status epoch first.
+                            // Finalize this answer's status epoch first. A message
+                            // the turn says on its way (#209) only SEALS the card —
+                            // the work above it is over, the turn is not — so no
+                            // reader takes an interim line for the end of the turn.
                             if progress_on && fold.has_activity() && !fold.done() {
-                                fold.mark_done();
+                                if is_final_answer || session.protocol.is_terminal() {
+                                    fold.mark_done();
+                                } else {
+                                    fold.seal();
+                                }
                                 if !flush_progress(
                                     &tx, &session, &session_id, epoch, &fold,
                                     &mut last_sent, &mut last_emit, &mut dirty,
@@ -8046,7 +8202,7 @@ impl Gateway {
                             // ANSWER +1)+ sid 派生,稳定且可 grep,非随机。失败
                             // 只 warn,绝不阻断回复投递。
                             if let Some(dir) = project_dir.as_ref() {
-                                let failure = thread_event_failure(&evt);
+                                let failure = thread_event_failure(&evt).filter(|_| is_final_answer);
                                 let record = ccteam_harness::execution::turns_mirror::TurnRecord {
                                     // Which EXECUTION turn produced this row.
                                     // A restart reconcile rebinds an
@@ -8108,11 +8264,12 @@ impl Gateway {
                                         // any interim notes); an ordinary assistant
                                         // message is only remembered as the boundary
                                         // candidate flushed on `TurnCompleted` above.
-                                        let is_boundary_evt = matches!(
-                                            &evt,
-                                            ThreadEvent::TurnFailed { .. }
-                                                | ThreadEvent::Error(_)
-                                        );
+                                        let is_boundary_evt = is_final_answer
+                                            && matches!(
+                                                &evt,
+                                                ThreadEvent::TurnFailed { .. }
+                                                    | ThreadEvent::Error(_)
+                                            );
                                         turn_covered.push(record.turn_id.clone());
                                         if is_boundary_evt {
                                             let notes = turn_notes;
@@ -8345,7 +8502,7 @@ impl Gateway {
                             released_mid_turn = false;
                             held_since = None;
                           }
-                        } else if progress_on {
+                        } else if progress_on && vendor_event {
                             // ----- PROGRESS (IM, unchanged) -----
                             // The fold drives the IM status string; its dirty
                             // signal gates the throttled status edit exactly as
@@ -18365,6 +18522,67 @@ fn async_event_text(evt: &ThreadEvent) -> Option<String> {
     }
 }
 
+/// What woke the event pump's stream branch: the vendor, or the deadline of
+/// text it is holding (#209).
+enum PumpWake {
+    /// The vendor stream's next item (`None` = the stream ended).
+    Vendor(Option<ThreadEvent>),
+    /// Held text has waited one heartbeat with the vendor silent.
+    HoldDue,
+}
+
+/// The vendor's next event, or [`PumpWake::HoldDue`] once `hold_deadline`
+/// passes first. Both halves are cancel-safe (a stream's `next` and a sleep),
+/// so losing the pump's outer `select!` to another branch drops nothing.
+async fn next_pump_wake(
+    events: &mut futures::stream::BoxStream<'static, ThreadEvent>,
+    hold_deadline: Option<Instant>,
+) -> PumpWake {
+    let Some(deadline) = hold_deadline else {
+        return PumpWake::Vendor(events.next().await);
+    };
+    tokio::select! {
+        biased;
+        evt = events.next() => PumpWake::Vendor(evt),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => PumpWake::HoldDue,
+    }
+}
+
+/// The event a due hold is carried through the pump as. It matches no arm
+/// that reads vendor facts — no answer, no boundary, no accounting — and the
+/// pump skips every vendor-only step for it, so it can only release what is
+/// already held.
+fn hold_due_marker() -> ThreadEvent {
+    ThreadEvent::ItemUpdated {
+        item: ccteam_harness::ThreadItem {
+            id: String::new(),
+            details: ThreadItemDetails::Reasoning(String::new()),
+        },
+    }
+}
+
+/// Fold held messages into ONE delivery, paragraph by paragraph. Returns the
+/// folded text (`None` when nothing was held) and, when more than one message
+/// was folded, the last of them — the text after the turn's last tool call,
+/// which is what its boundary names as the conclusion when the vendor names
+/// none (issue #196).
+fn fold_held(held: Vec<String>) -> (Option<String>, Option<String>) {
+    match held.len() {
+        0 => (None, None),
+        1 => (held.into_iter().next(), None),
+        _ => {
+            let last = held.last().cloned();
+            let text = held
+                .iter()
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (Some(text), last)
+        }
+    }
+}
+
 /// Canonical terminal failure carried by an event, independent of vendor.
 /// The ADAPTER's execution-turn id an event carries, when it has one.
 /// `Error` carries none — the pump pairs it with the turn it knows is open.
@@ -25363,22 +25581,14 @@ mod tests {
             .await
             .unwrap();
 
-        let first_turn = [
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-        ];
-        assert!(first_turn[..2].iter().all(|event| event.status.is_none()));
+        // #209 — what a short turn said is held to its boundary and goes out
+        // FOLDED: one message, every line in order, one status tail.
+        let ev = &recv_answer(&mut events).await;
+        let order = ["checkpoint 1\n\n", "checkpoint 2\n\n", "echo: hello"]
+            .map(|line| ev.content.find(line));
         assert!(
-            first_turn[..2]
-                .iter()
-                .all(|event| !event.content.contains("\n\n→ ")),
-            "interim messages carry no status tail: {first_turn:?}"
-        );
-        let ev = &first_turn[2];
-        assert!(
-            ev.content.contains("echo: hello"),
-            "answer still carries the real reply text: {}",
+            order.iter().all(Option::is_some) && order.is_sorted(),
+            "the folded answer carries every message, in order: {}",
             ev.content
         );
         // The echo is the LAST block of the answer. Split it off rather than
@@ -25417,36 +25627,36 @@ mod tests {
             .iter()
             .filter(|turn| !turn.assistant.is_empty())
             .collect();
-        assert_eq!(assistant.len(), 3);
-        assert!(assistant[..2].iter().all(|turn| turn.status.is_none()));
+        assert_eq!(assistant.len(), 1, "one folded row: {assistant:?}");
         assert_eq!(
-            assistant[2].status.as_ref().map(|status| status.turn),
+            assistant[0].status.as_ref().map(|status| status.turn),
             Some(1)
         );
-        assert_ne!(assistant[2].usage, serde_json::Value::Null);
+        assert!(
+            assistant[0]
+                .conclusion
+                .as_deref()
+                .is_some_and(|conclusion| conclusion.ends_with("echo: hello")
+                    && !conclusion.contains("checkpoint")),
+            "a folded row names its last message as the conclusion: {assistant:?}"
+        );
+        assert_ne!(assistant[0].usage, serde_json::Value::Null);
 
         gateway
             .handle_text("mock", "chat-1", "alice", "second")
             .await
             .unwrap();
-        let second_turn = [
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-            recv_answer(&mut events).await,
-        ];
-        assert!(second_turn[..2].iter().all(|event| event.status.is_none()));
+        let second = recv_answer(&mut events).await;
         assert_eq!(
-            second_turn[2].status.as_ref().map(|status| status.turn),
+            second.status.as_ref().map(|status| status.turn),
             Some(2),
             "three assistant messages still count as one vendor turn"
         );
         assert_eq!(
-            second_turn
-                .iter()
-                .filter(|event| event.content.contains("\n\n→ "))
-                .count(),
+            second.content.matches("\n\n→ ").count(),
             1,
-            "one IM status tail per vendor turn"
+            "one IM status tail per vendor turn: {}",
+            second.content
         );
     }
 
@@ -26150,6 +26360,14 @@ mod tests {
             recv_answer(&mut broadcast).await,
         ];
         assert!(web_broadcast.iter().all(|event| event.channel == "web"));
+        // #209 — the boundary publishes its ONE status-bearing Answer (the
+        // interim lines above carry none): a content-less frame, never the
+        // mirror's text.
+        let boundary = recv_answer(&mut broadcast).await;
+        assert!(
+            boundary.content.is_empty() && boundary.status.is_some(),
+            "{boundary:?}"
+        );
         while let Ok(event) = broadcast.try_recv() {
             assert!(
                 !matches!(event.kind, GatewayEventKind::Answer),
@@ -27505,12 +27723,129 @@ mod tests {
         assert!(answer.status.is_none(), "a mid-turn row carries no status");
     }
 
+    /// #209 — the hold is bounded by a CLOCK, not by the vendor's next event.
+    /// A session that says "running the suite now" and then sits in a silent
+    /// twenty-minute tool produces no event at all; waiting for one to notice
+    /// the expired hold kept the line unsent until the tool returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_vendor_cannot_hold_what_its_session_said() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude).with_turn_started());
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        let heartbeat = std::time::Duration::from_millis(150);
+        gateway.set_turn_heartbeat_interval(heartbeat);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let asked = Instant::now();
+        gateway
+            .handle_text("mock", "chat-1", "alice", "long job")
+            .await
+            .unwrap();
+
+        // The fake says one line and then nothing, and never ends the turn.
+        let answer = recv_answer(&mut events).await;
+        assert!(answer.content.contains("echo: long job"), "{answer:?}");
+        assert!(
+            answer.status.is_none(),
+            "the turn is still running: {answer:?}"
+        );
+        assert!(
+            asked.elapsed() >= heartbeat,
+            "it was held for one heartbeat first, to fold what follows"
+        );
+        assert!(gateway.session_turn_in_flight("s1"));
+    }
+
+    /// #209 — what a turn said before it failed was produced and paid for; the
+    /// failure used to `clear()` it with the hold. It goes out as ordinary
+    /// narration AHEAD of the failure row, and only the failure row is marked
+    /// failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_turn_still_delivers_what_it_said_first() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let identity = "alpha-reviewer-s1".to_string();
+        {
+            let mut queued = fake.events.lock().await;
+            queued.push_back((
+                identity.clone(),
+                ThreadEvent::TurnStarted {
+                    turn_id: "t-fail".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
+                },
+            ));
+            queued.push_back((
+                identity.clone(),
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "checking the logs",
+                ),
+            ));
+            queued.push_back((
+                identity.clone(),
+                ThreadEvent::TurnFailed {
+                    turn_id: "t-fail".into(),
+                    err: ccteam_harness::ThreadErrorEvent {
+                        kind: "vendor_error".into(),
+                        message: "the provider fell over".into(),
+                    },
+                    usage: Default::default(),
+                    model: None,
+                },
+            ));
+        }
+        fake.wake(&identity);
+
+        let said = recv_answer(&mut events).await;
+        assert_eq!(said.content, "checking the logs", "{said:?}");
+        assert!(said.status.is_none(), "{said:?}");
+        let failed = recv_answer(&mut events).await;
+        assert!(
+            failed.content.contains("the provider fell over"),
+            "{failed:?}"
+        );
+        assert!(
+            failed.status.is_some(),
+            "the failure is the boundary: {failed:?}"
+        );
+
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
+        let rows: Vec<_> = rows
+            .iter()
+            .filter(|row| !row.assistant.is_empty())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].assistant, "checking the logs");
+        assert_eq!(
+            rows[0].outcome, None,
+            "narration is not the failure: {rows:?}"
+        );
+        assert_eq!(rows[1].outcome.as_deref(), Some("failed"), "{rows:?}");
+    }
+
     /// GitHub #206 — text released mid-turn leaves the boundary with nothing
     /// to attach the turn's status line to, so the boundary owes the chat its
     /// CLOSING receipt: a chat that read live narration for hours must still
     /// learn the turn ended, with the model / ctx / turn / cost it ended on.
     /// The receipt is the status line ALONE — never a second copy of text the
-    /// chat already has.
+    /// chat already has. #209 — and the line is phone text, delivered to the
+    /// IM chat only; the web stream gets the same boundary as a content-less
+    /// status frame, not a bubble holding nothing but a status line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_turn_released_mid_flight_closes_with_its_status_line() {
         let fake = Arc::new(
@@ -27530,36 +27865,60 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
         gateway.set_event_sink(tx);
 
         gateway
             .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
             .await
             .unwrap();
+        while rx.try_recv().is_ok() {}
         let mut events = gateway.subscribe_events();
         gateway
             .handle_text("mock", "chat-1", "alice", "long job")
             .await
             .unwrap();
 
+        // The IM chat: the released text, then the status line alone.
+        let delivered = recv_sink_answers(&mut rx, 2).await;
+        assert!(delivered[0].content.contains("echo: long job"));
+        assert!(delivered[0].status.is_none(), "{delivered:?}");
+        let receipt = &delivered[1];
+        assert!(
+            receipt
+                .content
+                .starts_with("→ alpha/s1 (reviewer) · claude · claude-sonnet-4-6"),
+            "the boundary pays back the status line: {receipt:?}"
+        );
+        assert!(
+            !receipt.content.contains("echo: long job"),
+            "and never re-sends text the chat already has: {receipt:?}"
+        );
+        assert_eq!(
+            receipt.status.as_ref().map(|status| status.turn),
+            Some(1),
+            "the receipt carries the ended turn's own status"
+        );
+
+        // The web stream: the same text, then a content-less boundary frame.
         let answer = recv_answer(&mut events).await;
         assert!(answer.content.contains("echo: long job"));
         let closing = recv_answer(&mut events).await;
         assert!(
-            closing
-                .content
-                .starts_with("→ alpha/s1 (reviewer) · claude · claude-sonnet-4-6"),
-            "the boundary pays back the status line: {closing:?}"
+            closing.content.is_empty(),
+            "no status-line bubble on the web: {closing:?}"
         );
-        assert!(
-            !closing.content.contains("echo: long job"),
-            "and never re-sends text the chat already has: {closing:?}"
-        );
+        assert_eq!(closing.status.as_ref().map(|status| status.turn), Some(1));
+
+        // …and the ledger says the turn ended: a status-bearing closing row.
+        let rows =
+            ccteam_harness::execution::turns_mirror::read_all_turns(proj.path(), "s1").unwrap();
+        let closing_row = rows.last().expect("rows");
+        assert!(closing_row.assistant.is_empty(), "{rows:?}");
         assert_eq!(
-            closing.status.as_ref().map(|status| status.turn),
+            closing_row.status.as_ref().map(|status| status.turn),
             Some(1),
-            "the receipt carries the ended turn's own status"
+            "{rows:?}"
         );
     }
 

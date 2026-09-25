@@ -1,11 +1,18 @@
-//! Final-only translate: ACP notifications + prompt response → ThreadEvent.
+//! Translate: ACP notifications + prompt response → ThreadEvent.
 //!
 //! Client-started turn-end SoT = matching `session/prompt` JSON-RPC response.
 //! A vendor that admits an idle control message can also self-start a turn;
 //! that exceptional turn is opened by its first content update and finalized
 //! by its own boundary notification. Buffer only `agent_message_chunk`; drop
-//! thoughts and `isReplay` frames from the final answer, but emit throttled
+//! thoughts and `isReplay` frames from the answer, but emit throttled
 //! mid-stream liveness events so the gateway silence watchdog sees long work.
+//!
+//! A message is reported the moment it is COMPLETE, not at the turn's end:
+//! ACP streams message deltas with no end marker of their own, so the text
+//! gathered so far becomes one `ItemCompleted{AgentMessage}` when the agent
+//! moves on to a tool call, and the boundary reports only what is left. The
+//! gateway decides when a chat sees it; a turn reported in one piece gave it
+//! nothing to release for as long as the turn ran (#209).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -36,6 +43,12 @@ pub struct TurnBuffer {
     /// Every chunk of the turn, in order — this becomes the ANSWER, so it is
     /// whole by definition and grows with the turn.
     pub text: String,
+    /// How much of `text` (bytes) has already been reported as a completed
+    /// message; the rest is what the next boundary still owes.
+    delivered: usize,
+    /// A context probe's reply is data, not conversation (see the turn
+    /// runner): nothing of it is reported mid-turn.
+    quiet: bool,
     /// The bounded TAIL of the same text, kept incrementally.
     ///
     /// A read of a running turn used to render the tail by scanning and
@@ -52,8 +65,33 @@ impl TurnBuffer {
         Self {
             turn_id: turn_id.into(),
             text: String::new(),
+            delivered: 0,
+            quiet: false,
             narration: crate::NarrationAccumulator::default(),
         }
+    }
+
+    /// The text not yet reported as a completed message, marked reported.
+    fn take_undelivered(&mut self) -> String {
+        let rest = self.text[self.delivered..].to_string();
+        self.delivered = self.text.len();
+        rest
+    }
+
+    /// Close the message in progress: the agent moved on to other work, so
+    /// what it has said so far will not grow. `None` when there is nothing
+    /// new worth a message (or the turn is a quiet probe).
+    fn seal_message(&mut self) -> Option<ThreadEvent> {
+        if self.quiet || self.text[self.delivered..].trim().is_empty() {
+            return None;
+        }
+        let text = self.take_undelivered();
+        Some(ThreadEvent::ItemCompleted {
+            item: ThreadItem {
+                id: format!("{}-msg-{}", self.turn_id, self.delivered),
+                details: ThreadItemDetails::AgentMessage(text),
+            },
+        })
     }
 
     /// Append one `agent_message_chunk`. ACP's shape is DELTA and one message
@@ -299,6 +337,24 @@ impl SessionTranslateState {
         self.prompt_boundary_seen = false;
         // Fresh turn → first thought/message chunk should emit immediately.
         self.last_liveness_at = None;
+    }
+
+    /// Mark the turn just begun as a context probe, whose reply is read as
+    /// data and never reported as conversation.
+    pub fn quiet_current_turn(&mut self) {
+        if let Some(buffer) = self.buffer.as_mut() {
+            buffer.quiet = true;
+        }
+    }
+
+    /// Close the message the agent was writing (see [`TurnBuffer::seal_message`]).
+    fn seal_message(&mut self, vendor_started: bool) -> Option<ThreadEvent> {
+        let target = if vendor_started {
+            self.vendor_started_buffer.as_mut()
+        } else {
+            self.buffer.as_mut()
+        };
+        target.and_then(TurnBuffer::seal_message)
     }
 
     fn append_message(&mut self, chunk: &str, vendor_started: bool) {
@@ -561,13 +617,21 @@ fn apply_session_update(
                     args: update.get("rawInput").cloned().unwrap_or(Value::Null),
                 },
             };
-            if kind == "tool_call" && status != "completed" {
-                vec![ThreadEvent::ItemStarted { item }]
-            } else if status == "completed" {
-                vec![ThreadEvent::ItemCompleted { item }]
+            // A new tool call ends whatever the agent was saying before it:
+            // that message is complete, and it goes out ahead of the tool.
+            let mut events: Vec<ThreadEvent> = if kind == "tool_call" {
+                state.seal_message(vendor_started).into_iter().collect()
             } else {
-                vec![ThreadEvent::ItemUpdated { item }]
-            }
+                Vec::new()
+            };
+            events.push(if kind == "tool_call" && status != "completed" {
+                ThreadEvent::ItemStarted { item }
+            } else if status == "completed" {
+                ThreadEvent::ItemCompleted { item }
+            } else {
+                ThreadEvent::ItemUpdated { item }
+            });
+            events
         }
         // OpenCode: context occupancy + session-cumulative USD.
         "usage_update" => {
@@ -673,16 +737,17 @@ fn maybe_liveness_event(
 }
 
 fn finalize_vendor_started_turn(state: &mut SessionTranslateState) -> Vec<ThreadEvent> {
-    let Some(buf) = state.vendor_started_buffer.take() else {
+    let Some(mut buf) = state.vendor_started_buffer.take() else {
         return Vec::new();
     };
     state.last_liveness_at = None;
+    let text = buf.take_undelivered();
     let turn_id = buf.turn_id;
     vec![
         ThreadEvent::ItemCompleted {
             item: ThreadItem {
                 id: format!("{turn_id}-msg"),
-                details: ThreadItemDetails::AgentMessage(buf.text),
+                details: ThreadItemDetails::AgentMessage(text),
             },
         },
         ThreadEvent::TurnCompleted {
@@ -746,7 +811,8 @@ pub fn finalize_from_prompt_result(
         .as_ref()
         .map(|b| b.turn_id.clone())
         .unwrap_or_else(|| "unknown".into());
-    let text = buf.map(|b| b.text).unwrap_or_default();
+    // Only what no earlier message carried: the rest already went out.
+    let text = buf.map(|mut b| b.take_undelivered()).unwrap_or_default();
     let stop = stop_reason_from_prompt_result(result);
     let terminal_model = model.or_else(|| state.model.clone());
     let mut out = Vec::new();
@@ -1160,6 +1226,84 @@ mod tests {
             ThreadEvent::TurnCompleted { usage, .. } => *usage,
             _ => unreachable!(),
         };
+    }
+
+    /// Every `AgentMessage` in `events`, in order.
+    fn said(events: &[ThreadEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ThreadEvent::ItemCompleted { item } => match &item.details {
+                    ThreadItemDetails::AgentMessage(text) => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn chunk(text: &str) -> Notification {
+        Notification {
+            method: "session/update".into(),
+            params: json!({"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text}
+            }}),
+        }
+    }
+
+    fn tool_call(id: &str) -> Notification {
+        Notification {
+            method: "session/update".into(),
+            params: json!({"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": "bash",
+                "status": "pending"
+            }}),
+        }
+    }
+
+    /// #209 — ACP streams deltas with no end-of-message marker, so a turn used
+    /// to reach the gateway as ONE message at `session/prompt`'s response:
+    /// whatever the agent said before a twenty-minute build stayed unsaid until
+    /// the build was over. A tool call is where a message ends.
+    #[test]
+    fn a_tool_call_completes_the_message_before_it() {
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("t-seal", Arc::new(Notify::new()));
+        assert!(said(&apply_notification(&mut st, &chunk("reading "))).is_empty());
+        assert!(said(&apply_notification(&mut st, &chunk("the brief"))).is_empty());
+        let at_tool = apply_notification(&mut st, &tool_call("tc-1"));
+        assert_eq!(said(&at_tool), vec!["reading the brief".to_string()]);
+        assert!(
+            matches!(at_tool.last(), Some(ThreadEvent::ItemStarted { .. })),
+            "the message goes out AHEAD of the tool it handed over to: {at_tool:?}"
+        );
+        // A second tool with nothing said in between reports nothing.
+        assert!(said(&apply_notification(&mut st, &tool_call("tc-2"))).is_empty());
+        apply_notification(&mut st, &chunk("all green"));
+        let boundary = finalize_from_prompt_result(&mut st, &json!({"stopReason": "end_turn"}));
+        assert_eq!(
+            said(&boundary),
+            vec!["all green".to_string()],
+            "the boundary reports only what no earlier message carried"
+        );
+    }
+
+    /// A context probe's reply is data the runner parses, never conversation.
+    #[test]
+    fn a_quiet_probe_reports_nothing_mid_turn() {
+        let mut st = SessionTranslateState::default();
+        st.begin_turn("probe-1", Arc::new(Notify::new()));
+        st.quiet_current_turn();
+        apply_notification(&mut st, &chunk("context: 12k / 200k"));
+        assert!(said(&apply_notification(&mut st, &tool_call("tc-1"))).is_empty());
+        assert_eq!(
+            st.take_buffer().map(|buffer| buffer.text).as_deref(),
+            Some("context: 12k / 200k"),
+            "the probe still reads its whole reply"
+        );
     }
 
     /// Buffer some partial text, then finalize with `reason`.
