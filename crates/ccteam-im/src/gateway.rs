@@ -8081,11 +8081,17 @@ impl Gateway {
                             };
                             // ----- ANSWER (or error) -----
                             // Finalize this answer's status epoch first. A message
-                            // the turn says on its way (#209) only SEALS the card —
-                            // the work above it is over, the turn is not — so no
-                            // reader takes an interim line for the end of the turn.
+                            // a structured turn says on its way (#209) only SEALS
+                            // the card — the work above it is over, the turn is
+                            // not — so no reader takes an interim line for the end
+                            // of the turn. Without an open structured turn (or on
+                            // the terminal protocol) the answer is the only end
+                            // this pump will ever see, and it stays `done`.
                             if progress_on && fold.has_activity() && !fold.done() {
-                                if is_final_answer || session.protocol.is_terminal() {
+                                if is_final_answer
+                                    || !structured_turn_open
+                                    || session.protocol.is_terminal()
+                                {
                                     fold.mark_done();
                                 } else {
                                     fold.seal();
@@ -27760,6 +27766,95 @@ mod tests {
             "it was held for one heartbeat first, to fold what follows"
         );
         assert!(gateway.session_turn_in_flight("s1"));
+    }
+
+    /// #209 — a message a structured turn says on its way closes the progress
+    /// card above it WITHOUT calling the turn done: web readers counted a
+    /// `✅ done` card as the end of the turn and dropped Stop mid-turn. Only the
+    /// boundary writes `✅ done`, and an answer-less boundary still closes its
+    /// card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interim_message_seals_its_card_and_only_the_boundary_is_done() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.set_turn_heartbeat_interval(std::time::Duration::ZERO);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
+        gateway
+            .handle_text("mock", "chat-1", "alice", "/new claude reviewer")
+            .await
+            .unwrap();
+        let mut events = gateway.subscribe_events();
+        let identity = "alpha-reviewer-s1".to_string();
+        let tool = |id: &str, done: bool| {
+            let item = ThreadItem {
+                id: id.into(),
+                details: ThreadItemDetails::ToolCall {
+                    name: "Bash".into(),
+                    args: serde_json::json!({"command": "make test"}),
+                },
+            };
+            if done {
+                ThreadEvent::ItemCompleted { item }
+            } else {
+                ThreadEvent::ItemStarted { item }
+            }
+        };
+        {
+            let mut queued = fake.events.lock().await;
+            for event in [
+                ThreadEvent::TurnStarted {
+                    turn_id: "t-cards".into(),
+                    opening: ccteam_harness::TurnOpening::Submitted,
+                },
+                tool("tool-1", false),
+                tool("tool-1", true),
+                agent_msg(
+                    |item| ThreadEvent::ItemCompleted { item },
+                    "tests are running",
+                ),
+                tool("tool-2", false),
+                tool("tool-2", true),
+                ThreadEvent::TurnCompleted {
+                    turn_id: "t-cards".into(),
+                    usage: Default::default(),
+                    model: None,
+                    conclusion: None,
+                    continuation: ccteam_harness::TurnContinuation::Settled,
+                },
+            ] {
+                queued.push_back((identity.clone(), event));
+            }
+        }
+        fake.wake(&identity);
+
+        let mut finals: Vec<(String, bool)> = Vec::new();
+        let mut boundary_seen = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !boundary_seen {
+                let ev = events.recv().await.expect("broadcast open");
+                match &ev.kind {
+                    GatewayEventKind::Progress { done: true, .. } => {
+                        finals.push((ev.content.clone(), false));
+                    }
+                    GatewayEventKind::Answer if ev.status.is_some() => boundary_seen = true,
+                    GatewayEventKind::Answer => finals.push((ev.content.clone(), true)),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the turn reaches its boundary");
+        assert_eq!(
+            finals,
+            vec![
+                ("↳ 1 tools · 0 files".to_string(), false),
+                ("tests are running".to_string(), true),
+                ("✅ done · 1 tools · 0 files".to_string(), false),
+            ],
+            "sealed card, the message, then the boundary's done card"
+        );
     }
 
     /// #209 — what a turn said before it failed was produced and paid for; the
