@@ -227,11 +227,74 @@ describe('frame translation', () => {
     data: JSON.stringify(data),
   })
 
-  it('treats kind:"answer" as the reliable turn-completion signal', () => {
-    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'hi' }))).toEqual([
+  /** The upstream `TurnStatus` object a turn's boundary answer carries. */
+  const STATUS = {
+    model: 'opus',
+    context: { used_tokens: 42_000, window_tokens: 200_000, source: 'derived' },
+    turn: 3,
+    cost_usd: 0.25,
+    tokens_total: 9000,
+  }
+
+  it('treats the answer carrying a status as the turn boundary', () => {
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'hi', status: STATUS }))).toEqual([
       { kind: 'graph' },
       { kind: 'turn_done', sid: 's1' },
     ])
+    // The status-only closing frame (nothing left to say) ends the turn too.
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: '', status: STATUS }))).toEqual([
+      { kind: 'graph' },
+      { kind: 'turn_done', sid: 's1' },
+    ])
+  })
+
+  it('an interim answer (no status) completes nothing: no turn_done, no tree re-read', () => {
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'looking at the tests' }))).toEqual([])
+    expect(translateGlobal(frame({ kind: 'answer', sid: 's1', content: 'still going', status: null }))).toEqual([])
+  })
+
+  it('one long turn feeds the badge exactly once, however much it says mid-turn', () => {
+    const turn = [
+      frame({ kind: 'answer', sid: 's1', id: 'a1', content: 'first I will read the code' }),
+      frame({ kind: 'progress', sid: 's1', content: 'Read(src/bff.ts)', done: true }),
+      frame({ kind: 'answer', sid: 's1', id: 'a2', content: 'now the tests' }),
+      frame({ kind: 'progress', sid: 's1', content: 'Bash(npm test)', done: true }),
+      frame({ kind: 'answer', sid: 's1', id: 'a3', content: 'all green' }),
+      frame({ kind: 'answer', sid: 's1', id: 'a4', content: '', status: STATUS }),
+    ]
+    const events = turn.flatMap(translateGlobal)
+    expect(events.filter(event => event.kind === 'turn_done')).toEqual([{ kind: 'turn_done', sid: 's1' }])
+    // A closed progress card is not a turn end either, so the tree is re-read once.
+    expect(events.filter(event => event.kind === 'graph')).toHaveLength(1)
+  })
+
+  it('carries the boundary status as an object and leaves interim answers without one', () => {
+    expect(translateSession('s1', frame({ kind: 'answer', sid: 's1', id: 'a4', content: '', status: STATUS }))).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: {
+        kind: 'answer',
+        id: 'a4',
+        content: '',
+        status: {
+          model: 'opus',
+          context: { usedTokens: 42_000, windowTokens: 200_000, source: 'derived' },
+          turn: 3,
+          costUsd: 0.25,
+          tokensTotal: 9000,
+        },
+      },
+    }])
+    // Null-valued fields drop out rather than becoming NaN/'' noise.
+    expect(translateSession('s1', frame({
+      kind: 'answer', sid: 's1', id: 'a5', content: 'x',
+      status: { model: null, context: null, turn: 1, cost_usd: null, tokens_total: null },
+    }))).toEqual([{ kind: 'session', sid: 's1', event: { kind: 'answer', id: 'a5', content: 'x', status: { turn: 1 } } }])
+    expect(translateSession('s1', frame({ kind: 'answer', sid: 's1', id: 'a1', content: 'mid-turn' }))).toEqual([{
+      kind: 'session',
+      sid: 's1',
+      event: { kind: 'answer', id: 'a1', content: 'mid-turn' },
+    }])
   })
 
   it('does not mistake a human-in-the-loop prompt for a completed turn', () => {

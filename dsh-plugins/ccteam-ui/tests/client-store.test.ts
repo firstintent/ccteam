@@ -19,13 +19,23 @@ import {
 } from '../src/client/store.js'
 import type { Action, ConsoleState, StorageLike } from '../src/client/store.js'
 import { formatCost, formatElapsed, formatTokens, modelDirective, relativeTime, titleFromTask, vendorGlyph } from '../src/client/format.js'
-import type { TeamGraph, TeamNode } from '../src/shared/contract.js'
+import { isTurnBoundary } from '../src/shared/contract.js'
+import type { SessionEvent, Step, TeamGraph, TeamNode, TurnStatus } from '../src/shared/contract.js'
 
 function run(actions: Action[], start = initialState()): ConsoleState {
   return actions.reduce(reduce, start)
 }
 
 const NOW = 1_700_000_000_000
+
+/** What a turn's boundary answer carries; its presence is the boundary. */
+const STATUS: TurnStatus = { model: 'opus', turn: 1, costUsd: 0.1 }
+
+const step = (itemId: string, status: 'started' | 'completed'): Step => ({ itemId, kind: 'tool_call', name: 'Bash', summary: itemId, status })
+const on = (event: SessionEvent): Action => ({ type: 'session_event', sid: 's1', event, now: NOW })
+const activity = (itemId: string, status: 'started' | 'completed'): Action => on({ kind: 'activity', step: step(itemId, status) })
+const interim = (id: string, content: string): Action => on({ kind: 'answer', id, content })
+const boundary = (id: string, content: string): Action => on({ kind: 'answer', id, content, status: STATUS })
 
 describe('selection', () => {
   it('selecting a session records it as a recent and clears the step selection', () => {
@@ -116,7 +126,7 @@ describe('chat: live turn', () => {
   it('an answer settles the live turn into an ephemeral row carrying its steps', () => {
     let state = run([
       { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
-      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.' }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.', status: STATUS }, now: NOW },
     ])
     const chat = chatOf(state, 's1')
     expect(chat.live).toBeNull()
@@ -143,7 +153,7 @@ describe('chat: live turn', () => {
   it('steps attached to a canonical row survive later history reloads', () => {
     let state = run([
       { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
-      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.' }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.', status: STATUS }, now: NOW },
       { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:assistant', role: 'assistant', content: 'done.' }], hasMore: false },
       { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:assistant', role: 'assistant', content: 'done.' }, { turnId: 'u2:user', role: 'user', content: 'more' }], hasMore: false },
     ])
@@ -210,6 +220,122 @@ describe('chat: live turn', () => {
   })
 })
 
+describe('chat: mid-turn answers', () => {
+  it('only an answer carrying a status is the turn boundary', () => {
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: 'x' })).toBe(false)
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: 'x', status: STATUS })).toBe(true)
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: '', status: {} })).toBe(true)
+    // A choice prompt suspends the turn on a human; it does not end it.
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: '?', status: STATUS, options: [{ id: 'y', label: 'y' }], token: 't' })).toBe(false)
+    expect(isTurnBoundary({ kind: 'progress', content: '', done: true })).toBe(false)
+  })
+
+  it('an interim answer shows at once and the turn keeps working', () => {
+    const state = run([
+      { type: 'send_started', sid: 's1', text: 'fix it' },
+      activity('t1', 'started'),
+      activity('t1', 'completed'),
+      activity('t2', 'started'),
+      on({ kind: 'progress', content: 'Bash(t1) · Bash(t2)', done: false }),
+      interim('a1', 'found the bug, patching now'),
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.activity).toBe('working')
+    expect(chat.waiting).toBe(false)
+    expect(chat.live).not.toBeNull()
+    expect(chat.rows.map(r => r.kind)).toEqual(['user', 'assistant'])
+    const said = chat.rows[1]
+    expect(said).toMatchObject({ kind: 'assistant', id: 'answer-a1', content: 'found the bug, patching now', ephemeral: true })
+    // What finished before it settles with it; what is still running stays live.
+    if (said?.kind === 'assistant') expect(said.steps.map(s => s.itemId)).toEqual(['t1'])
+    expect(chat.live?.steps.map(s => [s.itemId, s.status])).toEqual([['t2', 'started']])
+    expect(chat.live?.content).toBe('')
+    // Nor does it count as a finished turn on the badge.
+    expect(state.badge).toBe(0)
+  })
+
+  it('a step that finishes after an interim answer settled it updates in place', () => {
+    const state = run([
+      activity('t1', 'started'),
+      on({ kind: 'progress', content: '', done: true }),
+      interim('a1', 'waiting on the build'),
+      activity('t1', 'completed'),
+    ])
+    const chat = chatOf(state, 's1')
+    const said = chat.rows[0]
+    if (said?.kind === 'assistant') expect(said.steps.map(s => [s.itemId, s.status])).toEqual([['t1', 'completed']])
+    expect(chat.live?.steps ?? []).toEqual([])
+    expect(chat.activity).toBe('working')
+  })
+
+  it('the status-only closing frame ends the turn and renders no row', () => {
+    const state = run([
+      { type: 'send_started', sid: 's1', text: 'go' },
+      interim('a1', 'on it'),
+      interim('a2', 'done: all green'),
+      boundary('close', ''),
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.activity).toBe('idle')
+    expect(chat.live).toBeNull()
+    expect(chat.rows.map(r => r.id)).toEqual(['local-1', 'answer-a1', 'answer-a2'])
+    expect(chat.rows.some(r => r.kind === 'assistant' && r.content === '' && r.steps.length === 0)).toBe(false)
+  })
+
+  it('steps still live at a status-only close join the row the session last spoke in', () => {
+    const state = run([
+      interim('a1', 'running the suite'),
+      activity('t9', 'started'),
+      boundary('close', ''),
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.rows).toHaveLength(1)
+    const said = chat.rows[0]
+    if (said?.kind === 'assistant') expect(said.steps.map(s => [s.itemId, s.status])).toEqual([['t9', 'completed']])
+    // With nothing said at all, the steps stand as their own (visible) row.
+    const silent = chatOf(run([activity('t1', 'started'), boundary('close', '')]), 's1')
+    expect(silent.rows).toHaveLength(1)
+    expect(silent.rows[0]).toMatchObject({ kind: 'assistant', content: '', steps: [{ itemId: 't1', status: 'completed' }] })
+    expect(silent.activity).toBe('idle')
+  })
+
+  it('reconcile hands each interim row its own canonical row, repeated lines included', () => {
+    let state = run([
+      { type: 'history_loaded', sid: 's1', rows: [
+        { turnId: 'p1:user', role: 'user', content: 'earlier' },
+        { turnId: 'p1:assistant', role: 'assistant', content: 'Checking.' },
+      ], hasMore: false },
+      { type: 'send_started', sid: 's1', text: 'go' },
+      activity('t1', 'completed'),
+      interim('a1', 'Checking.'),
+      activity('t2', 'completed'),
+      interim('a2', 'Checking.'),
+      activity('t3', 'started'),
+      boundary('a3', 'Fixed.'),
+    ])
+    state = reduce(state, { type: 'history_loaded', sid: 's1', rows: [
+      { turnId: 'p1:user', role: 'user', content: 'earlier' },
+      { turnId: 'p1:assistant', role: 'assistant', content: 'Checking.' },
+      { turnId: 'q1:user', role: 'user', content: 'go' },
+      { turnId: 'q1:assistant', role: 'assistant', content: 'Checking.' },
+      { turnId: 'q2:assistant', role: 'assistant', content: 'Checking.' },
+      { turnId: 'q3:assistant', role: 'assistant', content: 'Fixed.', status: STATUS },
+      // The empty closing row of a long turn is not a row.
+      { turnId: 'q4:assistant', role: 'assistant', content: '', status: STATUS },
+    ], hasMore: false })
+    const rows = chatOf(state, 's1').rows
+    expect(rows.map(r => r.id)).toEqual(['p1:user', 'p1:assistant', 'q1:user', 'q1:assistant', 'q2:assistant', 'q3:assistant'])
+    const stepsOf = (id: string): string[] => {
+      const row = rows.find(r => r.id === id)
+      return row?.kind === 'assistant' ? row.steps.map(s => s.itemId) : []
+    }
+    expect(stepsOf('p1:assistant')).toEqual([])
+    expect(stepsOf('q1:assistant')).toEqual(['t1'])
+    expect(stepsOf('q2:assistant')).toEqual(['t2'])
+    expect(stepsOf('q3:assistant')).toEqual(['t3'])
+  })
+})
+
 describe('chat: sending and history', () => {
   it('an optimistic user row is replaced by its canonical row', () => {
     let state = run([{ type: 'send_started', sid: 's1', text: 'hello' }])
@@ -220,7 +346,7 @@ describe('chat: sending and history', () => {
     expect(rows[0]).toMatchObject({ kind: 'user', id: 'u1:user' })
   })
 
-  it('queued and failed receipts become notices; an answer clears queued ones', () => {
+  it('queued and failed receipts become notices; the turn boundary clears queued ones', () => {
     let state = run([
       { type: 'send_started', sid: 's1', text: 'a' },
       { type: 'send_settled', sid: 's1', receipt: { ok: true, queued: true, queuedBehind: 's0' } },
@@ -228,7 +354,10 @@ describe('chat: sending and history', () => {
     expect(chatOf(state, 's1').notices).toEqual([{ id: 1, kind: 'queued', queuedBehind: 's0' }])
     state = reduce(state, { type: 'send_settled', sid: 's1', receipt: { ok: false, errorKind: 'bad_request', error: 'nope' } })
     expect(chatOf(state, 's1').notices).toHaveLength(2)
-    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'ok' }, now: NOW })
+    // Mid-turn talk does not release what the message is queued behind.
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e0', content: 'still busy' }, now: NOW })
+    expect(chatOf(state, 's1').notices.map(n => n.kind)).toEqual(['queued', 'error'])
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'ok', status: STATUS }, now: NOW })
     expect(chatOf(state, 's1').notices.map(n => n.kind)).toEqual(['error'])
     expect(reduce(state, { type: 'send_settled', sid: 's1', receipt: { ok: true } })).toBe(state)
   })

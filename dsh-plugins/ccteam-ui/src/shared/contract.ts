@@ -246,13 +246,28 @@ export interface TurnUsage {
   outputTokens?: number
 }
 
+/**
+ * The per-turn status snapshot ccteam stamps on a turn's boundary answer
+ * (upstream `TurnStatus`: model, context window, turn number, cumulative cost
+ * and tokens). Its PRESENCE is what marks the boundary — see
+ * {@link isTurnBoundary}; the fields themselves are advisory.
+ */
+export interface TurnStatus {
+  model?: string
+  context?: { usedTokens?: number; windowTokens?: number; source?: string }
+  turn?: number
+  costUsd?: number
+  tokensTotal?: number
+}
+
 export interface TranscriptRow {
   turnId: string
   role: 'user' | 'assistant'
   content: string
   ts?: string
   vendor?: string
-  status?: string
+  /** Present only on the row that closed its turn; absent = an interim answer. */
+  status?: TurnStatus
   attachments?: AttachmentRef[]
   usage?: TurnUsage
 }
@@ -366,10 +381,14 @@ export interface StatusResponse {
 /**
  * One per-session frame, translated from ccteam's session stream:
  * - `progress`: the running turn's narrative so far (a snapshot, not a delta;
- *   `done` closes the status line);
+ *   `done` means this status card will not be edited again — NOT that the
+ *   turn ended: a long turn closes several cards);
  * - `activity`: one structured step started/completed;
- * - `answer`: a delivered assistant message — the turn's result, or a
- *   human-in-the-loop prompt when `options` are present;
+ * - `answer`: something the session said. Without `status` it is an INTERIM
+ *   answer — said mid-turn while the turn keeps running; with `status` it is
+ *   the turn's one BOUNDARY (its content may be empty: a status-only closing
+ *   frame that ends the turn but carries nothing to show); with `options` it
+ *   is a human-in-the-loop prompt. {@link isTurnBoundary} is the one test;
  * - `lifecycle`: the session changed state (started / evicted / stopped …).
  */
 export type SessionEvent =
@@ -380,7 +399,7 @@ export type SessionEvent =
     id: string
     content: string
     ts?: string
-    status?: string
+    status?: TurnStatus
     attachments?: AttachmentRef[]
     options?: ChoiceOption[]
     token?: string
@@ -388,8 +407,23 @@ export type SessionEvent =
   | { kind: 'lifecycle'; state: string; reason?: string; ts?: string }
 
 /**
+ * Whether a session frame ends its turn. ccteam delivers what a session says
+ * while a turn runs as interim answers and closes every turn with exactly one
+ * answer carrying the turn's `status` snapshot, so "an answer arrived" is NOT
+ * "the turn finished" — only this is. A choice prompt (non-empty `options`)
+ * suspends the turn on a human; it does not end it. Both halves (the BFF's
+ * `turn_done` feed and the workbench's working state / reconcile) ask here.
+ */
+export function isTurnBoundary(event: SessionEvent): boolean {
+  return event.kind === 'answer'
+    && event.status !== undefined
+    && (event.options === undefined || event.options.length === 0)
+}
+
+/**
  * One SSE frame from the host. `graph` frames invalidate the team tree;
- * `turn_done` marks a completed turn (badge counter feed); `delegation`
+ * `turn_done` marks a completed turn — once per turn, at its boundary, never
+ * for an interim answer (badge counter feed); `delegation`
  * frames narrate parent/child relations; `session` frames carry one
  * {@link SessionEvent} for the sid the client subscribed to. Unknown kinds
  * must be ignored by the client (forward-compat).

@@ -26,6 +26,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { AttachmentRef, ChoiceOption, ModelsCatalog, Step, TeamNode } from '../shared/contract.js'
+import { isTurnBoundary } from '../shared/contract.js'
 import type { ApiClient } from './api.js'
 import { Composer } from './Composer.js'
 import type { ComposerAttachment } from './Composer.js'
@@ -346,9 +347,11 @@ export function Chat({ sid, project, chat, node, models, selectedStep, api, disp
         onEvent(event) {
           if (event.kind === 'session' && event.sid === sid) {
             dispatch({ type: 'session_event', sid, event: event.event, now: Date.now() })
-            if (event.event.kind === 'answer' && event.event.options === undefined) {
-              // The canonical turn is on disk now: reconcile the settled
-              // live turn against it, and refresh the statusline.
+            if (isTurnBoundary(event.event)) {
+              // The whole turn is on disk now: reconcile the rows settled
+              // from the stream against it, and refresh the statusline. An
+              // interim answer is the turn still talking — re-reading
+              // history per line would only refetch a page mid-write.
               api
                 .call('session.history', { sid })
                 .then((history) => {

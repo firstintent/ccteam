@@ -224,6 +224,36 @@ describe('method dispatch', () => {
     expect(older.nextBefore).toBe('cursor-2')
   })
 
+  it('session.history keeps a long turn\'s interim answers and drops its empty closing row', async () => {
+    const status = { model: 'opus', context: { used_tokens: 1000, window_tokens: 200_000, source: 'reported' }, turn: 2, cost_usd: 0.5, tokens_total: 1234 }
+    const fake = new FakeFetch().on('/api/v1/sessions/s1?', {
+      json: {
+        sid: 's1',
+        events: [
+          { turn_id: 's1-1', ts: '2026-08-25T10:00:00Z', user: 'fix it', assistant: 'reading the code' },
+          { turn_id: 's1-2', ts: '2026-08-25T10:03:00Z', user: '', assistant: 'found it, patching' },
+          { turn_id: 's1-3', ts: '2026-08-25T10:09:00Z', user: '', assistant: '', status },
+          { turn_id: 's1-4', ts: '2026-08-25T10:10:00Z', user: 'thanks', assistant: 'you are welcome', status: { ...status, turn: 3 } },
+        ],
+        next_before: null,
+        has_more: false,
+      },
+    })
+    const page = (await post(bff(fake), 'session.history', { sid: 's1' })).json() as { rows: Array<Record<string, unknown>> }
+
+    expect(page.rows.map(row => row.turnId)).toEqual(['s1-1:user', 's1-1:assistant', 's1-2:assistant', 's1-4:user', 's1-4:assistant'])
+    // Interim rows carry no status; the boundary row's status is the parsed object.
+    expect(page.rows[1]!.status).toBeUndefined()
+    expect(page.rows[2]!.status).toBeUndefined()
+    expect(page.rows[4]!.status).toEqual({
+      model: 'opus',
+      context: { usedTokens: 1000, windowTokens: 200_000, source: 'reported' },
+      turn: 3,
+      costUsd: 0.5,
+      tokensTotal: 1234,
+    })
+  })
+
   it('session.send posts JSON to the turn route and reports a plain acceptance', async () => {
     const fake = new FakeFetch().on('/turn', { status: 202, json: { accepted: true } })
     const res = await post(bff(fake), 'session.send', { sid: 's1', text: 'go' })
