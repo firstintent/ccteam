@@ -919,6 +919,157 @@ describe("SessionView history seed vs live stream (GitHub #186)", () => {
   });
 });
 
+describe("SessionView working state across interim answers (#209)", () => {
+  interface StreamState {
+    events: SessionEvent[];
+    connected: boolean;
+    connectionEpoch: number;
+    lastError: string | null;
+    gatewayUnavailable: boolean;
+  }
+  const STATUS = { model: "m", context: null, turn: 3, cost_usd: null, tokens_total: null };
+
+  async function mountTurnView(box: { stream: StreamState }) {
+    const harness = createHookHarness();
+    vi.resetModules();
+    vi.doMock("react", async () => ({
+      ...(await vi.importActual<typeof import("react")>("react")),
+      ...harness.hooks,
+    }));
+    vi.doMock("../hooks/useSessionEvents", async () => ({
+      ...(await vi.importActual<typeof import("../hooks/useSessionEvents")>(
+        "../hooks/useSessionEvents",
+      )),
+      useSessionEvents: () => box.stream,
+    }));
+    vi.doMock("../lib/sessionsApi", async () => ({
+      ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
+      getHistory: vi.fn().mockResolvedValue({ sid: "s9", events: [] }),
+      getSessionStatus: vi.fn().mockResolvedValue({
+        sid: "s9",
+        model: null,
+        context: null,
+        status_line: null,
+      }),
+      submitTurn: vi.fn().mockResolvedValue(undefined),
+      listScheduled: vi.fn().mockResolvedValue([]),
+      getDaemonTimezone: vi.fn().mockResolvedValue("UTC"),
+    }));
+    const View = (await import("./SessionView")).default;
+    return () => harness.render(() => View({ sid: "s9", session: SESSION }));
+  }
+
+  function unmockTurnView() {
+    vi.doUnmock("react");
+    vi.doUnmock("../hooks/useSessionEvents");
+    vi.doUnmock("../lib/sessionsApi");
+    vi.resetModules();
+  }
+
+  /** The composer element (the harness renders SessionView only, so its
+   *  children stay elements whose props we can read). */
+  function composerOf(value: unknown): Record<string, unknown> | null {
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        const found = composerOf(child);
+        if (found) return found;
+      }
+      return null;
+    }
+    if (!value || typeof value !== "object") return null;
+    const props = (value as { props?: Record<string, unknown> }).props;
+    if (!props) return null;
+    if (typeof props.onSend === "function" && "busy" in props) return props;
+    return composerOf(props.children);
+  }
+
+  const settle = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  /** Fold the new frames (effects), then read the settled tree. */
+  function push<T>(box: { stream: StreamState }, render: () => T, ...events: SessionEvent[]): T {
+    box.stream = { ...box.stream, events: [...box.stream.events, ...events] };
+    render();
+    return render();
+  }
+
+  const healthy = (): StreamState => ({
+    events: [{ id: "old", kind: "answer", content: "previous turn", status: { ...STATUS, turn: 2 } }],
+    connected: true,
+    connectionEpoch: 1,
+    lastError: null,
+    gatewayUnavailable: false,
+  });
+
+  it("an interim answer shows live while Stop + the cursor stay up until the boundary", async () => {
+    const box = { stream: healthy() };
+    try {
+      const render = await mountTurnView(box);
+      render();
+      await settle();
+      let tree = render();
+      expect(composerOf(tree)?.busy).toBe(false);
+
+      (composerOf(tree)?.onSend as (content: string) => void)("run the suite");
+      tree = render();
+      expect(composerOf(tree)?.busy).toBe(true);
+
+      // Mid-turn: a tool runs, its card seals (`done`), the session speaks.
+      tree = push(
+        box,
+        render,
+        {
+          id: "act-1",
+          kind: "activity",
+          content: "",
+          activity: { kind: "tool_call", name: "Bash", summary: "", status: "started", item_id: "b1" },
+        },
+        { id: "gateway-progress-s9-1", kind: "progress", content: "↳ 1 tools · 0 files", done: true },
+        { id: "a1", kind: "answer", content: "checking…" },
+      );
+      expect(collectElementText(tree)).toContain("checking…");
+      expect(collectElementText(tree)).toContain("↳ 1 tools · 0 files");
+      expect(composerOf(tree)?.busy).toBe(true);
+      expect(findByTestId(tree, "streaming-cursor")).not.toBeNull();
+
+      // The turn boundary: the final reply carries the turn's status.
+      tree = push(box, render, { id: "a2", kind: "answer", content: "all green", status: STATUS });
+      expect(collectElementText(tree)).toContain("all green");
+      expect(composerOf(tree)?.busy).toBe(false);
+      expect(findByTestId(tree, "streaming-cursor")).toBeNull();
+    } finally {
+      unmockTurnView();
+    }
+  });
+
+  it("a status-only boundary with no sealed card ends the turn and footers its last bubble", async () => {
+    const box = { stream: healthy() };
+    try {
+      const render = await mountTurnView(box);
+      render();
+      await settle();
+      let tree = render();
+      (composerOf(tree)?.onSend as (content: string) => void)("status?");
+      tree = push(box, render, { id: "a1", kind: "answer", content: "checking…" });
+      expect(composerOf(tree)?.busy).toBe(true);
+
+      tree = push(box, render, { id: "st", kind: "answer", content: "", status: STATUS });
+      expect(composerOf(tree)?.busy).toBe(false);
+      expect(findByTestId(tree, "streaming-cursor")).toBeNull();
+      const text = collectElementText(tree);
+      expect(text.filter((value) => value === "checking…")).toHaveLength(1);
+      // The closing frame drew no bubble of its own (two agent footers: the
+      // previous turn's and this one's); its status footers "checking…".
+      expect(text).toContain("claude · s9 · m · turn 3");
+      expect(text.filter((value) => /^claude · s9/.test(value))).toHaveLength(2);
+    } finally {
+      unmockTurnView();
+    }
+  });
+});
+
 describe("BusyHeartbeat (GitHub #186 B)", () => {
   it("renders elapsed time and the last event clock while a turn runs", () => {
     const since = Date.now() - 754_000; // 12:34 ago

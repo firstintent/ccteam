@@ -25,7 +25,12 @@ import CostPill from "../components/CostPill";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { VendorChip } from "../components/VendorChip";
-import { foldSessionLiveness, useSessionEvents } from "../hooks/useSessionEvents";
+import {
+  foldSessionLiveness,
+  turnInFlight,
+  useSessionEvents,
+  type TurnMark,
+} from "../hooks/useSessionEvents";
 import { makeT, type Lang } from "../lib/i18n";
 import { defaultDraft, normalizeDraft, vendorSpec, type ComposerDraft } from "../lib/vendors";
 import {
@@ -197,7 +202,9 @@ export default function SessionView({
   // wins over what the user typed.
   const [editingTitle, setEditingTitle] = useState(false);
   const [pendingTitle, setPendingTitle] = useState<string | null>(null);
-  const [busyMark, setBusyMark] = useState<number | null>(null);
+  // The turn this page sent, as a watermark into the SSE buffer (see
+  // `turnInFlight`); `null` = no turn of ours is running.
+  const [turnMark, setTurnMark] = useState<TurnMark | null>(null);
   const [busySince, setBusySince] = useState<number | null>(null);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [rows, setRows] = useState<TranscriptRow[]>(() => loadRows(sid));
@@ -247,10 +254,12 @@ export default function SessionView({
             setRows((current) => mergeHistory(current, seeded, events, barrier));
             foldedRef.current = events.length;
           }
-          const latest = [...seeded].reverse().find((row) => row.kind === "assistant" && row.status);
-          if (latest?.status) {
-            setStatusModel(latest.status.model ?? null);
-            setCtxPct(contextPct(latest.status.context));
+          // Newest turn status in the page — a status-only closing row counts
+          // even when it had no reply of its own to footer (#209).
+          const latest = [...h.events].reverse().find((ev) => ev.status)?.status;
+          if (latest) {
+            setStatusModel(latest.model ?? null);
+            setCtxPct(contextPct(latest.context));
           }
           setHistoryPage({
             hasMore: h.has_more === true,
@@ -322,9 +331,19 @@ export default function SessionView({
     saveRows(sid, rows);
   }, [sid, rows]);
 
+  // ---- working state of the turn we sent (#209) ------------------------------
+  // Ends on the turn BOUNDARY only — the one status-bearing answer. Neither an
+  // interim answer (the session talking mid-turn; Stop + the cursor must stay)
+  // nor a sealed progress card (`done` closes one card, not the turn) ends
+  // it, and a boundary with no sealed card before it still does.
+  const busy = turnInFlight(events, turnMark);
+  if (turnMark !== null && !busy) {
+    // Retire the finished turn's watermark (render-phase adjust) so its
+    // boundary aging out of the ring can never resurrect it.
+    setTurnMark(null);
+  }
+
   // ---- per-session status (model + effort + ctx%) --------------------------
-  const doneCount = events.reduce((n, ev) => (ev.done ? n + 1 : n), 0);
-  const busy = busyMark !== null && doneCount === busyMark;
   const lastEventTs = events.length > 0 ? events[events.length - 1]?.ts : undefined;
   useEffect(() => {
     let cancelled = false;
@@ -423,10 +442,11 @@ export default function SessionView({
         .filter(Boolean);
       const shown = names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
       pushRow({ kind: "user", content: shown });
-      setBusyMark(doneCount);
+      const buffered = eventsRef.current;
+      setTurnMark({ after: buffered[buffered.length - 1] ?? null });
       setBusySince(Date.now());
       submitTurn(sid, content, attachments).catch((e) => {
-        setBusyMark(null);
+        setTurnMark(null);
         setBusySince(null);
         const detail = e instanceof Error ? e.message : "unknown";
         pushRow({
@@ -435,7 +455,7 @@ export default function SessionView({
         });
       });
     },
-    [sid, pushRow, doneCount],
+    [sid, pushRow],
   );
 
   // ---- resolve a HITL approval prompt (gateway pending machinery) ----------

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendEvent,
   appendRow,
+  currentTurnFold,
   eventToRow,
   foldActivity,
   emptyFold,
@@ -225,6 +226,13 @@ describe("chatTranscript eventToRow", () => {
     expect(r).not.toBeNull();
     expect(r!.kind).toBe("system");
   });
+
+  it("a card sealed mid-turn reads its own text, never a hardcoded `done` (#209)", () => {
+    const r = eventToRow(
+      ev({ id: "gateway-progress-s9-1", kind: "progress", content: "↳ 3 tools · 1 files", done: true }),
+    );
+    expect(r).toMatchObject({ kind: "system", content: "↳ 3 tools · 1 files" });
+  });
 });
 
 describe("chatTranscript activity fold (v0.8.21 — mirrors IM ProgressFold)", () => {
@@ -316,6 +324,74 @@ describe("chatTranscript activity fold (v0.8.21 — mirrors IM ProgressFold)", (
   });
 });
 
+describe("chatTranscript interim answers and the turn boundary (#209)", () => {
+  const STATUS = { model: "m", context: null, turn: 3, cost_usd: null, tokens_total: null };
+  const step = (item: string, name = "Bash"): SessionEvent => ({
+    kind: "activity",
+    content: "",
+    activity: { kind: "tool_call", name, summary: "", status: "started", item_id: item },
+  });
+
+  it("an interim answer is a live bubble; the status-only boundary footers it, no empty bubble", () => {
+    let rows: TranscriptRow[] = [{ id: "u1", kind: "user", content: "go" }];
+    rows = appendEvent(rows, step("b1"));
+    rows = appendEvent(rows, { id: "p1", kind: "progress", content: "↳ 1 tools · 0 files", done: true });
+    rows = appendEvent(rows, { id: "a1", kind: "answer", content: "checking…" });
+    rows = appendEvent(rows, step("r1", "Read"));
+    rows = appendEvent(rows, { id: "a2", kind: "answer", content: "found it" });
+    expect(rows.map((r) => r.kind)).toEqual(["user", "activity", "system", "assistant", "activity", "assistant"]);
+    expect(rows[3]!.status).toBeUndefined();
+    expect(rows[5]!.status).toBeUndefined();
+
+    rows = appendEvent(rows, { id: "st", kind: "answer", content: "", status: STATUS });
+    expect(rows).toHaveLength(6); // no bubble for the closing frame
+    expect(rows[5]!.status).toEqual(STATUS); // the turn's last answer carries the footer
+    expect(rows[3]!.status).toBeUndefined();
+  });
+
+  it("the footer walks back over activity/system rows but never past the turn's user row", () => {
+    let rows: TranscriptRow[] = [{ id: "a0", kind: "assistant", content: "earlier" }];
+    rows = appendEvent(rows, { id: "a1", kind: "answer", content: "said" });
+    rows = appendEvent(rows, step("b1"));
+    rows = appendEvent(rows, { id: "p1", kind: "progress", content: "✅ done · 1 tools", done: true });
+    rows = appendEvent(rows, { id: "st", kind: "answer", content: "", status: STATUS });
+    expect(rows[1]!.status).toEqual(STATUS);
+
+    const asked: TranscriptRow[] = [
+      { id: "a0", kind: "assistant", content: "unfinished" },
+      { id: "u1", kind: "user", content: "next" },
+    ];
+    expect(appendEvent(asked, { id: "st2", kind: "answer", content: "", status: STATUS })).toBe(asked);
+
+    const footered: TranscriptRow[] = [{ id: "a0", kind: "assistant", content: "x", status: STATUS }];
+    const later = { ...STATUS, turn: 4 };
+    expect(appendEvent(footered, { id: "st3", kind: "answer", content: "", status: later })).toBe(
+      footered,
+    );
+  });
+
+  it("a boundary that carries the final reply is that reply's own bubble + footer", () => {
+    const rows = appendEvent([], { id: "f", kind: "answer", content: "final", status: STATUS });
+    expect(rows).toEqual([
+      expect.objectContaining({ kind: "assistant", content: "final", status: STATUS }),
+    ]);
+  });
+
+  it("currentTurnFold counts the whole turn across interim answers; the boundary resets it", () => {
+    const on = (sid: string, ev: SessionEvent) => ({ ...ev, sid });
+    const events = [
+      on("s1", step("b1")),
+      on("s1", { kind: "answer", content: "checking…" }),
+      on("s2", step("x1", "Edit")),
+      on("s1", step("r1", "Read")),
+    ];
+    expect(renderFold(currentTurnFold(events, "s1"))).toBe("⏳ working… · 🔧 bash ×1 · 📖 read ×1");
+    const ended = [...events, on("s1", { kind: "answer", content: "", status: STATUS })];
+    expect(currentTurnFold(ended, "s1")).toEqual(emptyFold());
+    expect(renderFold(currentTurnFold(ended, "s2"))).toBe("⏳ working… · ✏️ edit ×1");
+  });
+});
+
 describe("chatTranscript historyToRows", () => {
   it("expands mirrored turns into user+assistant rows", () => {
     const events: SessionHistoryEvent[] = [
@@ -335,6 +411,39 @@ describe("chatTranscript historyToRows", () => {
     ];
     const rows = historyToRows(events);
     expect(rows.map((r) => r.ts)).toEqual(["2026-06-06T00:00:00Z", "2026-06-06T00:00:00Z"]);
+  });
+
+  it("a status-only closing row is no bubble; its status footers the turn's last answer (#209)", () => {
+    const status = { model: "m", context: null, turn: 7, cost_usd: null, tokens_total: null };
+    const events: SessionHistoryEvent[] = [
+      { turn_id: "t1", ts: "2026-09-25T00:00:00Z", role: "", user: "go", assistant: "" },
+      { turn_id: "t2", ts: "2026-09-25T00:01:00Z", role: "", user: "", assistant: "checking…" },
+      { turn_id: "t3", ts: "2026-09-25T00:09:00Z", role: "", user: "", assistant: "all green" },
+      { turn_id: "t4", ts: "2026-09-25T00:09:01Z", role: "", user: "", assistant: "", status },
+    ];
+    const rows = historyToRows(events);
+    expect(rows.map((r) => [r.kind, r.content])).toEqual([
+      ["user", "go"],
+      ["assistant", "checking…"],
+      ["assistant", "all green"],
+    ]);
+    expect(rows[1]!.status).toBeUndefined(); // interim stays footer-less
+    expect(rows[2]!.status).toEqual(status);
+  });
+
+  it("a closing row never footers another turn's answer", () => {
+    const prev = { model: "m", context: null, turn: 1, cost_usd: null, tokens_total: null };
+    const next = { ...prev, turn: 2 };
+    const rows = historyToRows([
+      { turn_id: "t1", ts: "a", role: "", user: "", assistant: "earlier", status: prev },
+      { turn_id: "t2", ts: "b", role: "", user: "", assistant: "", status: next },
+      { turn_id: "t3", ts: "c", role: "", user: "", assistant: "unfinished" },
+      { turn_id: "t4", ts: "d", role: "", user: "new question", assistant: "" },
+      { turn_id: "t5", ts: "e", role: "", user: "", assistant: "", status: next },
+    ]);
+    expect(rows.map((r) => r.content)).toEqual(["earlier", "unfinished", "new question"]);
+    expect(rows[0]!.status).toEqual(prev); // already footered: kept
+    expect(rows[1]!.status).toBeUndefined(); // behind the new turn's user row
   });
 
   it("renders an attachment-only mirrored turn after reload", () => {
@@ -387,6 +496,38 @@ describe("chatTranscript mergeHistory (GitHub #186 A)", () => {
     const seeded = historyToRows(page("late"));
     const rows = mergeHistory([], seeded, [answer("e1", "late")], 0);
     expect(rows.filter((r) => r.content === "late")).toHaveLength(1);
+  });
+
+  it("keeps a live interim line that repeats an OLDER mirrored line (#209)", () => {
+    // The session said "checking…" earlier in the page, then finished; mid
+    // the next turn it says "checking…" again while the reseed is in flight.
+    const seeded = historyToRows([
+      { turn_id: "t1", ts: "x", role: "", user: "q", assistant: "" },
+      { turn_id: "t2", ts: "x", role: "", user: "", assistant: "checking…" },
+      { turn_id: "t3", ts: "x", role: "", user: "", assistant: "done" },
+    ]);
+    const rows = mergeHistory([], seeded, [answer("e9", "checking…")], 0);
+    expect(rows.map((r) => r.content)).toEqual(["q", "checking…", "done", "checking…"]);
+  });
+
+  it("dedups only the page's tail, in order", () => {
+    const seeded = historyToRows([
+      { turn_id: "t1", ts: "x", role: "", user: "q", assistant: "" },
+      { turn_id: "t2", ts: "x", role: "", user: "", assistant: "a1" },
+      { turn_id: "t3", ts: "x", role: "", user: "", assistant: "a2" },
+    ]);
+    // a2 was mirrored before the server read the page; a3 after it.
+    const rows = mergeHistory([], seeded, [answer("e2", "a2"), answer("e3", "a3")], 0);
+    expect(rows.map((r) => r.content)).toEqual(["q", "a1", "a2", "a3"]);
+  });
+
+  it("a late status-only boundary footers the page's last answer, once", () => {
+    const status = { model: "m", context: null, turn: 5, cost_usd: null, tokens_total: null };
+    const seeded = historyToRows(page("working on it"));
+    const boundary: SessionEvent = { id: "st", kind: "answer", content: "", status };
+    const rows = mergeHistory([], seeded, [boundary], 0);
+    expect(rows.map((r) => r.content)).toEqual(["q", "working on it"]);
+    expect(rows[1]!.status).toEqual(status);
   });
 
   it("treats frames delivered before the request as mirrored by the page", () => {

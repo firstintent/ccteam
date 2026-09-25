@@ -70,20 +70,33 @@ describe("sidsActiveWithin", () => {
     expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(false);
   });
 
-  it("a finalizing progress (done:true) ends the pulse even if recent", () => {
+  const STATUS = { model: "m", context: null, turn: 2, cost_usd: null, tokens_total: null };
+
+  it("a sealed progress card (done:true) does not end the pulse mid-turn (#209)", () => {
     const now = 100_000;
     const events = [
       ts({ sid: "s1", kind: "activity", receivedAt: now - 500 }),
       ts({ sid: "s1", kind: "progress", done: true, receivedAt: now - 200 }),
     ];
-    expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(false);
+    expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(true);
   });
 
-  it("an answer ends the pulse", () => {
+  it("an interim answer (no status) keeps the pulse — the turn goes on (#209)", () => {
     const now = 100_000;
     const events = [
       ts({ sid: "s1", kind: "activity", receivedAt: now - 500 }),
-      ts({ sid: "s1", kind: "answer", receivedAt: now - 200 }),
+      ts({ sid: "s1", kind: "answer", content: "checking…", receivedAt: now - 200 }),
+    ];
+    expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(true);
+  });
+
+  it("the turn boundary (a status-bearing answer) ends the pulse", () => {
+    const now = 100_000;
+    const events = [
+      ts({ sid: "s1", kind: "activity", receivedAt: now - 500 }),
+      ts({ sid: "s1", kind: "answer", content: "checking…", receivedAt: now - 400 }),
+      ts({ sid: "s1", kind: "progress", done: true, receivedAt: now - 300 }),
+      ts({ sid: "s1", kind: "answer", content: "", status: STATUS, receivedAt: now - 200 }),
     ];
     expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(false);
   });

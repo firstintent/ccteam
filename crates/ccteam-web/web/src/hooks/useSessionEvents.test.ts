@@ -10,11 +10,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   appendSessionEvent,
   foldSessionLiveness,
+  isTurnBoundary,
   parseSessionEvent,
   sessionEventsUrl,
   startSessionEventStream,
   shouldAcceptEventSeq,
   SESSION_RING_CAP,
+  turnInFlight,
   type SessionEvent,
 } from "./useSessionEvents";
 
@@ -375,6 +377,58 @@ describe("appendSessionEvent ring buffer", () => {
     expect(events).toHaveLength(SESSION_RING_CAP);
     expect(events[events.length - 1].content).toBe(String(SESSION_RING_CAP + 9));
     expect(events[0].content).toBe(String(10));
+  });
+});
+
+describe("turn boundary vs interim answer (#209)", () => {
+  const STATUS = { model: "m", context: null, turn: 3, cost_usd: null, tokens_total: null };
+  const parse = (frame: Record<string, unknown>) => parseSessionEvent(JSON.stringify(frame))!;
+
+  it("only a status-bearing answer ends the turn", () => {
+    // Interim: the session said something mid-turn — no status, still running.
+    const interim = parse({ id: "a1", kind: "answer", content: "checking…" });
+    expect(interim.status).toBeUndefined();
+    expect(isTurnBoundary(interim)).toBe(false);
+    // A null status is the same as none (never a boundary).
+    expect(isTurnBoundary(parse({ kind: "answer", content: "x", status: null }))).toBe(false);
+    // The boundary, with the final reply or status-only (empty content).
+    expect(isTurnBoundary(parse({ kind: "answer", content: "final", status: STATUS }))).toBe(true);
+    expect(isTurnBoundary(parse({ kind: "answer", content: "", status: STATUS }))).toBe(true);
+    // A sealed progress card is not a turn boundary, even the last one.
+    const sealed = parse({ kind: "progress", content: "↳ 3 tools · 1 files", done: true });
+    expect(sealed.done).toBe(true);
+    expect(isTurnBoundary(sealed)).toBe(false);
+  });
+
+  it("turnInFlight: running until a boundary arrives AFTER the send", () => {
+    const before: SessionEvent = { kind: "answer", content: "old", status: STATUS };
+    const interim: SessionEvent = { kind: "answer", content: "checking…" };
+    const sealed: SessionEvent = { kind: "progress", content: "↳ 1 tools", done: true };
+    const boundary: SessionEvent = { kind: "answer", content: "", status: STATUS };
+
+    expect(turnInFlight([before], null)).toBe(false); // nothing sent from here
+    const mark = { after: before };
+    // The previous turn's boundary sits BEFORE the watermark: not ours.
+    expect(turnInFlight([before], mark)).toBe(true);
+    expect(turnInFlight([before, sealed, interim], mark)).toBe(true);
+    expect(turnInFlight([before, sealed, interim, boundary], mark)).toBe(false);
+    // Sent into an empty buffer.
+    expect(turnInFlight([interim], { after: null })).toBe(true);
+    expect(turnInFlight([interim, boundary], { after: null })).toBe(false);
+  });
+
+  it("turnInFlight survives the ring dropping the watermark frame", () => {
+    const mark = { after: { kind: "activity", content: "" } as SessionEvent };
+    let events: SessionEvent[] = [mark.after];
+    for (let i = 0; i < SESSION_RING_CAP + 5; i++) {
+      events = appendSessionEvent(events, { kind: "progress", content: String(i), done: true });
+    }
+    expect(events).not.toContain(mark.after);
+    // Many sealed cards later the turn is still running…
+    expect(turnInFlight(events, mark)).toBe(true);
+    // …and ends on its boundary.
+    events = appendSessionEvent(events, { kind: "answer", content: "done", status: STATUS });
+    expect(turnInFlight(events, mark)).toBe(false);
   });
 });
 

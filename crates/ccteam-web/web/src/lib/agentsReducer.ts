@@ -4,6 +4,7 @@
 
 import type { AgentEdge } from "./agentsApi";
 import type { AgentsEvent } from "../hooks/useAgentsEvents";
+import { isTurnBoundary } from "../hooks/useSessionEvents";
 
 /** Fold one delegation frame into the edge list: `dispatched` marks (or
  *  creates) the parent→child edge active; `completed`/`notified`/`stopped`/
@@ -64,11 +65,14 @@ export interface TimestampedAgentsEvent extends AgentsEvent {
 }
 
 /** Which sids currently look "in-turn" (pulse the node ring): the LAST
- *  `progress`/`activity` frame for that sid landed within `windowMs` (default
- *  15s, per tech-design) of `nowMs`, and no finalizing `progress{done:true}`
- *  or `answer` has landed for it since. Processes events in order so a later
- *  terminal frame always wins over an earlier non-terminal one. Pure +
- *  DOM-free; `nowMs` is injectable for deterministic tests. */
+ *  in-turn frame for that sid — `progress` / `activity`, or an interim
+ *  `answer` (the session speaking mid-turn, #209) — landed within `windowMs`
+ *  (default 15s, per tech-design) of `nowMs`, and no turn boundary
+ *  ({@link isTurnBoundary}) has landed for it since. A sealed progress card
+ *  (`progress{done:true}`) neither ends nor extends the pulse: it closes one
+ *  card, not the turn. Processes events in order so a later boundary always
+ *  wins over an earlier in-turn frame. Pure + DOM-free; `nowMs` is
+ *  injectable for deterministic tests. */
 export function sidsActiveWithin(
   events: TimestampedAgentsEvent[],
   windowMs: number = 15_000,
@@ -77,15 +81,12 @@ export function sidsActiveWithin(
   const lastNonTerminalAt = new Map<string, number>();
   for (const ev of events) {
     if (!ev.sid) continue;
-    if (ev.kind === "progress" && ev.done) {
-      lastNonTerminalAt.delete(ev.sid); // a finalizing progress ends the pulse
-      continue;
-    }
-    if (ev.kind === "answer") {
+    if (isTurnBoundary(ev)) {
       lastNonTerminalAt.delete(ev.sid);
       continue;
     }
-    if (ev.kind === "progress" || ev.kind === "activity") {
+    if (ev.kind === "progress" && ev.done) continue;
+    if (ev.kind === "progress" || ev.kind === "activity" || ev.kind === "answer") {
       lastNonTerminalAt.set(ev.sid, ev.receivedAt);
     }
   }

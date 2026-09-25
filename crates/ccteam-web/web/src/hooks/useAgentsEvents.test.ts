@@ -94,6 +94,18 @@ describe("parseAgentsEvent", () => {
     expect(ev).toMatchObject({ kind: "session_lifecycle", sid: "s4", slug: "demo" });
   });
 
+  it("keeps an answer's status so an interim answer and the turn boundary differ (#209)", () => {
+    const status = { model: "m", context: null, turn: 4, cost_usd: null, tokens_total: null };
+    const boundary = parseAgentsEvent(
+      JSON.stringify({ kind: "answer", sid: "s1", content: "", status }),
+    );
+    expect(boundary!.status).toEqual(status);
+    const interim = parseAgentsEvent(
+      JSON.stringify({ kind: "answer", sid: "s1", content: "checking…", status: null }),
+    );
+    expect(interim!.status).toBeUndefined();
+  });
+
   it("defaults an unrecognized kind to answer and missing content to ''", () => {
     const ev = parseAgentsEvent(JSON.stringify({ foo: "bar" }));
     expect(ev).toMatchObject({ kind: "answer", content: "" });

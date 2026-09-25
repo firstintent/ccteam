@@ -3,7 +3,7 @@
 // Generalizes `useProgressStream`'s EventSource dance to the W2 endpoint
 //   GET /api/v1/sessions/{sid}/events
 // which streams `event: progress` frames whose payload is the W2 shape
-//   { id, sid, kind: "answer" | "progress", content, ts, done?, options? }
+//   { id, sid, kind: "answer" | "progress", content, ts, done?, status?, options? }
 // (see `crates/ccteam-web/src/routes/sessions_api.rs::session_event_payload`).
 // `options` is the non-empty label list of an approval ChoicePrompt — the
 // hook surfaces it so ChatConsole can render "session sX wants to run …
@@ -52,10 +52,11 @@ export interface SessionActivity {
 
 /** One event line off the per-session SSE stream (the W2 payload shape).
  *  `kind` is "answer" (assistant reply / approval prompt), "progress"
- *  (status edit, `done` on the finalizing one), or "activity" (a structured
- *  per-step `activity` payload, v0.8.19). `options` present + non-empty
- *  marks an approval prompt; `token` is then the pending-resolution token
- *  the web resolve path POSTs back (R-H1). */
+ *  (status edit; `done` once that progress CARD is sealed — not the turn,
+ *  see {@link isTurnBoundary}), or "activity" (a structured per-step
+ *  `activity` payload, v0.8.19). `options` present + non-empty marks an
+ *  approval prompt; `token` is then the pending-resolution token the web
+ *  resolve path POSTs back (R-H1). */
 export interface SessionEvent {
   id?: string;
   sid?: string;
@@ -80,7 +81,43 @@ export interface SessionEvent {
    *  branch (`ccteam-web/src/routes/sessions_api.rs`). */
   state?: string;
   reason?: string;
+  /** Present on exactly one `answer` per turn: the turn boundary. Absent on
+   *  an interim answer (see {@link isTurnBoundary}). */
   status?: TurnStatus;
+}
+
+/** Whether `ev` ends its session's turn (#209). A session now speaks DURING
+ *  a long turn: each thing it says mid-turn arrives as an interim `answer`
+ *  with no `status`, and the turn is still running after it. The turn ends
+ *  on exactly one status-bearing `answer` — non-empty `content` = the final
+ *  reply, empty = a status-only closing frame. `progress{done:true}` only
+ *  seals one progress card (each interim answer seals the current one) and
+ *  says nothing about the turn; a turn can also end with no sealed card at
+ *  all. Every "is the turn over?" question in the SPA asks this predicate —
+ *  never "did an answer arrive" or "did a card finalize". */
+export function isTurnBoundary(ev: { kind: string; status?: TurnStatus | null }): boolean {
+  return ev.kind === "answer" && ev.status != null;
+}
+
+/** The send-time watermark of a turn submitted from this page: the newest
+ *  frame already buffered when it left (`null` = the buffer was empty). */
+export interface TurnMark {
+  after: SessionEvent | null;
+}
+
+/** Whether the turn sent at `mark` is still running: no turn boundary has
+ *  arrived since the send. Anchored on the watermark frame's IDENTITY rather
+ *  than a count or an index: the ring drops its oldest frames once full, so a
+ *  count shrinks and an index shifts in the middle of exactly the long turns
+ *  this has to survive. A watermark that has aged out of the ring means every
+ *  buffered frame is newer than the send. Pure — unit-testable. */
+export function turnInFlight(events: readonly SessionEvent[], mark: TurnMark | null): boolean {
+  if (!mark) return false;
+  const start = mark.after ? events.lastIndexOf(mark.after) + 1 : 0;
+  for (let index = start; index < events.length; index += 1) {
+    if (isTurnBoundary(events[index]!)) return false;
+  }
+  return true;
 }
 
 export interface UseSessionEventsResult {
