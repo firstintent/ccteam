@@ -713,6 +713,18 @@ fn maybe_liveness_event(
     kind: &str,
     details: ThreadItemDetails,
 ) -> Vec<ThreadEvent> {
+    // No open turn → nothing is running for the pulse to keep alive: the
+    // chunk itself is dropped from every answer, and a pulse for it read to
+    // the gateway (and to a web client) as a new turn starting after the last
+    // one had ended (#209).
+    let Some(turn_id) = state
+        .vendor_started_buffer
+        .as_ref()
+        .or(state.buffer.as_ref())
+        .map(|b| b.turn_id.clone())
+    else {
+        return Vec::new();
+    };
     let now = Instant::now();
     if state
         .last_liveness_at
@@ -721,12 +733,6 @@ fn maybe_liveness_event(
         return Vec::new();
     }
     state.last_liveness_at = Some(now);
-    let turn_id = state
-        .vendor_started_buffer
-        .as_ref()
-        .or(state.buffer.as_ref())
-        .map(|b| b.turn_id.as_str())
-        .unwrap_or("pending");
     vec![ThreadEvent::ItemUpdated {
         item: ThreadItem {
             // Stable per-kind id so ProgressFold updates one card, not a flood.
@@ -1288,6 +1294,21 @@ mod tests {
             said(&boundary),
             vec!["all green".to_string()],
             "the boundary reports only what no earlier message carried"
+        );
+    }
+
+    /// #209 — with no turn open there is nothing for a liveness pulse to keep
+    /// alive; one used to go out as `pending-live-*` and read downstream as a
+    /// new turn starting after the last one had ended.
+    #[test]
+    fn no_open_turn_means_no_liveness_pulse() {
+        let mut st = SessionTranslateState::default();
+        assert!(apply_notification(&mut st, &chunk("stray")).is_empty());
+        st.begin_turn("t-live", Arc::new(Notify::new()));
+        let pulse = apply_notification(&mut st, &chunk("working"));
+        assert!(
+            matches!(pulse.as_slice(), [ThreadEvent::ItemUpdated { item }] if item.id == "t-live-live-msg"),
+            "{pulse:?}"
         );
     }
 
