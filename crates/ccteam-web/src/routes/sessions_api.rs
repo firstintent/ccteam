@@ -1501,7 +1501,8 @@ pub(crate) fn parse_last_event_id(headers: &HeaderMap, query: &SessionEventsQuer
 fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
     use ccteam_im::gateway::GatewayEventKind;
     GatewayEvent {
-        interim: false,
+        // Re-seeds the live prompt above: the turn is waiting, not over (#209).
+        interim: true,
         id: format!("permission-{}", prompt.token),
         channel: String::new(),
         chat_id: String::new(),

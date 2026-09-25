@@ -18006,7 +18006,8 @@ fn emit_turn_stall_warning(
          tune the window via CCTEAM_IM_GATEWAY_TURN_TIMEOUT_MS (0 = off)."
     );
     let _ = tx.send(GatewayEvent {
-        interim: false,
+        // A heads-up about a turn that is still running, not its end (#209).
+        interim: true,
         id: format!("gateway-timeout-{session_id}-{turn_id}"),
         channel,
         chat_id,

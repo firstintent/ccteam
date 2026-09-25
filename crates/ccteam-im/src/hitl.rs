@@ -394,7 +394,8 @@ async fn ask_external_choice(
     }
     if sink
         .send(GatewayEvent {
-            interim: false,
+            // The turn is waiting on this answer, not over (#209).
+            interim: true,
             id: format!("permission-{token}"),
             channel: ctx.channel.clone(),
             chat_id: ctx.chat_id.clone(),
