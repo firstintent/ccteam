@@ -255,8 +255,13 @@ mod tests {
 
         // Past every window (weekly reset gone, and beyond the credit bound):
         // nothing usable survives, so the row is omitted rather than stale.
+        // The credit bound runs from the REAL observation (`record_*` stamps
+        // `Utc::now()`), so "past it" is anchored there — a fixed date turned
+        // this assertion red a week after the fixture's own dates.
+        let past_everything =
+            (Utc::now() + WEEKLY_NATURAL).max(at("2026-09-03T00:00:00Z")) + Duration::days(1);
         assert_eq!(
-            last_known_usage_in(root.path(), "claude", at("2026-09-30T00:00:00Z")),
+            last_known_usage_in(root.path(), "claude", past_everything),
             None
         );
         // An unknown vendor never borrows another's account.
