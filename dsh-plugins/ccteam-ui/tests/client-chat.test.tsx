@@ -80,7 +80,7 @@ const MID_TURN: Action[] = [
   { type: 'send_started', sid: 's1', text: 'fix the build' },
   on({ kind: 'activity', step: { itemId: 't1', kind: 'command_exec', name: 'cargo', summary: 'cargo build', status: 'started' } }),
   on({ kind: 'activity', step: { itemId: 't1', kind: 'command_exec', name: 'cargo', summary: 'cargo build', status: 'completed' } }),
-  on({ kind: 'answer', id: 'a1', content: 'The build fails in the linker; patching the flags next.' }),
+  on({ kind: 'answer', id: 'a1', content: 'The build fails in the linker; patching the flags next.', interim: true }),
 ]
 
 describe('chat: a long turn', () => {
@@ -103,5 +103,16 @@ describe('chat: a long turn', () => {
     // One assistant block (the interim answer, with its step) and no empty one.
     expect(assistantBlocks(html)).toBe(1)
     expect(html).not.toMatch(/<div class="[^"]*turnAssistant[^"]*"><\/div>/)
+  })
+
+  it('a turn-ending answer with no status (the model switch receipt) takes Stop down', () => {
+    const html = render(chatAfter([
+      { type: 'send_started', sid: 's1', text: '/model opus' },
+      on({ kind: 'progress', content: '', done: false }),
+      on({ kind: 'answer', id: 'r1', content: 'switched model → opus' }),
+    ]))
+    expect(html).toContain('switched model → opus')
+    expect(html).not.toContain(zh['chat.working'])
+    expect(html).not.toContain('data-stop=""')
   })
 })

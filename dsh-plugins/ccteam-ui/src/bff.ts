@@ -994,9 +994,8 @@ export function attachmentRefs(value: unknown, sid: string): AttachmentRef[] | u
  * One upstream history event carries BOTH halves of a turn (`user` +
  * `assistant`, either possibly empty), so it fans out into up to two contract
  * rows. Ids are suffixed to stay unique. A long turn is several events — its
- * interim answers (no `status`) and a closing one carrying the turn's
- * `status`, whose `assistant` is EMPTY when the last thing said was already
- * delivered mid-turn; an empty half is never a row.
+ * interim answers and a closing one, whose `assistant` is EMPTY when the last
+ * thing said was already delivered mid-turn; an empty half is never a row.
  */
 export function transcriptRows(events: unknown[], sid = ''): TranscriptRow[] {
   const rows: TranscriptRow[] = []
@@ -1048,14 +1047,12 @@ export function transcriptRows(events: unknown[], sid = ''): TranscriptRow[] {
  * and lifecycle frames for whichever sid they concern (clients filter).
  *
  * `session_lifecycle` and `delegation` change the tree's shape; a completed
- * turn changes its cost/turn counters. Turn completion is the turn's one
- * BOUNDARY answer — the `answer` carrying a `status` snapshot
- * ({@link isTurnBoundary}), content or not. Everything else a turn emits is
- * mid-turn and completes nothing: an interim `answer` (no `status`) is the
- * session talking while it works, an `answer` with `options` is a
- * human-in-the-loop prompt, and `progress`+`done` only closes one status card
- * (a long turn closes several), so none of them feeds the badge or re-reads
- * the tree.
+ * turn changes its cost/turn counters. Turn completion is any `answer` that
+ * is not marked `interim` ({@link isTurnBoundary}) — status or not, content
+ * or not. The rest completes nothing: an `interim` answer is the session
+ * talking while it works, an `answer` with `options` is a human-in-the-loop
+ * prompt, and `progress`+`done` only makes one status card final (a long
+ * turn seals several), so none of them feeds the badge or re-reads the tree.
  */
 export function translateGlobal(frame: SseFrame): PanelEvent[] {
   if (frame.event === 'reconnect_hint' || frame.event === 'gateway_unavailable') return []
@@ -1132,7 +1129,8 @@ export function translateSession(sid: string, frame: SseFrame): PanelEvent[] {
 /**
  * One upstream `answer` payload as the contract's answer event — the single
  * parser both streams share, so the global feed's boundary test and the
- * session stream see the same event.
+ * session stream see the same event. Only a literal `interim: true` marks a
+ * mid-turn message; anything else is a turn-ending answer, as it always was.
  */
 function answerOf(sid: string, data: Record<string, unknown>): Extract<SessionEvent, { kind: 'answer' }> {
   const options = choiceOptions(data.options)
@@ -1141,6 +1139,7 @@ function answerOf(sid: string, data: Record<string, unknown>): Extract<SessionEv
     id: stringOf(data.id) ?? '',
     content: stringOf(data.content) ?? '',
     ...defined('ts', stringOf(data.ts)),
+    ...(data.interim === true ? { interim: true as const } : {}),
     ...defined('status', turnStatusOf(data.status)),
     ...defined('attachments', attachmentRefs(data.attachments, sid)),
     ...(options.length > 0 ? { options } : {}),
@@ -1151,9 +1150,8 @@ function answerOf(sid: string, data: Record<string, unknown>): Extract<SessionEv
 /**
  * Upstream `TurnStatus` (`{model, context: {used_tokens, window_tokens,
  * source}, turn, cost_usd, tokens_total}`, any field null) → the contract's
- * camelCase {@link TurnStatus}. The wire carries it as an OBJECT, and only on
- * a turn's boundary; absent / `null` / anything but an object is no status,
- * which is what makes an answer interim.
+ * camelCase {@link TurnStatus}. The wire carries it as an OBJECT; absent /
+ * `null` / anything but an object is no status.
  */
 export function turnStatusOf(value: unknown): TurnStatus | undefined {
   const row = asRecord(value)

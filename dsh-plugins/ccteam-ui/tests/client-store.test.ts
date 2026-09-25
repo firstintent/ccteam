@@ -28,13 +28,14 @@ function run(actions: Action[], start = initialState()): ConsoleState {
 
 const NOW = 1_700_000_000_000
 
-/** What a turn's boundary answer carries; its presence is the boundary. */
+/** The snapshot a structured turn's closing answer carries (advisory). */
 const STATUS: TurnStatus = { model: 'opus', turn: 1, costUsd: 0.1 }
 
 const step = (itemId: string, status: 'started' | 'completed'): Step => ({ itemId, kind: 'tool_call', name: 'Bash', summary: itemId, status })
 const on = (event: SessionEvent): Action => ({ type: 'session_event', sid: 's1', event, now: NOW })
 const activity = (itemId: string, status: 'started' | 'completed'): Action => on({ kind: 'activity', step: step(itemId, status) })
-const interim = (id: string, content: string): Action => on({ kind: 'answer', id, content })
+const interim = (id: string, content: string, extra: Partial<SessionEvent> = {}): Action =>
+  on({ kind: 'answer', id, content, interim: true, ...extra } as SessionEvent)
 const boundary = (id: string, content: string): Action => on({ kind: 'answer', id, content, status: STATUS })
 
 describe('selection', () => {
@@ -107,7 +108,7 @@ describe('recents', () => {
 })
 
 describe('chat: live turn', () => {
-  it('progress content is a snapshot, steps upsert by item id and complete on done', () => {
+  it('progress content is a snapshot, steps upsert by item id, and a done card finishes no step', () => {
     let state = run([
       { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
       { type: 'session_event', sid: 's1', event: { kind: 'progress', content: 'looking', done: false }, now: NOW },
@@ -120,13 +121,14 @@ describe('chat: live turn', () => {
     expect(live?.steps[0]?.status).toBe('completed')
     state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't2', kind: 'command_exec', name: 'cargo', summary: 'cargo test', status: 'started' } }, now: NOW })
     state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'progress', content: '', done: true }, now: NOW })
-    expect(chatOf(state, 's1').live?.steps.every(s => s.status === 'completed')).toBe(true)
+    // Steps finish on their own completion events; the turn's end settles the rest.
+    expect(chatOf(state, 's1').live?.steps.map(s => [s.itemId, s.status])).toEqual([['t1', 'completed'], ['t2', 'started']])
   })
 
   it('an answer settles the live turn into an ephemeral row carrying its steps', () => {
     let state = run([
       { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
-      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.', status: STATUS }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.' }, now: NOW },
     ])
     const chat = chatOf(state, 's1')
     expect(chat.live).toBeNull()
@@ -153,7 +155,7 @@ describe('chat: live turn', () => {
   it('steps attached to a canonical row survive later history reloads', () => {
     let state = run([
       { type: 'session_event', sid: 's1', event: { kind: 'activity', step: { itemId: 't1', kind: 'tool_call', name: 'Bash', summary: 'ls', status: 'started' } }, now: NOW },
-      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.', status: STATUS }, now: NOW },
+      { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e9', content: 'done.' }, now: NOW },
       { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:assistant', role: 'assistant', content: 'done.' }], hasMore: false },
       { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'u1:assistant', role: 'assistant', content: 'done.' }, { turnId: 'u2:user', role: 'user', content: 'more' }], hasMore: false },
     ])
@@ -221,13 +223,25 @@ describe('chat: live turn', () => {
 })
 
 describe('chat: mid-turn answers', () => {
-  it('only an answer carrying a status is the turn boundary', () => {
-    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: 'x' })).toBe(false)
-    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: 'x', status: STATUS })).toBe(true)
-    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: '', status: {} })).toBe(true)
+  it('every answer ends its turn unless it is marked interim', () => {
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: 'x', interim: true })).toBe(false)
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: 'x' })).toBe(true)
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: '', status: STATUS })).toBe(true)
     // A choice prompt suspends the turn on a human; it does not end it.
-    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: '?', status: STATUS, options: [{ id: 'y', label: 'y' }], token: 't' })).toBe(false)
+    expect(isTurnBoundary({ kind: 'answer', id: 'a', content: '?', options: [{ id: 'y', label: 'y' }], token: 't' })).toBe(false)
     expect(isTurnBoundary({ kind: 'progress', content: '', done: true })).toBe(false)
+  })
+
+  it('an answer with no status still ends the turn (a /model receipt, a terminal reply)', () => {
+    const state = run([
+      { type: 'send_started', sid: 's1', text: '/model opus' },
+      on({ kind: 'progress', content: '', done: false }),
+      on({ kind: 'answer', id: 'r1', content: 'switched model → opus' }),
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.activity).toBe('idle')
+    expect(chat.live).toBeNull()
+    expect(chat.rows.map(r => r.id)).toEqual(['local-1', 'answer-r1'])
   })
 
   it('an interim answer shows at once and the turn keeps working', () => {
@@ -254,18 +268,77 @@ describe('chat: mid-turn answers', () => {
     expect(state.badge).toBe(0)
   })
 
-  it('a step that finishes after an interim answer settled it updates in place', () => {
+  it('a card sealed mid-tool finishes nothing: the running tool stays live and completes where it runs', () => {
     const state = run([
       activity('t1', 'started'),
-      on({ kind: 'progress', content: '', done: true }),
+      // The release timer seals the card and delivers what was said, mid-tool.
+      on({ kind: 'progress', content: '↳ cargo build', done: true }),
       interim('a1', 'waiting on the build'),
       activity('t1', 'completed'),
     ])
     const chat = chatOf(state, 's1')
     const said = chat.rows[0]
-    if (said?.kind === 'assistant') expect(said.steps.map(s => [s.itemId, s.status])).toEqual([['t1', 'completed']])
-    expect(chat.live?.steps ?? []).toEqual([])
+    if (said?.kind === 'assistant') expect(said.steps).toEqual([])
+    expect(chat.live?.steps.map(s => [s.itemId, s.status])).toEqual([['t1', 'completed']])
     expect(chat.activity).toBe('working')
+  })
+
+  it('a late completion of a settled step refreshes it in its row; nothing makes it spin again', () => {
+    let state = run([
+      activity('t1', 'started'),
+      activity('t1', 'completed'),
+      interim('a1', 'read the file'),
+      on({ kind: 'activity', step: { ...step('t1', 'completed'), summary: 'read 120 lines' } }),
+    ])
+    let said = chatOf(state, 's1').rows[0]
+    if (said?.kind === 'assistant') expect(said.steps).toMatchObject([{ itemId: 't1', status: 'completed', summary: 'read 120 lines' }])
+    state = reduce(state, activity('t1', 'started'))
+    said = chatOf(state, 's1').rows[0]
+    if (said?.kind === 'assistant') expect(said.steps.map(s => s.status)).toEqual(['completed'])
+    expect(chatOf(state, 's1').live?.steps).toEqual([])
+  })
+
+  it('an ACP liveness pulse stays live across interim answers and settles with the turn', () => {
+    const pulse = (): Action => on({ kind: 'activity', step: { itemId: 'T7-live-msg', kind: 'thinking', name: '', summary: '…', status: 'started' } })
+    const state = run([
+      pulse(),
+      on({ kind: 'progress', content: '↳ …', done: true }),
+      interim('a1', 'first half'),
+      pulse(),
+      interim('a2', 'second half'),
+      pulse(),
+      boundary('close', ''),
+    ])
+    const chat = chatOf(state, 's1')
+    const spinning = chat.rows.flatMap(r => (r.kind === 'assistant' ? r.steps : [])).filter(s => s.status !== 'completed')
+    expect(spinning).toEqual([])
+    expect(chat.rows.map(r => r.id)).toEqual(['answer-a1', 'answer-a2', 'answer-close'])
+    expect(chat.rows[2]).toMatchObject({ content: '', steps: [{ itemId: 'T7-live-msg', status: 'completed' }] })
+  })
+
+  it('a step id reused by a later turn shows live in that turn, not on the old row', () => {
+    const state = run([
+      activity('call:0', 'completed'),
+      interim('a1', 'listed it'),
+      boundary('b1', 'done'),
+      activity('call:0', 'started'),
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.live?.steps.map(s => [s.itemId, s.status])).toEqual([['call:0', 'started']])
+    const first = chat.rows[0]
+    if (first?.kind === 'assistant') expect(first.steps.map(s => s.status)).toEqual(['completed'])
+    expect(chat.activity).toBe('working')
+  })
+
+  it('an interim answer, or a card sealed under it, does not override a pending choice', () => {
+    const state = run([
+      on({ kind: 'answer', id: 'p1', content: 'Allow rm?', options: [{ id: 'y', label: 'Yes' }], token: 'tok' }),
+      on({ kind: 'progress', content: '↳ asking', done: true }),
+      interim('a1', 'I need your approval to delete the build dir'),
+    ])
+    const chat = chatOf(state, 's1')
+    expect(chat.waiting).toBe(true)
+    expect(chat.rows.map(r => r.kind)).toEqual(['choice', 'assistant'])
   })
 
   it('the status-only closing frame ends the turn and renders no row', () => {
@@ -282,21 +355,71 @@ describe('chat: mid-turn answers', () => {
     expect(chat.rows.some(r => r.kind === 'assistant' && r.content === '' && r.steps.length === 0)).toBe(false)
   })
 
-  it('steps still live at a status-only close join the row the session last spoke in', () => {
-    const state = run([
+  it('steps still running at a status-only close become their own row, after what was said', () => {
+    const chat = chatOf(run([
       interim('a1', 'running the suite'),
       activity('t9', 'started'),
       boundary('close', ''),
+    ]), 's1')
+    expect(chat.rows.map(r => r.id)).toEqual(['answer-a1', 'answer-close'])
+    expect(chat.rows[0]).toMatchObject({ steps: [] })
+    expect(chat.rows[1]).toMatchObject({ kind: 'assistant', content: '', steps: [{ itemId: 't9', status: 'completed' }] })
+    expect(chat.activity).toBe('idle')
+  })
+
+  it('a tool-only turn keeps its steps row in place, and the next turn keeps its own steps', () => {
+    let state = run([
+      { type: 'history_loaded', sid: 's1', rows: [{ turnId: 'p1:user', role: 'user', content: 'hi' }, { turnId: 'p1:assistant', role: 'assistant', content: 'hello' }], hasMore: false },
+      { type: 'send_started', sid: 's1', text: 'touch x' },
+      activity('t1', 'started'),
+      boundary('close1', ''),
+      { type: 'history_loaded', sid: 's1', rows: [
+        { turnId: 'p1:user', role: 'user', content: 'hi' },
+        { turnId: 'p1:assistant', role: 'assistant', content: 'hello' },
+        { turnId: 'q1:user', role: 'user', content: 'touch x' },
+      ], hasMore: false },
     ])
-    const chat = chatOf(state, 's1')
-    expect(chat.rows).toHaveLength(1)
-    const said = chat.rows[0]
-    if (said?.kind === 'assistant') expect(said.steps.map(s => [s.itemId, s.status])).toEqual([['t9', 'completed']])
-    // With nothing said at all, the steps stand as their own (visible) row.
-    const silent = chatOf(run([activity('t1', 'started'), boundary('close', '')]), 's1')
-    expect(silent.rows).toHaveLength(1)
-    expect(silent.rows[0]).toMatchObject({ kind: 'assistant', content: '', steps: [{ itemId: 't1', status: 'completed' }] })
-    expect(silent.activity).toBe('idle')
+    expect(chatOf(state, 's1').rows.map(r => r.id)).toEqual(['p1:user', 'p1:assistant', 'q1:user', 'answer-close1'])
+    state = run([
+      { type: 'send_started', sid: 's1', text: 'now y' },
+      activity('t2', 'started'),
+      boundary('b2', 'made y'),
+      { type: 'history_loaded', sid: 's1', rows: [
+        { turnId: 'p1:user', role: 'user', content: 'hi' },
+        { turnId: 'p1:assistant', role: 'assistant', content: 'hello' },
+        { turnId: 'q1:user', role: 'user', content: 'touch x' },
+        { turnId: 'r1:user', role: 'user', content: 'now y' },
+        { turnId: 'r1:assistant', role: 'assistant', content: 'made y' },
+      ], hasMore: false },
+    ], state)
+    const rows = chatOf(state, 's1').rows
+    expect(rows.map(r => r.id)).toEqual(['p1:user', 'p1:assistant', 'q1:user', 'answer-close1', 'r1:user', 'r1:assistant'])
+    const stepsOf = (id: string): string[] => {
+      const row = rows.find(r => r.id === id)
+      return row?.kind === 'assistant' ? row.steps.map(s => s.itemId) : []
+    }
+    expect(stepsOf('p1:assistant')).toEqual([])
+    expect(stepsOf('answer-close1')).toEqual(['t1'])
+    expect(stepsOf('r1:assistant')).toEqual(['t2'])
+  })
+
+  it('a file sent mid-turn with no text keeps its row and its steps through reconcile', () => {
+    const file = { kind: 'file' as const, name: 'report.pdf', url: '/ccteam/api/attachment?sid=s1&name=report.pdf' }
+    let state = run([
+      { type: 'send_started', sid: 's1', text: 'make the report' },
+      activity('t1', 'completed'),
+      interim('f1', '', { attachments: [file] }),
+      activity('t2', 'started'),
+      boundary('b1', 'report attached above'),
+    ])
+    state = reduce(state, { type: 'history_loaded', sid: 's1', rows: [
+      { turnId: 'q1:user', role: 'user', content: 'make the report' },
+      { turnId: 'q2:assistant', role: 'assistant', content: 'report attached above' },
+    ], hasMore: false })
+    const rows = chatOf(state, 's1').rows
+    expect(rows.map(r => r.id)).toEqual(['q1:user', 'answer-f1', 'q2:assistant'])
+    expect(rows[1]).toMatchObject({ attachments: [file], steps: [{ itemId: 't1' }] })
+    expect(rows[2]).toMatchObject({ steps: [{ itemId: 't2', status: 'completed' }] })
   })
 
   it('reconcile hands each interim row its own canonical row, repeated lines included', () => {
@@ -355,9 +478,9 @@ describe('chat: sending and history', () => {
     state = reduce(state, { type: 'send_settled', sid: 's1', receipt: { ok: false, errorKind: 'bad_request', error: 'nope' } })
     expect(chatOf(state, 's1').notices).toHaveLength(2)
     // Mid-turn talk does not release what the message is queued behind.
-    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e0', content: 'still busy' }, now: NOW })
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e0', content: 'still busy', interim: true }, now: NOW })
     expect(chatOf(state, 's1').notices.map(n => n.kind)).toEqual(['queued', 'error'])
-    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'ok', status: STATUS }, now: NOW })
+    state = reduce(state, { type: 'session_event', sid: 's1', event: { kind: 'answer', id: 'e1', content: 'ok' }, now: NOW })
     expect(chatOf(state, 's1').notices.map(n => n.kind)).toEqual(['error'])
     expect(reduce(state, { type: 'send_settled', sid: 's1', receipt: { ok: true } })).toBe(state)
   })
