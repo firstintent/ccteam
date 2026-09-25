@@ -691,6 +691,14 @@ async fn run_chat_send_file(
         .as_ref()
         .map(|target| (target.channel.clone(), target.chat_id.clone()));
     let mut event = build_send_file_event(args, seq, event_target)?;
+    // A file the session sends from inside its running turn is part of that
+    // turn, not its end (#209): a reader that took it for the boundary
+    // dropped Stop for the rest of the turn.
+    if let (Some(gateway), Some(caller)) =
+        (gateway, args.get("_caller_sid").and_then(|v| v.as_str()))
+    {
+        event.interim = gateway.lock().await.session_turn_in_flight(caller);
+    }
     if event.channel == "web" {
         let session = live_target
             .as_ref()
@@ -4099,8 +4107,12 @@ fn exact_collected_turn(
         .find(|turn| is_transcript_row(turn))
         .map(|turn| turn.turn_id.clone());
     let row = all.iter().find(|turn| turn.turn_id == turn_id)?;
+    // The row's whole execution turn (#209): a completion's "read the rest"
+    // pointer names the turn's last row, and must return the same folded
+    // answer the notification counted, not only its last piece.
+    let row = crate::delegation::turn_answer_record(all, row);
     Some(TranscriptPage {
-        rows: vec![collected_turn_row(row)],
+        rows: vec![collected_turn_row(&row)],
         cursor: Some(row.turn_id.clone()),
         remaining: 0,
         latest,

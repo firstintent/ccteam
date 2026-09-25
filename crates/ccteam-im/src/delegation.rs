@@ -494,9 +494,19 @@ pub(crate) fn fold_turn_answer(
     (answer, conclusion)
 }
 
-/// `answered` widened to its whole execution turn: every row of the same turn
-/// up to and including it, folded by [`fold_turn_answer`]. A row with no
-/// execution identity, or a failed one, is its own answer.
+/// `answered` widened to its whole execution turn — the ONE definition of "the
+/// answer a turn id names", shared by the parent's notification, the restart
+/// reconcile, the inline `agent{wait}` result and `agent_read{turn}`.
+///
+/// The turn is delimited by its own rows, not by its execution id alone (pi
+/// and codex-exec mint ids from a per-process counter, so a restart reuses
+/// them): walking back from `answered`, it takes every text row of the same
+/// execution turn and stops at the previous turn's end — a status-bearing
+/// row, a terminal `outcome`, or another turn's text. Rows without text (user
+/// rows, a steer) are stepped over. Walking forward, the turn's closing row
+/// (#209: empty text, the status its pieces went out without) lends the
+/// answer its status and the vendor's conclusion. A row with no execution
+/// identity, or a failed one, is its own answer.
 pub(crate) fn turn_answer_record(
     all: &[ccteam_harness::execution::turns_mirror::TurnRecord],
     answered: &ccteam_harness::execution::turns_mirror::TurnRecord,
@@ -511,22 +521,48 @@ pub(crate) fn turn_answer_record(
     let Some(at) = all.iter().position(|row| row.turn_id == answered.turn_id) else {
         return answered.clone();
     };
-    let parts: Vec<&str> = all[..=at]
+    let same_turn = |row: &ccteam_harness::execution::turns_mirror::TurnRecord| {
+        row.exec_turn_id.as_deref() == Some(exec)
+    };
+    let mut parts: Vec<&str> = vec![answered.assistant.as_str()];
+    for row in all[..at].iter().rev() {
+        if row.status.is_some() || row.outcome.is_some() {
+            break;
+        }
+        if row.assistant.trim().is_empty() {
+            continue;
+        }
+        if !same_turn(row) {
+            break;
+        }
+        parts.push(row.assistant.as_str());
+    }
+    parts.reverse();
+    let closing = all[at + 1..]
         .iter()
-        .filter(|row| {
-            row.exec_turn_id.as_deref() == Some(exec)
-                && !row.assistant.trim().is_empty()
-                && row.outcome.is_none()
-        })
-        .map(|row| row.assistant.as_str())
-        .collect();
-    if parts.len() < 2 {
+        .take_while(|row| row.assistant.trim().is_empty())
+        .find(|row| same_turn(row) && row.status.is_some() && row.outcome.is_none());
+    if parts.len() < 2 && closing.is_none() {
         return answered.clone();
     }
-    let (assistant, conclusion) = fold_turn_answer(&parts, answered.conclusion.as_deref());
+    let vendor_conclusion = closing
+        .and_then(|row| row.conclusion.as_deref())
+        .or(answered.conclusion.as_deref());
+    let (assistant, conclusion) = fold_turn_answer(&parts, vendor_conclusion);
     ccteam_harness::execution::turns_mirror::TurnRecord {
         assistant,
         conclusion,
+        status: answered
+            .status
+            .clone()
+            .or_else(|| closing.and_then(|row| row.status.clone())),
+        usage: if answered.usage.is_null() {
+            closing
+                .map(|row| row.usage.clone())
+                .unwrap_or(serde_json::Value::Null)
+        } else {
+            answered.usage.clone()
+        },
         ..answered.clone()
     }
 }
@@ -813,6 +849,37 @@ mod tests {
         assert_eq!(answer.assistant, "started the build\n\nbuild green");
         assert_eq!(answer.conclusion.as_deref(), Some("build green"));
         assert_eq!(turn_answer_record(&all, &all[4]).assistant, "a later turn");
+
+        // pi / codex-exec reuse execution ids after a restart: a previous
+        // run's turn with the SAME id ended on a status row, and nothing of it
+        // joins the new turn. The new turn's closing row lends its status and
+        // the vendor's conclusion.
+        let status = ccteam_harness::TurnStatus {
+            model: None,
+            context: None,
+            turn: 7,
+            cost_usd: None,
+            tokens_total: None,
+        };
+        let mut ended = row("s9-1", "pi-s9-1", "previous run's answer");
+        ended.status = Some(status.clone());
+        let mut steer = row("input-1", "pi-s9-1", "");
+        steer.exec_turn_id = None;
+        steer.user = "and the logs?".into();
+        let mut closing = row("s9-4", "pi-s9-1", "");
+        closing.status = Some(status.clone());
+        closing.conclusion = Some("the receipt".into());
+        let all = vec![
+            ended,
+            row("s9-2", "pi-s9-1", "new run piece"),
+            steer,
+            row("s9-3", "pi-s9-1", "new run final"),
+            closing,
+        ];
+        let answer = turn_answer_record(&all, &all[3]);
+        assert_eq!(answer.assistant, "new run piece\n\nnew run final");
+        assert_eq!(answer.status.map(|status| status.turn), Some(7));
+        assert_eq!(answer.conclusion.as_deref(), Some("the receipt"));
     }
 
     #[test]

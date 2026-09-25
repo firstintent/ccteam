@@ -1422,20 +1422,15 @@ fn stranded_boundary_signals(
     }
     for (exec_turn_id, rows) in groups {
         let last = rows.last().expect("a group holds at least one row");
-        // The turn's answer is every row it wrote, not its last piece (#209)
-        // — unless it failed, when the failure row is what it ended on (the
-        // live boundary reports the same).
-        let (tail, conclusion) = if last.failed() {
-            (last.assistant.clone(), last.conclusion.clone())
-        } else {
-            let parts: Vec<&str> = rows.iter().map(|row| row.assistant.as_str()).collect();
-            crate::delegation::fold_turn_answer(&parts, last.conclusion.as_deref())
-        };
+        // The turn's answer is every row it wrote, not its last piece (#209),
+        // with the status its closing row carries — the same answer the live
+        // boundary and `agent{wait}` report (a failed turn is its failure row).
+        let answer = crate::delegation::turn_answer_record(all_turns, last);
         pending.push(crate::delegation::DelegationSignal {
             child_sid: child_sid.to_string(),
             turn_id: last.turn_id.clone(),
             exec_turn_id: Some(exec_turn_id),
-            tail,
+            tail: answer.assistant.clone(),
             vendor,
             host: host.to_string(),
             boundary: true,
@@ -1456,14 +1451,14 @@ fn stranded_boundary_signals(
                 || last.error.is_some(),
             interim_notes: rows.len().saturating_sub(1),
             covered_turns: rows.iter().map(|t| t.turn_id.clone()).collect(),
-            context_pct: crate::delegation::context_pct(last.status.as_ref()),
-            turn: last
+            context_pct: crate::delegation::context_pct(answer.status.as_ref()),
+            turn: answer
                 .status
                 .as_ref()
                 .map(|status| status.turn)
                 .unwrap_or_default(),
             error_kind: last.error_kind.clone(),
-            conclusion,
+            conclusion: answer.conclusion.clone(),
         });
     }
     pending
@@ -7324,6 +7319,9 @@ impl Gateway {
                         // preserves the original elapsed time.
                         if let ThreadEvent::TurnStarted { turn_id, opening } = &evt {
                             structured_turn_open = true;
+                            // What an earlier stretch said outside any turn is
+                            // not this turn's answer.
+                            turn_said.clear();
                             // The execution turn a delegation request is bound
                             // to. Recording it here is what lets a boundary
                             // resolve exactly the requests that asked for THIS
@@ -7879,6 +7877,12 @@ impl Gateway {
                             turn_had_answer = true;
                         }
                         if is_turn_boundary && answer_texts.is_empty() {
+                            // The turn has ended visibly even though no answer
+                            // rides its boundary: disarm the stall watchdog here,
+                            // or a turn whose every line went out mid-turn is
+                            // reported silent — and STUCK — minutes after it
+                            // finished.
+                            session.visible_events.fetch_add(1, Ordering::SeqCst);
                             // The boundary closes the turn's last progress card
                             // even when no answer rides it — otherwise the card
                             // stays open, and the NEXT turn's steps edit it.
@@ -8547,6 +8551,10 @@ impl Gateway {
                             open_continues_from = None;
                           }
                           if matches!(&evt, ThreadEvent::TurnFailed { .. } | ThreadEvent::Error(_)) {
+                            // Cleared here, not only on a durable failure row:
+                            // a row that failed to append must not carry this
+                            // turn's text into the next one's answer.
+                            turn_said.clear();
                             structured_turn_open = false;
                             open_exec_turn = None;
                             open_continues_from = None;
@@ -27908,9 +27916,13 @@ mod tests {
         .expect("the boundary signals the parent");
         assert_eq!(signal.tail, "replied to the steer\n\nall green");
         assert_eq!(signal.conclusion.as_deref(), Some("all green"));
-        // The watchdog was never told the turn answered by its interim lines.
+        // Only the boundary tells the watchdog the turn answered: its two
+        // interim lines never did, and the answer-less boundary still does.
         let visible = gateway.sessions["s1"].visible_events.load(Ordering::SeqCst);
-        assert_eq!(visible, 0, "interim lines never disarm the stall watchdog");
+        assert_eq!(
+            visible, 1,
+            "the boundary, and only the boundary, disarms the watchdog"
+        );
     }
 
     /// #209 — the hold is bounded by a CLOCK, not by the vendor's next event.
