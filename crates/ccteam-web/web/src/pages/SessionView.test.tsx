@@ -246,6 +246,21 @@ function createHookHarness() {
       for (const effect of effects) effect();
       return tree;
     },
+    /** A committed render whose passive effects have NOT run yet — the
+     *  window in which a user event can fire against the new tree. */
+    renderDeferred<T>(component: () => T): { tree: T; flush: () => void } {
+      cursor = 0;
+      pendingEffects = [];
+      const tree = component();
+      const effects = pendingEffects;
+      pendingEffects = [];
+      return {
+        tree,
+        flush: () => {
+          for (const effect of effects) effect();
+        },
+      };
+    },
   };
 }
 
@@ -929,7 +944,10 @@ describe("SessionView working state across interim answers (#209)", () => {
   }
   const STATUS = { model: "m", context: null, turn: 3, cost_usd: null, tokens_total: null };
 
-  async function mountTurnView(box: { stream: StreamState }) {
+  async function mountTurnView(
+    box: { stream: StreamState },
+    history = vi.fn().mockResolvedValue({ sid: "s9", events: [] }),
+  ) {
     const harness = createHookHarness();
     vi.resetModules();
     vi.doMock("react", async () => ({
@@ -944,7 +962,7 @@ describe("SessionView working state across interim answers (#209)", () => {
     }));
     vi.doMock("../lib/sessionsApi", async () => ({
       ...(await vi.importActual<typeof import("../lib/sessionsApi")>("../lib/sessionsApi")),
-      getHistory: vi.fn().mockResolvedValue({ sid: "s9", events: [] }),
+      getHistory: history,
       getSessionStatus: vi.fn().mockResolvedValue({
         sid: "s9",
         model: null,
@@ -956,7 +974,10 @@ describe("SessionView working state across interim answers (#209)", () => {
       getDaemonTimezone: vi.fn().mockResolvedValue("UTC"),
     }));
     const View = (await import("./SessionView")).default;
-    return () => harness.render(() => View({ sid: "s9", session: SESSION }));
+    const view = () => View({ sid: "s9", session: SESSION });
+    return Object.assign(() => harness.render(view), {
+      deferred: () => harness.renderDeferred(view),
+    });
   }
 
   function unmockTurnView() {
@@ -1027,7 +1048,7 @@ describe("SessionView working state across interim answers (#209)", () => {
           activity: { kind: "tool_call", name: "Bash", summary: "", status: "started", item_id: "b1" },
         },
         { id: "gateway-progress-s9-1", kind: "progress", content: "↳ 1 tools · 0 files", done: true },
-        { id: "a1", kind: "answer", content: "checking…" },
+        { id: "a1", kind: "answer", content: "checking…", interim: true },
       );
       expect(collectElementText(tree)).toContain("checking…");
       expect(collectElementText(tree)).toContain("↳ 1 tools · 0 files");
@@ -1052,7 +1073,7 @@ describe("SessionView working state across interim answers (#209)", () => {
       await settle();
       let tree = render();
       (composerOf(tree)?.onSend as (content: string) => void)("status?");
-      tree = push(box, render, { id: "a1", kind: "answer", content: "checking…" });
+      tree = push(box, render, { id: "a1", kind: "answer", content: "checking…", interim: true });
       expect(composerOf(tree)?.busy).toBe(true);
 
       tree = push(box, render, { id: "st", kind: "answer", content: "", status: STATUS });
@@ -1064,6 +1085,112 @@ describe("SessionView working state across interim answers (#209)", () => {
       // previous turn's and this one's); its status footers "checking…".
       expect(text).toContain("claude · s9 · m · turn 3");
       expect(text.filter((value) => /^claude · s9/.test(value))).toHaveLength(2);
+    } finally {
+      unmockTurnView();
+    }
+  });
+
+  it("a reply with no status and no interim marker ends the working state (contract v2)", async () => {
+    // A terminal-protocol reply, a slash-command reply, a recovered answer:
+    // none will ever be followed by a status-bearing answer.
+    const box = { stream: healthy() };
+    try {
+      const render = await mountTurnView(box);
+      render();
+      await settle();
+      let tree = render();
+      (composerOf(tree)?.onSend as (content: string) => void)("/model opus");
+      expect(composerOf(render())?.busy).toBe(true);
+      tree = push(box, render, { id: "r1", kind: "answer", content: "model set to opus" });
+      expect(collectElementText(tree)).toContain("model set to opus");
+      expect(composerOf(tree)?.busy).toBe(false);
+    } finally {
+      unmockTurnView();
+    }
+  });
+
+  it("an approval prompt keeps the working state: the turn waits, it did not end", async () => {
+    const box = { stream: healthy() };
+    try {
+      const render = await mountTurnView(box);
+      render();
+      await settle();
+      const tree = render();
+      (composerOf(tree)?.onSend as (content: string) => void)("deploy");
+      const prompted = push(box, render, {
+        id: "permission-p1",
+        kind: "answer",
+        content: "wants to run: rm -rf dist",
+        options: [{ label: "Approve", id: "allow" }],
+        token: "p1",
+      });
+      expect(composerOf(prompted)?.busy).toBe(true);
+    } finally {
+      unmockTurnView();
+    }
+  });
+
+  it("a send right after a boundary rendered (effects not yet run) still marks the new turn", async () => {
+    const box = { stream: healthy() };
+    try {
+      const render = await mountTurnView(box);
+      render();
+      await settle();
+      let tree = render();
+      (composerOf(tree)?.onSend as (content: string) => void)("first");
+      tree = push(box, render, { id: "a1", kind: "answer", content: "working", interim: true });
+      expect(composerOf(tree)?.busy).toBe(true);
+
+      // The first turn's boundary is committed; before its passive effects
+      // run, the user sends the next message from that very tree.
+      box.stream = {
+        ...box.stream,
+        events: [...box.stream.events, { id: "b1", kind: "answer", content: "done", status: STATUS }],
+      };
+      const committed = render.deferred();
+      expect(composerOf(committed.tree)?.busy).toBe(false);
+      (composerOf(committed.tree)?.onSend as (content: string) => void)("second");
+      committed.flush();
+      // The second turn is running: the first turn's boundary is behind it.
+      expect(composerOf(render())?.busy).toBe(true);
+    } finally {
+      unmockTurnView();
+    }
+  });
+
+  it("load-earlier footers the earlier page's last reply when the newer page starts with its closing row", async () => {
+    const box = { stream: { ...healthy(), events: [] } };
+    const closing = { ...STATUS, turn: 9 };
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t4", ts: "d", role: "", user: "", assistant: "", status: closing },
+          { turn_id: "t5", ts: "e", role: "", user: "next question", assistant: "" },
+        ],
+        next_before: "cursor-1",
+        has_more: true,
+      })
+      .mockResolvedValueOnce({
+        sid: "s9",
+        events: [
+          { turn_id: "t2", ts: "b", role: "", user: "go", assistant: "" },
+          { turn_id: "t3", ts: "c", role: "", user: "", assistant: "long answer" },
+        ],
+        next_before: null,
+        has_more: false,
+      });
+    try {
+      const render = await mountTurnView(box, history);
+      render();
+      await settle();
+      const tree = render();
+      (findByTestId(tree, "load-earlier")?.props.onClick as () => void)();
+      await settle();
+      const text = collectElementText(render());
+      expect(text.indexOf("long answer")).toBeLessThan(text.indexOf("next question"));
+      expect(text.some((value) => value.endsWith("claude · s9 · m · turn 9"))).toBe(true);
     } finally {
       unmockTurnView();
     }

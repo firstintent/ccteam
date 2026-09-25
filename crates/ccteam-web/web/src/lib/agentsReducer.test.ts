@@ -70,8 +70,6 @@ describe("sidsActiveWithin", () => {
     expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(false);
   });
 
-  const STATUS = { model: "m", context: null, turn: 2, cost_usd: null, tokens_total: null };
-
   it("a sealed progress card (done:true) does not end the pulse mid-turn (#209)", () => {
     const now = 100_000;
     const events = [
@@ -81,23 +79,44 @@ describe("sidsActiveWithin", () => {
     expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(true);
   });
 
-  it("an interim answer (no status) keeps the pulse — the turn goes on (#209)", () => {
+  it("an interim answer keeps the pulse — the turn goes on (#209)", () => {
     const now = 100_000;
     const events = [
       ts({ sid: "s1", kind: "activity", receivedAt: now - 500 }),
-      ts({ sid: "s1", kind: "answer", content: "checking…", receivedAt: now - 200 }),
+      ts({ sid: "s1", kind: "answer", content: "checking…", interim: true, receivedAt: now - 200 }),
     ];
     expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(true);
   });
 
-  it("the turn boundary (a status-bearing answer) ends the pulse", () => {
+  it("an approval prompt keeps the pulse — the turn waits on a human (#209)", () => {
     const now = 100_000;
     const events = [
       ts({ sid: "s1", kind: "activity", receivedAt: now - 500 }),
-      ts({ sid: "s1", kind: "answer", content: "checking…", receivedAt: now - 400 }),
-      ts({ sid: "s1", kind: "progress", done: true, receivedAt: now - 300 }),
-      ts({ sid: "s1", kind: "answer", content: "", status: STATUS, receivedAt: now - 200 }),
+      ts({
+        sid: "s1",
+        kind: "answer",
+        content: "run it?",
+        options: [{ label: "Approve", id: "allow" }],
+        receivedAt: now - 200,
+      }),
     ];
+    expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(true);
+  });
+
+  it("any answer not marked interim ends the pulse, with or without a status", () => {
+    const now = 100_000;
+    const events = [
+      ts({ sid: "s1", kind: "activity", receivedAt: now - 500 }),
+      ts({ sid: "s1", kind: "answer", content: "checking…", interim: true, receivedAt: now - 400 }),
+      ts({ sid: "s1", kind: "progress", done: true, receivedAt: now - 300 }),
+      ts({ sid: "s1", kind: "answer", content: "tmux reply", receivedAt: now - 200 }),
+    ];
+    expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(false);
+  });
+
+  it("a scheduled_changed frame never pulses a node", () => {
+    const now = 100_000;
+    const events = [ts({ sid: "s1", kind: "scheduled_changed", receivedAt: now - 200 })];
     expect(sidsActiveWithin(events, 15_000, now).has("s1")).toBe(false);
   });
 });

@@ -58,7 +58,13 @@ import { useProjectsStore } from "../hooks/useProjectsStore";
 import { VendorChip } from "../components/VendorChip";
 import { copyText } from "../lib/clipboard";
 import { getHistory, type SessionHistoryEvent } from "../lib/sessionsApi";
-import { currentTurnFold, emptyFold, renderFold, type ActivityFold } from "./chatTranscript";
+import {
+  currentTurnFold,
+  emptyFold,
+  recentHistoryTurns,
+  renderFold,
+  type ActivityFold,
+} from "./chatTranscript";
 import { vendorDotClass } from "../lib/vendors";
 import { makeT, tr, type Lang } from "../lib/i18n";
 import { relativeTime } from "./railHelpers";
@@ -903,7 +909,9 @@ export default function AgentsView({
   useEffect(() => {
     if (!selected || historyBySid[selected]) return;
     getHistory(selected)
-      .then((h) => setHistoryBySid((prev) => ({ ...prev, [selected]: h.events.slice(-3) })))
+      .then((h) =>
+        setHistoryBySid((prev) => ({ ...prev, [selected]: recentHistoryTurns(h.events, 3) })),
+      )
       .catch(() => setHistoryBySid((prev) => ({ ...prev, [selected]: [] })));
   }, [selected, historyBySid]);
 

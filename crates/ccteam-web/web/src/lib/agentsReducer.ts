@@ -65,12 +65,12 @@ export interface TimestampedAgentsEvent extends AgentsEvent {
 }
 
 /** Which sids currently look "in-turn" (pulse the node ring): the LAST
- *  in-turn frame for that sid — `progress` / `activity`, or an interim
- *  `answer` (the session speaking mid-turn, #209) — landed within `windowMs`
- *  (default 15s, per tech-design) of `nowMs`, and no turn boundary
- *  ({@link isTurnBoundary}) has landed for it since. A sealed progress card
- *  (`progress{done:true}`) neither ends nor extends the pulse: it closes one
- *  card, not the turn. Processes events in order so a later boundary always
+ *  in-turn frame for that sid — `progress` / `activity`, or an answer that is
+ *  not the end of the exchange (an interim line, an approval prompt; #209) —
+ *  landed within `windowMs` (default 15s, per tech-design) of `nowMs`, and no
+ *  end ({@link isTurnBoundary}) has landed for it since. A sealed progress
+ *  card (`progress{done:true}`) neither ends nor extends the pulse: it closes
+ *  one card, not the turn. Processes events in order so a later end always
  *  wins over an earlier in-turn frame. Pure + DOM-free; `nowMs` is
  *  injectable for deterministic tests. */
 export function sidsActiveWithin(

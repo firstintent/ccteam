@@ -47,11 +47,13 @@ import {
   type OutboundAttachmentRef,
   type SessionView as SessionSummary,
   type ScheduledItem,
+  type TurnStatus,
 } from "../lib/sessionsApi";
 import {
   appendEvent,
   appendRow,
   historyToRows,
+  leadingClosingStatus,
   loadRows,
   mergeHistory,
   nextRowId,
@@ -226,6 +228,9 @@ export default function SessionView({
     hasMore: false,
     nextBefore: null as string | null,
     loadingEarlier: false,
+    // The oldest loaded page opened with a closing row (#209): its status
+    // footers the last reply of the next earlier page.
+    closedBy: undefined as TurnStatus | undefined,
   });
   useEffect(() => {
     eventsRef.current = events;
@@ -265,6 +270,7 @@ export default function SessionView({
             hasMore: h.has_more === true,
             nextBefore: h.next_before ?? null,
             loadingEarlier: false,
+            closedBy: leadingClosingStatus(h.events),
           });
           setHistoryError(null);
         })
@@ -298,12 +304,13 @@ export default function SessionView({
     getHistory(sid, { before })
       .then((history) => {
         if (request !== historyRequestRef.current) return;
-        const earlier = historyToRows(history.events);
+        const earlier = historyToRows(history.events, historyPage.closedBy);
         if (earlier.length > 0) setRows((current) => [...earlier, ...current]);
         setHistoryPage({
           hasMore: history.has_more === true,
           nextBefore: history.next_before ?? null,
           loadingEarlier: false,
+          closedBy: leadingClosingStatus(history.events),
         });
       })
       .catch(() => {
@@ -332,10 +339,11 @@ export default function SessionView({
   }, [sid, rows]);
 
   // ---- working state of the turn we sent (#209) ------------------------------
-  // Ends on the turn BOUNDARY only — the one status-bearing answer. Neither an
-  // interim answer (the session talking mid-turn; Stop + the cursor must stay)
-  // nor a sealed progress card (`done` closes one card, not the turn) ends
-  // it, and a boundary with no sealed card before it still does.
+  // Ends on the first answer that ends the exchange (`isTurnBoundary`): any
+  // answer the server does not mark interim, with or without a status. An
+  // interim line (the session talking mid-turn; Stop + the cursor must stay),
+  // an approval prompt, or a sealed progress card (`done` closes one card,
+  // not the turn) does not end it.
   const busy = turnInFlight(events, turnMark);
   if (turnMark !== null && !busy) {
     // Retire the finished turn's watermark (render-phase adjust) so its
@@ -442,8 +450,10 @@ export default function SessionView({
         .filter(Boolean);
       const shown = names.length > 0 ? `${content}\n📎 ${names.join(", ")}` : content;
       pushRow({ kind: "user", content: shown });
-      const buffered = eventsRef.current;
-      setTurnMark({ after: buffered[buffered.length - 1] ?? null });
+      // The frames this tree RENDERED, not `eventsRef` — that ref catches up
+      // in an effect, and a send landing between a commit and its effects
+      // would anchor behind a boundary already on screen (ending busy at once).
+      setTurnMark({ after: events[events.length - 1] ?? null });
       setBusySince(Date.now());
       submitTurn(sid, content, attachments).catch((e) => {
         setTurnMark(null);
@@ -455,7 +465,7 @@ export default function SessionView({
         });
       });
     },
-    [sid, pushRow],
+    [sid, pushRow, events],
   );
 
   // ---- resolve a HITL approval prompt (gateway pending machinery) ----------

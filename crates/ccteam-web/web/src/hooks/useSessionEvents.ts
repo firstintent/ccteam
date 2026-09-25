@@ -3,7 +3,7 @@
 // Generalizes `useProgressStream`'s EventSource dance to the W2 endpoint
 //   GET /api/v1/sessions/{sid}/events
 // which streams `event: progress` frames whose payload is the W2 shape
-//   { id, sid, kind: "answer" | "progress", content, ts, done?, status?, options? }
+//   { id, sid, kind: "answer" | "progress", content, ts, done?, status?, interim?, options? }
 // (see `crates/ccteam-web/src/routes/sessions_api.rs::session_event_payload`).
 // `options` is the non-empty label list of an approval ChoicePrompt — the
 // hook surfaces it so ChatConsole can render "session sX wants to run …
@@ -81,22 +81,32 @@ export interface SessionEvent {
    *  branch (`ccteam-web/src/routes/sessions_api.rs`). */
   state?: string;
   reason?: string;
-  /** Present on exactly one `answer` per turn: the turn boundary. Absent on
-   *  an interim answer (see {@link isTurnBoundary}). */
+  /** Answer-only: the turn's status (`turn N · ctx`), on the answer that
+   *  closes a turn — the final reply, or a status-only frame with empty
+   *  `content`. Its absence says nothing about the turn (see
+   *  {@link isTurnBoundary}). */
   status?: TurnStatus;
+  /** Answer-only (#209): `true` = said mid-turn, the turn is still running.
+   *  The server says it positively; absent on every other answer. */
+  interim?: boolean;
 }
 
-/** Whether `ev` ends its session's turn (#209). A session now speaks DURING
- *  a long turn: each thing it says mid-turn arrives as an interim `answer`
- *  with no `status`, and the turn is still running after it. The turn ends
- *  on exactly one status-bearing `answer` — non-empty `content` = the final
- *  reply, empty = a status-only closing frame. `progress{done:true}` only
- *  seals one progress card (each interim answer seals the current one) and
- *  says nothing about the turn; a turn can also end with no sealed card at
- *  all. Every "is the turn over?" question in the SPA asks this predicate —
- *  never "did an answer arrive" or "did a card finalize". */
-export function isTurnBoundary(ev: { kind: string; status?: TurnStatus | null }): boolean {
-  return ev.kind === "answer" && ev.status != null;
+/** Whether `ev` ends the exchange its session was working on (#209). A
+ *  session now speaks DURING a long turn, and the server marks each such
+ *  mid-turn message `interim: true` — the turn is still running after it.
+ *  Every other answer ends the exchange, with or without a `status`: many
+ *  replies carry none and are still final (the terminal protocol's replies,
+ *  slash-command replies, recovered answers), so "no status" must never be
+ *  read as "still running". Two frames are not an end either: an approval
+ *  prompt (`options`) is a question the turn is blocked on, and
+ *  `progress{done:true}` only seals one progress card. Every "is the turn
+ *  over?" question in the SPA asks this predicate. */
+export function isTurnBoundary(ev: {
+  kind: string;
+  interim?: boolean;
+  options?: readonly unknown[];
+}): boolean {
+  return ev.kind === "answer" && ev.interim !== true && !(ev.options && ev.options.length > 0);
 }
 
 /** The send-time watermark of a turn submitted from this page: the newest
@@ -183,6 +193,28 @@ export function shouldAcceptEventSeq(
   return { accept: true, nextHighest: seq };
 }
 
+/** An approval prompt's options off a raw frame, or `undefined` for none.
+ *  v0.8.7 review-fix (R-H1) — options are `{label, id}` objects; the id is
+ *  the decision value the resolve path sends back as `selection`. A malformed
+ *  entry (no string label) is dropped so a half-formed frame can't render a
+ *  broken chip. Shared with the team view's parser. */
+export function parseEventOptions(raw: unknown): SessionEventOption[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const opts: SessionEventOption[] = [];
+  for (const o of raw) {
+    if (typeof o === "object" && o !== null) {
+      const rec = o as Record<string, unknown>;
+      if (typeof rec.label === "string") {
+        opts.push({
+          label: rec.label,
+          id: typeof rec.id === "string" ? rec.id : "",
+        });
+      }
+    }
+  }
+  return opts.length > 0 ? opts : undefined;
+}
+
 /** Parse one raw SSE `progress` payload into a {@link SessionEvent}, or
  *  `null` for garbage / a non-object (dropped silently — the next frame
  *  lands clean). Pure + DOM-free so it is unit-testable in node env. */
@@ -217,6 +249,7 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
   if (typeof obj.status === "object" && obj.status !== null) {
     event.status = obj.status as TurnStatus;
   }
+  if (obj.interim === true) event.interim = true;
   if (obj.done === true) event.done = true;
   // v0.8.19 — the structured per-step activity object (DOM-free, defensive:
   // a malformed `activity` is simply dropped, leaving a bare "activity" event
@@ -231,25 +264,8 @@ export function parseSessionEvent(raw: string): SessionEvent | null {
       item_id: typeof a.item_id === "string" ? a.item_id : "",
     };
   }
-  if (Array.isArray(obj.options)) {
-    // v0.8.7 review-fix (R-H1) — options are `{label, id}` objects; the id is
-    // the decision value the resolve path sends back as `selection`. Drop any
-    // malformed entry (no string label) so a half-formed frame can't render a
-    // broken chip.
-    const opts: SessionEventOption[] = [];
-    for (const o of obj.options) {
-      if (typeof o === "object" && o !== null) {
-        const rec = o as Record<string, unknown>;
-        if (typeof rec.label === "string") {
-          opts.push({
-            label: rec.label,
-            id: typeof rec.id === "string" ? rec.id : "",
-          });
-        }
-      }
-    }
-    if (opts.length > 0) event.options = opts;
-  }
+  const options = parseEventOptions(obj.options);
+  if (options) event.options = options;
   if (Array.isArray(obj.attachments)) {
     const attachments: OutboundAttachmentRef[] = [];
     for (const attachment of obj.attachments) {

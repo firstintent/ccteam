@@ -94,16 +94,29 @@ describe("parseAgentsEvent", () => {
     expect(ev).toMatchObject({ kind: "session_lifecycle", sid: "s4", slug: "demo" });
   });
 
-  it("keeps an answer's status so an interim answer and the turn boundary differ (#209)", () => {
-    const status = { model: "m", context: null, turn: 4, cost_usd: null, tokens_total: null };
-    const boundary = parseAgentsEvent(
-      JSON.stringify({ kind: "answer", sid: "s1", content: "", status }),
-    );
-    expect(boundary!.status).toEqual(status);
+  it("keeps the interim marker and approval options, so the team view can tell a running turn (#209)", () => {
     const interim = parseAgentsEvent(
-      JSON.stringify({ kind: "answer", sid: "s1", content: "checking…", status: null }),
+      JSON.stringify({ kind: "answer", sid: "s1", content: "checking…", interim: true }),
     );
-    expect(interim!.status).toBeUndefined();
+    expect(interim!.interim).toBe(true);
+    const final = parseAgentsEvent(JSON.stringify({ kind: "answer", sid: "s1", content: "done" }));
+    expect(final!.interim).toBeUndefined();
+    const approval = parseAgentsEvent(
+      JSON.stringify({
+        kind: "answer",
+        sid: "s1",
+        content: "run it?",
+        options: [{ label: "Approve", id: "allow" }, { bogus: true }],
+      }),
+    );
+    expect(approval!.options).toEqual([{ label: "Approve", id: "allow" }]);
+  });
+
+  it("parses a scheduled_changed frame as itself, never as an answer (#209)", () => {
+    const ev = parseAgentsEvent(
+      JSON.stringify({ kind: "scheduled_changed", sid: "s1", slug: "demo", content: "" }),
+    );
+    expect(ev).toMatchObject({ kind: "scheduled_changed", sid: "s1" });
   });
 
   it("defaults an unrecognized kind to answer and missing content to ''", () => {

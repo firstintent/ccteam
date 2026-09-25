@@ -384,16 +384,27 @@ describe("turn boundary vs interim answer (#209)", () => {
   const STATUS = { model: "m", context: null, turn: 3, cost_usd: null, tokens_total: null };
   const parse = (frame: Record<string, unknown>) => parseSessionEvent(JSON.stringify(frame))!;
 
-  it("only a status-bearing answer ends the turn", () => {
-    // Interim: the session said something mid-turn — no status, still running.
-    const interim = parse({ id: "a1", kind: "answer", content: "checking…" });
-    expect(interim.status).toBeUndefined();
+  it("only an answer the server does not mark interim ends the turn (contract v2)", () => {
+    // Interim: said mid-turn, marked explicitly — the turn is still running.
+    const interim = parse({ id: "a1", kind: "answer", content: "checking…", interim: true });
+    expect(interim.interim).toBe(true);
     expect(isTurnBoundary(interim)).toBe(false);
-    // A null status is the same as none (never a boundary).
-    expect(isTurnBoundary(parse({ kind: "answer", content: "x", status: null }))).toBe(false);
-    // The boundary, with the final reply or status-only (empty content).
+    // Anything but `true` is no interim marker at all.
+    expect(parse({ kind: "answer", content: "x", interim: false }).interim).toBeUndefined();
+    expect(parse({ kind: "answer", content: "x", interim: "yes" }).interim).toBeUndefined();
+    // Every other answer ends it: the final reply, the status-only closing
+    // frame, and a reply with no status at all (terminal protocol, a slash
+    // command, a recovered answer) — "no status" is never "still running".
     expect(isTurnBoundary(parse({ kind: "answer", content: "final", status: STATUS }))).toBe(true);
     expect(isTurnBoundary(parse({ kind: "answer", content: "", status: STATUS }))).toBe(true);
+    expect(isTurnBoundary(parse({ kind: "answer", content: "model set" }))).toBe(true);
+    // An approval prompt asks the human and waits: the turn goes on.
+    const approval = parse({
+      kind: "answer",
+      content: "run it?",
+      options: [{ label: "Approve", id: "allow" }],
+    });
+    expect(isTurnBoundary(approval)).toBe(false);
     // A sealed progress card is not a turn boundary, even the last one.
     const sealed = parse({ kind: "progress", content: "↳ 3 tools · 1 files", done: true });
     expect(sealed.done).toBe(true);
@@ -402,7 +413,7 @@ describe("turn boundary vs interim answer (#209)", () => {
 
   it("turnInFlight: running until a boundary arrives AFTER the send", () => {
     const before: SessionEvent = { kind: "answer", content: "old", status: STATUS };
-    const interim: SessionEvent = { kind: "answer", content: "checking…" };
+    const interim: SessionEvent = { kind: "answer", content: "checking…", interim: true };
     const sealed: SessionEvent = { kind: "progress", content: "↳ 1 tools", done: true };
     const boundary: SessionEvent = { kind: "answer", content: "", status: STATUS };
 
@@ -415,6 +426,12 @@ describe("turn boundary vs interim answer (#209)", () => {
     // Sent into an empty buffer.
     expect(turnInFlight([interim], { after: null })).toBe(true);
     expect(turnInFlight([interim, boundary], { after: null })).toBe(false);
+  });
+
+  it("turnInFlight: a status-less reply ends the exchange (terminal / slash command)", () => {
+    const mark = { after: null };
+    expect(turnInFlight([{ kind: "answer", content: "model set to opus" }], mark)).toBe(false);
+    expect(turnInFlight([{ kind: "answer", content: "tmux reply" }], mark)).toBe(false);
   });
 
   it("turnInFlight survives the ring dropping the watermark frame", () => {
