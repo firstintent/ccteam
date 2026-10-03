@@ -230,8 +230,33 @@ impl FocusRoutes {
     }
 
     /// Point this chat at `value`, replacing whatever it pointed at before.
-    fn set(&self, chat: &ChatKey, value: impl Into<String>) {
-        self.write().insert(self.key(chat), value.into());
+    ///
+    /// On the thread scope a session lives in ONE thread of a conversation:
+    /// binding it to this thread unbinds it from the conversation's other
+    /// threads, which are returned so the caller can tell them. Otherwise
+    /// the session's later output would follow whichever thread last drove it
+    /// and the thread the human knows it by would silently go quiet. Always
+    /// empty for a chat without a thread and on the conversation scope.
+    fn set(&self, chat: &ChatKey, value: impl Into<String>) -> Vec<ChatKey> {
+        let key = self.key(chat);
+        let value = value.into();
+        let mut map = self.write();
+        let mut displaced = Vec::new();
+        if self.scope == FocusScope::Thread && key.thread.is_some() {
+            map.retain(|other, v| {
+                let moved = *v == value
+                    && other.thread.is_some()
+                    && other.thread != key.thread
+                    && other.channel == key.channel
+                    && other.chat_id == key.chat_id;
+                if moved {
+                    displaced.push(other.clone());
+                }
+                !moved
+            });
+        }
+        map.insert(key, value);
+        displaced
     }
 
     fn remove(&self, chat: &ChatKey) {
@@ -244,9 +269,8 @@ impl FocusRoutes {
     }
 
     /// The threads of conversation `(channel, chat_id)` whose route points at
-    /// `value`, ascending. Thread ids sort by time on the platform that has
-    /// them (a Slack `ts` is fixed-width epoch seconds), so the LAST one is the
-    /// most recent tab. Always empty for a channel that never passes a thread.
+    /// `value` — at most one, since [`Self::set`] moves a session rather than
+    /// copying it. Always empty for a channel that never passes a thread.
     fn threads_bound_to(&self, channel: &str, chat_id: &str, value: &str) -> Vec<String> {
         self.read()
             .iter()
@@ -5010,7 +5034,7 @@ impl Gateway {
         }
         if let Some((handle, payload)) = crate::router::parse_first_mention(text) {
             if let Some(session_id) = self.session_by_handle(&chat, &handle) {
-                self.current_session.set(&chat, session_id);
+                self.focus_session(&chat, session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -5020,7 +5044,7 @@ impl Gateway {
             }
             if let Some(template) = self.template_by_handle(&chat, &handle) {
                 let session_id = self.start_template_session(chat.clone(), template).await?;
-                self.current_session.set(&chat, session_id);
+                self.focus_session(&chat, session_id);
                 if payload.is_empty() && attachments.is_empty() {
                     return Ok(vec![format!("using @{handle}")]);
                 }
@@ -5708,7 +5732,7 @@ impl Gateway {
                         }
                         self.current_project.set(chat, proj);
                     }
-                    self.current_session.set(chat, resumed_sid.clone());
+                    self.focus_session(chat, resumed_sid.clone());
                     self.persist_routing()?;
                     return Ok(format!("resumed session {resumed_sid}"));
                 }
@@ -5725,7 +5749,7 @@ impl Gateway {
         // session's project, so a following /new (and /cd's default) lands in
         // the same project you just switched into — not the stale prior one.
         self.current_project.set(chat, project);
-        self.current_session.set(chat, sid.clone());
+        self.focus_session(chat, sid.clone());
         self.persist_routing()?;
         Ok(format!("using session {sid}"))
     }
@@ -5840,25 +5864,20 @@ impl Gateway {
     /// conversation, never a thread ([`canonical_owner`]). On a channel that
     /// threads sessions that answer would land top-level and read as "not this
     /// thread's focus" — dropping its IM leg — so the session's thread is put
-    /// back: the one `current` (the session's present `reply_to`) names while
-    /// that thread is still bound to `sid`, else the most recent thread bound
-    /// to `sid` in that conversation. Nothing bound (and every single-stream
-    /// channel) → `target` unchanged. The ONE place this rule lives; every
-    /// owner-derived reset goes through [`Self::owner_reply_target`] /
-    /// [`Self::owner_reply_target_for_meta`].
-    fn with_bound_thread(&self, target: ChatKey, sid: &str, current: Option<&ChatKey>) -> ChatKey {
+    /// back: the one thread of that conversation bound to `sid` (a session
+    /// lives in at most one, see [`FocusRoutes::set`]). Nothing bound (and
+    /// every single-stream channel) → `target` unchanged. The ONE place this
+    /// rule lives; every owner-derived reset goes through
+    /// [`Self::owner_reply_target`] / [`Self::owner_reply_target_for_meta`].
+    fn with_bound_thread(&self, target: ChatKey, sid: &str) -> ChatKey {
         if target.thread.is_some() {
             return target;
         }
         let bound = self
             .current_session
             .threads_bound_to(&target.channel, &target.chat_id, sid);
-        let current_thread = current
-            .filter(|key| key.channel == target.channel && key.chat_id == target.chat_id)
-            .and_then(|key| key.thread.clone())
-            .filter(|thread| bound.contains(thread));
-        match current_thread.or_else(|| bound.last().cloned()) {
-            Some(thread) => target.with_thread(Some(&thread)),
+        match bound.last() {
+            Some(thread) => target.with_thread(Some(thread)),
             None => target,
         }
     }
@@ -5871,8 +5890,7 @@ impl Gateway {
         let target = self
             .tenant_project_owner_reply_target(&session.project)
             .unwrap_or_else(|| reply_target_for_owner(&session.owner));
-        let current = pump_target(session);
-        self.with_bound_thread(target, &session.id, Some(&current))
+        self.with_bound_thread(target, &session.id)
     }
 
     /// [`Self::owner_reply_target`] for a sid with no live record, resolved
@@ -5884,7 +5902,7 @@ impl Gateway {
                 ChatKey::from_identity(&meta.owner).map(|owner| reply_target_for_owner(&owner))
             })
             .unwrap_or_else(web_api_chat);
-        self.with_bound_thread(target, &meta.sid, None)
+        self.with_bound_thread(target, &meta.sid)
     }
 
     /// One "switch project" button per project (`nav:cd:<slug>`), the current
@@ -6780,7 +6798,7 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        self.current_session.set(&reply_to, id.clone());
+        self.focus_session(&reply_to, id.clone());
         if !capacity_checked {
             self.persist_routing()?;
         }
@@ -6936,7 +6954,7 @@ impl Gateway {
         // pane counters; replies route back to the owner (the chat that drives
         // it), matching `start_session` — in the thread this `/role` was typed
         // in, on a channel that threads sessions.
-        let reply_to = self.with_bound_thread(owner.clone(), &sid, Some(chat));
+        let reply_to = self.with_bound_thread(owner.clone(), &sid);
         self.sessions.insert(
             sid.clone(),
             GatewaySession {
@@ -6969,7 +6987,7 @@ impl Gateway {
                 delegation_depth,
             },
         );
-        self.current_session.set(chat, sid.clone());
+        self.focus_session(chat, sid.clone());
         self.persist_routing()?;
         // v0.8.21 Wave-2 — keep meta.json (the session SoT) in sync: `/role`
         // changed the role, so a daemon restart must rebuild at the NEW role.
@@ -7002,6 +7020,37 @@ impl Gateway {
         }
         self.spawn_event_pump(&sid);
         Ok(sid)
+    }
+
+    /// Bind `chat` (a thread, on a channel that threads sessions) to `sid`.
+    /// The ONE writer of `current_session`: a session lives in one thread of
+    /// a conversation ([`FocusRoutes::set`]), so a thread it leaves is told —
+    /// otherwise the human keeps writing there and gets a fresh session with
+    /// no idea why.
+    fn focus_session(&self, chat: &ChatKey, sid: impl Into<String>) {
+        let sid = sid.into();
+        for left in self.current_session.set(chat, sid.clone()) {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            self.emit_user_signal(GatewayEvent {
+                interim: false,
+                id: format!("gateway-moved-{sid}-{nanos}"),
+                channel: left.channel.clone(),
+                chat_id: left.chat_id.clone(),
+                thread_ts: left.thread.clone(),
+                content: format!(
+                    "↪ {sid} moved to another thread. This thread has no session now — your next message here starts a new one."
+                ),
+                kind: GatewayEventKind::Answer,
+                attachments: Vec::new(),
+                options: Vec::new(),
+                status: None,
+                sid: None,
+                slug: None,
+            });
+        }
     }
 
     fn emit_user_signal(&self, event: GatewayEvent) {
@@ -9582,11 +9631,8 @@ impl Gateway {
         {
             // The notice is about this session, so it goes to the thread the
             // session lives in (on a channel that threads sessions).
-            let target = self.with_bound_thread(
-                ChatKey::new(channel, chat_id, chat_id),
-                &entry.item.sid,
-                None,
-            );
+            let target =
+                self.with_bound_thread(ChatKey::new(channel, chat_id, chat_id), &entry.item.sid);
             self.emit_user_signal(GatewayEvent {
                 interim: false,
                 id: format!("scheduled-failed-{}", entry.item.id),
@@ -11335,7 +11381,7 @@ impl Gateway {
             });
         match &adopted {
             Some(id) => {
-                self.current_session.set(chat, id.clone());
+                self.focus_session(chat, id.clone());
             }
             None => {
                 self.current_session.remove(chat);
@@ -12790,7 +12836,7 @@ impl Gateway {
         // mints a fresh secret, inserts into the live map, starts the pump.
         self.rebuild_session_from_meta(&slug, cwd, &meta, caller.clone())
             .await?;
-        self.current_session.set(&caller, sid);
+        self.focus_session(&caller, sid);
         self.persist_routing()?;
         Ok(sid.to_string())
     }
@@ -12872,7 +12918,7 @@ impl Gateway {
             guard
                 .apply_rebuilt_session(plan, thread, caller.clone(), true)
                 .await?;
-            guard.current_session.set(&caller, sid);
+            guard.focus_session(&caller, sid);
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid.to_string())
@@ -12976,7 +13022,7 @@ impl Gateway {
         self.rebuild_session_from_meta(slug, cwd.clone(), &meta, caller.clone())
             .await?;
         self.persist_session_meta(&cwd, &meta)?;
-        self.current_session.set(&caller, sid.clone());
+        self.focus_session(&caller, sid.clone());
         self.persist_routing()?;
         Ok(sid)
     }
@@ -13105,7 +13151,7 @@ impl Gateway {
         catalog.write(&cwd, &meta)?;
         {
             let guard = gateway.lock().await;
-            guard.current_session.set(&caller, sid.clone());
+            guard.focus_session(&caller, sid.clone());
         }
         Self::persist_latest_routing_shared(&gateway).await?;
         Ok(sid)
@@ -16705,7 +16751,7 @@ impl Gateway {
             // the IM current-session semantics.
             if let Some(project) = self.sessions.get(sid).map(|s| s.project.clone()) {
                 self.current_project.set(&chat, project);
-                self.current_session.set(&chat, sid);
+                self.focus_session(&chat, sid);
             }
             if let Some(reply) = self.handle_command(&chat, &text).await? {
                 self.emit_sid_answer(sid, 0, reply);
@@ -39014,59 +39060,73 @@ mod tests {
         );
     }
 
-    /// The reattach rule itself: prefer the thread the session is answering in
-    /// right now while it is still that session's tab; otherwise its most
-    /// recent tab; no tab (and every single-stream chat) leaves the target as
-    /// it was.
+    /// The reattach rule itself: an owner target gets back the one thread the
+    /// session lives in; binding the session to another thread MOVES it (the
+    /// left thread is reported, never kept as a second tab); no tab (and every
+    /// single-stream chat) leaves the target as it was.
     #[tokio::test]
     async fn an_owner_target_gets_the_sessions_own_thread_back() {
         let fake = Arc::new(FakeAdapter::default());
         let tmp = tempfile::TempDir::new().unwrap();
         let gateway = Gateway::new(fake, "alpha", tmp.path());
         let owner = ChatKey::new("mock", "conv-1", "alice");
-        gateway.current_session.set(&thread_key("100.1"), "s1");
-        gateway.current_session.set(&thread_key("050.5"), "s1");
+        assert!(gateway
+            .current_session
+            .set(&thread_key("100.1"), "s1")
+            .is_empty());
         gateway.current_session.set(&thread_key("300.3"), "s2");
-
-        let current = thread_key("050.5");
         assert_eq!(
             gateway
-                .with_bound_thread(owner.clone(), "s1", Some(&current))
+                .with_bound_thread(owner.clone(), "s1")
+                .thread
+                .as_deref(),
+            Some("100.1")
+        );
+
+        let left = gateway.current_session.set(&thread_key("050.5"), "s1");
+        assert_eq!(
+            left,
+            vec![thread_key("100.1").thread_focus_key()],
+            "binding s1 elsewhere reports the thread it left"
+        );
+        assert_eq!(gateway.current_session.get(&thread_key("100.1")), None);
+        assert_eq!(
+            gateway
+                .with_bound_thread(owner.clone(), "s1")
                 .thread
                 .as_deref(),
             Some("050.5"),
-            "the thread it is answering in wins while it is still its tab"
-        );
-        gateway.current_session.set(&thread_key("050.5"), "s2");
-        assert_eq!(
-            gateway
-                .with_bound_thread(owner.clone(), "s1", Some(&current))
-                .thread
-                .as_deref(),
-            Some("100.1"),
-            "a thread re-pointed elsewhere is not its tab any more"
+            "the session follows its one thread"
         );
         assert_eq!(
             gateway
-                .with_bound_thread(owner.clone(), "s2", None)
+                .with_bound_thread(owner.clone(), "s2")
                 .thread
                 .as_deref(),
             Some("300.3"),
-            "the most recent tab (greatest ts) when nothing is current"
+            "another session's thread is untouched"
         );
-        assert_eq!(gateway.with_bound_thread(owner.clone(), "s7", None), owner);
+        assert_eq!(gateway.with_bound_thread(owner.clone(), "s7"), owner);
+
         let telegram = ChatKey::new("telegram", "339", "339");
+        let other_tg = ChatKey::new("telegram", "440", "440");
         gateway.current_session.set(&telegram, "s1");
+        assert!(
+            gateway.current_session.set(&other_tg, "s1").is_empty(),
+            "single-stream chats never move each other's focus"
+        );
+        assert_eq!(gateway.current_session.get(&telegram), Some("s1".into()));
         assert_eq!(
-            gateway.with_bound_thread(telegram.clone(), "s1", Some(&telegram)),
+            gateway.with_bound_thread(telegram.clone(), "s1"),
             telegram,
             "a single-stream chat is untouched"
         );
     }
 
     /// Ownership is the conversation's: a session started in thread A is
-    /// listed in thread B, `@handle`-addressable from it (no spawn), and
-    /// `/use` there binds B to it as well — without touching A.
+    /// listed in thread B and `@handle`-addressable from it (no spawn) — and
+    /// addressing it there MOVES it: it lives in one thread at a time, and the
+    /// thread it left is told so (its next message starts a fresh session).
     #[tokio::test]
     async fn a_session_from_one_thread_is_listed_and_usable_from_another() {
         let fake = Arc::new(FakeAdapter::default());
@@ -39094,16 +39154,34 @@ mod tests {
             Some("s1".to_string())
         );
 
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            None,
+            "s1 moved: thread A is no longer its tab"
+        );
+
+        let (tx, mut sink) = tokio::sync::mpsc::unbounded_channel::<GatewayEvent>();
+        gateway.set_event_sink(tx);
         say_in_thread(&mut gateway, "300.3", "/use s1").await;
         assert_eq!(
             gateway.current_session.get(&thread_key("300.3")),
             Some("s1".to_string())
         );
+        assert_eq!(gateway.current_session.get(&thread_key("200.2")), None);
+        let notice = recv_sink_answer_containing(&mut sink, "moved to another thread").await;
         assert_eq!(
-            gateway.current_session.get(&thread_key("100.1")),
-            Some("s1".to_string())
+            notice.thread_ts.as_deref(),
+            Some("200.2"),
+            "the thread s1 left is told, in that thread"
         );
         assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+
+        // Later output follows s1's one thread, not the thread it left.
+        let owner = ChatKey::new("mock", "conv-1", "conv-1");
+        assert_eq!(
+            gateway.with_bound_thread(owner, "s1").thread.as_deref(),
+            Some("300.3")
+        );
     }
 
     /// `routing.json` round-trips both scopes: session rows keep their thread,
