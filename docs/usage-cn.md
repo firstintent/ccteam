@@ -1,20 +1,20 @@
 # ccteam 使用手册
 
-**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi、DSH 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书或浏览器里统一指挥。**
+**ccteam 把你已经在用的编程 agent(Claude Code、Codex、Grok、Kimi、DSH 等)编成一支团队——任何会话都能跨厂商、跨机器 spawn、派活、收结果,而你从 Telegram、飞书、Slack 或浏览器里统一指挥。**
 
 你装一次、起一个常驻进程,之后所有日常操作都在三个入口里完成,**推荐程度从高到低**:
 
 | 入口 | 适合 | 章节 |
 |---|---|---|
 | 🖥️ **Web 控制台** | 创建项目、开会话、装插件、配 IM、看状态 —— 点点就能用,**首选** | [一、Web 控制台](#一web-控制台推荐) |
-| 💬 **Telegram / 飞书** | 手机上随时收发、驱动会话、审批工具 | [二、Telegram / 飞书](#二telegram--飞书) |
+| 💬 **Telegram / 飞书 / Slack** | 手机上随时收发、驱动会话、审批工具;Slack 上每个会话一个独立线程 | [二、Telegram / 飞书 / Slack](#二telegram--飞书--slack) |
 | ⌨️ **命令行(CLI)** | 脚本、运维、无图形界面的高级场景 | [三、命令行](#三命令行高级) |
 
 ---
 
 ## 核心概念
 
-- **chat** = 一个对话入口(一个网页控制台标签、一个 Telegram/飞书私聊或群)。每个 chat 有自己的当前项目、当前会话和会话列表,互相隔离。
+- **chat** = 一个对话入口(一个网页控制台标签、一个 Telegram/飞书私聊或群、一个 Slack 频道或私信)。每个 chat 有自己的当前项目、当前会话和会话列表,互相隔离。Slack 上「当前会话」按**线程**算——每个会话一个自己的线程(见 [Slack:一个会话 = 一个线程](#slack一个会话--一个线程))。
 - **project** = 一个本地代码目录,用 slug(短名)标识。
 - **session** = 一个独立的 agent 会话(像 Claude Code 原生会话一样自带上下文),属于某个项目。一个项目可同时开多个会话、互不串台,每个有持久句柄 `s<N>`(扛重启、不复用)。
 - **role** = 会话启动时**可选**绑定的角色(`.claude/agents/<role>.md` 里的 persona + 工具)。默认 **roleless**:裸 vendor 自读项目的 `CLAUDE.md`/`AGENTS.md`。persona 从插件市场装或自建,ccteam 不内置任何角色。
@@ -188,14 +188,15 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 **插件市场** 页(在**工作流**下;默认打开 Skills 分类,项目选择器只在装进项目的类型(agent/plugin)出现)浏览 [ccteam-hub](https://github.com/firstintent/ccteam-hub) 的精选插件(官方插件置顶,其余如 [agency-agents](https://github.com/wshobson/agents)、[mattpocock/skills](https://github.com/mattpocock/skills) 等开源库依次)。点开看正文预览后一键安装(下载时校验 sha256,带状态标记):**角色装进当前项目** `.claude/agents/`,装完任意入口 `/role <角色>` 切换;**技能装进用户级全局库** `~/.ccteam/skills`(**不进项目**),在会话输入框的 ＋ 菜单按条消息引用——技能菜单分两段:项目自有技能(`.agents/skills/`,兼容读旧 `.claude/skills/` 实体)与全局库;全局库与项目之间不软链、不复制。
 
-### 配置 Telegram / 飞书
+### 配置 Telegram / 飞书 / Slack
 
 进 **Settings** 页填 IM 凭证:
 
 - **Telegram**:粘贴 bot token,保存后给 bot 发一条消息,页面会自动轮询抓到你的 chat_id。
 - **飞书 / Lark**:填 App ID / App Secret / 区域(飞书国内 / Lark 国际)/ 允许的用户。
+- **Slack**:填 bot token(`xoxb-…`)、app-level token(`xapp-…`)和允许的成员 ID(`U…`)。
 
-秘密只显示掩码(`…末四位`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅在启动时加载),页面会提示 `restart required` —— 照 [运维](#运维) 重启即可。详细的 bot 创建步骤见 [二、Telegram / 飞书](#接入)。
+秘密只显示掩码(`…末四位`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅在启动时加载),页面会提示 `restart required` —— 照 [运维](#运维) 重启即可。详细的 bot 创建步骤见 [二、Telegram / 飞书 / Slack](#接入)。
 
 ### 多用户
 
@@ -234,9 +235,9 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 
 ---
 
-## 二、Telegram / 飞书
+## 二、Telegram / 飞书 / Slack
 
-把 ccteam 接到 IM 后,你就能在手机上随时驱动会话、收发文件、审批工具。最省事是在 [Web 控制台 Settings](#配置-telegram--飞书) 里配;也可以用 `ccteam config` 菜单,或手写凭证文件。
+把 ccteam 接到 IM 后,你就能在手机上随时驱动会话、收发文件、审批工具。最省事是在 [Web 控制台 Settings](#配置-telegram--飞书--slack) 里配;也可以用 `ccteam config` 菜单,或手写凭证文件。
 
 ### 接入
 
@@ -273,11 +274,73 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 - `use_feishu`:`true` = 飞书(国内),`false` = Lark(国际)。
 - `allowed_user_ids` 是 open_id(`ou_…`)白名单,**留空 = 拒绝所有人**(fail-closed,比 Telegram 更安全)。拿自己的 open_id:先留空启动,给 bot 发条消息,在日志里找 `ignoring ou_xxxx (not in allowed_users)`,把 `ou_xxxx` 填回去。
 
-> **手写凭证文件后必须重启 daemon 才生效**(Web Settings 配的同理)。飞书/Lark 与 Telegram 对等:文本、富文本、图片/文件收发都支持。
+**Slack** 给**每个会话一个独立线程**,并行会话不再挤在同一条消息流里。走 **Socket Mode**(出站 WebSocket,不需要公网回调地址)。在 [api.slack.com/apps](https://api.slack.com/apps) 选 **From a manifest** 新建应用,粘贴:
+
+```yaml
+display_information:
+  name: ccteam
+features:
+  bot_user:
+    display_name: ccteam
+    always_online: true
+  slash_commands:
+    - command: /ccteam
+      description: ccteam gateway command (sessions, new, cd, status, …)
+      usage_hint: "sessions | new codex | cd <project> | status"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - reactions:write
+      - files:read
+      - files:write
+      - commands
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+```
+
+把应用装进工作区,复制 **Bot User OAuth Token**(`xoxb-…`);在 **Basic Information → App-Level Tokens** 新建一个带 `connections:write` 的 token(`xapp-…`)。用 Web 设置 / `ccteam config` 配置,或在凭据文件里加 `slack` 段:
+
+```json
+{
+  "slack": {
+    "bot_token": "xoxb-replace_me",
+    "app_token": "xapp-replace_me",
+    "allowed_user_ids": ["U0123ABCD"]
+  }
+}
+```
+
+- `allowed_user_ids` 是 Slack 成员 ID(`U…`)白名单,**同时是 owner 名册**:名单里的发送者按本机 owner 服务。**留空 = 拒绝所有人**(fail closed)。成员 ID 在 Slack 个人资料 → ⋮ → *Copy member ID*;被拒的私信也会收到一条写着该 ID 的回复。
+- 把 bot 邀进频道(`/invite @ccteam`)或直接私信它。它会回答允许名单里的人在它所在频道里的每条消息,所以最好用一个专用频道(或私信)。
+
+> **手写凭证文件后必须重启 daemon 才生效**(Web Settings 配的同理)。飞书/Lark、Telegram 与 Slack 对等:文本、富文本、图片/文件收发都支持。
+
+### Slack:一个会话 = 一个线程
+
+- **顶层消息**开一个新线程;没有会话的线程里第一条普通消息会在本频道当前项目里新建一个 roleless 会话(与 Telegram 新 chat 首条消息同一条路)。再发一条顶层消息,第二个会话就与第一个并行。
+- **线程内回复**只发给该线程的会话。该会话产生的一切——回答、实时进度卡、审批按钮、文件、委派回报后的回答——都进它自己的线程。
+- 归属与当前项目以**频道**为单位:在任一线程里 `/cd` 会切换整个频道的项目(该线程的会话若不在新项目里,线程即释放,下一条消息在新项目里新建会话),`/sessions` 列出频道拥有的全部会话。线程里的 `/use <sid>` / `/new …` 只改**这个线程**指向的会话。
+- Slack 会拦截以 `/` 开头的消息,所以网关命令走 **`/ccteam`** 斜杠命令:`/ccteam new codex`、`/ccteam sessions`、`/ccteam cd demo`。ccteam 会先发一条锚点消息并在它的线程里回复——`/ccteam new codex` 就把新 codex 会话建在这个新线程里,`/ccteam use s12` 则为已有会话开一个线程。在线程里给该会话发命令,前面加一个空格(` /status`、` /compact`)。
+- 由其他 agent 雇来的会话没有自己的线程;想跟它说话就 `/ccteam use <sid>` 给它开一个。
 
 ### 网关命令
 
-聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。
+聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。Slack 上用 `/ccteam <命令>` 发(线程里则在命令前加一个空格),见 [Slack:一个会话 = 一个线程](#slack一个会话--一个线程)。
 
 ```text
 # 项目

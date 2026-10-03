@@ -1,20 +1,20 @@
 # ccteam User Manual
 
-**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, DSH…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, or a browser tab.**
+**ccteam turns the coding agents you already run (Claude Code, Codex, Grok, Kimi, DSH…) into one team — any session can spawn, dispatch, and collect work from any vendor on any machine, while you steer it all from Telegram, Lark, Slack, or a browser tab.**
 
 Install once, start one resident process, then do daily work from three surfaces, listed in recommended order:
 
 | Surface | Best for | Section |
 |---|---|---|
 | **Web console** | Create projects, start sessions, install plugins, configure IM, inspect status - the easiest default path | [1. Web console](#1-web-console-recommended) |
-| **Telegram / Lark** | Mobile control, file exchange, tool approvals | [2. Telegram / Lark](#2-telegram--lark) |
+| **Telegram / Lark / Slack** | Mobile control, file exchange, tool approvals — on Slack every session gets its own thread | [2. Telegram / Lark / Slack](#2-telegram--lark--slack) |
 | **CLI** | Scripts, ops, advanced headless use | [3. CLI](#3-cli-advanced) |
 
 ---
 
 ## Core Concepts
 
-- **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group. Each chat has its own current project, current session, and session list. Chats are isolated from each other.
+- **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group, or one Slack channel/DM. Each chat has its own current project, current session, and session list. Chats are isolated from each other. On Slack the current session is per **thread** — every session gets a thread of its own ([Slack: One Thread per Session](#slack-one-thread-per-session)).
 - **project** = a local code directory registered with a short slug.
 - **session** = one independent agent conversation with its own context, like a native Claude Code session. A project can have many sessions running side by side. Each session has a durable handle `s<N>` that survives restarts and is never reused.
 - **role** = an optional persona bound at session start, loaded from `.claude/agents/<role>.md`. The default is **roleless**: the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`. Personas are installed from the marketplace or written by you; ccteam seeds none.
@@ -192,16 +192,17 @@ The **Team** page is the multi-vendor cockpit, three tabs:
 
 The **Marketplace** page (under **Workflow**; the Skills tab opens first, and the project picker appears only for project-scoped types like agents) browses curated plugins from [ccteam-hub](https://github.com/firstintent/ccteam-hub). Official ccteam plugins are shown first, followed by tracked open-source sources such as [agency-agents](https://github.com/wshobson/agents) and [mattpocock/skills](https://github.com/mattpocock/skills). Open an item to preview its body, then install it. Agents (roles) install into the current project's `.claude/agents/`; **skills install into the user-level global library** `~/.ccteam/skills` — never into the project — and are attached per message from the composer. Installs verify sha256 and show status (skill status is computed against the library). After installing a role, switch to it from any surface with `/role <role>`.
 
-### Configure Telegram / Lark
+### Configure Telegram / Lark / Slack
 
 Open **Settings** and enter IM credentials:
 
 - **Telegram:** paste the bot token, save it, then send the bot a message. The page polls and captures your chat id.
 - **Lark/Feishu:** enter App ID, App Secret, region (Feishu China / Lark international), and allowed users.
+- **Slack:** enter the bot token (`xoxb-…`), the app-level token (`xapp-…`), and the allowed member ids (`U…`).
 
 Secrets are masked (`...last4`) and never returned in plaintext. **Restart the daemon after changing global IM credentials** because they are loaded at startup. The page will show `restart required`. Per-user IM bots are hot-reloaded; see [Multi-User](#multi-user).
 
-Detailed bot setup is in [2. Telegram / Lark](#setup).
+Detailed bot setup is in [2. Telegram / Lark / Slack](#setup).
 
 ### Multi-User
 
@@ -241,9 +242,9 @@ Mcp-Session-Id: <the id the daemon returned at initialize>
 
 ---
 
-## 2. Telegram / Lark
+## 2. Telegram / Lark / Slack
 
-After connecting IM, you can drive sessions, send files, and approve tools from your phone. The easiest setup is [Web console Settings](#configure-telegram--lark). You can also use the `ccteam config` menu or write the credentials file manually.
+After connecting IM, you can drive sessions, send files, and approve tools from your phone. The easiest setup is [Web console Settings](#configure-telegram--lark--slack). You can also use the `ccteam config` menu or write the credentials file manually.
 
 ### Setup
 
@@ -281,11 +282,73 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 - `allowed_user_ids` is an open_id allowlist (`ou_...`) **and the owner roster**: a listed sender is served as the box owner. **Empty means reject everyone** (fail closed). To get your open_id, start with an empty list, message the bot, find `ignoring ou_xxxx (not in allowed_users)` in logs, and add that `ou_xxxx`.
 - The `"*"` wildcard lets **anyone** message the bot. It names nobody, so nobody is served as the owner through it: every sender is a guest who owns only what it creates and sees no project. The daemon warns about this at startup — put your own `ou_...` in the list to take the bot back.
 
-> Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu and Telegram are peers: text, rich text, images, and files are supported.
+**Slack** gives **every session its own thread**, so parallel sessions never interleave in one stream. It connects over **Socket Mode** (an outbound WebSocket — no public callback URL). At [api.slack.com/apps](https://api.slack.com/apps) create an app **from a manifest** and paste:
+
+```yaml
+display_information:
+  name: ccteam
+features:
+  bot_user:
+    display_name: ccteam
+    always_online: true
+  slash_commands:
+    - command: /ccteam
+      description: ccteam gateway command (sessions, new, cd, status, …)
+      usage_hint: "sessions | new codex | cd <project> | status"
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      - reactions:write
+      - files:read
+      - files:write
+      - commands
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+```
+
+Install the app to your workspace, copy the **Bot User OAuth Token** (`xoxb-…`), and under **Basic Information → App-Level Tokens** create a token with the `connections:write` scope (`xapp-…`). Configure through Web Settings / `ccteam config`, or add a `slack` block:
+
+```json
+{
+  "slack": {
+    "bot_token": "xoxb-replace_me",
+    "app_token": "xapp-replace_me",
+    "allowed_user_ids": ["U0123ABCD"]
+  }
+}
+```
+
+- `allowed_user_ids` is a Slack member-id allowlist (`U…`) **and the owner roster**: a listed sender is served as the box owner. **Empty means reject everyone** (fail closed). Your member id is under your Slack profile → ⋮ → *Copy member ID*; a rejected DM also gets a reply naming the id to add.
+- Invite the bot to a channel (`/invite @ccteam`) or open its DM. It answers every message from allowed users in the channels it is in, so a dedicated channel (or the DM) works best.
+
+> Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu, Telegram, and Slack are peers: text, rich text, images, and files are supported.
+
+### Slack: One Thread per Session
+
+- A **top-level message** starts a new thread; the first ordinary message in a thread with no session starts a roleless session in the channel's current project (exactly like a fresh Telegram chat). Post another top-level message and a second session runs beside the first.
+- A **reply in a thread** goes to that thread's session. Everything that session produces — answers, the live progress card, approval buttons, files, the answer it gives after a delegate reports back — lands in its own thread.
+- The **channel** is the chat for ownership and the current project: `/cd` in any thread switches the project for the whole channel (that thread keeps its session only if the session is in the new project; otherwise its next message starts one there), and `/sessions` lists every session the channel owns. `/use <sid>` or `/new …` inside a thread re-points **that thread** only.
+- Slack treats a leading `/` as its own command, so gateway commands go through the **`/ccteam`** slash command: `/ccteam new codex`, `/ccteam sessions`, `/ccteam cd demo`. ccteam posts an anchor message for the command and answers in its thread — so `/ccteam new codex` creates the codex session right in that new thread, and `/ccteam use s12` opens a thread for an existing session. Inside a thread, type the command with a leading space (` /status`, ` /compact`) to send it to that thread's session.
+- Sessions hired by other agents get no thread of their own; open one with `/ccteam use <sid>` when you want to talk to it.
 
 ### Gateway Commands
 
-Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`.
+Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`. On Slack send them as `/ccteam <command>` (or, inside a thread, with a leading space) — see [Slack: One Thread per Session](#slack-one-thread-per-session).
 
 ```text
 # Projects
