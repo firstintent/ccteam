@@ -399,7 +399,7 @@ async fn ask_external_choice(
             id: format!("permission-{token}"),
             channel: ctx.channel.clone(),
             chat_id: ctx.chat_id.clone(),
-            thread_ts: None,
+            thread_ts: ctx.thread_ts.clone(),
             content: prompt.title,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
@@ -963,6 +963,7 @@ mod tests {
         HitlPromptContext {
             channel: "mock".to_string(),
             chat_id: "chat-1".to_string(),
+            thread_ts: None,
             role: "alice".to_string(),
             progress_path: None,
         }
@@ -995,6 +996,7 @@ mod tests {
         assert_eq!(evt.options.len(), 2);
         assert!(evt.content.contains("session s1 (alice)"));
         assert!(evt.content.contains("Bash ls"));
+        assert_eq!(evt.thread_ts, None, "a single-stream chat gets no thread");
 
         // Simulate the click: take the pending by token and deliver "allow"
         // over its oneshot — exactly what `Gateway::resolve_web_selection` /
@@ -1071,6 +1073,24 @@ mod tests {
             "lapsed pending is cleaned up"
         );
         drop(rx);
+    }
+
+    /// On a channel that gives every session its own thread (Slack) the
+    /// approval prompt lands in the thread the asking session lives in, not
+    /// at the top of the conversation where it would read as nobody's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ask_permission_prompt_lands_in_the_sessions_thread() {
+        let pending = Arc::new(Mutex::new(PendingInteractions::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel::<GatewayEvent>();
+        let threaded = HitlPromptContext {
+            thread_ts: Some("1700000000.000100".to_string()),
+            ..ctx()
+        };
+        let answer =
+            ask_permission_with_ttl(&tx, &pending, &threaded, "s1", "Bash", &json!({}), 1).await;
+        assert_eq!(answer, PermissionAnswer::Timeout);
+        let evt = rx.recv().await.expect("prompt event sent");
+        assert_eq!(evt.thread_ts.as_deref(), Some("1700000000.000100"));
     }
 
     /// A closed sink (event consumer gone) fails safe to `Unavailable`

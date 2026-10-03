@@ -528,6 +528,10 @@ fn is_chat_send_file_call(req: &serde_json::Value) -> bool {
 struct ChatSendFileTarget {
     channel: String,
     chat_id: String,
+    /// The firing session's own platform thread (Slack), so the file lands
+    /// where that session lives. `None` on a single-stream channel and for a
+    /// per-user delivery target (no session behind it).
+    thread_ts: Option<String>,
     /// Present for a live ccteam session. The server-resolved project path is
     /// the only authority the web staging/persistence path trusts.
     session: Option<crate::gateway::SessionResolve>,
@@ -538,6 +542,7 @@ impl ChatSendFileTarget {
         Self {
             channel,
             chat_id,
+            thread_ts: None,
             session: None,
         }
     }
@@ -662,7 +667,11 @@ async fn resolve_live_reply_target(
         return None;
     }
     let guard = gw.lock().await;
-    let (channel, chat_id) = guard.reply_target_for(sid)?;
+    let crate::gateway::ReplyTarget {
+        channel,
+        chat_id,
+        thread_ts,
+    } = guard.reply_target_for(sid)?;
     // IM delivery historically needs only the live reply binding. Project
     // metadata is an additional requirement solely for the web copy/read
     // path, so do not make Telegram/Lark depend on it.
@@ -674,6 +683,7 @@ async fn resolve_live_reply_target(
     Some(ChatSendFileTarget {
         channel,
         chat_id,
+        thread_ts,
         session,
     })
 }
@@ -691,6 +701,9 @@ async fn run_chat_send_file(
         .as_ref()
         .map(|target| (target.channel.clone(), target.chat_id.clone()));
     let mut event = build_send_file_event(args, seq, event_target)?;
+    event.thread_ts = live_target
+        .as_ref()
+        .and_then(|target| target.thread_ts.clone());
     // A file the session sends from inside its running turn is part of that
     // turn, not its end (#209): a reader that took it for the boundary
     // dropped Stop for the rest of the turn.
@@ -1052,7 +1065,12 @@ async fn execute_interaction_ask(
         }
         _ => None,
     };
-    let Some((channel, chat_id)) = live_target else {
+    let Some(crate::gateway::ReplyTarget {
+        channel,
+        chat_id,
+        thread_ts,
+    }) = live_target
+    else {
         return err_resp(format!(
             "interaction/ask: no IM chat bound to firing session sid={session_sid:?} ({slug}/{role}); owner unset at spawn/bind — not falling back to the registry"
         ));
@@ -1113,7 +1131,7 @@ async fn execute_interaction_ask(
             id: format!("interaction-{token}"),
             channel,
             chat_id,
-            thread_ts: None,
+            thread_ts,
             content: question.clone(),
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),
@@ -1257,7 +1275,12 @@ async fn execute_permission_ask(
         }
         _ => (None, None),
     };
-    let Some((channel, chat_id)) = dest else {
+    let Some(crate::gateway::ReplyTarget {
+        channel,
+        chat_id,
+        thread_ts,
+    }) = dest
+    else {
         return err_resp(format!(
             "permission/ask: no IM chat bound to firing session sid={session_sid:?} ({slug}/{role}); owner unset at spawn/bind — not falling back to the registry"
         ));
@@ -1344,7 +1367,7 @@ async fn execute_permission_ask(
             id: format!("permission-{token}"),
             channel,
             chat_id,
-            thread_ts: None,
+            thread_ts,
             content: title,
             kind: GatewayEventKind::Answer,
             attachments: Vec::new(),

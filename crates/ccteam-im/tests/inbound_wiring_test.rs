@@ -700,6 +700,118 @@ async fn daemon_routes_gateway_inbound_to_submit_turn_and_outbound() {
     }));
 }
 
+/// One threaded-inbound daemon run (#19): two messages posted in two threads
+/// of ONE conversation, through a `MockChannel` that does (or does not) give
+/// every session its own thread. Returns `(spawns, answers)` where `answers`
+/// are the outbound echo sends as `(content, thread_ts)`.
+async fn run_two_thread_conversation(threaded: bool) -> (usize, Vec<(String, Option<String>)>) {
+    let home = isolate_home();
+    let projects_root = home.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+
+    let mock = Arc::new(if threaded {
+        MockChannel::new().with_session_threads()
+    } else {
+        MockChannel::new()
+    });
+    for (id, thread, text) in [("t-1", "100.1", "hello A"), ("t-2", "200.2", "hello B")] {
+        mock.push(ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "conv-1".into(),
+            content: text.into(),
+            channel: "telegram".into(),
+            timestamp: 0,
+            thread_ts: Some(thread.into()),
+            attachments: Vec::new(),
+            selection: None,
+        })
+        .await;
+    }
+    let mut channels: ChannelMap = std::collections::HashMap::new();
+    channels.insert(
+        "telegram".to_string(),
+        mock.clone() as Arc<dyn Channel + Send + Sync>,
+    );
+
+    // A fresh adapter per spawn, so each session drains only its own scripted
+    // events and an answer is attributed to the session that produced it.
+    let spawned: Arc<std::sync::Mutex<Vec<Arc<GatewayAdapter>>>> = Arc::default();
+    let adapter_factory: AdapterFactory = {
+        let spawned = Arc::clone(&spawned);
+        Arc::new(move |_, _| {
+            let adapter = Arc::new(GatewayAdapter::default());
+            spawned.lock().unwrap().push(Arc::clone(&adapter));
+            adapter as Arc<dyn HarnessAdapter + Send + Sync>
+        })
+    };
+
+    let args = DaemonArgs {
+        credentials: None,
+        registry: Some(projects_root),
+        max_runtime: Some(Duration::from_millis(1200)),
+        adapter_factory: Some(adapter_factory),
+        channels_override: Some(channels),
+        extra_channels: None,
+        ..Default::default()
+    };
+    run_daemon_with_shutdown(args, async {
+        futures::future::pending::<()>().await;
+    })
+    .await
+    .unwrap();
+
+    let spawns = spawned
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|adapter| adapter.starts.load(Ordering::SeqCst))
+        .sum();
+    let answers = mock
+        .outbox()
+        .await
+        .into_iter()
+        .filter(|m| m.content.starts_with("gateway echo: "))
+        .map(|m| (m.content, m.thread_ts))
+        .collect();
+    (spawns, answers)
+}
+
+/// #19 — the daemon hands the gateway an inbound thread ONLY for a channel
+/// that gives every session its own thread. There, two threads of one
+/// conversation are two sessions and each answer goes back into its own
+/// thread; the very same messages on a single-stream channel stay one
+/// conversation talking to one session, answered top-level as before.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_scopes_sessions_to_threads_only_on_a_threading_channel() {
+    let _g = env_lock();
+
+    let (spawns, answers) = run_two_thread_conversation(false).await;
+    assert_eq!(spawns, 1, "a single-stream channel never passes the thread");
+    assert_eq!(answers.len(), 2, "both messages answered: {answers:?}");
+    assert!(
+        answers.iter().all(|(_, thread)| thread.is_none()),
+        "single-stream answers stay top-level: {answers:?}"
+    );
+
+    let (spawns, answers) = run_two_thread_conversation(true).await;
+    assert_eq!(spawns, 2, "one session per thread");
+    for (text, thread) in [("hello A", "100.1"), ("hello B", "200.2")] {
+        let echo = format!("gateway echo: {text}");
+        let landed: Vec<_> = answers
+            .iter()
+            .filter(|(content, _)| content.starts_with(&echo))
+            .map(|(_, thread)| thread.as_deref())
+            .collect();
+        assert_eq!(
+            landed,
+            vec![Some(thread)],
+            "{text:?} is answered in its own thread: {answers:?}"
+        );
+    }
+}
+
 /// V0.8.4 P0 — a gateway reply that overflows the channel's
 /// `max_message_len` is split into ordered durable sub-messages. Built on
 /// `daemon_routes_gateway_inbound_to_submit_turn_and_outbound`, but with a

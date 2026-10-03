@@ -1439,6 +1439,12 @@ fn spawn_inbound_consumer(
                 continue;
             };
 
+            // The thread reaches the gateway only from a channel whose
+            // contract is "one thread = one session" (Slack). Everyone else
+            // (Telegram, Lark, web) never passes one, whatever the platform
+            // happened to fill in — their routing stays the single stream.
+            let thread = inbound_session_thread(channel.as_ref(), &msg);
+
             let restore_incomplete = !*restore_complete.borrow();
             if clean_payload.split_whitespace().next() == Some("/sessions") && restore_incomplete {
                 // Startup restore deliberately runs outside the gateway lock
@@ -1467,6 +1473,7 @@ fn spawn_inbound_consumer(
                             &msg.channel,
                             &msg.reply_target,
                             &msg.sender,
+                            thread.as_deref(),
                             &msg.id,
                             &clean_payload,
                             &msg.attachments,
@@ -1524,6 +1531,7 @@ fn spawn_inbound_consumer(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
+                    thread.as_deref(),
                     &clean_payload,
                     msg.selection.is_some(),
                 )
@@ -1544,6 +1552,7 @@ fn spawn_inbound_consumer(
                         &msg.channel,
                         &msg.reply_target,
                         &msg.sender,
+                        thread.as_deref(),
                         &msg.id,
                         &clean_payload,
                         &msg.attachments,
@@ -1570,6 +1579,7 @@ fn spawn_inbound_consumer(
                     &msg.channel,
                     &msg.reply_target,
                     &msg.sender,
+                    thread.as_deref(),
                     &msg.id,
                     &clean_payload,
                     &msg.attachments,
@@ -1588,6 +1598,19 @@ fn spawn_inbound_consumer(
         }
         tracing::debug!("imd: inbound consumer exited (all senders closed)");
     })
+}
+
+/// The thread an inbound message hands the gateway: its platform thread when
+/// `channel` gives every session its own thread
+/// ([`crate::transport::Channel::session_threads`]), else `None` — so a channel
+/// without that contract routes as a single stream even if its provider filled
+/// in a thread id.
+fn inbound_session_thread(channel: &dyn Channel, msg: &ChannelMessage) -> Option<String> {
+    if channel.session_threads() {
+        msg.thread_ts.clone()
+    } else {
+        None
+    }
 }
 
 /// Send the outcome of one `handle_message`/`handle_message_shared` call to
@@ -2122,6 +2145,30 @@ pub fn _link_check(_c: &Credentials) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a channel whose contract is "one thread = one session" hands the
+    /// gateway a thread; any other channel routes as a single stream even
+    /// when its provider filled in a thread id.
+    #[test]
+    fn only_a_session_threading_channel_hands_the_gateway_a_thread() {
+        use crate::transport::providers::mock::MockChannel;
+        let msg = ChannelMessage {
+            id: "m-1".into(),
+            sender: "alice".into(),
+            reply_target: "conv-1".into(),
+            content: "hi".into(),
+            channel: "mock".into(),
+            timestamp: 0,
+            thread_ts: Some("1700000000.000100".into()),
+            attachments: Vec::new(),
+            selection: None,
+        };
+        assert_eq!(inbound_session_thread(&MockChannel::new(), &msg), None);
+        assert_eq!(
+            inbound_session_thread(&MockChannel::new().with_session_threads(), &msg),
+            Some("1700000000.000100".to_string())
+        );
+    }
 
     /// v0.8.20 F2 — one channel per tenant bot, keyed `"<platform>@<tenant_id>"`
     /// (the unique routing key); a tenant with no IM creds yields no channel.

@@ -583,6 +583,17 @@ pub trait Channel: Send + Sync {
         None
     }
 
+    /// Whether this channel gives every agent session its own platform thread
+    /// (Slack). When `true`, the daemon hands each inbound message's
+    /// [`ChannelMessage::thread_ts`] to the gateway, which then scopes session
+    /// focus to the thread (one thread = one session) while ownership, ACL and
+    /// the current project stay per conversation. **Default `false`**: a
+    /// channel without that contract (Telegram, Lark, web) never passes a
+    /// thread, so its routing is exactly the single-stream behaviour.
+    fn session_threads(&self) -> bool {
+        false
+    }
+
     /// Edit a previously-sent message in place (V0.8.4 P1 — live progress
     /// status). Returns the platform message id (usually `message_id`
     /// unchanged). The **default degrades gracefully** to appending a new

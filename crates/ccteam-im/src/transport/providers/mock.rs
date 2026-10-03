@@ -53,6 +53,10 @@ pub struct MockChannel {
     /// and `handle` is the handle passed to remove (always `None` on add). Lets
     /// a test assert the daemon egress add→remove handle round-trip.
     reactions: Arc<Mutex<Vec<RecordedReaction>>>,
+    /// Report [`Channel::session_threads`] — `false` by default (the
+    /// single-stream shape); a test flips it to drive the threaded routing a
+    /// Slack channel gets.
+    session_threads: bool,
 }
 
 impl MockChannel {
@@ -68,7 +72,16 @@ impl MockChannel {
             registered_commands: Arc::default(),
             reaction_handle: None,
             reactions: Arc::default(),
+            session_threads: false,
         }
+    }
+
+    /// Make this channel report [`Channel::session_threads`] `== true` (one
+    /// thread = one session, the Slack contract), so a test can drive the
+    /// daemon's threaded inbound path. Builder-style; default stays `false`.
+    pub fn with_session_threads(mut self) -> Self {
+        self.session_threads = true;
+        self
     }
 
     /// Make [`Channel::add_reaction`] return `Some(handle)` (the stateful Lark
@@ -168,6 +181,10 @@ impl Channel for MockChannel {
 
     fn max_message_len(&self) -> Option<usize> {
         self.max_len
+    }
+
+    fn session_threads(&self) -> bool {
+        self.session_threads
     }
 
     async fn edit_message(
