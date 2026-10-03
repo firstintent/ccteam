@@ -1763,7 +1763,7 @@ fn spawn_gateway_event_consumer(
                 GatewayEventKind::Delegation { .. } => {}
                 GatewayEventKind::SessionLifecycle { .. } => {}
                 GatewayEventKind::ScheduledChanged => {}
-                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord/slack keep
+                // v0.8.19 — the 👀 ack reaction (IM-only; web/discord keep
                 // the trait's no-op `add_reaction`/`remove_reaction`). Mirror the
                 // Activity arm's discipline: ALL fire-and-forget — log + swallow,
                 // never propagate, so a reaction can't break/delay the turn.

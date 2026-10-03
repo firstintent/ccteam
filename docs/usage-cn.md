@@ -283,6 +283,9 @@ features:
   bot_user:
     display_name: ccteam
     always_online: true
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
   slash_commands:
     - command: /ccteam
       description: ccteam gateway command (sessions, new, cd, status, …)

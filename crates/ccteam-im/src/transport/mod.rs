@@ -628,7 +628,7 @@ pub trait Channel: Send + Sync {
     /// so there is no generic emoji argument). Returns an opaque `handle` the
     /// provider needs to remove it later (e.g. Feishu's `reaction_id`), or
     /// `None` when the provider clears a reaction by `(chat, message)` alone
-    /// (Telegram). **Default no-op `Ok(None)`** — web/discord/slack/mock/ws
+    /// (Telegram, Slack). **Default no-op `Ok(None)`** — web/discord/mock/ws
     /// keep it (reactions are an IM-only affordance), so they need no change.
     /// Fire-and-forget at the call site: a reaction failure must NEVER break or
     /// delay turn/answer delivery.

@@ -2096,7 +2096,7 @@ pub enum GatewayEventKind {
     /// dispatched (filling the silent time-to-first-token gap); `on: false`
     /// removes it the moment the turn's first event appears. **IM-only**: the
     /// daemon egress maps it to the channel's `add_reaction`/`remove_reaction`
-    /// (default no-op for web/discord/slack), and the web SSE drops it (a
+    /// (default no-op for web/discord), and the web SSE drops it (a
     /// reaction has no web representation — web has its own UI). The
     /// `GatewayEvent` already carries `channel`/`chat_id`/`sid`; this only adds
     /// the inbound `message_id` to react to.
