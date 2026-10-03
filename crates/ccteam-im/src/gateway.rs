@@ -11288,6 +11288,27 @@ impl Gateway {
     /// id. When none exists, clear the active session so the next message spawns
     /// one on demand in `project`. Backs `/cd` so the project switch is real.
     fn adopt_session_in_project(&mut self, chat: &ChatKey, project: &str) -> Option<String> {
+        // A thread is one session's own tab: adopting the project's session
+        // here would pull a session that already lives in another thread into
+        // this one. The thread keeps its session only if that session is in
+        // `project`; otherwise it is freed, so its next message starts a
+        // session there — what a new thread does anyway.
+        if chat.thread.is_some() {
+            let kept = self.current_session.get(chat).filter(|sid| {
+                self.sessions
+                    .get(sid)
+                    .map(|s| s.project == project)
+                    .unwrap_or_else(|| {
+                        self.owned_released_metas(chat)
+                            .iter()
+                            .any(|(slug, meta)| slug == project && &meta.sid == sid)
+                    })
+            });
+            if kept.is_none() {
+                self.current_session.remove(chat);
+            }
+            return kept;
+        }
         // Own = owned by the chat's CANONICAL identity (`user:<id>` for web /
         // tenant bots, the chat itself for the admin/global IM bot). Owner is the
         // synthetic `user:` channel, never the querier's delivery channel, so we
@@ -38820,6 +38841,60 @@ mod tests {
             Some("beta".to_string()),
             "a brand-new thread already works in the conversation's project"
         );
+    }
+
+    /// `/cd` in a thread never pulls a session that lives in another thread
+    /// into this one: a fresh thread stays free (its next message spawns), a
+    /// thread whose session is already in the project keeps it, and a thread
+    /// whose session is elsewhere is freed for a new session in the project.
+    #[tokio::test]
+    async fn cd_in_a_thread_never_adopts_another_threads_session() {
+        let fake = Arc::new(FakeAdapter::default());
+        let alpha = tempfile::TempDir::new().unwrap();
+        let beta = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", alpha.path());
+        gateway.register_project("alpha", alpha.path());
+        gateway.register_project("beta", beta.path());
+
+        say_in_thread(&mut gateway, "100.1", "hello from A").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            Some("s1".to_string())
+        );
+
+        // A fresh thread `/cd`s into s1's project: s1 stays A's alone.
+        let reply = say_in_thread(&mut gateway, "200.2", "/cd alpha").await;
+        assert!(
+            reply[0].contains("next message starts a session there"),
+            "{reply:?}"
+        );
+        assert_eq!(gateway.current_session.get(&thread_key("200.2")), None);
+        say_in_thread(&mut gateway, "200.2", "hello from B").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("200.2")),
+            Some("s2".to_string()),
+            "the fresh thread gets a session of its own"
+        );
+
+        // A thread whose session is already in the project keeps it.
+        say_in_thread(&mut gateway, "100.1", "/cd alpha").await;
+        assert_eq!(
+            gateway.current_session.get(&thread_key("100.1")),
+            Some("s1".to_string())
+        );
+
+        // A thread whose session is elsewhere is freed, not re-pointed.
+        say_in_thread(&mut gateway, "100.1", "/cd beta").await;
+        assert_eq!(gateway.current_session.get(&thread_key("100.1")), None);
+        assert_eq!(
+            gateway.current_session.get(&thread_key("200.2")),
+            Some("s2".to_string()),
+            "another thread's session is untouched"
+        );
+        say_in_thread(&mut gateway, "100.1", "now in beta").await;
+        let sid = gateway.current_session.get(&thread_key("100.1")).unwrap();
+        assert_eq!(gateway.sessions[&sid].project, "beta");
+        assert_eq!(fake.starts.load(Ordering::SeqCst), 3);
     }
 
     /// Two first messages racing into ONE new thread spawn once (the claim is
