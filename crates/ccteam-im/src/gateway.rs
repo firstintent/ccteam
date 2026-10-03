@@ -341,10 +341,30 @@ impl FocusRoutes {
                 }
             }
         }
-        *self.write() = collapsed
+        let mut routes: BTreeMap<ChatKey, String> = collapsed
             .into_iter()
             .map(|(chat, (_, value))| (chat, value))
             .collect();
+        if self.scope == FocusScope::Thread {
+            // The restore path holds the same invariant [`Self::set`] does: a
+            // session lives in ONE thread of a conversation. Keys iterate in
+            // ascending thread order, so the last one seen per
+            // `(conversation, session)` is its most recent thread — keep that,
+            // drop the rest, whatever the file says.
+            let mut home: BTreeMap<(String, String, String), ChatKey> = BTreeMap::new();
+            for (chat, value) in routes.iter().filter(|(chat, _)| chat.thread.is_some()) {
+                home.insert(
+                    (chat.channel.clone(), chat.chat_id.clone(), value.clone()),
+                    chat.clone(),
+                );
+            }
+            routes.retain(|chat, value| {
+                chat.thread.is_none()
+                    || home.get(&(chat.channel.clone(), chat.chat_id.clone(), value.clone()))
+                        == Some(chat)
+            });
+        }
+        *self.write() = routes;
     }
 }
 
@@ -39121,6 +39141,39 @@ mod tests {
             telegram,
             "a single-stream chat is untouched"
         );
+    }
+
+    /// Restoring `routing.json` keeps the one-thread-per-session invariant
+    /// even when the file names a session in two threads: the most recent
+    /// thread keeps it, the other is freed; other conversations, other
+    /// sessions and single-stream chats are untouched.
+    #[test]
+    fn restored_routes_keep_one_thread_per_session() {
+        let routes = FocusRoutes::new(FocusScope::Thread);
+        let route = |chat: ChatKey, value: &str| SavedGatewayRoute {
+            chat,
+            value: value.to_string(),
+        };
+        let other_conv = ChatKey::new("mock", "conv-2", "bob").with_thread(Some("100.1"));
+        let telegram_a = ChatKey::new("telegram", "339", "339");
+        let telegram_b = ChatKey::new("telegram", "440", "440");
+        routes.load_saved(
+            vec![
+                route(thread_key("100.1"), "s1"),
+                route(thread_key("300.3"), "s1"),
+                route(thread_key("200.2"), "s2"),
+                route(other_conv.clone(), "s1"),
+                route(telegram_a.clone(), "s1"),
+                route(telegram_b.clone(), "s1"),
+            ],
+            |_, _| Some(0),
+        );
+        assert_eq!(routes.get(&thread_key("100.1")), None);
+        assert_eq!(routes.get(&thread_key("300.3")), Some("s1".into()));
+        assert_eq!(routes.get(&thread_key("200.2")), Some("s2".into()));
+        assert_eq!(routes.get(&other_conv), Some("s1".into()));
+        assert_eq!(routes.get(&telegram_a), Some("s1".into()));
+        assert_eq!(routes.get(&telegram_b), Some("s1".into()));
     }
 
     /// Ownership is the conversation's: a session started in thread A is
