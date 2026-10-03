@@ -294,6 +294,7 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(super::im_config::handle_telegram_chat_id_start))
         .routes(routes!(super::im_config::handle_telegram_chat_id_poll))
         .routes(routes!(super::im_config::handle_put_lark))
+        .routes(routes!(super::im_config::handle_put_slack))
         // v0.8.9 Phase 2 — ccteam-hub plugin marketplace: global catalog +
         // body preview, plus per-project decorated catalog + install.
         .routes(routes!(super::marketplace::handle_marketplace))

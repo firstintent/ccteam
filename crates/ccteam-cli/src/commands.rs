@@ -2140,6 +2140,95 @@ pub fn run_config_set_lark_creds_with_base(
     ))
 }
 
+/// `config` action — validate Slack app credentials (bot token via
+/// `auth.test`, app-level token via `apps.connections.open`) and persist them
+/// to `~/.ccteam/secrets/im-credentials.json` (mode 0600). Mirrors
+/// [`run_config_set_lark_creds`]: Socket Mode needs no public endpoint and
+/// there is nothing to long-poll — the allowlist is operator-supplied Slack
+/// user ids (`U…`), **fail-closed** (empty = the bot answers no one).
+pub fn run_config_set_slack_creds(
+    bot_token: &str,
+    app_token: &str,
+    allowed_user_ids: Vec<String>,
+) -> Result<String> {
+    run_config_set_slack_creds_with_base(
+        bot_token,
+        app_token,
+        allowed_user_ids,
+        ccteam_im::onboarding::SLACK_API_BASE,
+        None,
+    )
+}
+
+/// Test seam for [`run_config_set_slack_creds`]: overrides the Slack API
+/// base (a deterministic local mock) and the credentials-file path (a
+/// tempdir). Same `_with_base` convention as the Lark seam.
+pub fn run_config_set_slack_creds_with_base(
+    bot_token: &str,
+    app_token: &str,
+    allowed_user_ids: Vec<String>,
+    api_base: &str,
+    creds_path_override: Option<&std::path::Path>,
+) -> Result<String> {
+    let bot_token = bot_token.trim();
+    let app_token = app_token.trim();
+    if bot_token.is_empty() || app_token.is_empty() {
+        bail!("config: Slack bot token (xoxb-…) and app-level token (xapp-…) are both required");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for Slack credential onboarding")?;
+    let result = runtime
+        .block_on(ccteam_im::onboarding::slack_setup_with_base(
+            bot_token,
+            app_token,
+            allowed_user_ids,
+            api_base,
+        ))
+        .context("Slack onboarding (auth.test + apps.connections.open)")?;
+
+    // Persist: merge so a prior Telegram / Lark / Discord entry survives.
+    let creds_path = match creds_path_override {
+        Some(p) => p.to_path_buf(),
+        None => ccteam_im::credentials::default_path(),
+    };
+    let mut creds = ccteam_im::credentials::load(Some(&creds_path))
+        .context("load existing IM credentials before merge")?;
+    let allow_count = result.creds.allowed_user_ids.len();
+    creds.slack = Some(result.creds);
+    ccteam_im::credentials::save(&creds_path, &creds).context("persist IM credentials")?;
+
+    // Best-effort live reload; skipped on the test seam (see the Lark twin).
+    if creds_path_override.is_none() {
+        notify_daemon_im_reload();
+    }
+
+    let allow_note = if allow_count == 0 {
+        "  allowlist     EMPTY — fail-closed: the bot answers NO ONE.\n  \
+         add Slack user ids (U…) to allowed_user_ids to let users in.\n"
+            .to_string()
+    } else {
+        format!("  allowlist     {allow_count} user id(s) allowed\n")
+    };
+
+    Ok(format!(
+        "ccteam config: Slack credentials saved\n\n  \
+         workspace     {}\n  \
+         bot           @{} ({})\n\
+         {}  \
+         credentials   {}\n\n\
+         {}\n\
+         `ccteam start` will bring the IM gateway up with these credentials.\n",
+        result.team,
+        result.bot_user,
+        result.bot_user_id,
+        allow_note,
+        creds_path.display(),
+        ccteam_im::onboarding::SLACK_APP_CHECKLIST,
+    ))
+}
+
 /// Bare `ccteam config` — thin numbered-choice interactive menu. Reads a
 /// single digit from stdin and dispatches to the same action fn the
 /// non-interactive path uses (so all real work stays in testable fns).
@@ -2164,9 +2253,10 @@ pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
     println!("  1) register / refresh the ccteam MCP server (~/.claude.json)");
     println!("  2) set the IM (Telegram) bot token");
     println!("  3) set Lark/Feishu app credentials");
-    println!("  4) show preferences");
+    println!("  4) set Slack app credentials (one thread per session)");
+    println!("  5) show preferences");
     println!("  q) quit");
-    print!("\nchoose [1-4/q]: ");
+    print!("\nchoose [1-5/q]: ");
     std::io::stdout().flush().ok();
 
     let mut line = String::new();
@@ -2189,10 +2279,54 @@ pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
             run_config_set_im_token(&token)
         }
         "3" => run_config_lark_menu(),
-        "4" => run_prefs_show(paths),
+        "4" => run_config_slack_menu(),
+        "5" => run_prefs_show(paths),
         "q" | "Q" | "" => Ok("ccteam config: nothing changed.\n".to_string()),
-        other => bail!("ccteam config: unrecognized choice {other:?} (expected 1-4 or q)"),
+        other => bail!("ccteam config: unrecognized choice {other:?} (expected 1-5 or q)"),
     }
+}
+
+/// One trimmed line from stdin after printing `label` (the menu prompts).
+fn prompt_line(label: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{label}");
+    std::io::stdout().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .with_context(|| format!("read {label:?} from stdin"))?;
+    Ok(buf.trim().to_string())
+}
+
+/// Split a pasted id list on commas / whitespace.
+fn split_id_list(raw: &str) -> Vec<String> {
+    raw.split([',', ' ', '\t'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Interactive prompt for the menu's Slack item: collect the bot token, the
+/// app-level token and the user-id allowlist, then hand off to
+/// [`run_config_set_slack_creds`] (validate + persist).
+fn run_config_slack_menu() -> Result<String> {
+    println!(
+        "\nSlack app credentials (api.slack.com/apps → your app). The bot token is under\n\
+         OAuth & Permissions; the app-level token (scope connections:write) under Basic Information."
+    );
+    let bot_token = prompt_line("bot token (xoxb-…): ")?;
+    let app_token = prompt_line("app-level token (xapp-…): ")?;
+    println!(
+        "\nallowed_user_ids = the Slack member ids (U…) allowed to drive the bot\n  \
+         (profile → ⋯ → Copy member ID). FAIL-CLOSED: leaving this EMPTY means the\n  \
+         bot answers NO ONE. Use `*` to allow everyone in the workspace."
+    );
+    let allowed_user_ids = split_id_list(&prompt_line(
+        "allowed user ids (comma/space separated, or blank): ",
+    )?);
+    println!("validating tokens (auth.test + apps.connections.open)…");
+    run_config_set_slack_creds(&bot_token, &app_token, allowed_user_ids)
 }
 
 /// Interactive prompt for the menu's Lark/Feishu item: collect
@@ -2202,18 +2336,6 @@ pub fn run_config_menu(paths: &CcteamPaths) -> Result<String> {
 /// separate from [`run_config_menu`] so the stdin reads stay linear and
 /// the persistence logic remains unit-testable without a TTY.
 fn run_config_lark_menu() -> Result<String> {
-    use std::io::Write;
-
-    fn prompt_line(label: &str) -> Result<String> {
-        print!("{label}");
-        std::io::stdout().flush().ok();
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_line(&mut buf)
-            .with_context(|| format!("read {label:?} from stdin"))?;
-        Ok(buf.trim().to_string())
-    }
-
     println!(
         "\nLark/Feishu app credentials (from the developer console → app → Credentials & Basic Info)."
     );
@@ -2230,13 +2352,9 @@ fn run_config_lark_menu() -> Result<String> {
          FAIL-CLOSED: leaving this EMPTY means the bot answers NO ONE\n  \
          (the opposite of Telegram, where empty = open). Use `*` to allow everyone."
     );
-    let allow_raw = prompt_line("allowed open_ids (comma/space separated, or blank): ")?;
-    let allowed_user_ids: Vec<String> = allow_raw
-        .split([',', ' ', '\t'])
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    let allowed_user_ids = split_id_list(&prompt_line(
+        "allowed open_ids (comma/space separated, or blank): ",
+    )?);
 
     println!("validating app credentials (fetching a tenant_access_token)…");
     run_config_set_lark_creds(&app_id, &app_secret, allowed_user_ids, use_feishu)
@@ -5097,6 +5215,214 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("app_id and app_secret are both required"),
+            "must name the missing-field guard; got: {err}"
+        );
+    }
+
+    // --- Slack config (run_config_set_slack_creds) ----------------------
+    //
+    // Setup makes two calls (`auth.test`, `apps.connections.open`), so the
+    // mock is a std TCP responder routed by request path that serves every
+    // connection until the test ends. No env mutation; the creds path is a
+    // tempdir — safe in this lib module like the Lark tests above.
+
+    /// Serve `routes` (path → JSON body) on `127.0.0.1:0`; unknown paths get
+    /// `{"ok":false,"error":"unknown_method"}`. Returns the `api_base`.
+    fn spawn_slack_http(routes: &[(&'static str, &'static str)]) -> String {
+        use std::io::{Read, Write};
+        let routes: Vec<(&'static str, &'static str)> = routes.to_vec();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    content_length = String::from_utf8_lossy(&req[..pos])
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                }
+                            }
+                            if let Some(end) = header_end {
+                                if req.len().saturating_sub(end) >= content_length {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&req).into_owned();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let body = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, b)| *b)
+                    .unwrap_or(r#"{"ok":false,"error":"unknown_method"}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    const SLACK_AUTH_OK: &str =
+        r#"{"ok":true,"team":"Acme","user":"ccteam","user_id":"UBOT","bot_id":"BBOT"}"#;
+    const SLACK_SOCKET_OK: &str = r#"{"ok":true,"url":"wss://wss-primary.slack.com/link/?t=1"}"#;
+
+    #[test]
+    fn slack_creds_persist_list_the_app_checklist_and_preserve_lark() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let seed = ccteam_im::credentials::Credentials {
+            lark: Some(ccteam_im::credentials::LarkCreds {
+                app_id: "cli_seed".into(),
+                app_secret: "seed_secret".into(),
+                allowed_user_ids: vec!["ou_seed".into()],
+                use_feishu: true,
+            }),
+            ..Default::default()
+        };
+        ccteam_im::credentials::save(&creds_path, &seed).unwrap();
+        let base = spawn_slack_http(&[
+            ("/auth.test", SLACK_AUTH_OK),
+            ("/apps.connections.open", SLACK_SOCKET_OK),
+        ]);
+
+        let out = run_config_set_slack_creds_with_base(
+            " xoxb-1-bot ",
+            "xapp-1-app",
+            vec!["U0ALICE".into(), "U0BOB".into()],
+            &base,
+            Some(&creds_path),
+        )
+        .expect("slack creds validate + persist must succeed against the mock");
+        assert!(
+            out.contains("Slack credentials saved")
+                && out.contains("2 user id(s) allowed")
+                && out.contains("@ccteam (UBOT)")
+                && out.contains("Acme"),
+            "summary must confirm the save; got: {out}"
+        );
+        for item in [
+            "Socket Mode",
+            "/ccteam",
+            "Interactivity",
+            "app_mentions:read chat:write channels:history groups:history",
+            "im:history mpim:history reactions:write files:read files:write commands",
+            "message.channels message.groups message.im message.mpim",
+            "invite the bot",
+        ] {
+            assert!(
+                out.contains(item),
+                "checklist must mention {item:?}; got: {out}"
+            );
+        }
+
+        let reloaded = ccteam_im::credentials::load(Some(&creds_path)).unwrap();
+        let slack = reloaded.slack.expect("slack creds must be persisted");
+        assert_eq!(slack.bot_token, "xoxb-1-bot", "tokens are trimmed");
+        assert_eq!(slack.app_token, "xapp-1-app");
+        assert_eq!(slack.allowed_user_ids, vec!["U0ALICE", "U0BOB"]);
+        let lark = reloaded.lark.expect("lark must survive the merge");
+        assert_eq!(lark.app_id, "cli_seed");
+    }
+
+    #[test]
+    fn slack_creds_empty_allowlist_warns_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let base = spawn_slack_http(&[
+            ("/auth.test", SLACK_AUTH_OK),
+            ("/apps.connections.open", SLACK_SOCKET_OK),
+        ]);
+        let out = run_config_set_slack_creds_with_base(
+            "xoxb-1",
+            "xapp-1",
+            vec![],
+            &base,
+            Some(&creds_path),
+        )
+        .expect("an empty allowlist is a valid, locked-down config");
+        assert!(
+            out.contains("fail-closed") && out.contains("NO ONE"),
+            "empty allowlist must surface the fail-closed warning; got: {out}"
+        );
+        let reloaded = ccteam_im::credentials::load(Some(&creds_path)).unwrap();
+        assert!(reloaded.slack.unwrap().allowed_user_ids.is_empty());
+    }
+
+    #[test]
+    fn slack_creds_rejected_app_token_errors_without_persisting() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let base = spawn_slack_http(&[
+            ("/auth.test", SLACK_AUTH_OK),
+            (
+                "/apps.connections.open",
+                r#"{"ok":false,"error":"invalid_auth"}"#,
+            ),
+        ]);
+        let err = run_config_set_slack_creds_with_base(
+            "xoxb-1",
+            "xapp-bad",
+            vec!["U1".into()],
+            &base,
+            Some(&creds_path),
+        )
+        .expect_err("a rejected app-level token must not be saved");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("apps.connections.open") && msg.contains("invalid_auth"),
+            "error must carry the upstream Slack reason; got: {msg}"
+        );
+        assert!(
+            !creds_path.exists(),
+            "credentials file must not be created when validation fails"
+        );
+    }
+
+    #[test]
+    fn slack_creds_blank_token_rejected_before_network() {
+        let tmp = TempDir::new().unwrap();
+        let creds_path = tmp.path().join("im/credentials.json");
+        let err = run_config_set_slack_creds_with_base(
+            "xoxb-1",
+            "  ",
+            vec![],
+            "http://127.0.0.1:1", // would refuse-connect if reached
+            Some(&creds_path),
+        )
+        .expect_err("a blank app-level token must be rejected up front");
+        assert!(
+            err.to_string().contains("are both required"),
             "must name the missing-field guard; got: {err}"
         );
     }

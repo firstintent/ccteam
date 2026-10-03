@@ -65,6 +65,19 @@ async fn tenant_token_keeps_only_user_management_and_global_im_admin_only() {
         .await
         .unwrap();
     assert_eq!(r.status(), 403, "tenant must be 403 on global IM config");
+    // …including the Slack write (denied before any token validation).
+    let r = c
+        .put(format!("http://{addr}/api/v1/config/im/slack"))
+        .header("Authorization", format!("Bearer ccteam:{tenant_tok}"))
+        .json(&serde_json::json!({"bot_token": "xoxb-1", "app_token": "xapp-1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        403,
+        "tenant must be 403 on the global Slack config"
+    );
 
     // Shared operational/library surfaces are available to every identity.
     for path in ["/api/v1/hosts", "/api/v1/status", "/api/v1/skills"] {
