@@ -1,11 +1,13 @@
 // v0.8.8 F4 — REST client for the IM credential config surface
-// (`/api/v1/config/im/...`), driving the Settings page (Telegram + Lark).
+// (`/api/v1/config/im/...`), driving the Settings page (Telegram + Lark +
+// Slack).
 //
 // Backend SoT: `crates/ccteam-web/src/routes/im_config.rs`. Every endpoint
 // sits behind the same web-token gate as the rest of the resource API.
 //
 // 红线(red line): the read shape NEVER carries a plaintext secret — the
-// server `ImConfigStatus` has no `bot_token` / `app_secret` field at all,
+// server `ImConfigStatus` has no `bot_token` / `app_token` / `app_secret`
+// field at all,
 // only last-4 fingerprints + counts. {@link ImConfigStatus} mirrors that
 // exactly: omitting the secret fields here is a second (type-level) guard
 // on top of the server's.
@@ -42,12 +44,26 @@ export interface LarkStatus {
   allowed_user_id_count: number;
 }
 
+/** Masked Slack status (`im_config::SlackStatus`). No token fields — only
+ *  last-4 fingerprints; Slack member ids are not secrets. */
+export interface SlackStatus {
+  /** Always `true` when present. */
+  configured: boolean;
+  /** Last-4 fingerprint of the `xoxb-` bot token (`…wxyz`). */
+  bot_token_last4: string;
+  /** Last-4 fingerprint of the `xapp-` app-level token (`…wxyz`). */
+  app_token_last4: string;
+  /** Slack member ids (`U…`) allowed to drive the bot — empty = no one. */
+  allowed_user_ids: string[];
+}
+
 /** `GET /api/v1/config/im` response — masked, secret-free
- *  (`im_config::ImConfigStatus`). `telegram`/`lark` are `null` when the
- *  corresponding block is absent on disk. */
+ *  (`im_config::ImConfigStatus`). `telegram`/`lark`/`slack` are `null` when
+ *  the corresponding block is absent on disk. */
 export interface ImConfigStatus {
   telegram: TelegramStatus | null;
   lark: LarkStatus | null;
+  slack: SlackStatus | null;
   /** Cleartext-on-LAN caveat (no TLS) — surfaced as a warning banner. */
   transport_warning: string;
 }
@@ -105,6 +121,27 @@ export interface LarkSaveInput {
 export interface LarkSaveResult {
   ok: boolean;
   restart_required: boolean;
+  note: string;
+}
+
+/** `PUT /config/im/slack` request body. */
+export interface SlackSaveInput {
+  /** `xoxb-…` bot token (validated via `auth.test`). */
+  bot_token: string;
+  /** `xapp-…` app-level token (validated via `apps.connections.open`). */
+  app_token: string;
+  /** Slack member ids (`U…`) — empty = fail-closed (no one). */
+  allowed_user_ids: string[];
+}
+
+/** `PUT /config/im/slack` success body. */
+export interface SlackSaveResult {
+  ok: boolean;
+  restart_required: boolean;
+  /** Workspace name from `auth.test` (validation echo, not a secret). */
+  team: string;
+  /** The bot user's handle from `auth.test`. */
+  bot_user: string;
   note: string;
 }
 
@@ -207,4 +244,10 @@ export function pollTelegramChatId(): Promise<ChatIdPollResult> {
  *  the Lark/Feishu app credentials. 400 surfaces the validator's reason. */
 export function saveLark(input: LarkSaveInput): Promise<LarkSaveResult> {
   return putJson<LarkSaveResult>("/api/v1/config/im/lark", input);
+}
+
+/** `PUT /api/v1/config/im/slack` — validate both tokens (`auth.test` +
+ *  `apps.connections.open`) + persist. 400 surfaces the validator's reason. */
+export function saveSlack(input: SlackSaveInput): Promise<SlackSaveResult> {
+  return putJson<SlackSaveResult>("/api/v1/config/im/slack", input);
 }

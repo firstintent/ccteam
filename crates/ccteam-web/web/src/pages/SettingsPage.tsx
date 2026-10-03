@@ -1,5 +1,5 @@
 // v0.8.8 F4 — Settings panels: the admin's GLOBAL IM credentials
-// (Telegram + Lark), the tenant's self-serve 「我的 IM bot」, and the
+// (Telegram + Lark + Slack), the tenant's self-serve 「我的 IM bot」, and the
 // admin-only user management table. SettingsView places them: credentials
 // under 设置→接入 (admin), MyImSection under 设置→接入 (tenant), and
 // UserManagementSection on the standalone 管理员 · Admin tab.
@@ -41,10 +41,11 @@
 // re-run (cleanup `clearTimeout`) so navigating away never leaks a timer.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link2, MessageSquare, Send, Users } from "lucide-react";
+import { Hash, Link2, MessageSquare, Send, Users } from "lucide-react";
 import {
   pollTelegramChatId,
   saveLark,
+  saveSlack,
   saveTelegramToken,
   startTelegramChatId,
   type ChatIdPollStatus,
@@ -653,6 +654,219 @@ export function LarkSection({
       )}
 
       <CardFooter>app secret 永不回显;重配显「(set, ····wxyz)」+ 空白框 · 下次重启生效</CardFooter>
+    </Card>
+  );
+}
+
+// --------------------------------------------------------------------------
+// Slack — Socket Mode; every agent session lives in its own Slack thread
+// --------------------------------------------------------------------------
+
+export function SlackSection({
+  lang = "zh",
+  status,
+  onSaved,
+}: {
+  lang?: Lang;
+  status: ImConfigStatus["slack"];
+  onSaved: () => void;
+}) {
+  const t = makeT(lang);
+  const configured = status?.configured ?? false;
+  const [editing, setEditing] = useState(!configured);
+  const [botToken, setBotToken] = useState("");
+  const [appToken, setAppToken] = useState("");
+  const [userIdsRaw, setUserIdsRaw] = useState("");
+  const [pending, setPending] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+
+  const userIds = parseUserIds(userIdsRaw);
+  const canSubmit = !pending && botToken.trim().length > 0 && appToken.trim().length > 0;
+
+  async function persist() {
+    setPending(true);
+    setConfirming(false);
+    try {
+      const res = await saveSlack({
+        bot_token: botToken.trim(),
+        app_token: appToken.trim(),
+        allowed_user_ids: userIds,
+      });
+      toastBus.handler?.info(res.note || "Slack saved. Restart to apply.");
+      setBotToken("");
+      setAppToken("");
+      setUserIdsRaw("");
+      setEditing(false);
+      onSaved();
+    } catch (err) {
+      if (err instanceof Error && err.message === "UNAUTHENTICATED") return;
+      const msg = err instanceof Error ? err.message : "save failed";
+      toastBus.handler?.error(msg);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canSubmit) return;
+    if (configured && !confirming) {
+      setConfirming(true);
+      return;
+    }
+    void persist();
+  }
+
+  function cancelEdit() {
+    setBotToken("");
+    setAppToken("");
+    setUserIdsRaw("");
+    setConfirming(false);
+    setEditing(false);
+  }
+
+  return (
+    <Card data-testid="settings-slack">
+      <CardHeader>
+        <Hash className="text-text-secondary" />
+        <CardTitle className="flex-1">Slack</CardTitle>
+        {configured ? (
+          <Badge variant="running">已连接</Badge>
+        ) : (
+          <Badge variant="idle">未配置</Badge>
+        )}
+      </CardHeader>
+
+      {editing ? (
+        <CardContent>
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="flex flex-col gap-1.5">
+                {/* Red line: token fields always start EMPTY. */}
+                <Label htmlFor="settings-slack-bot-token">Bot token</Label>
+                <Input
+                  id="settings-slack-bot-token"
+                  type="password"
+                  autoComplete="off"
+                  value={botToken}
+                  onChange={(e) => {
+                    setBotToken(e.target.value);
+                    if (confirming) setConfirming(false);
+                  }}
+                  disabled={pending}
+                  spellCheck={false}
+                  placeholder="xoxb-…"
+                  className="font-mono"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="settings-slack-app-token">App-level token</Label>
+                <Input
+                  id="settings-slack-app-token"
+                  type="password"
+                  autoComplete="off"
+                  value={appToken}
+                  onChange={(e) => {
+                    setAppToken(e.target.value);
+                    if (confirming) setConfirming(false);
+                  }}
+                  disabled={pending}
+                  spellCheck={false}
+                  placeholder="xapp-…"
+                  className="font-mono"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="settings-slack-users">允许的 Slack user ID(逗号或换行分隔)</Label>
+              <Textarea
+                id="settings-slack-users"
+                value={userIdsRaw}
+                onChange={(e) => setUserIdsRaw(e.target.value)}
+                disabled={pending}
+                rows={2}
+                spellCheck={false}
+                placeholder="U0123ABC…, U0456DEF…"
+                className="font-mono"
+              />
+              {userIds.length === 0 ? (
+                <p className="text-[11px] font-mono text-status-error">
+                  空 allowlist = fail-closed:机器人谁也不回。
+                </p>
+              ) : (
+                <p className="text-[11px] font-mono text-text-dim">
+                  {userIds.length} user{userIds.length === 1 ? "" : "s"} allowed.
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 justify-end">
+              {confirming ? (
+                <>
+                  <span className="text-[11px] font-mono text-status-error mr-auto">
+                    覆盖已配置的 Slack 凭据?
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setConfirming(false)}
+                    disabled={pending}
+                  >
+                    取消
+                  </Button>
+                  <Button type="submit" size="sm" variant="destructive" disabled={!canSubmit}>
+                    {pending ? "保存中…" : "确认覆盖"}
+                  </Button>
+                </>
+              ) : (
+                <>
+                  {configured ? (
+                    <Button variant="ghost" size="sm" onClick={cancelEdit} disabled={pending}>
+                      取消
+                    </Button>
+                  ) : null}
+                  <Button type="submit" size="sm" disabled={!canSubmit}>
+                    {pending ? "保存中…" : configured ? "重置凭据" : "保存"}
+                  </Button>
+                </>
+              )}
+            </div>
+          </form>
+        </CardContent>
+      ) : (
+        <CardContent data-testid="settings-slack-summary" className="flex flex-col gap-3">
+          <Readout>
+            <ReadoutRow
+              label="bot token"
+              value={configured && status ? `(set, ${status.bot_token_last4})` : "—"}
+              ok={configured}
+            />
+            <ReadoutRow
+              label="app token"
+              value={configured && status ? `(set, ${status.app_token_last4})` : "—"}
+              ok={configured}
+            />
+            <ReadoutRow
+              label="allowed users"
+              value={configured && status ? String(status.allowed_user_ids.length) : "—"}
+            />
+          </Readout>
+          <Button
+            variant="outline"
+            size="sm"
+            className="self-end"
+            onClick={() => setEditing(true)}
+          >
+            {t("accessResetCredentials")}
+          </Button>
+        </CardContent>
+      )}
+
+      <CardFooter>
+        token 永不回显 · 每个 session 一个 Slack thread · 需开 Socket Mode + /ccteam
+      </CardFooter>
     </Card>
   );
 }

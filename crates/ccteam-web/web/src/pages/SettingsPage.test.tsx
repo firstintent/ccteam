@@ -16,6 +16,7 @@ import { renderToString } from "react-dom/server";
 import {
   LarkSection,
   MyImSection,
+  SlackSection,
   TelegramSection,
   UserManagementSection,
 } from "./SettingsPage";
@@ -83,6 +84,39 @@ describe("Settings sections", () => {
     expect(html).toContain('type="password"');
     expect(html).toContain('value=""');
     // Default textarea is empty → fail-closed warning is visible.
+    expect(html).toContain("fail-closed");
+  });
+
+  it("SlackSection (configured) renders masked token tails + allowlist size, no secret field", () => {
+    const html = renderToString(
+      <SlackSection
+        status={{
+          configured: true,
+          bot_token_last4: "…bot1",
+          app_token_last4: "…app1",
+          allowed_user_ids: ["U0ALICE", "U0BOB"],
+        }}
+        onSaved={() => {}}
+      />,
+    );
+    expect(html).toContain('data-testid="settings-slack"');
+    expect(html).toContain('data-testid="settings-slack-summary"');
+    expect(html).toContain("…bot1");
+    expect(html).toContain("…app1");
+    expect(html).toContain("allowed users");
+    expect(html).not.toContain('type="password"');
+  });
+
+  it("SlackSection (unconfigured) shows empty bot + app token fields and the fail-closed note", () => {
+    const html = renderToString(<SlackSection status={null} onSaved={() => {}} />);
+    expect(html).toContain('data-testid="settings-slack"');
+    expect(html).toContain("未配置");
+    expect(html).toContain('id="settings-slack-bot-token"');
+    expect(html).toContain('id="settings-slack-app-token"');
+    expect(html).toContain('placeholder="xoxb-…"');
+    expect(html).toContain('placeholder="xapp-…"');
+    expect(html).toContain('id="settings-slack-users"');
+    expect(html).not.toMatch(/value="[^"]+"/);
     expect(html).toContain("fail-closed");
   });
 

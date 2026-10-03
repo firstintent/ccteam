@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Braces, KeyRound, Link2, MessageSquare, Network, Send } from "lucide-react";
+import { Braces, Hash, KeyRound, Link2, MessageSquare, Network, Send } from "lucide-react";
 import {
   Button,
   Card,
@@ -30,7 +30,7 @@ import { getUserLink, listUsers, type TenantView } from "../lib/usersApi";
 import { useMe } from "../hooks/useMe";
 import { toastBus } from "../lib/toastBus";
 import { JoinCard } from "./HostsView";
-import { LarkSection, MyImSection, TelegramSection } from "./SettingsPage";
+import { LarkSection, MyImSection, SlackSection, TelegramSection } from "./SettingsPage";
 
 const CODE_PRE_CLASS =
   "max-h-80 overflow-auto rounded-lg border border-surface-700 bg-surface-950 p-3 text-[11px] text-text-secondary";
@@ -135,6 +135,7 @@ export default function AccessView({ lang }: { lang: Lang }) {
               <>
                 <TelegramSection lang={lang} status={config.telegram} onSaved={reloadConfig} />
                 <LarkSection lang={lang} status={config.lark} onSaved={reloadConfig} />
+                <SlackSection lang={lang} status={config.slack ?? null} onSaved={reloadConfig} />
               </>
             ) : (
               <>
@@ -148,6 +149,12 @@ export default function AccessView({ lang }: { lang: Lang }) {
                   testId="settings-lark"
                   icon={<MessageSquare />}
                   title="Lark / 飞书"
+                  loadingLabel={t("loading")}
+                />
+                <CredentialPlaceholder
+                  testId="settings-slack"
+                  icon={<Hash />}
+                  title="Slack"
                   loadingLabel={t("loading")}
                 />
               </>
