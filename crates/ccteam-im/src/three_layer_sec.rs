@@ -1,11 +1,10 @@
 //! Three-layer security composition.
 //!
 //! Mirrors `references/oh-my-claudecode/src/notifications/reply-listener.ts`
-//! (slack-socket.ts `verifySlackSignature`, the shared `RateLimiter`,
-//! and `sanitizeReplyInput`). All three layers must pass before the
-//! daemon will forward an IM turn to a tmux session.
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! (the shared `RateLimiter` and `sanitizeReplyInput`). All three layers
+//! must pass before the daemon will forward an IM turn to a session. Slack
+//! needs no request-signature layer: its inbound is a Socket Mode connection
+//! the daemon opens itself, never a signed webhook.
 
 use crate::acl::AclPolicy;
 use crate::rate_limit::RateLimiter;
@@ -30,10 +29,6 @@ pub enum SecOutcome {
     EmptyAfterSanitize,
 }
 
-/// Maximum age (seconds) of a Slack signed-request timestamp before it
-/// counts as replay-attack territory. OMC uses 5 minutes.
-pub const SLACK_TIMESTAMP_MAX_AGE_SECS: u64 = 300;
-
 /// Stateless evaluator. The daemon holds one [`ThreeLayerSec`] per
 /// bot — the [`RateLimiter`] inside lives across IM events but is
 /// owned by the caller (so tests can inject a deterministic clock by
@@ -56,9 +51,9 @@ impl ThreeLayerSec {
 
     /// Layer 1 + 2 + 3 in order: ACL → rate limit → sanitize.
     /// Signature verification is **not** included here because it's
-    /// platform-specific (Slack HMAC vs Telegram chat-id binding vs
-    /// Discord allowed-user check); call the verify helper for the
-    /// matching platform before calling [`Self::evaluate`].
+    /// platform-specific (Telegram chat-id binding vs Discord allowed-user
+    /// check vs the providers' own allowlists); call the verify helper for
+    /// the matching platform before calling [`Self::evaluate`].
     pub fn evaluate(&mut self, platform: &str, sender_id: &str, raw_text: &str) -> SecOutcome {
         if !self.acl.allow(platform, sender_id) {
             return SecOutcome::AclDenied;
@@ -72,56 +67,6 @@ impl ThreeLayerSec {
         }
         SecOutcome::Accept { payload: cleaned }
     }
-}
-
-/// Slack `v0:<ts>:<body>` HMAC-SHA256 signature verification — drop-in
-/// port of the OMC `verifySlackSignature` (TS source quoted in the
-/// reply-listener Explore report).
-///
-/// V0.6 implements without the `hmac`/`sha2`/`subtle` deps to avoid
-/// adding crates for one method — a future PR can swap in
-/// `subtle::ConstantTimeEq` + `hmac` if Slack inbound HTTP receiver
-/// lands. For now this returns `false` when no crypto backend is
-/// available, forcing platform setups to either:
-///
-/// 1. Use long-polling (the V0.6 default — no signed request to
-///    verify), OR
-/// 2. Provide their own verification path before calling
-///    [`ThreeLayerSec::evaluate`].
-pub fn verify_slack_signature_stub(
-    _signing_secret: &str,
-    _signature: &str,
-    timestamp: &str,
-    _body: &str,
-) -> bool {
-    // Replay-window check (we can do this without crypto).
-    let ts: u64 = match timestamp.parse() {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age = now.saturating_sub(ts);
-    if age > SLACK_TIMESTAMP_MAX_AGE_SECS {
-        return false;
-    }
-    // No HMAC backend wired yet; conservative deny by default.
-    // TODO(V0.7-slack-inbound): wire `hmac` + `sha2` + `subtle`
-    //   crates to verify the `v0=<hex>` signature against
-    //   `v0:<ts>:<body>` keyed by `creds.slack.signing_secret`,
-    //   returning `true` only on constant-time match.
-    // Reason deferred: Slack inbound HTTP receiver (the only caller
-    //   that would consume `true`) is V0.7 scope per
-    //   `docs/versions/v0-6-0/wave-2-decisions.md §5`; V0.6.x Slack
-    //   uses polling via `SlackChannel` which carries no signed
-    //   request, so wiring HMAC in isolation would add 3 deps for
-    //   zero production caller and risk drift before the inbound
-    //   receiver lands.
-    // Tracking: docs/versions/v0-6-6/prd.md §F168 (decision row #8) +
-    //   docs/dev-coupling-audit.md V0.6.6 segment.
-    false
 }
 
 /// Telegram chat-id binding check — the bot only accepts updates from
@@ -200,14 +145,6 @@ mod tests {
             sec.evaluate("telegram", "u1", "\x00\x01\x07"),
             SecOutcome::EmptyAfterSanitize
         );
-    }
-
-    #[test]
-    fn slack_signature_stub_rejects_old_timestamp() {
-        let old = "100"; // epoch=100s — far past window.
-        assert!(!verify_slack_signature_stub(
-            "secret", "v0=abc", old, "body"
-        ));
     }
 
     #[test]

@@ -18,9 +18,11 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::credentials::{LarkCreds, TelegramCreds};
+use crate::credentials::{LarkCreds, SlackCreds, TelegramCreds};
 
-fn client_for_api_base(
+/// HTTP client for one IM platform's API base. A loopback base (a test mock)
+/// bypasses any configured HTTP proxy so `cargo test` never leaves the box.
+pub(crate) fn client_for_api_base(
     api_base: &str,
     timeout: std::time::Duration,
 ) -> Result<reqwest::Client, reqwest::Error> {
@@ -72,9 +74,11 @@ pub enum OnboardingError {
     /// DNS, TLS, connect, or read timeout.
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    /// Telegram returned a `200` with `ok: false`; the `String` names the
-    /// API method that was rejected (e.g. an invalid bot token on `getMe`).
-    #[error("Telegram API returned `ok: false`: {0}")]
+    /// The platform API answered but refused the call (Telegram/Slack
+    /// `ok: false`, a non-zero Feishu `code`); the `String` names the
+    /// platform + method and carries the upstream reason (e.g. an invalid
+    /// bot token on `getMe` / `auth.test`).
+    #[error("IM platform API rejected the call: {0}")]
     ApiNotOk(String),
     /// The long-poll window elapsed without the owner sending a message,
     /// so no `chat_id` could be captured.
@@ -83,9 +87,10 @@ pub enum OnboardingError {
         /// The poll budget (seconds) that was exhausted.
         seconds: u64,
     },
-    /// A Telegram response decoded but was missing a field the flow needs
-    /// (e.g. `getMe.result`); the `String` describes what was absent.
-    #[error("malformed Telegram response: {0}")]
+    /// A platform response decoded but was missing a field the flow needs
+    /// (e.g. `getMe.result`, `auth.test.user_id`); the `String` describes
+    /// what was absent.
+    #[error("malformed IM platform response: {0}")]
     BadResponse(String),
 }
 
@@ -151,7 +156,7 @@ pub async fn telegram_validate_token_with_base(
         .json()
         .await?;
     if !me.ok {
-        return Err(OnboardingError::ApiNotOk("getMe".into()));
+        return Err(OnboardingError::ApiNotOk("Telegram getMe".into()));
     }
     let bot_user = me
         .result
@@ -198,7 +203,7 @@ async fn poll_first_chat_id(
 
         let resp: GetUpdatesResponse = client.get(&url).send().await?.json().await?;
         if !resp.ok {
-            return Err(OnboardingError::ApiNotOk("getUpdates".into()));
+            return Err(OnboardingError::ApiNotOk("Telegram getUpdates".into()));
         }
         for upd in resp.result.iter() {
             last_update_id = Some(upd.update_id);
@@ -328,7 +333,7 @@ pub async fn lark_setup_with_base(
     if resp.code != 0 {
         let msg = resp.msg.unwrap_or_else(|| "unknown error".into());
         return Err(OnboardingError::ApiNotOk(format!(
-            "tenant_access_token (code={}): {msg}",
+            "Lark tenant_access_token (code={}): {msg}",
             resp.code
         )));
     }
@@ -356,4 +361,132 @@ struct TenantTokenResponse {
     msg: Option<String>,
     #[serde(default)]
     tenant_access_token: Option<String>,
+}
+
+// --- Slack onboarding ------------------------------------------------
+//
+// Like Lark there is nothing to long-poll: the provider keys its allowlist on
+// operator-supplied Slack user ids (fail-closed) and opens an *outbound*
+// Socket Mode connection. Setup proves both tokens with the exact calls the
+// live channel makes (`transport::providers::slack::SlackChannel`):
+// `auth.test` with the `xoxb-` bot token (Web API) and
+// `apps.connections.open` with the `xapp-` app-level token (Socket Mode). The
+// WSS URL the latter returns is discarded unused — no socket is kept.
+
+/// Default Slack Web API root (also the live channel's default base).
+pub const SLACK_API_BASE: &str = "https://slack.com/api";
+
+/// What the Slack app itself must have for the provider to work — printed by
+/// the setup surfaces after a successful save. The one home of this list.
+pub const SLACK_APP_CHECKLIST: &str = "\
+Slack app checklist (api.slack.com/apps → your app):
+  - Socket Mode: ON (the xapp- app-level token needs connections:write)
+  - Slash command: /ccteam
+  - Interactivity & Shortcuts: ON (option buttons)
+  - App Home → Messages tab: ON, allow users to message the app (DMs)
+  - Bot token scopes: app_mentions:read chat:write channels:history groups:history
+    im:history mpim:history reactions:write files:read files:write commands
+  - Event subscriptions → bot events: message.channels message.groups message.im message.mpim
+  - Reinstall the app after scope changes, then invite the bot to a channel
+    (/invite @<bot>) or DM it
+";
+
+/// Result of a successful Slack credential check: the on-disk
+/// [`SlackCreds`] record plus the workspace/bot names for the setup UX.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlackSetupResult {
+    /// Validated tokens + the provider allowlist.
+    pub creds: SlackCreds,
+    /// Workspace name from `auth.test` (`team`).
+    pub team: String,
+    /// The bot user's handle from `auth.test` (`user`).
+    pub bot_user: String,
+    /// The bot user's id (`U…`) from `auth.test` (`user_id`).
+    pub bot_user_id: String,
+}
+
+/// Validate Slack credentials against the real Web API and return the
+/// on-disk record. `allowed_user_ids` is the provider allowlist of Slack user
+/// ids (`U…`) — **fail-closed**: empty means the bot answers no one.
+pub async fn slack_setup(
+    bot_token: &str,
+    app_token: &str,
+    allowed_user_ids: Vec<String>,
+) -> Result<SlackSetupResult, OnboardingError> {
+    slack_setup_with_base(bot_token, app_token, allowed_user_ids, SLACK_API_BASE).await
+}
+
+/// Test-friendly variant of [`slack_setup`] with an overridable API base
+/// (point a deterministic local mock at it — `cargo test` never calls Slack).
+pub async fn slack_setup_with_base(
+    bot_token: &str,
+    app_token: &str,
+    allowed_user_ids: Vec<String>,
+    api_base: &str,
+) -> Result<SlackSetupResult, OnboardingError> {
+    let client = client_for_api_base(api_base, std::time::Duration::from_secs(30))?;
+
+    let auth: SlackOkResponse = client
+        .post(format!("{api_base}/auth.test"))
+        .bearer_auth(bot_token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if !auth.ok {
+        return Err(OnboardingError::ApiNotOk(format!(
+            "Slack auth.test (bot token xoxb-…): {}",
+            auth.error.unwrap_or_else(|| "unknown_error".into())
+        )));
+    }
+    let bot_user_id = auth
+        .user_id
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| OnboardingError::BadResponse("Slack auth.test: user_id missing".into()))?;
+
+    let socket: SlackOkResponse = client
+        .post(format!("{api_base}/apps.connections.open"))
+        .bearer_auth(app_token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if !socket.ok {
+        return Err(OnboardingError::ApiNotOk(format!(
+            "Slack apps.connections.open (app-level token xapp-…, Socket Mode): {}",
+            socket.error.unwrap_or_else(|| "unknown_error".into())
+        )));
+    }
+    if socket.url.unwrap_or_default().is_empty() {
+        return Err(OnboardingError::BadResponse(
+            "Slack apps.connections.open: url missing".into(),
+        ));
+    }
+
+    Ok(SlackSetupResult {
+        creds: SlackCreds {
+            bot_token: bot_token.into(),
+            app_token: app_token.into(),
+            allowed_user_ids,
+        },
+        team: auth.team.unwrap_or_default(),
+        bot_user: auth.user.unwrap_or_default(),
+        bot_user_id,
+    })
+}
+
+/// The fields of `auth.test` / `apps.connections.open` setup reads.
+#[derive(Debug, Deserialize)]
+struct SlackOkResponse {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
 }

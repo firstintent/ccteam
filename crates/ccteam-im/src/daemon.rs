@@ -749,6 +749,11 @@ fn bind_operator_rosters(gateway: &mut Gateway, creds: &Credentials) {
     if let Some(lark) = creds.lark.as_ref() {
         rosters.push(("lark", lark.allowed_user_ids.clone()));
     }
+    // Slack names its owners by user id (`U…`), which the gateway matches
+    // against `ChatKey::user_id` (the inbound sender).
+    if let Some(slack) = creds.slack.as_ref() {
+        rosters.push(("slack", slack.allowed_user_ids.clone()));
+    }
     if let Some(discord) = creds.discord.as_ref() {
         rosters.push(("discord", discord.authorized_user_ids.clone()));
     }
@@ -970,22 +975,27 @@ fn build_telegram_channel(
     )))
 }
 
-/// Slack: HTTP `chat.postMessage` + channel polling. Discharges the old
-/// `TODO(V0.7-im-providers)` — the row was dark only because no creds
-/// block existed, not because the provider was missing.
+/// Slack: Socket Mode inbound + Web API outbound, one thread per session.
+///
+/// The allowlist is the operator's `SlackCreds.allowed_user_ids` alone (Slack
+/// user ids, fail-closed). Unlike Lark's parity-only union, registered bots'
+/// `im_chat_id`s (channel ids — a different namespace) are not mixed in.
 #[cfg(feature = "slack")]
 fn build_slack_channel(
     creds: &Credentials,
     _bots: &[BotRegistration],
-    _probe_path: Option<&Path>,
+    probe_path: Option<&Path>,
 ) -> Option<Arc<dyn Channel + Send + Sync>> {
     let slack = creds.slack.as_ref()?;
-    Some(Arc::new(
-        crate::transport::providers::slack::SlackChannel::new(
-            slack.bot_token.clone(),
-            slack.poll_channels.clone(),
-        ),
-    ))
+    let mut ch = crate::transport::providers::slack::SlackChannel::new(
+        slack.bot_token.clone(),
+        slack.app_token.clone(),
+        slack.allowed_user_ids.clone(),
+    );
+    if let Some(path) = probe_path {
+        ch = ch.with_probe_path(path.to_path_buf());
+    }
+    Some(Arc::new(ch))
 }
 
 /// Discord: REST messages API + per-channel polling. `DiscordCreds`
@@ -2195,6 +2205,27 @@ mod tests {
         // The Channel reports the SAME unique name → inbound stamps it + replies
         // route back through this bot (not a colliding shared `"telegram"`).
         assert_eq!(chans[0].1.name(), format!("telegram@{}", a.id).as_str());
+    }
+
+    /// #19 — a Slack credentials block yields the Socket Mode channel under the
+    /// `"slack"` key, and that channel carries the one-thread-per-session
+    /// contract the inbound consumer keys on. No block → no channel.
+    #[cfg(feature = "slack")]
+    #[test]
+    fn build_slack_channel_from_creds_threads_sessions() {
+        assert!(build_slack_channel(&Credentials::default(), &[], None).is_none());
+        let creds = Credentials {
+            slack: Some(crate::credentials::SlackCreds {
+                bot_token: "xoxb-1".into(),
+                app_token: "xapp-1".into(),
+                allowed_user_ids: vec!["U1".into()],
+            }),
+            ..Default::default()
+        };
+        let ch = build_slack_channel(&creds, &[], None).expect("slack block → channel");
+        assert_eq!(ch.name(), "slack");
+        assert!(ch.session_threads());
+        assert!(ch.max_message_len().is_some());
     }
     use tempfile::TempDir;
 

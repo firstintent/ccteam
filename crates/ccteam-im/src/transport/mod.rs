@@ -9,10 +9,10 @@
 //! - **No event_bus / security / config coupling.** ccteam-im has
 //!   its own credentials + ACL + sanitize layers; providers stay
 //!   plain reqwest clients.
-//! - **No Socket Mode / gateway WebSockets.** Slack + Discord both
-//!   use HTTP polling. Telegram uses `getUpdates` long-polling. None
-//!   of the V0.6 scope needs a public HTTPS endpoint, which keeps
-//!   ops surface to "edit credentials.json, run daemon".
+//! - **No public endpoint.** Every inbound path is outbound-initiated:
+//!   Telegram `getUpdates` long-polling, Lark and Slack (Socket Mode)
+//!   WebSocket long-connections, Discord HTTP polling — which keeps ops
+//!   surface to "edit credentials.json, run daemon".
 //!
 //! See `providers/mock.rs` for the in-memory test channel.
 
