@@ -14,7 +14,7 @@ Install once, start one resident process, then do daily work from three surfaces
 
 ## Core Concepts
 
-- **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group, or one Slack channel/DM. Each chat has its own current project, current session, and session list. Chats are isolated from each other. On Slack the current session is per **thread** — every session gets a thread of its own ([Slack: One Thread per Session](#slack-one-thread-per-session)).
+- **chat** = one conversation surface: one web console tab, Telegram/Feishu DM, or group, or one Slack channel/DM. Each chat has its own current project, current session, and session list. Other people's chats are isolated from each other; **your own** IM chats (the ones a bot allowlist names as you) see each other's sessions — but a session only ever pushes to **one** chat: the one that last messaged it or switched to it. On Slack the current session is per **thread** — every session gets a thread of its own ([Slack: One Thread per Session](#slack-one-thread-per-session)).
 - **project** = a local code directory registered with a short slug.
 - **session** = one independent agent conversation with its own context, like a native Claude Code session. A project can have many sessions running side by side. Each session has a durable handle `s<N>` that survives restarts and is never reused.
 - **role** = an optional persona bound at session start, loaded from `.claude/agents/<role>.md`. The default is **roleless**: the bare vendor reads the project's own `CLAUDE.md`/`AGENTS.md`. Personas are installed from the marketplace or written by you; ccteam seeds none.
