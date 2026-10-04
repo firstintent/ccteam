@@ -198,7 +198,7 @@ Open **Settings** and enter IM credentials:
 
 - **Telegram:** paste the bot token, save it, then send the bot a message. The page polls and captures your chat id.
 - **Lark/Feishu:** enter App ID, App Secret, region (Feishu China / Lark international), and allowed users.
-- **Slack:** enter the bot token (`xoxb-…`), the app-level token (`xapp-…`), and the allowed member ids (`U…`).
+- **Slack:** a three-step card — create the app from a one-click link (manifest prefilled), paste the bot and app-level tokens, then DM the bot and click your member id to allow it. Details in [Setup](#setup).
 
 Secrets are masked (`...last4`) and never returned in plaintext. **Restart the daemon after changing global IM credentials** because they are loaded at startup. The page will show `restart required`. Per-user IM bots are hot-reloaded; see [Multi-User](#multi-user).
 
@@ -282,62 +282,15 @@ After connecting IM, you can drive sessions, send files, and approve tools from 
 - `allowed_user_ids` is an open_id allowlist (`ou_...`) **and the owner roster**: a listed sender is served as the box owner. **Empty means reject everyone** (fail closed). To get your open_id, start with an empty list, message the bot, find `ignoring ou_xxxx (not in allowed_users)` in logs, and add that `ou_xxxx`.
 - The `"*"` wildcard lets **anyone** message the bot. It names nobody, so nobody is served as the owner through it: every sender is a guest who owns only what it creates and sees no project. The daemon warns about this at startup — put your own `ou_...` in the list to take the bot back.
 
-**Slack** gives **every session its own thread**, so parallel sessions never interleave in one stream. It connects over **Socket Mode** (an outbound WebSocket — no public callback URL). At [api.slack.com/apps](https://api.slack.com/apps) create an app **from a manifest** and paste:
+**Slack** gives **every session its own thread**, so parallel sessions never interleave in one stream. It connects over **Socket Mode** (an outbound WebSocket — no public callback URL). Set it up in **Settings → Access → Slack**, a guided three-step card:
 
-```yaml
-display_information:
-  name: ccteam
-features:
-  bot_user:
-    display_name: ccteam
-    always_online: true
-  app_home:
-    messages_tab_enabled: true
-    messages_tab_read_only_enabled: false
-  slash_commands:
-    - command: /ccteam
-      description: ccteam gateway command (sessions, new, cd, status, …)
-      usage_hint: "sessions | new codex | cd <project> | status"
-      should_escape: false
-oauth_config:
-  scopes:
-    bot:
-      - app_mentions:read
-      - chat:write
-      - channels:history
-      - groups:history
-      - im:history
-      - mpim:history
-      - reactions:write
-      - files:read
-      - files:write
-      - commands
-settings:
-  event_subscriptions:
-    bot_events:
-      - message.channels
-      - message.groups
-      - message.im
-      - message.mpim
-  interactivity:
-    is_enabled: true
-  socket_mode_enabled: true
-```
+1. **Create the app.** Name it (say `ccteam`, or `cct2` on a second machine) and click **Create in Slack**: Slack's create-app page opens with the whole manifest filled in — Socket Mode, the scopes and events ccteam needs, option buttons, the DM tab, and a slash command named after the app (`/ccteam`, `/cct2`). Pick the workspace, **Create**, then **Install App → Install to Workspace → Allow**.
+2. **Paste the two tokens.** *Bot token* = **OAuth & Permissions → Bot User OAuth Token** (`xoxb-…`); *App-level token* = **Basic Information → App-Level Tokens → Generate** with the `connections:write` scope (`xapp-…`). Saving checks both with Slack and connects at once — no restart.
+3. **Allow yourself.** DM the bot (or @-mention it in a channel): your member id (`U…`) shows up on the card, one click allows it. Until someone is allowed the bot answers **no one** (fail closed). The allowlist is also the **owner roster**: an allowed member is served as the box owner.
 
-Install the app to your workspace, copy the **Bot User OAuth Token** (`xoxb-…`), and under **Basic Information → App-Level Tokens** create a token with the `connections:write` scope (`xapp-…`). Configure through Web Settings / `ccteam config`, or add a `slack` block:
+Then invite the bot to a channel (`/invite @ccteam`) or DM it. It answers every message from allowed members in the channels it is in, so a dedicated channel (or the DM) works best.
 
-```json
-{
-  "slack": {
-    "bot_token": "xoxb-replace_me",
-    "app_token": "xapp-replace_me",
-    "allowed_user_ids": ["U0123ABCD"]
-  }
-}
-```
-
-- `allowed_user_ids` is a Slack member-id allowlist (`U…`) **and the owner roster**: a listed sender is served as the box owner. **Empty means reject everyone** (fail closed). Your member id is under your Slack profile → ⋮ → *Copy member ID*; a rejected DM also gets a reply naming the id to add.
-- Invite the bot to a channel (`/invite @ccteam`) or open its DM. It answers every message from allowed users in the channels it is in, so a dedicated channel (or the DM) works best.
+- **Several ccteam machines in one workspace:** give each independent ccteam its own app (`cct2`, `cct3`, …) — Socket Mode spreads one app's events across all its connections, so two daemons cannot share an app. Each app gets its own slash command. Slack's free plan allows up to 10 apps per workspace. Machines joined to one ccteam as satellites need no app of their own: that ccteam's app already reaches their projects.
 
 > Manual credentials file changes require daemon restart. The same applies to global credentials configured in Web Settings. Lark/Feishu, Telegram, and Slack are peers: text, rich text, images, and files are supported.
 
@@ -346,12 +299,12 @@ Install the app to your workspace, copy the **Bot User OAuth Token** (`xoxb-…`
 - A **top-level message** starts a new thread; the first ordinary message in a thread with no session starts a roleless session in the channel's current project (exactly like a fresh Telegram chat). Post another top-level message and a second session runs beside the first.
 - A **reply in a thread** goes to that thread's session. Everything that session produces — answers, the live progress card, approval buttons, files, the answer it gives after a delegate reports back — lands in its own thread.
 - The **channel** is the chat for ownership and the current project: `/cd` in any thread switches the project for the whole channel (that thread keeps its session only if the session is in the new project; otherwise its next message starts one there), and `/sessions` lists every session the channel owns. A session lives in **one thread at a time**: `/use <sid>` (or `@<handle>`) in a thread moves that session into it, and the thread it left says so (a new message there starts a fresh session). `/new …` in a thread starts a new session in that thread.
-- Slack treats a leading `/` as its own command, so gateway commands go through the **`/ccteam`** slash command: `/ccteam new codex`, `/ccteam sessions`, `/ccteam cd demo`. ccteam posts an anchor message for the command and answers in its thread — so `/ccteam new codex` creates the codex session right in that new thread, and `/ccteam use s12` moves an existing session into a fresh thread. Inside a thread, type the command with a leading space (` /status`, ` /compact`) to send it to that thread's session.
+- Slack treats a leading `/` as its own command, so gateway commands go through the app's **slash command** — `/ccteam` for an app named ccteam, `/cct2` for one named cct2: `/ccteam new codex`, `/ccteam sessions`, `/ccteam cd demo`. ccteam posts an anchor message for the command and answers in its thread — so `/ccteam new codex` creates the codex session right in that new thread, and `/ccteam use s12` moves an existing session into a fresh thread. Inside a thread, type the command with a leading space (` /status`, ` /compact`) to send it to that thread's session.
 - Sessions hired by other agents get no thread of their own; give one a thread with `/ccteam use <sid>` when you want to talk to it.
 
 ### Gateway Commands
 
-Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`. On Slack send them as `/ccteam <command>` (or, inside a thread, with a leading space) — see [Slack: One Thread per Session](#slack-one-thread-per-session).
+Send these commands in chat. The gateway handles them directly. Use `/help` anytime; Telegram also shows command candidates when you type `/`. On Slack send them through the app's slash command, e.g. `/ccteam <command>` (or, inside a thread, with a leading space) — see [Slack: One Thread per Session](#slack-one-thread-per-session).
 
 ```text
 # Projects

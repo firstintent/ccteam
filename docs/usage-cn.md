@@ -194,7 +194,7 @@ web url:   http://<你的局域网IP>:7331/?token=ccteam:<令牌>
 
 - **Telegram**:粘贴 bot token,保存后给 bot 发一条消息,页面会自动轮询抓到你的 chat_id。
 - **飞书 / Lark**:填 App ID / App Secret / 区域(飞书国内 / Lark 国际)/ 允许的用户。
-- **Slack**:填 bot token(`xoxb-…`)、app-level token(`xapp-…`)和允许的成员 ID(`U…`)。
+- **Slack**:三步卡片——一键链接创建 App(manifest 已填好)、填 bot token 和 app-level token、私信 bot 后点一下自己的成员 ID 完成授权。详见 [接入](#接入)。
 
 秘密只显示掩码(`…末四位`),永不回显明文。**改完需重启 daemon 才生效**(凭证仅在启动时加载),页面会提示 `restart required` —— 照 [运维](#运维) 重启即可。详细的 bot 创建步骤见 [二、Telegram / 飞书 / Slack](#接入)。
 
@@ -274,62 +274,15 @@ Mcp-Session-Id: <initialize 时 daemon 返回的 id>
 - `use_feishu`:`true` = 飞书(国内),`false` = Lark(国际)。
 - `allowed_user_ids` 是 open_id(`ou_…`)白名单,**留空 = 拒绝所有人**(fail-closed,比 Telegram 更安全)。拿自己的 open_id:先留空启动,给 bot 发条消息,在日志里找 `ignoring ou_xxxx (not in allowed_users)`,把 `ou_xxxx` 填回去。
 
-**Slack** 给**每个会话一个独立线程**,并行会话不再挤在同一条消息流里。走 **Socket Mode**(出站 WebSocket,不需要公网回调地址)。在 [api.slack.com/apps](https://api.slack.com/apps) 选 **From a manifest** 新建应用,粘贴:
+**Slack** 给**每个会话一个独立线程**,并行会话不再挤在同一条消息流里。走 **Socket Mode**(出站 WebSocket,不需要公网回调地址)。在 **Settings → 接入 → Slack** 卡片里按三步完成:
 
-```yaml
-display_information:
-  name: ccteam
-features:
-  bot_user:
-    display_name: ccteam
-    always_online: true
-  app_home:
-    messages_tab_enabled: true
-    messages_tab_read_only_enabled: false
-  slash_commands:
-    - command: /ccteam
-      description: ccteam gateway command (sessions, new, cd, status, …)
-      usage_hint: "sessions | new codex | cd <project> | status"
-      should_escape: false
-oauth_config:
-  scopes:
-    bot:
-      - app_mentions:read
-      - chat:write
-      - channels:history
-      - groups:history
-      - im:history
-      - mpim:history
-      - reactions:write
-      - files:read
-      - files:write
-      - commands
-settings:
-  event_subscriptions:
-    bot_events:
-      - message.channels
-      - message.groups
-      - message.im
-      - message.mpim
-  interactivity:
-    is_enabled: true
-  socket_mode_enabled: true
-```
+1. **创建 App**:起个名字(比如 `ccteam`,第二台机器用 `cct2`),点 **在 Slack 中创建**——Slack 的建应用页面会带着完整 manifest 打开:Socket Mode、ccteam 需要的权限和事件、选项按钮、私信入口,以及以 App 名命名的斜杠命令(`/ccteam`、`/cct2`)。选工作区 → **Create**,再 **Install App → Install to Workspace → Allow**。
+2. **填两个 token**:*Bot token* = **OAuth & Permissions → Bot User OAuth Token**(`xoxb-…`);*App-level token* = **Basic Information → App-Level Tokens → Generate**,scope 选 `connections:write`(`xapp-…`)。保存时会先用 Slack 校验两者,通过即连接,不用重启。
+3. **允许自己**:私信 bot(或在频道里 @ 它),你的成员 ID(`U…`)会出现在卡片上,点一下即允许。没人被允许前 bot **谁也不回**(fail closed)。允许名单同时是 **owner 名册**:被允许的成员按本机 owner 服务。
 
-把应用装进工作区,复制 **Bot User OAuth Token**(`xoxb-…`);在 **Basic Information → App-Level Tokens** 新建一个带 `connections:write` 的 token(`xapp-…`)。用 Web 设置 / `ccteam config` 配置,或在凭据文件里加 `slack` 段:
+之后把 bot 邀进频道(`/invite @ccteam`)或直接私信它。它会回答允许名单里的人在它所在频道里的每条消息,所以最好用一个专用频道(或私信)。
 
-```json
-{
-  "slack": {
-    "bot_token": "xoxb-replace_me",
-    "app_token": "xapp-replace_me",
-    "allowed_user_ids": ["U0123ABCD"]
-  }
-}
-```
-
-- `allowed_user_ids` 是 Slack 成员 ID(`U…`)白名单,**同时是 owner 名册**:名单里的发送者按本机 owner 服务。**留空 = 拒绝所有人**(fail closed)。成员 ID 在 Slack 个人资料 → ⋮ → *Copy member ID*;被拒的私信也会收到一条写着该 ID 的回复。
-- 把 bot 邀进频道(`/invite @ccteam`)或直接私信它。它会回答允许名单里的人在它所在频道里的每条消息,所以最好用一个专用频道(或私信)。
+- **一个工作区里有多台 ccteam**:每个独立的 ccteam 各建一个 App(`cct2`、`cct3`……)——Socket Mode 会把一个 App 的事件分散到它的所有连接上,两个 daemon 不能共用一个 App。每个 App 有自己的斜杠命令。Slack 免费版一个工作区最多 10 个 App。以卫星方式接入同一个 ccteam 的机器不需要单独的 App:那个 ccteam 的 App 已经能管到它们的项目。
 
 > **手写凭证文件后必须重启 daemon 才生效**(Web Settings 配的同理)。飞书/Lark、Telegram 与 Slack 对等:文本、富文本、图片/文件收发都支持。
 
@@ -338,12 +291,12 @@ settings:
 - **顶层消息**开一个新线程;没有会话的线程里第一条普通消息会在本频道当前项目里新建一个 roleless 会话(与 Telegram 新 chat 首条消息同一条路)。再发一条顶层消息,第二个会话就与第一个并行。
 - **线程内回复**只发给该线程的会话。该会话产生的一切——回答、实时进度卡、审批按钮、文件、委派回报后的回答——都进它自己的线程。
 - 归属与当前项目以**频道**为单位:在任一线程里 `/cd` 会切换整个频道的项目(该线程的会话若不在新项目里,线程即释放,下一条消息在新项目里新建会话),`/sessions` 列出频道拥有的全部会话。一个会话**同一时刻只住一个线程**:在线程里 `/use <sid>`(或 `@<handle>`)会把该会话搬进这个线程,它离开的线程会收到提示(在那里再发消息会新建会话);线程里 `/new …` 在该线程新建会话。
-- Slack 会拦截以 `/` 开头的消息,所以网关命令走 **`/ccteam`** 斜杠命令:`/ccteam new codex`、`/ccteam sessions`、`/ccteam cd demo`。ccteam 会先发一条锚点消息并在它的线程里回复——`/ccteam new codex` 就把新 codex 会话建在这个新线程里,`/ccteam use s12` 则把已有会话搬进一个新线程。在线程里给该会话发命令,前面加一个空格(` /status`、` /compact`)。
+- Slack 会拦截以 `/` 开头的消息,所以网关命令走 App 的**斜杠命令**(名为 ccteam 的 App 是 `/ccteam`,名为 cct2 的是 `/cct2`):`/ccteam new codex`、`/ccteam sessions`、`/ccteam cd demo`。ccteam 会先发一条锚点消息并在它的线程里回复——`/ccteam new codex` 就把新 codex 会话建在这个新线程里,`/ccteam use s12` 则把已有会话搬进一个新线程。在线程里给该会话发命令,前面加一个空格(` /status`、` /compact`)。
 - 由其他 agent 雇来的会话没有自己的线程;想跟它说话就 `/ccteam use <sid>` 给它开一个。
 
 ### 网关命令
 
-聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。Slack 上用 `/ccteam <命令>` 发(线程里则在命令前加一个空格),见 [Slack:一个会话 = 一个线程](#slack一个会话--一个线程)。
+聊天框里发这些命令,由网关直接处理。随时 `/help` 看清单(Telegram 里敲 `/` 也会弹候选)。Slack 上用 App 的斜杠命令发,如 `/ccteam <命令>`(线程里则在命令前加一个空格),见 [Slack:一个会话 = 一个线程](#slack一个会话--一个线程)。
 
 ```text
 # 项目
