@@ -58,11 +58,6 @@ use crate::transport::{
     RejectedSenderProbe, SendMessage,
 };
 
-/// The slash command this provider answers. It must match the command
-/// declared in the Slack app manifest (slash commands live there, not in an
-/// API call — so [`Channel::register_commands`] stays the default no-op).
-pub const SLACK_SLASH_COMMAND: &str = "/ccteam";
-
 /// Per-message ceiling in **UTF-16 code units**. Slack caps the cumulative
 /// text of `markdown` blocks in one payload at 12 000 characters; a UTF-16
 /// count is never smaller than the character count, so 10 000 units keeps a
@@ -603,7 +598,7 @@ fn anchor_failure_notice(err: &anyhow::Error) -> String {
     let code = api_error_code(err).unwrap_or("request_failed");
     format!(
         "ccteam 无法在这里开线程({code})。请先把 bot 邀请进此频道(`/invite @<bot>`),\
-         或在与 bot 的私聊里使用 `{SLACK_SLASH_COMMAND}`。"
+         或在与 bot 的私聊里使用它的斜杠命令。"
     )
 }
 
@@ -1083,10 +1078,9 @@ impl SlackChannel {
 
     async fn handle_slash(&self, payload: &Value) -> Option<ChannelMessage> {
         let command = decode_slash(payload)?;
-        if command.command != SLACK_SLASH_COMMAND {
-            tracing::debug!(command = %command.command, "slack: ignoring foreign slash command");
-            return None;
-        }
+        // No name check: Socket Mode only delivers this app's own slash
+        // commands, and each app is named its own (`/ccteam`, `/cct2`, …) —
+        // see `onboarding::slack_slash_command`.
         if !command.trigger_id.is_empty()
             && !self
                 .first_sighting(&[format!("trigger:{}", command.trigger_id)])

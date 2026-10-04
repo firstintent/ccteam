@@ -2225,7 +2225,7 @@ pub fn run_config_set_slack_creds_with_base(
         result.bot_user_id,
         allow_note,
         creds_path.display(),
-        ccteam_im::onboarding::SLACK_APP_CHECKLIST,
+        ccteam_im::onboarding::slack_app_checklist(),
     ))
 }
 

@@ -191,3 +191,58 @@ async fn slack_setup_missing_bot_user_is_bad_response() {
         .expect_err("auth.test without user_id is malformed");
     assert!(matches!(err, OnboardingError::BadResponse(_)), "{err:?}");
 }
+
+/// One home for "what a ccteam Slack app is": the manifest the web card links
+/// to and the checklist the CLI prints carry the same scopes, events and slash
+/// command, and an odd app name still yields a valid bot handle.
+#[test]
+fn slack_manifest_and_checklist_share_one_definition() {
+    use ccteam_im::onboarding::{
+        slack_app_checklist, slack_app_manifest, slack_create_app_url, slack_slash_command,
+        SLACK_BOT_EVENTS, SLACK_BOT_SCOPES,
+    };
+    let manifest = slack_app_manifest("ccteam");
+    let scopes: Vec<&str> = manifest["oauth_config"]["scopes"]["bot"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    assert_eq!(scopes, SLACK_BOT_SCOPES);
+    assert_eq!(
+        manifest["features"]["slash_commands"][0]["command"],
+        "/ccteam"
+    );
+    // Each app is named its own command, so several daemons can share a
+    // workspace: cct2 → /cct2, and a long name stays within Slack's 32.
+    assert_eq!(
+        slack_app_manifest("cct2")["features"]["slash_commands"][0]["command"],
+        "/cct2"
+    );
+    assert_eq!(slack_slash_command("Dev Box 3"), "/dev-box-3");
+    let long = slack_slash_command(&"x".repeat(40));
+    assert!(long.len() <= 32 && long.starts_with("/x"), "{long}");
+    assert_eq!(manifest["settings"]["socket_mode_enabled"], true);
+    assert_eq!(manifest["settings"]["interactivity"]["is_enabled"], true);
+
+    let checklist = slack_app_checklist();
+    for item in SLACK_BOT_SCOPES.iter().chain(SLACK_BOT_EVENTS) {
+        assert!(checklist.contains(item), "checklist names {item}");
+    }
+    assert!(checklist.contains(&slack_create_app_url("ccteam")));
+
+    let blank = slack_app_manifest("   ");
+    assert_eq!(blank["display_information"]["name"], "ccteam");
+    let odd = slack_app_manifest("Dev Team / 机器人!");
+    assert_eq!(odd["display_information"]["name"], "Dev Team / 机器人!");
+    let handle = odd["features"]["bot_user"]["display_name"]
+        .as_str()
+        .unwrap();
+    assert!(
+        handle
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c)),
+        "bot handle is Slack-valid: {handle}"
+    );
+    assert!(!handle.is_empty() && !handle.starts_with('-') && !handle.ends_with('-'));
+}

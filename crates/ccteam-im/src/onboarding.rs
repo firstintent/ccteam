@@ -376,20 +376,159 @@ struct TenantTokenResponse {
 /// Default Slack Web API root (also the live channel's default base).
 pub const SLACK_API_BASE: &str = "https://slack.com/api";
 
+/// The app name a setup surface proposes when the operator gives none.
+pub const DEFAULT_SLACK_APP_NAME: &str = "ccteam";
+
+/// Bot token scopes the Slack provider uses — the manifest and the setup
+/// checklist are both built from this list.
+pub const SLACK_BOT_SCOPES: &[&str] = &[
+    "app_mentions:read",
+    "chat:write",
+    "channels:history",
+    "groups:history",
+    "im:history",
+    "mpim:history",
+    "reactions:write",
+    "files:read",
+    "files:write",
+    "commands",
+];
+
+/// Bot events the Slack provider consumes over Socket Mode.
+pub const SLACK_BOT_EVENTS: &[&str] = &[
+    "message.channels",
+    "message.groups",
+    "message.im",
+    "message.mpim",
+];
+
+/// Slack's limits on an app's display name, its bot user's handle and a
+/// slash command (the leading `/` included).
+const SLACK_APP_NAME_MAX: usize = 35;
+const SLACK_BOT_HANDLE_MAX: usize = 80;
+const SLACK_SLASH_COMMAND_MAX: usize = 32;
+
+/// The app's display name: trimmed, capped, [`DEFAULT_SLACK_APP_NAME`] when
+/// blank.
+fn slack_app_name(app_name: &str) -> String {
+    let name: String = app_name.trim().chars().take(SLACK_APP_NAME_MAX).collect();
+    if name.is_empty() {
+        DEFAULT_SLACK_APP_NAME.to_string()
+    } else {
+        name
+    }
+}
+
+/// The bot user's handle for `app_name`: Slack only allows lowercase letters,
+/// digits, `.`, `_` and `-` there.
+fn slack_bot_handle(app_name: &str) -> String {
+    let handle: String = slack_app_name(app_name)
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(SLACK_BOT_HANDLE_MAX)
+        .collect();
+    let handle = handle.trim_matches('-');
+    if handle.is_empty() {
+        DEFAULT_SLACK_APP_NAME.to_string()
+    } else {
+        handle.to_string()
+    }
+}
+
+/// The slash command an app called `app_name` declares: `/` + its bot handle
+/// (`cct2` → `/cct2`). Every app gets its own, so several ccteam daemons can
+/// each have an app in one workspace without fighting over one command. The
+/// provider needs no copy of it: Socket Mode only ever delivers the app's own
+/// commands.
+pub fn slack_slash_command(app_name: &str) -> String {
+    let handle: String = slack_bot_handle(app_name)
+        .chars()
+        .take(SLACK_SLASH_COMMAND_MAX - 1)
+        .collect();
+    format!("/{}", handle.trim_end_matches(['-', '.']))
+}
+
+/// The Slack app manifest ccteam needs, for an app called `app_name`: Socket
+/// Mode on (no public URL), a slash command named after the app
+/// ([`slack_slash_command`]), interactivity for
+/// option buttons, the App Home messages tab for DMs, and exactly the scopes
+/// and events the provider uses. The one home of what "a ccteam Slack app"
+/// is — the web setup card and [`slack_app_checklist`] both come from here.
+pub fn slack_app_manifest(app_name: &str) -> serde_json::Value {
+    let name = slack_app_name(app_name);
+    let handle = slack_bot_handle(app_name);
+    serde_json::json!({
+        "display_information": {
+            "name": name,
+            "description": "ccteam — every agent session in its own thread",
+        },
+        "features": {
+            "bot_user": { "display_name": handle, "always_online": true },
+            "app_home": {
+                "messages_tab_enabled": true,
+                "messages_tab_read_only_enabled": false,
+            },
+            "slash_commands": [{
+                "command": slack_slash_command(app_name),
+                "description": "ccteam command: projects, cd, sessions, new, status, help",
+                "usage_hint": "projects | cd <project> | sessions | new codex | status",
+                "should_escape": false,
+            }],
+        },
+        "oauth_config": { "scopes": { "bot": SLACK_BOT_SCOPES } },
+        "settings": {
+            "event_subscriptions": { "bot_events": SLACK_BOT_EVENTS },
+            "interactivity": { "is_enabled": true },
+            "socket_mode_enabled": true,
+            "org_deploy_enabled": false,
+            "token_rotation_enabled": false,
+        },
+    })
+}
+
+/// A link that opens Slack's "create app" flow with [`slack_app_manifest`]
+/// already filled in (`new_app=1&manifest_json=…`): one click, pick the
+/// workspace, Create — no YAML to copy.
+pub fn slack_create_app_url(app_name: &str) -> String {
+    let manifest = slack_app_manifest(app_name).to_string();
+    reqwest::Url::parse_with_params(
+        "https://api.slack.com/apps",
+        &[("new_app", "1"), ("manifest_json", manifest.as_str())],
+    )
+    .map(|url| url.to_string())
+    .unwrap_or_else(|_| "https://api.slack.com/apps".to_string())
+}
+
 /// What the Slack app itself must have for the provider to work — printed by
-/// the setup surfaces after a successful save. The one home of this list.
-pub const SLACK_APP_CHECKLIST: &str = "\
-Slack app checklist (api.slack.com/apps → your app):
+/// the setup surfaces after a successful save. Built from the same constants
+/// as [`slack_app_manifest`].
+pub fn slack_app_checklist() -> String {
+    format!(
+        "Slack app checklist (api.slack.com/apps → your app):
   - Socket Mode: ON (the xapp- app-level token needs connections:write)
-  - Slash command: /ccteam
+  - Slash command: /<app name> ({} for an app named {})
   - Interactivity & Shortcuts: ON (option buttons)
   - App Home → Messages tab: ON, allow users to message the app (DMs)
-  - Bot token scopes: app_mentions:read chat:write channels:history groups:history
-    im:history mpim:history reactions:write files:read files:write commands
-  - Event subscriptions → bot events: message.channels message.groups message.im message.mpim
+  - Bot token scopes: {}
+  - Event subscriptions → bot events: {}
   - Reinstall the app after scope changes, then invite the bot to a channel
     (/invite @<bot>) or DM it
-";
+  Easiest: create the app from {}
+",
+        slack_slash_command(DEFAULT_SLACK_APP_NAME),
+        DEFAULT_SLACK_APP_NAME,
+        SLACK_BOT_SCOPES.join(" "),
+        SLACK_BOT_EVENTS.join(" "),
+        slack_create_app_url(DEFAULT_SLACK_APP_NAME),
+    )
+}
 
 /// Result of a successful Slack credential check: the on-disk
 /// [`SlackCreds`] record plus the workspace/bot names for the setup UX.

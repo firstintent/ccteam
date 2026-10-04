@@ -1055,17 +1055,27 @@ async fn slash_command_without_a_postable_anchor_explains_ephemerally_and_drops(
     assert!(body["text"].as_str().unwrap().contains("channel_not_found"));
 }
 
+/// Each app declares its own command (`/cct2` for an app named cct2) and
+/// Socket Mode only routes an app its own commands, so whatever command
+/// arrives is this app's: it opens an anchor thread like `/ccteam` does.
 #[tokio::test]
-async fn foreign_slash_command_is_ignored() {
+async fn an_apps_own_slash_command_works_whatever_it_is_named() {
     let api = MockHttp::start_sync(default_api).await;
     let ch = channel(&api.base, &[ALLOWED]);
-    let mut payload = slash_payload(ALLOWED, "C1", "x", "");
-    payload["command"] = json!("/other");
-    assert!(ch
+    let mut payload = slash_payload(ALLOWED, "C1", "projects", "");
+    payload["command"] = json!("/cct2");
+    let message = ch
         .handle_envelope(&envelope("slash_commands", payload))
         .await
-        .is_none());
-    assert!(api.calls("chat.postMessage").is_empty());
+        .expect("the app's own command is handled");
+    assert_eq!(message.content, "/projects");
+    let posts = api.calls("chat.postMessage");
+    assert_eq!(posts.len(), 1, "one anchor message");
+    assert!(posts[0].json()["text"]
+        .as_str()
+        .unwrap()
+        .contains("/cct2 projects"));
+    assert_eq!(message.thread_ts.as_deref(), Some("1700000999.000100"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
