@@ -11,6 +11,8 @@ import {
   listUsers,
   putMyIm,
   putMyLarkAllowedUsers,
+  getMySlackUserIdCandidates,
+  putMySlackAllowedUsers,
 } from "./usersApi";
 
 const realFetch = globalThis.fetch;
@@ -196,5 +198,28 @@ describe("per-user Telegram binding (the fail-closed bot's way in)", () => {
     await expect(putMyTelegramAllowedChats(["1"])).rejects.toThrow(
       "HTTP 400: no Telegram bot configured",
     );
+  });
+});
+
+describe("per-user Slack binding (symmetric with Telegram / Lark)", () => {
+  it("getMySlackUserIdCandidates GETs the caller's own discovery endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { candidates: [] }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await getMySlackUserIdCandidates(1500);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/v1/me/im/slack/user-id-candidates?since=1500");
+    globalThis.fetch = realFetch;
+  });
+
+  it("putMySlackAllowedUsers PUTs only the member ids", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(200, { ok: true, allowed_user_id_count: 1 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await putMySlackAllowedUsers(["U0ALICE"]);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/me/im/slack/allowed-users");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ allowed_user_ids: ["U0ALICE"] });
+    globalThis.fetch = realFetch;
   });
 });

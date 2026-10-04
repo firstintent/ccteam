@@ -200,6 +200,10 @@ fn build_api_v1() -> OpenApiRouter<AppState> {
         .routes(routes!(
             super::users::handle_put_me_telegram_allowed_chats
         ))
+        .routes(routes!(
+            super::users::handle_get_me_slack_user_id_candidates
+        ))
+        .routes(routes!(super::users::handle_put_me_slack_allowed_users))
         .routes(routes!(super::users::handle_put_user_im))
         // v0.8.9 Phase 4 — daemon-wide status aggregate (cost pill + Status view)
         .routes(routes!(super::status::handle_status))

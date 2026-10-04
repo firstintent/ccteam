@@ -1200,6 +1200,25 @@ fn build_tenant_channels(
                 out.push((name, Arc::new(ch)));
             }
         }
+        #[cfg(feature = "slack")]
+        {
+            if let Some(sl) = &t.slack {
+                // Fail-closed like the global Slack bot: an empty member-id
+                // allowlist answers nobody, and the rejected ids land in the
+                // probe file this tenant's own setup card reads.
+                let name = format!("slack@{}", t.id);
+                let mut ch = crate::transport::providers::slack::SlackChannel::new(
+                    sl.bot_token.clone(),
+                    sl.app_token.clone(),
+                    sl.allowed_user_ids.clone(),
+                )
+                .with_name(name.clone());
+                if let Some(path) = probe_path {
+                    ch = ch.with_probe_path(path.to_path_buf());
+                }
+                out.push((name, Arc::new(ch)));
+            }
+        }
     }
     out
 }
@@ -2227,6 +2246,31 @@ mod tests {
         // The Channel reports the SAME unique name → inbound stamps it + replies
         // route back through this bot (not a colliding shared `"telegram"`).
         assert_eq!(chans[0].1.name(), format!("telegram@{}", a.id).as_str());
+    }
+
+    /// A regular user's OWN Slack app is a `slack@<tenant>` channel like their
+    /// Telegram / Lark bot — and keeps Slack's contracts (a thread per session,
+    /// buttons) under that name.
+    #[cfg(feature = "slack")]
+    #[test]
+    fn a_tenants_slack_app_is_its_own_threaded_channel() {
+        let mut reg = ccteam_core::tenants::TenantRegistry::default();
+        let a = reg.add("alice");
+        reg.set_slack(
+            &a.id,
+            Some(ccteam_core::tenants::TenantSlack {
+                bot_token: "xoxb-a".into(),
+                app_token: "xapp-a".into(),
+                allowed_user_ids: vec!["U0ALICE".into()],
+            }),
+        );
+        let chans = build_tenant_channels(&reg, None);
+        assert_eq!(chans.len(), 1);
+        let (name, ch) = &chans[0];
+        assert_eq!(name, &format!("slack@{}", a.id));
+        assert_eq!(ch.name(), name.as_str());
+        assert!(ch.session_threads());
+        assert!(ch.native_buttons());
     }
 
     /// #19 — a Slack credentials block yields the Socket Mode channel under the

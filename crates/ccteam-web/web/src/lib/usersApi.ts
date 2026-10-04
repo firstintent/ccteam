@@ -73,6 +73,14 @@ export interface PutMyImForm {
     allowed_user_ids?: string[];
     use_feishu?: boolean;
   } | null;
+  /** Omit → unchanged; `null` → no Slack bot. Both tokens are checked with
+   *  Slack before anything is saved; omitting `allowed_user_ids` keeps the
+   *  members already bound. */
+  slack?: {
+    bot_token: string;
+    app_token: string;
+    allowed_user_ids?: string[];
+  } | null;
 }
 
 /** `PUT /api/v1/me/im` — the caller sets its OWN per-user IM bot (self-serve).
@@ -90,6 +98,10 @@ export interface PutMyImResult {
   /** A Telegram bot is configured but has an empty chat allowlist → it will
    *  answer no one until `putMyTelegramAllowedChats` binds a chat. */
   telegram_unbound: boolean;
+  slack?: boolean;
+  /** A Slack app is configured but allows no member yet → it answers no one
+   *  until `putMySlackAllowedUsers` binds one. */
+  slack_unbound?: boolean;
   reloaded?: boolean;
   note?: string;
 }
@@ -152,6 +164,28 @@ export function putMyLarkAllowedUsers(
 ): Promise<{ ok: boolean; allowed_user_id_count: number; note?: string }> {
   return sendJson<{ ok: boolean; allowed_user_id_count: number; note?: string }>(
     "/api/v1/me/im/lark/allowed-users",
+    "PUT",
+    { allowed_user_ids },
+  );
+}
+
+/** Poll the Slack member ids the caller's OWN Slack app rejected (not
+ *  allowed yet) — DM the bot and your own `U…` shows up here. */
+export function getMySlackUserIdCandidates(
+  since?: number,
+): Promise<SenderCandidatesResponse> {
+  const qs = since ? `?since=${encodeURIComponent(String(since))}` : "";
+  return getJson<SenderCandidatesResponse>(
+    `/api/v1/me/im/slack/user-id-candidates${qs}`,
+  );
+}
+
+/** Set the caller's own Slack member allowlist without re-entering tokens. */
+export function putMySlackAllowedUsers(
+  allowed_user_ids: string[],
+): Promise<{ ok: boolean; allowed_user_id_count: number; note?: string }> {
+  return sendJson<{ ok: boolean; allowed_user_id_count: number; note?: string }>(
+    "/api/v1/me/im/slack/allowed-users",
     "PUT",
     { allowed_user_ids },
   );

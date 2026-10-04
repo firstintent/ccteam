@@ -791,6 +791,123 @@ async fn slack_user_id_candidates_are_the_global_bots_rejected_senders() {
 }
 
 // --------------------------------------------------------------------------
+// A regular user's OWN Slack app — symmetric with their Telegram / Lark bot
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn a_tenant_sets_up_their_own_slack_app() {
+    use ccteam_core::tenants::TenantRegistry;
+    let base = spawn_slack_mock(true, true).await;
+    std::env::set_var("CCTEAM_SLACK_API_BASE", &base);
+
+    let tmp = TempDir::new().unwrap();
+    let paths = fake_paths(tmp.path());
+    std::fs::create_dir_all(&paths.root).unwrap();
+    let mut reg = TenantRegistry::default();
+    let alice = reg.add("alice");
+    let bob = reg.add("bob");
+    reg.save(&paths.users_dir()).unwrap();
+    let users = paths.users_dir();
+    let probe = paths.im_state_dir().join("rejected-senders.jsonl");
+    let (state, _) = state_with_creds(&tmp, AuthState::enabled(TOKEN_HEX.into()));
+    let addr = spawn_app(state).await;
+    let alice_auth = format!("Bearer ccteam:{}", alice.web_token);
+
+    // ② Tokens, validated against Slack; fail-closed until someone is allowed.
+    let v: Value = client()
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"slack": {"bot_token": "xoxb-a", "app_token": "xapp-a"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["slack"], true, "{v}");
+    assert_eq!(v["slack_unbound"], true, "{v}");
+    let saved = TenantRegistry::load(&users)
+        .by_id(&alice.id)
+        .unwrap()
+        .clone();
+    assert_eq!(saved.slack.as_ref().unwrap().bot_token, "xoxb-a");
+    assert!(saved.lark.is_none() && saved.telegram.is_none());
+
+    // ③ Capture is scoped to HER bot (`slack@<alice>`), then one click allows.
+    std::fs::create_dir_all(probe.parent().unwrap()).unwrap();
+    let row = |channel: String, sender: &str| {
+        serde_json::json!({
+            "channel": channel, "sender_id": sender, "chat_id": "D1",
+            "message_id": "1.1", "timestamp": 2000_u64,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        &probe,
+        [
+            row(format!("slack@{}", alice.id), "U0ALICE"),
+            row(format!("slack@{}", bob.id), "U0BOB"),
+            row("slack".into(), "U0OWNER"),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let candidates: Value = client()
+        .get(format!(
+            "http://{addr}/api/v1/me/im/slack/user-id-candidates"
+        ))
+        .header("Authorization", &alice_auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = candidates["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["sender_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["U0ALICE"], "only her own bot's rejected senders");
+    let r = client()
+        .put(format!("http://{addr}/api/v1/me/im/slack/allowed-users"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"allowed_user_ids": ["U0ALICE"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // A later token change keeps the binding (a member id names the person).
+    client()
+        .put(format!("http://{addr}/api/v1/me/im"))
+        .header("Authorization", &alice_auth)
+        .json(&serde_json::json!({"slack": {"bot_token": "xoxb-a2", "app_token": "xapp-a2"}}))
+        .send()
+        .await
+        .unwrap();
+    let saved = TenantRegistry::load(&users)
+        .by_id(&alice.id)
+        .unwrap()
+        .clone();
+    let slack = saved.slack.unwrap();
+    assert_eq!(slack.bot_token, "xoxb-a2");
+    assert_eq!(slack.allowed_user_ids, vec!["U0ALICE"]);
+    assert!(
+        TenantRegistry::load(&users)
+            .by_id(&bob.id)
+            .unwrap()
+            .slack
+            .is_none(),
+        "bob is untouched"
+    );
+
+    std::env::remove_var("CCTEAM_SLACK_API_BASE");
+}
+
+// --------------------------------------------------------------------------
 // Web-token gate
 // --------------------------------------------------------------------------
 

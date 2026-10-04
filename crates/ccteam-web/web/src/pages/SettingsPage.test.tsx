@@ -149,6 +149,20 @@ describe("Settings sections", () => {
     expect(html).not.toContain('data-testid="settings-slack-capture"');
   });
 
+  it("MyImSection gives Slack the same self-serve card as Telegram and Lark", () => {
+    const html = renderToString(<MyImSection />);
+    expect(html).toContain('data-testid="my-im-slack"');
+    // Same three steps as the owner's admin card: create → tokens → allow.
+    expect(html).toContain('data-testid="my-im-slack-create-link"');
+    expect(html).toContain('id="my-im-slack-bot-token"');
+    expect(html).toContain('id="my-im-slack-app-token"');
+    expect(html).toContain('data-testid="my-im-slack-save"');
+    expect(html).toContain('data-testid="my-im-slack-capture"');
+    expect(html).toContain('data-testid="my-im-slack-allowlist-save"');
+    expect(html).toContain("Telegram / Lark / Slack");
+    expect(html).not.toMatch(/id="my-im-slack-(bot|app)-token"[^>]*value="[^"]+"/);
+  });
+
   it("MyImSection guides Telegram and Lark as two separate stepped cards", () => {
     const html = renderToString(<MyImSection />);
     expect(html).toContain('data-testid="settings-my-im"');

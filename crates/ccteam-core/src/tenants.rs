@@ -56,6 +56,18 @@ pub struct TenantLark {
     pub use_feishu: bool,
 }
 
+/// A tenant's OWN Slack app (the per-user IM bot, symmetric with
+/// [`TenantTelegram`] / [`TenantLark`]): the `xoxb-` bot token, the `xapp-`
+/// app-level token for Socket Mode, and the Slack member ids it answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantSlack {
+    pub bot_token: String,
+    pub app_token: String,
+    /// Slack member ids (`U…`) allowed to drive the bot. Empty = closed.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -83,6 +95,9 @@ pub struct Tenant {
     /// v0.8.20 F2 — this tenant's OWN Lark/Feishu app (per-user IM).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lark: Option<TenantLark>,
+    /// This tenant's OWN Slack app (per-user IM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<TenantSlack>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -212,6 +227,7 @@ impl TenantRegistry {
             linked_chat: None,
             telegram: None,
             lark: None,
+            slack: None,
             created_at: Utc::now(),
         };
         self.tenants.push(tenant.clone());
@@ -289,6 +305,17 @@ impl TenantRegistry {
         match self.tenants.iter_mut().find(|t| t.id == id) {
             Some(t) => {
                 t.lark = lark;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Set (or clear with `None`) a tenant's OWN Slack app.
+    pub fn set_slack(&mut self, id: &str, slack: Option<TenantSlack>) -> bool {
+        match self.tenants.iter_mut().find(|t| t.id == id) {
+            Some(t) => {
+                t.slack = slack;
                 true
             }
             None => false,

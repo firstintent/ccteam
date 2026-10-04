@@ -209,7 +209,7 @@ Detailed bot setup is in [2. Telegram / Lark / Slack](#setup).
 One daemon can serve multiple users on one machine. This is **soft isolation** under one OS account: a UX boundary, not a security boundary.
 
 - Admins can create users in **Settings -> User Management**. Each user receives a one-time personal login link and sees only their own projects and sessions.
-- Each user can configure their own IM bot in **Settings → Access → My IM bot**: one guided card per platform (Telegram / Lark), each a numbered two-step flow — ① save that platform's credential with its own button, ② bind who the bot answers, with sender capture starting by itself right after the save, so the next action is never a guess. Saving one platform never touches the other's credential. Save validates the token and applies immediately without a daemon restart. That bot drives only that user's sessions. **Each bot token must be unique.**
+- Each user can configure their own IM bot in **Settings → Access → My IM bot**: one guided card per platform (Telegram / Lark / Slack — Slack adds a first step that creates the app from a one-click link), each a numbered flow — ① save that platform's credential with its own button, ② bind who the bot answers, with sender capture starting by itself right after the save, so the next action is never a guess. Saving one platform never touches the other's credential. Save validates the token and applies immediately without a daemon restart. That bot drives only that user's sessions. **Each bot token must be unique.**
 
 ### Status and Cost
 

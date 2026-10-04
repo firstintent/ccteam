@@ -127,7 +127,7 @@ fn lark_api_base(use_feishu: bool) -> String {
 
 /// Resolve the Slack Web API base: the [`SLACK_API_BASE_ENV`] override if set
 /// + non-empty, else the production constant.
-fn slack_api_base() -> String {
+pub(crate) fn slack_api_base() -> String {
     std::env::var(SLACK_API_BASE_ENV)
         .ok()
         .filter(|s| !s.is_empty())
@@ -767,7 +767,9 @@ pub struct SlackManifestResponse {
 /// `GET /api/v1/config/im/slack/app-manifest` — the manifest for a new Slack
 /// app and a one-click link that creates it, so setup never starts from a
 /// hand-copied YAML. The manifest's one home is
-/// [`ccteam_im::onboarding::slack_app_manifest`].
+/// [`ccteam_im::onboarding::slack_app_manifest`]. Open to every signed-in
+/// identity: it holds no secret, and a regular user creates their OWN Slack
+/// app from it exactly as the owner creates the global one.
 #[utoipa::path(
     get,
     path = "/api/v1/config/im/slack/app-manifest",
@@ -775,16 +777,11 @@ pub struct SlackManifestResponse {
     params(SlackManifestQuery),
     responses(
         (status = 200, description = "Manifest + create-app link", body = SlackManifestResponse),
-        (status = 403, description = "Not an admin"),
     ),
 )]
 pub(crate) async fn handle_get_slack_manifest(
-    Extension(identity): Extension<Identity>,
     axum::extract::Query(query): axum::extract::Query<SlackManifestQuery>,
 ) -> Response {
-    if let Some(deny) = deny_non_admin(&identity) {
-        return deny;
-    }
     let name = query.name.unwrap_or_default();
     Json(SlackManifestResponse {
         manifest: ccteam_im::onboarding::slack_app_manifest(&name),

@@ -617,6 +617,7 @@ pub(crate) fn user_delivery_target(
         let channel = match platform {
             "telegram" if tenant.telegram.is_some() => format!("telegram@{user_id}"),
             "lark" if tenant.lark.is_some() => format!("lark@{user_id}"),
+            "slack" if tenant.slack.is_some() => format!("slack@{user_id}"),
             other => other.to_string(),
         };
         return Ok((channel, chat_id.to_string()));
@@ -635,6 +636,14 @@ pub(crate) fn user_delivery_target(
         .and_then(|lark| lark.allowed_user_ids.first())
     {
         return Ok((format!("lark@{user_id}"), open_id.clone()));
+    }
+    // Slack posts to a member id as the app's DM with that member.
+    if let Some(member_id) = tenant
+        .slack
+        .as_ref()
+        .and_then(|slack| slack.allowed_user_ids.first())
+    {
+        return Ok((format!("slack@{user_id}"), member_id.clone()));
     }
 
     Err(
