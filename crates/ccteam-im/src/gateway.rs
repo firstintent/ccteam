@@ -5994,9 +5994,23 @@ impl Gateway {
     /// session owner's own frontend — with the session's thread re-attached
     /// ([`Self::with_bound_thread`]).
     fn owner_reply_target(&self, session: &GatewaySession) -> ChatKey {
-        let target = self
-            .tenant_project_owner_reply_target(&session.project)
-            .unwrap_or_else(|| reply_target_for_owner(&session.owner));
+        let target = match self.tenant_project_owner_reply_target(&session.project) {
+            Some(target) => target,
+            None => {
+                // A session one of the owner's IM chats switched to (or last
+                // drove) and still has in focus lives THERE now — its
+                // follow-ups go to that chat, not back to the one that created
+                // it. One target, never a broadcast: seeing a session from
+                // several chats must not make it push to all of them.
+                let current = pump_target(session);
+                if current.channel != "web"
+                    && self.current_session.is_focused(&current, &session.id)
+                {
+                    return current;
+                }
+                reply_target_for_owner(&session.owner)
+            }
+        };
         self.with_bound_thread(target, &session.id)
     }
 
@@ -11355,12 +11369,13 @@ impl Gateway {
         // tenant's console), so a `/sessions` list — or a `/use` on a listed
         // sid, which re-points `reply_to` — crossed users.
         let (user_id, is_admin) = self.project_acl_identity(chat);
-        ccteam_core::identity::can_see_session_owner(
-            &canonical_owner(chat).identity(),
-            &user_id,
-            is_admin,
-            owner_identity,
-        )
+        let viewer = canonical_owner(chat).identity();
+        ccteam_core::identity::can_see_session_owner(&viewer, &user_id, is_admin, owner_identity)
+            || ccteam_core::identity::operator_im_pool_sees(
+                &viewer,
+                self.is_named_operator_chat(chat),
+                owner_identity,
+            )
     }
 
     /// Session ownership inherits the project principal. The stored owner is
@@ -11466,6 +11481,20 @@ impl Gateway {
             }
             Some(OperatorBinding::Wildcard) => false,
             None => true,
+        }
+    }
+
+    /// Whether this chat is EXPLICITLY named in its global bot's operator
+    /// roster — [`Self::is_operator_chat`] minus the open-mode fallback that
+    /// treats an unconfigured bot's every sender as the operator. What the
+    /// owner's shared IM session pool keys on: a stranger who reached an
+    /// unconfigured bot must not see the owner's sessions.
+    fn is_named_operator_chat(&self, chat: &ChatKey) -> bool {
+        match self.operator_chats.get(&chat.channel) {
+            Some(OperatorBinding::Named(named)) => {
+                named.contains(&chat.chat_id) || named.contains(&chat.user_id)
+            }
+            _ => false,
         }
     }
 
@@ -27107,7 +27136,7 @@ mod tests {
     /// ("IM chat 之间互相隔离" — the 档0 rule the v0.8.13 same-project sharing
     /// was reverted for; do not let project inheritance quietly re-add it).
     #[tokio::test]
-    async fn operator_and_unowned_projects_keep_per_im_chat_isolation() {
+    async fn the_owners_named_chats_share_sessions_a_guest_sees_none() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (paths, _project_dir) = mirror_test_paths(&tmp);
         seed_owned_project(&paths, "ops", Some("user:web-api")); // operator pool
@@ -27142,14 +27171,23 @@ mod tests {
                 gateway.chat_can_access(&rob, gateway.sessions.get(&mine).unwrap()),
                 "{slug}: a chat sees its own session"
             );
+            // Owner 2026-10-05: the owner's NAMED IM chats share one pool.
             assert!(
-                !gateway.chat_can_access(&rob, gateway.sessions.get(&theirs).unwrap()),
-                "{slug}: an admin chat must NOT see another admin chat's session"
+                gateway.chat_can_access(&rob, gateway.sessions.get(&theirs).unwrap()),
+                "{slug}: a named operator chat sees the owner's other chat's session"
             );
             assert!(
-                !gateway.chat_can_access(&eve, gateway.sessions.get(&mine).unwrap()),
-                "{slug}: isolation is symmetric"
+                gateway.chat_can_access(&eve, gateway.sessions.get(&mine).unwrap()),
+                "{slug}: sharing is symmetric"
             );
+            // A chat the allowlist does not name is a guest: it sees neither.
+            let guest = ChatKey::new("telegram", "333", "mallory");
+            for sid in [&mine, &theirs] {
+                assert!(
+                    !gateway.chat_can_access(&guest, gateway.sessions.get(sid).unwrap()),
+                    "{slug}: a guest must not see the owner's {sid}"
+                );
+            }
         }
     }
 
@@ -39048,7 +39086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbox_list_reuses_own_plus_web_pool_acl() {
+    async fn inbox_list_reuses_the_owners_pools_acl() {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_role(tmp.path(), "reviewer");
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
@@ -39098,7 +39136,8 @@ mod tests {
             .unwrap();
         assert!(listed[0].contains("own-message"), "{listed:?}");
         assert!(listed[0].contains("web-pool-message"), "{listed:?}");
-        assert!(!listed[0].contains("foreign-message"), "{listed:?}");
+        // chat-2 is the owner's other NAMED chat: its schedule is in the pool.
+        assert!(listed[0].contains("foreign-message"), "{listed:?}");
     }
 
     #[tokio::test]
@@ -39528,6 +39567,108 @@ mod tests {
             !delivered.content.starts_with("[s1 "),
             "the thread's own session is not labelled: {}",
             delivered.content
+        );
+    }
+
+    /// The owner's IM chats share one session POOL but never one push: a
+    /// session the owner's Telegram chat created is listed and `/use`-able from
+    /// the owner's Slack, and once Slack switched to it its follow-ups (an
+    /// internal turn's answer) go to Slack ONLY — until Telegram drives it
+    /// again. A sender who is not a named operator still sees nothing.
+    #[tokio::test]
+    async fn the_owners_chats_share_sessions_but_a_session_pushes_to_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut gateway, mut sink) = threaded_answer_gateway(tmp.path());
+        gateway.bind_operator_allowlist("telegram", ["339".to_string()]);
+        gateway.bind_operator_allowlist("slack", ["U1".to_string()]);
+
+        gateway
+            .handle_text("telegram", "339", "339", "hello from telegram")
+            .await
+            .unwrap();
+        recv_sink_answer_containing(&mut sink, "hello from telegram").await;
+        let tg = ChatKey::new("telegram", "339", "339");
+        let sid = gateway
+            .current_session
+            .get(&tg)
+            .expect("telegram spawned a session");
+
+        // Slack (the owner, named by member id) sees and takes it.
+        let listed = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                "/sessions",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.join("\n").contains(&sid),
+            "listed on Slack: {listed:?}"
+        );
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                &format!("/use {sid}"),
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A follow-up nobody typed goes where the session was switched to.
+        gateway
+            .submit_to_sid(&sid, "s9 done · turn 1\nanswer".into())
+            .await
+            .unwrap();
+        let follow_up = recv_sink_answer_containing(&mut sink, "s9 done").await;
+        assert_eq!(follow_up.channel, "slack");
+        assert_eq!(follow_up.thread_ts.as_deref(), Some("1.1"));
+        assert!(
+            !std::iter::from_fn(|| sink.try_recv().ok())
+                .any(|e| e.channel == "telegram" && e.content.contains("s9 done")),
+            "never a second push to Telegram"
+        );
+
+        // Telegram drives it again → its follow-ups come back to Telegram.
+        gateway
+            .handle_text("telegram", "339", "339", "back on telegram")
+            .await
+            .unwrap();
+        recv_sink_answer_containing(&mut sink, "back on telegram").await;
+        gateway
+            .submit_to_sid(&sid, "s10 done · turn 1\nanswer".into())
+            .await
+            .unwrap();
+        let back = recv_sink_answer_containing(&mut sink, "s10 done").await;
+        assert_eq!(back.channel, "telegram");
+
+        // Someone the Slack allowlist does not name sees nothing of it.
+        let stranger = gateway
+            .handle_message(
+                "slack",
+                "C2",
+                "U9",
+                Some("2.2"),
+                "2.2",
+                "/sessions",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !stranger.join("\n").contains(&sid),
+            "a guest sees no owner session: {stranger:?}"
         );
     }
 

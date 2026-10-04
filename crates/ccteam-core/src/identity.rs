@@ -92,6 +92,19 @@ pub fn can_see_session_owner(
     is_web_pool_owned(owner) && can_see_owner(user_id, is_admin, Some(owner))
 }
 
+/// The owner's IM chats share ONE session pool (owner decision 2026-10-05):
+/// an IM chat that is a NAMED operator — listed in a global bot's allowlist,
+/// never the open-mode fallback that treats anyone as the operator — sees
+/// every IM-owned session, whichever of the owner's chats (Telegram, Slack,
+/// Lark …) created it. Visibility only: a session still delivers to its one
+/// reply target, the chat that last drove it or switched to it, so seeing a
+/// session never makes it push to another chat. The web-console pools
+/// (`user:*`) stay under [`can_see_session_owner`]: a tenant's sessions stay
+/// private and the web console still does not list IM sessions.
+pub fn operator_im_pool_sees(viewer_identity: &str, named_operator: bool, owner: &str) -> bool {
+    named_operator && !is_web_pool_owned(viewer_identity) && !is_web_pool_owned(owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +204,19 @@ mod tests {
             true,
             "user:ualice"
         ));
+    }
+
+    #[test]
+    fn a_named_operators_im_chats_share_one_session_pool() {
+        // Telegram and Slack chats of the owner see each other's sessions…
+        assert!(operator_im_pool_sees("slack:C1", true, "telegram:339"));
+        assert!(operator_im_pool_sees("telegram:339", true, "slack:C1"));
+        // …but only when the viewer is NAMED (never the open-mode fallback),
+        assert!(!operator_im_pool_sees("slack:C1", false, "telegram:339"));
+        // never a web-console pool (tenants stay private),
+        assert!(!operator_im_pool_sees("slack:C1", true, "user:ualice"));
+        assert!(!operator_im_pool_sees("slack:C1", true, "user:web-api"));
+        // and the web console itself does not start listing IM sessions.
+        assert!(!operator_im_pool_sees("user:web-api", true, "telegram:339"));
     }
 }
