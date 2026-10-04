@@ -463,6 +463,10 @@ where
     // Privilege is a NAMED chat, never "reached the bot": seed the operator
     // roster from the same credentials the channels above were built from.
     bind_operator_rosters(&mut *gateway.lock().await, &creds);
+    // Which channels render buttons is the provider's fact; hand it over so
+    // the gateway's pickers never branch on a platform name.
+    let button_caps = channel_button_caps(&shared_channels.read().unwrap());
+    bind_channel_buttons(&mut *gateway.lock().await, &button_caps);
     // V0.8.4 P2b — use the externally-supplied channel when `ccteam start`
     // provided one (so the mcp.sock handler shares this sender); else make
     // our own (standalone `ccteam-im run`).
@@ -774,6 +778,22 @@ fn bind_operator_rosters(gateway: &mut Gateway, creds: &Credentials) {
     }
 }
 
+/// Each channel's [`Channel::native_buttons`], read out of `channels` so no
+/// lock is held while the gateway is updated.
+fn channel_button_caps(channels: &ChannelMap) -> Vec<(String, bool)> {
+    channels
+        .iter()
+        .map(|(name, ch)| (name.clone(), ch.native_buttons()))
+        .collect()
+}
+
+/// Report channel button capabilities to the gateway (startup + IM reload).
+fn bind_channel_buttons(gateway: &mut Gateway, caps: &[(String, bool)]) {
+    for (name, native) in caps {
+        gateway.bind_channel_buttons(name, *native);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reload_im_channels(
     gateway: &Arc<Mutex<Gateway>>,
@@ -822,6 +842,8 @@ async fn reload_im_channels(
             rebuilt.insert(name, ch);
         }
     }
+    // A rebuilt channel's button capability goes to the gateway with it.
+    bind_channel_buttons(&mut *gateway.lock().await, &channel_button_caps(&rebuilt));
     // Apply: for each rebuilt channel, abort its old listener, spawn a new one,
     // and (re)publish its command menu.
     for (name, ch) in rebuilt.iter() {
@@ -2225,7 +2247,38 @@ mod tests {
         let ch = build_slack_channel(&creds, &[], None).expect("slack block → channel");
         assert_eq!(ch.name(), "slack");
         assert!(ch.session_threads());
+        assert!(ch.native_buttons());
         assert!(ch.max_message_len().is_some());
+    }
+
+    /// The daemon hands every live channel's button capability to the
+    /// gateway: a provider that renders buttons is bound, one that does not
+    /// (the mock) is not.
+    #[test]
+    fn channel_button_caps_come_from_the_providers() {
+        let mut map: ChannelMap = HashMap::new();
+        let creds = Credentials {
+            slack: Some(crate::credentials::SlackCreds {
+                bot_token: "xoxb-1".into(),
+                app_token: "xapp-1".into(),
+                allowed_user_ids: vec!["U1".into()],
+            }),
+            ..Default::default()
+        };
+        map.insert(
+            "slack".into(),
+            build_slack_channel(&creds, &[], None).expect("slack channel"),
+        );
+        map.insert(
+            "mock".into(),
+            Arc::new(crate::transport::providers::mock::MockChannel::new()),
+        );
+        let mut caps = channel_button_caps(&map);
+        caps.sort();
+        assert_eq!(
+            caps,
+            vec![("mock".to_string(), false), ("slack".to_string(), true)]
+        );
     }
     use tempfile::TempDir;
 

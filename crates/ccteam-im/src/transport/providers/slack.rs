@@ -1366,6 +1366,10 @@ impl Channel for SlackChannel {
         true
     }
 
+    fn native_buttons(&self) -> bool {
+        true
+    }
+
     async fn edit_message(
         &self,
         recipient: &str,

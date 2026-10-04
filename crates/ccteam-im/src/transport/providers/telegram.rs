@@ -710,6 +710,10 @@ impl Channel for TelegramChannel {
         Some(MAX_MESSAGE_UTF16)
     }
 
+    fn native_buttons(&self) -> bool {
+        true
+    }
+
     async fn edit_message(
         &self,
         recipient: &str,

@@ -594,6 +594,18 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Whether this channel renders [`SendMessage::options`] as tappable
+    /// buttons whose click comes back as a [`ChannelMessage::selection`]
+    /// (Telegram inline keyboard, Slack Block Kit). The daemon reports it to
+    /// the gateway ([`crate::gateway::Gateway::bind_channel_buttons`]), which
+    /// then delivers its pickers (`/projects`, `/sessions`) as text + buttons
+    /// instead of a plain list — so the gateway never names a platform.
+    /// **Default `false`**: Lark's picker card is not wired for these clicks,
+    /// web turns options into a choice-chip frame, and the mock reads text.
+    fn native_buttons(&self) -> bool {
+        false
+    }
+
     /// Edit a previously-sent message in place (V0.8.4 P1 — live progress
     /// status). Returns the platform message id (usually `message_id`
     /// unchanged). The **default degrades gracefully** to appending a new

@@ -897,6 +897,10 @@ pub struct Gateway {
     /// [`Principal::Guest`] instead: it owns only what it creates and sees no
     /// project, so it cannot reach anything of the owner's or a tenant's.
     operator_chats: BTreeMap<String, OperatorBinding>,
+    /// Live channel names whose provider renders option buttons, as the
+    /// daemon reported them ([`Self::bind_channel_buttons`]). Empty until the
+    /// daemon binds its channel set — every chat then gets plain-text pickers.
+    button_channels: BTreeSet<String>,
     /// conversation → its current project ([`FocusScope::Conversation`]: every
     /// thread of a conversation works in the same project).
     current_project: FocusRoutes,
@@ -3471,6 +3475,7 @@ impl Gateway {
             body_watch_notify: Arc::new(tokio::sync::Notify::new()),
             projects,
             operator_chats: BTreeMap::new(),
+            button_channels: BTreeSet::new(),
             current_project: FocusRoutes::new(FocusScope::Conversation),
             current_session: FocusRoutes::new(FocusScope::Thread),
             sessions: BTreeMap::new(),
@@ -5529,7 +5534,7 @@ impl Gateway {
                 // command then returns no inline reply. Every other channel
                 // (web's structured session frame, Lark's text-only send, the
                 // test mock) keeps the plain-text reply unchanged.
-                if Self::channel_supports_buttons(&chat.channel) {
+                if self.channel_supports_buttons(&chat.channel) {
                     let options = self.session_switch_options(chat, all);
                     self.emit_list_options(chat, text, options);
                     Ok(None)
@@ -5544,7 +5549,7 @@ impl Gateway {
                 // "switch" button per project (`nav:cd:<slug>` tap → `/cd`),
                 // delivered via the event sink. Others keep the bare
                 // newline-separated slug list as an inline reply.
-                if Self::channel_supports_buttons(&chat.channel) {
+                if self.channel_supports_buttons(&chat.channel) {
                     let options = self.project_switch_options(chat);
                     let cur = self.current_project_label(chat);
                     self.emit_list_options(
@@ -5797,14 +5802,24 @@ impl Gateway {
         Ok(vec!["invalid selection".to_string()])
     }
 
-    /// Whether a channel renders message `options` as tappable inline-keyboard
-    /// buttons. Only Telegram does today: Lark's `send` ignores options, web
-    /// turns an options-bearing message into a choice-chip frame (which would
-    /// REPLACE its structured session list), and the test mock reads the plain
-    /// text reply. Keyed by platform so per-tenant bots (`"telegram@<tenant>"`)
-    /// are covered too. Extend as other providers gain native buttons.
-    fn channel_supports_buttons(channel: &str) -> bool {
-        crate::transport::platform_of(channel) == "telegram"
+    /// Record whether the live channel `name` (`"telegram"`, `"slack"`,
+    /// `"telegram@<tenant>"` …) renders option buttons — the provider's own
+    /// [`crate::transport::Channel::native_buttons`], reported by the daemon
+    /// whenever it (re)builds a channel. The gateway never names a platform.
+    pub fn bind_channel_buttons(&mut self, name: &str, native: bool) {
+        if native {
+            self.button_channels.insert(name.to_string());
+        } else {
+            self.button_channels.remove(name);
+        }
+    }
+
+    /// Whether a chat's channel renders message `options` as tappable
+    /// buttons ([`Self::bind_channel_buttons`]). A picker there is text +
+    /// buttons; everywhere else (web's structured session frame, a channel
+    /// whose clicks are not wired) it stays a plain-text reply.
+    fn channel_supports_buttons(&self, channel: &str) -> bool {
+        self.button_channels.contains(channel)
     }
 
     /// Project slugs `chat` may SEE — backs `/projects`, the `/cd` picker, and
@@ -29429,9 +29444,10 @@ mod tests {
         assert_eq!(answer.assistant, "LGTM, two nits inline.");
     }
 
-    /// Clickable project picker: on Telegram, `/projects` is delivered as a
-    /// header + one inline "switch" button per project (`nav:cd:<slug>`), so
-    /// the command returns NO inline reply (the buttons ride the event sink).
+    /// Clickable project picker: on a channel the daemon reported as
+    /// button-capable (Telegram here), `/projects` is delivered as a header +
+    /// one inline "switch" button per project (`nav:cd:<slug>`), so the
+    /// command returns NO inline reply (the buttons ride the event sink).
     /// Non-button channels (the test mock, web, Lark) keep the plain slug list.
     #[tokio::test]
     async fn telegram_projects_delivers_switch_buttons() {
@@ -29439,6 +29455,7 @@ mod tests {
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
         gateway.register_project("beta", proj.path());
+        gateway.bind_channel_buttons("telegram", true);
         let mut events = gateway.subscribe_events();
 
         // Telegram → the reply is empty; the list + buttons arrive as an Answer.
@@ -29472,6 +29489,90 @@ mod tests {
         assert_eq!(mock, vec!["alpha\nbeta"]);
     }
 
+    /// Buttons are the provider's capability, not a platform name: a threaded
+    /// channel the daemon reported as button-capable (Slack) gets the project
+    /// picker as buttons IN the thread the command came from, and a tapped
+    /// `nav:cd:` switches the conversation's project; once the capability is
+    /// withdrawn the same command is a plain list again.
+    #[tokio::test]
+    async fn a_button_capable_threaded_channel_gets_a_clickable_picker() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.register_project("beta", proj.path());
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+
+        let replies = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("100.1"),
+                "100.1",
+                "/projects",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "picker rides the event sink: {replies:?}"
+        );
+        let ev = recv_answer(&mut events).await;
+        assert_eq!(ev.channel, "slack");
+        assert_eq!(
+            ev.thread_ts.as_deref(),
+            Some("100.1"),
+            "in the command's thread"
+        );
+        assert!(
+            ev.options.iter().any(|o| o.data == "nav:cd:beta"),
+            "options: {:?}",
+            ev.options
+        );
+
+        let tap = ChoiceReply {
+            data: "nav:cd:beta".into(),
+        };
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("100.1"),
+                "100.1",
+                "",
+                &[],
+                Some(&tap),
+            )
+            .await
+            .unwrap();
+        let other_thread = ChatKey::new("slack", "C1", "U1").with_thread(Some("200.2"));
+        assert_eq!(
+            gateway.current_project.get(&other_thread),
+            Some("beta".to_string()),
+            "the tap switched the conversation's project"
+        );
+
+        gateway.bind_channel_buttons("slack", false);
+        let replies = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("300.3"),
+                "300.3",
+                "/projects",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replies, vec!["alpha\nbeta"]);
+    }
+
     /// Clickable session picker: on Telegram, `/sessions` is delivered as the
     /// usual text list PLUS one inline "switch" button per live session
     /// (`nav:use:<sid>`), so the command returns no inline reply. The mock
@@ -29481,6 +29582,7 @@ mod tests {
         let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
         let proj = tempfile::TempDir::new().unwrap();
         let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.bind_channel_buttons("telegram", true);
         gateway
             .handle_text("telegram", "chat-1", "alice", "/new claude reviewer")
             .await
