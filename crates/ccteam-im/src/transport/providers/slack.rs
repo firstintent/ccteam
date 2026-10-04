@@ -54,8 +54,8 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use crate::onboarding::{client_for_api_base, SLACK_API_BASE};
 use crate::transport::{
     inbound_staging_dir, sanitize_attachment_name, AttachmentKind, Channel, ChannelAttachment,
-    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OutboundFile, RejectedSenderNotifier,
-    RejectedSenderProbe, SendMessage,
+    ChannelMessage, ChoiceReply, CommandSpec, MessageOption, OptionWeight, OutboundFile,
+    RejectedSenderNotifier, RejectedSenderProbe, SendMessage,
 };
 
 /// Per-message ceiling in **UTF-16 code units**. Slack caps the cumulative
@@ -601,12 +601,27 @@ fn message_blocks(content: &str, options: &[MessageOption]) -> Vec<Value> {
             } else {
                 label
             };
-            json!({
+            let mut button = json!({
                 "type": "button",
                 "text": { "type": "plain_text", "text": label, "emoji": true },
                 "value": option.data,
                 "action_id": format!("ccteam_opt_{index}"),
-            })
+            });
+            // Slack cannot size a button: a main action gets the highlighted
+            // style, one that is easy to regret asks before it acts.
+            match option.weight {
+                OptionWeight::Primary => button["style"] = json!("primary"),
+                OptionWeight::Minor => {
+                    button["confirm"] = json!({
+                        "title": { "type": "plain_text", "text": "确认" },
+                        "text": { "type": "plain_text", "text": format!("{} — 确定吗?", label.trim()) },
+                        "confirm": { "type": "plain_text", "text": "确定" },
+                        "deny": { "type": "plain_text", "text": "取消" },
+                    });
+                }
+                OptionWeight::Normal => {}
+            }
+            button
         })
         .collect();
     blocks.push(json!({ "type": "actions", "elements": buttons }));

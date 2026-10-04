@@ -1100,6 +1100,7 @@ async fn execute_interaction_ask(
         .iter()
         .enumerate()
         .map(|(i, opt)| MessageOption {
+            weight: Default::default(),
             data: format!("{token}:{i}"),
             label: opt.label.clone(),
             // v0.8.7 review-fix (R-H1) — carry the stable option id (e.g.
@@ -1328,6 +1329,7 @@ async fn execute_permission_ask(
         .iter()
         .enumerate()
         .map(|(i, opt)| MessageOption {
+            weight: Default::default(),
             data: format!("{token}:{i}"),
             label: opt.label.clone(),
             // v0.8.7 review-fix (R-H1) — carry the stable option id (e.g.

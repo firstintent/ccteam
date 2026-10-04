@@ -564,6 +564,7 @@ fn a_few_options_render_as_one_row_of_buttons() {
 fn many_options_render_as_a_dropdown() {
     let options: Vec<MessageOption> = (0..130)
         .map(|i| MessageOption {
+            weight: Default::default(),
             data: format!("nav:cd:p{i}"),
             label: if i == 0 {
                 "x".repeat(200)
@@ -1221,6 +1222,7 @@ async fn oversize_or_html_files_are_refused_with_a_thread_notice() {
 fn options(n: usize) -> Vec<MessageOption> {
     (0..n)
         .map(|i| MessageOption {
+            weight: Default::default(),
             data: format!("tok:{i}"),
             label: format!("Option {i}"),
             id: format!("o{i}"),
@@ -1552,4 +1554,31 @@ async fn sends_use_the_registered_command_names() {
         "the agent commands a reply names by example are typed with `!` too"
     );
     assert_eq!(api.calls("chat.update")[0].json()["text"], "card → !status");
+}
+
+/// Slack cannot size a button: main actions get the highlighted style, and a
+/// minor one (interrupt) asks for confirmation before it acts.
+#[test]
+fn button_weight_maps_to_style_and_a_confirm_step() {
+    let option = |data: &str, weight: OptionWeight| MessageOption {
+        data: data.into(),
+        label: format!("{data} label"),
+        id: data.into(),
+        weight,
+    };
+    let blocks = message_blocks(
+        "",
+        &[
+            option("act:status", OptionWeight::Primary),
+            option("act:sessions", OptionWeight::Normal),
+            option("act:interrupt", OptionWeight::Minor),
+        ],
+    );
+    let buttons = blocks[0]["elements"].as_array().unwrap();
+    assert_eq!(buttons[0]["style"], "primary");
+    assert!(buttons[0].get("confirm").is_none());
+    assert!(buttons[1].get("style").is_none() && buttons[1].get("confirm").is_none());
+    assert!(buttons[2].get("style").is_none());
+    assert_eq!(buttons[2]["confirm"]["confirm"]["text"], "确定");
+    assert_eq!(buttons[2]["confirm"]["deny"]["text"], "取消");
 }

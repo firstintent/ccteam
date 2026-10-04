@@ -376,6 +376,7 @@ async fn ask_external_choice(
         .iter()
         .enumerate()
         .map(|(index, option)| MessageOption {
+            weight: Default::default(),
             data: format!("{token}:{index}"),
             label: option.label.clone(),
             id: option.id.clone(),

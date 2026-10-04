@@ -32,7 +32,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::pending::InteractionOrigin;
-use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption};
+use crate::transport::{ChannelAttachment, ChoiceReply, MessageOption, OptionWeight};
 use crate::BotRegistration;
 
 /// Resolve a live thread status after the caller has dropped the gateway
@@ -3450,11 +3450,12 @@ fn button_action_command(action: &str) -> Option<String> {
 }
 
 /// One `act:` button.
-fn action_option(data: &str, label: &str) -> MessageOption {
+fn action_option(data: &str, label: &str, weight: OptionWeight) -> MessageOption {
     MessageOption {
         data: format!("act:{data}"),
         label: label.to_string(),
         id: data.to_string(),
+        weight,
     }
 }
 
@@ -6029,6 +6030,7 @@ impl Gateway {
                     format!("▸ {slug}")
                 };
                 MessageOption {
+                    weight: Default::default(),
                     data: format!("nav:cd:{slug}"),
                     label,
                     id: slug,
@@ -6111,6 +6113,7 @@ impl Gateway {
                     ));
                 }
                 MessageOption {
+                    weight: Default::default(),
                     data: format!("nav:use:{sid}"),
                     label,
                     id: sid.to_string(),
@@ -6152,31 +6155,36 @@ impl Gateway {
     /// interrupt) when the chat has one, the session/project lists, or the
     /// main menu.
     fn next_step_options(&self, chat: &ChatKey, step: NextStep) -> Vec<MessageOption> {
-        let lists = || {
+        use OptionWeight::{Minor, Normal, Primary};
+        let lists = |weight| {
             vec![
-                action_option("sessions", "🧵 会话"),
-                action_option("projects", "📁 项目"),
+                action_option("sessions", "🧵 会话", weight),
+                action_option("projects", "📁 项目", weight),
             ]
         };
         match step {
             NextStep::Session | NextStep::SessionControls => {
                 if self.current_session.contains(chat) {
-                    vec![
-                        action_option("status", "📊 状态"),
-                        action_option("model", "🧠 模型"),
-                        action_option("interrupt", "⏹ 中断"),
-                    ]
+                    // Status and model are what a thread reaches for; interrupt
+                    // is easy to regret, so it is the smallest, last button.
+                    let mut controls = vec![
+                        action_option("status", "📊 状态", Primary),
+                        action_option("model", "🧠 模型", Primary),
+                    ];
+                    controls.extend(lists(Normal));
+                    controls.push(action_option("interrupt", "⏹ 中断", Minor));
+                    controls
                 } else {
-                    lists()
+                    lists(Primary)
                 }
             }
-            NextStep::Sessions => lists(),
+            NextStep::Sessions => lists(Primary),
             NextStep::Menu => vec![
-                action_option("projects", "📁 项目"),
-                action_option("sessions", "🧵 会话"),
-                action_option("status", "📊 状态"),
-                action_option("new:claude", "＋ Claude"),
-                action_option("new:codex", "＋ Codex"),
+                action_option("projects", "📁 项目", Primary),
+                action_option("sessions", "🧵 会话", Primary),
+                action_option("status", "📊 状态", Normal),
+                action_option("new:claude", "＋ Claude", Normal),
+                action_option("new:codex", "＋ Codex", Normal),
             ],
         }
     }
@@ -19993,6 +20001,7 @@ fn to_message_options(prompt: &ChoicePrompt) -> Vec<MessageOption> {
         .iter()
         .enumerate()
         .map(|(i, opt)| MessageOption {
+            weight: Default::default(),
             data: format!("{}:{}", prompt.token, i),
             label: opt.label.clone(),
             id: opt.id.clone(),
@@ -29791,7 +29800,16 @@ mod tests {
             ev.content
         );
         let controls: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
-        assert_eq!(controls, vec!["act:status", "act:model", "act:interrupt"]);
+        assert_eq!(
+            controls,
+            vec![
+                "act:status",
+                "act:model",
+                "act:sessions",
+                "act:projects",
+                "act:interrupt"
+            ]
+        );
         assert_eq!(ev.thread_ts.as_deref(), Some("1.1"));
 
         // Only whitelisted actions run; session actions need a session.
@@ -29868,7 +29886,16 @@ mod tests {
         );
         assert_eq!(ev.thread_ts.as_deref(), Some("7.7"));
         let controls: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
-        assert_eq!(controls, vec!["act:status", "act:model", "act:interrupt"]);
+        assert_eq!(
+            controls,
+            vec![
+                "act:status",
+                "act:model",
+                "act:sessions",
+                "act:projects",
+                "act:interrupt"
+            ]
+        );
 
         // A single-stream chat gets no header.
         gateway.bind_channel_buttons("telegram", true);
@@ -30057,11 +30084,13 @@ mod tests {
         // Padding: mixed CJK/Latin rows end up the same display width.
         let mut opts = vec![
             MessageOption {
+                weight: Default::default(),
                 data: "a".into(),
                 label: "▸ s39 · grok · 「当前是什么模型」".into(),
                 id: "s39".into(),
             },
             MessageOption {
+                weight: Default::default(),
                 data: "b".into(),
                 label: "▸ s43 · claude · 「Completed the full reques…".into(),
                 id: "s43".into(),

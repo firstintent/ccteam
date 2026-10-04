@@ -1515,6 +1515,7 @@ fn synthetic_approval_event(sid: &str, prompt: &ChoicePrompt) -> GatewayEvent {
             .iter()
             .enumerate()
             .map(|(i, opt)| MessageOption {
+                weight: Default::default(),
                 data: format!("{}:{i}", prompt.token),
                 label: opt.label.clone(),
                 id: opt.id.clone(),
@@ -2702,11 +2703,13 @@ mod tests {
         ev.content = "session s7 (cto) wants to run: Bash rm -rf /".into();
         ev.options = vec![
             MessageOption {
+                weight: Default::default(),
                 data: "pcafef00d:0".into(),
                 label: "✅ Approve".into(),
                 id: "allow".into(),
             },
             MessageOption {
+                weight: Default::default(),
                 data: "pcafef00d:1".into(),
                 label: "⛔ Deny".into(),
                 id: "deny".into(),
@@ -2728,6 +2731,7 @@ mod tests {
         use ccteam_im::transport::MessageOption;
         let mut ev = gw_event(Some("s1"));
         ev.options = vec![MessageOption {
+            weight: Default::default(),
             data: "ptok:0".into(),
             label: "x".into(),
             id: "allow".into(),

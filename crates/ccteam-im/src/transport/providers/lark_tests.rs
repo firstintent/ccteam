@@ -956,11 +956,13 @@ fn image_ext_sniffs_magic_bytes() {
 fn build_option_card_renders_text_and_one_button_per_option() {
     let opts = vec![
         MessageOption {
+            weight: Default::default(),
             data: "nav:cd:alpha".into(),
             label: "✓ alpha".into(),
             id: "alpha".into(),
         },
         MessageOption {
+            weight: Default::default(),
             data: "nav:cd:beta".into(),
             label: "▸ beta".into(),
             id: "beta".into(),
@@ -987,6 +989,7 @@ fn build_option_card_renders_text_and_one_button_per_option() {
 #[test]
 fn build_option_card_omits_empty_text_div() {
     let opts = vec![MessageOption {
+        weight: Default::default(),
         data: "t:0".into(),
         label: "Yes".into(),
         id: "yes".into(),

@@ -465,6 +465,34 @@ pub struct MessageOption {
     /// the SAME token-keyed pending the IM callback does, never a turn.
     #[serde(default)]
     pub id: String,
+    /// How prominently to present this option ([`OptionWeight`]). Pickers
+    /// leave it `Normal`; a session's controls mark their main actions and
+    /// the one that is easy to regret.
+    #[serde(default, skip_serializing_if = "OptionWeight::is_normal")]
+    pub weight: OptionWeight,
+}
+
+/// How prominently a channel should present one option. Channel-neutral: a
+/// provider maps it to whatever its buttons can do (Telegram: row layout;
+/// Slack: button style + a confirm step) and may ignore it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionWeight {
+    /// An ordinary option — every picker's.
+    #[default]
+    Normal,
+    /// A main action: as large / prominent as the channel allows.
+    Primary,
+    /// Easy to regret on a mis-tap (interrupt): kept small, and asks first
+    /// where the channel can.
+    Minor,
+}
+
+impl OptionWeight {
+    /// `serde` skip predicate: `Normal` is the default and stays off the wire.
+    pub fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
 }
 
 /// An inbound option click carried on a [`ChannelMessage`] (v0.8.5 D3).
