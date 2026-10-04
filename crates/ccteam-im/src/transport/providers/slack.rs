@@ -73,8 +73,11 @@ const SLACK_MAX_ATTACHMENT_BYTES: u64 = 30 * 1024 * 1024;
 /// Reaction name of the 👀 "received, processing" ack.
 const SLACK_ACK_REACTION: &str = "eyes";
 
-/// Slack allows at most 25 elements in one `actions` block.
-const SLACK_ACTIONS_PER_BLOCK: usize = 25;
+/// More options than this render as a dropdown instead of buttons.
+const SLACK_MAX_BUTTONS: usize = 6;
+
+/// Slack's cap on the options of one `static_select`.
+const SLACK_SELECT_MAX_OPTIONS: usize = 100;
 
 /// Slack rejects a button whose `plain_text` label exceeds 75 characters.
 const SLACK_BUTTON_LABEL_MAX_CHARS: usize = 75;
@@ -517,7 +520,9 @@ fn decode_block_actions(payload: &Value) -> Option<ButtonClick> {
         return None;
     }
     let user_id = str_at(payload, "/user/id")?;
-    let value = str_at(payload, "/actions/0/value")?;
+    // A button carries `value`; a dropdown pick carries the chosen option's.
+    let value = str_at(payload, "/actions/0/value")
+        .or_else(|| str_at(payload, "/actions/0/selected_option/value"))?;
     let channel_id =
         str_at(payload, "/channel/id").or_else(|| str_at(payload, "/container/channel_id"))?;
     let message_ts =
@@ -536,40 +541,71 @@ fn decode_block_actions(payload: &Value) -> Option<ButtonClick> {
 }
 
 /// Blocks for one outbound message: a `markdown` block carrying `content`,
-/// then the options as buttons, chunked into `actions` blocks of ≤ 25. Each
-/// button's `value` is the option's opaque `data` (returned verbatim on
-/// click); `action_id`s are unique within the message as Slack requires.
+/// then the options — as one row of buttons when there are a few, as a dropdown when there are more than
+/// [`SLACK_MAX_BUTTONS`] (a project list or a model × effort picker would
+/// otherwise bury the thread under a wall of buttons). Either way the
+/// option's opaque `data` comes back verbatim on click; `action_id`s are
+/// unique within the message as Slack requires.
 fn message_blocks(content: &str, options: &[MessageOption]) -> Vec<Value> {
     let mut blocks = Vec::new();
     if !content.is_empty() {
         blocks.push(json!({ "type": "markdown", "text": content }));
     }
-    for (chunk_index, chunk) in options.chunks(SLACK_ACTIONS_PER_BLOCK).enumerate() {
-        let elements: Vec<Value> = chunk
-            .iter()
-            .enumerate()
-            .map(|(offset, option)| {
-                let index = chunk_index * SLACK_ACTIONS_PER_BLOCK + offset;
-                let label: String = option
-                    .label
-                    .chars()
-                    .take(SLACK_BUTTON_LABEL_MAX_CHARS)
-                    .collect();
-                let label = if label.trim().is_empty() {
-                    format!("{}", index + 1)
-                } else {
-                    label
-                };
-                json!({
-                    "type": "button",
-                    "text": { "type": "plain_text", "text": label, "emoji": true },
-                    "value": option.data,
-                    "action_id": format!("ccteam_opt_{index}"),
+    if options.len() > SLACK_MAX_BUTTONS {
+        for (index, chunk) in options.chunks(SLACK_SELECT_MAX_OPTIONS).enumerate() {
+            let choices: Vec<Value> = chunk
+                .iter()
+                .map(|option| {
+                    let label: String = option
+                        .label
+                        .trim()
+                        .chars()
+                        .take(SLACK_BUTTON_LABEL_MAX_CHARS)
+                        .collect();
+                    json!({
+                        "text": { "type": "plain_text", "text": label, "emoji": true },
+                        "value": option.data,
+                    })
                 })
-            })
-            .collect();
-        blocks.push(json!({ "type": "actions", "elements": elements }));
+                .collect();
+            blocks.push(json!({
+                "type": "actions",
+                "elements": [{
+                    "type": "static_select",
+                    "action_id": format!("ccteam_select_{index}"),
+                    "placeholder": { "type": "plain_text", "text": "选择…", "emoji": true },
+                    "options": choices,
+                }],
+            }));
+        }
+        return blocks;
     }
+    if options.is_empty() {
+        return blocks;
+    }
+    let buttons: Vec<Value> = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let label: String = option
+                .label
+                .chars()
+                .take(SLACK_BUTTON_LABEL_MAX_CHARS)
+                .collect();
+            let label = if label.trim().is_empty() {
+                format!("{}", index + 1)
+            } else {
+                label
+            };
+            json!({
+                "type": "button",
+                "text": { "type": "plain_text", "text": label, "emoji": true },
+                "value": option.data,
+                "action_id": format!("ccteam_opt_{index}"),
+            })
+        })
+        .collect();
+    blocks.push(json!({ "type": "actions", "elements": buttons }));
     blocks
 }
 

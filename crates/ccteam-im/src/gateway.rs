@@ -3392,12 +3392,69 @@ fn command_menu_description(c: &GatewayCommandSpec) -> String {
 const NEXT_HINT_STATUS: &str = "↓ 查看状态 → /status";
 const NEXT_HINT_SESSIONS: &str = "↓ 本项目会话 → /sessions";
 
-fn command_next_hint(cmd: &str) -> Option<&'static str> {
+/// What to offer after a command's reply. On a channel that renders buttons
+/// it becomes a row of buttons under the reply (see
+/// [`Gateway::reply_with_next_step`]); elsewhere the text footer
+/// ([`NextStep::hint`]), when there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextStep {
+    /// The chat's session was just created / switched / steered: its controls.
+    Session,
+    /// The chat's session set changed: the session list.
+    Sessions,
+    /// `/status` already shows the session: just its controls, no footer.
+    SessionControls,
+    /// `/help`: the main menu, so nothing has to be typed.
+    Menu,
+}
+
+impl NextStep {
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Session => Some(NEXT_HINT_STATUS),
+            Self::Sessions => Some(NEXT_HINT_SESSIONS),
+            Self::SessionControls | Self::Menu => None,
+        }
+    }
+}
+
+fn command_next_step(cmd: &str) -> Option<NextStep> {
     Some(match cmd {
-        "/new" | "/use" | "/role" | "/interrupt" => NEXT_HINT_STATUS,
-        "/stop" | "/rename" | "/cd" | "/newproject" => NEXT_HINT_SESSIONS,
+        "/new" | "/use" | "/role" | "/interrupt" => NextStep::Session,
+        "/stop" | "/rename" | "/cd" | "/newproject" => NextStep::Sessions,
+        "/status" => NextStep::SessionControls,
+        "/help" => NextStep::Menu,
         _ => return None,
     })
+}
+
+/// A button click that stands for a typed command (`act:<what>`): the
+/// whitelist of commands a button may run, as the text a user would type.
+/// Anything else is refused — a button can do nothing typing could not.
+fn button_action_command(action: &str) -> Option<String> {
+    let command = match action {
+        "status" => "/status",
+        "sessions" => "/sessions",
+        "projects" => "/projects",
+        "help" => "/help",
+        "model" => "/model",
+        "interrupt" => "/interrupt",
+        _ => {
+            let vendor = action.strip_prefix("new:")?;
+            parse_vendor(vendor).ok()?;
+            return Some(format!("/new {vendor}"));
+        }
+    };
+    Some(command.to_string())
+}
+
+/// One `act:` button.
+fn action_option(data: &str, label: &str) -> MessageOption {
+    MessageOption {
+        data: format!("act:{data}"),
+        label: label.to_string(),
+        id: data.to_string(),
+    }
 }
 
 fn append_next_hint(reply: &mut String, hint: &str) {
@@ -5004,6 +5061,30 @@ impl Gateway {
         selection: Option<&ChoiceReply>,
     ) -> Result<Vec<String>> {
         let chat = ChatKey::new(channel, chat_id, user_id).with_thread(thread);
+        // An `act:` button stands for a command the user could have typed
+        // (`button_action_command`): run it exactly as typed, in this chat.
+        if let Some(action) = selection.and_then(|reply| reply.data.strip_prefix("act:")) {
+            let Some(command) = button_action_command(action) else {
+                return Ok(vec![format!("unknown action: {action}")]);
+            };
+            let needs_session = matches!(command.as_str(), "/model" | "/interrupt");
+            if needs_session && !self.current_session.contains(&chat) {
+                return Ok(vec![
+                    "这里现在没有会话 —— 发一条消息就会新建一个".to_string()
+                ]);
+            }
+            return Box::pin(self.handle_message(
+                channel,
+                chat_id,
+                user_id,
+                thread,
+                message_id,
+                &command,
+                &[],
+                None,
+            ))
+            .await;
+        }
         // (v0.8.5 D3) An inbound option click (Telegram callback / web chip)
         // resolves the session's pending choice — never treated as text.
         if let Some(reply) = selection {
@@ -5036,18 +5117,13 @@ impl Gateway {
                 "/inbox scheduled messages do not support files or skills"
             ));
         }
-        if let Some(mut reply) = self.handle_command(&chat, text).await? {
-            // Owner req — teach the next step: append a recommended-command
-            // footer as the reply's last line (see `command_next_hint`). IM only
-            // — the web console navigates by GUI and reaches commands via
-            // `submit_web_sid` in production, so it never gets the text footer.
-            if chat.channel != "web" {
-                if let Some(hint) = command_next_hint(text.split_whitespace().next().unwrap_or(""))
-                {
-                    append_next_hint(&mut reply, hint);
-                }
-            }
-            return Ok(vec![reply]);
+        if let Some(reply) = self.handle_command(&chat, text).await? {
+            // Owner req — teach the next step (`command_next_step`): buttons
+            // where the channel renders them, else a footer line. IM only — the
+            // web console navigates by GUI and reaches commands via
+            // `submit_web_sid` in production, so it never gets either.
+            let step = command_next_step(text.split_whitespace().next().unwrap_or(""));
+            return Ok(self.reply_with_next_step(&chat, reply, step));
         }
         // A gateway command may handle itself ENTIRELY via the event sink and
         // return no inline reply — a project / session picker delivered as
@@ -5107,7 +5183,10 @@ impl Gateway {
         }
         let turn = wrap_inbound(channel, chat_id, user_id, message_id, text, attachments);
         let mut replies = self.submit_to_current(&chat, message_id, turn).await?;
-        if chat.channel != "web" && text.split_whitespace().next() == Some("/model") {
+        if chat.channel != "web"
+            && !self.channel_supports_buttons(&chat.channel)
+            && text.split_whitespace().next() == Some("/model")
+        {
             if let Some(last) = replies.last_mut() {
                 append_next_hint(last, NEXT_HINT_STATUS);
             }
@@ -5247,6 +5326,7 @@ impl Gateway {
                         .apply_new_session(*plan, thread, None, false, None)
                         .await?;
                     let sid = outcome.id.clone();
+                    g.announce_thread_session(&chat, &sid);
                     g.drain_and_dispatch_pending_turns(&sid).await;
                     sid
                 };
@@ -5321,15 +5401,11 @@ impl Gateway {
         Some(match Self::stop_session_shared(gateway, &sid).await {
             Err(error) => Err(error),
             Ok(outcome) => {
-                let mut reply = stop_command_receipt(&sid, was_detached, &outcome);
-                // The same next-step footer every other IM command gets: this
-                // leg answers ahead of `handle_command`, so it appends its own.
-                if chat.channel != "web" {
-                    if let Some(hint) = command_next_hint("/stop") {
-                        append_next_hint(&mut reply, hint);
-                    }
-                }
-                Ok(vec![reply])
+                let reply = stop_command_receipt(&sid, was_detached, &outcome);
+                // The same next step every other IM command gets: this leg
+                // answers ahead of `handle_command`, so it adds its own.
+                let g = crate::latency::gateway_lock(gateway, "im.stop.next_step").await;
+                Ok(g.reply_with_next_step(chat, reply, command_next_step("/stop")))
             }
         })
     }
@@ -5786,18 +5862,12 @@ impl Gateway {
     /// or reads as an unknown target.
     async fn resolve_nav_selection(&mut self, chat: &ChatKey, nav: &str) -> Result<Vec<String>> {
         if let Some(slug) = nav.strip_prefix("cd:") {
-            let mut reply = self.change_project(chat, slug)?;
-            if chat.channel != "web" {
-                append_next_hint(&mut reply, NEXT_HINT_SESSIONS);
-            }
-            return Ok(vec![reply]);
+            let reply = self.change_project(chat, slug)?;
+            return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Sessions)));
         }
         if let Some(sid) = nav.strip_prefix("use:") {
-            let mut reply = self.use_session(chat, sid).await?;
-            if chat.channel != "web" {
-                append_next_hint(&mut reply, NEXT_HINT_STATUS);
-            }
-            return Ok(vec![reply]);
+            let reply = self.use_session(chat, sid).await?;
+            return Ok(self.reply_with_next_step(chat, reply, Some(NextStep::Session)));
         }
         Ok(vec!["invalid selection".to_string()])
     }
@@ -6051,6 +6121,88 @@ impl Gateway {
         options
     }
 
+    /// Deliver a command's `reply` with its next step. Where the channel
+    /// renders buttons the step is a row of buttons under the reply, sent
+    /// through the event sink (so no inline reply comes back); elsewhere it is
+    /// the footer line [`NextStep::hint`]. The web console gets neither.
+    fn reply_with_next_step(
+        &self,
+        chat: &ChatKey,
+        mut reply: String,
+        step: Option<NextStep>,
+    ) -> Vec<String> {
+        let Some(step) = step.filter(|_| chat.channel != "web") else {
+            return vec![reply];
+        };
+        if self.channel_supports_buttons(&chat.channel) {
+            let options = self.next_step_options(chat, step);
+            if !options.is_empty() {
+                self.emit_list_options(chat, reply, options);
+                return Vec::new();
+            }
+        }
+        if let Some(hint) = step.hint() {
+            append_next_hint(&mut reply, hint);
+        }
+        vec![reply]
+    }
+
+    /// The buttons for a [`NextStep`]: a session's controls (status, model,
+    /// interrupt) when the chat has one, the session/project lists, or the
+    /// main menu.
+    fn next_step_options(&self, chat: &ChatKey, step: NextStep) -> Vec<MessageOption> {
+        let lists = || {
+            vec![
+                action_option("sessions", "🧵 会话"),
+                action_option("projects", "📁 项目"),
+            ]
+        };
+        match step {
+            NextStep::Session | NextStep::SessionControls => {
+                if self.current_session.contains(chat) {
+                    vec![
+                        action_option("status", "📊 状态"),
+                        action_option("model", "🧠 模型"),
+                        action_option("interrupt", "⏹ 中断"),
+                    ]
+                } else {
+                    lists()
+                }
+            }
+            NextStep::Sessions => lists(),
+            NextStep::Menu => vec![
+                action_option("projects", "📁 项目"),
+                action_option("sessions", "🧵 会话"),
+                action_option("status", "📊 状态"),
+                action_option("new:claude", "＋ Claude"),
+                action_option("new:codex", "＋ Codex"),
+            ],
+        }
+    }
+
+    /// A thread whose first message just spawned its session opens with a
+    /// one-line header and that session's controls, so status / model /
+    /// interrupt are a tap away for the rest of the thread. Threads only: a
+    /// single-stream chat has no "top of the session" to put them at.
+    fn announce_thread_session(&self, chat: &ChatKey, sid: &str) {
+        if chat.thread.is_none() || !self.channel_supports_buttons(&chat.channel) {
+            return;
+        }
+        let Some(session) = self.sessions.get(sid) else {
+            return;
+        };
+        let header = format!(
+            "🧵 会话 {sid} · 项目 {} · {}",
+            session.project,
+            vendor_str(session.vendor)
+        );
+        self.emit_list_options(
+            chat,
+            header,
+            self.next_step_options(chat, NextStep::Session),
+        );
+    }
+
     /// Emit a picker message (a project/session list) carrying inline `options`
     /// to a button-capable channel, via the user-signal sink.
     /// Delivers text + buttons as ONE message
@@ -6166,6 +6318,7 @@ impl Gateway {
                 let outcome = self
                     .apply_new_session(*plan, thread, None, false, None)
                     .await?;
+                self.announce_thread_session(chat, &outcome.id);
                 self.drain_and_dispatch_pending_turns(&outcome.id).await;
                 Ok(())
             }
@@ -29571,6 +29724,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replies, vec!["alpha\nbeta"]);
+    }
+
+    /// Buttons over typing: on a button-capable channel a command's next step
+    /// is a row of buttons (a session's controls, the menu) instead of a
+    /// `→ /status` footer, and an `act:` tap runs the whitelisted command it
+    /// stands for exactly as if it were typed.
+    #[tokio::test]
+    async fn next_steps_are_buttons_and_a_tap_runs_the_command() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake.clone(), "alpha", proj.path());
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+        // `/help` → the main menu, no footer.
+        let replies = gateway
+            .handle_message("slack", "C1", "U1", Some("1.1"), "1.1", "/help", &[], None)
+            .await
+            .unwrap();
+        assert!(replies.is_empty(), "rides the sink: {replies:?}");
+        let ev = recv_answer(&mut events).await;
+        let menu: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(
+            menu,
+            vec![
+                "act:projects",
+                "act:sessions",
+                "act:status",
+                "act:new:claude",
+                "act:new:codex"
+            ]
+        );
+
+        // A tap on `＋ Codex` is `/new codex`, in the thread it was tapped in.
+        let tap = |data: &str| ChoiceReply { data: data.into() };
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                "",
+                &[],
+                Some(&tap("act:new:codex")),
+            )
+            .await
+            .unwrap();
+        let thread = ChatKey::new("slack", "C1", "U1").with_thread(Some("1.1"));
+        let sid = gateway
+            .current_session
+            .get(&thread)
+            .expect("the tap created a session");
+        assert_eq!(gateway.sessions[&sid].vendor, AgentVendor::Codex);
+        // …and its receipt carries the session's controls instead of a footer.
+        let ev = recv_answer(&mut events).await;
+        assert!(ev.content.contains(&sid), "receipt: {}", ev.content);
+        assert!(
+            !ev.content.contains("→ /status"),
+            "no typed footer: {}",
+            ev.content
+        );
+        let controls: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(controls, vec!["act:status", "act:model", "act:interrupt"]);
+        assert_eq!(ev.thread_ts.as_deref(), Some("1.1"));
+
+        // Only whitelisted actions run; session actions need a session.
+        let refused = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("1.1"),
+                "1.1",
+                "",
+                &[],
+                Some(&tap("act:stop s1")),
+            )
+            .await
+            .unwrap();
+        assert!(refused[0].contains("unknown action"), "{refused:?}");
+        let starts = fake.starts.load(Ordering::SeqCst);
+        let empty = gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("9.9"),
+                "9.9",
+                "",
+                &[],
+                Some(&tap("act:model")),
+            )
+            .await
+            .unwrap();
+        assert!(empty[0].contains("没有会话"), "{empty:?}");
+        assert_eq!(
+            fake.starts.load(Ordering::SeqCst),
+            starts,
+            "a model tap in a thread without a session spawns nothing"
+        );
+
+        // A channel without buttons keeps the typed footer.
+        let plain = gateway
+            .handle_text("mock", "chat-9", "bob", "/new claude")
+            .await
+            .unwrap();
+        assert!(plain[0].contains("→ /status"), "{plain:?}");
+    }
+
+    /// A thread whose first plain message spawns its session opens with a
+    /// header carrying that session's controls — in that thread.
+    #[tokio::test]
+    async fn a_new_thread_session_opens_with_its_controls() {
+        let fake = Arc::new(FakeAdapter::new(AgentVendor::Claude));
+        let proj = tempfile::TempDir::new().unwrap();
+        let mut gateway = Gateway::new(fake, "alpha", proj.path());
+        gateway.bind_channel_buttons("slack", true);
+        let mut events = gateway.subscribe_events();
+        gateway
+            .handle_message(
+                "slack",
+                "C1",
+                "U1",
+                Some("7.7"),
+                "7.7",
+                "fix the bug",
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        let ev = recv_answer(&mut events).await;
+        assert!(
+            ev.content.starts_with("🧵 会话 s1"),
+            "header: {}",
+            ev.content
+        );
+        assert_eq!(ev.thread_ts.as_deref(), Some("7.7"));
+        let controls: Vec<&str> = ev.options.iter().map(|o| o.data.as_str()).collect();
+        assert_eq!(controls, vec!["act:status", "act:model", "act:interrupt"]);
+
+        // A single-stream chat gets no header.
+        gateway.bind_channel_buttons("telegram", true);
+        gateway
+            .handle_text("telegram", "42", "bob", "hello")
+            .await
+            .unwrap();
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|e| e.content.starts_with("🧵 会话")),
+            "no header outside a thread"
+        );
     }
 
     /// Clickable session picker: on Telegram, `/sessions` is delivered as the

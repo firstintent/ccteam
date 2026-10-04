@@ -537,41 +537,71 @@ fn button_click_threads_on_the_clicked_messages_thread() {
 }
 
 #[test]
-fn blocks_render_markdown_and_chunk_buttons_with_unique_action_ids() {
-    let options: Vec<MessageOption> = (0..30)
-        .map(|i| MessageOption {
-            data: format!("tok:{i}"),
-            label: if i == 0 {
-                "x".repeat(200)
-            } else {
-                format!("opt {i}")
-            },
-            id: format!("o{i}"),
-        })
-        .collect();
+fn a_few_options_render_as_one_row_of_buttons() {
+    let options = options(3);
     let blocks = message_blocks("**bold** text", &options);
-    assert_eq!(blocks.len(), 3, "markdown + 25 + 5 buttons");
+    assert_eq!(blocks.len(), 2, "markdown + one actions row");
     assert_eq!(
         blocks[0],
         json!({ "type": "markdown", "text": "**bold** text" })
     );
-    assert_eq!(blocks[1]["elements"].as_array().unwrap().len(), 25);
-    assert_eq!(blocks[2]["elements"].as_array().unwrap().len(), 5);
-    let first = &blocks[1]["elements"][0];
-    assert_eq!(first["value"], "tok:0");
-    assert_eq!(
-        first["text"]["text"].as_str().unwrap().chars().count(),
-        SLACK_BUTTON_LABEL_MAX_CHARS
-    );
-    let ids: HashSet<&str> = blocks[1..]
+    let buttons = blocks[1]["elements"].as_array().unwrap();
+    assert_eq!(buttons.len(), 3);
+    assert_eq!(buttons[0]["type"], "button");
+    assert_eq!(buttons[2]["value"], "tok:2");
+    let ids: HashSet<&str> = buttons
         .iter()
-        .flat_map(|b| b["elements"].as_array().unwrap())
         .map(|e| e["action_id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids.len(), 30, "action_ids are unique within the message");
-    assert!(ids.contains("ccteam_opt_29"));
+    assert_eq!(ids.len(), 3, "action_ids are unique within the message");
 
     assert!(message_blocks("", &[]).is_empty());
+}
+
+/// A long list (a project picker, model × effort) is a dropdown, not a wall
+/// of buttons; Slack caps one dropdown at 100 options.
+#[test]
+fn many_options_render_as_a_dropdown() {
+    let options: Vec<MessageOption> = (0..130)
+        .map(|i| MessageOption {
+            data: format!("nav:cd:p{i}"),
+            label: if i == 0 {
+                "x".repeat(200)
+            } else {
+                format!("  project {i}")
+            },
+            id: format!("p{i}"),
+        })
+        .collect();
+    let blocks = message_blocks("📁 项目", &options);
+    assert_eq!(blocks.len(), 3, "markdown + 100 + 30 in two dropdowns");
+    let select = &blocks[1]["elements"][0];
+    assert_eq!(select["type"], "static_select");
+    let choices = select["options"].as_array().unwrap();
+    assert_eq!(choices.len(), 100);
+    assert_eq!(choices[0]["value"], "nav:cd:p0");
+    assert_eq!(
+        choices[0]["text"]["text"].as_str().unwrap().chars().count(),
+        SLACK_BUTTON_LABEL_MAX_CHARS
+    );
+    assert_eq!(choices[1]["text"]["text"], "project 1", "padding trimmed");
+    assert_ne!(
+        blocks[1]["elements"][0]["action_id"],
+        blocks[2]["elements"][0]["action_id"]
+    );
+}
+
+#[test]
+fn a_dropdown_pick_comes_back_like_a_button_click() {
+    let mut payload = click_payload(ALLOWED, "C1", "5.5", Some("1.1"));
+    payload["actions"] = json!([{
+        "type": "static_select",
+        "action_id": "ccteam_select_0",
+        "selected_option": { "value": "nav:cd:beta", "text": { "type": "plain_text", "text": "beta" } },
+    }]);
+    let click = decode_block_actions(&payload).unwrap();
+    assert_eq!(click.value, "nav:cd:beta");
+    assert_eq!(click.thread_ts, "1.1");
 }
 
 #[test]
