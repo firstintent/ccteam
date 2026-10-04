@@ -424,6 +424,10 @@ fn slash_content(text: &str) -> String {
 /// session's thread included.
 const COMMAND_SIGIL: char = '!';
 
+/// Agent (vendor) commands ccteam's replies name by example; rewritten to
+/// `!name` alongside ccteam's own registered commands.
+const AGENT_COMMANDS_NAMED: &[&str] = &["model", "compact", "clear", "effort", "goal"];
+
 /// `!word …` → `/word …` (a letter must follow, so `!!!` or `! wow` stay
 /// prose); anything else unchanged.
 fn command_from_sigil(text: String) -> String {
@@ -764,10 +768,13 @@ impl SlackChannel {
         if !text.contains('/') {
             return None;
         }
-        let names = self.command_names.read().await;
+        let mut names = self.command_names.read().await.clone();
         if names.is_empty() {
             return None;
         }
+        // The agents' own commands a reply most often names (`/help` points
+        // at `/model` and `/compact`) — typed with `!` on Slack just the same.
+        names.extend(AGENT_COMMANDS_NAMED.iter().map(|n| n.to_string()));
         let out = rewrite_command_sigils(text, &names);
         (out != text).then_some(out)
     }

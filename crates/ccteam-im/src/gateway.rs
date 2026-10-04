@@ -3286,7 +3286,8 @@ pub const GATEWAY_COMMANDS: &[GatewayCommandSpec] = &[
     },
     GatewayCommandSpec {
         name: "/use",
-        arg_hint: Some("<id|@role>"),
+        // No `|` inside `<…>`: Slack reads `<a|b>` as its own link syntax.
+        arg_hint: Some("<id> | @<role>"),
         // v0.8.23 review §3.2-5 — `@role` is a shorthand for "the most
         // recently active session with that role" (silent recency tie-break;
         // an unmatched role lists what IS available).
@@ -20011,15 +20012,19 @@ fn render_choice_text(prompt: &ChoicePrompt) -> String {
 
 /// Render the `/help` body from [`GATEWAY_COMMANDS`].
 fn render_help() -> String {
-    let mut s = String::from("Gateway commands:");
-    for c in GATEWAY_COMMANDS {
-        match c.arg_hint {
-            Some(hint) => s.push_str(&format!("\n{} {} — {}", c.name, hint, c.help)),
-            None => s.push_str(&format!("\n{} — {}", c.name, c.help)),
-        }
-    }
-    s.push_str("\n\nAny other /command is forwarded to the current session's agent.");
-    s
+    // A short, task-grouped list — not the full reference (that is `ccteam`'s
+    // docs and each command's own usage error). Grouped by what a person
+    // wants to do; on a channel with buttons `/help` also carries the main
+    // menu, so most of this need not be typed at all.
+    [
+        "常用命令",
+        "会话  /new [harness] [model=…] · /use <id> · /sessions · /status",
+        "控制  /interrupt · /stop <id> · /rename <标题> · /role <角色>",
+        "项目  /projects · /cd <项目> · /newproject <slug> <路径>",
+        "定时  /inbox",
+        "其他命令(如 /model /compact)会转给当前会话的 agent。",
+    ]
+    .join("\n")
 }
 
 fn parse_inbox_create_args(rest: &str) -> Result<(String, String)> {
@@ -33705,12 +33710,22 @@ mod tests {
             .unwrap();
         assert_eq!(used, vec!["using session s1\n↓ 查看状态 → /status"]);
 
-        // /help advertises /role.
-        assert!(
-            render_help().contains("/role"),
-            "render_help should list /role: {}",
-            render_help()
-        );
+        // /help is a short, grouped list that still names the everyday
+        // commands — and no `<a|b>` hint, which Slack would turn into a link.
+        let help = render_help();
+        for cmd in [
+            "/new",
+            "/use",
+            "/status",
+            "/role",
+            "/cd",
+            "/stop",
+            "/interrupt",
+        ] {
+            assert!(help.contains(cmd), "help names {cmd}: {help}");
+        }
+        assert!(help.lines().count() <= 8, "help stays short: {help}");
+        assert!(!help.contains("<id|"), "{help}");
     }
 
     /// V0.8.6 fix #5 — `/role` to a missing role must NOT destroy the live

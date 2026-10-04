@@ -93,7 +93,7 @@ async fn daemon_registers_command_menu_per_channel() {
     // /help. They're in_menu now, with the arg hint woven into the
     // description so a menu tap still teaches the argument.
     for (name, hint) in [
-        ("/use", "<id|@role>"),
+        ("/use", "<id> | @<role>"),
         ("/cd", "<project>"),
         ("/role", "<role>"),
         ("/stop", "<id>"),

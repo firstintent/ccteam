@@ -1537,11 +1537,19 @@ async fn sends_use_the_registered_command_names() {
     ch.send(&SendMessage::new("→ /status · /sessions", "C1"))
         .await
         .unwrap();
+    ch.send(&SendMessage::new("其他命令(如 /model /compact)", "C1"))
+        .await
+        .unwrap();
     ch.edit_message("C1", "9.9", "card → /status")
         .await
         .unwrap();
     let posts = api.calls("chat.postMessage");
     assert_eq!(posts[0].json()["text"], "→ /status");
     assert_eq!(posts[1].json()["text"], "→ !status · !sessions");
+    assert_eq!(
+        posts[2].json()["text"],
+        "其他命令(如 !model !compact)",
+        "the agent commands a reply names by example are typed with `!` too"
+    );
     assert_eq!(api.calls("chat.update")[0].json()["text"], "card → !status");
 }
